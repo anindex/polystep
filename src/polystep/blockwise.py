@@ -319,7 +319,7 @@ def create_subspace_blocks(
     equal-sized blocks, each with subspace_particle_dim as the particle
     dimension.
 
-    Key insight from CONTEXT.md:
+    Key design insight:
     - Block operation space is PROJECTED SUBSPACE, not full parameter space
     - Blocks slice the subspace_dim coordinates
     - Global projection P is shared across all blocks (applied once at start/end)

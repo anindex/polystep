@@ -484,7 +484,7 @@ class PolyStep:
         total_disp = 0.0
         total_particles = 0
 
-        # Python loop over blocks (per CONTEXT decision #7)
+        # Python loop over blocks (sequential per-block OT solves)
         for block_idx, block in enumerate(blocks):
             block_X = all_block_particles[block_idx]
             block_dim = block.particle_dim

@@ -470,7 +470,6 @@ def step_monolithic(opt, closure: Callable) -> float:
             # Descent direction = negative gradient
             opt._prev_descent_direction = -grad_orig.detach()
             opt._prev_descent_direction_finite = True
-            # (_prev_fd_gradient and _prev_rotated_dirs removed - were dead code)
             # Compute Newton direction for momentum steps
             from .quadratic_model import extract_fd_hessian_diag, compute_newton_step
             fd_hess = extract_fd_hessian_diag(

@@ -12,6 +12,7 @@ Provides two schedulers:
 - ``ProgressiveEpsilon``: Feedback-driven auto-adjustment based on Sinkhorn solver
   convergence behavior, inspired by ProgOT (Kassab & Thornton, 2025).
 """
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -175,7 +176,7 @@ class CosineEpsilon:
     total_steps: int = 0
     restart_mult: float = 1.0
 
-    def at(self, iteration: int | None = 1) -> float:
+    def at(self, iteration: Optional[int] = 1) -> float:
         """Compute epsilon at the given iteration.
 
         Args:
@@ -204,6 +205,5 @@ class CosineEpsilon:
             T_local = T
             t_local = min(iteration, T)
 
-        import math
         cos_val = math.cos(math.pi * t_local / max(T_local, 1))
         return self.target + 0.5 * (self.init - self.target) * (1.0 + cos_val)

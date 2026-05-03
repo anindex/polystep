@@ -30,7 +30,7 @@ Issues = "https://github.com/anindex/polystep/issues"
 
 [project.optional-dependencies]
 # Lightweight: just enough for examples/ demos
-examples = ["torchvision", "matplotlib"]
+examples = ["torchvision", "matplotlib", "Pillow", "gymnasium[classic-control]"]
 # Core dev: lint + test the library itself (no experiment deps)
 dev = ["pytest", "pytest-timeout", "pytest-rerunfailures", "pytest-cov", "ruff"]
 # Full experiment reproduction (paper results, ablations, baselines)
@@ -65,11 +65,12 @@ src = ["src"]
 ignore = ["E501", "F401"]
 
 [tool.ruff.lint.per-file-ignores]
-# Benchmark scripts and optimizer use deferred imports after sys.path
-# manipulation or long module-level docstrings - E402 is intentional.
+# Benchmark scripts, optimizer, and examples use deferred imports after
+# sys.path manipulation or long module-level docstrings - E402 is intentional.
 "src/polystep/benchmarks/*.py" = ["E402"]
 "src/polystep/optimizer.py" = ["E402"]
 "experiments/scripts/*.py" = ["E402"]
+"examples/*.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

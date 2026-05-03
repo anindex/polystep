@@ -1,5 +1,10 @@
 # polystep
 
+[![arXiv](https://img.shields.io/badge/arXiv-2605.01928-b31b1b.svg)](https://arxiv.org/abs/2605.01928)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.4+](https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c.svg)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+
 **Gradient-free neural network training via optimal transport.**
 
 PolyStep optimizes neural networks without backpropagation. At each step, it samples polytope vertices around current parameters, evaluates losses via forward passes only, and computes softmax-weighted projections to find descent directions. This enables training models with non-differentiable components - spiking networks, quantized layers, blackbox modules - where gradients are unavailable or undefined.
@@ -158,6 +163,20 @@ docs/                  API overview, reproducibility guide
 | [`LIMITATIONS.md`](LIMITATIONS.md) | Known limitations |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
+
+## Citation
+
+If you use PolyStep in your research, please cite:
+
+```bibtex
+@article{le2025polystep,
+  title   = {Training Non-Differentiable Networks via Optimal Transport},
+  author  = {Le, An T.},
+  journal = {arXiv preprint arXiv:2605.01928},
+  year    = {2025},
+  url     = {https://arxiv.org/abs/2605.01928}
+}
+```
 
 ## License
 

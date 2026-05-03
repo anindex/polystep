@@ -46,6 +46,7 @@ profile_traces/
 # Stale run logs
 logs/
 
-# Example outputs (PNGs are regeneratable; keep the directory via .gitkeep)
+# Example outputs (regeneratable; keep the directory via .gitkeep)
 examples/figures/*.png
+examples/figures/*.gif
 !examples/figures/.gitkeep

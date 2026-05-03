@@ -14,6 +14,9 @@ from .blockwise import (
     reassemble_blocks,
     split_subspace_to_blocks,
     reassemble_blocks_to_subspace,
+    layout_flat_to_block_flat,
+    blocks_to_layout_flat,
+    blocks_to_layout_flat_batch,
 )
 from .dynamics import apply_momentum, compute_momentum_coefficient, update_adaptive_radius
 from .geometry import get_random_rotation_matrices
@@ -56,7 +59,6 @@ def step_blockwise(opt, closure: Callable) -> float:
     # Convert layout-indexed flat to block-indexed flat before splitting.
     # Per-layer blocks pad each entry independently, creating different
     # offsets from ParamLayout (contiguous concat + single end pad).
-    from .blockwise import layout_flat_to_block_flat, blocks_to_layout_flat
     total_flat_size = sum(b.flat_end - b.flat_start for b in blocks)
     block_flat = layout_flat_to_block_flat(
         X.reshape(-1), blocks, opt.layout,
@@ -170,7 +172,6 @@ def step_blockwise(opt, closure: Callable) -> float:
             # Map block-indexed flat vector to layout-indexed flat vector.
             # Per-layer blocks pad each entry independently, creating
             # different offsets from ParamLayout.
-            from .blockwise import blocks_to_layout_flat_batch
             batch_for_layout = blocks_to_layout_flat_batch(
                 base_batch, blocks, opt.layout,
             )
@@ -373,7 +374,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     2. Per-block OT decomposition: Splits subspace coords into blocks for
        independent OT solves, reducing OT cost from O(N^2) to O(N^2/L).
 
-    Algorithm (from CONTEXT.md):
+    Algorithm:
     a) Get current subspace coords from state.X (flattened)
     b) Split subspace coords into per-block particles
     c) For each block:

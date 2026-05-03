@@ -45,6 +45,6 @@ Networks via Optimal Transport*.
 
 ### Verification
 
-- 959 unit tests pass (`pytest -q -m "not slow"`); ruff lint clean
+- 879 unit tests pass (`pytest -q -m "not slow"`); ruff lint clean
 - Headline numbers verified against multi-seed result JSONs (seeds
   `{42, 123, 456, 789, 1337}`)

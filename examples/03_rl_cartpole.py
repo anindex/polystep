@@ -17,14 +17,19 @@ What you should see:
   ~80 PolyStep steps. CartPole-v1's max return is 500; we use a reduced
   horizon of 200 to keep the demo under one minute on CPU.
 
+  After training, the script launches a Gymnasium render window to visually
+  verify the trained policy (pass ``--no-render`` to skip).
+
 Output:
   examples/figures/rl_cartpole.png
 
 Run:
   python examples/03_rl_cartpole.py
+  python examples/03_rl_cartpole.py --no-render   # headless
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -47,10 +52,59 @@ from polystep.hybrid_subspace import HybridSubspace  # noqa: E402
 from polystep.transform import ParamLayout  # noqa: E402
 
 
+def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
+    """Run the trained policy in Gymnasium and save a GIF visualization.
+
+    Uses ``render_mode="rgb_array"`` to avoid OpenGL/GLX dependency —
+    Gymnasium's ``"human"`` mode requires a working GLX context which
+    fails on many setups (WSL, remote desktops, containers, missing
+    GPU drivers).  The resulting GIF is saved next to the training plot.
+    """
+    import gymnasium as gym
+    from PIL import Image
+
+    # Override the default 500-step truncation so we can demonstrate
+    # long-term stability of the trained policy.
+    env = gym.make("CartPole-v1", render_mode="rgb_array",
+                   max_episode_steps=horizon)
+    frames: list = []
+
+    for ep in range(num_episodes):
+        obs, _ = env.reset()
+        total_reward = 0.0
+        for _ in range(horizon):
+            frame = env.render()
+            frames.append(frame)
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                logits = policy(obs_t)
+                action = int(logits.argmax(dim=-1).item())
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+            if terminated or truncated:
+                break
+        print(f"  episode {ep + 1}: return = {total_reward:.0f}")
+    env.close()
+
+    # Save as GIF (sub-sampled to keep file size reasonable).
+    out = Path(__file__).parent / "figures" / "rl_cartpole_policy.gif"
+    os.makedirs(out.parent, exist_ok=True)
+    step = max(1, len(frames) // 200)  # cap at ~200 frames
+    imgs = [Image.fromarray(f) for f in frames[::step]]
+    imgs[0].save(out, save_all=True, append_images=imgs[1:],
+                 duration=33, loop=0)
+    print(f"  saved visualization: {out}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="CartPole policy search with PolyStep")
+    parser.add_argument("--no-render", action="store_true",
+                        help="skip Gymnasium visualization after training")
+    args = parser.parse_args()
+
     seed = 42
     device = "cpu"
-    target_steps = 80
+    target_steps = 40
     rollouts_per_candidate = 16
     horizon = 200  # below the 500 max so the demo runs in <60s on CPU
     eval_episodes = 32
@@ -152,6 +206,8 @@ def main():
     print(f"  wallclock: {elapsed:.1f}s ({target_steps} steps)")
     print("=" * 60)
 
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(1, 1, figsize=(5.0, 2.8), constrained_layout=True)
@@ -172,6 +228,14 @@ def main():
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"saved figure: {out}")
+
+    # Visualization with Gymnasium rendering
+    if not args.no_render:
+        print()
+        print("launching Gymnasium CartPole-v1 visualization...")
+        visualize_policy(policy, num_episodes=1, horizon=2000)
+    else:
+        print("(skipping Gymnasium render; pass without --no-render to visualize)")
 
 
 if __name__ == "__main__":

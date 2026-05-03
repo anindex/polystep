@@ -14,6 +14,15 @@ keywords:
   - pytorch
   - neural network training
   - non-differentiable
+preferred-citation:
+  type: article
+  title: "Training Non-Differentiable Networks via Optimal Transport"
+  authors:
+    - family-names: Le
+      given-names: An T.
+  journal: "arXiv preprint arXiv:2605.01928"
+  year: 2025
+  url: "https://arxiv.org/abs/2605.01928"
 references:
   - type: conference-paper
     title: "Accelerating Motion Planning via Optimal Transport"

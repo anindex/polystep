@@ -9,8 +9,7 @@ Multi-particle architecture: Model parameters are reshaped into
 (num_particles, particle_dim) where particle_dim is typically 2. Each particle
 is an independent unit in the OT problem. The polytope operates in
 particle_dim space (e.g., 4 orthoplex vertices in 2D), giving a tractable
-OT problem of shape (num_particles, num_vertices). This matches the ssax/ssoptax
-reference design.
+OT problem of shape (num_particles, num_vertices).
 """
 from __future__ import annotations
 
@@ -286,7 +285,7 @@ class PolyStepOptimizer:
         projection_type: Type of projection for AdaptiveSubspace mode.
             'dense' uses QR-orthogonalized dense matrices (default).
             'sparse' uses SparseRandomProjection for memory efficiency.
-            'auto' will auto-select based on model size (in Plan 02).
+            'auto' will auto-select based on model size.
 
     Hyperparameter Guide:
         **Optimal configurations by subspace mode (validated on MNIST):**
@@ -596,7 +595,7 @@ class PolyStepOptimizer:
                 "newton_refinement=True auto-enables use_quadratic_model=True "
                 "(needed to retain probe losses for Newton correction)"
             )
-        # (_prev_fd_gradient and _prev_rotated_dirs removed - were dead code)
+
         self._newton_direction = None  # (P, pdim) Newton step in original space
         # Trust region: adapt step_radius via multiplier based on quadratic model
         self.trust_region = trust_region
