@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyTorch / ML artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Data (downloaded on demand)
+data/
+
+# Profiling
+*.trace.json
+profile_traces/
+
+# Stale run logs
+logs/
+
+# Example outputs (PNGs are regeneratable; keep the directory via .gitkeep)
+examples/figures/*.png
+!examples/figures/.gitkeep

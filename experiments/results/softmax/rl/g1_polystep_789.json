@@ -1,0 +1,492 @@
+{
+  "benchmark": "g1",
+  "method": "polystep",
+  "seed": 789,
+  "timestamp": "2026-05-01T15:20:05Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-22-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 131.33
+  },
+  "hyperparameters": {
+    "actor_hidden": [
+      128,
+      64
+    ],
+    "activation": "elu",
+    "steps": 150,
+    "num_envs": 64,
+    "horizon": 200,
+    "subspace_rank": 2,
+    "epsilon_init": 2.0,
+    "epsilon_target": 0.1,
+    "step_radius": 0.1,
+    "probe_radius": 0.2,
+    "amortize_steps": 3,
+    "max_subspace_dim": 32,
+    "param_count": 22941,
+    "subspace_dim": 224
+  },
+  "metrics": {
+    "final_accuracy": 0.0,
+    "best_accuracy": 0.0,
+    "wall_time_seconds": 2416.7909972667694,
+    "peak_gpu_memory_mb": 131.33,
+    "function_evals": 22400,
+    "total_steps": 150,
+    "final_return": 3.013381083806356,
+    "best_return": 3.2263569831848145,
+    "normalized_score": 0.0,
+    "rl_env_steps": 286720000,
+    "episode_length": 82.72916666666667,
+    "fall_rate": 0.015625,
+    "final_return_std": 0.1319944003773758,
+    "final_eval_seeds": 3
+  },
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "accuracy": 0.0,
+      "loss": -2.246612071990967,
+      "time": 51.70733714103699
+    },
+    {
+      "epoch": 7,
+      "accuracy": 0.0,
+      "loss": -2.233900308609009,
+      "time": 138.9718143939972
+    },
+    {
+      "epoch": 14,
+      "accuracy": 0.0,
+      "loss": -2.3815932273864746,
+      "time": 226.90569281578064
+    },
+    {
+      "epoch": 21,
+      "accuracy": 0.0,
+      "loss": -2.3793749809265137,
+      "time": 315.89636516571045
+    },
+    {
+      "epoch": 28,
+      "accuracy": 0.0,
+      "loss": -2.422647476196289,
+      "time": 446.2537131309509
+    },
+    {
+      "epoch": 35,
+      "accuracy": 0.0,
+      "loss": -2.4492125511169434,
+      "time": 535.746036529541
+    },
+    {
+      "epoch": 42,
+      "accuracy": 0.0,
+      "loss": -2.764434814453125,
+      "time": 627.0336093902588
+    },
+    {
+      "epoch": 49,
+      "accuracy": 0.0,
+      "loss": -2.9111857414245605,
+      "time": 758.4812762737274
+    },
+    {
+      "epoch": 56,
+      "accuracy": 0.0,
+      "loss": -3.0011961460113525,
+      "time": 850.9650149345398
+    },
+    {
+      "epoch": 63,
+      "accuracy": 0.0,
+      "loss": -2.944654941558838,
+      "time": 940.9051487445831
+    },
+    {
+      "epoch": 70,
+      "accuracy": 0.0,
+      "loss": -2.949228286743164,
+      "time": 1076.8244824409485
+    },
+    {
+      "epoch": 77,
+      "accuracy": 0.0,
+      "loss": -2.9592061042785645,
+      "time": 1175.3212504386902
+    },
+    {
+      "epoch": 84,
+      "accuracy": 0.0,
+      "loss": -2.8473968505859375,
+      "time": 1273.4758520126343
+    },
+    {
+      "epoch": 91,
+      "accuracy": 0.0,
+      "loss": -3.117046356201172,
+      "time": 1431.4122610092163
+    },
+    {
+      "epoch": 98,
+      "accuracy": 0.0,
+      "loss": -3.1677675247192383,
+      "time": 1536.7813668251038
+    },
+    {
+      "epoch": 105,
+      "accuracy": 0.0,
+      "loss": -3.2263569831848145,
+      "time": 1640.810917854309
+    },
+    {
+      "epoch": 112,
+      "accuracy": 0.0,
+      "loss": -2.9320430755615234,
+      "time": 1792.9066038131714
+    },
+    {
+      "epoch": 119,
+      "accuracy": 0.0,
+      "loss": -2.9156570434570312,
+      "time": 1895.3088405132294
+    },
+    {
+      "epoch": 126,
+      "accuracy": 0.0,
+      "loss": -2.9921700954437256,
+      "time": 1995.501761674881
+    },
+    {
+      "epoch": 133,
+      "accuracy": 0.0,
+      "loss": -2.9325990676879883,
+      "time": 2142.216521501541
+    },
+    {
+      "epoch": 140,
+      "accuracy": 0.0,
+      "loss": -2.912928342819214,
+      "time": 2242.094892501831
+    },
+    {
+      "epoch": 147,
+      "accuracy": 0.0,
+      "loss": -3.094569683074951,
+      "time": 2342.079290866852
+    },
+    {
+      "epoch": 150,
+      "accuracy": 0.0,
+      "loss": -2.7661068439483643,
+      "time": 2396.3535928726196
+    }
+  ],
+  "step_logs": [
+    {
+      "step": 1,
+      "epoch": 1,
+      "accuracy": 0.0,
+      "mean_return": 2.246612071990967,
+      "loss": -2.246612071990967,
+      "time": 51.70733714103699,
+      "step_wall_time": 46.256147384643555,
+      "candidates_evaluated": 448,
+      "env_steps_cumulative": 5734400,
+      "episode_length": 70.328125,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 7,
+      "epoch": 7,
+      "accuracy": 0.0,
+      "mean_return": 2.233900308609009,
+      "loss": -2.233900308609009,
+      "time": 138.9718143939972,
+      "step_wall_time": 41.237677812576294,
+      "candidates_evaluated": 1344,
+      "env_steps_cumulative": 17203200,
+      "episode_length": 72.203125,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 14,
+      "epoch": 14,
+      "accuracy": 0.0,
+      "mean_return": 2.3815932273864746,
+      "loss": -2.3815932273864746,
+      "time": 226.90569281578064,
+      "step_wall_time": 0.00020360946655273438,
+      "candidates_evaluated": 2240,
+      "env_steps_cumulative": 28672000,
+      "episode_length": 72.5,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 21,
+      "epoch": 21,
+      "accuracy": 0.0,
+      "mean_return": 2.3793749809265137,
+      "loss": -2.3793749809265137,
+      "time": 315.89636516571045,
+      "step_wall_time": 0.00019025802612304688,
+      "candidates_evaluated": 3136,
+      "env_steps_cumulative": 40140800,
+      "episode_length": 74.15625,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 28,
+      "epoch": 28,
+      "accuracy": 0.0,
+      "mean_return": 2.422647476196289,
+      "loss": -2.422647476196289,
+      "time": 446.2537131309509,
+      "step_wall_time": 41.72416567802429,
+      "candidates_evaluated": 4480,
+      "env_steps_cumulative": 57344000,
+      "episode_length": 72.984375,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 35,
+      "epoch": 35,
+      "accuracy": 0.0,
+      "mean_return": 2.4492125511169434,
+      "loss": -2.4492125511169434,
+      "time": 535.746036529541,
+      "step_wall_time": 0.00020766258239746094,
+      "candidates_evaluated": 5376,
+      "env_steps_cumulative": 68812800,
+      "episode_length": 74.65625,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 42,
+      "epoch": 42,
+      "accuracy": 0.0,
+      "mean_return": 2.764434814453125,
+      "loss": -2.764434814453125,
+      "time": 627.0336093902588,
+      "step_wall_time": 0.00019049644470214844,
+      "candidates_evaluated": 6272,
+      "env_steps_cumulative": 80281600,
+      "episode_length": 78.671875,
+      "fall_rate": 0.03125
+    },
+    {
+      "step": 49,
+      "epoch": 49,
+      "accuracy": 0.0,
+      "mean_return": 2.9111857414245605,
+      "loss": -2.9111857414245605,
+      "time": 758.4812762737274,
+      "step_wall_time": 41.73644399642944,
+      "candidates_evaluated": 7616,
+      "env_steps_cumulative": 97484800,
+      "episode_length": 81.53125,
+      "fall_rate": 0.046875
+    },
+    {
+      "step": 56,
+      "epoch": 56,
+      "accuracy": 0.0,
+      "mean_return": 3.0011961460113525,
+      "loss": -3.0011961460113525,
+      "time": 850.9650149345398,
+      "step_wall_time": 0.0002040863037109375,
+      "candidates_evaluated": 8512,
+      "env_steps_cumulative": 108953600,
+      "episode_length": 84.5625,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 63,
+      "epoch": 63,
+      "accuracy": 0.0,
+      "mean_return": 2.944654941558838,
+      "loss": -2.944654941558838,
+      "time": 940.9051487445831,
+      "step_wall_time": 0.00018930435180664062,
+      "candidates_evaluated": 9408,
+      "env_steps_cumulative": 120422400,
+      "episode_length": 80.765625,
+      "fall_rate": 0.03125
+    },
+    {
+      "step": 70,
+      "epoch": 70,
+      "accuracy": 0.0,
+      "mean_return": 2.949228286743164,
+      "loss": -2.949228286743164,
+      "time": 1076.8244824409485,
+      "step_wall_time": 44.70024037361145,
+      "candidates_evaluated": 10752,
+      "env_steps_cumulative": 137625600,
+      "episode_length": 81.734375,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 77,
+      "epoch": 77,
+      "accuracy": 0.0,
+      "mean_return": 2.9592061042785645,
+      "loss": -2.9592061042785645,
+      "time": 1175.3212504386902,
+      "step_wall_time": 0.00021457672119140625,
+      "candidates_evaluated": 11648,
+      "env_steps_cumulative": 149094400,
+      "episode_length": 80.265625,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 84,
+      "epoch": 84,
+      "accuracy": 0.0,
+      "mean_return": 2.8473968505859375,
+      "loss": -2.8473968505859375,
+      "time": 1273.4758520126343,
+      "step_wall_time": 0.00019431114196777344,
+      "candidates_evaluated": 12544,
+      "env_steps_cumulative": 160563200,
+      "episode_length": 80.296875,
+      "fall_rate": 0.03125
+    },
+    {
+      "step": 91,
+      "epoch": 91,
+      "accuracy": 0.0,
+      "mean_return": 3.117046356201172,
+      "loss": -3.117046356201172,
+      "time": 1431.4122610092163,
+      "step_wall_time": 51.595202684402466,
+      "candidates_evaluated": 13888,
+      "env_steps_cumulative": 177766400,
+      "episode_length": 85.203125,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 98,
+      "epoch": 98,
+      "accuracy": 0.0,
+      "mean_return": 3.1677675247192383,
+      "loss": -3.1677675247192383,
+      "time": 1536.7813668251038,
+      "step_wall_time": 0.00021886825561523438,
+      "candidates_evaluated": 14784,
+      "env_steps_cumulative": 189235200,
+      "episode_length": 84.265625,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 105,
+      "epoch": 105,
+      "accuracy": 0.0,
+      "mean_return": 3.2263569831848145,
+      "loss": -3.2263569831848145,
+      "time": 1640.810917854309,
+      "step_wall_time": 0.0001933574676513672,
+      "candidates_evaluated": 15680,
+      "env_steps_cumulative": 200704000,
+      "episode_length": 86.71875,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 112,
+      "epoch": 112,
+      "accuracy": 0.0,
+      "mean_return": 2.9320430755615234,
+      "loss": -2.9320430755615234,
+      "time": 1792.9066038131714,
+      "step_wall_time": 48.37560677528381,
+      "candidates_evaluated": 17024,
+      "env_steps_cumulative": 217907200,
+      "episode_length": 83.296875,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 119,
+      "epoch": 119,
+      "accuracy": 0.0,
+      "mean_return": 2.9156570434570312,
+      "loss": -2.9156570434570312,
+      "time": 1895.3088405132294,
+      "step_wall_time": 0.0002262592315673828,
+      "candidates_evaluated": 17920,
+      "env_steps_cumulative": 229376000,
+      "episode_length": 81.390625,
+      "fall_rate": 0.03125
+    },
+    {
+      "step": 126,
+      "epoch": 126,
+      "accuracy": 0.0,
+      "mean_return": 2.9921700954437256,
+      "loss": -2.9921700954437256,
+      "time": 1995.501761674881,
+      "step_wall_time": 0.00019812583923339844,
+      "candidates_evaluated": 18816,
+      "env_steps_cumulative": 240844800,
+      "episode_length": 82.671875,
+      "fall_rate": 0.03125
+    },
+    {
+      "step": 133,
+      "epoch": 133,
+      "accuracy": 0.0,
+      "mean_return": 2.9325990676879883,
+      "loss": -2.9325990676879883,
+      "time": 2142.216521501541,
+      "step_wall_time": 46.47746515274048,
+      "candidates_evaluated": 20160,
+      "env_steps_cumulative": 258048000,
+      "episode_length": 81.59375,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 140,
+      "epoch": 140,
+      "accuracy": 0.0,
+      "mean_return": 2.912928342819214,
+      "loss": -2.912928342819214,
+      "time": 2242.094892501831,
+      "step_wall_time": 0.00021219253540039062,
+      "candidates_evaluated": 21056,
+      "env_steps_cumulative": 269516800,
+      "episode_length": 82.171875,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 147,
+      "epoch": 147,
+      "accuracy": 0.0,
+      "mean_return": 3.094569683074951,
+      "loss": -3.094569683074951,
+      "time": 2342.079290866852,
+      "step_wall_time": 0.0001919269561767578,
+      "candidates_evaluated": 21952,
+      "env_steps_cumulative": 280985600,
+      "episode_length": 84.265625,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 150,
+      "epoch": 150,
+      "accuracy": 0.0,
+      "mean_return": 2.7661068439483643,
+      "loss": -2.7661068439483643,
+      "time": 2396.3535928726196,
+      "step_wall_time": 0.00019311904907226562,
+      "candidates_evaluated": 22400,
+      "env_steps_cumulative": 286720000,
+      "episode_length": 82.171875,
+      "fall_rate": 0.03125
+    }
+  ]
+}

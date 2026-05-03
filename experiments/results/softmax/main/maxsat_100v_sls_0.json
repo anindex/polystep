@@ -1,0 +1,34 @@
+{
+  "benchmark": "maxsat_100v",
+  "method": "sls",
+  "seed": 0,
+  "timestamp": "2026-04-18T01:37:14Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-20-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 9.54
+  },
+  "hyperparameters": {
+    "max_flips": 100000,
+    "num_vars": 100,
+    "walk_probability": 0.5
+  },
+  "metrics": {
+    "final_accuracy": 0.9976525821596244,
+    "best_accuracy": 0.9976525821596244,
+    "wall_time_seconds": 5.714940309524536,
+    "peak_gpu_memory_mb": 0.0,
+    "function_evals": 100000,
+    "total_steps": 100000,
+    "num_satisfied": 425,
+    "num_unsatisfied": 1,
+    "num_clauses": 426
+  },
+  "epoch_logs": [],
+  "step_logs": []
+}

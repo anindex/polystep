@@ -1,0 +1,69 @@
+{
+  "benchmark": "maxsat_20000v",
+  "method": "cmaes",
+  "seed": 456,
+  "timestamp": "2026-04-18T01:52:23Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-20-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 218.94
+  },
+  "hyperparameters": {
+    "popsize": 50,
+    "sigma0": 1.0,
+    "cra_lambda": 0.0,
+    "cra_alpha": 2,
+    "num_vars": 20000,
+    "max_evals": 50000,
+    "CMA_diagonal": true
+  },
+  "metrics": {
+    "final_accuracy": 0.9233948588371277,
+    "best_accuracy": 0.9233948588371277,
+    "wall_time_seconds": 18.470027923583984,
+    "peak_gpu_memory_mb": 218.94,
+    "function_evals": 21250,
+    "total_steps": 425,
+    "num_satisfied": 78857,
+    "num_unsatisfied": 6542,
+    "num_clauses": 85399
+  },
+  "epoch_logs": [
+    {
+      "epoch": 100,
+      "accuracy": 0.9011815190315247,
+      "loss": 0.09881848096847534,
+      "time": 4.261742830276489
+    },
+    {
+      "epoch": 200,
+      "accuracy": 0.9175751209259033,
+      "loss": 0.08242487907409668,
+      "time": 8.115317821502686
+    },
+    {
+      "epoch": 300,
+      "accuracy": 0.9225283861160278,
+      "loss": 0.07747167348861694,
+      "time": 12.120843887329102
+    },
+    {
+      "epoch": 400,
+      "accuracy": 0.9233714938163757,
+      "loss": 0.07662856578826904,
+      "time": 17.1236789226532
+    },
+    {
+      "epoch": 425,
+      "accuracy": 0.9233948588371277,
+      "loss": 0.07660514116287231,
+      "time": 18.46979808807373
+    }
+  ],
+  "step_logs": []
+}

@@ -1,0 +1,38 @@
+{
+  "benchmark": "acrobot",
+  "method": "random_policy",
+  "seed": 456,
+  "timestamp": "2026-05-02T06:39:13Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-22-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 0.0
+  },
+  "hyperparameters": {
+    "env_id": "Acrobot-v1",
+    "eval_episodes": 256,
+    "horizon": 500,
+    "action_selection": "uniform_random"
+  },
+  "metrics": {
+    "final_accuracy": 0.002232142857142857,
+    "best_accuracy": 0.002232142857142857,
+    "wall_time_seconds": 2.2302114963531494,
+    "peak_gpu_memory_mb": 0.0,
+    "function_evals": 1,
+    "total_steps": 1,
+    "final_return": -499.0625,
+    "best_return": -499.0625,
+    "normalized_score": 0.002232142857142857,
+    "rl_env_steps": 128000,
+    "success_rate": 1.0,
+    "episode_length": 499.07421875
+  },
+  "epoch_logs": [],
+  "step_logs": []
+}

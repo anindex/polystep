@@ -1,0 +1,31 @@
+{
+  "benchmark": "memory_scaling",
+  "method": "bptt_T50",
+  "seed": 0,
+  "timestamp": "2026-04-01T11:56:08Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.13",
+    "platform": "Linux",
+    "platform_release": "6.17.0-19-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 1538.2
+  },
+  "hyperparameters": {
+    "timesteps": 50,
+    "batch_size": 4,
+    "model": "SNNVGG11Small",
+    "mode": "forward_backward"
+  },
+  "metrics": {
+    "final_accuracy": 0.0,
+    "best_accuracy": 0.0,
+    "wall_time_seconds": 0.0,
+    "peak_gpu_memory_mb": 226.03857421875,
+    "function_evals": 0,
+    "total_steps": 0
+  },
+  "epoch_logs": []
+}

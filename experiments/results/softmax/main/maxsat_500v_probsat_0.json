@@ -1,0 +1,36 @@
+{
+  "benchmark": "maxsat_500v",
+  "method": "probsat",
+  "seed": 0,
+  "timestamp": "2026-04-29T16:08:15Z",
+  "environment": {
+    "torch_version": "2.11.0+cu128",
+    "python_version": "3.12.13",
+    "platform": "Linux",
+    "platform_release": "6.17.0-20-generic",
+    "cuda_version": "12.8",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 0.0
+  },
+  "hyperparameters": {
+    "max_flips": 10000000,
+    "runs": 10,
+    "num_vars": 500,
+    "timed_out": false,
+    "solver": "probSAT SC13.2"
+  },
+  "metrics": {
+    "final_accuracy": 0.9995316159250586,
+    "best_accuracy": 0.9995316159250586,
+    "wall_time_seconds": 12.311355590820312,
+    "peak_gpu_memory_mb": 0.0,
+    "function_evals": 100000000,
+    "total_steps": 10000000,
+    "num_satisfied": 2134,
+    "num_unsatisfied": 1,
+    "num_clauses": 2135
+  },
+  "epoch_logs": [],
+  "step_logs": []
+}

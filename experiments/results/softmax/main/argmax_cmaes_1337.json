@@ -1,0 +1,94 @@
+{
+  "benchmark": "argmax",
+  "method": "cmaes",
+  "seed": 1337,
+  "timestamp": "2026-04-16T05:55:04Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-20-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 22.76
+  },
+  "hyperparameters": {
+    "generations": 10000,
+    "popsize": 16,
+    "stdev_init": 0.5,
+    "generations_actual": 10000,
+    "CMA_diagonal": true
+  },
+  "metrics": {
+    "final_accuracy": 0.7345,
+    "best_accuracy": 0.7345,
+    "wall_time_seconds": 2061.662631750107,
+    "peak_gpu_memory_mb": 22.76,
+    "function_evals": 160000,
+    "total_steps": 10000
+  },
+  "epoch_logs": [
+    {
+      "epoch": 1000,
+      "accuracy": 0.6732,
+      "loss": 6.974655628204346,
+      "time": 173.25012969970703
+    },
+    {
+      "epoch": 2000,
+      "accuracy": 0.6998,
+      "loss": 5.896293640136719,
+      "time": 408.51046991348267
+    },
+    {
+      "epoch": 3000,
+      "accuracy": 0.7093,
+      "loss": 5.131343364715576,
+      "time": 655.0953278541565
+    },
+    {
+      "epoch": 4000,
+      "accuracy": 0.7127,
+      "loss": 4.441427230834961,
+      "time": 887.6894176006317
+    },
+    {
+      "epoch": 5000,
+      "accuracy": 0.7178,
+      "loss": 3.555342435836792,
+      "time": 1118.2681748867035
+    },
+    {
+      "epoch": 6000,
+      "accuracy": 0.7178,
+      "loss": 3.555342435836792,
+      "time": 1343.5733361244202
+    },
+    {
+      "epoch": 7000,
+      "accuracy": 0.7178,
+      "loss": 3.555342435836792,
+      "time": 1538.8746531009674
+    },
+    {
+      "epoch": 8000,
+      "accuracy": 0.7345,
+      "loss": 1.9334073066711426,
+      "time": 1713.9422507286072
+    },
+    {
+      "epoch": 9000,
+      "accuracy": 0.7345,
+      "loss": 1.9334073066711426,
+      "time": 1887.4199137687683
+    },
+    {
+      "epoch": 10000,
+      "accuracy": 0.7345,
+      "loss": 1.9334073066711426,
+      "time": 2061.6621317863464
+    }
+  ],
+  "step_logs": []
+}

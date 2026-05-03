@@ -1,0 +1,38 @@
+{
+  "benchmark": "cartpole",
+  "method": "random_policy",
+  "seed": 42,
+  "timestamp": "2026-05-02T05:58:15Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-22-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 0.0
+  },
+  "hyperparameters": {
+    "env_id": "CartPole-v1",
+    "eval_episodes": 256,
+    "horizon": 500,
+    "action_selection": "uniform_random"
+  },
+  "metrics": {
+    "final_accuracy": 0.002157426778242678,
+    "best_accuracy": 0.002157426778242678,
+    "wall_time_seconds": 0.16572213172912598,
+    "peak_gpu_memory_mb": 0.0,
+    "function_evals": 1,
+    "total_steps": 1,
+    "final_return": 23.03125,
+    "best_return": 23.03125,
+    "normalized_score": 0.002157426778242678,
+    "rl_env_steps": 128000,
+    "success_rate": 1.0,
+    "episode_length": 23.03125
+  },
+  "epoch_logs": [],
+  "step_logs": []
+}

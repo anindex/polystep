@@ -1,0 +1,251 @@
+{
+  "benchmark": "g1",
+  "method": "polystep_sweep_0",
+  "seed": 42,
+  "timestamp": "2026-05-01T05:40:58Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-22-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 79.16
+  },
+  "hyperparameters": {
+    "actor_hidden": [
+      128,
+      64
+    ],
+    "activation": "elu",
+    "steps": 30,
+    "num_envs": 64,
+    "horizon": 48,
+    "subspace_rank": 2,
+    "epsilon_init": 0.5,
+    "epsilon_target": 0.1,
+    "step_radius": 0.05,
+    "probe_radius": 0.1,
+    "amortize_steps": 3,
+    "max_subspace_dim": 32,
+    "param_count": 22941,
+    "subspace_dim": 224
+  },
+  "metrics": {
+    "final_accuracy": 0.0,
+    "best_accuracy": 0.0,
+    "wall_time_seconds": 149.2745463848114,
+    "peak_gpu_memory_mb": 79.16,
+    "function_evals": 4480,
+    "total_steps": 30,
+    "final_return": 2.82112193107605,
+    "best_return": 2.9347336292266846,
+    "normalized_score": 0.0,
+    "rl_env_steps": 13762560,
+    "episode_length": 47.890625,
+    "fall_rate": 0.0
+  },
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "accuracy": 0.0,
+      "loss": -2.869561195373535,
+      "time": 20.40272355079651
+    },
+    {
+      "epoch": 3,
+      "accuracy": 0.0,
+      "loss": -2.8028976917266846,
+      "time": 23.094363927841187
+    },
+    {
+      "epoch": 6,
+      "accuracy": 0.0,
+      "loss": -2.7703423500061035,
+      "time": 37.0929970741272
+    },
+    {
+      "epoch": 9,
+      "accuracy": 0.0,
+      "loss": -2.8556292057037354,
+      "time": 50.75293970108032
+    },
+    {
+      "epoch": 12,
+      "accuracy": 0.0,
+      "loss": -2.780637264251709,
+      "time": 64.57649803161621
+    },
+    {
+      "epoch": 15,
+      "accuracy": 0.0,
+      "loss": -2.9347336292266846,
+      "time": 78.24152135848999
+    },
+    {
+      "epoch": 18,
+      "accuracy": 0.0,
+      "loss": -2.638032913208008,
+      "time": 91.79991340637207
+    },
+    {
+      "epoch": 21,
+      "accuracy": 0.0,
+      "loss": -2.8143601417541504,
+      "time": 105.72340536117554
+    },
+    {
+      "epoch": 24,
+      "accuracy": 0.0,
+      "loss": -2.779853343963623,
+      "time": 119.56387186050415
+    },
+    {
+      "epoch": 27,
+      "accuracy": 0.0,
+      "loss": -2.7788708209991455,
+      "time": 133.03101134300232
+    },
+    {
+      "epoch": 30,
+      "accuracy": 0.0,
+      "loss": -2.714877128601074,
+      "time": 146.57403111457825
+    }
+  ],
+  "step_logs": [
+    {
+      "step": 1,
+      "epoch": 1,
+      "accuracy": 0.0,
+      "mean_return": 2.869561195373535,
+      "loss": -2.869561195373535,
+      "time": 20.40272355079651,
+      "step_wall_time": 17.743235111236572,
+      "candidates_evaluated": 448,
+      "episode_length": 47.921875,
+      "fall_rate": 0.0
+    },
+    {
+      "step": 3,
+      "epoch": 3,
+      "accuracy": 0.0,
+      "mean_return": 2.8028976917266846,
+      "loss": -2.8028976917266846,
+      "time": 23.094363927841187,
+      "step_wall_time": 0.000209808349609375,
+      "candidates_evaluated": 448,
+      "episode_length": 48.0,
+      "fall_rate": 0.0
+    },
+    {
+      "step": 6,
+      "epoch": 6,
+      "accuracy": 0.0,
+      "mean_return": 2.7703423500061035,
+      "loss": -2.7703423500061035,
+      "time": 37.0929970741272,
+      "step_wall_time": 0.0001926422119140625,
+      "candidates_evaluated": 896,
+      "episode_length": 48.0,
+      "fall_rate": 0.0
+    },
+    {
+      "step": 9,
+      "epoch": 9,
+      "accuracy": 0.0,
+      "mean_return": 2.8556292057037354,
+      "loss": -2.8556292057037354,
+      "time": 50.75293970108032,
+      "step_wall_time": 0.0001900196075439453,
+      "candidates_evaluated": 1344,
+      "episode_length": 47.984375,
+      "fall_rate": 0.0
+    },
+    {
+      "step": 12,
+      "epoch": 12,
+      "accuracy": 0.0,
+      "mean_return": 2.780637264251709,
+      "loss": -2.780637264251709,
+      "time": 64.57649803161621,
+      "step_wall_time": 0.000186920166015625,
+      "candidates_evaluated": 1792,
+      "episode_length": 47.984375,
+      "fall_rate": 0.0
+    },
+    {
+      "step": 15,
+      "epoch": 15,
+      "accuracy": 0.0,
+      "mean_return": 2.9347336292266846,
+      "loss": -2.9347336292266846,
+      "time": 78.24152135848999,
+      "step_wall_time": 0.00018477439880371094,
+      "candidates_evaluated": 2240,
+      "episode_length": 48.0,
+      "fall_rate": 0.0
+    },
+    {
+      "step": 18,
+      "epoch": 18,
+      "accuracy": 0.0,
+      "mean_return": 2.638032913208008,
+      "loss": -2.638032913208008,
+      "time": 91.79991340637207,
+      "step_wall_time": 0.00019168853759765625,
+      "candidates_evaluated": 2688,
+      "episode_length": 47.96875,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 21,
+      "epoch": 21,
+      "accuracy": 0.0,
+      "mean_return": 2.8143601417541504,
+      "loss": -2.8143601417541504,
+      "time": 105.72340536117554,
+      "step_wall_time": 0.00018596649169921875,
+      "candidates_evaluated": 3136,
+      "episode_length": 48.0,
+      "fall_rate": 0.0
+    },
+    {
+      "step": 24,
+      "epoch": 24,
+      "accuracy": 0.0,
+      "mean_return": 2.779853343963623,
+      "loss": -2.779853343963623,
+      "time": 119.56387186050415,
+      "step_wall_time": 0.00018787384033203125,
+      "candidates_evaluated": 3584,
+      "episode_length": 48.0,
+      "fall_rate": 0.0
+    },
+    {
+      "step": 27,
+      "epoch": 27,
+      "accuracy": 0.0,
+      "mean_return": 2.7788708209991455,
+      "loss": -2.7788708209991455,
+      "time": 133.03101134300232,
+      "step_wall_time": 0.00041937828063964844,
+      "candidates_evaluated": 4032,
+      "episode_length": 48.0,
+      "fall_rate": 0.015625
+    },
+    {
+      "step": 30,
+      "epoch": 30,
+      "accuracy": 0.0,
+      "mean_return": 2.714877128601074,
+      "loss": -2.714877128601074,
+      "time": 146.57403111457825,
+      "step_wall_time": 0.00018596649169921875,
+      "candidates_evaluated": 4480,
+      "episode_length": 47.890625,
+      "fall_rate": 0.0
+    }
+  ]
+}

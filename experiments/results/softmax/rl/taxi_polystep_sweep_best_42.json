@@ -1,0 +1,421 @@
+{
+  "seed": 42,
+  "best": {
+    "config_id": "5",
+    "config": {
+      "steps": 200,
+      "rollouts_per_candidate": 128,
+      "horizon": 200,
+      "epsilon_target": 0.3,
+      "subspace_rank": 4,
+      "epsilon_init": 2.0,
+      "step_radius": 0.2,
+      "probe_radius": 0.8,
+      "amortize_steps": 1,
+      "max_subspace_dim": 24
+    },
+    "metrics": {
+      "final_accuracy": 0.0,
+      "best_accuracy": 0.0,
+      "wall_time_seconds": 28.262768030166626,
+      "peak_gpu_memory_mb": 0.0,
+      "function_evals": 9600,
+      "total_steps": 200,
+      "final_return": -789.5703125,
+      "best_return": -579.0546875,
+      "normalized_score": 0.0,
+      "rl_env_steps": 245760000,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.32753902673721313,
+      "best_success_rate": 0.0
+    },
+    "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_5_42.json"
+  },
+  "results": [
+    {
+      "config_id": "0",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 2,
+        "epsilon_init": 0.5,
+        "step_radius": 0.05,
+        "probe_radius": 0.1,
+        "amortize_steps": 1,
+        "max_subspace_dim": 16
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 115.82865190505981,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 6400,
+        "total_steps": 200,
+        "final_return": -859.1796875,
+        "best_return": -803.703125,
+        "normalized_score": 0.0,
+        "rl_env_steps": 163840000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.3662109375,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_0_42.json"
+    },
+    {
+      "config_id": "1",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 2,
+        "epsilon_init": 1.0,
+        "step_radius": 0.1,
+        "probe_radius": 0.2,
+        "amortize_steps": 1,
+        "max_subspace_dim": 16
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 98.46082496643066,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 6400,
+        "total_steps": 200,
+        "final_return": -873.1015625,
+        "best_return": -705.3359375,
+        "normalized_score": 0.0,
+        "rl_env_steps": 163840000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.37394529581069946,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_1_42.json"
+    },
+    {
+      "config_id": "2",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 2,
+        "epsilon_init": 2.0,
+        "step_radius": 0.2,
+        "probe_radius": 0.4,
+        "amortize_steps": 1,
+        "max_subspace_dim": 16
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 133.69306230545044,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 6400,
+        "total_steps": 200,
+        "final_return": -915.8515625,
+        "best_return": -761.234375,
+        "normalized_score": 0.0,
+        "rl_env_steps": 163840000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.39769530296325684,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_2_42.json"
+    },
+    {
+      "config_id": "3",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 4,
+        "epsilon_init": 0.5,
+        "step_radius": 0.05,
+        "probe_radius": 0.2,
+        "amortize_steps": 1,
+        "max_subspace_dim": 24
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 24.002148866653442,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 9600,
+        "total_steps": 200,
+        "final_return": -818.46875,
+        "best_return": -733.4609375,
+        "normalized_score": 0.0,
+        "rl_env_steps": 245760000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.3435937464237213,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_3_42.json"
+    },
+    {
+      "config_id": "4",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 4,
+        "epsilon_init": 1.0,
+        "step_radius": 0.1,
+        "probe_radius": 0.4,
+        "amortize_steps": 1,
+        "max_subspace_dim": 24
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 40.57603621482849,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 9600,
+        "total_steps": 200,
+        "final_return": -761.515625,
+        "best_return": -705.4765625,
+        "normalized_score": 0.0,
+        "rl_env_steps": 245760000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.3119531571865082,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_4_42.json"
+    },
+    {
+      "config_id": "5",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 4,
+        "epsilon_init": 2.0,
+        "step_radius": 0.2,
+        "probe_radius": 0.8,
+        "amortize_steps": 1,
+        "max_subspace_dim": 24
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 28.262768030166626,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 9600,
+        "total_steps": 200,
+        "final_return": -789.5703125,
+        "best_return": -579.0546875,
+        "normalized_score": 0.0,
+        "rl_env_steps": 245760000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.32753902673721313,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_5_42.json"
+    },
+    {
+      "config_id": "6",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 4,
+        "epsilon_init": 3.0,
+        "step_radius": 0.3,
+        "probe_radius": 0.6,
+        "amortize_steps": 1,
+        "max_subspace_dim": 24
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 58.77401638031006,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 9600,
+        "total_steps": 200,
+        "final_return": -901.15625,
+        "best_return": -705.125,
+        "normalized_score": 0.0,
+        "rl_env_steps": 245760000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.3895312249660492,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_6_42.json"
+    },
+    {
+      "config_id": "7",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 8,
+        "epsilon_init": 1.0,
+        "step_radius": 0.1,
+        "probe_radius": 0.2,
+        "amortize_steps": 1,
+        "max_subspace_dim": 48
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 72.75357937812805,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 19200,
+        "total_steps": 200,
+        "final_return": -817.1328125,
+        "best_return": -746.8203125,
+        "normalized_score": 0.0,
+        "rl_env_steps": 491520000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.34285157918930054,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_7_42.json"
+    },
+    {
+      "config_id": "8",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 8,
+        "epsilon_init": 2.0,
+        "step_radius": 0.2,
+        "probe_radius": 0.8,
+        "amortize_steps": 1,
+        "max_subspace_dim": 48
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 47.215683698654175,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 19200,
+        "total_steps": 200,
+        "final_return": -775.6484375,
+        "best_return": -733.6015625,
+        "normalized_score": 0.0,
+        "rl_env_steps": 491520000,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.31980466842651367,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_8_42.json"
+    },
+    {
+      "config_id": "9",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 4,
+        "epsilon_init": 1.0,
+        "step_radius": 0.1,
+        "probe_radius": 0.4,
+        "amortize_steps": 3,
+        "max_subspace_dim": 24
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 19.020303964614868,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 3216,
+        "total_steps": 200,
+        "final_return": -719.5390625,
+        "best_return": -719.5390625,
+        "normalized_score": 0.0,
+        "rl_env_steps": 82329600,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.2886328101158142,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_9_42.json"
+    },
+    {
+      "config_id": "10",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 4,
+        "epsilon_init": 2.0,
+        "step_radius": 0.2,
+        "probe_radius": 0.4,
+        "amortize_steps": 3,
+        "max_subspace_dim": 24
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 21.71624207496643,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 3216,
+        "total_steps": 200,
+        "final_return": -999.9453125,
+        "best_return": -733.4609375,
+        "normalized_score": 0.0,
+        "rl_env_steps": 82329600,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.44441404938697815,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_10_42.json"
+    },
+    {
+      "config_id": "11",
+      "config": {
+        "steps": 200,
+        "rollouts_per_candidate": 128,
+        "horizon": 200,
+        "epsilon_target": 0.3,
+        "subspace_rank": 8,
+        "epsilon_init": 1.0,
+        "step_radius": 0.1,
+        "probe_radius": 0.2,
+        "amortize_steps": 3,
+        "max_subspace_dim": 48
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 11.66939377784729,
+        "peak_gpu_memory_mb": 0.0,
+        "function_evals": 6432,
+        "total_steps": 200,
+        "final_return": -1069.9765625,
+        "best_return": -970.625,
+        "normalized_score": 0.0,
+        "rl_env_steps": 164659200,
+        "success_rate": 0.0,
+        "episode_length": 200.0,
+        "illegal_action_rate": 0.48332029581069946,
+        "best_success_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/taxi_polystep_sweep_11_42.json"
+    }
+  ]
+}

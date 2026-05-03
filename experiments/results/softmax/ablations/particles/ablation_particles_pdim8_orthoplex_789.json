@@ -1,0 +1,99 @@
+{
+  "benchmark": "ablation_particles",
+  "method": "pdim8_orthoplex",
+  "seed": 789,
+  "timestamp": "2026-04-01T14:08:39Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.13",
+    "platform": "Linux",
+    "platform_release": "6.17.0-19-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 1673.33
+  },
+  "hyperparameters": {
+    "particle_dim": 8,
+    "polytope_type": "orthoplex",
+    "subspace": "hybrid_rank4",
+    "epochs": 10,
+    "batch_size": 512,
+    "epsilon_init": 1.0,
+    "epsilon_target": 0.1,
+    "step_radius": 4.5,
+    "probe_radius": 1.0,
+    "num_probe": 3,
+    "sinkhorn_max_iters": 50
+  },
+  "metrics": {
+    "final_accuracy": 0.9375,
+    "best_accuracy": 0.9375,
+    "wall_time_seconds": 550.3264594078064,
+    "peak_gpu_memory_mb": 1673.33,
+    "function_evals": 1180,
+    "total_steps": 1180
+  },
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "accuracy": 0.892,
+      "loss": 0.7172635073884058,
+      "time": 55.36151742935181
+    },
+    {
+      "epoch": 2,
+      "accuracy": 0.9108,
+      "loss": 0.3250557933065851,
+      "time": 55.22690153121948
+    },
+    {
+      "epoch": 3,
+      "accuracy": 0.9147,
+      "loss": 0.27848741247997444,
+      "time": 56.025933504104614
+    },
+    {
+      "epoch": 4,
+      "accuracy": 0.9241,
+      "loss": 0.2531313370850127,
+      "time": 55.1838493347168
+    },
+    {
+      "epoch": 5,
+      "accuracy": 0.9255,
+      "loss": 0.23711956772258727,
+      "time": 55.91892766952515
+    },
+    {
+      "epoch": 6,
+      "accuracy": 0.9308,
+      "loss": 0.22612122117967928,
+      "time": 50.382548809051514
+    },
+    {
+      "epoch": 7,
+      "accuracy": 0.9334,
+      "loss": 0.2177586797309124,
+      "time": 55.96108102798462
+    },
+    {
+      "epoch": 8,
+      "accuracy": 0.9355,
+      "loss": 0.21343319105394817,
+      "time": 55.128724575042725
+    },
+    {
+      "epoch": 9,
+      "accuracy": 0.9372,
+      "loss": 0.20947055354461833,
+      "time": 55.97965383529663
+    },
+    {
+      "epoch": 10,
+      "accuracy": 0.9375,
+      "loss": 0.206826640892837,
+      "time": 55.15541911125183
+    }
+  ]
+}

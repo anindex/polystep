@@ -1,0 +1,45 @@
+{
+  "benchmark": "taxi",
+  "method": "q_learning",
+  "seed": 42,
+  "timestamp": "2026-05-01T02:19:14Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-22-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 74.15
+  },
+  "hyperparameters": {
+    "episodes": 50000,
+    "eval_episodes": 512,
+    "horizon": 200
+  },
+  "metrics": {
+    "final_accuracy": 0.9442027698863636,
+    "best_accuracy": 0.9442027698863636,
+    "wall_time_seconds": 494.8012900352478,
+    "peak_gpu_memory_mb": 0.0,
+    "function_evals": 50000,
+    "total_steps": 50000,
+    "final_return": 7.724609375,
+    "best_return": 7.724609375,
+    "normalized_score": 0.9442027698863636,
+    "rl_env_steps": 2875288,
+    "success_rate": 1.0,
+    "episode_length": 13.275390625,
+    "illegal_action_rate": 0.0
+  },
+  "epoch_logs": [
+    {
+      "epoch": 50000,
+      "accuracy": 0.9442027698863636,
+      "loss": -7.724609375,
+      "time": 494.80129766464233
+    }
+  ],
+  "step_logs": []
+}

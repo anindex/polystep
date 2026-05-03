@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "polystep: Gradient-Free Neural Network Training via Entropic Optimal Transport"
+authors:
+  - family-names: Le
+    given-names: An T.
+license: Apache-2.0
+repository-code: "https://github.com/anindex/polystep"
+keywords:
+  - gradient-free optimization
+  - optimal transport
+  - sinkhorn
+  - pytorch
+  - neural network training
+  - non-differentiable
+references:
+  - type: conference-paper
+    title: "Accelerating Motion Planning via Optimal Transport"
+    authors:
+      - family-names: Le
+        given-names: An T.
+      - family-names: Chalvatzaki
+        given-names: Georgia
+      - family-names: Biess
+        given-names: Armin
+      - family-names: Peters
+        given-names: Jan R.
+    conference:
+      name: "Advances in Neural Information Processing Systems (NeurIPS)"
+    year: 2023
+    url: "https://arxiv.org/abs/2309.15970"

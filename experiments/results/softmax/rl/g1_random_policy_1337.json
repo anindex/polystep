@@ -1,0 +1,36 @@
+{
+  "benchmark": "g1",
+  "method": "random_policy",
+  "seed": 1337,
+  "timestamp": "2026-05-01T12:23:22Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-22-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 15.46
+  },
+  "hyperparameters": {
+    "num_envs": 256,
+    "horizon": 24
+  },
+  "metrics": {
+    "final_accuracy": 0.0,
+    "best_accuracy": 0.0,
+    "wall_time_seconds": 0.7389557361602783,
+    "peak_gpu_memory_mb": 0.0,
+    "function_evals": 1,
+    "total_steps": 1,
+    "final_return": 1.4061481952667236,
+    "best_return": 1.4061481952667236,
+    "normalized_score": 0.0,
+    "rl_env_steps": 6144,
+    "episode_length": 24.0,
+    "fall_rate": 0.0
+  },
+  "epoch_logs": [],
+  "step_logs": []
+}

@@ -1,0 +1,18 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Python
+*.py text diff=python
+
+# Binary assets
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pt binary
+*.pth binary
+
+# Data
+*.csv text
+*.json text
+*.tex text

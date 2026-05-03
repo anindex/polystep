@@ -1,0 +1,191 @@
+{
+  "benchmark": "ablation_convergence",
+  "method": "cmaes",
+  "seed": 1337,
+  "timestamp": "2026-03-13T04:21:52Z",
+  "environment": {
+    "torch_version": "2.12.0.dev20260307+cu128",
+    "python_version": "3.12.13",
+    "platform": "Linux",
+    "platform_release": "6.17.0-14-generic",
+    "cuda_version": "12.8",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 0.0
+  },
+  "hyperparameters": {
+    "generations": 200,
+    "popsize": 16,
+    "stdev_init": 0.5
+  },
+  "metrics": {
+    "final_accuracy": 0.5341,
+    "best_accuracy": 0.5341,
+    "wall_time_seconds": 2.2196733951568604,
+    "peak_gpu_memory_mb": 261.22,
+    "function_evals": 3200,
+    "total_steps": 200
+  },
+  "epoch_logs": [
+    {
+      "generation": 10,
+      "pop_best_fitness": 0.16015625,
+      "mean_fitness": 0.1273193359375,
+      "sigma": 0.49967288970947266,
+      "test_accuracy": 0.1748,
+      "cumulative_function_evals": 160
+    },
+    {
+      "generation": 20,
+      "pop_best_fitness": 0.234375,
+      "mean_fitness": 0.18798828125,
+      "sigma": 0.49935242533683777,
+      "test_accuracy": 0.2424,
+      "cumulative_function_evals": 320
+    },
+    {
+      "generation": 30,
+      "pop_best_fitness": 0.267578125,
+      "mean_fitness": 0.2354736328125,
+      "sigma": 0.4990364611148834,
+      "test_accuracy": 0.2757,
+      "cumulative_function_evals": 480
+    },
+    {
+      "generation": 40,
+      "pop_best_fitness": 0.349609375,
+      "mean_fitness": 0.2825927734375,
+      "sigma": 0.4987243115901947,
+      "test_accuracy": 0.3174,
+      "cumulative_function_evals": 640
+    },
+    {
+      "generation": 50,
+      "pop_best_fitness": 0.365234375,
+      "mean_fitness": 0.33447265625,
+      "sigma": 0.4984155297279358,
+      "test_accuracy": 0.3443,
+      "cumulative_function_evals": 800
+    },
+    {
+      "generation": 60,
+      "pop_best_fitness": 0.416015625,
+      "mean_fitness": 0.3897705078125,
+      "sigma": 0.49810951948165894,
+      "test_accuracy": 0.4218,
+      "cumulative_function_evals": 960
+    },
+    {
+      "generation": 70,
+      "pop_best_fitness": 0.455078125,
+      "mean_fitness": 0.4033203125,
+      "sigma": 0.4978061318397522,
+      "test_accuracy": 0.4296,
+      "cumulative_function_evals": 1120
+    },
+    {
+      "generation": 80,
+      "pop_best_fitness": 0.453125,
+      "mean_fitness": 0.3968505859375,
+      "sigma": 0.4975053071975708,
+      "test_accuracy": 0.4129,
+      "cumulative_function_evals": 1280
+    },
+    {
+      "generation": 90,
+      "pop_best_fitness": 0.447265625,
+      "mean_fitness": 0.415283203125,
+      "sigma": 0.4972066581249237,
+      "test_accuracy": 0.4265,
+      "cumulative_function_evals": 1440
+    },
+    {
+      "generation": 100,
+      "pop_best_fitness": 0.462890625,
+      "mean_fitness": 0.4305419921875,
+      "sigma": 0.49691036343574524,
+      "test_accuracy": 0.4407,
+      "cumulative_function_evals": 1600
+    },
+    {
+      "generation": 110,
+      "pop_best_fitness": 0.4765625,
+      "mean_fitness": 0.4429931640625,
+      "sigma": 0.4966161549091339,
+      "test_accuracy": 0.4451,
+      "cumulative_function_evals": 1760
+    },
+    {
+      "generation": 120,
+      "pop_best_fitness": 0.46875,
+      "mean_fitness": 0.4417724609375,
+      "sigma": 0.49632400274276733,
+      "test_accuracy": 0.4601,
+      "cumulative_function_evals": 1920
+    },
+    {
+      "generation": 130,
+      "pop_best_fitness": 0.517578125,
+      "mean_fitness": 0.47802734375,
+      "sigma": 0.49603360891342163,
+      "test_accuracy": 0.5019,
+      "cumulative_function_evals": 2080
+    },
+    {
+      "generation": 140,
+      "pop_best_fitness": 0.5546875,
+      "mean_fitness": 0.4957275390625,
+      "sigma": 0.49574515223503113,
+      "test_accuracy": 0.5116,
+      "cumulative_function_evals": 2240
+    },
+    {
+      "generation": 150,
+      "pop_best_fitness": 0.5703125,
+      "mean_fitness": 0.53173828125,
+      "sigma": 0.4954585134983063,
+      "test_accuracy": 0.533,
+      "cumulative_function_evals": 2400
+    },
+    {
+      "generation": 160,
+      "pop_best_fitness": 0.560546875,
+      "mean_fitness": 0.531494140625,
+      "sigma": 0.4951735734939575,
+      "test_accuracy": 0.5341,
+      "cumulative_function_evals": 2560
+    },
+    {
+      "generation": 170,
+      "pop_best_fitness": 0.5703125,
+      "mean_fitness": 0.52978515625,
+      "sigma": 0.4948902726173401,
+      "test_accuracy": 0.5229,
+      "cumulative_function_evals": 2720
+    },
+    {
+      "generation": 180,
+      "pop_best_fitness": 0.54296875,
+      "mean_fitness": 0.5091552734375,
+      "sigma": 0.4946085512638092,
+      "test_accuracy": 0.5087,
+      "cumulative_function_evals": 2880
+    },
+    {
+      "generation": 190,
+      "pop_best_fitness": 0.52734375,
+      "mean_fitness": 0.4949951171875,
+      "sigma": 0.4943283796310425,
+      "test_accuracy": 0.494,
+      "cumulative_function_evals": 3040
+    },
+    {
+      "generation": 200,
+      "pop_best_fitness": 0.580078125,
+      "mean_fitness": 0.5234375,
+      "sigma": 0.49404972791671753,
+      "test_accuracy": 0.5313,
+      "cumulative_function_evals": 3200
+    }
+  ]
+}

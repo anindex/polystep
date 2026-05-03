@@ -1,0 +1,495 @@
+{
+  "seed": 42,
+  "best": {
+    "config_id": "6",
+    "config": {
+      "steps": 25,
+      "num_envs": 32,
+      "horizon": 24,
+      "max_subspace_dim": 24,
+      "activation": "elu",
+      "actor_hidden": [
+        128,
+        64
+      ],
+      "amortize_steps": 3,
+      "epsilon_target": 0.1,
+      "subspace_rank": 2,
+      "epsilon_init": 0.5,
+      "step_radius": 0.005,
+      "probe_radius": 0.015
+    },
+    "metrics": {
+      "final_accuracy": 0.0,
+      "best_accuracy": 0.0,
+      "wall_time_seconds": 35.92215299606323,
+      "peak_gpu_memory_mb": 130.83,
+      "function_evals": 4032,
+      "total_steps": 25,
+      "final_return": 1.4605779647827148,
+      "best_return": 1.5528219938278198,
+      "normalized_score": 0.0,
+      "rl_env_steps": 3096576,
+      "episode_length": 24.0,
+      "fall_rate": 0.0
+    },
+    "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_6_42.json"
+  },
+  "results": [
+    {
+      "config_id": "0",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 0.3,
+        "step_radius": 0.001,
+        "probe_radius": 0.004
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 37.07632637023926,
+        "peak_gpu_memory_mb": 61.28,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.458580732345581,
+        "best_return": 1.550973892211914,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_0_42.json"
+    },
+    {
+      "config_id": "1",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 1.0,
+        "step_radius": 0.001,
+        "probe_radius": 0.004
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.10200595855713,
+        "peak_gpu_memory_mb": 79.3,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4593701362609863,
+        "best_return": 1.5516003370285034,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_1_42.json"
+    },
+    {
+      "config_id": "2",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 3.0,
+        "step_radius": 0.001,
+        "probe_radius": 0.004
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.19613218307495,
+        "peak_gpu_memory_mb": 96.76,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4599206447601318,
+        "best_return": 1.549638032913208,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_2_42.json"
+    },
+    {
+      "config_id": "3",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 0.3,
+        "step_radius": 0.003,
+        "probe_radius": 0.012
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.498849391937256,
+        "peak_gpu_memory_mb": 96.76,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4582966566085815,
+        "best_return": 1.55222487449646,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_3_42.json"
+    },
+    {
+      "config_id": "4",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 1.0,
+        "step_radius": 0.003,
+        "probe_radius": 0.012
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.35895347595215,
+        "peak_gpu_memory_mb": 114.25,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4595770835876465,
+        "best_return": 1.5516029596328735,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_4_42.json"
+    },
+    {
+      "config_id": "5",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 3.0,
+        "step_radius": 0.003,
+        "probe_radius": 0.012
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.03879976272583,
+        "peak_gpu_memory_mb": 114.25,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4583795070648193,
+        "best_return": 1.5499917268753052,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_5_42.json"
+    },
+    {
+      "config_id": "6",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 0.5,
+        "step_radius": 0.005,
+        "probe_radius": 0.015
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 35.92215299606323,
+        "peak_gpu_memory_mb": 130.83,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4605779647827148,
+        "best_return": 1.5528219938278198,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_6_42.json"
+    },
+    {
+      "config_id": "7",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 1.0,
+        "step_radius": 0.005,
+        "probe_radius": 0.015
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.052374839782715,
+        "peak_gpu_memory_mb": 130.83,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4586660861968994,
+        "best_return": 1.551279067993164,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_7_42.json"
+    },
+    {
+      "config_id": "8",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 2.0,
+        "step_radius": 0.005,
+        "probe_radius": 0.015
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.12580704689026,
+        "peak_gpu_memory_mb": 148.37,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4606635570526123,
+        "best_return": 1.5503448247909546,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_8_42.json"
+    },
+    {
+      "config_id": "9",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 0.5,
+        "step_radius": 0.01,
+        "probe_radius": 0.03
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.30221199989319,
+        "peak_gpu_memory_mb": 148.37,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.458681344985962,
+        "best_return": 1.5490951538085938,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_9_42.json"
+    },
+    {
+      "config_id": "10",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 2,
+        "epsilon_init": 2.0,
+        "step_radius": 0.01,
+        "probe_radius": 0.03
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.100780963897705,
+        "peak_gpu_memory_mb": 166.2,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4603074789047241,
+        "best_return": 1.5519685745239258,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_10_42.json"
+    },
+    {
+      "config_id": "11",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 4,
+        "epsilon_init": 1.0,
+        "step_radius": 0.003,
+        "probe_radius": 0.012
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 36.043641567230225,
+        "peak_gpu_memory_mb": 166.2,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.4589473009109497,
+        "best_return": 1.5515966415405273,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_11_42.json"
+    },
+    {
+      "config_id": "12",
+      "config": {
+        "steps": 25,
+        "num_envs": 32,
+        "horizon": 24,
+        "max_subspace_dim": 24,
+        "activation": "elu",
+        "actor_hidden": [
+          128,
+          64
+        ],
+        "amortize_steps": 3,
+        "epsilon_target": 0.1,
+        "subspace_rank": 4,
+        "epsilon_init": 1.0,
+        "step_radius": 0.005,
+        "probe_radius": 0.015
+      },
+      "metrics": {
+        "final_accuracy": 0.0,
+        "best_accuracy": 0.0,
+        "wall_time_seconds": 35.15263772010803,
+        "peak_gpu_memory_mb": 184.22,
+        "function_evals": 4032,
+        "total_steps": 25,
+        "final_return": 1.459434986114502,
+        "best_return": 1.5512735843658447,
+        "normalized_score": 0.0,
+        "rl_env_steps": 3096576,
+        "episode_length": 24.0,
+        "fall_rate": 0.0
+      },
+      "path": "/home/anindex/git/polystep/experiments/results/softmax/rl/g1_polystep_sweep_12_42.json"
+    }
+  ]
+}

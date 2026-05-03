@@ -1,0 +1,101 @@
+{
+  "benchmark": "ablation_epsilon",
+  "method": "ei1.0_et0.5",
+  "seed": 42,
+  "timestamp": "2026-03-13T17:31:22Z",
+  "environment": {
+    "torch_version": "2.12.0.dev20260307+cu128",
+    "python_version": "3.12.13",
+    "platform": "Linux",
+    "platform_release": "6.17.0-14-generic",
+    "cuda_version": "12.8",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 1694.35
+  },
+  "hyperparameters": {
+    "rank": 4,
+    "step_radius": 4.5,
+    "probe_radius": 1.0,
+    "rotation_interval": 0,
+    "absorb_interval": 20,
+    "num_probe": 3,
+    "sinkhorn_max_iters": 50,
+    "epochs": 10,
+    "batch_size": 512,
+    "epsilon_init": 1.0,
+    "epsilon_target": 0.5,
+    "epsilon_decay": 0.000423728813559322,
+    "total_steps": 1180
+  },
+  "metrics": {
+    "final_accuracy": 0.9397,
+    "best_accuracy": 0.9421,
+    "wall_time_seconds": 2309.1503908634186,
+    "peak_gpu_memory_mb": 1694.35,
+    "function_evals": 1180,
+    "total_steps": 1180
+  },
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "accuracy": 0.8949,
+      "loss": 0.6704734471642365,
+      "time": 230.74147987365723
+    },
+    {
+      "epoch": 2,
+      "accuracy": 0.9135,
+      "loss": 0.3119660372198638,
+      "time": 230.97908926010132
+    },
+    {
+      "epoch": 3,
+      "accuracy": 0.9219,
+      "loss": 0.2666080083887456,
+      "time": 230.64277577400208
+    },
+    {
+      "epoch": 4,
+      "accuracy": 0.9272,
+      "loss": 0.2407638515203686,
+      "time": 230.89219450950623
+    },
+    {
+      "epoch": 5,
+      "accuracy": 0.932,
+      "loss": 0.2225264946030358,
+      "time": 230.95011639595032
+    },
+    {
+      "epoch": 6,
+      "accuracy": 0.9364,
+      "loss": 0.20908217056322906,
+      "time": 230.78355622291565
+    },
+    {
+      "epoch": 7,
+      "accuracy": 0.9381,
+      "loss": 0.19829846451343117,
+      "time": 231.05070996284485
+    },
+    {
+      "epoch": 8,
+      "accuracy": 0.941,
+      "loss": 0.19015504716564033,
+      "time": 231.06541466712952
+    },
+    {
+      "epoch": 9,
+      "accuracy": 0.9421,
+      "loss": 0.18342752868341186,
+      "time": 231.002583026886
+    },
+    {
+      "epoch": 10,
+      "accuracy": 0.9397,
+      "loss": 0.17891479839207763,
+      "time": 231.03811860084534
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+{
+  "benchmark": "ablation_ot_fullspace",
+  "method": "entropic_ot",
+  "seed": 1337,
+  "timestamp": "2026-03-29T17:01:28Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.13",
+    "platform": "Linux",
+    "platform_release": "6.17.0-19-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 250.88
+  },
+  "hyperparameters": {
+    "epsilon_init": 3.0,
+    "epsilon_target": 0.1,
+    "probe_radius": 1.0,
+    "step_radius": 8.0,
+    "num_probe": 3,
+    "sinkhorn_max_iters": 50,
+    "chunk_size": 256,
+    "epochs": 3,
+    "batch_size": 512,
+    "variant": "entropic_ot",
+    "mode": "fullspace",
+    "particle_dim": 2,
+    "num_particles": 50885,
+    "num_vertices": 4
+  },
+  "metrics": {
+    "final_accuracy": 0.4564,
+    "best_accuracy": 0.4564,
+    "wall_time_seconds": 1192.6630969047546,
+    "peak_gpu_memory_mb": 0.0,
+    "function_evals": 354,
+    "total_steps": 354
+  },
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "accuracy": 0.2623,
+      "loss": 775.5891485315258,
+      "time": 400.4368407726288
+    },
+    {
+      "epoch": 2,
+      "accuracy": 0.406,
+      "loss": 1.7906567444235593,
+      "time": 395.90695571899414
+    },
+    {
+      "epoch": 3,
+      "accuracy": 0.4564,
+      "loss": 1.4536692207142459,
+      "time": 396.3191571235657
+    }
+  ]
+}

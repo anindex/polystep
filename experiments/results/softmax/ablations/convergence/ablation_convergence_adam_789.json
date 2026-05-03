@@ -1,0 +1,172 @@
+{
+  "benchmark": "ablation_convergence",
+  "method": "adam",
+  "seed": 789,
+  "timestamp": "2026-03-13T04:21:52Z",
+  "environment": {
+    "torch_version": "2.12.0.dev20260307+cu128",
+    "python_version": "3.12.13",
+    "platform": "Linux",
+    "platform_release": "6.17.0-14-generic",
+    "cuda_version": "12.8",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 0.0
+  },
+  "hyperparameters": {
+    "optimizer": "adam",
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "epochs": 20
+  },
+  "metrics": {
+    "final_accuracy": 0.9781,
+    "best_accuracy": 0.9791,
+    "wall_time_seconds": 4.637200355529785,
+    "peak_gpu_memory_mb": 22.58,
+    "function_evals": 1200000,
+    "total_steps": 20
+  },
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "accuracy": 0.9319,
+      "loss": 0.46251718396857633,
+      "time": 0.20585346221923828,
+      "cumulative_function_evals": 60000
+    },
+    {
+      "epoch": 2,
+      "accuracy": 0.9524,
+      "loss": 0.2054038288987289,
+      "time": 0.525888204574585,
+      "cumulative_function_evals": 120000
+    },
+    {
+      "epoch": 3,
+      "accuracy": 0.9607,
+      "loss": 0.1506147740756051,
+      "time": 0.7312195301055908,
+      "cumulative_function_evals": 180000
+    },
+    {
+      "epoch": 4,
+      "accuracy": 0.964,
+      "loss": 0.12137177245596707,
+      "time": 0.9327518939971924,
+      "cumulative_function_evals": 240000
+    },
+    {
+      "epoch": 5,
+      "accuracy": 0.9696,
+      "loss": 0.09921353423999528,
+      "time": 1.1414334774017334,
+      "cumulative_function_evals": 300000
+    },
+    {
+      "epoch": 6,
+      "accuracy": 0.9708,
+      "loss": 0.08383648870986397,
+      "time": 1.4555470943450928,
+      "cumulative_function_evals": 360000
+    },
+    {
+      "epoch": 7,
+      "accuracy": 0.9741,
+      "loss": 0.0718484787049435,
+      "time": 1.6593878269195557,
+      "cumulative_function_evals": 420000
+    },
+    {
+      "epoch": 8,
+      "accuracy": 0.9738,
+      "loss": 0.061538970902940984,
+      "time": 1.8636500835418701,
+      "cumulative_function_evals": 480000
+    },
+    {
+      "epoch": 9,
+      "accuracy": 0.9761,
+      "loss": 0.05299248282750279,
+      "time": 2.0655429363250732,
+      "cumulative_function_evals": 540000
+    },
+    {
+      "epoch": 10,
+      "accuracy": 0.9767,
+      "loss": 0.046881822403520346,
+      "time": 2.385418653488159,
+      "cumulative_function_evals": 600000
+    },
+    {
+      "epoch": 11,
+      "accuracy": 0.9769,
+      "loss": 0.042081939924697755,
+      "time": 2.593672752380371,
+      "cumulative_function_evals": 660000
+    },
+    {
+      "epoch": 12,
+      "accuracy": 0.9779,
+      "loss": 0.036370353268112166,
+      "time": 2.7915525436401367,
+      "cumulative_function_evals": 720000
+    },
+    {
+      "epoch": 13,
+      "accuracy": 0.9784,
+      "loss": 0.032586884132381214,
+      "time": 2.98928165435791,
+      "cumulative_function_evals": 780000
+    },
+    {
+      "epoch": 14,
+      "accuracy": 0.9774,
+      "loss": 0.028495640438681438,
+      "time": 3.307088613510132,
+      "cumulative_function_evals": 840000
+    },
+    {
+      "epoch": 15,
+      "accuracy": 0.9777,
+      "loss": 0.025038777639442202,
+      "time": 3.5149691104888916,
+      "cumulative_function_evals": 900000
+    },
+    {
+      "epoch": 16,
+      "accuracy": 0.9774,
+      "loss": 0.022338107725510658,
+      "time": 3.7149291038513184,
+      "cumulative_function_evals": 960000
+    },
+    {
+      "epoch": 17,
+      "accuracy": 0.9781,
+      "loss": 0.0205456816109876,
+      "time": 3.9193413257598877,
+      "cumulative_function_evals": 1020000
+    },
+    {
+      "epoch": 18,
+      "accuracy": 0.979,
+      "loss": 0.016883283249749723,
+      "time": 4.12015700340271,
+      "cumulative_function_evals": 1080000
+    },
+    {
+      "epoch": 19,
+      "accuracy": 0.9791,
+      "loss": 0.01571669258271991,
+      "time": 4.437657117843628,
+      "cumulative_function_evals": 1140000
+    },
+    {
+      "epoch": 20,
+      "accuracy": 0.9781,
+      "loss": 0.013047391746066889,
+      "time": 4.637065649032593,
+      "cumulative_function_evals": 1200000
+    }
+  ]
+}

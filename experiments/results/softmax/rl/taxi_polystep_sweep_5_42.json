@@ -1,0 +1,260 @@
+{
+  "benchmark": "taxi",
+  "method": "polystep_sweep_5",
+  "seed": 42,
+  "timestamp": "2026-05-01T04:44:02Z",
+  "environment": {
+    "torch_version": "2.11.0+cu130",
+    "python_version": "3.12.3",
+    "platform": "Linux",
+    "platform_release": "6.17.0-22-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 0.0
+  },
+  "hyperparameters": {
+    "representation": "tabular_q_table",
+    "steps": 200,
+    "rollouts_per_candidate": 128,
+    "horizon": 200,
+    "subspace_rank": 4,
+    "epsilon_init": 2.0,
+    "epsilon_target": 0.3,
+    "step_radius": 0.2,
+    "probe_radius": 0.8,
+    "amortize_steps": 1,
+    "max_subspace_dim": 24,
+    "param_count": 3000,
+    "subspace_dim": 24
+  },
+  "metrics": {
+    "final_accuracy": 0.0,
+    "best_accuracy": 0.0,
+    "wall_time_seconds": 28.262768030166626,
+    "peak_gpu_memory_mb": 0.0,
+    "function_evals": 9600,
+    "total_steps": 200,
+    "final_return": -789.5703125,
+    "best_return": -579.0546875,
+    "normalized_score": 0.0,
+    "rl_env_steps": 245760000,
+    "success_rate": 0.0,
+    "episode_length": 200.0,
+    "illegal_action_rate": 0.32753902673721313,
+    "best_success_rate": 0.0
+  },
+  "epoch_logs": [
+    {
+      "epoch": 1,
+      "accuracy": 0.0,
+      "loss": 1111.3203125,
+      "time": 0.14588546752929688
+    },
+    {
+      "epoch": 20,
+      "accuracy": 0.0,
+      "loss": 1109.140625,
+      "time": 2.267674446105957
+    },
+    {
+      "epoch": 40,
+      "accuracy": 0.0,
+      "loss": 887.3046875,
+      "time": 8.47318148612976
+    },
+    {
+      "epoch": 60,
+      "accuracy": 0.0,
+      "loss": 873.171875,
+      "time": 10.668678760528564
+    },
+    {
+      "epoch": 80,
+      "accuracy": 0.0,
+      "loss": 747.5234375,
+      "time": 14.06618595123291
+    },
+    {
+      "epoch": 100,
+      "accuracy": 0.0,
+      "loss": 579.0546875,
+      "time": 16.251996278762817
+    },
+    {
+      "epoch": 120,
+      "accuracy": 0.0,
+      "loss": 761.5859375,
+      "time": 18.44547939300537
+    },
+    {
+      "epoch": 140,
+      "accuracy": 0.0,
+      "loss": 733.6015625,
+      "time": 20.664711475372314
+    },
+    {
+      "epoch": 160,
+      "accuracy": 0.0,
+      "loss": 663.5,
+      "time": 23.377994775772095
+    },
+    {
+      "epoch": 180,
+      "accuracy": 0.0,
+      "loss": 802.859375,
+      "time": 25.922921657562256
+    },
+    {
+      "epoch": 200,
+      "accuracy": 0.0,
+      "loss": 607.1796875,
+      "time": 28.226242303848267
+    }
+  ],
+  "step_logs": [
+    {
+      "step": 1,
+      "epoch": 1,
+      "accuracy": 0.0,
+      "mean_return": -1111.3203125,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.506289005279541,
+      "loss": 1111.3203125,
+      "time": 0.14588546752929688,
+      "step_wall_time": 0.10998654365539551,
+      "candidates_evaluated": 48
+    },
+    {
+      "step": 20,
+      "epoch": 20,
+      "accuracy": 0.0,
+      "mean_return": -1109.140625,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.5050780773162842,
+      "loss": 1109.140625,
+      "time": 2.267674446105957,
+      "step_wall_time": 0.10350704193115234,
+      "candidates_evaluated": 960
+    },
+    {
+      "step": 40,
+      "epoch": 40,
+      "accuracy": 0.0,
+      "mean_return": -887.3046875,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.3818359076976776,
+      "loss": 887.3046875,
+      "time": 8.47318148612976,
+      "step_wall_time": 0.10564041137695312,
+      "candidates_evaluated": 1920
+    },
+    {
+      "step": 60,
+      "epoch": 60,
+      "accuracy": 0.0,
+      "mean_return": -873.171875,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.3739843964576721,
+      "loss": 873.171875,
+      "time": 10.668678760528564,
+      "step_wall_time": 0.10696530342102051,
+      "candidates_evaluated": 2880
+    },
+    {
+      "step": 80,
+      "epoch": 80,
+      "accuracy": 0.0,
+      "mean_return": -747.5234375,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.30417966842651367,
+      "loss": 747.5234375,
+      "time": 14.06618595123291,
+      "step_wall_time": 0.10787463188171387,
+      "candidates_evaluated": 3840
+    },
+    {
+      "step": 100,
+      "epoch": 100,
+      "accuracy": 0.0,
+      "mean_return": -579.0546875,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.21058593690395355,
+      "loss": 579.0546875,
+      "time": 16.251996278762817,
+      "step_wall_time": 0.10543680191040039,
+      "candidates_evaluated": 4800
+    },
+    {
+      "step": 120,
+      "epoch": 120,
+      "accuracy": 0.0,
+      "mean_return": -761.5859375,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.31199216842651367,
+      "loss": 761.5859375,
+      "time": 18.44547939300537,
+      "step_wall_time": 0.10633730888366699,
+      "candidates_evaluated": 5760
+    },
+    {
+      "step": 140,
+      "epoch": 140,
+      "accuracy": 0.0,
+      "mean_return": -733.6015625,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.2964453101158142,
+      "loss": 733.6015625,
+      "time": 20.664711475372314,
+      "step_wall_time": 0.11125349998474121,
+      "candidates_evaluated": 6720
+    },
+    {
+      "step": 160,
+      "epoch": 160,
+      "accuracy": 0.0,
+      "mean_return": -663.5,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.2574999928474426,
+      "loss": 663.5,
+      "time": 23.377994775772095,
+      "step_wall_time": 0.10880303382873535,
+      "candidates_evaluated": 7680
+    },
+    {
+      "step": 180,
+      "epoch": 180,
+      "accuracy": 0.0,
+      "mean_return": -802.859375,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.3349218964576721,
+      "loss": 802.859375,
+      "time": 25.922921657562256,
+      "step_wall_time": 0.13723158836364746,
+      "candidates_evaluated": 8640
+    },
+    {
+      "step": 200,
+      "epoch": 200,
+      "accuracy": 0.0,
+      "mean_return": -607.1796875,
+      "success_rate": 0.0,
+      "episode_length": 200.0,
+      "illegal_action_rate": 0.22621095180511475,
+      "loss": 607.1796875,
+      "time": 28.226242303848267,
+      "step_wall_time": 0.1096639633178711,
+      "candidates_evaluated": 9600
+    }
+  ]
+}
