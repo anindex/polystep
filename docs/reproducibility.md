@@ -18,7 +18,7 @@ cd polystep
 pip install -e ".[experiments]"
 ```
 
-The `[experiments]` extra installs scipy, statsmodels, seaborn, pandas, matplotlib, and python-sat.
+The `[experiments]` extra installs scipy, statsmodels, pandas, python-sat, torchvision, cma, and gymnasium.
 
 ### Datasets
 

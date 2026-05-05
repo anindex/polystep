@@ -169,11 +169,11 @@ docs/                  API overview, reproducibility guide
 If you use PolyStep in your research, please cite:
 
 ```bibtex
-@article{le2025polystep,
+@article{le2026polystep,
   title   = {Training Non-Differentiable Networks via Optimal Transport},
   author  = {Le, An T.},
   journal = {arXiv preprint arXiv:2605.01928},
-  year    = {2025},
+  year    = {2026},
   url     = {https://arxiv.org/abs/2605.01928}
 }
 ```
