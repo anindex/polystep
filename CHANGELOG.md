@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.0 - 2026-05-14
+
+Dependency floor lift, native fast-path adoption, and performance pass for
+PyTorch 2.12.
+
+### Changed
+
+- Minimum Python is now 3.11 (was 3.10); minimum PyTorch is now 2.8 (was 2.4);
+  NumPy floor is now `>=2.0`.
+- Ruff `target-version` bumped to `py311`. Classifiers updated to advertise
+  3.11 / 3.12 / 3.13 / 3.14.
+
+### Performance
+
+- `SinkhornSolver` convergence loop: batched the per-check scalar
+  measurements (err_a, err_b, dual norm, Lyapunov) into a single
+  device-to-host transfer, and switched the Anderson-acceleration
+  Lyapunov accept gate to a device-side `torch.where`. Eliminates 4-7
+  GPU-CPU syncs per `check_every` interval. Microbench (200 iter,
+  n=m=512, fp32 on RTX 5090, full Anderson + adaptive omega): **490 ms
+  -> 48 ms (~10x)**.
+- Block-wise step (`_step_blockwise.py`): per-block displacement and
+  model-loss scalars are accumulated as device tensors and reduced to
+  the host once per step instead of twice per block.
+- `NNCostEvaluator.evaluate` and `BatchedLinearEvaluator.evaluate` now
+  use `@torch.inference_mode()` instead of `@torch.no_grad()` (matches
+  the rest of `cost_nn.py`).
+
+### Verified
+
+- Full test suite (CPU + CUDA) green on PyTorch 2.12 / Python 3.14 / CUDA 13.0
+  on RTX 5090 (sm_120).
+- All five `examples/` reproduce within tolerance (≤1% accuracy / ≤5% returns).
+- `torch.compile(fullgraph=True)` (default in `_compiled.py:try_compile`)
+  warns on bypass in PyTorch 2.12 and will hard-error in 2.13; behavior
+  documented for the next dependency lift.
+
+### Test suite
+
+- Consolidated overlapping test files.
+- Net: 935 → 906 collected tests across 45 files (was 49); fast-tier suite
+  passes 885 (+ 2 skipped, 19 deselected) in ~21 s on RTX 5090.
+
 ## 0.1.0 - 2026-05-03 (Initial Release)
 
 First public release alongside the arXiv preprint *Training Non-Differentiable

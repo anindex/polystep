@@ -34,8 +34,7 @@ pip install -e ".[experiments]"
 
 | # | Task | Runner |
 |---|------|--------|
-| 11 | CartPole / Acrobot / LunarLander | `run_rl.py` |
-| 12 | Taxi-v3 / G1 locomotion | `run_rl.py` |
+| 11 | CartPole / Acrobot (vanilla + hardened) | `run_rl.py` |
 
 ### Ablations
 
@@ -62,11 +61,11 @@ experiments/results/softmax/
   main/          SNN, INT8, argmax, staircase, MNIST, timeseries, MAX-SAT, MoE
   ablations/     Epsilon, radius, particles, compile, subspace, convergence, OT
   scalability/   Parameter scaling, sparse projection, memory
-  rl/            RL policy search results
+  rl/            RL policy search results (CartPole, Acrobot)
 ```
 
 Each JSON file contains method, dataset, seed, config, and metrics (accuracy/loss/wallclock).
 
 ## Hardware
 
-- NVIDIA RTX 5090, Python 3.12, PyTorch 2.5.1+cu124, Ubuntu Linux
+- NVIDIA RTX 5090, Python 3.11+, PyTorch 2.8+ (tested with 2.12+cu130 on Ubuntu Linux).

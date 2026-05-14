@@ -1,8 +1,11 @@
 """Vmap-compatible multi-head attention.
 
-Avoids PyTorch's scaled_dot_product_attention (SDPA), which has known mask
-validation issues under torch.vmap (PyTorch Issue #151558). Uses explicit
-matmul operations instead.
+Historically a workaround for PyTorch Issue #151558 (mask validation under
+``torch.vmap`` for ``F.scaled_dot_product_attention``). The upstream bug is
+fixed as of PyTorch 2.12, so on a 2.12+ install ``nn.MultiheadAttention`` is
+vmap-safe out of the box. This class is retained as a drop-in alternative
+that works identically on older PyTorch (>=2.8) and is functionally
+equivalent on 2.12+.
 
 Example:
     >>> import torch

@@ -9,7 +9,7 @@ results/softmax/
 ├── main/          Primary experiments (SNN, INT8, argmax, staircase, MNIST, timeseries, MAX-SAT, MoE)
 ├── ablations/     Ablation studies (epsilon, radius, particles, compile, subspace, convergence, OT)
 ├── scalability/   Parameter scaling, sparse projection, memory
-└── rl/            RL policy search (CartPole, Acrobot, LunarLander, Taxi, G1)
+└── rl/            RL policy search (CartPole, Acrobot)
 ```
 
 ## Format

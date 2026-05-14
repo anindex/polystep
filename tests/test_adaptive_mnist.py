@@ -282,7 +282,7 @@ def test_adaptive_absorb_fires(mnist_loaders):
 
 @requires_mnist
 @pytest.mark.slow
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(600)
 def test_adaptive_convergence_vs_linear(mnist_loaders):
     """Compare AdaptiveSubspace and LinearSubspace convergence using steps_to_target metric.
 

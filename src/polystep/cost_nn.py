@@ -175,7 +175,7 @@ class NNCostEvaluator:
             return self._chunk_size_cached
         return self._chunk_size_raw
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate(
         self,
         stacked_params: dict[str, torch.Tensor],
@@ -488,7 +488,7 @@ class BatchedLinearEvaluator:
             return None
         return cls(model, loss_fn, layer_keys)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate(
         self,
         stacked_params: dict[str, torch.Tensor],

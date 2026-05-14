@@ -12,62 +12,6 @@ class TestSinkhornSolver:
     # Full-rank tests
     # ------------------------------------------------------------------
 
-    def test_uniform_marginals(self):
-        """Full-rank Sinkhorn with uniform marginals satisfies marginal constraints."""
-        torch.manual_seed(42)
-        n, m = 10, 8
-        C = torch.rand(n, m)
-
-        solver = SinkhornSolver(epsilon=0.1, max_iterations=2000, threshold=1e-8, compile=False)
-        result = solver.solve(C)
-
-        P = result.matrix
-        a = torch.ones(n) / n
-        b = torch.ones(m) / m
-
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), \
-            f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), \
-            f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-
-    def test_non_uniform_marginals(self):
-        """Full-rank Sinkhorn with non-uniform marginals satisfies both constraints."""
-        torch.manual_seed(42)
-        n = m = 6
-        C = torch.rand(n, m)
-        a = torch.tensor([0.3, 0.2, 0.1, 0.15, 0.15, 0.1])
-        b = torch.tensor([0.2, 0.2, 0.1, 0.1, 0.2, 0.2])
-
-        solver = SinkhornSolver(epsilon=0.1, max_iterations=2000, threshold=1e-8, compile=False)
-        result = solver.solve(C, a=a, b=b)
-
-        P = result.matrix
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), \
-            f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), \
-            f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-
-    def test_convergence_flag(self):
-        """Solver should converge on a simple problem."""
-        torch.manual_seed(42)
-        C = torch.rand(5, 5)
-
-        solver = SinkhornSolver(epsilon=0.5, max_iterations=500, threshold=1e-6, compile=False)
-        result = solver.solve(C)
-
-        assert result.converged, f"Did not converge after {result.n_iters} iters"
-
-    def test_transport_matrix_nonnegative(self):
-        """Transport matrix entries should be non-negative."""
-        torch.manual_seed(42)
-        C = torch.rand(8, 8)
-
-        solver = SinkhornSolver(epsilon=0.1, max_iterations=1000, compile=False)
-        result = solver.solve(C)
-
-        P = result.matrix
-        assert (P >= -1e-8).all(), f"Min entry: {P.min().item():.8f}"
-
     def test_small_epsilon_near_deterministic(self):
         """Small epsilon pushes transport toward deterministic (near one-hot rows).
 
@@ -125,30 +69,6 @@ class TestSinkhornSolver:
         a = torch.ones(5) / 5
         assert torch.allclose(P.sum(dim=1), a, atol=1e-3), \
             f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-
-    def test_warm_start_produces_valid_result(self):
-        """Warm-starting from a previous solve should produce valid transport plan."""
-        torch.manual_seed(42)
-        C = torch.rand(10, 10)
-
-        solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=500, threshold=1e-8,
-            check_every=1, compile=False,
-        )
-        result_cold = solver.solve(C)
-
-        # Warm start from cold solution
-        result_warm = solver.solve(C, init_f=result_cold.f, init_g=result_cold.g)
-
-        P = result_warm.matrix
-        a = torch.ones(10) / 10
-        b = torch.ones(10) / 10
-
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4)
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4)
-        # Warm start should converge in fewer or equal iterations
-        assert result_warm.n_iters <= result_cold.n_iters, \
-            f"Warm {result_warm.n_iters} > Cold {result_cold.n_iters}"
 
     # ------------------------------------------------------------------
     # Low-rank tests

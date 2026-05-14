@@ -5,9 +5,9 @@ This document describes how to reproduce all experiments and results in the Poly
 ## Environment Setup
 
 ### Requirements
-- Python ≥ 3.10
-- PyTorch ≥ 2.4.0
-- NVIDIA GPU with CUDA support (tested on RTX 5090, 32GB VRAM)
+- Python >= 3.11
+- PyTorch >= 2.8
+- NVIDIA GPU with CUDA support (tested on RTX 5090, 32GB VRAM, CUDA 13.0, PyTorch 2.12)
 - ~10GB disk space for results
 
 ### Installation
@@ -71,8 +71,8 @@ python experiments/runners/run_timeseries.py
 ### RL Policy Search
 
 ```bash
-python experiments/runners/run_rl.py --mode sweep --env taxi
-python experiments/runners/run_rl.py --mode full --env g1    # Requires MJWarp/mjlab
+python experiments/runners/run_rl.py --mode full --env cartpole
+python experiments/runners/run_rl.py --mode full --env acrobot
 ```
 
 ### GPT-2 Fine-Tuning (Limitation Study)

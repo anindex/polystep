@@ -427,10 +427,13 @@ class SinkhornSolver:
                                         g_combined = combined[n:]
                                         lyap_plain = (f_new * a).sum() + (g_new * b).sum()
                                         lyap_combined = (f_combined * a).sum() + (g_combined * b).sum()
-                                        if lyap_combined.item() >= lyap_plain.item() - 1e-6:
-                                            f_new = f_combined
-                                            g_new = g_combined
-                                        # else: silently fall back to plain iterate
+                                        # Device-side accept gate avoids a
+                                        # GPU->CPU sync per Anderson iter; the
+                                        # math is unchanged (broadcast scalar
+                                        # bool selects between the two iterates).
+                                        accept = (lyap_combined >= lyap_plain - 1e-6)
+                                        f_new = torch.where(accept, f_combined, f_new)
+                                        g_new = torch.where(accept, g_combined, g_new)
                             except RuntimeError:
                                 pass  # Fall back to standard iterate on solver failure (expected for ill-conditioned problems)
 
@@ -438,7 +441,9 @@ class SinkhornSolver:
                     n_iters = i + 1
 
                     # Convergence and divergence check (every check_every iterations
-                    # to avoid GPU-CPU sync on every iteration)
+                    # to avoid GPU-CPU sync on every iteration). All scalar
+                    # measurements are batched into a single device->host
+                    # transfer per check to amortize the sync cost.
                     if (i + 1) % self.check_every == 0:
                         # Divergence check
                         if (torch.isnan(f).any() or torch.isinf(f).any()
@@ -446,6 +451,25 @@ class SinkhornSolver:
                             f.zero_()
                             g.zero_()
                             break
+
+                        log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
+                        marginal_a = torch.exp(torch.logsumexp(log_P_row, dim=1))
+                        marginal_b = torch.exp(torch.logsumexp(log_P_row, dim=0))
+
+                        # Batch all scalar measurements into one transfer.
+                        err_a_t = torch.max(torch.abs(marginal_a - a))
+                        err_b_t = torch.max(torch.abs(marginal_b - b))
+                        if omega > 1.5:
+                            dual_norm_t = f.abs().max() + g.abs().max()
+                        else:
+                            dual_norm_t = err_a_t  # placeholder, value unused
+                        if self.adaptive_omega:
+                            lyap_t = (f * a).sum() + (g * b).sum()
+                        else:
+                            lyap_t = err_a_t  # placeholder, value unused
+                        err_a, err_b, dual_norm_v, lyap_v = torch.stack(
+                            [err_a_t, err_b_t, dual_norm_t, lyap_t]
+                        ).tolist()
 
                         # Static-omega divergence detector. Lehmann et al.
                         # 2022 give a safe range ``omega in (0, 2 - rho)``
@@ -456,8 +480,7 @@ class SinkhornSolver:
                         # and three-in-a-row to avoid firing on the benign
                         # iterate ripples that occur near the fixed point.
                         if omega > 1.5:
-                            _dual_norm = (f.abs().max() + g.abs().max()).item()
-                            if _dual_norm > _divergence_prev_norm * 1.05:
+                            if dual_norm_v > _divergence_prev_norm * 1.05:
                                 _divergence_growth_count += 1
                                 if _divergence_growth_count >= _divergence_patience:
                                     warnings.warn(
@@ -472,22 +495,16 @@ class SinkhornSolver:
                                     _divergence_growth_count = 0
                             else:
                                 _divergence_growth_count = 0
-                            _divergence_prev_norm = _dual_norm
+                            _divergence_prev_norm = dual_norm_v
 
                         # Adaptive omega: adjust based on Lyapunov function
                         if self.adaptive_omega:
-                            lyapunov = (f * a).sum().item() + (g * b).sum().item()
-                            if lyapunov >= prev_lyapunov:
+                            if lyap_v >= prev_lyapunov:
                                 omega = min(omega * 1.05, 1.8)  # Good progress, cautiously increase
                             else:
                                 omega = max(omega * 0.8, 1.0)   # Overshot, back off toward standard
-                            prev_lyapunov = lyapunov
+                            prev_lyapunov = lyap_v
 
-                        log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
-                        marginal_a = torch.exp(torch.logsumexp(log_P_row, dim=1))
-                        marginal_b = torch.exp(torch.logsumexp(log_P_row, dim=0))
-                        err_a = torch.max(torch.abs(marginal_a - a)).item()
-                        err_b = torch.max(torch.abs(marginal_b - b)).item()
                         err = max(err_a, err_b)
                         errors.append(err)
                         if err < self.threshold:

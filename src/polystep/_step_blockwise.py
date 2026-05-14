@@ -74,9 +74,11 @@ def step_blockwise(opt, closure: Callable) -> float:
     new_block_duals = []
     new_block_descent_dirs = []  # For biased rotation in next step
     total_ent_cost = 0.0
-    total_model_loss = 0.0
+    # Per-block scalars accumulated as device tensors and summed once after
+    # the loop to avoid one GPU->CPU sync per block per step.
+    block_disp_terms: list = []
+    block_model_loss_terms: list = []
     all_converged = True
-    total_disp = 0.0
     total_particles = 0
     num_blocks_counted = 0
 
@@ -248,8 +250,7 @@ def step_blockwise(opt, closure: Callable) -> float:
 
         # Track displacement and descent direction for biased rotation
         block_descent = (X_new_block - block_X).detach()
-        block_disp = torch.sum(block_descent ** 2, dim=-1).sum().item()
-        total_disp += block_disp
+        block_disp_terms.append(torch.sum(block_descent ** 2, dim=-1).sum())
         total_particles += P_block
         new_block_descent_dirs.append(block_descent)
 
@@ -259,7 +260,7 @@ def step_blockwise(opt, closure: Callable) -> float:
             ot_result.g.detach() if ot_result.g is not None else None,
         ))
         total_ent_cost += ot_result.ent_reg_cost
-        total_model_loss += cost_matrix.mean().item()
+        block_model_loss_terms.append(cost_matrix.mean().detach())
         num_blocks_counted += 1
         all_converged = all_converged and ot_result.converged
 
@@ -319,6 +320,16 @@ def step_blockwise(opt, closure: Callable) -> float:
                 opt._transport_direction_ema = (
                     alpha * opt._transport_direction_ema + (1.0 - alpha) * raw_direction
                 )
+
+    # Reduce per-block accumulators with one host transfer each.
+    total_model_loss = (
+        torch.stack(block_model_loss_terms).sum().item()
+        if block_model_loss_terms else 0.0
+    )
+    total_disp = (
+        torch.stack(block_disp_terms).sum().item()
+        if block_disp_terms else 0.0
+    )
 
     # Adaptive radius (use model loss, not OT regularized cost)
     avg_model_loss = total_model_loss / num_blocks_counted if num_blocks_counted > 0 else total_ent_cost
@@ -442,9 +453,11 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     new_block_duals = []
     new_block_descent_dirs = []  # For biased rotation in next step
     total_ent_cost = 0.0
-    total_model_loss = 0.0
+    # Per-block scalars accumulated as device tensors and summed once after
+    # the loop to avoid one GPU->CPU sync per block per step.
+    block_disp_terms: list = []
+    block_model_loss_terms: list = []
     all_converged = True
-    total_disp = 0.0
     total_particles = 0
     num_blocks_counted = 0
 
@@ -641,8 +654,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
         # Track displacement and descent direction for biased rotation
         block_descent = (X_new_block - block_X).detach()
-        block_disp = torch.sum(block_descent ** 2, dim=-1).sum().item()
-        total_disp += block_disp
+        block_disp_terms.append(torch.sum(block_descent ** 2, dim=-1).sum())
         total_particles += P_block
         new_block_descent_dirs.append(block_descent)
 
@@ -652,7 +664,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             ot_result.g.detach() if ot_result.g is not None else None,
         ))
         total_ent_cost += ot_result.ent_reg_cost
-        total_model_loss += cost_matrix.mean().item()
+        block_model_loss_terms.append(cost_matrix.mean().detach())
         num_blocks_counted += 1
         all_converged = all_converged and ot_result.converged
 
@@ -722,6 +734,16 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 opt._transport_direction_ema = (
                     alpha * opt._transport_direction_ema + (1.0 - alpha) * raw_direction
                 )
+
+    # Reduce per-block accumulators with one host transfer each.
+    total_model_loss = (
+        torch.stack(block_model_loss_terms).sum().item()
+        if block_model_loss_terms else 0.0
+    )
+    total_disp = (
+        torch.stack(block_disp_terms).sum().item()
+        if block_disp_terms else 0.0
+    )
 
     # Adaptive radius (use model loss, not OT regularized cost)
     avg_model_loss = total_model_loss / num_blocks_counted if num_blocks_counted > 0 else total_ent_cost

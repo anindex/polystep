@@ -1,8 +1,4 @@
-"""Smoke tests for RL benchmark helpers and runner.
-
-The G1/mjlab tests are optional because MJWarp requires a separate GPU-focused
-install. Taxi tests are dependency-light and should run in the default suite.
-"""
+"""Smoke tests for RL benchmark helpers and runner."""
 
 from __future__ import annotations
 
@@ -11,41 +7,6 @@ import os
 
 import pytest
 import torch
-
-
-def test_taxi_evaluator_returns_one_loss_per_candidate():
-    from polystep.benchmarks.rl.policies import make_taxi_policy, stack_module_params
-    from polystep.benchmarks.rl.taxi import TaxiEvaluator
-
-    model = make_taxi_policy(hidden=8)
-    stacked_params = stack_module_params(model, num_candidates=3)
-    evaluator = TaxiEvaluator(rollouts_per_candidate=4, horizon=20, device="cpu")
-
-    losses = evaluator.loss_for_stacked_params(stacked_params, seed=42, step=0)
-
-    assert losses.shape == (3,)
-    assert losses.dtype == torch.float32
-    assert torch.isfinite(losses).all()
-
-
-def test_taxi_evaluator_is_seed_deterministic():
-    from polystep.benchmarks.rl.policies import make_taxi_policy, stack_module_params
-    from polystep.benchmarks.rl.taxi import TaxiEvaluator
-
-    model = make_taxi_policy(hidden=8)
-    with torch.no_grad():
-        for param in model.parameters():
-            param.zero_()
-        model.net[2].bias[4] = 10.0  # always attempt pickup; legality depends on initial state
-    stacked_params = stack_module_params(model, num_candidates=2)
-    evaluator = TaxiEvaluator(rollouts_per_candidate=64, horizon=15, device="cpu")
-
-    first = evaluator.loss_for_stacked_params(stacked_params, seed=123, step=2)
-    second = evaluator.loss_for_stacked_params(stacked_params, seed=123, step=2)
-    different_seed = evaluator.loss_for_stacked_params(stacked_params, seed=456, step=2)
-
-    assert torch.equal(first, second)
-    assert not torch.equal(first, different_seed)
 
 
 def test_rl_metrics_include_save_result_required_keys():
@@ -78,195 +39,6 @@ def test_rl_metrics_include_save_result_required_keys():
     assert metrics["final_accuracy"] == pytest.approx(0.25)
     assert metrics["best_accuracy"] == pytest.approx(0.25)
 
-
-@pytest.mark.timeout(30)
-def test_run_polystep_taxi_smoke_writes_result_json(tmp_path):
-    from experiments.runners.run_rl import run_polystep_taxi
-
-    evals = run_polystep_taxi(
-        seed=42,
-        device="cpu",
-        steps=2,
-        rollouts_per_candidate=4,
-        horizon=20,
-        max_subspace_dim=16,
-        results_dir=str(tmp_path),
-    )
-
-    assert evals > 0
-    result_file = os.path.join(str(tmp_path), "taxi_polystep_42.json")
-    assert os.path.exists(result_file)
-    with open(result_file) as f:
-        data = json.load(f)
-
-    assert data["benchmark"] == "taxi"
-    assert data["method"] == "polystep"
-    assert data["seed"] == 42
-    assert data["metrics"]["total_steps"] == 2
-    assert data["metrics"]["function_evals"] == evals
-    assert "final_return" in data["metrics"]
-    assert "rl_env_steps" in data["metrics"]
-    assert data["hyperparameters"]["representation"] == "tabular_q_table"
-
-
-@pytest.mark.timeout(30)
-def test_run_q_learning_taxi_smoke_writes_result_json(tmp_path):
-    from experiments.runners.run_rl import run_q_learning_taxi
-
-    run_q_learning_taxi(
-        seed=42,
-        episodes=20,
-        eval_episodes=8,
-        results_dir=str(tmp_path),
-    )
-
-    result_file = os.path.join(str(tmp_path), "taxi_q_learning_42.json")
-    assert os.path.exists(result_file)
-    with open(result_file) as f:
-        data = json.load(f)
-
-    assert data["benchmark"] == "taxi"
-    assert data["method"] == "q_learning"
-    assert data["metrics"]["rl_env_steps"] > 0
-
-
-def test_select_best_sweep_result_prefers_best_return():
-    from experiments.runners.run_rl import select_best_sweep_result
-
-    best = select_best_sweep_result(
-        [
-            {"config_id": "a", "metrics": {"best_return": -200.0}, "config": {"step_radius": 0.1}},
-            {"config_id": "b", "metrics": {"best_return": -50.0}, "config": {"step_radius": 0.3}},
-        ]
-    )
-
-    assert best["config_id"] == "b"
-    assert best["config"]["step_radius"] == 0.3
-
-
-@pytest.mark.timeout(30)
-def test_run_taxi_fast_sweep_writes_per_config_results(tmp_path):
-    from experiments.runners.run_rl import run_polystep_taxi, select_best_sweep_result
-
-    # Use minimal configs for CI speed (production sweep uses 200 steps)
-    # Tabular Q-table: no 'hidden' param needed
-    smoke_configs = [
-        {"steps": 2, "rollouts_per_candidate": 4, "horizon": 20,
-         "subspace_rank": 2, "epsilon_init": 0.5, "epsilon_target": 0.3,
-         "step_radius": 0.05, "probe_radius": 0.1, "amortize_steps": 1, "max_subspace_dim": 16},
-        {"steps": 2, "rollouts_per_candidate": 4, "horizon": 20,
-         "subspace_rank": 4, "epsilon_init": 1.0, "epsilon_target": 0.3,
-         "step_radius": 0.1, "probe_radius": 0.2, "amortize_steps": 1, "max_subspace_dim": 24},
-    ]
-    records = []
-    for idx, config in enumerate(smoke_configs):
-        method = f"polystep_sweep_{idx}"
-        run_polystep_taxi(seed=42, device="cpu", results_dir=str(tmp_path), method=method, **config)
-        result_path = os.path.join(str(tmp_path), f"taxi_{method}_42.json")
-        with open(result_path) as f:
-            data = json.load(f)
-        records.append({"config_id": str(idx), "config": config, "metrics": data["metrics"]})
-    best = select_best_sweep_result(records)
-
-    assert "config" in best
-    assert os.path.exists(os.path.join(str(tmp_path), "taxi_polystep_sweep_0_42.json"))
-    assert os.path.exists(os.path.join(str(tmp_path), "taxi_polystep_sweep_1_42.json"))
-
-
-def test_sb3_taxi_baseline_reports_missing_dependency(tmp_path):
-    from experiments.runners.run_rl import run_sb3_taxi
-
-    stable_baselines3 = pytest.importorskip("stable_baselines3", reason="missing path tested only when SB3 absent")
-    assert stable_baselines3 is not None
-
-
-def test_sb3_taxi_baseline_missing_dependency_message(monkeypatch, tmp_path):
-    import builtins
-
-    from experiments.runners.run_rl import run_sb3_taxi
-
-    real_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        if name.startswith("stable_baselines3"):
-            raise ImportError("synthetic missing sb3")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
-    with pytest.raises(ImportError, match="stable-baselines3"):
-        run_sb3_taxi(method="ppo", seed=42, total_timesteps=8, results_dir=str(tmp_path))
-
-
-def test_mjlab_g1_module_is_importable_without_mjlab_installed():
-    from polystep.benchmarks.rl.mjlab_g1 import MJLAB_TASK_ID, MjlabUnavailableError
-
-    assert MJLAB_TASK_ID == "Mjlab-Velocity-Flat-Unitree-G1"
-    assert issubclass(MjlabUnavailableError, RuntimeError)
-
-
-def test_run_g1_sweep_records_dependency_blocker_when_mjlab_missing(tmp_path):
-    import importlib.util
-
-    if importlib.util.find_spec("mjlab") is not None:
-        pytest.skip("mjlab installed; blocker path not applicable")
-
-    from experiments.runners.run_rl import run_polystep_g1_sweep
-
-    result = run_polystep_g1_sweep(seed=42, results_dir=str(tmp_path), max_configs=1)
-
-    assert result["status"] == "blocked"
-    assert os.path.exists(os.path.join(str(tmp_path), "g1_polystep_sweep_blocked_42.json"))
-
-
-def test_mjlab_g1_smoke_if_dependency_is_installed():
-    pytest.importorskip("mjlab")
-
-    from polystep.benchmarks.rl.mjlab_g1 import MjlabG1Evaluator
-
-    evaluator = MjlabG1Evaluator(num_envs=1, horizon=1, device="cuda")
-    assert evaluator.env_id == "Mjlab-Velocity-Flat-Unitree-G1"
-
-
-@pytest.mark.parametrize("activation", ["elu", "tanh"])
-def test_g1_batched_forward_matches_per_candidate_loop(activation):
-    """``_batched_mlp_forward`` must equal a per-candidate Python loop.
-
-    Regression guard: previously ``summarize_stacked_params`` hardcoded ``elu``
-    in its single-policy loop, silently diverging from the batched bmm path
-    when ``activation != "elu"``.
-    """
-
-    from polystep.benchmarks.rl.mjlab_g1 import _batched_mlp_forward
-
-    torch.manual_seed(0)
-    n_candidates, epc = 3, 5
-    obs_dim, hidden, action_dim = 99, 32, 29
-
-    obs = torch.randn(n_candidates * epc, obs_dim)
-    stacked = {
-        "net.0.weight": torch.randn(n_candidates, hidden, obs_dim) * 0.1,
-        "net.0.bias": torch.randn(n_candidates, hidden) * 0.1,
-        "net.2.weight": torch.randn(n_candidates, action_dim, hidden) * 0.1,
-        "net.2.bias": torch.randn(n_candidates, action_dim) * 0.1,
-    }
-
-    batched = _batched_mlp_forward(obs, stacked, n_candidates, epc, activation)
-
-    act_fn = {"elu": torch.nn.functional.elu, "tanh": torch.tanh}[activation]
-    expected = torch.empty_like(batched)
-    for c in range(n_candidates):
-        x = obs[c * epc : (c + 1) * epc]
-        x = act_fn(x @ stacked["net.0.weight"][c].T + stacked["net.0.bias"][c])
-        x = torch.tanh(x @ stacked["net.2.weight"][c].T + stacked["net.2.bias"][c])
-        expected[c * epc : (c + 1) * epc] = x
-
-    assert torch.allclose(batched, expected, atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# GymVectorEvaluator smoke tests (Acrobot-v1 always available in gymnasium core)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("env_id", ["Acrobot-v1"])
 def test_gym_vector_evaluator_basic(env_id):
@@ -397,7 +169,6 @@ def test_sb3_nondiff_zero_grad(method):
 def test_hardened_env_smoke():
     """Hardened wrappers register, reset, step, and produce quantized obs / bucketed reward."""
     pytest.importorskip("gymnasium")
-    pytest.importorskip("Box2D")  # LunarLander dependency
     import gymnasium as gym
     import numpy as np
     from experiments.runners.hardened_env import (
@@ -424,7 +195,7 @@ def test_hardened_env_smoke():
     env.close()
 
     # End-to-end factory + Gym registration
-    for s in ("cartpole_hard", "acrobot_hard", "lunarlander_hard"):
+    for s in ("cartpole_hard", "acrobot_hard"):
         e = make_hardened_env(s)
         obs, _ = e.reset(seed=0)
         assert np.isfinite(obs).all()

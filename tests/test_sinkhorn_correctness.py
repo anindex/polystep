@@ -32,7 +32,7 @@ def _gaussian_cost(P, V, dtype=torch.float32, seed=0, scale=1.0):
 
 
 # ---------------------------------------------------------------------------
-# 2B.1a Log-sum-exp safety
+# Log-sum-exp safety
 # ---------------------------------------------------------------------------
 
 
@@ -59,7 +59,7 @@ def test_sinkhorn_lse_safety(dtype, scale):
 
 
 # ---------------------------------------------------------------------------
-# 2B.1b epsilon-scheduled warm start - rescaling preserves convergence
+# epsilon-scheduled warm start - rescaling preserves convergence
 # ---------------------------------------------------------------------------
 
 
@@ -105,7 +105,7 @@ def test_sinkhorn_warm_start_rescale_on_eps_change():
 
 
 # ---------------------------------------------------------------------------
-# 2B.1c marginal-constraint enforcement
+# marginal-constraint enforcement
 # ---------------------------------------------------------------------------
 
 
@@ -150,7 +150,7 @@ def test_sinkhorn_marginals_satisfied_at_convergence():
 
 
 # ---------------------------------------------------------------------------
-# 2B.1d ties symmetry
+# ties symmetry
 # ---------------------------------------------------------------------------
 
 
@@ -177,7 +177,7 @@ def test_sinkhorn_ties_yield_symmetric_transport():
 
 
 # ---------------------------------------------------------------------------
-# 2B.2a divergence detector
+# divergence detector
 # ---------------------------------------------------------------------------
 
 
@@ -226,7 +226,7 @@ def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
 
 
 # ---------------------------------------------------------------------------
-# 2B.2b omega sweep
+# omega sweep
 # ---------------------------------------------------------------------------
 
 
@@ -250,7 +250,7 @@ def test_sinkhorn_omega_sweep(omega):
 
 
 # ---------------------------------------------------------------------------
-# 2B.3a dual re-centering on cost shift
+# dual re-centering on cost shift
 # ---------------------------------------------------------------------------
 
 
@@ -281,7 +281,7 @@ def test_sinkhorn_warm_start_centered_under_cost_shift():
 
 
 # ---------------------------------------------------------------------------
-# 2B.4a Anderson regression-check guard
+# Anderson regression-check guard
 # ---------------------------------------------------------------------------
 
 
@@ -330,7 +330,7 @@ def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
 
 
 # ---------------------------------------------------------------------------
-# 2B.4b Anderson restart on epsilon change (per-call history)
+# Anderson restart on epsilon change (per-call history)
 # ---------------------------------------------------------------------------
 
 
@@ -354,7 +354,7 @@ def test_sinkhorn_anderson_history_resets_per_call():
 
 
 # ---------------------------------------------------------------------------
-# 2B.4c Anderson depth clamp
+# Anderson depth clamp
 # ---------------------------------------------------------------------------
 
 

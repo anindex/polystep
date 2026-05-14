@@ -21,6 +21,11 @@ source locations where the limitation surfaces.
 - `dropout > 0` under `torch.vmap` - works but emits a warning. Call
   `model.eval()` before vmap evaluation.
 
+Note: PyTorch 2.12 fixes native `vmap(nn.MultiheadAttention)` (issue
+#151558). The wrapper is retained for the `torch>=2.8` floor; users on
+2.12+ may use `nn.MultiheadAttention` directly when none of the above
+restrictions apply.
+
 ### `VmapSafeLSTM` - does NOT support
 
 (per [`src/polystep/layers/rnn.py`](src/polystep/layers/rnn.py))

@@ -17,7 +17,7 @@ from polystep import SinkhornSolver, SoftmaxSolver
 
 
 # ---------------------------------------------------------------------------
-# 3.1 BF16 / FP16 outer autocast must not collapse solver internals
+# BF16 / FP16 outer autocast must not collapse solver internals
 # ---------------------------------------------------------------------------
 
 
@@ -68,7 +68,7 @@ def test_solver_disables_outer_bf16_autocast(solver_cls):
 
 
 # ---------------------------------------------------------------------------
-# 3.2a Overflow grid (replicates 2A.1 / 2B.1a but for SinkhornSolver)
+# Overflow grid for SinkhornSolver
 # ---------------------------------------------------------------------------
 
 
@@ -98,7 +98,7 @@ def test_sinkhorn_no_nan_across_eps_cost_grid():
 
 
 # ---------------------------------------------------------------------------
-# 3.2b +Inf entry handling: row stays valid, masked entry transports to 0
+# +Inf entry handling: row stays valid, masked entry transports to 0
 # ---------------------------------------------------------------------------
 
 

@@ -24,7 +24,7 @@ from polystep import (
 
 
 # ---------------------------------------------------------------------------
-# 2E.1 Mezzadri sign-corrected QR Haar test
+# Mezzadri sign-corrected QR Haar test
 # ---------------------------------------------------------------------------
 
 
@@ -68,7 +68,7 @@ def test_mezzadri_rotation_is_haar_distributed():
 
 
 # ---------------------------------------------------------------------------
-# 2E.2 dp=2 analytic SO(2) rotation
+# dp=2 analytic SO(2) rotation
 # ---------------------------------------------------------------------------
 
 
@@ -104,7 +104,7 @@ def test_orthoplex_vertices_for_dp2():
 
 
 # ---------------------------------------------------------------------------
-# 2E.3 Sparse JL: variance, warning, fixed seed within session
+# Sparse JL: variance, warning, fixed seed within session
 # ---------------------------------------------------------------------------
 
 

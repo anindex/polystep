@@ -24,7 +24,10 @@ def test_compute_cost_matrix_chunked_matches_unchunked():
     """Chunked evaluation should produce same result as unchunked."""
     batch, verts, probes, dim = 3, 5, 2, 4
     X = torch.randn(batch, verts, probes, dim)
-    fn = lambda x: x.norm(dim=-1)
+
+    def fn(x):
+        return x.norm(dim=-1)
+
     C_full = compute_cost_matrix(fn, X)
     C_chunked = compute_cost_matrix(fn, X, chunk_size=4)
     assert torch.allclose(C_full, C_chunked, atol=1e-6)

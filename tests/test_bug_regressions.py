@@ -12,7 +12,7 @@ from polystep.geometry import get_random_rotation_matrices
 
 
 # ---------------------------------------------------------------------------
-# BH-001: Biased rotation must preserve det(R) = +1
+# Biased rotation must preserve det(R) = +1
 # ---------------------------------------------------------------------------
 
 class TestBiasedRotationDet:
@@ -61,7 +61,7 @@ class TestBiasedRotationDet:
 
 
 # ---------------------------------------------------------------------------
-# BH-002: Eval mode must be enforced during NNCostEvaluator.evaluate()
+# Eval mode must be enforced during NNCostEvaluator.evaluate()
 # ---------------------------------------------------------------------------
 
 class TestEvalModeEnforced:
@@ -91,7 +91,7 @@ class TestEvalModeEnforced:
         targets = torch.randint(0, 2, (8,))
 
         rm_before = model.state_dict()["1.running_mean"].clone()
-        losses = evaluator.evaluate(stacked, inputs, targets)
+        evaluator.evaluate(stacked, inputs, targets)
         rm_after = model.state_dict()["1.running_mean"]
 
         assert torch.equal(rm_before, rm_after), (
@@ -122,7 +122,7 @@ class TestEvalModeEnforced:
 
 
 # ---------------------------------------------------------------------------
-# BH-003: Non-trainable buffers excluded from particle layout
+# Non-trainable buffers excluded from particle layout
 # ---------------------------------------------------------------------------
 
 class TestBuffersExcluded:

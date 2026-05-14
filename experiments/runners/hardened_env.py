@@ -24,7 +24,7 @@ Conventions:
 * Observation bounds clip values outside ``[lo, hi]`` *before* binning so a
   rare out-of-bounds observation does not destabilise the bin grid.
 * The ``register_hardened_envs()`` function registers ``CartPole-Hard-v1``,
-  ``Acrobot-Hard-v1``, and ``LunarLander-Hard-v3`` env IDs that bake in the
+  ``Acrobot-Hard-v1`` env IDs that bake in the
   per-env defaults; the underlying class definitions remain reusable.
 """
 
@@ -140,11 +140,6 @@ HARDENED_DEFAULTS = {
         base="Acrobot-v1", bins=4, bucket=1.0, deadband=0.0,
         low=None, high=None,  # Acrobot bounds are finite already.
     ),
-    "lunarlander_hard": dict(
-        base="LunarLander-v3", bins=4, bucket=10.0, deadband=2.0,
-        low=[-1.5, -1.5, -3.0, -3.0, -3.14, -5.0, 0.0, 0.0],
-        high=[1.5, 1.5, 3.0, 3.0, 3.14, 5.0, 1.0, 1.0],
-    ),
 }
 
 
@@ -167,7 +162,7 @@ _REGISTERED = False
 
 
 def register_hardened_envs() -> None:
-    """Register ``cartpole_hard`` / ``acrobot_hard`` / ``lunarlander_hard`` Gym IDs.
+    """Register ``cartpole_hard`` / ``acrobot_hard`` Gym IDs.
 
     Idempotent - safe to call multiple times.
     """
@@ -180,7 +175,6 @@ def register_hardened_envs() -> None:
     id_map = {
         "cartpole_hard": "CartPoleHard-v1",
         "acrobot_hard": "AcrobotHard-v1",
-        "lunarlander_hard": "LunarLanderHard-v3",
     }
     for short, gym_id in id_map.items():
         spec = HARDENED_DEFAULTS[short]
@@ -204,5 +198,4 @@ def register_hardened_envs() -> None:
 HARDENED_GYM_IDS = {
     "cartpole_hard": "CartPoleHard-v1",
     "acrobot_hard": "AcrobotHard-v1",
-    "lunarlander_hard": "LunarLanderHard-v3",
 }

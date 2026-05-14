@@ -1,6 +1,5 @@
-"""Tests for compilation infrastructure: fallback, numerical equivalence, benchmarks."""
+"""Tests for compilation infrastructure: fallback, numerical equivalence."""
 import inspect
-import time
 import warnings
 
 import pytest
@@ -244,80 +243,6 @@ class TestPolyStepCompileFlagEquivalence:
 # ---------------------------------------------------------------------------
 # Group 4: Benchmark tests (marked slow)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-@pytest.mark.timeout(300)
-class TestBenchmarkSinkhornIteration:
-    """Test 10: Baseline benchmark for _sinkhorn_iteration."""
-
-    def test_benchmark_sinkhorn_iteration(self):
-        torch.manual_seed(42)
-        n, m = 500, 300
-        eps = 0.1
-
-        f = torch.randn(n)
-        g = torch.randn(m)
-        log_K = torch.randn(n, m)
-        log_a = torch.log(torch.ones(n) / n)
-        log_b = torch.log(torch.ones(m) / m)
-
-        # Warmup
-        for _ in range(10):
-            f, g = _sinkhorn_iteration(f.clone(), g.clone(), log_K, log_a, log_b, eps)
-
-        # Timed run
-        start = time.perf_counter()
-        for _ in range(1000):
-            f, g = _sinkhorn_iteration(f, g, log_K, log_a, log_b, eps)
-        elapsed = time.perf_counter() - start
-
-        print(f"\n  _sinkhorn_iteration: 1000 calls in {elapsed:.3f}s "
-              f"({elapsed / 1000 * 1e6:.1f} us/call) [CPU baseline]")
-
-
-@pytest.mark.slow
-@pytest.mark.timeout(120)
-class TestBenchmarkSolverStep:
-    """Test 11: Benchmark PolyStep.step() compile=True vs compile=False."""
-
-    def test_benchmark_solver_step(self):
-        torch.manual_seed(42)
-        dim = 10
-        num_particles = 50
-
-        def objective_fn(x):
-            return x.pow(2).sum(-1)
-        times = {}
-
-        for compile_flag in [True, False]:
-            solver = PolyStep(
-                objective_fn=objective_fn, dim=dim, compile=compile_flag,
-                sinkhorn_max_iters=100, threshold=-1,
-            )
-            X_init = torch.randn(num_particles, dim)
-            state = solver.init_state(X_init)
-
-            # Warmup
-            for _ in range(5):
-                g = torch.Generator().manual_seed(0)
-                state = solver.step(state, generator=g)
-
-            # Timed iterations
-            durations = []
-            for i in range(10):
-                g = torch.Generator().manual_seed(i + 100)
-                start = time.perf_counter()
-                state = solver.step(state, generator=g)
-                durations.append(time.perf_counter() - start)
-
-            median_time = sorted(durations)[len(durations) // 2]
-            label = "compiled" if compile_flag else "eager"
-            times[label] = median_time
-            print(f"\n  PolyStep.step ({label}): median {median_time * 1e3:.2f} ms")
-
-        print(f"\n  Ratio (compiled/eager): {times['compiled'] / times['eager']:.2f}x "
-              "[CPU, expect ~1.0x; 2x improvement expected on GPU]")
 
 
 # ---------------------------------------------------------------------------

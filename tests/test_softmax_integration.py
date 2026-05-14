@@ -174,7 +174,7 @@ class TestSoftmaxFunctionalStep:
         for _ in range(3):
             loss = opt.step(closure)
             losses.append(loss)
-        assert all(isinstance(l, float) for l in losses)
+        assert all(isinstance(loss_v, float) for loss_v in losses)
 
     @pytest.mark.timeout(30)
     def test_state_f_g_none_after_softmax_solve(self, model, closure):
@@ -306,7 +306,7 @@ class TestEpsilonSharing:
         closure = _make_closure(model)
 
         # Record epsilon before first step
-        eps_before = opt.solver.epsilon
+        _ = opt.solver.epsilon
 
         opt.step(closure)
 
@@ -372,8 +372,8 @@ class TestFusedSoftmaxDispatch:
         for _ in range(2):
             loss = opt.step(closure)
             losses.append(loss)
-        assert all(isinstance(l, float) for l in losses)
-        assert all(l == l for l in losses), "Loss should not be NaN"
+        assert all(isinstance(loss_v, float) for loss_v in losses)
+        assert all(loss_v == loss_v for loss_v in losses), "Loss should not be NaN"
 
     def test_fused_softmax_path_inactive_with_sinkhorn(self, model):
         """Fused path is NOT active when solver='sinkhorn'."""
@@ -418,7 +418,7 @@ class TestFusedSoftmaxDispatch:
         for _ in range(3):
             loss = opt.step(closure)
             losses.append(loss)
-        assert all(isinstance(l, float) for l in losses)
+        assert all(isinstance(loss_v, float) for loss_v in losses)
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +443,8 @@ class TestK1ReshapeShortcut:
         for _ in range(3):
             loss = opt.step(closure)
             losses.append(loss)
-        assert all(isinstance(l, float) for l in losses)
-        assert all(l == l for l in losses), "All losses should be finite"
+        assert all(isinstance(loss_v, float) for loss_v in losses)
+        assert all(loss_v == loss_v for loss_v in losses), "All losses should be finite"
 
     @pytest.mark.timeout(60)
     def test_k3_still_uses_mean_path(self, model, layout):
@@ -459,8 +459,8 @@ class TestK1ReshapeShortcut:
         for _ in range(2):
             loss = opt.step(closure)
             losses.append(loss)
-        assert all(isinstance(l, float) for l in losses)
-        assert all(l == l for l in losses), "All losses should be finite"
+        assert all(isinstance(loss_v, float) for loss_v in losses)
+        assert all(loss_v == loss_v for loss_v in losses), "All losses should be finite"
 
     @pytest.mark.timeout(60)
     def test_k1_with_sinkhorn_solver(self, model):

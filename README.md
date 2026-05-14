@@ -37,7 +37,7 @@ pip install -e ".[dev]"               # + pytest, ruff (development)
 pip install -e ".[experiments]"       # + scipy, pandas, python-sat (paper reproduction)
 ```
 
-GPU: `pip install torch --index-url https://download.pytorch.org/whl/cu124`
+GPU: `pip install torch --index-url https://download.pytorch.org/whl/cu130` (or pick the CUDA build that matches your driver from the [PyTorch install page](https://pytorch.org/get-started/locally/)).
 
 ## Quickstart
 

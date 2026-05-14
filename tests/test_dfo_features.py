@@ -85,11 +85,11 @@ def test_newton_momentum_uses_fd_direction():
     closure = make_closure(opt)
 
     # Step 1: full OT - extracts FD gradient + Hessian, computes Newton direction
-    loss1 = opt.step(closure)
+    opt.step(closure)
     assert opt._newton_direction is not None  # Newton direction computed from FD data
 
     # Step 2: momentum - should use Newton direction (not just EMA transport)
-    loss2 = opt.step(closure)
+    opt.step(closure)
     # Should have moved (not zero displacement)
     assert opt._state.displacement_sqnorms[-1] >= 0
 
@@ -248,5 +248,5 @@ def test_dfo_features_with_subspace():
     closure = make_closure(opt)
 
     for _ in range(5):
-        loss = opt.step(closure)
+        opt.step(closure)
     assert opt._state.iteration_count == 5

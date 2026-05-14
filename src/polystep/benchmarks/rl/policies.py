@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Dict, Iterable, Sequence
+from typing import Dict, Iterable
 
 import torch
 import torch.nn as nn
@@ -96,48 +96,6 @@ class NonDiffMLPPolicy(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.net(obs)
-
-
-class ContinuousMLPPolicy(nn.Module):
-    """MLP policy for continuous-control direct policy search.
-
-    Args:
-        obs_dim: Observation space size.
-        hidden_sizes: Sequence of hidden layer widths.
-        action_dim: Action space size.
-        activation: Hidden layer activation (``'tanh'`` or ``'elu'``).
-        output_tanh: If True, apply tanh to the final output for [-1, 1] action clipping.
-    """
-
-    def __init__(
-        self,
-        obs_dim: int,
-        hidden_sizes: Sequence[int],
-        action_dim: int,
-        activation: str = "tanh",
-        output_tanh: bool = True,
-    ):
-        super().__init__()
-        act_cls = {"tanh": nn.Tanh, "elu": nn.ELU}.get(activation.lower(), nn.Tanh)
-        layers: list[nn.Module] = []
-        prev = obs_dim
-        for hidden in hidden_sizes:
-            layers.append(nn.Linear(prev, hidden))
-            layers.append(act_cls())
-            prev = hidden
-        layers.append(nn.Linear(prev, action_dim))
-        if output_tanh:
-            layers.append(nn.Tanh())
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
-
-
-def make_taxi_policy(hidden: int = 32) -> DiscreteMLPPolicy:
-    """Create the tiny one-hot Taxi policy used by the RL runner."""
-
-    return DiscreteMLPPolicy(obs_dim=500, hidden=hidden, action_dim=6)
 
 
 def stack_module_params(

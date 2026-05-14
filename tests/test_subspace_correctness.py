@@ -21,7 +21,7 @@ from polystep import HybridSubspace, AdaptiveSubspace, ParamLayout
 
 
 # ---------------------------------------------------------------------------
-# 2D.1 HybridSubspace exact reconstruction at saturation
+# HybridSubspace exact reconstruction at saturation
 # ---------------------------------------------------------------------------
 
 
@@ -72,7 +72,7 @@ def test_hybrid_subspace_exact_reconstruction_at_saturation():
 
 
 # ---------------------------------------------------------------------------
-# 2D.2 Bias handling: 1D params stay full-dim
+# Bias handling: 1D params stay full-dim
 # ---------------------------------------------------------------------------
 
 
@@ -110,7 +110,7 @@ def test_hybrid_subspace_bias_is_full_dim_identity():
 
 
 # ---------------------------------------------------------------------------
-# 2D.3 Tied weights deduplicated through HybridSubspace
+# Tied weights deduplicated through HybridSubspace
 # ---------------------------------------------------------------------------
 
 
@@ -145,7 +145,7 @@ def test_hybrid_subspace_dedupes_tied_weights():
 
 
 # ---------------------------------------------------------------------------
-# 2D.4 AdaptiveSubspace step-0 fallback + determinism
+# AdaptiveSubspace step-0 fallback + determinism
 # ---------------------------------------------------------------------------
 
 

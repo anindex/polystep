@@ -33,7 +33,7 @@ from polystep.transform import ParamLayout
 
 
 # ---------------------------------------------------------------------------
-# 2C.1 ParamLayout dedup of tied weights
+# ParamLayout dedup of tied weights
 # ---------------------------------------------------------------------------
 
 
@@ -96,7 +96,7 @@ def test_tied_weights_unflatten_aliased():
 
 
 # ---------------------------------------------------------------------------
-# 2C.2 dp divisibility padding round-trip
+# dp divisibility padding round-trip
 # ---------------------------------------------------------------------------
 
 
@@ -105,7 +105,8 @@ def test_dp_padding_round_trip_does_not_mutate_state_dict():
     original (within dtype rounding) and must not expose padding bytes
     as state_dict keys."""
     # 7-element model + particle_dim=2 -> requires 1 byte of padding
-    model = nn.Linear(3, 1, bias=True)  # 3 + 1 = 4 params; padded to 4 (no pad)
+    # (sanity check: a single 4-param linear has no padding)
+    _ = nn.Linear(3, 1, bias=True)
     model2 = nn.Sequential(nn.Linear(3, 1, bias=True), nn.Linear(1, 1, bias=False))
     # 4 + 1 = 5 params; padded to 6 with particle_dim=2 -> 1 element of padding
 
@@ -133,7 +134,7 @@ def test_dp_padding_round_trip_does_not_mutate_state_dict():
 
 
 # ---------------------------------------------------------------------------
-# 2C.3 nn.LSTM under vmap (issue #105982) and 2C.4 nn.MultiheadAttention float
+# nn.LSTM under vmap (issue #105982) and nn.MultiheadAttention float
 # mask (issue #107084) - record the upstream pitfalls so a future PyTorch
 # release that fixes them will fail this test and prompt removal of the
 # VmapSafe layers.
@@ -179,7 +180,7 @@ def test_vmap_safe_lstm_works_under_vmap():
 
 
 # ---------------------------------------------------------------------------
-# 2C.5a sqrt(head_dim) scale
+# sqrt(head_dim) scale
 # ---------------------------------------------------------------------------
 
 
@@ -192,7 +193,7 @@ def test_vmap_safe_attention_scales_by_sqrt_head_dim():
 
 
 # ---------------------------------------------------------------------------
-# 2C.5b bool attn_mask must mask-fill (-inf), not add (P1 BUG)
+# bool attn_mask must mask-fill (-inf), not add (P1 BUG)
 # ---------------------------------------------------------------------------
 
 
@@ -238,7 +239,7 @@ def test_vmap_safe_attention_bool_mask_zeros_attention():
 
 
 # ---------------------------------------------------------------------------
-# 2C.5c NotImplementedError for unsupported configs
+# NotImplementedError for unsupported configs
 # ---------------------------------------------------------------------------
 
 
@@ -269,7 +270,7 @@ def test_vmap_safe_attention_raises_on_unsupported_forward_kwargs(forward_kwargs
 
 
 # ---------------------------------------------------------------------------
-# 2C.6 VmapSafeLSTM raises on unsupported configs / PackedSequence
+# VmapSafeLSTM raises on unsupported configs / PackedSequence
 # ---------------------------------------------------------------------------
 
 
@@ -293,7 +294,7 @@ def test_vmap_safe_lstm_raises_on_packed_sequence():
 
 
 # ---------------------------------------------------------------------------
-# 2C.7 state_dict round-trip BF16 + tied weights
+# state_dict round-trip BF16 + tied weights
 # ---------------------------------------------------------------------------
 
 
