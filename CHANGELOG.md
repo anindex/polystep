@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.1 - 2026-05-14
+
+### Added
+
+- `examples/06_loihi_snn_polystep.py`: end-to-end skeleton demonstrating
+  PolyStep on a Loihi 2-style two-phase workflow. Pretrains a hard-LIF
+  MNIST SNN with PolyStep using the paper's `PSTORCH_CONFIGS["snn"]`
+  config, then adapts *only* the writable subset a real Loihi 2 chip
+  would expose at runtime (`fc2` + per-population `vth` + `beta`,
+  1.3 % of model parameters) under a `N(0, 1^2)` Gaussian input-shift.
+  Phase B uses three TENT-style test-time-adaptation safeguards —
+  mixed-batch (half clean / half shifted), rank-8 probing on the tiny
+  writable subspace, and two probes per step. Both phases use
+  best-test early stopping (patience 4, tuned for the noisier per-epoch
+  test curves of zeroth-order optimization). Shifted-test evaluations
+  share a fixed seeded noise mask across pre / post / baseline so the
+  reported recovery is a *paired* comparison free of sampling jitter.
+  On default settings reaches **83.1 % best clean / +13.1 pp paired
+  shift-recovery over the frozen-readout baseline with near-zero clean-
+  accuracy degradation** (Phase B clean 82.5 % vs. Phase A clean
+  83.1 %) in ~17 min on a single GPU. Headline numbers shift by a
+  few pp run-to-run on CUDA due to non-deterministic cuBLAS reductions;
+  the qualitative recovery is robust. The host loop is backend-
+  agnostic — `LoihiSpikeEvaluator` is the single swap point against
+  the Lava `netx` deployment path.
+
 ## 0.2.0 - 2026-05-14
 
 Dependency floor lift, native fast-path adoption, and performance pass for

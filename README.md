@@ -1,8 +1,8 @@
 # polystep
 
 [![arXiv](https://img.shields.io/badge/arXiv-2605.01928-b31b1b.svg)](https://arxiv.org/abs/2605.01928)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.4+](https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c.svg)](https://pytorch.org/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.8+](https://img.shields.io/badge/PyTorch-2.8%2B-ee4c2c.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
 **Gradient-free neural network training via optimal transport.**
@@ -78,7 +78,7 @@ optimizer = PolyStepOptimizer(
 train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 ```
 
-See [`examples/`](examples/) for 5 runnable demos (SNN, RL, MAX-SAT, MNIST).
+See [`examples/`](examples/) for 6 runnable demos (SNN, RL, MAX-SAT, MNIST, Loihi 2 on-chip adaptation skeleton).
 
 ## When to use PolyStep
 
@@ -148,7 +148,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for detailed discussion.
 ```
 src/polystep/          Core library (optimizer, solvers, subspaces, geometry)
 tests/                 Unit, integration, and regression tests
-examples/              5 runnable demos (quickstart, SNN, RL, MAX-SAT, MNIST)
+examples/              6 runnable demos (quickstart, SNN, RL, MAX-SAT, MNIST, Loihi 2)
 experiments/           Paper reproduction: runners, results, baselines
 docs/                  API overview, reproducibility guide
 ```
@@ -157,7 +157,7 @@ docs/                  API overview, reproducibility guide
 
 | Resource | Description |
 |----------|-------------|
-| [`examples/`](examples/) | 5 runnable demos with output figures |
+| [`examples/`](examples/) | 6 runnable demos with output figures |
 | [`experiments/`](experiments/) | Full paper reproduction harness |
 | [`docs/api_overview.md`](docs/api_overview.md) | API reference |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | Known limitations |
