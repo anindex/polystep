@@ -15,6 +15,7 @@ class TestGenerateMaxsatInstance:
     """Tests for generate_maxsat_instance."""
 
     def test_returns_dict_with_required_keys(self):
+        pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
@@ -25,6 +26,7 @@ class TestGenerateMaxsatInstance:
         assert "num_clauses" in result
 
     def test_clause_vars_shape_and_dtype(self):
+        pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
@@ -32,6 +34,7 @@ class TestGenerateMaxsatInstance:
         assert result["clause_vars"].dtype == torch.long
 
     def test_clause_signs_shape_and_dtype(self):
+        pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
@@ -39,6 +42,7 @@ class TestGenerateMaxsatInstance:
         assert result["clause_signs"].dtype == torch.float
 
     def test_clause_vars_in_valid_range(self):
+        pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
@@ -46,6 +50,7 @@ class TestGenerateMaxsatInstance:
         assert result["clause_vars"].max().item() <= 19  # 0-indexed
 
     def test_clause_signs_binary_values(self):
+        pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
@@ -54,6 +59,7 @@ class TestGenerateMaxsatInstance:
             assert v in [0.0, 1.0]
 
     def test_reproducible_with_same_seed(self):
+        pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         r1 = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3, seed=42)
@@ -63,6 +69,7 @@ class TestGenerateMaxsatInstance:
 
     def test_critical_ratio_default(self):
         """generate_maxsat_instance with default ratio (alpha~4.27) generates valid instance."""
+        pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         result = generate_maxsat_instance(num_vars=100)
@@ -72,6 +79,7 @@ class TestGenerateMaxsatInstance:
         assert result["clause_vars"].shape == (expected_clauses, 3)
 
     def test_returns_cnf_object(self):
+        pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
@@ -122,6 +130,7 @@ class TestGenerateMultidomainData:
     """Tests for generate_multidomain_data."""
 
     def test_returns_dict_with_required_keys(self):
+        pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data
 
         result = generate_multidomain_data()
@@ -131,6 +140,7 @@ class TestGenerateMultidomainData:
         assert "num_classes" in result
 
     def test_num_classes_is_20(self):
+        pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data
 
         result = generate_multidomain_data()
@@ -138,6 +148,7 @@ class TestGenerateMultidomainData:
 
     def test_labels_range_0_to_19(self):
         """Labels should span MNIST 0-9 and Fashion-MNIST 10-19."""
+        pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data
 
         result = generate_multidomain_data()
@@ -156,6 +167,7 @@ class TestGenerateMultidomainData:
 
     def test_image_shape(self):
         """Each batch should have shape (batch, 1, 28, 28)."""
+        pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data
 
         result = generate_multidomain_data(batch_size=32)
