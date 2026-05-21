@@ -165,7 +165,7 @@ class TestTemperedSoftmaxSolver:
         solver2 = TemperedSoftmaxSolver(epsilon=99.0, tau=1.0)
         r1 = solver1.solve(cost_matrix, a=source_marginal)
         r2 = solver2.solve(cost_matrix, a=source_marginal)
-        # Same tau → same result regardless of epsilon
+        # Same tau -> same result regardless of epsilon
         assert torch.allclose(r1.matrix, r2.matrix, atol=1e-7)
 
     def test_different_tau_different_result(self, cost_matrix, source_marginal):

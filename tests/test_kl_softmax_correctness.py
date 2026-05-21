@@ -123,7 +123,7 @@ def test_validation_zero_or_negative_epsilon_raises() -> None:
 def test_default_uniform_marginals_when_a_b_none() -> None:
     C = torch.rand(6, 4)
     res = KLSoftmaxSolver(epsilon=0.1, lam=1.0).solve(C)
-    # Default a uniform → row sums uniform 1/6
+    # Default a uniform -> row sums uniform 1/6
     torch.testing.assert_close(
         res.matrix.sum(dim=1), torch.full((6,), 1.0 / 6), atol=1e-3, rtol=0,
     )

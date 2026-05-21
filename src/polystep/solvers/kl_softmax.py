@@ -8,7 +8,7 @@ Implements the soft-target-marginal formulation:
 with `lam ∈ [0, ∞]`. The two limits are exact:
 
 - `lam = 0`  ≡ ``SoftmaxSolver`` (only row marginal enforced).
-- `lam → ∞` ≡ ``SinkhornSolver`` (both row and column marginals).
+- `lam -> ∞` ≡ ``SinkhornSolver`` (both row and column marginals).
 
 Algorithm (log-domain alternating updates):
 

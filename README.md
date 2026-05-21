@@ -47,7 +47,7 @@ GPU: `pip install torch --index-url https://download.pytorch.org/whl/cu130` (or 
 import torch
 from polystep import PolyStep, Ackley
 
-solver = PolyStep.create(Ackley(dim=10), epsilon=0.5, max_iteration=50)
+solver = PolyStep.create(Ackley(dim=10), epsilon=0.5, max_iterations=50)
 state = solver.run(torch.randn(100, 10))
 print(f"Best cost: {min(state.costs):.4f}")
 ```
@@ -67,7 +67,7 @@ model = nn.Sequential(nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, 10))
 layout = ParamLayout.from_module(model)
 subspace = HybridSubspace.from_layout(layout, rank=8)
 
-# Cosine schedules: broad exploration → fine exploitation
+# Cosine schedules: broad exploration -> fine exploitation
 optimizer = PolyStepOptimizer(
     model, subspace=subspace, solver="softmax",
     epsilon=CosineEpsilon(init=10.0, target=0.1, decay=0.02),

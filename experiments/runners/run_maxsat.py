@@ -104,7 +104,7 @@ def get_polystep_config(num_vars: int) -> dict:
 # At 1M vars, full closure eval is too expensive (4.5 min/step). Delta evaluation
 # builds a CSR inverted index (variable -> clause list), then only re-evaluates
 # ~1664 affected clauses per chunk instead of 4.27M.
-# Tuned: eps 5→0.5, sr 5000→1000, pr 500→100 (from hyperparameter search)
+# Tuned: eps 5->0.5, sr 5000->1000, pr 500->100 (from hyperparameter search)
 PSTORCH_TURBO_1M = {
     "epsilon_init": 5.0,
     "epsilon_target": 0.5,
@@ -443,7 +443,7 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         solver=solver,
     )
 
-    # Clause sampling for 1M+: evaluate random clause subset → 43× compute reduction
+    # Clause sampling for 1M+: evaluate random clause subset -> 43× compute reduction
     clause_sample = cfg.get("clause_sample_size", 0) if turbo else 0
     base_closure = make_sat_closure(
         clause_vars, clause_signs, cra_lambda=cra_lambda, cra_alpha=CRA_ALPHA,

@@ -289,7 +289,7 @@ PRED_LEN = 96
 
 # polystep hyperparameters (HybridSubspace)
 # Best softmax configuration (HybridSubspace + cosine schedules)
-#   - Wider probe radius (10→2) is the key improvement over baseline (5→1)
+#   - Wider probe radius (10->2) is the key improvement over baseline (5->1)
 #   - Momentum essential: no_mom collapses to MSE 0.44
 #   - 20 epochs standardized (was 30, now matched to sweep budget)
 PSTORCH_CONFIG = {

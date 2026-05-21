@@ -3,6 +3,7 @@
 Implements full-rank log-domain Sinkhorn with optional low-rank cost approximation
 via randomized SVD, and auto-selection based on problem size.
 """
+import functools
 import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -42,7 +43,7 @@ class SinkhornResult:
     _R: Optional[torch.Tensor] = None             # Low-rank: (m, r)
     _g_lr: Optional[torch.Tensor] = None           # Low-rank: (r,)
 
-    @property
+    @functools.cached_property
     def matrix(self) -> torch.Tensor:
         """Compute the transport matrix lazily.
 
@@ -245,8 +246,8 @@ class SinkhornSolver:
             cost_matrix = torch.where(finite_mask, cost_matrix,
                                       torch.full_like(cost_matrix, penalty))
 
-        # Scale cost matrix (always clone to prevent aliasing with caller's tensor)
-        cost_matrix = scale_cost_matrix(cost_matrix.clone(), scale_cost)
+        # Scale cost matrix (division creates a new tensor; no clone needed)
+        cost_matrix = scale_cost_matrix(cost_matrix, scale_cost)
 
         # Log kernel: log_K = -C / eps
         eps = self.epsilon
@@ -570,7 +571,7 @@ class SinkhornSolver:
         if b is None:
             b = torch.ones(m, device=device, dtype=dtype) / m
 
-        cost_matrix = scale_cost_matrix(cost_matrix.clone(), scale_cost)
+        cost_matrix = scale_cost_matrix(cost_matrix, scale_cost)
         fixed_mode = self.threshold <= 0
         omega = self.omega
 
@@ -604,7 +605,9 @@ class SinkhornSolver:
         n_iters = 0
         errors: List[float] = []
 
-        with torch.no_grad():
+        with torch.no_grad(), \
+                torch.amp.autocast("cuda", enabled=False), \
+                torch.amp.autocast("cpu", enabled=False):
             if fixed_mode:
                 # Fixed-iteration path: compiled body with post-loop NaN check
                 sinkhorn_iter = self._compiled.sinkhorn_iter
@@ -624,16 +627,14 @@ class SinkhornSolver:
 
                     n_iters = i + 1
 
-                    if torch.isnan(f).any() or torch.isinf(f).any():
-                        f.zero_()
-                        g.zero_()
-                        break
-                    if torch.isnan(g).any() or torch.isinf(g).any():
-                        f.zero_()
-                        g.zero_()
-                        break
-
                     if (i + 1) % self.check_every == 0:
+                        # NaN/Inf check (batched with convergence check to minimize GPU syncs)
+                        if (torch.isnan(f).any() or torch.isinf(f).any()
+                                or torch.isnan(g).any() or torch.isinf(g).any()):
+                            f.zero_()
+                            g.zero_()
+                            break
+
                         log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
                         marginal_a_hat = torch.exp(torch.logsumexp(log_P_row, dim=1))
                         marginal_b_hat = torch.exp(torch.logsumexp(log_P_row, dim=0))

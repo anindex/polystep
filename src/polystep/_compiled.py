@@ -35,7 +35,7 @@ import torch
 
 
 # Note: "reduce-overhead" uses CUDA graphs which cause tensor ownership conflicts
-# when chaining multiple compiled functions (rotate→probe→barycentric) within one step.
+# when chaining multiple compiled functions (rotate->probe->barycentric) within one step.
 # "default" mode still compiles with Inductor but avoids CUDA graph issues.
 DEFAULT_MODE = "default"
 
@@ -262,7 +262,8 @@ class CompiledFunctions:
     DEFAULT_MODE = DEFAULT_MODE
 
     def __init__(self, compile: bool = True) -> None:
-        if compile and torch.cuda.is_available():
+        self.compile = compile and torch.cuda.is_available()
+        if self.compile:
             self.sinkhorn_iter = try_compile(
                 _sinkhorn_iteration, name="sinkhorn_iteration"
             )
@@ -292,16 +293,23 @@ class CompiledFunctions:
         include compilation overhead. Call before benchmarking to get accurate
         timing measurements.
 
+        No-ops when compilation is disabled (``compile=False``).
+
         Args:
-            dim: Dimensionality for dummy tensors.
-            batch: Batch size for dummy tensors.
+            dim: Dimensionality for dummy tensors. For best results, match
+                the actual ``particle_dim`` of your problem.
+            batch: Batch size for dummy tensors. For best results, match
+                the actual ``num_particles`` of your problem.
             device: Device for dummy tensors. Defaults to CPU if None.
         """
+        if not self.compile:
+            return  # No JIT compilation to warm up
+
         if device is None:
             device = torch.device("cpu")
         num_verts = 2 * dim
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Warm sinkhorn_iter
             f = torch.zeros(batch, device=device)
             g = torch.zeros(batch, device=device)

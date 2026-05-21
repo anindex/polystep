@@ -11,7 +11,7 @@ Model: HardMoENet (~235K params) - top-1 argmax gating (non-differentiable)
 Data: Combined MNIST + Fashion-MNIST (20 classes)
 
 polystep config from r4_sr12t4 config (90.92% at 20ep, seed 42):
-  Flat eps=0.5 (eps scheduling → collapse), scheduled sr 12→4,
+  Flat eps=0.5 (eps scheduling -> collapse), scheduled sr 12->4,
   flat pr=1.0, rank=4, advanced features (biased_rotation, anderson, adaptive_omega).
 
 Results saved as: experiments/results/softmax/main/moe_{method}_{seed}.json
@@ -70,10 +70,10 @@ SPSA_CONFIG = {"a": 0.1, "c": 0.1, "alpha": 0.602, "gamma": 0.101, "max_iters": 
 # polystep config - r4_sr12t4 config (90.92% at 20ep, seed 42)
 # HYBRID: flat eps + flat pr, but SCHEDULED sr only
 # eps ≤ 0.5 mandatory - eps scheduling causes MoE collapse (2.66% at eps=1.5)
-# sr scheduling (12→4) with rank=4 beats flat rank=8 while being 2× faster
+# sr scheduling (12->4) with rank=4 beats flat rank=8 while being 2× faster
 PSTORCH_CONFIG = {
-    "epsilon": 0.5,                     # FLAT - eps scheduling → collapse
-    "step_radius_init": 12.0,          # sr scheduling: 12→4
+    "epsilon": 0.5,                     # FLAT - eps scheduling -> collapse
+    "step_radius_init": 12.0,          # sr scheduling: 12->4
     "step_radius_target": 4.0,
     "probe_radius": 1.0,               # FLAT
     "num_probe": 1, "rank": 4,
@@ -126,7 +126,7 @@ def run_polystep(seed, device, results_dir, epochs=EPOCHS, dry_run=False,
     # Epsilon: FLAT (no CosineEpsilon - eps scheduling destroys MoE)
     epsilon_value = PSTORCH_CONFIG["epsilon"]
 
-    # Step radius: CosineEpsilon scheduled 12→4
+    # Step radius: CosineEpsilon scheduled 12->4
     if "step_radius_init" in PSTORCH_CONFIG:
         sr_decay = (PSTORCH_CONFIG["step_radius_init"] - PSTORCH_CONFIG["step_radius_target"]) / max(1, total_steps)
         step_radius_value = CosineEpsilon(

@@ -104,7 +104,7 @@ def compute_cma_hyperparameters(n: int, mu_eff: float = 2.0) -> Dict[str, float]
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def update_evolution_path_sigma(
     p_sigma: torch.Tensor,
     displacement: torch.Tensor,
@@ -143,7 +143,7 @@ def update_evolution_path_sigma(
     return (1 - c_sigma) * p_sigma + sqrt_factor * C_inv_sqrt * displacement
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def update_evolution_path_c(
     p_c: torch.Tensor,
     displacement: torch.Tensor,
@@ -180,7 +180,7 @@ def update_evolution_path_c(
     return (1 - c_c) * p_c + h_sigma_float * sqrt_factor * displacement
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_heaviside_sigma(
     p_sigma_norm: float,
     expected_norm: float,
@@ -229,7 +229,7 @@ def compute_heaviside_sigma(
     return p_sigma_norm < threshold
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def update_step_size_csa(
     sigma: float,
     p_sigma: torch.Tensor,
@@ -276,7 +276,7 @@ def update_step_size_csa(
     return max(1e-6, min(sigma_new, 100.0))
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def update_covariance_diagonal(
     C_diag: torch.Tensor,
     p_c: torch.Tensor,
@@ -342,7 +342,7 @@ def update_covariance_diagonal(
     return torch.clamp(C_new, min=cov_min, max=cov_max)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_ot_weights(
     transport_matrix: torch.Tensor,
     source_marginal: torch.Tensor,
@@ -350,32 +350,44 @@ def compute_ot_weights(
     """Compute particle weights from OT transport plan for rank-mu update.
 
     In standard CMA-ES, weights come from ranking (best mu out of lambda).
-    In OT-CMA-ES, we use the transport masses: particles that move more
-    mass contribute more to the covariance update.
+    In OT-CMA-ES, we use the transport entropy: particles with focused
+    (low-entropy) transport indicate confident descent directions and
+    contribute more to the covariance update.
+
+    Note: The naive approach of using row-sum mass does NOT work because
+    row sums of a valid transport plan equal the source marginal (uniform
+    by default), making all weights identical.
 
     Args:
         transport_matrix: OT transport plan, shape (num_particles, num_vertices).
             Entry T[i,v] indicates mass transported from particle i to vertex v.
         source_marginal: Source marginal (particle masses), shape (num_particles,).
-            Not used in current implementation but kept for API consistency.
 
     Returns:
         Normalized weights, shape (num_particles,), summing to approximately 1.0.
-
-    Note:
-        The source_marginal parameter is kept for future extensions where
-        we might want to weight by relative transport (mass_moved / source_mass).
+        Higher weights for particles with more focused (lower entropy) transport.
     """
-    # Total mass moved by each particle
-    mass_moved = transport_matrix.sum(dim=1)  # (num_particles,)
+    # Normalize transport per particle to get a probability distribution
+    row_sums = transport_matrix.sum(dim=1, keepdim=True).clamp(min=1e-10)
+    probs = transport_matrix / row_sums  # (P, V)
+
+    # Compute per-particle transport entropy: H_i = -sum_v p(v|i) log p(v|i)
+    # Low entropy = focused transport = confident direction
+    log_probs = torch.log(probs.clamp(min=1e-30))
+    entropy = -(probs * log_probs).sum(dim=1)  # (P,)
+
+    # Convert entropy to weights: lower entropy -> higher weight
+    # Use inverse entropy (add eps to avoid division by zero for perfectly
+    # focused transport where entropy = 0)
+    weights = 1.0 / (entropy + 1e-6)
 
     # Normalize to weights that sum to 1
-    weights = mass_moved / (mass_moved.sum() + 1e-10)
+    weights = weights / (weights.sum() + 1e-10)
 
     return weights
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_ot_bias_directions(
     transport_matrix: torch.Tensor,
     X_vertices: torch.Tensor,

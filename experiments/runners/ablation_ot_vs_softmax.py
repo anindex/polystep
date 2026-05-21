@@ -47,7 +47,7 @@ from experiments.runners.nondiff_models import SpikingMNISTNet
 
 RESULTS_DIR = os.path.join("results", "ot_ablation")
 
-# Solver name mapping: ablation rule name → PolyStepOptimizer solver string
+# Solver name mapping: ablation rule name -> PolyStepOptimizer solver string
 SOLVER_MAP = {
     "entropic_ot": "sinkhorn",
     "softmax": "softmax",

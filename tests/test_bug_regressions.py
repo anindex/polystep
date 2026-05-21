@@ -238,7 +238,7 @@ class TestBlockwiseTurboFeatures:
         def closure(bp):
             return evaluator.evaluate(bp, inputs, targets)
 
-        # First step: full OT (amortize counter=0 → triggers full OT)
+        # First step: full OT (amortize counter=0 -> triggers full OT)
         optimizer.step(closure)
         ema = optimizer._transport_direction_ema
         assert ema is not None, (

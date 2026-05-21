@@ -731,7 +731,7 @@ class PolyStepOptimizer:
             # Subspace mode: subspace coords reshaped to multi-particle format.
             # Use the user-specified particle_dim if it was explicitly set;
             # otherwise fall back to subspace_particle_dim (default 8) for a
-            # stronger per-step OT signal (orthoplex in 8D → 16 vertices).
+            # stronger per-step OT signal (orthoplex in 8D -> 16 vertices).
             self._base_params = {k: v.clone() for k, v in model.state_dict().items()}
             sub_dim = subspace.subspace_dim
             pdim = subspace_particle_dim
@@ -760,8 +760,9 @@ class PolyStepOptimizer:
         # This gives a small number of vertices (e.g., 4 for orthoplex in 2D).
         # Skip when using block-wise mode (per-block polytopes used instead).
         if block_strategy == 'monolithic':
-            origin = torch.zeros(particle_dim, dtype=X_init.dtype, device=device)
-            self._polytope_vertices = POLYTOPE_MAP[polytope_type](origin, radius=1.0)
+            self._polytope_vertices = POLYTOPE_MAP[polytope_type](
+                particle_dim, device=device, dtype=X_init.dtype, radius=1.0,
+            )
         else:
             self._polytope_vertices = None  # per-block polytopes used instead
 
@@ -960,11 +961,10 @@ class PolyStepOptimizer:
 
             self._subspace_block_polytopes = []
             for block in self._subspace_blocks:
-                block_origin = torch.zeros(
-                    block.particle_dim, dtype=X_init.dtype, device=device,
-                )
                 self._subspace_block_polytopes.append(
-                    POLYTOPE_MAP[polytope_type](block_origin, radius=1.0)
+                    POLYTOPE_MAP[polytope_type](
+                        block.particle_dim, device=device, dtype=X_init.dtype, radius=1.0,
+                    )
                 )
 
             self._state.block_duals = [(None, None) for _ in self._subspace_blocks]
@@ -987,11 +987,10 @@ class PolyStepOptimizer:
                 )
             self._block_polytopes = []
             for block in self._blocks:
-                block_origin = torch.zeros(
-                    block.particle_dim, dtype=X_init.dtype, device=device,
-                )
                 self._block_polytopes.append(
-                    POLYTOPE_MAP[polytope_type](block_origin, radius=1.0)
+                    POLYTOPE_MAP[polytope_type](
+                        block.particle_dim, device=device, dtype=X_init.dtype, radius=1.0,
+                    )
                 )
             self._state.block_duals = [(None, None) for _ in self._blocks]
 
@@ -1156,7 +1155,7 @@ class PolyStepOptimizer:
     # Step: entry point
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def step(self, closure: Callable) -> float:
         """Run one optimization step.
 

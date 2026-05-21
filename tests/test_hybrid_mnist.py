@@ -179,7 +179,7 @@ def _evaluate(model, dataloader):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: HybridSubspace can train (loss decreases)
+# HybridSubspace can train (loss decreases)
 # ---------------------------------------------------------------------------
 
 
@@ -258,7 +258,7 @@ def test_hybrid_subspace_trains(small_mnist_loaders):
 
 
 # ---------------------------------------------------------------------------
-# Test 2: HybridSubspace achieves higher accuracy than AdaptiveSubspace
+# HybridSubspace achieves higher accuracy than AdaptiveSubspace
 # ---------------------------------------------------------------------------
 
 
@@ -345,7 +345,7 @@ def test_hybrid_accuracy_above_adaptive(mnist_loaders):
 
 
 # ---------------------------------------------------------------------------
-# Test 3: HybridSubspace reaches accuracy threshold
+# HybridSubspace reaches accuracy threshold
 # ---------------------------------------------------------------------------
 
 
@@ -403,7 +403,7 @@ def test_hybrid_accuracy_threshold(mnist_loaders):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: HybridSubspace absorb triggers during training
+# HybridSubspace absorb triggers during training
 # ---------------------------------------------------------------------------
 
 

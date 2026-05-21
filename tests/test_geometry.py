@@ -27,49 +27,36 @@ class TestPolytopes:
     @pytest.mark.parametrize("dim", [2, 3, 5, 10])
     def test_orthoplex_vertex_count(self, dim):
         """Orthoplex generates exactly 2*dim vertices."""
-        origin = torch.zeros(dim)
-        verts = get_orthoplex_vertices(origin)
+        verts = get_orthoplex_vertices(dim)
         assert verts.shape == (2 * dim, dim), \
             f"Expected ({2*dim}, {dim}), got {verts.shape}"
 
     @pytest.mark.parametrize("dim", [2, 3, 5, 10])
     def test_simplex_vertex_count(self, dim):
         """Simplex generates exactly dim+1 vertices."""
-        origin = torch.zeros(dim)
-        verts = get_simplex_vertices(origin)
+        verts = get_simplex_vertices(dim)
         assert verts.shape == (dim + 1, dim), \
             f"Expected ({dim+1}, {dim}), got {verts.shape}"
 
     @pytest.mark.parametrize("dim", [2, 3, 4])
     def test_cube_vertex_count(self, dim):
         """Cube generates exactly 2^dim vertices."""
-        origin = torch.zeros(dim)
-        verts = get_cube_vertices(origin)
+        verts = get_cube_vertices(dim)
         assert verts.shape == (2 ** dim, dim), \
             f"Expected ({2**dim}, {dim}), got {verts.shape}"
 
     def test_orthoplex_centered_at_origin(self):
-        """Orthoplex centered at origin has mean close to zero."""
+        """Orthoplex vertices are centered at the origin."""
         dim = 5
-        origin = torch.zeros(dim)
-        verts = get_orthoplex_vertices(origin, radius=1.0)
+        verts = get_orthoplex_vertices(dim, radius=1.0)
         mean = verts.mean(dim=0)
         assert torch.allclose(mean, torch.zeros(dim), atol=1e-6), \
             f"Mean: {mean}"
 
-    def test_orthoplex_offset_by_origin(self):
-        """Orthoplex offset by non-zero origin has mean close to that origin."""
-        origin = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
-        verts = get_orthoplex_vertices(origin, radius=1.0)
-        mean = verts.mean(dim=0)
-        assert torch.allclose(mean, origin, atol=1e-6), \
-            f"Mean: {mean}, Expected: {origin}"
-
     def test_simplex_equidistant(self):
         """Simplex vertices are pairwise equidistant."""
         dim = 4
-        origin = torch.zeros(dim)
-        verts = get_simplex_vertices(origin, radius=1.0)
+        verts = get_simplex_vertices(dim, radius=1.0)
 
         # Compute all pairwise distances
         n_verts = verts.shape[0]
@@ -202,7 +189,7 @@ class TestProbes:
 
         origin = torch.randn(batch, dim)
         probes = torch.linspace(0, 1, num_probe)
-        polytope_verts = get_orthoplex_vertices(torch.zeros(dim))  # (2*dim, dim)
+        polytope_verts = get_orthoplex_vertices(dim)  # (2*dim, dim)
 
         gen = torch.Generator()
         gen.manual_seed(42)
@@ -226,7 +213,7 @@ class TestProbes:
         batch = 2
         origin = torch.randn(batch, dim)
         probes = torch.linspace(0, 1, 4)
-        polytope_verts = get_orthoplex_vertices(torch.zeros(dim))
+        polytope_verts = get_orthoplex_vertices(dim)
 
         gen1 = torch.Generator()
         gen1.manual_seed(99)

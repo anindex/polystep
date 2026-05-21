@@ -90,7 +90,7 @@ MAX_TRAIN = 5000       # Limit training samples for feasibility
 MAX_SEQ_LEN = 128
 
 # Head-only fine-tuning configs (train classifier head only, freeze backbone)
-# CosineEpsilon scheduling: broader exploration early → refinement
+# CosineEpsilon scheduling: broader exploration early -> refinement
 # K=1 optimal (single probe, softmax solver auto-selected)
 # Momentum smooths trajectory on 1538-param landscape
 HEADONLY_PSTORCH_CONFIG = {

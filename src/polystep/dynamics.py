@@ -43,7 +43,7 @@ def compute_momentum_coefficient(
     return momentum_init + progress * (momentum_final - momentum_init)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def apply_momentum(
     X_old: torch.Tensor,
     X_barycentric: torch.Tensor,
@@ -74,7 +74,7 @@ def apply_momentum(
     return X_new, velocity_new
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def update_adaptive_radius(
     current_loss: float,
     prev_loss: float,

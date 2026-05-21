@@ -80,8 +80,10 @@ Global rotating orthogonal projection. Fastest wall-clock time, lower accuracy.
 
 ```python
 from polystep import AdaptiveSubspace
+from polystep.transform import ParamLayout
 
-subspace = AdaptiveSubspace(param_dim=total_params, subspace_dim=64)
+layout = ParamLayout.from_module(model)
+subspace = AdaptiveSubspace.from_layout(layout, rank=64)
 ```
 
 ### LinearSubspace
@@ -90,8 +92,10 @@ Fixed random projection baseline.
 
 ```python
 from polystep import LinearSubspace
+from polystep.transform import ParamLayout
 
-subspace = LinearSubspace(param_dim=total_params, subspace_dim=64)
+layout = ParamLayout.from_module(model)
+subspace = LinearSubspace.from_layout(layout, rank=8)
 ```
 
 ### SparseRandomProjection
@@ -122,11 +126,11 @@ lstm = VmapSafeLSTM(input_size=128, hidden_size=256, num_layers=2)
 For synthetic objectives or custom optimization loops.
 
 ```python
-from polystep import PolyStep, SolverState
+from polystep import PolyStep
 
 solver = PolyStep.create(objective_fn,
     epsilon=0.5,
-    max_iteration=100,
+    max_iterations=100,
     polytope_type='orthoplex',
 )
 
@@ -134,7 +138,7 @@ solver = PolyStep.create(objective_fn,
 state = solver.run(X_init)
 
 # Or step-by-step
-state = SolverState(X=X_init)
+state = solver.init_state(X_init)
 for i in range(100):
     state = solver.step(state)
 ```

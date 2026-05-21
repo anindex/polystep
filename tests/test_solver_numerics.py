@@ -104,10 +104,9 @@ def test_sinkhorn_no_nan_across_eps_cost_grid():
 
 def test_softmax_handles_single_inf_entry():
     """A +Inf cost entry models a hard constraint: that vertex must not
-    be picked. Pre-fix softmax produced NaN because the whole row went
-    to -Inf in `-C/eps`. Post-fix the +Inf is replaced with a large
-    finite penalty so the masked entry still gets near-zero weight
-    while the rest of the row stays valid."""
+    be picked. The +Inf is replaced with a large finite penalty so the
+    masked entry still gets near-zero weight while the rest of the row
+    stays valid."""
     P, V = 4, 8
     torch.manual_seed(0)
     C = torch.randn(P, V)

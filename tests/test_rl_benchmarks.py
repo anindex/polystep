@@ -84,7 +84,7 @@ def test_nondiff_policy_zero_grad():
         logits = pol(x)
         loss = logits.sum()
         loss.backward()
-        # First Linear sits below the non-diff op → must have zero (or None) grad.
+        # First Linear sits below the non-diff op -> must have zero (or None) grad.
         first_w_grad = pol.net[0].weight.grad
         assert first_w_grad is not None
         assert torch.allclose(first_w_grad, torch.zeros_like(first_w_grad)), (
@@ -191,7 +191,7 @@ def test_hardened_env_smoke():
     env = SparseRewardWrapper(gym.make("CartPole-v1"), bucket=10.0, deadband=2.0)
     env.reset(seed=0)
     _, r, _, _, _ = env.step(0)
-    assert r == 0.0  # CartPole step reward is 1 < deadband 2 → bucketed to 0
+    assert r == 0.0  # CartPole step reward is 1 < deadband 2 -> bucketed to 0
     env.close()
 
     # End-to-end factory + Gym registration

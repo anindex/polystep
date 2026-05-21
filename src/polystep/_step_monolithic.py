@@ -115,23 +115,20 @@ def step_monolithic(opt, closure: Callable) -> float:
         bias_dir = opt._prev_descent_direction  # (P, pdim)
         bias_norms = torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
         bias_dir_norm = bias_dir / bias_norms  # (P, pdim)
-        # Save original rotation matrices BEFORE modification for Gram-Schmidt fallback
+        # Save original rotation matrices BEFORE modification for fallback
         rot_mats_orig = rot_mats.clone()
         # Replace column 0 with normalized bias direction
         rot_mats[:, :, 0] = bias_dir_norm
-        # Re-orthogonalize remaining columns via Gram-Schmidt
-        for col in range(1, pdim):
-            v = rot_mats[:, :, col].clone()
-            for prev_col in range(col):
-                proj = (v * rot_mats[:, :, prev_col]).sum(dim=-1, keepdim=True)
-                v = v - proj * rot_mats[:, :, prev_col]
-            raw_norm = torch.norm(v, dim=-1, keepdim=True)
-            norms_v = raw_norm.clamp(min=1e-10)
-            # Only replace column if sufficiently independent
-            mask = (raw_norm > 1e-6).float()
-            rot_mats[:, :, col] = mask * (v / norms_v) + (1 - mask) * rot_mats_orig[:, :, col]
+        # Re-orthogonalize via QR decomposition (vectorized, replaces Python loop)
+        # QR on the transposed matrix: columns of rot_mats are rows of rot_mats^T
+        # QR preserves column 0 direction (bias), orthogonalizes the rest
+        Q, _ = torch.linalg.qr(rot_mats)
+        # Fall back to original for any batch element where QR produced NaN
+        # (degenerate case: bias direction nearly parallel to other columns)
+        valid = torch.isfinite(Q).all(dim=-1).all(dim=-1)  # (P,)
+        rot_mats = torch.where(valid[:, None, None], Q, rot_mats_orig)
 
-        # Fix determinant: Gram-Schmidt can flip det from +1 to -1.
+        # Fix determinant: QR can produce det=-1 matrices.
         # Correct by flipping the last column for matrices with det < 0.
         dets = torch.det(rot_mats)
         flip = (dets < 0).unsqueeze(-1)  # (P, 1)
@@ -193,7 +190,7 @@ def step_monolithic(opt, closure: Callable) -> float:
         losses = torch.empty(total_evals, dtype=torch.float32, device=device)
 
         # Pre-allocate batch_configs buffer for reuse across chunks
-        _batch_configs_buf = X.unsqueeze(0).expand(chunk, -1, -1).contiguous().clone() if chunk <= total_evals else None
+        _batch_configs_buf = X.unsqueeze(0).expand(chunk, -1, -1).clone() if chunk <= total_evals else None
         # Pre-allocate local range tensors (avoid repeated arange calls)
         _local_range_full = torch.arange(chunk, device=device) if chunk <= total_evals else None
 
@@ -1068,4 +1065,4 @@ def step_monolithic(opt, closure: Callable) -> float:
     # 12. Write particles back to model
     opt._sync_model()
 
-    return cost_matrix.mean().item()
+    return _cost_mean

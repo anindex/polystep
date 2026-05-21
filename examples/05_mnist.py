@@ -149,7 +149,7 @@ def main():
 
     # --- Optimizer config (matches paper runner) ---
     # HybridSubspace rank=8 gives 16 polytope vertices per step.
-    # Cosine schedules: broad exploration early → fine exploitation late.
+    # Cosine schedules: broad exploration early -> fine exploitation late.
     total_steps = args.epochs * len(train_loader)
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(layout, rank=8,
@@ -180,7 +180,7 @@ def main():
 
     print(f"  params: {num_params:,}  device: {device}  epochs: {args.epochs}")
     print(f"  subspace: HybridSubspace rank=8  solver: softmax")
-    print(f"  eps: {eps_init}→{eps_target}  sr: {sr_init}→{sr_target}  pr: {pr_init}→{pr_target}")
+    print(f"  eps: {eps_init}->{eps_target}  sr: {sr_init}->{sr_target}  pr: {pr_init}->{pr_target}")
     print()
 
     init_acc = evaluate(model, test_loader)

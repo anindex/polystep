@@ -595,7 +595,7 @@ class TestAdaptiveOmega:
 
 
 class TestFixedModeLogic:
-    """Tests for fixed_mode determination (OR → AND fix).
+    """Tests for fixed_mode determination (OR -> AND fix).
 
     Before the fix, fixed_mode = threshold <= 0 OR check_every > max_iterations.
     This meant that setting check_every > max_iterations silently forced the solver

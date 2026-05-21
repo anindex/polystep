@@ -233,7 +233,7 @@ class AdaptiveSubspace:
     # Rotation
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def rotate(
         self,
         projection: torch.Tensor,
@@ -320,7 +320,7 @@ class AdaptiveSubspace:
                 device, dtype, generator,
             )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _rotate_random(
         self,
         device: str | torch.device,
@@ -342,7 +342,7 @@ class AdaptiveSubspace:
             generator=generator,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _rotate_displacement(
         self,
         projection: torch.Tensor,
@@ -423,7 +423,7 @@ class AdaptiveSubspace:
 
         return P_new
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _rotate_ot_bias(
         self,
         transport_matrix: torch.Tensor,

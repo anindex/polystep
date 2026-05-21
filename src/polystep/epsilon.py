@@ -196,10 +196,15 @@ class CosineEpsilon:
             # Warm restart: find which period we're in
             period = T
             t = iteration
-            while t >= period:
+            # Guard: limit iterations to prevent unbounded loop when
+            # restart_mult is very close to 1.0 or period is tiny
+            max_restarts = 100
+            restarts = 0
+            while t >= period and period > 0 and restarts < max_restarts:
                 t -= period
                 period = int(period * self.restart_mult)
-            T_local = period
+                restarts += 1
+            T_local = max(period, 1)
             t_local = t
         else:
             T_local = T

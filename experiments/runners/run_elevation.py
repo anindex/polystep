@@ -151,8 +151,8 @@ PSTORCH_CONFIGS = {
         "chunk_size": 1024, "amortize_steps": 1,
         "rotation_interval": 0, "absorb_interval": 0,
     },
-    # Staircase: Retuned from sr64→16 which degraded after epoch 11
-    # Gentler cosine targets (64→32, eps 5→1) eliminate late-epoch degradation
+    # Staircase: Retuned from sr64->16 which degraded after epoch 11
+    # Gentler cosine targets (64->32, eps 5->1) eliminate late-epoch degradation
     # 15ep tune: cosine_64_32=91.96%/91.10% vs cosine_64_16=91.80%/89.15%
     "staircase": {
         "epsilon_init": 5.0, "epsilon_target": 1.0,

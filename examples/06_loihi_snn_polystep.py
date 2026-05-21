@@ -24,7 +24,7 @@ Phase B -- On-chip readout adaptation under input shift. Hidden layer is
       3. Two probes per step (``--adapt-num-probe 2``) for variance
          reduction on the noisier shifted landscape.
 
-Both phases use **best-test early stopping** (patience 4 — higher than
+Both phases use **best-test early stopping** (patience 4 - higher than
 typical SGD because zeroth-order test curves are noisier per epoch).
 The model weights at the end of each phase are the checkpoint with the
 highest test accuracy on that phase's target distribution (clean for
@@ -35,8 +35,7 @@ reported recovery is a paired comparison free of sampling jitter.
 
 Backends. ``--backend cpu_sim`` (default) uses PyTorch as the forward
 evaluator. The host loop is identical to the on-chip loop -- only
-``LoihiSpikeEvaluator.evaluate`` would change for ``--backend loihi2``
-(Phase-2 deliverable; gated by INRC membership; Lava archived 13 May 2026).
+``LoihiSpikeEvaluator.evaluate`` would change for ``--backend loihi2``.
 
 Run::
 
@@ -603,7 +602,7 @@ def _save_visualization(
         color=_COLOR_RECOVERED, fontweight="bold",
     )
 
-    # Custom legend (clean / shifted-failed / shifted-recovered) — placed
+    # Custom legend (clean / shifted-failed / shifted-recovered) - placed
     # horizontally above the bar axis so it never overlaps the data.
     legend_handles = [
         mpatches.Patch(color=_COLOR_CLEAN, label="Clean test"),
@@ -624,21 +623,21 @@ def _save_visualization(
     fig.text(
         0.985, 0.005,
         f"Phase B adapts only {n_writable:,} / {n_total:,} params "
-        f"({pct_writable:.1f} %) — the Loihi 2 runtime-writable subset "
+        f"({pct_writable:.1f} %) - the Loihi 2 runtime-writable subset "
         "(fc2 + per-population vth, β).",
         ha="right", va="bottom", fontsize=8.0, color="#555", style="italic",
     )
 
     # Suptitle
     fig.suptitle(
-        "PolyStep → Loihi 2 (skeleton):  spiking MNIST + on-chip readout adaptation",
+        "PolyStep -> Loihi 2 (skeleton):  spiking MNIST + on-chip readout adaptation",
         fontsize=13, fontweight="bold", y=0.965,
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180, facecolor="white")
     plt.close(fig)
-    print(f"  [viz] saved → {out_path}")
+    print(f"  [viz] saved -> {out_path}")
 
 
 # ---------------------------------------------------------------------------

@@ -59,7 +59,7 @@ python experiments/runners/run_mnist.py          # ~30 min
 ### MAX-SAT
 
 ```bash
-python experiments/runners/run_maxsat.py         # Scales: 100 → 1M variables
+python experiments/runners/run_maxsat.py         # Scales: 100 -> 1M variables
 ```
 
 ### Time Series (ETTh1)

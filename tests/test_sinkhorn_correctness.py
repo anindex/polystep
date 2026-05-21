@@ -67,12 +67,8 @@ def test_sinkhorn_warm_start_rescale_on_eps_change():
     """When epsilon changes between solves, the dual potentials must be
     rescaled by ``eps_new / eps_old`` to preserve convergence speed.
 
-    Without rescaling the warm-started f/g are off by a factor that
-    inflates iteration count; the post-fix path accepts ``init_eps`` so
-    the caller can opt into rescaling.
-
-    Pre-fix: solver accepts no `init_eps` arg -> raises TypeError.
-    Post-fix: rescaled warm-start converges within 3x the iterations of
+    The solver accepts ``init_eps`` so the caller can opt into rescaling.
+    Rescaled warm-start converges within 3x the iterations of
     the cold start (vs 5-10x without rescaling).
     """
     P, V = 16, 32
@@ -201,10 +197,6 @@ def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
     """When omega is set near the unstable boundary on an ill-conditioned
     cost, three consecutive growth steps must trigger an automatic
     back-off to omega=1.0 plus a UserWarning.
-
-    Pre-fix: no detector exists; solver may diverge silently and zero the
-    duals.
-    Post-fix: detector backs omega off and emits a "divergence" warning.
     """
     P, V = 32, 64
     # Ill-conditioned: large dynamic range relative to eps
@@ -255,13 +247,10 @@ def test_sinkhorn_omega_sweep(omega):
 
 
 def test_sinkhorn_warm_start_centered_under_cost_shift():
-    """Warm-started duals (and the `data_dependent_init` cold init) must
-    be re-centered after warm-start validation so |f|.max stays bounded
-    even when the cost matrix mean shifts between solves.
-
-    Pre-fix: f.mean() can grow unboundedly across many cost shifts.
-    Post-fix: the solver re-centers f and g (zero-mean), so |f|.max is
-    bounded by O(cost_scale).
+    """Warm-started duals must be re-centered after warm-start validation
+    so |f|.max stays bounded even when the cost matrix mean shifts
+    between solves. The solver re-centers f and g (zero-mean), so
+    |f|.max is bounded by O(cost_scale).
     """
     P, V = 16, 32
     eps = 0.1
@@ -290,9 +279,7 @@ def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
     matrix must converge to similar accuracy as plain Sinkhorn (Chizat 2020:
     when Anderson would regress, fall back to the plain iterate).
 
-    Pre-fix: no regression check; Anderson may push the iterate to a worse
-    Lyapunov than plain Sinkhorn would have.
-    Post-fix: regression-check guard accepts only Anderson updates that
+    The regression-check guard accepts only Anderson updates that
     do not decrease the Lyapunov function below the plain iterate.
     """
     # Moderately ill-conditioned (range/eps = 10/0.1 = 100). Lower than

@@ -513,15 +513,19 @@ class TestOTWeights:
         assert torch.allclose(weights, expected, atol=1e-5)
 
     def test_concentrated_transport(self):
-        """Particle with most transport gets highest weight."""
+        """Particle with focused transport (low entropy) gets highest weight."""
         P, V = 5, 4
-        transport_matrix = torch.zeros(P, V)
-        transport_matrix[0, :] = 1.0  # Particle 0 transports all mass
+        # All particles have uniform transport except particle 0
+        transport_matrix = torch.ones(P, V) / (P * V)
+        # Particle 0 concentrates all its mass on vertex 0 (entropy ≈ 0)
+        transport_matrix[0, :] = 0.0
+        transport_matrix[0, 0] = 1.0 / P  # same row sum as others
         source_marginal = torch.ones(P) / P
 
         weights = compute_ot_weights(transport_matrix, source_marginal)
-        assert weights[0].item() == pytest.approx(1.0, rel=1e-5)
-        assert (weights[1:] < 1e-5).all()
+        # Particle 0 has lowest entropy -> highest weight
+        assert weights[0].item() > weights[1].item()
+        assert weights[0].item() > 0.5  # should dominate
 
     def test_zero_transport_matrix_handled(self):
         """Edge case: zero transport matrix doesn't crash (uses epsilon)."""

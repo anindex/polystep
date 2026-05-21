@@ -1173,7 +1173,7 @@ def run_es_gym(
             noise[name] = torch.cat([eps_half, -eps_half], dim=0)  # (popsize, *)
 
         stacked = _make_stacked(noise, sigma)
-        # Use evaluator: returns (popsize, R) → mean over R is fitness per candidate.
+        # Use evaluator: returns (popsize, R) -> mean over R is fitness per candidate.
         result = evaluator.rollout_stacked_params(stacked, seed=seed, step=gen)
         fitness = result.returns.mean(dim=1).detach().cpu()  # (popsize,)
         env_steps_cumulative += int(popsize) * rollouts_per_candidate * horizon

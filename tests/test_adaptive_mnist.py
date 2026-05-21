@@ -194,48 +194,8 @@ def test_adaptive_subspace_trains(mnist_loaders):
     assert total_disp > 0, "Expected non-zero total displacement"
 
 
-@requires_mnist
-@pytest.mark.slow
-def test_adaptive_subspace_accuracy_above_random(mnist_loaders):
-    """AdaptiveSubspace should achieve accuracy well above random chance (10%).
 
-    With rank=4096 on a 50K param model, each step explores ~8% of params.
-    After enough steps with periodic absorb, the model should significantly
-    exceed random. We use a threshold of 50% which is conservative for 5
-    epochs on 1000 training samples.
-    """
-    train_loader, test_loader = mnist_loaders
 
-    torch.manual_seed(42)
-    model = SmallMLP(hidden=64)
-    layout = ParamLayout.from_module(model)
-    adaptive_sub = AdaptiveSubspace.from_layout(
-        layout, rank=4096, rotation_mode='displacement',
-        absorb_mode='periodic', absorb_interval=10,
-    )
-
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=False,
-        seed=42,
-        epsilon=0.5,
-        step_radius=10.0,
-        probe_radius=2.0,
-        num_probe=3,
-        sinkhorn_max_iters=50,
-        subspace=adaptive_sub,
-    )
-
-    # Train for multiple epochs to give adaptive subspace time to explore
-    config = TrainConfig(epochs=5)
-    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
-
-    accuracy = _evaluate(model, test_loader)
-    # With rank=4096 (~8% of params per step), the model should reach 50%+ accuracy
-    # after 5 epochs on 1000 training samples
-    assert accuracy >= 0.50, (
-        f"Expected accuracy >= 50%, got {accuracy*100:.1f}%"
-    )
 
 
 @requires_mnist

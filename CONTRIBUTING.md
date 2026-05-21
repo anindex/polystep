@@ -15,7 +15,7 @@ pip install -e ".[dev]"
 1. Create a branch from `main`
 2. Make your changes
 3. Run tests: `pytest tests/ -v -m "not slow"`
-4. Run linting: `ruff check src/polystep/ --ignore=E501,F401`
+4. Run linting: `ruff check src/polystep/`
 5. Submit a pull request
 
 ## Running Tests

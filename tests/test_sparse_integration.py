@@ -60,7 +60,7 @@ def medium_subspace(medium_model):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: projection_type='sparse' creates SparseRandomProjection
+# projection_type='sparse' creates SparseRandomProjection
 # ---------------------------------------------------------------------------
 
 
@@ -84,7 +84,7 @@ class TestProjectionTypeSparse:
 
 
 # ---------------------------------------------------------------------------
-# Test 2: projection_type='dense' creates dense tensor
+# projection_type='dense' creates dense tensor
 # ---------------------------------------------------------------------------
 
 
@@ -106,7 +106,7 @@ class TestProjectionTypeDense:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Invalid projection_type raises ValueError
+# Invalid projection_type raises ValueError
 # ---------------------------------------------------------------------------
 
 
@@ -123,7 +123,7 @@ class TestProjectionTypeInvalid:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Sparse projection step runs without error
+# Sparse projection step runs without error
 # ---------------------------------------------------------------------------
 
 
@@ -168,7 +168,7 @@ class TestSparseProjectionStep:
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Sparse projection absorb works
+# Sparse projection absorb works
 # ---------------------------------------------------------------------------
 
 
@@ -222,7 +222,7 @@ class TestSparseProjectionAbsorb:
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Sparse projection dtype compatibility
+# Sparse projection dtype compatibility
 # ---------------------------------------------------------------------------
 
 
@@ -279,7 +279,7 @@ class TestSparseProjectionDtype:
 
 
 # ---------------------------------------------------------------------------
-# Test 7: Verify sparse projection dimensions match
+# Verify sparse projection dimensions match
 # ---------------------------------------------------------------------------
 
 
@@ -307,7 +307,7 @@ class TestSparseProjectionDimensions:
 
 
 # ---------------------------------------------------------------------------
-# Test 8: Auto projection_type with auto-selection
+# Auto projection_type with auto-selection
 # ---------------------------------------------------------------------------
 
 
@@ -327,7 +327,7 @@ class TestProjectionTypeAuto:
 
 
 # ---------------------------------------------------------------------------
-# Test 9: Auto-selects sparse for large model
+# Auto-selects sparse for large model
 # ---------------------------------------------------------------------------
 
 
@@ -359,7 +359,7 @@ class TestAutoSelectsSparseForLargeModel:
 
 
 # ---------------------------------------------------------------------------
-# Test 10: Auto-selects dense for small model
+# Auto-selects dense for small model
 # ---------------------------------------------------------------------------
 
 
@@ -384,7 +384,7 @@ class TestAutoSelectsDenseForSmallModel:
 
 
 # ---------------------------------------------------------------------------
-# Test 11: Tiny model fallback to dense even if sparse requested
+# Tiny model fallback to dense even if sparse requested
 # ---------------------------------------------------------------------------
 
 
@@ -418,7 +418,7 @@ class TestTinyModelFallbackToDense:
 
 
 # ---------------------------------------------------------------------------
-# Test 12: Explicit projection_type overrides auto-selection
+# Explicit projection_type overrides auto-selection
 # ---------------------------------------------------------------------------
 
 

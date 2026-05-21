@@ -16,60 +16,70 @@ import torch
 
 
 def get_orthoplex_vertices(
-    origin: torch.Tensor,
+    dim: int,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
     radius: float = 1.0,
     **kwargs,
 ) -> torch.Tensor:
-    """Generate orthoplex (cross-polytope) vertices.
+    """Generate orthoplex (cross-polytope) vertices centered at the origin.
 
     Produces 2*dim vertices: the positive and negative unit vectors along each axis.
 
     Args:
-        origin: Center point of shape (..., dim).
+        dim: Dimensionality of the vertices.
+        device: Target device for the output tensor.
+        dtype: Target dtype for the output tensor.
         radius: Scaling radius.
 
     Returns:
-        Vertices of shape (2*dim, dim) offset by origin.
+        Vertices of shape (2*dim, dim).
     """
-    dim = origin.shape[-1]
-    eye = torch.eye(dim, dtype=origin.dtype, device=origin.device)
+    eye = torch.eye(dim, dtype=dtype, device=device)
     points = torch.cat([eye, -eye], dim=0)
-    return points * radius + origin
+    return points * radius
 
 
 def get_simplex_vertices(
-    origin: torch.Tensor,
+    dim: int,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
     radius: float = 1.0,
     **kwargs,
 ) -> torch.Tensor:
-    """Generate regular simplex vertices.
+    """Generate regular simplex vertices centered at the origin.
 
     Produces dim+1 vertices forming a regular simplex.
 
     Args:
-        origin: Center point of shape (..., dim).
+        dim: Dimensionality of the vertices.
+        device: Target device for the output tensor.
+        dtype: Target dtype for the output tensor.
         radius: Scaling radius.
 
     Returns:
-        Vertices of shape (dim+1, dim) offset by origin.
+        Vertices of shape (dim+1, dim).
     """
-    dim = origin.shape[-1]
-
-    points = math.sqrt(1 + 1 / dim) * torch.eye(dim, dtype=origin.dtype, device=origin.device)
+    points = math.sqrt(1 + 1 / dim) * torch.eye(dim, dtype=dtype, device=device)
     points = points - ((math.sqrt(dim + 1) + 1) / math.sqrt(dim ** 3))
 
-    last_vertex = (1 / math.sqrt(dim)) * torch.ones(1, dim, dtype=origin.dtype, device=origin.device)
+    last_vertex = (1 / math.sqrt(dim)) * torch.ones(1, dim, dtype=dtype, device=device)
     points = torch.cat([points, last_vertex], dim=0)
 
     # Center simplex at origin (unlike orthoplex/cube, simplex is not inherently symmetric)
     centroid = points.mean(dim=0, keepdim=True)
     points = points - centroid
 
-    return points * radius + origin
+    return points * radius
 
 
 def get_cube_vertices(
-    origin: torch.Tensor,
+    dim: int,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
     radius: float = 1.0,
     **kwargs,
 ) -> torch.Tensor:
@@ -78,23 +88,26 @@ def get_cube_vertices(
     Produces 2^dim vertices: all sign combinations normalized by sqrt(dim).
 
     Args:
-        origin: Center point of shape (..., dim).
+        dim: Dimensionality of the vertices.
+        device: Target device for the output tensor.
+        dtype: Target dtype for the output tensor.
         radius: Scaling radius.
 
     Returns:
-        Vertices of shape (2^dim, dim) offset by origin.
+        Vertices of shape (2^dim, dim).
     """
-    dim = origin.shape[-1]
     n_vertices = 2 ** dim
 
-    indices = torch.arange(n_vertices, dtype=torch.int32, device=origin.device).unsqueeze(1)
-    shifts = torch.arange(dim, dtype=torch.int32, device=origin.device).unsqueeze(0)
+    indices = torch.arange(n_vertices, dtype=torch.int32, device=device).unsqueeze(1)
+    shifts = torch.arange(dim, dtype=torch.int32, device=device).unsqueeze(0)
 
     bits = (indices >> shifts) & 1
-    signs = 1.0 - 2.0 * bits.to(origin.dtype)
+    # Resolve dtype for the float conversion (default to float32 if None)
+    float_dtype = dtype if dtype is not None else torch.float32
+    signs = 1.0 - 2.0 * bits.to(float_dtype)
 
     points = signs / math.sqrt(dim)
-    return points * radius + origin
+    return points * radius
 
 
 POLYTOPE_MAP: Dict[str, Callable] = {

@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.2 - 2026-05-21
+
+Codebase cleanup, test modernization, and documentation correctness pass.
+
+### Breaking
+
+- Vertex generator API (`get_orthoplex_vertices`, `get_simplex_vertices`,
+  `get_cube_vertices`) signature changed from `(dim, origin, radius)` to
+  `(dim, *, radius=1.0)`. The `origin` parameter has been removed - all
+  generators now produce unit-radius templates centered at the origin;
+  translation is handled by the solver. This affects direct callers only;
+  `PolyStep` and `PolyStepOptimizer` are unaffected.
+
+### Fixed
+
+- `compute_ot_weights` in `cma.py`: replaced linear softmax normalization
+  with entropy-based OT weight computation matching the theoretical
+  derivation.
+- `@torch.inference_mode()` migration across `transform.py` (removed
+  unused `import warnings`).
+- README and API overview: `max_iteration` -> `max_iterations` (matching
+  the actual `PolyStep` dataclass field).
+- API overview: `AdaptiveSubspace` and `LinearSubspace` code snippets
+  updated from stale direct constructors to the `from_layout()` factory.
+- API overview: `SolverState(X=X_init)` -> `solver.init_state(X_init)`.
+
+### Test suite
+
+- Modernized all geometry tests to the new `(dim, radius)` API; fixed 17
+  failing tests.
+- Deleted duplicate `test_softmax_correctness.py` (was a copy of tests
+  already in `test_softmax.py`).
+- Stripped AI-pattern artifacts (numbered tags, pre/post-fix prose) from
+  10 test files.
+- Net: 905 collected tests across 45 files; fast-tier CI suite passes
+  880 (+ 2 skipped, 23 deselected) in ~20 s.
+
+### CI
+
+- Removed 11 `--ignore` entries from CI (7 pointed to non-existent files,
+  1 to a previously deleted file). CI now runs all non-slow, non-GPU tests
+  without explicit ignores.
+- Fast experiment-infrastructure tests (`test_baseline_fairness`,
+  `test_nondiff_data`, `test_nondiff_models`, `test_rl_benchmarks`) are
+  now included in CI (+98 tests, <2 s overhead).
+
 ## 0.2.1 - 2026-05-14
 
 ### Added
@@ -10,7 +56,7 @@
   config, then adapts *only* the writable subset a real Loihi 2 chip
   would expose at runtime (`fc2` + per-population `vth` + `beta`,
   1.3 % of model parameters) under a `N(0, 1^2)` Gaussian input-shift.
-  Phase B uses three TENT-style test-time-adaptation safeguards —
+  Phase B uses three TENT-style test-time-adaptation safeguards -
   mixed-batch (half clean / half shifted), rank-8 probing on the tiny
   writable subspace, and two probes per step. Both phases use
   best-test early stopping (patience 4, tuned for the noisier per-epoch
@@ -23,7 +69,7 @@
   83.1 %) in ~17 min on a single GPU. Headline numbers shift by a
   few pp run-to-run on CUDA due to non-deterministic cuBLAS reductions;
   the qualitative recovery is robust. The host loop is backend-
-  agnostic — `LoihiSpikeEvaluator` is the single swap point against
+  agnostic - `LoihiSpikeEvaluator` is the single swap point against
   the Lava `netx` deployment path.
 
 ## 0.2.0 - 2026-05-14
@@ -66,7 +112,7 @@ PyTorch 2.12.
 ### Test suite
 
 - Consolidated overlapping test files.
-- Net: 935 → 906 collected tests across 45 files (was 49); fast-tier suite
+- Net: 935 -> 906 collected tests across 45 files (was 49); fast-tier suite
   passes 885 (+ 2 skipped, 19 deselected) in ~21 s on RTX 5090.
 
 ## 0.1.0 - 2026-05-03 (Initial Release)

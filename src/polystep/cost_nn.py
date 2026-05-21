@@ -347,16 +347,15 @@ class NNCostEvaluator:
                     if key in param_dict:
                         param_dict[key].data.copy_(stacked_params[key][i])
 
-                # Forward pass under inference_mode - minimal memory
-                with torch.inference_mode():
-                    output = self.model(inputs)
-                    if targets is not None:
-                        loss = self.loss_fn(output, targets)
-                    else:
-                        loss = self.loss_fn(output)
-                    if loss.dim() > 0:
-                        loss = loss.mean()
-                # .item()-free: store tensor directly, detach from inference graph
+                # Forward pass - already under inference_mode from evaluate()
+                output = self.model(inputs)
+                if targets is not None:
+                    loss = self.loss_fn(output, targets)
+                else:
+                    loss = self.loss_fn(output)
+                if loss.dim() > 0:
+                    loss = loss.mean()
+                # .item()-free: store tensor directly, detach from graph
                 losses[i] = loss.detach()
         finally:
             # Always restore original weights, even on error
@@ -411,15 +410,14 @@ class NNCostEvaluator:
                 subspace.apply_perturbation_inplace(
                     projections, self.model, base_sd, flat_subspace_batch[i],
                 )
-                # Forward pass - inference memory only
-                with torch.inference_mode():
-                    output = self.model(inputs)
-                    if targets is not None:
-                        loss = self.loss_fn(output, targets)
-                    else:
-                        loss = self.loss_fn(output)
-                    if loss.dim() > 0:
-                        loss = loss.mean()
+                # Forward pass - already under inference_mode from caller
+                output = self.model(inputs)
+                if targets is not None:
+                    loss = self.loss_fn(output, targets)
+                else:
+                    loss = self.loss_fn(output)
+                if loss.dim() > 0:
+                    loss = loss.mean()
                 losses[i] = loss.detach()
         finally:
             # Restore base weights
@@ -455,7 +453,7 @@ class BatchedLinearEvaluator:
     def try_build(cls, model: nn.Module, loss_fn: Callable) -> "BatchedLinearEvaluator | None":
         """Build if model is compatible, else return None."""
         supported = (nn.Linear, nn.ReLU, nn.LeakyReLU, nn.Sigmoid, nn.Tanh,
-                     nn.Flatten, nn.Dropout)
+                     nn.GELU, nn.SiLU, nn.Flatten, nn.Dropout)
         layer_keys = []
         for name, mod in model.named_children():
             if isinstance(mod, nn.Linear):
@@ -509,7 +507,7 @@ class BatchedLinearEvaluator:
                 w_key = f"{name}.weight"
                 b_key = f"{name}.bias"
                 W = stacked_params[w_key]  # (N, out, in)
-                # bmm: (N, out, in) @ (N, in, B)^T → (N, B, out)
+                # bmm: (N, out, in) @ (N, in, B)^T -> (N, B, out)
                 x = torch.bmm(x, W.transpose(1, 2))  # (N, B, out)
                 if b_key in stacked_params:
                     x = x + stacked_params[b_key].unsqueeze(1)  # (N, 1, out) broadcast

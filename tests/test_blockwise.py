@@ -330,7 +330,7 @@ class TestBlockLayoutConversion:
     """Tests for layout_flat_to_block_flat, blocks_to_layout_flat, and batch variant."""
 
     def test_per_layer_roundtrip(self):
-        """Per-layer blocks: layout→block→layout is identity for real params."""
+        """Per-layer blocks: layout->block->layout is identity for real params."""
         from polystep.blockwise import layout_flat_to_block_flat, blocks_to_layout_flat
 
         model = SimpleMLP()
@@ -344,7 +344,7 @@ class TestBlockLayoutConversion:
         torch.testing.assert_close(flat, roundtrip)
 
     def test_grouped_roundtrip(self):
-        """Grouped blocks: layout→block→layout is identity for real params."""
+        """Grouped blocks: layout->block->layout is identity for real params."""
         from polystep.blockwise import layout_flat_to_block_flat, blocks_to_layout_flat
 
         model = SimpleMLP()

@@ -4,12 +4,12 @@
 # Run from repo root: bash experiments/runners/run_all_paper.sh
 #
 # Paper sections covered:
-#   §5.2 Non-Differentiable Model Training  → run_elevation.py (SNN, int8, argmax, staircase)
-#                                            → run_moe.py (Hard MoE)
-#   §5.3 MAX-SAT Discrete Optimization      → run_maxsat.py (100→1M variables, 1000 steps each)
-#   §5.4 SNN Memory Scaling                 → deep_snn_memory.py (O(1) vs O(T))
-#   §5.5 MNIST Sanity Check                 → run_mnist.py
-#   §5.6 LSTM Time-Series Forecasting       → run_timeseries.py (ETTh1)
+#   §5.2 Non-Differentiable Model Training  -> run_elevation.py (SNN, int8, argmax, staircase)
+#                                            -> run_moe.py (Hard MoE)
+#   §5.3 MAX-SAT Discrete Optimization      -> run_maxsat.py (100->1M variables, 1000 steps each)
+#   §5.4 SNN Memory Scaling                 -> deep_snn_memory.py (O(1) vs O(T))
+#   §5.5 MNIST Sanity Check                 -> run_mnist.py
+#   §5.6 LSTM Time-Series Forecasting       -> run_timeseries.py (ETTh1)
 #
 #   - All experiments use softmax solver (including MAX-SAT full-space)
 #
@@ -83,10 +83,10 @@ echo ""
 
 # ------------------------------------------------------------------
 # 3. MAX-SAT Discrete Optimization (§5.3)
-#    100→1M variables, 1000 steps each, softmax solver (full-space)
+#    100->1M variables, 1000 steps each, softmax solver (full-space)
 #    Config: sr2000 (CosineEpsilon, momentum, amortize=3)
 # ------------------------------------------------------------------
-echo ">>> [3/7] MAX-SAT Scaling (100→1M, 1000 steps each)..."
+echo ">>> [3/7] MAX-SAT Scaling (100->1M, 1000 steps each)..."
 $PYTHON experiments/runners/run_maxsat.py \
     --sizes 100 500 1000 5000 20000 100000 1000000 \
     --methods polystep cmaes openai_es sls \

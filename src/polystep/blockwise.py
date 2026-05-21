@@ -150,7 +150,7 @@ def split_particles(
     return result
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def reassemble_blocks(
     block_particles: List[torch.Tensor],
     blocks: List[BlockConfig],
@@ -182,7 +182,7 @@ def reassemble_blocks(
     return full_flat
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def blocks_to_layout_flat(
     block_flat: torch.Tensor,
     blocks: List[BlockConfig],
@@ -225,7 +225,7 @@ def blocks_to_layout_flat(
     return layout_flat
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def layout_flat_to_block_flat(
     layout_flat: torch.Tensor,
     blocks: List[BlockConfig],
@@ -265,7 +265,7 @@ def layout_flat_to_block_flat(
     return block_flat
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def blocks_to_layout_flat_batch(
     block_flat_batch: torch.Tensor,
     blocks: List[BlockConfig],

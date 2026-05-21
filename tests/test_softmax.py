@@ -120,11 +120,8 @@ def test_softmax_source_marginal_preserved(dtype, tol):
 
 def test_softmax_warns_on_nonuniform_b():
     """Softmax solver does not enforce target marginal b; a non-uniform b
-    that the caller passes in is silently ignored. The fix adds a warning
-    so the user knows their constraint did nothing.
-
-    Pre-fix: this test FAILS (no warning emitted).
-    Post-fix: passes.
+    that the caller passes in is silently ignored. The solver warns
+    so the user knows their constraint has no effect.
     """
     P, V = 4, 8
     torch.manual_seed(0)
@@ -155,7 +152,7 @@ def test_softmax_warns_on_nonuniform_b():
 def test_softmax_warns_on_tiny_epsilon():
     """epsilon = 1e-30 is technically positive (passes existing
     `epsilon <= 0` validation) but produces -C/eps overflow in any
-    realistic cost matrix. Post-fix: warn whenever
+    realistic cost matrix. The solver warns whenever
     `eps < 1e-6 * cost_max`.
     """
     P, V = 4, 8

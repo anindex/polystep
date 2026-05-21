@@ -94,8 +94,7 @@ def test_dp2_rotations_are_proper_so2():
 def test_orthoplex_vertices_for_dp2():
     """dp=2 orthoplex has 4 vertices: +/-e_i. Verify shape and that
     the 4 vertices are pairwise orthogonal in the +/- pairs."""
-    origin = torch.zeros(2)
-    verts = get_orthoplex_vertices(origin, radius=1.0)
+    verts = get_orthoplex_vertices(2, radius=1.0)
     assert verts.shape == (4, 2)
     expected = torch.tensor([
         [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0],

@@ -55,7 +55,7 @@ from polystep.transform import ParamLayout  # noqa: E402
 def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
     """Run the trained policy in Gymnasium and save a GIF visualization.
 
-    Uses ``render_mode="rgb_array"`` to avoid OpenGL/GLX dependency —
+    Uses ``render_mode="rgb_array"`` to avoid OpenGL/GLX dependency -
     Gymnasium's ``"human"`` mode requires a working GLX context which
     fails on many setups (WSL, remote desktops, containers, missing
     GPU drivers).  The resulting GIF is saved next to the training plot.

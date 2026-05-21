@@ -470,7 +470,7 @@ class MNISTNet(nn.Module):
 class CIFAR10Net(nn.Module):
     """Standard small CNN for CIFAR-10 classification (vmap-compatible).
 
-    Architecture: 3×Conv2d + MaxPool → FC(128) → FC(10)
+    Architecture: 3×Conv2d + MaxPool -> FC(128) -> FC(10)
     No BatchNorm (incompatible with vmap). ~189K parameters.
     """
 

@@ -193,8 +193,7 @@ class PolyStep:
                 "Use subspace or block_strategy independently."
             )
 
-        origin = torch.zeros(self.dim)
-        self.polytope_vertices = POLYTOPE_MAP[self.polytope_type](origin, radius=1.0)
+        self.polytope_vertices = POLYTOPE_MAP[self.polytope_type](self.dim, radius=1.0)
         self.probes = torch.linspace(0, 1, self.num_probe + 2)[1:self.num_probe + 1]
         self.sinkhorn_solver = SinkhornSolver(
             max_iterations=self.sinkhorn_max_iters,
@@ -302,7 +301,7 @@ class PolyStep:
             return self.ent_epsilon.at(iteration)
         return self.ent_epsilon
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def step(
         self,
         state: SolverState,
@@ -433,7 +432,7 @@ class PolyStep:
 
         return state
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _step_blockwise(
         self,
         state: SolverState,
@@ -490,8 +489,9 @@ class PolyStep:
             block_dim = block.particle_dim
 
             # Per-block polytope template and probes
-            origin = torch.zeros(block_dim, device=device, dtype=X.dtype)
-            block_polytope_verts = POLYTOPE_MAP[self.polytope_type](origin, radius=1.0)
+            block_polytope_verts = POLYTOPE_MAP[self.polytope_type](
+                block_dim, device=device, dtype=X.dtype, radius=1.0,
+            )
             block_probes = self.probes.to(device=device, dtype=X.dtype)
 
             P_block = block.num_particles

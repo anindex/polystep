@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------
-# 6.2 Turbo-feature contamination check
+# Turbo-feature contamination check
 # ---------------------------------------------------------------------------
 
 
@@ -83,7 +83,7 @@ def test_no_baseline_imports_polystep_turbo_features():
 
 
 # ---------------------------------------------------------------------------
-# 6.1c PySAT baseline smoke
+# PySAT baseline smoke
 # ---------------------------------------------------------------------------
 
 

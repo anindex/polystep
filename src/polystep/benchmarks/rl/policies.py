@@ -77,7 +77,7 @@ class NonDiffActivation(nn.Module):
 class NonDiffMLPPolicy(nn.Module):
     """Discrete-action MLP policy with a non-differentiable activation layer.
 
-    Topology: ``Linear(obs_dim, hidden) → NonDiffActivation(mode) → Linear(hidden, action_dim)``.
+    Topology: ``Linear(obs_dim, hidden) -> NonDiffActivation(mode) -> Linear(hidden, action_dim)``.
 
     Compared to :class:`DiscreteMLPPolicy` the only change is the inner Tanh
     being replaced by a non-diff op. PolyStep treats the policy as a black box
