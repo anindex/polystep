@@ -6,11 +6,14 @@ to solve but less precise). Lower epsilon gives a sharper plan (closer to
 exact OT but harder to solve numerically). Annealing from high to low
 epsilon allows coarse-to-fine optimization.
 
-Provides two schedulers:
+Provides three schedulers:
 
-- ``LinearEpsilon``: Fixed linear decay: eps_t = max(init - decay * t, target).
-- ``ProgressiveEpsilon``: Feedback-driven auto-adjustment based on Sinkhorn solver
-  convergence behavior, inspired by ProgOT (Kassab & Thornton, 2025).
+- ``LinearEpsilon``: Fixed linear decay: ``eps_t = max(init - decay * t, target)``.
+- ``CosineEpsilon``: Cosine annealing with optional SGDR-style warm restarts.
+- ``ProgressiveEpsilon``: Feedback-driven auto-adjustment based on Sinkhorn
+  solver convergence, inspired by ProgOT (Kassraie, Pooladian, Klein,
+  Thornton, Niles-Weed & Cuturi, *Progressive Entropic Optimal Transport
+  Solvers*, NeurIPS 2024, arXiv:2406.05061).
 """
 import math
 from dataclasses import dataclass, field
@@ -59,8 +62,9 @@ class LinearEpsilon:
 class ProgressiveEpsilon:
     """Auto-adjusting epsilon based on Sinkhorn solver feedback.
 
-    Inspired by ProgOT (Kassab & Thornton, 2025): epsilon is adjusted
-    based on actual solver convergence behavior rather than a fixed schedule.
+    Inspired by ProgOT (Kassraie et al., NeurIPS 2024, arXiv:2406.05061):
+    epsilon is adjusted from actual solver convergence behavior rather than
+    a fixed schedule.
 
     When the solver converges quickly (few iterations), epsilon is decreased
     to sharpen the transport plan. When the solver struggles (many iterations

@@ -2,7 +2,7 @@
 
 Deduplicates common patterns that appear across _step_monolithic,
 _step_blockwise, and _step_subspace_blockwise: radius resolution,
-biased rotation (Gram-Schmidt), cost matrix sanitization, NaN-safe
+biased rotation (QR re-orthogonalisation), cost matrix sanitization, NaN-safe
 state revert, diagnostics update, transport direction capture, and
 CMA-ES evolution path updates.
 """
@@ -71,7 +71,7 @@ def resolve_radii(
 
 
 # ---------------------------------------------------------------------------
-# Biased rotation (Gram-Schmidt orthogonalization)
+# Biased rotation (QR re-orthogonalisation)
 # ---------------------------------------------------------------------------
 
 
@@ -80,40 +80,30 @@ def apply_biased_rotation(
     bias_dir: torch.Tensor,
     pdim: int,
 ) -> torch.Tensor:
-    """Apply transport-biased rotation: replace first column with bias
-    direction and re-orthogonalize remaining columns via Gram-Schmidt.
+    """Replace column 0 of each rotation matrix with the bias direction
+    and re-orthogonalise the rest via batched QR. Falls back to the
+    original random rotation for any batch element where QR produced NaN
+    (degenerate bias).
 
     Args:
-        rot_mats: (P, pdim, pdim) rotation matrices (modified in-place).
+        rot_mats: (P, pdim, pdim) rotation matrices.
         bias_dir: (P, pdim) bias direction vectors.
-        pdim: Particle dimension.
+        pdim: Particle dimension. Unused; kept for backwards compatibility.
 
     Returns:
         Modified rotation matrices with proper SO(n) structure.
     """
     bias_norms = torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
     bias_dir_norm = bias_dir / bias_norms
-    # Save original for Gram-Schmidt fallback
     rot_mats_orig = rot_mats.clone()
-    # Replace column 0 with normalized bias direction
     rot_mats[:, :, 0] = bias_dir_norm
-    # Re-orthogonalize remaining columns via Gram-Schmidt
-    for col in range(1, pdim):
-        v = rot_mats[:, :, col].clone()
-        for prev_col in range(col):
-            proj = (v * rot_mats[:, :, prev_col]).sum(dim=-1, keepdim=True)
-            v = v - proj * rot_mats[:, :, prev_col]
-        raw_norm = torch.norm(v, dim=-1, keepdim=True)
-        norms_v = raw_norm.clamp(min=1e-10)
-        # Only replace column if sufficiently independent
-        mask = (raw_norm > 1e-6).float()
-        rot_mats[:, :, col] = mask * (v / norms_v) + (1 - mask) * rot_mats_orig[:, :, col]
-
-    # Fix determinant: Gram-Schmidt can flip det from +1 to -1.
+    Q, _ = torch.linalg.qr(rot_mats)
+    valid = torch.isfinite(Q).all(dim=-1).all(dim=-1)  # (P,)
+    rot_mats = torch.where(valid[:, None, None], Q, rot_mats_orig)
+    # QR can return det=-1; flip the last column to restore SO(n).
     dets = torch.det(rot_mats)
     flip = (dets < 0).unsqueeze(-1)  # (P, 1)
     rot_mats[:, :, -1] = torch.where(flip, -rot_mats[:, :, -1], rot_mats[:, :, -1])
-
     return rot_mats
 
 
@@ -421,7 +411,8 @@ def update_cma_es(
             optimizer._cma_params['cov_max'],
         )
 
-    # 5. Update step-size via CSA (if enabled)
+    # 5. Update step-size via CSA (if enabled). Pass the p_sigma_norm
+    # we already paid for above to skip a redundant .item() sync.
     if optimizer.use_csa:
         state.sigma = update_step_size_csa(
             sigma=state.sigma,
@@ -429,6 +420,7 @@ def update_cma_es(
             c_sigma=optimizer._cma_params['c_sigma'],
             d_sigma=optimizer._cma_params['d_sigma'],
             n=sub_dim,
+            p_sigma_norm=p_sigma_norm,
         )
         # Floor sigma to prevent collapse to zero
         state.sigma = max(state.sigma, 1e-6)

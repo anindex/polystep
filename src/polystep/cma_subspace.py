@@ -1,12 +1,10 @@
-"""CMAAdaptiveSubspace: CMA-ES covariance adaptation over AdaptiveSubspace.
+"""CMAAdaptiveSubspace: CMA-ES covariance adaptation on top of AdaptiveSubspace.
 
-Wraps AdaptiveSubspace with sep-CMA-ES (diagonal covariance) for adaptive
-Strategy) inspired mechanisms for adaptive step-size and search direction scaling.
-
-The wrapper follows sep-CMA-ES (separable CMA-ES) which uses a diagonal covariance
-matrix instead of a full covariance matrix. This reduces memory from O(n^2) to O(n)
-and computational cost from O(n^3) to O(n), making it practical for high-dimensional
-subspaces typical in neural network optimization.
+Wraps an ``AdaptiveSubspace`` with the separable CMA-ES (sep-CMA-ES) variant
+of the Covariance Matrix Adaptation Evolution Strategy. sep-CMA-ES uses a
+diagonal covariance instead of a full one, reducing memory from O(n^2) to O(n)
+and compute from O(n^3) to O(n) per update -- which is what makes it usable
+in the high-dimensional subspaces that show up in neural network training.
 
 Key CMA-ES concepts integrated:
 
@@ -154,6 +152,10 @@ class CMAAdaptiveSubspace:
         total_steps: int,
         displacement_history: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        # OT-bias mode inputs (forwarded to base.rotate; ignored otherwise)
+        transport_matrix: Optional[torch.Tensor] = None,
+        X_vertices: Optional[torch.Tensor] = None,
+        X_current: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Rotate projection basis (delegated to base).
 
@@ -163,12 +165,19 @@ class CMAAdaptiveSubspace:
             total_steps: Total number of optimization steps.
             displacement_history: Optional displacement history tensor.
             generator: Optional torch.Generator for reproducibility.
+            transport_matrix: OT transport plan (only used when the wrapped
+                AdaptiveSubspace is in ``'ot_bias'`` rotation mode).
+            X_vertices: Polytope vertex positions (ot_bias mode only).
+            X_current: Current particle positions (ot_bias mode only).
 
         Returns:
             New projection matrix P_new.
         """
         return self.base.rotate(
-            projection, step, total_steps, displacement_history, generator
+            projection, step, total_steps, displacement_history, generator,
+            transport_matrix=transport_matrix,
+            X_vertices=X_vertices,
+            X_current=X_current,
         )
 
     def apply_perturbation(

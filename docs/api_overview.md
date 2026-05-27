@@ -10,6 +10,7 @@ The main entry point. Wraps any `nn.Module` for gradient-free training.
 
 ```python
 from polystep import PolyStepOptimizer
+from polystep.cost_nn import NNCostEvaluator
 
 model = nn.Sequential(nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, 10))
 optimizer = PolyStepOptimizer(model,
@@ -18,8 +19,14 @@ optimizer = PolyStepOptimizer(model,
     polytope_type='orthoplex',
 )
 
-# Training step with closure
-loss = optimizer.step(lambda: loss_fn(model(x), y))
+# The closure receives batched candidate parameters and returns one loss
+# per candidate. NNCostEvaluator handles the vmap'd forward pass for you.
+evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+
+def closure(batched_params):
+    return evaluator.evaluate(batched_params, x, y)
+
+cost = optimizer.step(closure)
 ```
 
 ### train()
@@ -100,12 +107,15 @@ subspace = LinearSubspace.from_layout(layout, rank=8)
 
 ### SparseRandomProjection
 
-For models with 1M+ parameters. Uses sparse Johnson-Lindenstrauss transform.
+For models with 1M+ parameters. Uses a sparse Johnson-Lindenstrauss transform
+under the hood and is typically created automatically when the optimizer is
+constructed with `projection_type='sparse'` or `'auto'`. The constructor
+signature is:
 
 ```python
 from polystep import SparseRandomProjection
 
-proj = SparseRandomProjection(input_dim=10_000_000, output_dim=64)
+proj = SparseRandomProjection(full_dim=10_000_000, subspace_dim=64, seed=0)
 ```
 
 ## VmapSafe Layers

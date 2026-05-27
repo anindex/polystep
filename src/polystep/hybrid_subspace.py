@@ -1,7 +1,7 @@
 """HybridSubspace: per-layer projections with coordinated rotation.
 
-Combines LinearSubspace's per-layer structure (better per-step coverage) with
-per step) with ``AdaptiveSubspace`` (synchronized rotation coordination).
+Combines ``LinearSubspace``'s per-layer structure (better per-step coverage)
+with ``AdaptiveSubspace``'s synchronized rotation coordination.
 
 Key design principles:
 

@@ -74,10 +74,11 @@ def step_blockwise(opt, closure: Callable) -> float:
     new_block_duals = []
     new_block_descent_dirs = []  # For biased rotation in next step
     total_ent_cost = 0.0
-    # Per-block scalars accumulated as device tensors and summed once after
-    # the loop to avoid one GPU->CPU sync per block per step.
+    # Per-block scalars accumulated as device tensors and summed once
+    # after the loop, to avoid one GPU->CPU sync per block per step.
     block_disp_terms: list = []
     block_model_loss_terms: list = []
+    block_fused_ent_terms: list = []  # 0-d ent_cost tensors, fused path
     all_converged = True
     total_particles = 0
     num_blocks_counted = 0
@@ -107,7 +108,11 @@ def step_blockwise(opt, closure: Callable) -> float:
             generator=opt._generator,
         )
 
-        # Apply biased rotation per block
+        # Apply biased rotation per block. We keep the elementwise
+        # Gram-Schmidt loop here on purpose: per-layer block_dim is
+        # typically <=128 and small batched QR via cuSOLVER measured
+        # slower than this loop on RTX 5090. The monolithic step uses
+        # one big QR for the opposite reason.
         if (opt.biased_rotation
                 and _block_descent_dirs is not None
                 and block_idx < len(_block_descent_dirs)
@@ -203,17 +208,21 @@ def step_blockwise(opt, closure: Callable) -> float:
         opt.solver.epsilon = ot_epsilon
         block_a = torch.ones(P_block, device=device, dtype=X.dtype) / P_block
         if opt._use_fused_softmax:
-            # Fused path: softmax + vertex-free projection in one compiled call
+            # Fused path: softmax + vertex-free projection in one compiled
+            # call. ent_cost_tensor stays on-device; it gets summed with
+            # the other blocks' tensors in a single .item() after the loop.
             X_new_block, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
                 cost_matrix, ot_epsilon, block_a,
                 block_polytope_verts, rot_mats, step_r, block_X,
                 scale_cost_mean=opt._scale_cost_is_mean,
             )
-            ent_cost = ent_cost_tensor.item()
+            block_fused_ent_terms.append(ent_cost_tensor)
+            # ot_result.cost / ent_reg_cost are only read by the
+            # num_blocks_counted == 0 fallback below, so 0.0 is safe here.
             ot_result = SolverResult(
-                matrix=transport_matrix, cost=ent_cost,
+                matrix=transport_matrix, cost=0.0,
                 f=None, g=None, converged=True, n_iters=1,
-                ent_reg_cost=ent_cost,
+                ent_reg_cost=0.0,
             )
         else:
             init_f, init_g = state.block_duals[block_idx]
@@ -247,6 +256,8 @@ def step_blockwise(opt, closure: Callable) -> float:
             X_new_block = opt._compiled.barycentric_projection(
                 ot_result.matrix, block_a, X_vertices,
             )
+            # Non-fused solvers return a Python-float ent_reg_cost already.
+            total_ent_cost += ot_result.ent_reg_cost
 
         # Track displacement and descent direction for biased rotation
         block_descent = (X_new_block - block_X).detach()
@@ -259,10 +270,13 @@ def step_blockwise(opt, closure: Callable) -> float:
             ot_result.f.detach() if ot_result.f is not None else None,
             ot_result.g.detach() if ot_result.g is not None else None,
         ))
-        total_ent_cost += ot_result.ent_reg_cost
         block_model_loss_terms.append(cost_matrix.mean().detach())
         num_blocks_counted += 1
         all_converged = all_converged and ot_result.converged
+
+    # Resolve fused-softmax entropic cost in a single host transfer.
+    if block_fused_ent_terms:
+        total_ent_cost += torch.stack(block_fused_ent_terms).sum().item()
 
     # Save per-block descent directions for biased rotation in next step
     if opt.biased_rotation:
@@ -457,6 +471,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     # the loop to avoid one GPU->CPU sync per block per step.
     block_disp_terms: list = []
     block_model_loss_terms: list = []
+    block_fused_ent_terms: list = []  # 0-d ent_cost tensors, fused path
     all_converged = True
     total_particles = 0
     num_blocks_counted = 0
@@ -486,7 +501,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             generator=opt._generator,
         )
 
-        # Apply biased rotation per block
+        # Same Gram-Schmidt-vs-QR trade-off as in step_blockwise() above.
         if (opt.biased_rotation
                 and _block_descent_dirs is not None
                 and block_idx < len(_block_descent_dirs)
@@ -607,17 +622,18 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         opt.solver.epsilon = ot_epsilon
         block_a = torch.ones(P_block, device=device, dtype=X.dtype) / P_block
         if opt._use_fused_softmax:
-            # Fused path: softmax + vertex-free projection in one compiled call
+            # See step_blockwise() above for the rationale behind the
+            # 0.0 placeholders and the deferred .item() on ent_cost_tensor.
             X_new_block, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
                 cost_matrix, ot_epsilon, block_a,
                 block_polytope_verts, rot_mats, step_r, block_X,
                 scale_cost_mean=opt._scale_cost_is_mean,
             )
-            ent_cost = ent_cost_tensor.item()
+            block_fused_ent_terms.append(ent_cost_tensor)
             ot_result = SolverResult(
-                matrix=transport_matrix, cost=ent_cost,
+                matrix=transport_matrix, cost=0.0,
                 f=None, g=None, converged=True, n_iters=1,
-                ent_reg_cost=ent_cost,
+                ent_reg_cost=0.0,
             )
         else:
             init_f, init_g = state.block_duals[block_idx]
@@ -651,6 +667,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             X_new_block = opt._compiled.barycentric_projection(
                 ot_result.matrix, block_a, X_vertices,
             )
+            total_ent_cost += ot_result.ent_reg_cost
 
         # Track displacement and descent direction for biased rotation
         block_descent = (X_new_block - block_X).detach()
@@ -663,10 +680,13 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             ot_result.f.detach() if ot_result.f is not None else None,
             ot_result.g.detach() if ot_result.g is not None else None,
         ))
-        total_ent_cost += ot_result.ent_reg_cost
         block_model_loss_terms.append(cost_matrix.mean().detach())
         num_blocks_counted += 1
         all_converged = all_converged and ot_result.converged
+
+    # Resolve fused-softmax entropic cost in a single host transfer.
+    if block_fused_ent_terms:
+        total_ent_cost += torch.stack(block_fused_ent_terms).sum().item()
 
     # Save per-block descent directions for biased rotation in next step
     if opt.biased_rotation:

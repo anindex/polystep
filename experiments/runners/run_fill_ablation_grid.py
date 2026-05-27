@@ -264,7 +264,9 @@ def scan_existing(out_dir: str, benchmark: str, pr_vals, sr_vals):
                 try:
                     d = json.load(open(f))
                     seeds.append(d["seed"])
-                except:
+                except (OSError, ValueError, KeyError):
+                    # OSError: unreadable file. ValueError: bad JSON.
+                    # KeyError: result file missing the 'seed' field.
                     pass
             existing[(pr, sr)] = seeds
     return existing
@@ -319,7 +321,7 @@ def main():
                 try:
                     d = json.load(open(f))
                     seeds.append(d["seed"])
-                except:
+                except (OSError, ValueError, KeyError):
                     pass
             eps_existing[(ei, et)] = seeds
 

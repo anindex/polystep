@@ -22,11 +22,12 @@ Sinkhorn alternating projections. Intermediate α produces a smooth
 interpolation, with `KL(P^T 1 || b)` decreasing monotonically as α
 grows.
 
-The α-scaling is the Chizat-Roussillon-Léger-Vialard (2018) "scaling
-algorithm for unbalanced OT" form. We also support `lam = inf`
-explicitly (the user-facing default for "go to full Sinkhorn") so
-that downstream code can pass `float('inf')` without arithmetic on
-infinity.
+The α-scaling matches the scaling-algorithm form for unbalanced OT in
+Chizat, Peyré, Schmitzer & Vialard, *Scaling Algorithms for Unbalanced
+Optimal Transport Problems*, Math. Comp. 87 (2018), arXiv:1607.05816.
+We also support `lam = inf` explicitly (the user-facing default for
+"go to full Sinkhorn") so downstream code can pass `float('inf')`
+without arithmetic on infinity.
 """
 from __future__ import annotations
 

@@ -418,7 +418,6 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # Build CosineEpsilon schedules for epsilon, step_radius, probe_radius
-    total_steps = steps
     eps = CosineEpsilon(cfg["epsilon_init"], cfg["epsilon_target"]) if "epsilon_init" in cfg else cfg.get("epsilon", 3.0)
     sr = CosineEpsilon(cfg["step_radius_init"], cfg["step_radius_target"]) if "step_radius_init" in cfg else cfg.get("step_radius", 500.0)
     pr = CosineEpsilon(cfg["probe_radius_init"], cfg["probe_radius_target"]) if "probe_radius_init" in cfg else cfg.get("probe_radius", 50.0)
@@ -511,8 +510,6 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
     final_result = evaluate_sat_result(model, clause_vars, clause_signs)
     best_sat_ratio = max(best_sat_ratio, final_result["sat_ratio"])
 
-    # Compose filename with size info
-    result_filename = f"{BENCHMARK}_{num_vars}v_polystep_{seed}"
     filepath = save_result(
         benchmark=f"{BENCHMARK}_{num_vars}v",
         method="polystep",
@@ -837,7 +834,8 @@ def _rc2_worker(clauses_list, num_clauses, result_queue):
 
     try:
         with RC2(wcnf) as solver:
-            model_sol = solver.compute()
+            # solver.compute() returns the assignment; we only need the cost.
+            solver.compute()
             cost = solver.cost
         result_queue.put({"cost": cost, "timed_out": False})
     except Exception as e:

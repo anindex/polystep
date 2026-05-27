@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.2.4 - 2026-05-27
+
+Inner-loop performance improvements. Profile-driven cleanup of CPU<->GPU sync points. No algorithmic changes.
+
+### Changed
+
+- `solvers/sinkhorn.py`: dropped two GPU->CPU syncs per Sinkhorn solve.
+  - `cost_scale` (used to compute the warm-start `clamp_` bound) stays
+    on-device as a 0-d tensor; `Tensor.clamp_` accepts tensor bounds.
+  - `ent_reg_cost = <f,a> + <g,b>` now resolves both inner products in
+    one host transfer via `torch.stack([...]).sum().item()`. Same
+    pattern applied to the low-rank convergence loop, plus its
+    `err_a/err_b` marginal-error transfers (mirrors the dense
+    convergence path).
+- `_step_blockwise.py`: per-block fused-softmax `ent_cost_tensor.item()`
+  calls defer to a single `torch.stack([...]).sum().item()` after the
+  per-block loop, mirroring the existing `block_disp_terms` and
+  `block_model_loss_terms` reductions. Saves `O(num_blocks)` syncs per
+  step in the fused-softmax path.
+- `cma.py`: `update_step_size_csa` now accepts an optional
+  pre-computed `p_sigma_norm`. Both call sites
+  (`_step_common.py:update_cma_state`, `_step_monolithic.py:step`)
+  forward the norm they already paid for in `compute_heaviside_sigma`,
+  removing one redundant `torch.norm(...).item()` per CMA generation.
+- `_step_common.py:apply_biased_rotation`: the (dead-but-exported)
+  helper now mirrors the production path in `_step_monolithic.py` --
+  one batched `torch.linalg.qr` plus a determinant fix-up, instead of
+  an `O(pdim^2)` Python Gram-Schmidt loop. The blockwise paths keep
+  the Gram-Schmidt loop on purpose: per-layer block_dim is typically
+  <=128 and small batched QR via cuSOLVER measured slower than the
+  elementwise loop on this hardware.
+
+## 0.2.3 - 2026-05-27
+
+Final-pass polish: docstring cleanup, citation corrections, lint sweep
+of examples and experiments.
+
+### Fixed
+
+- `kl_softmax.py`: corrected the author list for the unbalanced-OT
+  scaling-algorithm reference to Chizat, Peyré, Schmitzer & Vialard
+  (Math. Comp. 87, 2018; arXiv:1607.05816). The previous citation
+  conflated two different Chizat et al. papers.
+- `epsilon.py`: corrected the ProgOT citation to Kassraie, Pooladian,
+  Klein, Thornton, Niles-Weed & Cuturi, NeurIPS 2024 (arXiv:2406.05061).
+  The previous "Kassab & Thornton, 2025" tag was wrong on author, year,
+  and arXiv.
+- `epsilon.py`: module docstring now lists all three schedulers
+  (`LinearEpsilon`, `CosineEpsilon`, `ProgressiveEpsilon`).
+- `cma_subspace.py`, `hybrid_subspace.py`: rewrote two module
+  docstrings whose first paragraph was mangled by an earlier refactor
+  (text fragments like "Strategy)" and "per step) with" at the start
+  of sentences).
+- `CMAAdaptiveSubspace.rotate()` now forwards `transport_matrix`,
+  `X_vertices`, and `X_current` to the wrapped `AdaptiveSubspace`, so
+  the `'ot_bias'` rotation mode actually fires when CMA is enabled
+  (previously silently fell through to random rotation).
+- `docs/api_overview.md`: the `PolyStepOptimizer.step` snippet used a
+  zero-argument lambda, which is **not** what the optimizer expects.
+  Replaced with the real `closure(batched_params) -> losses` signature
+  via `NNCostEvaluator`. The `SparseRandomProjection` example used
+  `input_dim` / `output_dim` keyword args; the actual constructor
+  takes `full_dim` / `subspace_dim`.
+
+### Lint
+
+- Cleared ruff sweep over `examples/` and `experiments/`: F541 (f-string
+  with no placeholders) in `examples/05_mnist.py`; F841 (unused locals)
+  in `experiments/runners/run_maxsat.py`; E722 (bare `except`) in
+  `experiments/runners/run_fill_ablation_grid.py`; F821 (closure capture
+  shadowed by later `del`) in `experiments/runners/run_gpt2_finetune.py`.
+  `ruff check src tests examples experiments` is now clean.
+
+### Verified
+
+- 880 tests pass (2 skipped) on the fast CI tier in ~21 s on RTX 5090
+  (PyTorch 2.12 / Python 3.14 / CUDA 13.0).
+
 ## 0.2.2 - 2026-05-21
 
 Codebase cleanup, test modernization, and documentation correctness pass.

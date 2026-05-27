@@ -284,9 +284,10 @@ class SinkhornSolver:
                         stacklevel=2,
                     )
 
-        # Validate warm-started dual potentials
-        # Dual potentials scale with the cost matrix magnitude, not epsilon
-        cost_scale = cost_matrix.abs().max().clamp(min=1e-6).item()
+        # Validate warm-started dual potentials. Dual potentials scale
+        # with the cost matrix magnitude, not epsilon. ``cost_scale`` is
+        # kept on-device so the clamp does not sync every solve.
+        cost_scale = cost_matrix.abs().max().clamp(min=1e-6)
         max_abs_dual = 10.0 * cost_scale
         if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
             f.zero_()
@@ -512,8 +513,8 @@ class SinkhornSolver:
                             converged = True
                             break
 
-        # Entropic regularized cost: <f, a> + <g, b>
-        ent_reg_cost = (f * a).sum().item() + (g * b).sum().item()
+        # Entropic regularized cost: <f, a> + <g, b>. One host transfer.
+        ent_reg_cost = torch.stack([(f * a).sum(), (g * b).sum()]).sum().item()
 
         result = SinkhornResult(
             f=f,
@@ -638,15 +639,19 @@ class SinkhornSolver:
                         log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
                         marginal_a_hat = torch.exp(torch.logsumexp(log_P_row, dim=1))
                         marginal_b_hat = torch.exp(torch.logsumexp(log_P_row, dim=0))
-                        err_a = torch.max(torch.abs(marginal_a_hat - a)).item()
-                        err_b = torch.max(torch.abs(marginal_b_hat - b)).item()
+                        # One host transfer for both marginal errors.
+                        err_a, err_b = torch.stack([
+                            torch.max(torch.abs(marginal_a_hat - a)),
+                            torch.max(torch.abs(marginal_b_hat - b)),
+                        ]).tolist()
                         err = max(err_a, err_b)
                         errors.append(err)
                         if err < self.threshold:
                             converged = True
                             break
 
-        ent_reg_cost = (f * a).sum().item() + (g * b).sum().item()
+        # Entropic regularized cost: <f, a> + <g, b>. One host transfer.
+        ent_reg_cost = torch.stack([(f * a).sum(), (g * b).sum()]).sum().item()
 
         # Store transport plan via dual potentials + approximated cost matrix.
         # The .matrix property computes P_ij = exp((f_i + g_j - C_ij) / eps)

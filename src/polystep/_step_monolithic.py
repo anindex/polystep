@@ -677,7 +677,8 @@ def step_monolithic(opt, closure: Callable) -> float:
                 opt._cma_params['cov_max'],
             )
 
-        # 5. Update step-size via CSA (if enabled)
+        # 5. Update step-size via CSA (if enabled). Pass p_sigma_norm
+        # from the Heaviside check above to skip a redundant .item() sync.
         if opt.use_csa:
             state.sigma = update_step_size_csa(
                 sigma=state.sigma,
@@ -685,6 +686,7 @@ def step_monolithic(opt, closure: Callable) -> float:
                 c_sigma=opt._cma_params['c_sigma'],
                 d_sigma=opt._cma_params['d_sigma'],
                 n=sub_dim,
+                p_sigma_norm=p_sigma_norm,
             )
             # Floor sigma to prevent collapse to zero
             state.sigma = max(state.sigma, 1e-6)

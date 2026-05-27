@@ -236,6 +236,7 @@ def update_step_size_csa(
     c_sigma: float,
     d_sigma: float,
     n: int,
+    p_sigma_norm: float | None = None,
 ) -> float:
     """Update step-size using CSA (Cumulative Step-size Adaptation) formula.
 
@@ -255,6 +256,8 @@ def update_step_size_csa(
         c_sigma: Cumulation factor for step-size path.
         d_sigma: Damping factor for step-size adaptation.
         n: Subspace dimension.
+        p_sigma_norm: Pre-computed ``||p_sigma||`` as a Python float. When
+            provided, skips the internal ``torch.norm(...).item()`` sync.
 
     Returns:
         Updated step-size, clamped to [1e-6, 100.0] for numerical stability.
@@ -264,7 +267,8 @@ def update_step_size_csa(
     """
     # Expected norm of N(0,I) in n dimensions
     expected_norm = math.sqrt(n) * (1.0 - 1.0 / (4 * n) + 1.0 / (21 * n ** 2))
-    p_sigma_norm = torch.norm(p_sigma).item()
+    if p_sigma_norm is None:
+        p_sigma_norm = torch.norm(p_sigma).item()
 
     # CSA update
     exponent = (c_sigma / d_sigma) * (p_sigma_norm / expected_norm - 1)

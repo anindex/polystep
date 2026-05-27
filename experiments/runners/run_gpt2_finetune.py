@@ -1176,19 +1176,19 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
     attention_mask = torch.ones(batch_size, max_seq_len, dtype=torch.long, device=device)
     labels = torch.randint(0, 2, (batch_size,), device=device)
 
-    def make_closure(_ids, _mask, _labels):
+    def make_closure(_ids, _mask, _labels, _model=model, _buffers=buffers):
         def closure(batched_params):
-            was_training = model.training
-            model.eval()
+            was_training = _model.training
+            _model.eval()
             try:
                 def single_forward(params):
-                    full_dict = {**params, **buffers}
-                    logits = functional_call(model, full_dict, (_ids, _mask))
+                    full_dict = {**params, **_buffers}
+                    logits = functional_call(_model, full_dict, (_ids, _mask))
                     return criterion(logits, _labels)
                 losses = vmap(single_forward, in_dims=(0,))(batched_params)
             finally:
                 if was_training:
-                    model.train()
+                    _model.train()
             return losses
         return closure
 
