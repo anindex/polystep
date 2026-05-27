@@ -1,8 +1,9 @@
-"""05 - MNIST: train a 2-layer MLP with the high-level train() API.
+"""05 - MNIST: train a 2-layer MLP with PolyStep.
 
-Demonstrates the recommended configuration: HybridSubspace with cosine-
-scheduled epsilon, step_radius, and probe_radius.  Downloads MNIST data
-directly (no torchvision dependency).
+Demonstrates the recommended configuration: a ``HybridSubspace`` with
+cosine-scheduled epsilon, step_radius, and probe_radius, driven by an
+explicit per-epoch training loop with best-state tracking. Downloads
+MNIST data directly (no torchvision dependency).
 
 What you should see:
   ~95% test accuracy after 15 epochs on GPU (~3 min).
@@ -179,7 +180,7 @@ def main():
     )
 
     print(f"  params: {num_params:,}  device: {device}  epochs: {args.epochs}")
-    print(f"  subspace: HybridSubspace rank=8  solver: softmax")
+    print("  subspace: HybridSubspace rank=8  solver: softmax")
     print(f"  eps: {eps_init}->{eps_target}  sr: {sr_init}->{sr_target}  pr: {pr_init}->{pr_target}")
     print()
 

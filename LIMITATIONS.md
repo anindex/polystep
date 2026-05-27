@@ -1,7 +1,6 @@
-# LIMITATIONS.md
+# Limitations
 
-User list of what does NOT work in `polystep`. Each entry cites
-source locations where the limitation surfaces.
+What does not work in `polystep`, with source-file references for each entry.
 
 ## Drop-in vmap-safe layers
 
@@ -74,7 +73,7 @@ restrictions apply.
 ## Subspace and projection
 
 - `HybridSubspace.from_layout(layout, rank=R)` produces an
-  *over-parameterised* projection when `R >= min(d_in, d_out)`: the
+  *over-parameterized* projection when `R >= min(d_in, d_out)`: the
   projection has more coordinates than parameters. Reconstruction is
   exact in this saturated regime.
 - `SparseRandomProjection`: `subspace_dim / full_dim < 1e-5` triggers
@@ -107,8 +106,6 @@ restrictions apply.
   `dual_momentum_beta=0.3` explicitly to enable dual momentum in
   turbo mode.
 - `num_probe` defaults to `1` everywhere.
-- `amortize_loss_gate=False` by default. The loss-gated revert is
-  implemented but opt-in.
 - `step_radius=CosineEpsilon(...)` paired with an SNN model (LIF /
   Leaky / Spik / ALIF in module class names) emits a `UserWarning`
   because the combination collapses SNN accuracy from ~93% to 10-47%.
@@ -141,13 +138,14 @@ restrictions apply.
   polystep receives `STEP_BUDGETS * popsize` evals; SLS receives only
   flip budget. **Not a fair comparison** to a tuned production
   solver.
-- **SNN Adam-surrogate baseline**
-  (`src/polystep/benchmarks/surrogate_baseline.py:115-150`): fixed
-  `spike_grad_alpha=2.0`, `lr=0.001`, no sweep.
+- **SNN Adam-surrogate baseline**: the surrogate-gradient baseline
+  reported in the paper (§5.3) is not bundled with this release; the
+  Adam baseline in `experiments/results/softmax/main/snn_adam_*.json`
+  uses straight-through gradients only.
 
 ### Evaluation protocol
 
-All four headline runners default to val-selected checkpoints (no
+The four main runners default to val-selected checkpoints (no
 test-set leakage). A test-selected mode is opt-in via
 `--allow-test-leakage`:
 
@@ -163,7 +161,7 @@ runners expose the flag.
 
 ## Random-seed gotchas
 
-- The Sinkhorn low-rank SVD initialiser uses the optimizer's seed
+- The Sinkhorn low-rank SVD initializer uses the optimizer's seed
   (propagated from `PolyStepOptimizer` through
   `solver.solve(seed=...)`).
 - Tied weights are silently deduplicated in `ParamLayout.from_module`

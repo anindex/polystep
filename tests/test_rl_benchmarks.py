@@ -176,13 +176,13 @@ def test_hardened_env_smoke():
         register_hardened_envs, HARDENED_GYM_IDS,
     )
 
-    # Direct quantizer: only 4 distinct values per channel (bin centres).
+    # Direct quantizer: only 4 distinct values per channel (bin centers).
     env = QuantizedObsWrapper(gym.make("CartPole-v1"), bins=4,
                               low=[-2.4, -3.0, -0.21, -3.5],
                               high=[2.4, 3.0, 0.21, 3.5])
     obs0, _ = env.reset(seed=0)
     obs1, _ = env.reset(seed=1)
-    # Quantizer outputs should be one of 4 bin centres per channel.
+    # Quantizer outputs should be one of 4 bin centers per channel.
     assert obs0.shape == (4,) and obs0.dtype == np.float32
     assert np.unique(np.concatenate([obs0, obs1])).size <= 8  # ≤ 4 bins × 2 resets
     env.close()

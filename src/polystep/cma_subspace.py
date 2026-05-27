@@ -58,7 +58,7 @@ from .adaptive_subspace import AdaptiveSubspace
 from .cma import compute_cma_hyperparameters
 
 if TYPE_CHECKING:
-    from .transform import ParamLayout
+    pass
 
 
 @dataclass

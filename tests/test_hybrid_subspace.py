@@ -890,3 +890,102 @@ class TestMaxSubspaceDim:
         assert torch.allclose(new_coords, torch.zeros_like(new_coords))
 
 
+class TestHybridReconstructionProperties:
+    """Reconstruction-side properties: surjectivity at saturation, the
+    1D-pass-through identity, and tied-weight deduplication."""
+
+    def test_exact_reconstruction_at_saturation(self):
+        """When ``r >= min(d_in, d_out)`` the layer projection is
+        surjective onto the parameter delta space, so any target delta
+        is reachable via a least-norm coordinate solution.
+        """
+        model = nn.Linear(4, 4, bias=False)
+        layout = ParamLayout.from_module(model, particle_dim=2)
+        hybrid = HybridSubspace.from_layout(layout, rank=4, seed=0)
+
+        assert len(hybrid.specs) == 1
+        spec = hybrid.specs[0]
+        assert spec.is_projected
+        # num_coords = d_out*r + r*d_in = 4*4 + 4*4 = 32 (>= num_params=16)
+        assert spec.num_coords == 32
+        assert spec.num_params == 16
+
+        projections = hybrid.init_projections(
+            torch.device("cpu"), torch.float32,
+        )
+        P = projections[spec.entry_key]
+        assert P.shape == (16, 32)
+
+        rank = torch.linalg.matrix_rank(P).item()
+        assert rank == 16, (
+            "Hybrid projection at saturation should span the full 16-dim "
+            f"param space; got rank {rank}"
+        )
+
+        target_delta = torch.randn(4, 4)
+        target_flat = target_delta.reshape(-1)
+        coords = torch.linalg.lstsq(P, target_flat).solution
+
+        base_sd = {spec.entry_key: torch.zeros(4, 4)}
+        perturbed = hybrid.apply_perturbation(projections, base_sd, coords)
+        recovered = perturbed[spec.entry_key]
+        assert torch.allclose(recovered, target_delta, atol=1e-4), (
+            "saturated HybridSubspace failed to reconstruct target delta; "
+            f"max diff {(recovered - target_delta).abs().max().item():.3e}"
+        )
+
+    def test_bias_pass_through_is_identity(self):
+        """Biases (1D params) carry ``is_projected=False`` and one coord
+        per element, so a per-element coord write must appear verbatim
+        in the perturbed bias.
+        """
+        model = nn.Linear(4, 8, bias=True)
+        layout = ParamLayout.from_module(model, particle_dim=2)
+        hybrid = HybridSubspace.from_layout(layout, rank=4, seed=0)
+
+        bias_specs = [s for s in hybrid.specs if s.entry_key == "bias"]
+        assert len(bias_specs) == 1
+        spec = bias_specs[0]
+
+        assert not spec.is_projected
+        assert spec.num_params == 8
+        assert spec.num_coords == 8
+
+        projections = hybrid.init_projections(
+            torch.device("cpu"), torch.float32,
+        )
+        coords = torch.zeros(hybrid.subspace_dim)
+        delta_bias = torch.tensor(
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        )
+        coords[spec.flat_start:spec.flat_end] = delta_bias
+
+        base_sd = {k: torch.zeros_like(v) for k, v in model.state_dict().items()}
+        perturbed = hybrid.apply_perturbation(projections, base_sd, coords)
+        assert torch.equal(perturbed["bias"], delta_bias)
+
+    def test_tied_weights_are_projected_once(self):
+        """A tied embedding/lm_head pair must produce exactly one
+        :class:`LayerProjectionSpec` instead of one per state_dict key.
+        """
+
+        class _TiedHead(nn.Module):
+            def __init__(self, vocab: int = 8, dim: int = 4) -> None:
+                super().__init__()
+                self.embedding = nn.Embedding(vocab, dim)
+                self.lm_head = nn.Linear(dim, vocab, bias=False)
+                self.lm_head.weight = self.embedding.weight
+
+        model = _TiedHead(vocab=8, dim=4)
+        layout = ParamLayout.from_module(model, particle_dim=2)
+
+        canonical_keys = [e.key for e in layout.entries]
+        assert "embedding.weight" in canonical_keys
+        assert "lm_head.weight" not in canonical_keys
+
+        hybrid = HybridSubspace.from_layout(layout, rank=4, seed=0)
+        assert len(hybrid.specs) == len(layout.entries)
+        spec_keys = [s.entry_key for s in hybrid.specs]
+        assert spec_keys.count("embedding.weight") == 1
+
+

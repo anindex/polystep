@@ -84,8 +84,13 @@ def test_intermediate_lam_softens_column_constraint() -> None:
     err_one = (kl_one.matrix.sum(dim=0) - b).abs().max().item()
     err_huge = (kl_huge.matrix.sum(dim=0) - b).abs().max().item()
 
-    # Stricter constraint as lam grows
-    assert err_huge < err_one < err_zero or err_huge <= err_one <= err_zero
+    # Stricter constraint as lam grows: the column-marginal error must
+    # be (weakly) monotone non-increasing in lam.
+    assert err_huge <= err_one <= err_zero, (
+        f"column-marginal error should be non-increasing in lam, "
+        f"got err_zero={err_zero:.3e} err_one={err_one:.3e} "
+        f"err_huge={err_huge:.3e}"
+    )
 
 
 def test_returns_solver_result_with_expected_fields() -> None:

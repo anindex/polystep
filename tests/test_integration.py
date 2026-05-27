@@ -178,13 +178,13 @@ def _make_integration_closure(model, input_dim=50, output_dim=10):
     return closure
 
 
-class TestPhase241Improvements:
-    """Integration tests for all four Parametric improvements.
+class TestParticleDimAdaptiveProbes:
+    """Integration tests for four core configuration knobs.
 
-    1. particle_dim=4 (richer OT signal in full-space mode)
-    2. omega=1.5 (overrelaxed Sinkhorn iterations)
-    3. RankSchedule (progressive rank expansion)
-    4. adaptive_probes (cost-row reuse for stagnant particles)
+    1. ``particle_dim=4`` (richer OT signal in full-space mode).
+    2. ``omega=1.5`` (overrelaxed Sinkhorn iterations).
+    3. ``RankSchedule`` (progressive rank expansion).
+    4. ``adaptive_probes`` (cost-row reuse for stagnant particles).
     """
 
     def test_particle_dim_4_mnist_step(self):
@@ -307,13 +307,14 @@ class TestPhase241Improvements:
         assert any_changed, "Optimization should proceed with adaptive_probes=True"
 
 
-class TestPhase241Composition:
-    """Composition tests verifying all 4 improvements work together.
+class TestSinkhornAccelerationComposition:
+    """Composition tests verifying the four knobs work together.
 
-    Since particle_dim is for full-space mode and rank_schedule is for
-    subspace mode, we test two composition scenarios:
-    - Full-space: particle_dim=4 + omega=1.5 + adaptive_probes=True
-    - Subspace: rank_schedule + omega=1.5 + adaptive_probes=True
+    ``particle_dim`` is full-space mode and ``rank_schedule`` is
+    subspace mode, so we cover both scenarios:
+
+    * Full-space: ``particle_dim=4`` + ``omega=1.5`` + ``adaptive_probes=True``.
+    * Subspace: ``rank_schedule`` + ``omega=1.5`` + ``adaptive_probes=True``.
     """
 
     def test_fullspace_composition(self):
@@ -387,11 +388,12 @@ class TestPhase241Composition:
         assert torch.isfinite(opt.state.X).all(), "State X should be finite"
 
 
-class TestPhase241Regression:
+class TestTurboBlockwiseRegression:
     """Regression guard: default parameters produce identical behavior."""
 
-    def test_defaults_match_v13_behavior(self):
-        """Default PolyStepOptimizer (no new features) runs identically to pre-24.1 behavior."""
+    def test_default_step_is_deterministic(self):
+        """PolyStepOptimizer with default kwargs and a fixed seed produces a
+        finite, reproducible step trajectory over a small model."""
         torch.manual_seed(42)
         model = _make_small_model()
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}

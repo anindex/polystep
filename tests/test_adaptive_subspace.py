@@ -129,6 +129,23 @@ class TestRotateDisplacement:
         eye = torch.eye(adaptive_sub.subspace_dim)
         assert torch.allclose(PtP, eye, atol=1e-4)
 
+    def test_rotate_with_none_history_falls_back_to_random(self, adaptive_sub):
+        """Step-0 case: ``displacement_history=None`` triggers the
+        random fallback path, which must still produce an orthonormal
+        basis."""
+        P = adaptive_sub.init_projection(
+            generator=torch.Generator().manual_seed(0),
+        )
+        P_new = adaptive_sub.rotate(
+            P, step=0, total_steps=100,
+            displacement_history=None,
+            generator=torch.Generator().manual_seed(456),
+        )
+        gram = P_new.T @ P_new
+        assert torch.allclose(
+            gram, torch.eye(adaptive_sub.subspace_dim), atol=1e-5,
+        )
+
     def test_rotate_displacement_single_entry_history(self, adaptive_sub):
         """Single-entry displacement history works correctly."""
         P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))

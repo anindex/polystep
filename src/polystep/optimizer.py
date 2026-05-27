@@ -24,7 +24,6 @@ import torch.nn as nn
 
 if TYPE_CHECKING:
     from .cost_nn import NNCostEvaluator
-    from .hybrid_subspace import HybridSubspace as _HybridSubspaceType  # noqa: F811
 
 logger = logging.getLogger(__name__)
 
@@ -82,29 +81,15 @@ from .blockwise import (
     create_grouped_blocks,
     create_per_layer_blocks,
     create_subspace_blocks,
-    reassemble_blocks,
-    reassemble_blocks_to_subspace,
-    split_particles,
-    split_subspace_to_blocks,
 )
-from .dynamics import apply_momentum, compute_momentum_coefficient, update_adaptive_radius
 from .epsilon import LinearEpsilon
-from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
+from .geometry import POLYTOPE_MAP
 from .solvers import SinkhornSolver, SoftmaxSolver, MinCostGreedySolver, TopKMeanSolver, TemperedSoftmaxSolver
-from .solvers.base import SolverResult
 from .solver import SolverState
 from .adaptive_subspace import AdaptiveSubspace
 from .cma_subspace import CMAAdaptiveSubspace
-from .cma import (
-    update_evolution_path_c,
-    update_evolution_path_sigma,
-    update_step_size_csa,
-    update_covariance_diagonal,
-    compute_ot_weights,
-    compute_heaviside_sigma,
-)
 from .subspace import LowRankSubspace, LinearSubspace
-from .hybrid_subspace import HybridSubspace, create_hybrid_blocks
+from .hybrid_subspace import HybridSubspace
 from .transform import ParamLayout, create_generator
 
 # Extracted step methods (decomposed for maintainability)
@@ -114,7 +99,6 @@ from ._step_blockwise import step_subspace_blockwise as _step_subspace_blockwise
 from ._step_momentum import (
     step_momentum as _step_momentum_fn,
     evaluate_current_loss as _evaluate_current_loss_fn,
-    amortize_should_revert as _amortize_should_revert_fn,
 )
 
 
@@ -223,14 +207,12 @@ class PolyStepOptimizer:
             K=1 is optimal: multi-probe averaging is redundant when entropic
             regularization is active. K=1 gives ~3x speedup over K=3 with no
             accuracy loss.
-        adaptive_probes: Enable adaptive probe count (default False). When True,
-            stagnant particles (small displacement) reuse the previous step's
-            cost row instead of recomputing, saving V*K forward passes each.
-        adaptive_probes_min: Minimum probe count for stagnant particles (default 2).
-            Not used in cost-row reuse mode but reserved for future per-particle
-            probe count implementation.
-        adaptive_probes_threshold: Displacement squared norm below which a particle
-            is considered stagnant (default 1e-6).
+        adaptive_probes: Enable adaptive probe count (default False). When
+            True, stagnant particles (small displacement) reuse the
+            previous step's cost row instead of recomputing, saving
+            ``V * K`` forward passes each.
+        adaptive_probes_threshold: Displacement squared norm below which a
+            particle is considered stagnant (default ``1e-6``).
         max_iterations: Maximum outer iterations (for momentum warmup schedule).
         rank: Sinkhorn rank (None=full-rank with auto-selection, int=low-rank).
         sinkhorn_max_iters: Maximum inner Sinkhorn iterations.
@@ -287,65 +269,20 @@ class PolyStepOptimizer:
             'sparse' uses SparseRandomProjection for memory efficiency.
             'auto' will auto-select based on model size.
 
-    Hyperparameter Guide:
-        **Optimal configurations by subspace mode (validated on MNIST):**
+    Hyperparameter quick reference (MNIST as a sanity check):
 
-        **Full-space mode (no subspace):**
-        Best accuracy (~80-85%), slowest per step.
-        ::
+    - **Full-space (no subspace).** ``epsilon=LinearEpsilon(1.0 -> 0.1)``,
+      ``step_radius=0.15``, ``probe_radius=0.12``.
+    - **HybridSubspace.** ``rank=4``, ``rotation_interval=0``, decaying
+      ``epsilon``, ``step_radius=4.5``, ``probe_radius=2.0``.
+    - **LinearSubspace.** Same radii as HybridSubspace; decaying ``epsilon``.
+    - **AdaptiveSubspace.** Large ``rank`` (e.g. 4096), *fixed* ``epsilon=0.5``,
+      ``step_radius=10.0``, ``probe_radius=2.0``, ``use_adaptive_radius=True``.
 
-            optimizer = PolyStepOptimizer(
-                model,
-                epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
-                step_radius=0.15,
-                probe_radius=0.12,
-            )
-
-        **HybridSubspace (recommended for accuracy, ~77% MNIST):**
-        Best subspace accuracy, moderate speed.
-        ::
-
-            subspace = HybridSubspace.from_layout(layout, rank=4,
-                rotation_interval=0,  # disable rotation for MLP fast path
-                absorb_interval=20,
-            )
-            optimizer = PolyStepOptimizer(
-                model, subspace=subspace,
-                epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
-                step_radius=4.5,
-                probe_radius=2.0,
-            )
-
-        **LinearSubspace (~60-75% MNIST):**
-        Good accuracy, simple setup.
-        ::
-
-            subspace = LinearSubspace.from_layout(layout, rank=4)
-            optimizer = PolyStepOptimizer(
-                model, subspace=subspace,
-                epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
-                step_radius=4.5,
-                probe_radius=2.0,
-            )
-
-        **AdaptiveSubspace (8-30% MNIST, fastest wall-clock):**
-        Fastest steps, but lower per-step convergence.
-        ::
-
-            subspace = AdaptiveSubspace.from_layout(layout, rank=4096)
-            optimizer = PolyStepOptimizer(
-                model, subspace=subspace,
-                epsilon=0.5,  # Fixed, NOT scheduled
-                step_radius=10.0,
-                probe_radius=2.0,
-                use_adaptive_radius=True,
-            )
-
-        **Key insights:**
-        - HybridSubspace requires ``rotation_interval=0`` for best accuracy
-        - Use ``LinearEpsilon`` schedule for per-layer projections
-        - Use fixed epsilon for global projection (AdaptiveSubspace)
-        - Higher ``step_radius`` needed for global projections (10.0 vs 4.5)
+    Rule of thumb: per-layer subspaces benefit from a decaying epsilon
+    schedule; a single global projection prefers a fixed epsilon with
+    adaptive radius. Global projections also need a larger ``step_radius``
+    than per-layer ones.
     """
 
     def __init__(
@@ -376,7 +313,6 @@ class PolyStepOptimizer:
         adaptive_probe_warmup: int = 20,
         # Adaptive probes: reduce evaluations for stagnant particles
         adaptive_probes: bool = False,
-        adaptive_probes_min: int = 2,
         adaptive_probes_threshold: float = 1e-6,
         max_iterations: int = 50,
         rank: Optional[int] = None,
@@ -387,13 +323,6 @@ class PolyStepOptimizer:
         # Amortized OT: alternate between full OT steps and cheap momentum steps
         amortize_steps: int = 1,
         amortize_ema: float = 0.7,
-        # Opt-in loss-gated revert for the cheap momentum step. Off by
-        # default so existing paper runs are bit-for-bit unchanged; turn
-        # on when the cheap step occasionally takes the iterate
-        # backwards (chaotic landscapes such as SNN and hard MoE).
-        amortize_loss_gate: bool = False,
-        amortize_loss_gate_threshold: float = 1.5,
-        amortize_loss_gate_floor: float = 0.1,
         compile: bool = False,
         solver: Optional[str] = None,
         tempered_softmax_tau: float = 1.0,
@@ -535,7 +464,6 @@ class PolyStepOptimizer:
         # OT-step-only costs for adaptive_num_probe check (avoids mixing with momentum costs)
         self._ot_step_costs: collections.deque = collections.deque(maxlen=3)
         self._adaptive_probes = adaptive_probes
-        self._adaptive_probes_min = adaptive_probes_min
         self._adaptive_probes_threshold = adaptive_probes_threshold
         # Previous per-particle displacement squared norms for stagnation detection
         self._prev_displacement_sqnorms: Optional[torch.Tensor] = None
@@ -549,9 +477,6 @@ class PolyStepOptimizer:
         self.cost_batch_size = cost_batch_size
         self.amortize_steps = max(1, amortize_steps)
         self.amortize_ema = amortize_ema
-        self.amortize_loss_gate = amortize_loss_gate
-        self.amortize_loss_gate_threshold = amortize_loss_gate_threshold
-        self.amortize_loss_gate_floor = amortize_loss_gate_floor
 
         # SNN-like models (LIF / Leaky / Spiking / ALIF cells) collapse
         # from ~93% to 10-47% accuracy when step_radius is on a cosine
@@ -1048,26 +973,24 @@ class PolyStepOptimizer:
         return self.probe_radius
 
     def _apply_probe_radius_jitter(self, probe_r: float) -> float:
-        """Apply per-step uniform multiplicative jitter to the resolved probe radius.
+        """Apply per-step uniform multiplicative jitter to the probe radius.
 
-        Implements the radius-randomisation step required by the Fubini
-        transversality argument (Theorem 4.2, condition (iv)) of the paper:
-        eta_t ~ Uniform[-eta_max, +eta_max] is sampled fresh each step from
-        the optimiser's seeded generator, and the effective probe radius is
-        probe_r * (1 + eta_t). When probe_radius_jitter == 0 (default) this
-        is a no-op and consumes no random state, so existing reported
-        experiments are bit-for-bit reproducible. When > 0, it provides the
-        positive-Lebesgue-measure tube around the (d_p-1)-sphere that the
-        proof requires.
+        Samples ``eta ~ Uniform[-eta_max, +eta_max]`` and returns
+        ``probe_r * (1 + eta)``. When ``probe_radius_jitter == 0`` (default)
+        this is a no-op and consumes no random state.
         """
         eta_max = float(self.probe_radius_jitter)
         if eta_max <= 0.0:
             return probe_r
-        eta = (
-            torch.empty((1,), device=self._generator.device)
-            .uniform_(-eta_max, eta_max, generator=self._generator)
-            .item()
-        )
+        if self._generator is not None:
+            device = self._generator.device
+            eta = (
+                torch.empty((1,), device=device)
+                .uniform_(-eta_max, eta_max, generator=self._generator)
+                .item()
+            )
+        else:
+            eta = float(torch.empty((1,)).uniform_(-eta_max, eta_max).item())
         return float(probe_r) * (1.0 + eta)
 
     def _get_ent_epsilon(self, iteration: int) -> Optional[float]:
@@ -1237,15 +1160,6 @@ class PolyStepOptimizer:
         Delegates to ``_step_momentum.evaluate_current_loss()``.
         """
         return _evaluate_current_loss_fn(self, closure)
-
-    def _amortize_should_revert(self, amortized: float, last: float) -> bool:
-        """Decide whether the amortized momentum step regressed badly.
-
-        Delegates to ``_step_momentum.amortize_should_revert()``.
-        """
-        return _amortize_should_revert_fn(self, amortized, last)
-
-
 
     # ------------------------------------------------------------------
     # Rank transition

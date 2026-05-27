@@ -293,83 +293,82 @@ def update_covariance_diagonal(
 ) -> torch.Tensor:
     """Update diagonal covariance with rank-one and rank-mu terms.
 
-    Implements the sep-CMA-ES diagonal covariance update. The full CMA-ES
-    covariance update is O(n^2), but for diagonal-only we achieve O(n).
+    Implements the sep-CMA-ES diagonal covariance update (Ros & Hansen,
+    PPSN 2008). The rank-mu term squares Mahalanobis-normalized
+    displacements ``y_{k,j} = displacement_{k,j} / sqrt(C_diag_j)`` so that
+    well-scaled coordinates contribute on equal footing with poorly-scaled
+    ones; without this normalization the diagonal can drift toward whatever
+    coordinate happened to have the largest raw displacement.
 
-    Formula (adapted from CMA-ES for diagonal):
+    Formula:
         C_diag[j] = h_factor * (1 - c_1 - c_mu) * C_diag[j]
-                  + c_1 * p_c[j]^2                           [rank-one]
-                  + c_mu * sum(w_i * z_i[j]^2)               [rank-mu]
+                  + c_1 * p_c[j]^2
+                  + c_mu * sum_k w_k * y_{k,j}^2
+        h_factor  = 1.0 if h_sigma else (1 - c_1 * c_c * (2 - c_c))
 
-    where:
-        h_factor = 1.0 if h_sigma else (1 - c_1 * c_c * (2 - c_c))
-
-    The h_factor dampens the update when p_sigma is stalled to prevent
-    covariance explosion during step-size reduction.
+    ``p_c`` is itself accumulated in Mahalanobis-normalized form by
+    ``update_evolution_path_c`` so its rank-one contribution is consistent.
 
     Args:
-        C_diag: Current diagonal covariance, shape (subspace_dim,).
-        p_c: Covariance evolution path, shape (subspace_dim,).
-        displacements: Per-particle displacements, shape (num_particles, subspace_dim).
-        weights: Particle weights from OT masses, shape (num_particles,).
-            Should sum to approximately 1.0.
+        C_diag: Current diagonal covariance, shape ``(subspace_dim,)``.
+        p_c: Covariance evolution path, shape ``(subspace_dim,)``.
+        displacements: Per-particle displacements normalized by ``sigma``
+            (not by ``sqrt(C_diag)``), shape ``(num_particles, subspace_dim)``.
+        weights: Particle weights, shape ``(num_particles,)``, summing to
+            approximately ``1.0``.
         c_1: Learning rate for rank-one update.
         c_mu: Learning rate for rank-mu update.
-        h_sigma: Heaviside flag (True if p_sigma healthy, False if stalled).
-        c_c: Cumulation factor for covariance path (used in h_factor).
+        h_sigma: Heaviside flag (``True`` if ``p_sigma`` healthy).
+        c_c: Cumulation factor for covariance path (used in ``h_factor``).
 
     Returns:
-        Updated diagonal covariance, clamped to [1e-6, 1e6] for stability,
-        shape (subspace_dim,).
+        Updated diagonal covariance, clamped to ``[1e-6, 1e6]``,
+        shape ``(subspace_dim,)``.
 
     References:
-        Hansen CMA-ES Tutorial (arXiv:1604.00772), Equation 5.
-        Ros & Hansen PPSN 2008 for sep-CMA-ES diagonal adaptation.
+        Hansen, "The CMA Evolution Strategy: A Tutorial" (arXiv:1604.00772).
+        Ros & Hansen, "A Simple Modification in CMA-ES Achieving Linear
+        Time and Space Complexity", PPSN 2008.
     """
-    # Rank-one update: p_c^2 element-wise
+    # Rank-one update: p_c is already Mahalanobis-normalized.
     rank_one = p_c ** 2
 
-    # Rank-mu update: weighted sum of squared displacements
-    # displacements: (num_particles, subspace_dim)
-    # weights: (num_particles,)
-    rank_mu = (weights[:, None] * (displacements ** 2)).sum(dim=0)
+    # Rank-mu update: square Mahalanobis-normalized displacements
+    # y_{k,j} = displacement_{k,j} / sqrt(C_diag_j).
+    sqrt_C = C_diag.clamp(min=1e-12).sqrt()
+    y = displacements / sqrt_C  # (num_particles, subspace_dim)
+    rank_mu = (weights[:, None] * (y ** 2)).sum(dim=0)
 
-    # Heaviside correction factor for stalled p_sigma
     h_factor = 1.0 if h_sigma else (1 - c_1 * c_c * (2 - c_c))
 
-    # Combined update
     C_new = h_factor * (1 - c_1 - c_mu) * C_diag + c_1 * rank_one + c_mu * rank_mu
 
-    # Clamp to reasonable bounds for numerical stability
     cov_min = 1e-6
     cov_max = 1e6
     return torch.clamp(C_new, min=cov_min, max=cov_max)
 
 
 @torch.inference_mode()
-def compute_ot_weights(
-    transport_matrix: torch.Tensor,
-    source_marginal: torch.Tensor,
-) -> torch.Tensor:
+def compute_ot_weights(transport_matrix: torch.Tensor) -> torch.Tensor:
     """Compute particle weights from OT transport plan for rank-mu update.
 
-    In standard CMA-ES, weights come from ranking (best mu out of lambda).
-    In OT-CMA-ES, we use the transport entropy: particles with focused
-    (low-entropy) transport indicate confident descent directions and
-    contribute more to the covariance update.
+    In standard CMA-ES, weights come from ranking (best ``mu`` out of
+    ``lambda``). Here we use the *transport entropy*: particles with
+    focused (low-entropy) transport indicate confident descent directions
+    and contribute more to the covariance update.
 
-    Note: The naive approach of using row-sum mass does NOT work because
-    row sums of a valid transport plan equal the source marginal (uniform
-    by default), making all weights identical.
+    Row-sum mass does *not* work as a weight because, for a valid OT plan,
+    rows sum to the source marginal (uniform by default), making all
+    weights identical.
 
     Args:
-        transport_matrix: OT transport plan, shape (num_particles, num_vertices).
-            Entry T[i,v] indicates mass transported from particle i to vertex v.
-        source_marginal: Source marginal (particle masses), shape (num_particles,).
+        transport_matrix: OT transport plan of shape
+            ``(num_particles, num_vertices)``. Entry ``T[i, v]`` is the
+            mass transported from particle ``i`` to vertex ``v``.
 
     Returns:
-        Normalized weights, shape (num_particles,), summing to approximately 1.0.
-        Higher weights for particles with more focused (lower entropy) transport.
+        Normalized weights of shape ``(num_particles,)`` summing to ``~1.0``;
+        higher weights for particles with more focused transport.
     """
     # Normalize transport per particle to get a probability distribution
     row_sums = transport_matrix.sum(dim=1, keepdim=True).clamp(min=1e-10)
@@ -400,68 +399,45 @@ def compute_ot_bias_directions(
 ) -> torch.Tensor:
     """Extract high-transport directions from the OT plan for subspace bias.
 
-    Computes weighted displacement directions based on the transport plan,
-    where particles that moved more mass to vertices contribute more strongly
-    to the bias directions. These directions can be used to bias the random
-    subspace projection toward productive regions of parameter space.
-
-    The algorithm:
-    1. For each particle i, compute the weighted vertex centroid based on
-       transport weights: centroid_i = sum_v(T[i,v] * X_vertices[i,v])
-    2. Compute displacement: direction_i = centroid_i - X_current[i]
-    3. Weight each direction by total mass moved by that particle
-    4. Take top-k directions by weight, normalize them
+    For each particle, compute the displacement from the current position
+    to the transport-weighted vertex centroid, then rank particles by
+    *transport entropy*: particles whose transport is concentrated on a
+    single vertex have low entropy and provide the most confident descent
+    direction. The same row-sum pitfall noted in :func:`compute_ot_weights`
+    applies here, which is why entropy is used instead of mass moved.
 
     Args:
-        transport_matrix: OT transport plan, shape (num_particles, num_vertices).
-            Entry T[i,v] indicates mass transported from particle i to vertex v.
+        transport_matrix: OT transport plan of shape
+            ``(num_particles, num_vertices)``. Entry ``T[i, v]`` is the
+            mass transported from particle ``i`` to vertex ``v``.
         X_vertices: Polytope vertex positions for each particle,
-            shape (num_particles, num_vertices, particle_dim).
-        X_current: Current particle positions, shape (num_particles, particle_dim).
+            shape ``(num_particles, num_vertices, particle_dim)``.
+        X_current: Current particle positions of shape
+            ``(num_particles, particle_dim)``.
         top_k: Number of top directions to return.
 
     Returns:
-        Tensor of shape (top_k, particle_dim) containing normalized high-transport
-        directions. If fewer than top_k particles have meaningful transport,
-        returns as many directions as available.
-
-    Example:
-        >>> T = torch.rand(10, 4)  # 10 particles, 4 vertices
-        >>> T = T / T.sum()  # normalize
-        >>> X_verts = torch.randn(10, 4, 8)  # vertices in 8D particle space
-        >>> X_curr = torch.randn(10, 8)
-        >>> dirs = compute_ot_bias_directions(T, X_verts, X_curr, top_k=5)
-        >>> dirs.shape
-        torch.Size([5, 8])
+        Tensor of shape ``(min(top_k, num_particles), particle_dim)``
+        containing normalized high-confidence transport directions.
     """
-    P, V = transport_matrix.shape
+    P, _ = transport_matrix.shape
 
-    # Normalize transport per particle (row-wise)
-    row_sums = transport_matrix.sum(dim=1, keepdim=True)
-    T_norm = transport_matrix / (row_sums + 1e-10)  # (P, V)
+    # Per-particle transport probability distribution.
+    row_sums = transport_matrix.sum(dim=1, keepdim=True).clamp(min=1e-10)
+    T_norm = transport_matrix / row_sums  # (P, V)
 
-    # Compute weighted centroid for each particle
-    # T_norm: (P, V) -> (P, V, 1) for broadcasting with X_vertices: (P, V, pdim)
-    weighted_vertices = T_norm.unsqueeze(-1) * X_vertices  # (P, V, pdim)
-    centroids = weighted_vertices.sum(dim=1)  # (P, pdim)
-
-    # Displacement from current position to centroid
+    # Centroid_i = sum_v T_norm[i, v] * X_vertices[i, v]
+    centroids = (T_norm.unsqueeze(-1) * X_vertices).sum(dim=1)  # (P, pdim)
     displacements = centroids - X_current  # (P, pdim)
 
-    # Weight by total mass moved (particles that moved more mass are more important)
-    mass_moved = transport_matrix.sum(dim=1)  # (P,)
-    weights = mass_moved / (mass_moved.sum() + 1e-10)
+    # Rank by inverse transport entropy so concentrated transport scores high.
+    log_T = torch.log(T_norm.clamp(min=1e-30))
+    entropy = -(T_norm * log_T).sum(dim=1)  # (P,)
+    confidence = 1.0 / (entropy + 1e-6)
 
-    # Get top-k by weight
     k_actual = min(top_k, P)
-    topk_indices = torch.topk(weights, k_actual).indices
+    topk_indices = torch.topk(confidence, k_actual).indices
+    top_displacements = displacements[topk_indices]
 
-    # Extract top-k displacements
-    top_displacements = displacements[topk_indices]  # (k_actual, pdim)
-
-    # Normalize each direction (avoid zero division)
-    norms = torch.norm(top_displacements, dim=1, keepdim=True)
-    norms = torch.clamp(norms, min=1e-10)
-    normalized_dirs = top_displacements / norms  # (k_actual, pdim)
-
-    return normalized_dirs
+    norms = torch.norm(top_displacements, dim=1, keepdim=True).clamp(min=1e-10)
+    return top_displacements / norms

@@ -203,8 +203,10 @@ class TestTemperedSoftmaxSolver:
         greedy = MinCostGreedySolver()
         r_greedy = greedy.solve(C, a=a)
 
-        # Should be very close to greedy assignment
-        assert torch.allclose(T, r_greedy.matrix, atol=0.01)
+        # tau=1e-3 with well-separated costs (gaps >= 1) makes exp(-gap/tau)
+        # underflow to ~0, so the tempered softmax collapses to the greedy
+        # assignment up to float32 rounding.
+        assert torch.allclose(T, r_greedy.matrix, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

@@ -579,11 +579,11 @@ class TestDualMomentum:
 
 
 # ---------------------------------------------------------------------------
-# TestPhase31Integration
+# Sinkhorn acceleration integration tests
 # ---------------------------------------------------------------------------
 
 
-class TestPhase31Integration:
+class TestSinkhornAccelerationIntegration:
     """Integration tests verifying all convergence acceleration improvements compose correctly."""
 
     def test_all_sinkhorn_improvements_compose(self):
@@ -899,7 +899,7 @@ class TestProbeRadiusJitter:
 
     def test_default_jitter_is_no_op(self):
         """With jitter=0, _apply_probe_radius_jitter returns the input unchanged
-        and consumes NO random state from the optimiser's generator."""
+        and consumes NO random state from the optimizer's generator."""
         torch.manual_seed(0)
         model = _make_model()
         opt = PolyStepOptimizer(
@@ -916,7 +916,7 @@ class TestProbeRadiusJitter:
     def test_jitter_perturbs_probe_radius(self):
         """With jitter > 0, _apply_probe_radius_jitter returns a value in
         the bounded multiplicative interval [(1-eta_max)*r, (1+eta_max)*r]
-        and consumes random state from the optimiser's generator."""
+        and consumes random state from the optimizer's generator."""
         torch.manual_seed(0)
         model = _make_model()
         eta_max = 0.05
@@ -949,7 +949,7 @@ class TestProbeRadiusJitter:
             PolyStepOptimizer(model, probe_radius_jitter=-0.1)
 
     def test_jitter_step_runs_and_changes_iterates(self):
-        """End-to-end: optimisation with jitter > 0 still produces a valid
+        """End-to-end: optimization with jitter > 0 still produces a valid
         step and updates the iterate, exercising the helper from inside the
         full step path (resolve_radii / _step_monolithic)."""
         torch.manual_seed(0)

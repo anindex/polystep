@@ -248,8 +248,14 @@ def step_blockwise(opt, closure: Callable) -> float:
                 init_g=init_g,
                 scale_cost=opt.scale_cost,
             )
-            if isinstance(opt.solver, SinkhornSolver) and opt._seed is not None:
-                solve_bw_kwargs["seed"] = opt._seed
+            if isinstance(opt.solver, SinkhornSolver):
+                # Forward previous solve's epsilon so warm-started duals get
+                # rescaled when the epsilon schedule moves.
+                last_eps = state.last_solve_eps
+                if last_eps is not None:
+                    solve_bw_kwargs["init_eps"] = last_eps
+                if opt._seed is not None:
+                    solve_bw_kwargs["seed"] = opt._seed
             ot_result = opt.solver.solve(**solve_bw_kwargs)
 
             # Barycentric projection
@@ -381,6 +387,7 @@ def step_blockwise(opt, closure: Callable) -> float:
             ] if state.block_duals is not None else None
         state.block_duals = new_block_duals
     state.epsilon = current_eps
+    state.last_solve_eps = ot_epsilon
 
     # Write back to model
     opt._sync_model()
@@ -659,8 +666,12 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 init_g=init_g,
                 scale_cost=opt.scale_cost,
             )
-            if isinstance(opt.solver, SinkhornSolver) and opt._seed is not None:
-                solve_sbw_kwargs["seed"] = opt._seed
+            if isinstance(opt.solver, SinkhornSolver):
+                last_eps = state.last_solve_eps
+                if last_eps is not None:
+                    solve_sbw_kwargs["init_eps"] = last_eps
+                if opt._seed is not None:
+                    solve_sbw_kwargs["seed"] = opt._seed
             ot_result = opt.solver.solve(**solve_sbw_kwargs)
 
             # Barycentric projection for this block
@@ -793,7 +804,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     # Only update block duals if no NaN revert occurred (otherwise stale NaN-causing
     # duals would overwrite the clean reset done above)
     if not _blockwise_nan_reverted:
-        # Save previous block duals for dual momentum extrapolation (matching monolithic L1728-1731)
+        # Save previous block duals for dual momentum extrapolation.
         if opt._dual_momentum_beta > 0.0:
             state._prev_prev_block_duals = [
                 (f.clone() if f is not None else None, g.clone() if g is not None else None)
@@ -801,6 +812,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             ] if state.block_duals is not None else None
         state.block_duals = new_block_duals
     state.epsilon = current_eps
+    state.last_solve_eps = ot_epsilon
 
     # Adaptive subspace: displacement tracking, absorb, and rotation
     # For combined mode with AdaptiveSubspace, handle synchronized absorb

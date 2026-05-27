@@ -11,33 +11,46 @@ from torch.utils.data import DataLoader, TensorDataset
 from polystep.cost_nn import NNCostEvaluator
 
 
-def _ensure_python_include_path():
-    """Add Python include directory to CPLUS_INCLUDE_PATH for torch.compile.
+def _python_include_dir() -> str:
+    """Return the directory containing ``Python.h`` for the active interpreter.
 
-    torch.compile's C++ backend needs Python.h, which may not be in the
-    standard /usr/include/pythonX.Y when using venvs or conda environments.
+    ``torch.compile``'s C++ backend needs ``Python.h``, which may not
+    be in the standard ``/usr/include/pythonX.Y`` when using venvs or
+    conda environments.
     """
     include_dir = sysconfig.get_path("include")
-    python_h = os.path.join(include_dir, "Python.h")
-    if not os.path.isfile(python_h):
-        # Search common locations
-        candidates = [
-            # conda / miniforge environments
-            os.path.join(sysconfig.get_config_var("prefix"), "include",
-                         f"python{sysconfig.get_python_version()}"),
-        ]
-        for candidate in candidates:
-            if os.path.isfile(os.path.join(candidate, "Python.h")):
-                include_dir = candidate
-                break
-    existing = os.environ.get("CPLUS_INCLUDE_PATH", "")
-    if include_dir not in existing:
+    if os.path.isfile(os.path.join(include_dir, "Python.h")):
+        return include_dir
+    candidate = os.path.join(
+        sysconfig.get_config_var("prefix") or "",
+        "include",
+        f"python{sysconfig.get_python_version()}",
+    )
+    if os.path.isfile(os.path.join(candidate, "Python.h")):
+        return candidate
+    return include_dir
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cplus_include_path():
+    """Prepend the Python include directory to ``CPLUS_INCLUDE_PATH``.
+
+    Scoped to the session and unwound at teardown so the mutation does
+    not leak into the parent shell or sibling pytest processes.
+    """
+    include_dir = _python_include_dir()
+    previous = os.environ.get("CPLUS_INCLUDE_PATH")
+    if include_dir not in (previous or ""):
         os.environ["CPLUS_INCLUDE_PATH"] = (
-            f"{include_dir}:{existing}" if existing else include_dir
+            f"{include_dir}:{previous}" if previous else include_dir
         )
-
-
-_ensure_python_include_path()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("CPLUS_INCLUDE_PATH", None)
+        else:
+            os.environ["CPLUS_INCLUDE_PATH"] = previous
 
 
 def pytest_configure(config):

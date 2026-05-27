@@ -54,7 +54,6 @@ class TestTrainConfig:
         assert config.epochs == 10
         assert config.batch_size == 32
         assert config.log_every == 10
-        assert config.eval_every == 0
         assert config.callbacks == []
 
     def test_invalid_epochs_zero(self):

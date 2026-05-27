@@ -1,7 +1,4 @@
-"""Regression tests for known bugs.
-
-Regression tests for specific bug fixes.
-"""
+"""Regression tests for specific bug fixes."""
 import torch
 import torch.nn as nn
 import pytest
@@ -206,7 +203,7 @@ class TestBuffersExcluded:
 
 
 # ---------------------------------------------------------------------------
-# BUG-NEW-01: Turbo features in blockwise and subspace_blockwise modes
+# Turbo features in blockwise and subspace_blockwise modes
 # ---------------------------------------------------------------------------
 
 class TestBlockwiseTurboFeatures:

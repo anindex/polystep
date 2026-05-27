@@ -1,37 +1,39 @@
 """Subspace compression for neural network parameters.
 
-Subspace compression reduces the dimensionality of the OT problem. Instead of
-optimizing N parameters directly, the optimizer works in a K-dimensional
-subspace (K << N) and projects back to full parameter space. This reduces
-memory from O(N^2) to O(K^2) in the OT solver.
+Reduces the OT problem from ``N`` parameters to a ``K``-dimensional
+subspace (``K << N``) and projects back to full parameter space, dropping
+the OT solver's memory from O(N^2) to O(K^2).
 
-Two approaches are provided:
+Two factorisations are provided:
 
-1. **LowRankSubspace** (B@A factorization): Compresses via delta_W = B @ A.
-   Bilinear in the subspace coordinates, which can cause uniform OT transport
-   near zero initialization. Best for scalability diagnostics.
+- :class:`LowRankSubspace` — ``delta_W = B @ A``, bilinear in the subspace
+  coords. Near zero this bilinearity flattens the cost landscape and
+  often gives uniform OT transport; useful for scalability diagnostics.
+- :class:`LinearSubspace` — ``delta_W = P @ coords`` with a fixed random
+  projection ``P``. Linear in the subspace coords, so probing
+  ``coords + alpha * direction`` produces a proportional cost change.
+  Recommended for training.
 
-2. **LinearSubspace** (random projection): Compresses via delta_W = P @ coords
-   where P is a fixed random projection matrix. Linear in subspace coordinates,
-   ensuring the OT solver sees proportional cost differences when probing.
-   Recommended for training convergence.
-
-The key difference: LinearSubspace preserves OT cost linearity (probing at
-coords + alpha * direction gives proportional cost change), while
-LowRankSubspace's bilinear B@A factorization can create cost landscape
-distortion near the origin.
-
-All factors/coords are packed into a single flat subspace vector with per-layer
-offsets. The subspace vector IS the particle array for the OT solver
-(reshaped to (num_particles, particle_dim)).
+All factors/coords are packed into a single flat subspace vector with
+per-layer offsets. That vector *is* the particle array for the OT solver
+(reshaped to ``(num_particles, particle_dim)``).
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+import zlib
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
+
+
+def _stable_entry_seed(*parts: object) -> int:
+    """Hash a tuple of seed components to a 31-bit integer, deterministically
+    across processes (unlike Python's salted ``hash``).
+    """
+    key = "|".join(str(p) for p in parts).encode("utf-8")
+    return int(zlib.adler32(key)) & 0x7FFFFFFF
 
 if TYPE_CHECKING:
     from .transform import ParamLayout
@@ -562,7 +564,7 @@ class LinearSubspace:
                 return cached
 
         # Deterministic seed from global seed + entry key
-        entry_seed = hash((self.seed, spec.entry_key)) % (2**31)
+        entry_seed = _stable_entry_seed(self.seed, spec.entry_key)
         gen = torch.Generator(device='cpu')
         gen.manual_seed(entry_seed)
 

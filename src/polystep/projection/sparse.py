@@ -1,11 +1,15 @@
 """Sparse random projection for memory-efficient large-scale subspace.
 
-Uses sparse Johnson-Lindenstrauss transform (SJLT) which maintains
-distance preservation guarantees while using O(nnz) memory.
+Implements an Achlioptas-style sparse projection (Rademacher entries at
+randomly sampled positions) at the very-sparse density of Li, Hastie &
+Church (2006), preserving Johnson-Lindenstrauss distance guarantees
+while using O(nnz) memory.
 
-Default sparsity (1/sqrt(n)) follows Li, Hastie, Church's
-"Very sparse random projections" which shows sqrt(n)-sparse
-projections preserve distances as well as dense.
+References:
+    Achlioptas, D. (2003). "Database-friendly random projections:
+        Johnson-Lindenstrauss with binary coins."
+    Li, P., Hastie, T. & Church, K. (2006). "Very sparse random
+        projections."
 """
 import math
 import warnings
@@ -25,12 +29,11 @@ _EXTREME_COMPRESSION_RATIO = 1e-5
 class SparseRandomProjection:
     """Sparse random projection for memory-efficient large-scale subspace.
 
-    Uses sparse Johnson-Lindenstrauss transform (SJLT) which maintains
-    distance preservation guarantees while using O(nnz) memory.
-
-    Default sparsity (1/sqrt(n)) follows Li, Hastie, Church's
-    "Very sparse random projections" which shows sqrt(n)-sparse
-    projections preserve distances as well as dense.
+    Achlioptas-style sparse projection: each column has Rademacher (+1/-1)
+    entries at randomly sampled positions, scaled by 1/sqrt(nnz_per_col).
+    The default density ``1/sqrt(full_dim)`` follows Li, Hastie & Church
+    (2006), which preserves JL distance guarantees while keeping memory
+    at O(nnz).
 
     The projection matrix P is (full_dim x subspace_dim) with:
     - Each column has exactly nnz_per_col = density * full_dim nonzeros
@@ -93,7 +96,6 @@ class SparseRandomProjection:
         self._device: Optional[torch.device] = None
         self._dtype: Optional[torch.dtype] = None
         self._sparse_matrix: Optional[torch.Tensor] = None
-        self._sparse_matrix_t: Optional[torch.Tensor] = None  # CSR transpose cache
 
     def _init_sparse_matrix(self, device: torch.device, dtype: torch.dtype) -> None:
         """Initialize sparse projection matrix on demand.
@@ -154,14 +156,12 @@ class SparseRandomProjection:
         Returns:
             Sparse COO tensor of shape (full_dim, subspace_dim).
         """
-        # Initialize on first use or if device/dtype changed
+        # Initialize on first use or if device/dtype changed.
         if (self._indices is None or
             self._device != device or
             self._dtype != dtype):
             self._init_sparse_matrix(device, dtype)
-            # Rebuild cached sparse matrices after re-initialization
             self._sparse_matrix = None
-            self._sparse_matrix_t = None
 
         if self._sparse_matrix is None:
             self._sparse_matrix = torch.sparse_coo_tensor(

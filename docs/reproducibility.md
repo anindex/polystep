@@ -92,7 +92,8 @@ Results are saved as JSON files in `experiments/results/softmax/`. Each file con
 
 ## View
 
-Paper figures are pre-rendered in the paper repository (`paper/figures/`).
+Figures referenced in the paper are not bundled in this repository --
+see the arXiv preprint (arXiv:2605.01928) for the rendered versions.
 To aggregate CLI results from JSON:
 
 ```bash

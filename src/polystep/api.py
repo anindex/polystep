@@ -73,16 +73,13 @@ class TrainConfig:
             the provided DataLoader directly and does NOT build one
             from this value.
         log_every: Step interval for built-in logging. Must be > 0.
-        eval_every: Epoch interval for full-training-set loss evaluation.
-            0 = disabled.
-        callbacks: List of ``TrainCallback`` instances. None is
+        callbacks: List of ``TrainCallback`` instances. ``None`` is
             normalized to an empty list.
     """
 
     epochs: int = 10
     batch_size: int = 32
     log_every: int = 10
-    eval_every: int = 0
     callbacks: Optional[List[TrainCallback]] = None
 
     def __post_init__(self):
@@ -155,10 +152,14 @@ def train(
             inputs, targets = batch
             inputs, targets = inputs.to(device), targets.to(device)
 
-            # Micro-batch: subsample for cost evaluation if configured
+            # Micro-batch: subsample for cost evaluation if configured.
             cost_bs = getattr(optimizer, 'cost_batch_size', None)
             if cost_bs is not None and cost_bs < inputs.shape[0]:
-                idx = torch.randperm(inputs.shape[0], device=inputs.device)[:cost_bs]
+                gen = getattr(optimizer, '_generator', None)
+                if gen is not None and gen.device.type == inputs.device.type:
+                    idx = torch.randperm(inputs.shape[0], device=inputs.device, generator=gen)[:cost_bs]
+                else:
+                    idx = torch.randperm(inputs.shape[0], device=inputs.device)[:cost_bs]
                 cost_inputs = inputs[idx]
                 cost_targets = targets[idx]
             else:
@@ -199,7 +200,7 @@ def train(
                 'converged': (
                     state.linear_convergence[-1]
                     if state.linear_convergence
-                    else True
+                    else False
                 ),
                 'absorb_count': getattr(state, 'absorb_count', 0),
             }

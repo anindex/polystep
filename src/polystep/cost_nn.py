@@ -155,8 +155,8 @@ class NNCostEvaluator:
         """Reset the vmap failure flag so vmap is attempted again.
 
         Useful after changing the model architecture (e.g., swapping layers),
-        moving the model to a different device, or upgrading PyTorch where
-        a previously unsupported op may now work under vmap.
+        moving the model to a different device, or upgrading PyTorch (vmap
+        op coverage expands across releases).
         """
         self._vmap_failed = False
         self._warned = False
@@ -171,7 +171,10 @@ class NNCostEvaluator:
         """
         if self._chunk_size_raw == "auto":
             if self._chunk_size_cached is _UNSET:
-                self._chunk_size_cached = auto_detect_chunk_size(self.model)
+                self._chunk_size_cached = auto_detect_chunk_size(
+                    self.model,
+                    compile_overhead=self._compile_vmap,
+                )
             return self._chunk_size_cached
         return self._chunk_size_raw
 
@@ -377,13 +380,14 @@ class NNCostEvaluator:
     ) -> torch.Tensor:
         """Fused subspace-reconstruct + forward via in-place weight swap.
 
-        EGGROLL-inspired: instead of materializing ALL N configs' full
-        weights via ``reconstruct_batch`` then evaluating, this reconstructs
-        ONE config at a time directly into model weights using
-        ``apply_perturbation_inplace``, then runs a single forward pass.
+        Instead of materialising all ``N`` configurations' full weights
+        up front via ``reconstruct_batch`` and then evaluating, this
+        method reconstructs one configuration at a time directly into the
+        model parameters using ``apply_perturbation_inplace`` and runs a
+        single forward pass per configuration.
 
-        Memory: O(model_params + 1 × batch × activation) regardless of N.
-        No stacked_params dict is ever allocated.
+        Peak memory is ``O(model_params + batch * activation)``
+        independent of ``N``; no stacked parameter dict is ever allocated.
 
         Args:
             subspace: HybridSubspace with ``apply_perturbation_inplace``.
@@ -432,16 +436,17 @@ class NNCostEvaluator:
 
 
 class BatchedLinearEvaluator:
-    """Fast batched evaluation for models composed only of Linear + stateless layers.
+    """Fast batched evaluation for pure-MLP models.
 
     Replaces vmap + functional_call with explicit ``torch.bmm`` per Linear
     layer, eliminating vmap dispatch overhead. For N parameter configs of a
     k-layer MLP, performs k batched matmuls instead of N sequential forward
     passes or a single vmap call.
 
-    Only supports: ``nn.Linear``, ``nn.ReLU``, ``nn.Flatten``, ``nn.Dropout``
-    (eval mode), ``nn.BatchNorm1d`` (eval mode with frozen stats).
-    Returns None from ``try_build`` if the model contains unsupported layers.
+    Supported layers: ``nn.Linear``, ``nn.ReLU``, ``nn.LeakyReLU``,
+    ``nn.Sigmoid``, ``nn.Tanh``, ``nn.GELU``, ``nn.SiLU``, ``nn.Flatten``,
+    and ``nn.Dropout`` (eval mode). Models containing any other layer
+    cause ``try_build`` to return ``None``.
     """
 
     def __init__(self, model: nn.Module, loss_fn: Callable, layer_keys: list):
@@ -519,6 +524,10 @@ class BatchedLinearEvaluator:
                 x = torch.sigmoid(x)
             elif tag == 'tanh':
                 x = torch.tanh(x)
+            elif tag == 'gelu':
+                x = torch.nn.functional.gelu(x)
+            elif tag == 'silu':
+                x = torch.nn.functional.silu(x)
             elif tag in ('flatten', 'dropout'):
                 pass  # already flat / eval mode = identity
 

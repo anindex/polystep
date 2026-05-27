@@ -1,12 +1,11 @@
-"""Data generation utilities for non-differentiable showcase experiments.
+"""Data generators for the non-differentiable experiment runners.
 
-Provides data generators for:
-- MAX-SAT: Random 3-SAT instances via PySAT with clause tensors
-- Permutation learning: Random sequences with target sort permutations
-- Multi-domain: Combined MNIST + Fashion-MNIST (20 classes)
+- MAX-SAT: random 3-SAT instances via PySAT with clause tensors
+- Permutation learning: random sequences with target sort permutations
+- Multi-domain: combined MNIST + Fashion-MNIST (20 classes)
 
-These utilities are shared across Phases 36-40 of the v2.0 non-differentiable
-showcase experiments.
+Consumed by ``run_maxsat.py``, ``run_elevation.py``, ``run_mnist.py``,
+and ``run_moe.py`` under ``experiments/runners/``.
 """
 from __future__ import annotations
 

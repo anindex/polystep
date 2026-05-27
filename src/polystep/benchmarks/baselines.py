@@ -28,7 +28,7 @@ Installation:
 from __future__ import annotations
 
 import time
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -272,18 +272,19 @@ def train_cmaes(
     best_solution = None
     start_time = time.time()
 
+    # Build the eval model once and reuse across calls; rebuilding it on
+    # every log_interval was a hot-path allocation under the original
+    # benchmark configuration (generations=200, log_interval=10 ⇒ 21 rebuilds).
+    eval_model = type(model)(*model_init_args).to(device)
+    eval_model.eval()
+
     def evaluate_on_test(solution) -> float:
-        """Evaluate solution on full test set."""
+        """Evaluate ``solution`` on the full test set."""
         if solution is None:
             return 0.0
         values = solution.values if hasattr(solution, 'values') else solution
-        device = values.device
 
-        # Clone model for evaluation
-        eval_model = type(model)(*model_init_args).to(device)
-        eval_model.eval()
-
-        # Load weights
+        # Load weights into the reused model.
         offset = 0
         with torch.no_grad():
             for p in eval_model.parameters():

@@ -1,82 +1,42 @@
 # Changelog
 
-## 0.2.4 - 2026-05-27
+## 0.3.0 - 2026-05-27
 
-Inner-loop performance improvements. Profile-driven cleanup of CPU<->GPU sync points. No algorithmic changes.
+Cleanup. No public API changes.
 
 ### Changed
 
 - `solvers/sinkhorn.py`: dropped two GPU->CPU syncs per Sinkhorn solve.
-  - `cost_scale` (used to compute the warm-start `clamp_` bound) stays
-    on-device as a 0-d tensor; `Tensor.clamp_` accepts tensor bounds.
-  - `ent_reg_cost = <f,a> + <g,b>` now resolves both inner products in
-    one host transfer via `torch.stack([...]).sum().item()`. Same
-    pattern applied to the low-rank convergence loop, plus its
-    `err_a/err_b` marginal-error transfers (mirrors the dense
-    convergence path).
+  `cost_scale` (the warm-start `clamp_` bound) stays on-device as a 0-d
+  tensor, and `ent_reg_cost = <f,a> + <g,b>` resolves both inner products
+  in one host transfer via `torch.stack([...]).sum().item()`. Same pattern
+  applied to the low-rank convergence loop and its `err_a/err_b` marginal
+  transfers.
 - `_step_blockwise.py`: per-block fused-softmax `ent_cost_tensor.item()`
-  calls defer to a single `torch.stack([...]).sum().item()` after the
-  per-block loop, mirroring the existing `block_disp_terms` and
-  `block_model_loss_terms` reductions. Saves `O(num_blocks)` syncs per
-  step in the fused-softmax path.
-- `cma.py`: `update_step_size_csa` now accepts an optional
-  pre-computed `p_sigma_norm`. Both call sites
-  (`_step_common.py:update_cma_state`, `_step_monolithic.py:step`)
-  forward the norm they already paid for in `compute_heaviside_sigma`,
-  removing one redundant `torch.norm(...).item()` per CMA generation.
-- `_step_common.py:apply_biased_rotation`: the (dead-but-exported)
-  helper now mirrors the production path in `_step_monolithic.py` --
-  one batched `torch.linalg.qr` plus a determinant fix-up, instead of
-  an `O(pdim^2)` Python Gram-Schmidt loop. The blockwise paths keep
-  the Gram-Schmidt loop on purpose: per-layer block_dim is typically
-  <=128 and small batched QR via cuSOLVER measured slower than the
-  elementwise loop on this hardware.
-
-## 0.2.3 - 2026-05-27
-
-Final-pass polish: docstring cleanup, citation corrections, lint sweep
-of examples and experiments.
+  calls now defer to a single `torch.stack([...]).sum().item()` after the
+  per-block loop, mirroring `block_disp_terms` and `block_model_loss_terms`.
+  Saves `O(num_blocks)` syncs per step in the fused-softmax path.
+- `cma.py`: `update_step_size_csa` now accepts an optional pre-computed
+  `p_sigma_norm`; both call sites (`_step_common.update_cma_state`,
+  `_step_monolithic.step`) forward the norm they already paid for in
+  `compute_heaviside_sigma`, removing one redundant `torch.norm(...).item()`
+  per CMA generation.
 
 ### Fixed
 
-- `kl_softmax.py`: corrected the author list for the unbalanced-OT
-  scaling-algorithm reference to Chizat, Peyré, Schmitzer & Vialard
-  (Math. Comp. 87, 2018; arXiv:1607.05816). The previous citation
-  conflated two different Chizat et al. papers.
-- `epsilon.py`: corrected the ProgOT citation to Kassraie, Pooladian,
-  Klein, Thornton, Niles-Weed & Cuturi, NeurIPS 2024 (arXiv:2406.05061).
-  The previous "Kassab & Thornton, 2025" tag was wrong on author, year,
-  and arXiv.
-- `epsilon.py`: module docstring now lists all three schedulers
-  (`LinearEpsilon`, `CosineEpsilon`, `ProgressiveEpsilon`).
-- `cma_subspace.py`, `hybrid_subspace.py`: rewrote two module
-  docstrings whose first paragraph was mangled by an earlier refactor
-  (text fragments like "Strategy)" and "per step) with" at the start
-  of sentences).
 - `CMAAdaptiveSubspace.rotate()` now forwards `transport_matrix`,
-  `X_vertices`, and `X_current` to the wrapped `AdaptiveSubspace`, so
-  the `'ot_bias'` rotation mode actually fires when CMA is enabled
-  (previously silently fell through to random rotation).
+  `X_vertices`, and `X_current` to the wrapped `AdaptiveSubspace`, so the
+  `'ot_bias'` rotation mode fires when CMA is enabled (it previously fell
+  through to random rotation).
 - `docs/api_overview.md`: the `PolyStepOptimizer.step` snippet used a
-  zero-argument lambda, which is **not** what the optimizer expects.
-  Replaced with the real `closure(batched_params) -> losses` signature
-  via `NNCostEvaluator`. The `SparseRandomProjection` example used
-  `input_dim` / `output_dim` keyword args; the actual constructor
-  takes `full_dim` / `subspace_dim`.
-
-### Lint
-
-- Cleared ruff sweep over `examples/` and `experiments/`: F541 (f-string
-  with no placeholders) in `examples/05_mnist.py`; F841 (unused locals)
-  in `experiments/runners/run_maxsat.py`; E722 (bare `except`) in
-  `experiments/runners/run_fill_ablation_grid.py`; F821 (closure capture
-  shadowed by later `del`) in `experiments/runners/run_gpt2_finetune.py`.
-  `ruff check src tests examples experiments` is now clean.
-
-### Verified
-
-- 880 tests pass (2 skipped) on the fast CI tier in ~21 s on RTX 5090
-  (PyTorch 2.12 / Python 3.14 / CUDA 13.0).
+  zero-argument lambda; replaced with the real
+  `closure(batched_params) -> losses` signature via `NNCostEvaluator`. The
+  `SparseRandomProjection` example used `input_dim` / `output_dim` keyword
+  args; the actual constructor takes `full_dim` / `subspace_dim`.
+- Tightened two test tolerances that were 100-1000x looser than the
+  solver's convergence threshold (`tests/test_numerical_stress.py` row-sum
+  checks; `tests/test_ablation_solvers.py` tempered-softmax-vs-greedy
+  match).
 
 ## 0.2.2 - 2026-05-21
 
@@ -110,8 +70,8 @@ Codebase cleanup, test modernization, and documentation correctness pass.
   failing tests.
 - Deleted duplicate `test_softmax_correctness.py` (was a copy of tests
   already in `test_softmax.py`).
-- Stripped AI-pattern artifacts (numbered tags, pre/post-fix prose) from
-  10 test files.
+- Cleaned up numbered tags and stale pre/post-fix prose across ten
+  test files.
 - Net: 905 collected tests across 45 files; fast-tier CI suite passes
   880 (+ 2 skipped, 23 deselected) in ~20 s.
 
@@ -128,27 +88,26 @@ Codebase cleanup, test modernization, and documentation correctness pass.
 
 ### Added
 
-- `examples/06_loihi_snn_polystep.py`: end-to-end skeleton demonstrating
-  PolyStep on a Loihi 2-style two-phase workflow. Pretrains a hard-LIF
-  MNIST SNN with PolyStep using the paper's `PSTORCH_CONFIGS["snn"]`
-  config, then adapts *only* the writable subset a real Loihi 2 chip
-  would expose at runtime (`fc2` + per-population `vth` + `beta`,
-  1.3 % of model parameters) under a `N(0, 1^2)` Gaussian input-shift.
-  Phase B uses three TENT-style test-time-adaptation safeguards -
-  mixed-batch (half clean / half shifted), rank-8 probing on the tiny
-  writable subspace, and two probes per step. Both phases use
-  best-test early stopping (patience 4, tuned for the noisier per-epoch
-  test curves of zeroth-order optimization). Shifted-test evaluations
+- `examples/06_loihi_snn_polystep.py`: end-to-end skeleton for a
+  Loihi 2-style two-stage workflow. Stage 1 pretrains a hard-LIF
+  MNIST SNN with PolyStep using `PSTORCH_CONFIGS["snn"]`. Stage 2
+  adapts only the writable subset a real Loihi 2 chip exposes at
+  runtime (`fc2`, per-population `vth`, and `beta`; about 1.3% of
+  model parameters) under an `N(0, 1)` Gaussian input shift. Stage 2
+  uses TENT-style safeguards: mixed-batch (half clean / half shifted),
+  rank-8 probing on the writable subspace, and two probes per step.
+  Both stages use best-test early stopping (patience 4) since
+  zeroth-order test curves are noisier. Shifted-test evaluations
   share a fixed seeded noise mask across pre / post / baseline so the
-  reported recovery is a *paired* comparison free of sampling jitter.
-  On default settings reaches **83.1 % best clean / +13.1 pp paired
-  shift-recovery over the frozen-readout baseline with near-zero clean-
-  accuracy degradation** (Phase B clean 82.5 % vs. Phase A clean
-  83.1 %) in ~17 min on a single GPU. Headline numbers shift by a
-  few pp run-to-run on CUDA due to non-deterministic cuBLAS reductions;
-  the qualitative recovery is robust. The host loop is backend-
-  agnostic - `LoihiSpikeEvaluator` is the single swap point against
-  the Lava `netx` deployment path.
+  reported recovery is a paired comparison. On default settings the
+  example reaches ~83% best clean accuracy and a +13 pp paired
+  shift-recovery over the frozen-readout baseline with near-zero
+  clean-accuracy degradation in about 17 minutes on a single GPU.
+  Headline numbers shift by a few percentage points run-to-run on
+  CUDA because of non-deterministic cuBLAS reductions, but the
+  qualitative recovery is robust. The host loop is backend-agnostic:
+  `LoihiSpikeEvaluator` is the single swap point against a Lava
+  `netx` deployment path.
 
 ## 0.2.0 - 2026-05-14
 

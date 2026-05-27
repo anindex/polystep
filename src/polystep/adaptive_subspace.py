@@ -1,53 +1,35 @@
-"""AdaptiveSubspace: rotating orthogonal projection for gradient-free optimization.
+"""Rotating orthogonal projection subspace.
 
-Replaces LinearSubspace's fixed random projection with a rotating orthogonal
-basis. The projection P can be re-drawn each iteration, optionally biased
-toward productive OT displacement directions discovered during optimization.
+:class:`AdaptiveSubspace` replaces :class:`LinearSubspace`'s fixed random
+per-layer projection with a single *global* QR-orthogonal projection
+``P`` of shape ``(full_dim, subspace_dim)`` that can be re-drawn each
+iteration, optionally biased toward productive directions.
 
-Key differences from LinearSubspace:
+Differences from :class:`LinearSubspace`:
 
-1. **Single global projection**: AdaptiveSubspace uses ONE projection matrix P
-   of shape (full_dim, subspace_dim) for ALL parameters, rather than per-layer
-   projection matrices. This enables cross-layer information sharing.
+- One projection matrix covers all parameters (cross-layer mixing).
+- ``P`` is stored in ``SolverState.projection`` and passed in to every
+  method, so rotation does not require rebuilding the subspace object.
+- Columns are QR-orthonormal (``P^T P = I``), so ``||P @ coords|| =
+  ||coords||``. There is no ``1/sqrt(N)`` dilation, so the right
+  ``step_radius`` is typically smaller than for :class:`LinearSubspace`.
 
-2. **Mutable projection**: The projection P is NOT stored inside the subspace
-   object. It lives in ``SolverState.projection`` (optimizer state) and is
-   passed as an argument to all methods. This allows rotation without
-   reconstructing the subspace object.
+Rotation modes:
 
-3. **QR-orthogonalized columns**: P has orthonormal columns (P.T @ P = I),
-   unlike LinearSubspace's 1/sqrt(N)-scaled random columns. This means
-   perturbation norms are preserved: ||P @ coords|| = ||coords||. As a
-   consequence, ``step_radius`` does not need the 30x scaling factor that
-   LinearSubspace requires.
+- ``'random'`` — fresh QR-orthogonal basis every call.
+- ``'displacement'`` — SVD of recent displacements keeps productive
+  directions; the SVD share grows linearly from ``svd_ratio_init`` to
+  ``svd_ratio_final`` over the schedule.
+- ``'ot_bias'`` — biases a fraction of columns toward high-transport
+  directions extracted from the OT plan (falls back to random when the
+  full-dim layout doesn't match the particle layout).
 
-4. **Three rotation modes**:
-   - ``'random'``: Draws entirely new QR-orthogonalized basis each call.
-     Equivalent to random search in a new subspace each iteration.
-   - ``'displacement'``: Uses SVD of recent displacement history to keep
-     productive directions and fills the remainder with random directions.
-     The SVD ratio (fraction of directions from SVD) is linearly scheduled
-     from ``svd_ratio_init`` to ``svd_ratio_final`` over optimization.
-   - ``'ot_bias'``: Uses high-transport directions from the OT plan to bias
-     a fraction of the projection basis. Combines OT-derived directions
-     (via ``ot_bias_ratio``) with random directions via QR orthogonalization.
-     Falls back to random when OT info is not available.
-
-5. **Absorb mechanics**: Like LinearSubspace, ``absorb()`` folds the current
-   subspace perturbation into base weights and zeros the subspace vector.
-   Combined with rotation, this means each iteration explores a fresh
-   subspace centered on the current best parameters.
-
-Note on radius scaling:
-    Because QR-orthogonalized columns have unit norm (not 1/sqrt(N)),
-    perturbation magnitudes in full parameter space equal the subspace
-    coordinate magnitudes. This is different from LinearSubspace where
-    the 1/sqrt(N) scaling dilutes perturbations. Users may need to adjust
-    ``step_radius`` accordingly (typically smaller values than LinearSubspace).
+``absorb()`` folds the current subspace perturbation into the base
+weights and zeros the subspace vector. Combined with rotation each
+iteration explores a fresh subspace centered on the current best.
 """
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -455,40 +437,33 @@ class AdaptiveSubspace:
         """
         from .cma import compute_ot_bias_directions
 
-        # Number of directions from OT bias
+        # Number of directions to allocate to OT bias vs random.
         k_ot = max(1, int(self.ot_bias_ratio * self.subspace_dim))
-        k_random = self.subspace_dim - k_ot
 
-        # Get high-transport directions in particle space
+        # Get high-transport directions in particle space.
         ot_dirs = compute_ot_bias_directions(
             transport_matrix, X_vertices, X_current, top_k=k_ot,
         )
         # ot_dirs: (k_ot_actual, particle_dim)
         k_ot_actual = ot_dirs.shape[0]
-        k_random = self.subspace_dim - k_ot_actual
 
-        # Project particle-space directions to full parameter space.
-        # Strategy: tile the particle-dim directions to match full_dim.
-        # Since full_dim = num_particles * particle_dim, each particle-space
-        # direction can be repeated num_particles times.
+        # Lifting particle-space directions to ``full_dim`` only makes sense
+        # when the full vector is a concatenation of equal-size particle
+        # slots (full_dim == num_particles * particle_dim). For real
+        # parameter layouts ``full_dim`` is the total number of trainable
+        # parameters; tiling would map an OT direction to arbitrary layer
+        # weights and lose its meaning. Fall back to pure random in that
+        # case.
         num_particles = X_current.shape[0]
-
-        # Create full_dim directions by tiling
-        # ot_dirs: (k_ot_actual, particle_dim) -> (k_ot_actual, full_dim)
-        # We tile each direction across all particles
-        ot_dirs_full = ot_dirs.unsqueeze(1).expand(-1, num_particles, -1)
-        ot_dirs_full = ot_dirs_full.reshape(k_ot_actual, -1)  # (k_ot_actual, P * pdim)
-
-        # Truncate or pad to match full_dim
-        if ot_dirs_full.shape[1] >= self.full_dim:
-            ot_dirs_full = ot_dirs_full[:, :self.full_dim]
+        particle_dim = ot_dirs.shape[1]
+        if num_particles * particle_dim == self.full_dim:
+            ot_dirs_full = ot_dirs.unsqueeze(1).expand(-1, num_particles, -1)
+            ot_dirs_full = ot_dirs_full.reshape(k_ot_actual, -1)
+            ot_cols = ot_dirs_full.T  # (full_dim, k_ot_actual)
         else:
-            # Pad with zeros if needed (shouldn't happen in normal use)
-            pad_size = self.full_dim - ot_dirs_full.shape[1]
-            ot_dirs_full = torch.nn.functional.pad(ot_dirs_full, (0, pad_size))
-
-        # Transpose to column format: (full_dim, k_ot_actual)
-        ot_cols = ot_dirs_full.T
+            ot_cols = None
+            k_ot_actual = 0
+        k_random = self.subspace_dim - k_ot_actual
 
         # Generate random directions for the remainder
         gen_device = "cpu"
@@ -503,11 +478,12 @@ class AdaptiveSubspace:
         )
         if str(device) != gen_device:
             Z_random = Z_random.to(device=device)
-        if ot_cols.device != Z_random.device:
-            ot_cols = ot_cols.to(device=Z_random.device)
-
-        # Concatenate OT directions + random, then QR-orthogonalize
-        combined = torch.cat([ot_cols, Z_random], dim=1)
+        if ot_cols is not None:
+            if ot_cols.device != Z_random.device:
+                ot_cols = ot_cols.to(device=Z_random.device)
+            combined = torch.cat([ot_cols, Z_random], dim=1)
+        else:
+            combined = Z_random
         P_new, R = torch.linalg.qr(combined)
         # Fix sign ambiguity
         d = torch.sign(torch.diagonal(R))

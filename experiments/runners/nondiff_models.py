@@ -1,4 +1,4 @@
-"""Non-differentiable model definitions for paper experiments (Phases 36-40).
+"""Non-differentiable model definitions for the paper experiments.
 
 All models contain at least one non-differentiable operation in their forward pass
 where backpropagation gives zero gradients. polystep trains them using only forward

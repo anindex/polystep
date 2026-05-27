@@ -1,17 +1,19 @@
 """polystep: PyTorch PolyStep Optimizer."""
-__version__ = "0.2.4"
+__version__ = "0.3.0"
 
 __all__ = [
     # Core solver
     "Solver", "SolverResult",
     "SinkhornSolver", "SinkhornResult",
     "SoftmaxSolver", "SoftmaxResult",
+    "KLSoftmaxSolver", "TemperedSoftmaxSolver",
     # Geometry
     "get_orthoplex_vertices", "get_simplex_vertices", "get_cube_vertices",
     "get_sampled_polytope_vertices", "get_random_rotation_matrices",
     "POLYTOPE_MAP", "POLYTOPE_NUM_VERTICES_MAP",
     # Cost & epsilon
-    "compute_cost_matrix", "scale_cost_matrix", "LinearEpsilon", "CosineEpsilon",
+    "compute_cost_matrix", "scale_cost_matrix",
+    "LinearEpsilon", "CosineEpsilon", "ProgressiveEpsilon",
     # Solver
     "PolyStep", "SolverState",
     # Transform
@@ -45,7 +47,12 @@ __all__ = [
     "HybridSubspace", "LayerProjectionSpec",
 ]
 
-from .solvers import Solver, SolverResult, SinkhornSolver, SinkhornResult, SoftmaxSolver, SoftmaxResult
+from .solvers import (
+    Solver, SolverResult,
+    SinkhornSolver, SinkhornResult,
+    SoftmaxSolver, SoftmaxResult,
+    KLSoftmaxSolver, TemperedSoftmaxSolver,
+)
 
 from .geometry import (
     get_orthoplex_vertices,
@@ -58,7 +65,7 @@ from .geometry import (
 )
 
 from .costs import compute_cost_matrix, scale_cost_matrix
-from .epsilon import LinearEpsilon, CosineEpsilon
+from .epsilon import LinearEpsilon, CosineEpsilon, ProgressiveEpsilon
 
 from .solver import PolyStep, SolverState
 

@@ -92,20 +92,29 @@ def compute_newton_step(
     max_step_norm: float = 10.0,
     hessian_reg: float = 1e-4,
 ) -> torch.Tensor:
-    """Compute Newton step in rotated frame: delta = -g / (H + reg).
+    """Compute a diagonal Newton step in the rotated frame.
 
-    Only uses positive curvature directions. Clamps step norm for safety.
+    Along positive-curvature coordinates returns ``-g_i / H_i``; along
+    nonpositive coordinates the Hessian is replaced by ``hessian_reg``
+    (so the step becomes a small gradient step in those directions, never
+    an ascent step). The full step is then clipped to ``max_step_norm``.
 
     Args:
-        gradient: FD gradient of shape (P, pdim).
-        hessian_diag: Diagonal Hessian of shape (P, pdim).
+        gradient: FD gradient of shape ``(P, pdim)``.
+        hessian_diag: Diagonal Hessian of shape ``(P, pdim)``.
         max_step_norm: Maximum step norm (trust region bound).
-        hessian_reg: Regularization for near-zero Hessian entries.
+        hessian_reg: Floor used on nonpositive curvature entries.
 
     Returns:
-        Newton step in rotated frame of shape (P, pdim).
+        Newton step in rotated frame of shape ``(P, pdim)``.
     """
-    H_safe = hessian_diag.clamp(min=hessian_reg)
+    # Where curvature is positive use H_i directly; otherwise fall back to
+    # the regulariser so the direction stays a descent step.
+    H_safe = torch.where(
+        hessian_diag > hessian_reg,
+        hessian_diag,
+        torch.full_like(hessian_diag, hessian_reg),
+    )
     delta = -gradient / H_safe  # (P, pdim)
 
     # Clamp step norm

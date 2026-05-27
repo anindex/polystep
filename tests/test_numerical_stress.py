@@ -11,8 +11,7 @@ import torch
 import torch.nn as nn
 import pytest
 
-from polystep import SinkhornSolver, SinkhornResult, PolyStep, SolverState
-from polystep import ParamLayout, PolyStepOptimizer
+from polystep import ParamLayout, SinkhornSolver
 from polystep.cost_nn import NNCostEvaluator
 
 
@@ -21,6 +20,7 @@ class TestSinkhornEdgeCases:
 
     def test_very_small_epsilon(self):
         """Tiny epsilon should produce near-deterministic (one-hot) transport."""
+        torch.manual_seed(0)
         n, m = 10, 6
         C = torch.rand(n, m)
         solver = SinkhornSolver(epsilon=0.001, max_iterations=500, threshold=1e-8)
@@ -28,12 +28,17 @@ class TestSinkhornEdgeCases:
 
         T = result.matrix
         assert torch.isfinite(T).all(), "Transport has NaN/Inf at eps=0.001"
-        # Row sums should approximately match marginals (looser at tiny eps)
+        # At eps=0.001 the log-domain solver collapses toward a permutation
+        # and the iterates stop reducing marginal error below ~1e-2 in
+        # practice (LSE rounding plus the eps -> 0 limit). This test guards
+        # the no-NaN/no-Inf behavior; the broad atol reflects that
+        # near-breakdown regime, not the solver's normal convergence floor.
         row_sums = T.sum(dim=1)
         assert torch.allclose(row_sums, torch.ones(n) / n, atol=0.02)
 
     def test_very_large_epsilon(self):
         """Large epsilon should produce near-uniform transport."""
+        torch.manual_seed(0)
         n, m = 10, 6
         C = torch.rand(n, m)
         solver = SinkhornSolver(epsilon=100.0, max_iterations=200)
@@ -71,6 +76,7 @@ class TestSinkhornEdgeCases:
 
     def test_large_cost_range(self):
         """Cost matrix with values spanning [0, 1000] should converge."""
+        torch.manual_seed(0)
         n, m = 10, 6
         C = torch.rand(n, m) * 1000.0
         solver = SinkhornSolver(epsilon=10.0, max_iterations=500)
@@ -82,6 +88,7 @@ class TestSinkhornEdgeCases:
 
     def test_negative_costs(self):
         """Cost matrix with negative values should still work."""
+        torch.manual_seed(0)
         n, m = 10, 6
         C = torch.randn(n, m)  # mean 0, includes negatives
         solver = SinkhornSolver(epsilon=1.0, max_iterations=200)
@@ -91,26 +98,28 @@ class TestSinkhornEdgeCases:
         assert (T >= -1e-8).all(), "Transport plan should be non-negative"
 
     @pytest.mark.filterwarnings("ignore:Cost matrix has.*non-finite:UserWarning")
-    def test_nan_in_cost_propagation(self):
-        """NaN in cost matrix should NOT propagate to output (A3 sanitization)."""
+    def test_nan_in_cost_is_sanitized(self):
+        """``SinkhornSolver`` sanitizes NaN / Inf entries in the cost
+        matrix and emits a ``UserWarning``; the resulting transport
+        plan is always finite.
+        """
+        torch.manual_seed(0)
         n, m = 8, 4
         C = torch.rand(n, m)
         C[0, 0] = float('nan')
         C[3, 2] = float('inf')
 
         solver = SinkhornSolver(epsilon=1.0, max_iterations=100)
-        # The solver itself should handle NaN via the sanitization in solver.py
-        # But the raw SinkhornSolver may not sanitize - that's done in PolyStep
-        # Let's test the raw solver to see if it produces finite output
         result = solver.solve(C)
         T = result.matrix
-        # We expect NaN because the raw solver doesn't sanitize
-        # This test documents the behavior: the caller must sanitize
-        if not torch.isfinite(T).all():
-            pytest.skip("Raw SinkhornSolver does not sanitize NaN - expected, caller must handle")
+        assert torch.isfinite(T).all(), (
+            "SinkhornSolver should sanitize non-finite cost entries and "
+            "return a finite transport plan."
+        )
 
     def test_warm_start_after_scale_change(self):
         """Warm-started duals from a 1x-cost step applied to a 100x-cost step."""
+        torch.manual_seed(0)
         n, m = 10, 6
         C_small = torch.rand(n, m)
         C_large = torch.rand(n, m) * 100.0
@@ -125,10 +134,11 @@ class TestSinkhornEdgeCases:
         T2 = result2.matrix
         assert torch.isfinite(T2).all(), "Warm start with scale change produced NaN/Inf"
         row_sums = T2.sum(dim=1)
-        assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-2)
+        assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-4)
 
     def test_overrelaxation_stability(self):
         """omega=1.9 (aggressive overrelaxation) should converge without diverging."""
+        torch.manual_seed(0)
         n, m = 20, 8
         C = torch.rand(n, m)
         solver = SinkhornSolver(
@@ -144,6 +154,7 @@ class TestMarginalConstraints:
 
     @pytest.mark.parametrize("n,m", [(5, 4), (10, 6), (50, 8), (100, 16)])
     def test_row_column_sums(self, n, m):
+        torch.manual_seed(0)
         C = torch.rand(n, m)
         a = torch.ones(n) / n
         b = torch.ones(m) / m
@@ -158,6 +169,7 @@ class TestMarginalConstraints:
 
     def test_non_uniform_marginals(self):
         """Non-uniform source marginals should be respected."""
+        torch.manual_seed(0)
         n, m = 10, 6
         a = torch.softmax(torch.randn(n), dim=0)
         C = torch.rand(n, m)
@@ -223,6 +235,7 @@ class TestChunkSizeConsistency:
     """Verify chunked evaluation matches unchunked."""
 
     def test_chunked_vs_unchunked(self):
+        torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 2))
         model.eval()
         loss_fn = nn.CrossEntropyLoss()

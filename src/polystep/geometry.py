@@ -186,15 +186,23 @@ def get_random_rotation_matrices(
     compute_dtype = torch.float32 if needs_fp32_qr else resolved_dtype
     compute_device = 'cpu' if needs_fp32_qr else resolved_device
 
-    # Handle CUDA generator with CPU tensor (generator device must match tensor device for randn)
+    # Generator device must match tensor device for ``randn``. If the user
+    # supplied a CUDA generator but we have to run QR on CPU (bfloat16
+    # fallback), sample on the generator's device first, then move the
+    # result to the QR compute device. This preserves reproducibility.
     gen_for_randn = generator
+    sample_device = compute_device
+    needs_post_move = False
     if generator is not None and hasattr(generator, 'device'):
         gen_device_type = generator.device.type if hasattr(generator.device, 'type') else str(generator.device)
         compute_device_type = 'cpu' if needs_fp32_qr else device_type
         if gen_device_type != compute_device_type:
-            gen_for_randn = None  # Can't use mismatched generator
+            sample_device = generator.device
+            needs_post_move = True
 
-    Z = torch.randn(batch, dim, dim, device=compute_device, dtype=compute_dtype, generator=gen_for_randn)
+    Z = torch.randn(batch, dim, dim, device=sample_device, dtype=compute_dtype, generator=gen_for_randn)
+    if needs_post_move:
+        Z = Z.to(device=compute_device)
     Q, R = torch.linalg.qr(Z)
 
     # Sign correction for Haar measure (Mezzadri method)

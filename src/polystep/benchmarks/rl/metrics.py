@@ -24,18 +24,22 @@ def build_rl_metrics(
     function_evals: int,
     total_steps: int,
     rl_env_steps: int,
+    best_normalized_score: float | None = None,
     **extra: Any,
 ) -> Dict[str, Any]:
     """Build metrics compatible with ``experiments.runners.common.save_result``.
 
-    The paper-facing RL metrics are preserved as explicit return fields. The
-    required ``*_accuracy`` keys are populated with the normalized RL score so
-    existing aggregation code can load the JSON without schema changes.
+    Returns explicit ``*_return`` fields plus ``*_accuracy`` aliases for
+    schema compatibility with non-RL benchmarks. When
+    ``best_normalized_score`` is omitted, ``best_accuracy`` falls back to
+    ``normalized_score`` (preserves earlier behavior); pass it explicitly to
+    distinguish best from final.
     """
 
+    best_norm = float(best_normalized_score) if best_normalized_score is not None else float(normalized_score)
     metrics: Dict[str, Any] = {
         "final_accuracy": float(normalized_score),
-        "best_accuracy": float(normalized_score),
+        "best_accuracy": best_norm,
         "wall_time_seconds": float(wall_time_seconds),
         "peak_gpu_memory_mb": float(peak_gpu_memory_mb),
         "function_evals": int(function_evals),

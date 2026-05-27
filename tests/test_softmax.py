@@ -222,8 +222,8 @@ def test_headline_runner_uses_softmax(relpath, literal):
     src = path.read_text()
     pattern = re.compile(rf"solver\s*=\s*{re.escape(literal)}")
     assert pattern.search(src), (
-        f"{relpath} no longer pins solver={literal}. "
-        f"This may indicate the headline configuration drifted off softmax."
+        f"{relpath} does not pin solver={literal}; "
+        f"headline runners must hard-code softmax to avoid solver auto-selection drift."
     )
 
 

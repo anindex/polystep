@@ -11,7 +11,7 @@ import torch
 from ._compiled import CompiledFunctions
 from .costs import compute_cost_matrix
 from .epsilon import LinearEpsilon
-from .geometry import get_random_rotation_matrices, get_probe_points, POLYTOPE_MAP
+from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
 from .solvers import SinkhornSolver
 
 

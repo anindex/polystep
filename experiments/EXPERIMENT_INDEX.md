@@ -14,8 +14,8 @@ pip install -e ".[experiments]"
 
 | # | Task | Runner | Result (5-seed mean ± std) |
 |---|------|--------|---------------------------|
-| 1 | SNN hard-LIF | `run_elevation.py` | 93.4% ± 0.3 |
-| 2 | INT8 quantized | `run_elevation.py` | 97.2% ± 0.1 |
+| 1 | SNN hard-LIF | `run_elevation.py` | 93.4% ± 0.2 |
+| 2 | INT8 quantized | `run_elevation.py` | 97.1% ± 0.1 |
 | 3 | Argmax attention | `run_elevation.py` | 86.8% ± 0.4 |
 | 4 | Staircase | `run_elevation.py` | 93.2% ± 0.3 |
 | 5 | Hard MoE routing | `run_moe.py` | 90.7% ± 0.2 |
@@ -28,7 +28,7 @@ pip install -e ".[experiments]"
 |---|------|--------|--------|
 | 8 | MNIST (101K MLP) | `run_mnist.py` | 96.0% ± 0.1 |
 | 9 | ETTh1 timeseries | `run_timeseries.py` | MSE 0.121 ± 0.004 |
-| 10 | GPT-2 SST-2 (head-only) | `run_gpt2_finetune.py` | 76.8% (limitation) |
+| 10 | GPT-2 SST-2 (head-only) | `run_gpt2_finetune.py` | 76.8% (head-only fine-tune; see `LIMITATIONS.md`) |
 
 ### RL Policy Search
 
@@ -51,8 +51,9 @@ cd experiments/runners
 bash run_all_paper.sh              # ~8–10 GPU hours (RTX 5090)
 ```
 
-Results are saved to `experiments/results/`. Figures referenced in the paper
-are pre-rendered in the paper repository (`paper/figures/`).
+Results are saved to `experiments/results/`. Figures referenced in the
+paper are not bundled with this repository -- see the arXiv preprint
+(arXiv:2605.01928) for the rendered versions.
 
 ## Result layout
 

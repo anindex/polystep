@@ -31,7 +31,6 @@ _TURBO_TOKENS = (
     "update_adaptive_radius",
     "amortize_steps",
     "amortize_ema",
-    "amortize_loss_gate",
     "biased_rotation",
     "anderson_depth",
     "adaptive_omega",
@@ -44,7 +43,6 @@ _BASELINE_DIRS = (
 )
 _BASELINE_FILES = (
     REPO_ROOT / "src" / "polystep" / "benchmarks" / "baselines.py",
-    REPO_ROOT / "src" / "polystep" / "benchmarks" / "surrogate_baseline.py",
 )
 
 

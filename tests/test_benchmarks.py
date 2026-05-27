@@ -1,7 +1,7 @@
 """Synthetic optimization benchmark tests for PolyStep solver.
 
 Verifies convergence on standard test functions (Ackley, Rosenbrock,
-Rastrigin, Sphere) in low dimensions, matching JAX qualitative behavior.
+Rastrigin, Sphere) in low dimensions.
 """
 import math
 
@@ -9,41 +9,29 @@ import pytest
 import torch
 
 from polystep import PolyStep, LinearEpsilon
-
-try:
-    from polystep.objectives import Ackley, Rosenbrock, Rastrigin, ObjectiveFn
-    HAS_OBJECTIVES = True
-except ImportError:
-    HAS_OBJECTIVES = False
-
-pytestmark = pytest.mark.skipif(not HAS_OBJECTIVES, reason="polystep.objectives not yet implemented")
+from polystep.objectives import Ackley, Rosenbrock, Rastrigin, ObjectiveFn
 
 
-# --- Sphere objective (not yet in polystep.objectives) ---
+class Sphere(ObjectiveFn):
+    """Sphere function: f(x) = sum(x_i^2). Global minimum at origin."""
 
-if HAS_OBJECTIVES:
-    class Sphere(ObjectiveFn):
-        """Sphere function: f(x) = sum(x_i^2). Global minimum at origin."""
+    def __init__(self, dim: int = 2):
+        bounds = torch.tensor([[-5.0, 5.0]] * dim)
+        optimizers = torch.zeros(1, dim)
+        super().__init__(
+            dim=dim, bounds=bounds, optimizers=optimizers, optimal_value=0.0,
+        )
 
-        def __init__(self, dim: int = 2):
-            bounds = torch.tensor([[-5.0, 5.0]] * dim)
-            optimizers = torch.zeros(1, dim)
-            super().__init__(dim=dim, bounds=bounds, optimizers=optimizers, optimal_value=0.0)
-
-        def evaluate(self, X: torch.Tensor) -> torch.Tensor:
-            return torch.sum(X ** 2, dim=-1)
+    def evaluate(self, X: torch.Tensor) -> torch.Tensor:
+        return torch.sum(X ** 2, dim=-1)
 
 
-    # --- Shared helper ---
-
-    ALL_OBJECTIVES = [
-        ("ackley", Ackley(dim=2)),
-        ("rosenbrock", Rosenbrock(dim=2)),
-        ("rastrigin", Rastrigin(dim=2)),
-        ("sphere", Sphere(dim=2)),
-    ]
-else:
-    ALL_OBJECTIVES = []
+ALL_OBJECTIVES = [
+    ("ackley", Ackley(dim=2)),
+    ("rosenbrock", Rosenbrock(dim=2)),
+    ("rastrigin", Rastrigin(dim=2)),
+    ("sphere", Sphere(dim=2)),
+]
 
 
 def _run_benchmark(

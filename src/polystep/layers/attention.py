@@ -1,11 +1,11 @@
 """Vmap-compatible multi-head attention.
 
-A drop-in replacement for ``nn.MultiheadAttention`` that avoids
-``F.scaled_dot_product_attention``, whose mask-validation path has
-historically been fragile under ``torch.vmap`` (PyTorch Issue #151558 and
-related). The hand-rolled matmul path here works identically on the full
-``torch>=2.8`` floor and does not depend on whether the upstream SDPA fix
-is present in your particular PyTorch build.
+A drop-in replacement for ``nn.MultiheadAttention`` that uses an
+explicit ``torch.matmul`` path instead of
+``F.scaled_dot_product_attention``. The hand-rolled path sidesteps the
+SDPA mask-validation issues reported under ``torch.vmap`` (PyTorch
+issue #151558 and related) and works the same way on every PyTorch
+build supported by this project.
 
 Example:
     >>> import torch
@@ -46,11 +46,12 @@ class VmapSafeMultiHeadAttention(nn.Module):
         bias: Whether to add bias to projection layers. Default: True.
 
     Input shapes:
-        - query: (batch, seq_q, embed_dim)
-        - key: (batch, seq_k, embed_dim)
-        - value: (batch, seq_k, embed_dim)
-        - attn_mask: (seq_q, seq_k) or (batch, num_heads, seq_q, seq_k), additive mask
-        - key_padding_mask: (batch, seq_k), boolean mask where True = padding
+        - query: ``(batch, seq_q, embed_dim)``
+        - key: ``(batch, seq_k, embed_dim)``
+        - value: ``(batch, seq_k, embed_dim)``
+        - attn_mask: ``(seq_q, seq_k)``, ``(batch, seq_q, seq_k)``, or
+          ``(batch, num_heads, seq_q, seq_k)`` (float additive or bool)
+        - key_padding_mask: ``(batch, seq_k)`` bool, ``True`` = padding
 
     Output shape:
         - (batch, seq_q, embed_dim)
@@ -150,20 +151,22 @@ class VmapSafeMultiHeadAttention(nn.Module):
         """Compute multi-head attention.
 
         Args:
-            query: Query tensor of shape (batch, seq_q, embed_dim).
-            key: Key tensor of shape (batch, seq_k, embed_dim).
-            value: Value tensor of shape (batch, seq_k, embed_dim).
-            attn_mask: Attention mask of shape (seq_q, seq_k) or
-                (batch, num_heads, seq_q, seq_k). Float masks are added
-                to attention scores before softmax (use -inf to mask).
-                Bool masks are interpreted upstream-style: True positions
-                are masked out (logits set to -inf).
-            key_padding_mask: Boolean mask of shape (batch, seq_k) where True
-                indicates padding positions that should not be attended to.
-            need_weights: NOT supported. Returning attention weights
-                from inside ``vmap`` requires extra reshapes that defeat
-                the kernel fusion this layer is here to enable.
-            is_causal: NOT supported. Pass an explicit triangular
+            query: Query tensor of shape ``(batch, seq_q, embed_dim)``.
+            key: Key tensor of shape ``(batch, seq_k, embed_dim)``.
+            value: Value tensor of shape ``(batch, seq_k, embed_dim)``.
+            attn_mask: Attention mask. Accepted shapes (matching
+                ``nn.MultiheadAttention``):
+                ``(seq_q, seq_k)``, ``(batch, seq_q, seq_k)``, or
+                ``(batch, num_heads, seq_q, seq_k)``. Float masks are added
+                to attention scores before softmax (use ``-inf`` for hard
+                masking). Bool masks are interpreted upstream-style: ``True``
+                positions are masked out.
+            key_padding_mask: Boolean mask of shape ``(batch, seq_k)`` where
+                ``True`` marks padding positions.
+            need_weights: Not supported. Returning attention weights from
+                inside ``vmap`` requires extra reshapes that defeat the
+                kernel fusion this layer is here to enable.
+            is_causal: Not supported. Pass an explicit triangular
                 ``attn_mask`` instead.
 
         Returns:
@@ -199,15 +202,22 @@ class VmapSafeMultiHeadAttention(nn.Module):
         # Q @ K.T = (batch, num_heads, seq_q, head_dim) @ (batch, num_heads, head_dim, seq_k)
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
-        # Apply attention mask. Bool masks are mask-filled with -inf to
-        # match upstream ``nn.MultiheadAttention`` semantics; an earlier
-        # version silently added the bool tensor, which BOOSTED masked
-        # logits by 1.0 instead of suppressing them. Float masks are
-        # additive (callers use -inf for hard masks, finite values for
-        # soft biases like ALiBi or relative-position embeddings).
+        # Bool masks are mask-filled with -inf to match
+        # ``nn.MultiheadAttention`` semantics. Float masks are additive
+        # (use -inf for hard masking, finite values for soft biases like
+        # ALiBi or relative-position embeddings).
         if attn_mask is not None:
             if attn_mask.dim() == 2:
+                # (seq_q, seq_k) -> (1, 1, seq_q, seq_k)
                 attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+            elif attn_mask.dim() == 3:
+                # (batch, seq_q, seq_k) -> (batch, 1, seq_q, seq_k)
+                attn_mask = attn_mask.unsqueeze(1)
+            elif attn_mask.dim() != 4:
+                raise ValueError(
+                    "attn_mask must have 2, 3, or 4 dimensions, got "
+                    f"{attn_mask.dim()}D (shape {tuple(attn_mask.shape)})"
+                )
             if attn_mask.dtype == torch.bool:
                 scores = scores.masked_fill(attn_mask, float('-inf'))
             else:

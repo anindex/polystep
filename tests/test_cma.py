@@ -478,63 +478,55 @@ class TestOTWeights:
         """Weights should sum to approximately 1.0."""
         P, V = 20, 6
         transport_matrix = torch.rand(P, V)
-        transport_matrix = transport_matrix / transport_matrix.sum()  # Normalize
-        source_marginal = torch.ones(P) / P
+        transport_matrix = transport_matrix / transport_matrix.sum()
 
-        weights = compute_ot_weights(transport_matrix, source_marginal)
+        weights = compute_ot_weights(transport_matrix)
         assert weights.sum().item() == pytest.approx(1.0, rel=1e-5)
 
     def test_weights_shape(self):
         """Weights shape is (num_particles,)."""
         P, V = 15, 8
         transport_matrix = torch.rand(P, V)
-        source_marginal = torch.ones(P) / P
 
-        weights = compute_ot_weights(transport_matrix, source_marginal)
+        weights = compute_ot_weights(transport_matrix)
         assert weights.shape == (P,)
 
     def test_weights_non_negative(self):
         """All weights should be non-negative."""
         P, V = 10, 4
         transport_matrix = torch.rand(P, V)
-        source_marginal = torch.ones(P) / P
 
-        weights = compute_ot_weights(transport_matrix, source_marginal)
+        weights = compute_ot_weights(transport_matrix)
         assert (weights >= 0).all()
 
     def test_uniform_transport_gives_uniform_weights(self):
         """If all particles transport equal mass, weights are uniform."""
         P, V = 10, 4
         transport_matrix = torch.ones(P, V) / (P * V)
-        source_marginal = torch.ones(P) / P
 
-        weights = compute_ot_weights(transport_matrix, source_marginal)
+        weights = compute_ot_weights(transport_matrix)
         expected = torch.ones(P) / P
         assert torch.allclose(weights, expected, atol=1e-5)
 
     def test_concentrated_transport(self):
         """Particle with focused transport (low entropy) gets highest weight."""
         P, V = 5, 4
-        # All particles have uniform transport except particle 0
         transport_matrix = torch.ones(P, V) / (P * V)
-        # Particle 0 concentrates all its mass on vertex 0 (entropy ≈ 0)
+        # Particle 0 concentrates all its mass on vertex 0 (entropy ~ 0).
         transport_matrix[0, :] = 0.0
         transport_matrix[0, 0] = 1.0 / P  # same row sum as others
-        source_marginal = torch.ones(P) / P
 
-        weights = compute_ot_weights(transport_matrix, source_marginal)
-        # Particle 0 has lowest entropy -> highest weight
+        weights = compute_ot_weights(transport_matrix)
+        # Particle 0 has lowest entropy -> highest weight.
         assert weights[0].item() > weights[1].item()
-        assert weights[0].item() > 0.5  # should dominate
+        assert weights[0].item() > 0.5
 
     def test_zero_transport_matrix_handled(self):
-        """Edge case: zero transport matrix doesn't crash (uses epsilon)."""
+        """Edge case: zero transport matrix does not crash."""
         P, V = 5, 4
         transport_matrix = torch.zeros(P, V)
-        source_marginal = torch.ones(P) / P
 
-        weights = compute_ot_weights(transport_matrix, source_marginal)
-        # Should return uniform-ish weights due to epsilon division guard
+        weights = compute_ot_weights(transport_matrix)
         assert weights.shape == (P,)
         assert not torch.isnan(weights).any()
 

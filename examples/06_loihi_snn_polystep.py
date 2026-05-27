@@ -1,36 +1,37 @@
 """06 - PolyStep on Loihi 2 (skeleton): MNIST SNN + on-chip readout adaptation.
 
-A two-phase demonstration that PolyStep can train a spiking network *and*
-adapt the deployed model on-device under input distribution shift, using
-only the constrained writable subset a real Loihi 2 chip exposes at
-runtime -- without backpropagation, surrogate gradients, or BPTT.
+A two-stage demonstration that PolyStep can train a spiking network and
+adapt the deployed model on device under input distribution shift, using
+only the writable subset a real Loihi 2 chip exposes at runtime, without
+backpropagation, surrogate gradients, or BPTT.
 
-Phase A -- Off-chip pretrain (clean MNIST). Full-model PolyStep with the
-    paper SNN config from ``experiments/runners/run_elevation.py``
-    ``PSTORCH_CONFIGS["snn"]`` (all-flat schedules; ``CosineEpsilon``
-    on eps/sr/pr collapses SNN accuracy per the paper sweeps). Stands in
-    for a real SLAYER + ``netx`` deploy.
+Stage 1 -- Off-chip pretrain on clean MNIST. Full-model PolyStep with
+    the paper's SNN configuration from
+    ``experiments/runners/run_elevation.py`` ``PSTORCH_CONFIGS["snn"]``
+    (flat schedules; ``CosineEpsilon`` on eps / sr / pr collapses SNN
+    accuracy in the paper sweeps). Stands in for a SLAYER + ``netx``
+    deploy.
 
-Phase B -- On-chip readout adaptation under input shift. Hidden layer is
+Stage 2 -- On-chip readout adaptation under input shift. Hidden layer is
     frozen; only the writable subset is adapted -- ``fc2`` weights and
     the per-population learnable LIF ``vth`` / ``beta`` (the chip's
-    runtime-mutable µcode neuron ``Var``s). Three TENT-style safeguards
-    (Wang et al., ICLR 2021) make Phase B robust:
+    runtime-mutable microcode neuron ``Var``s). Three TENT-style
+    safeguards (Wang et al., ICLR 2021) make Stage 2 robust:
 
       1. Mixed-batch shift (``--mixed-shift``, default on): each adapt
-         batch is ``[clean ; shifted]``, so the writable subset is
+         batch is ``[clean ; shifted]`` so the writable subset is
          pulled toward both manifolds and clean accuracy does not drift.
       2. Higher rank on the tiny writable subspace (``--adapt-rank 8``).
       3. Two probes per step (``--adapt-num-probe 2``) for variance
          reduction on the noisier shifted landscape.
 
-Both phases use **best-test early stopping** (patience 4 - higher than
+Both stages use best-test early stopping (patience 4 -- higher than
 typical SGD because zeroth-order test curves are noisier per epoch).
-The model weights at the end of each phase are the checkpoint with the
-highest test accuracy on that phase's target distribution (clean for
-Phase A, shifted for Phase B). The frozen-readout baseline reloads the
-*Phase-A best* weights, and **the shifted test set uses a fixed,
-seeded noise mask across pre / post / baseline evaluations**, so the
+The weights at the end of each stage are the checkpoint with the
+highest test accuracy on that stage's target distribution (clean for
+Stage 1, shifted for Stage 2). The frozen-readout baseline reloads
+the Stage 1 best weights, and the shifted test set uses a fixed,
+seeded noise mask across pre / post / baseline evaluations, so the
 reported recovery is a paired comparison free of sampling jitter.
 
 Backends. ``--backend cpu_sim`` (default) uses PyTorch as the forward
@@ -99,8 +100,8 @@ class LearnableLIF(nn.Module):
         spk[t] = (mem[t] >= vth)        # hard Heaviside, derivative = 0
         mem[t] = mem[t] - spk[t] * vth  # subtract on spike
 
-    ``beta`` is parameterised through a sigmoid so it stays in (0, 1)
-    under unconstrained PolyStep updates. ``vth`` is parameterised
+    ``beta`` is parameterized through a sigmoid so it stays in (0, 1)
+    under unconstrained PolyStep updates. ``vth`` is parameterized
     directly. Both are scalars -- vmap stacks them along dim 0 with no
     special handling.
 
@@ -172,7 +173,7 @@ class CpuSimEvaluator:
 
 
 class LoihiSpikeEvaluator:
-    """Loihi 2 forward evaluator (Lava ``netx`` deployment) -- Phase 2.
+    """Loihi 2 forward evaluator (Lava ``netx`` deployment) -- Stage 2.
 
     Implementation sketch (real version requires ``lava`` + a SLAYER-
     trained HDF5 net description; not run by default in this example)::
@@ -203,7 +204,7 @@ class LoihiSpikeEvaluator:
         if not _HAS_LAVA:
             raise RuntimeError("`pip install lava-nc` first.")
         raise NotImplementedError(
-            "LoihiSpikeEvaluator is a Phase-2 deliverable. The cpu_sim "
+            "LoihiSpikeEvaluator is a Stage 2 deliverable. The cpu_sim "
             "backend exercises the same PolyStep host loop end-to-end."
         )
 
@@ -238,7 +239,7 @@ def freeze_to_writable_subset(model: MnistSpikingNet) -> int:
 def make_pretrain_optimizer(
     model: nn.Module, *, seed: int, device: torch.device,
 ) -> PolyStepOptimizer:
-    """Phase-A optimizer: paper SNN config from ``run_elevation.py``.
+    """Stage 1 optimizer (off-chip pretrain): paper SNN config from ``run_elevation.py``.
 
     Mirrors ``PSTORCH_CONFIGS["snn"]`` exactly. Key insight from the
     paper sweeps (see ``experiments/runners/run_elevation.py:84``):
@@ -274,7 +275,7 @@ def make_adapt_optimizer(
     rank: int = 8, num_probe: int = 2,
     step_radius: float = 1.5, probe_radius: float = 0.75,
 ) -> PolyStepOptimizer:
-    """Phase-B optimizer: small writable subset, low-rank, all flat.
+    """Stage 2 optimizer (on-chip readout adaptation): small writable subset, low-rank, all flat.
 
     Defaults are tuned for on-chip adaptation under input shift:
     - ``rank=8`` (the writable subset is tiny ~1.3 % of params, so a
@@ -534,14 +535,14 @@ def _save_visualization(
         loc="left", fontsize=12, pad=14,
     )
 
-    group_centers = [0.0, 1.4]  # Phase A, Phase B
+    group_centers = [0.0, 1.4]  # Stage 1, Stage 2
     bar_offset = 0.32
     bar_width = 0.55
 
     clean_vals = [pre_clean * 100, post_clean * 100]
     shift_vals = [base_shift * 100, post_shift * 100]
 
-    # Clean bars (both phases, same blue)
+    # Clean bars (both stages, same blue)
     bars_clean = ax_bar.bar(
         [c - bar_offset for c in group_centers], clean_vals,
         width=bar_width, color=_COLOR_CLEAN, edgecolor="white", linewidth=1.0,
@@ -567,7 +568,7 @@ def _save_visualization(
     # X axis: group labels
     ax_bar.set_xticks(group_centers)
     ax_bar.set_xticklabels(
-        ["Phase A\noff-chip pretrain", "Phase B\non-chip adaptation"],
+        ["Stage 1\noff-chip pretrain", "Stage 2\non-chip adaptation"],
         fontsize=10,
     )
     ax_bar.tick_params(axis="x", length=0, pad=8)
@@ -622,7 +623,7 @@ def _save_visualization(
     pct_writable = 100 * n_writable / n_total
     fig.text(
         0.985, 0.005,
-        f"Phase B adapts only {n_writable:,} / {n_total:,} params "
+        f"Stage 2 adapts only {n_writable:,} / {n_total:,} params "
         f"({pct_writable:.1f} %) - the Loihi 2 runtime-writable subset "
         "(fc2 + per-population vth, β).",
         ha="right", va="bottom", fontsize=8.0, color="#555", style="italic",
@@ -723,9 +724,9 @@ def main():
     init_clean = evaluate(model, test_loader, device)
     print(f"  init test acc (clean): {100 * init_clean:.1f}%")
 
-    # ----- Phase A: off-chip pretrain (clean MNIST) -----
+    # ----- Stage 1: off-chip pretrain (clean MNIST) -----
     print()
-    print("Phase A: off-chip PolyStep pretrain (paper SNN config)")
+    print("Stage 1: off-chip PolyStep pretrain (paper SNN config)")
     print("-" * 70)
     pre_opt = make_pretrain_optimizer(model, seed=args.seed, device=device)
     pre_eval = CpuSimEvaluator(model, loss_fn=loss_fn)
@@ -736,21 +737,21 @@ def main():
         test_loader=test_loader, eval_shift_sigma=0.0,
         patience=args.patience, noise_seed=args.seed,
     )
-    # Best Phase-A weights are now loaded; sample its shifted accuracy
+    # Best Stage 1 weights are now loaded; sample their shifted accuracy
     # for context (and for the paired baseline comparison below).
     pre_shift = evaluate(
         model, test_loader, device,
         shift_sigma=args.shift_sigma, noise_seed=args.seed,
     )
-    print(f"  -> best Phase A | clean: {100 * pre_clean:.1f}%  "
+    print(f"  -> best Stage 1 | clean: {100 * pre_clean:.1f}%  "
           f"shifted: {100 * pre_shift:.1f}%")
 
-    # Snapshot the Phase-A best for the frozen-readout baseline.
+    # Snapshot the Stage 1 best for the frozen-readout baseline.
     pretrained_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-    # ----- Phase B: 'on-chip' readout + LIF Var adaptation -----
+    # ----- Stage 2: 'on-chip' readout + LIF Var adaptation -----
     print()
-    print(f"Phase B: 'on-chip' readout + LIF Var adaptation "
+    print(f"Stage 2: 'on-chip' readout + LIF Var adaptation "
           f"(shift sigma={args.shift_sigma})")
     print("-" * 70)
     n_writable = freeze_to_writable_subset(model)
@@ -775,13 +776,13 @@ def main():
         test_loader=test_loader, eval_shift_sigma=args.shift_sigma,
         patience=args.patience, noise_seed=args.seed,
     )
-    # Best Phase-B weights are now loaded; sample clean accuracy on it.
+    # Best Stage 2 weights are now loaded; sample clean accuracy on it.
     post_clean = evaluate(
         model, test_loader, device,
         shift_sigma=0.0, noise_seed=args.seed,
     )
 
-    # Reload Phase-A best to evaluate the frozen-readout baseline
+    # Reload Stage 1 best to evaluate the frozen-readout baseline
     # against the SAME shift noise mask as post_shift -- paired.
     model.load_state_dict(pretrained_state)
     base_shift = evaluate(
@@ -796,10 +797,10 @@ def main():
     print("=" * 70)
     print(f"  initial (random):                          "
           f"clean {100 * init_clean:5.1f}%")
-    print(f"  best Phase A (off-chip pretrain):          "
+    print(f"  best Stage 1 (off-chip pretrain):          "
           f"clean {100 * pre_clean:5.1f}%   "
           f"shifted {100 * pre_shift:5.1f}%")
-    print(f"  best Phase B (PolyStep on-chip adapt):     "
+    print(f"  best Stage 2 (PolyStep on-chip adapt):     "
           f"clean {100 * post_clean:5.1f}%   "
           f"shifted {100 * post_shift:5.1f}%")
     print(f"  baseline (no adaptation, frozen readout):  "

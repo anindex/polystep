@@ -9,6 +9,8 @@ polystep provides two levels of API for gradient-free neural network training.
 The main entry point. Wraps any `nn.Module` for gradient-free training.
 
 ```python
+import torch.nn as nn
+
 from polystep import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
 
@@ -31,9 +33,12 @@ cost = optimizer.step(closure)
 
 ### train()
 
-Complete training loop with automatic closure construction.
+Complete training loop with automatic closure construction. Pass any
+``torch.utils.data.DataLoader`` (or compatible iterable of
+``(inputs, targets)`` batches) as ``train_loader``.
 
 ```python
+import torch.nn as nn
 from polystep import train, TrainConfig, LoggingCallback, EarlyStoppingCallback
 
 config = TrainConfig(
@@ -62,9 +67,10 @@ schedule = LinearEpsilon(init=1.0, decay=0.01, target=1e-3)
 
 For large models, subspace projection reduces the OT problem dimension.
 
-### HybridSubspace (recommended)
+### HybridSubspace
 
-Per-layer projections with coordinated rotations.
+Per-layer projections with coordinated rotations. The default choice
+for most workloads.
 
 ```python
 from polystep import HybridSubspace
@@ -186,9 +192,9 @@ optimizer = PolyStepOptimizer(model,
 | `epsilon` | 0.1 | Use `CosineEpsilon` for scheduled decay |
 | `step_radius` | 1.0 | Multiplied by current epsilon |
 | `probe_radius` | 2.0 | Multiplied by current epsilon |
-| `num_probe` | 1 | K=1 is optimal (entropic regularization provides smoothing) |
+| `num_probe` | 1 | Default; larger K trades evaluations for variance reduction |
 | `polytope_type` | `'orthoplex'` | `'orthoplex'`, `'simplex'`, `'cube'` |
 | `compile` | False | Enable for GPU acceleration |
 | `chunk_size` | None | Set to 512 for memory control |
-| `subspace` | None | `HybridSubspace` recommended for large models |
+| `subspace` | None | Use `HybridSubspace` for large models |
 | `block_strategy` | `'monolithic'` | `'per_layer'` for memory efficiency |

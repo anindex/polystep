@@ -1,4 +1,9 @@
-"""Tests for ParamLayout flatten/unflatten round-trip correctness."""
+"""Tests for ParamLayout flatten/unflatten round-trip correctness.
+
+Covers the common architectures (MLP, CNN, tied weights, BatchNorm),
+``float64`` round-trip, parameterless modules, particle shape,
+metadata preservation, device handling, and deterministic generators.
+"""
 import dataclasses
 
 import pytest
@@ -204,7 +209,7 @@ HAS_CUDA = torch.cuda.is_available()
 
 
 class TestFlattenDeviceCPU:
-    """Test 1 (02-02): Flatten produces particles on CPU when model is on CPU."""
+    """``flatten`` produces particles on CPU when the model is on CPU."""
 
     def test_flatten_device_cpu(self):
         model = SimpleMLP()
@@ -215,7 +220,7 @@ class TestFlattenDeviceCPU:
 
 @pytest.mark.skipif(not HAS_CUDA, reason="CUDA not available")
 class TestFlattenDeviceCUDA:
-    """Test 2 (02-02): Flatten produces particles on CUDA when model is on CUDA."""
+    """``flatten`` produces particles on CUDA when the model is on CUDA."""
 
     def test_flatten_device_cuda(self):
         model = SimpleMLP().cuda()
@@ -225,7 +230,7 @@ class TestFlattenDeviceCUDA:
 
 
 class TestUnflattenPreservesDevice:
-    """Test 3 (02-02): Unflatten returns tensors on the same device as particles."""
+    """``unflatten`` returns tensors on the same device as the particles."""
 
     def test_unflatten_preserves_device(self):
         model = SimpleMLP()
@@ -239,7 +244,7 @@ class TestUnflattenPreservesDevice:
 
 
 class TestGetDeviceCPU:
-    """Test 4 (02-02): get_device returns CPU for a CPU model."""
+    """``get_device`` returns CPU for a CPU model."""
 
     def test_get_device_cpu(self):
         model = nn.Linear(2, 2)
@@ -247,7 +252,7 @@ class TestGetDeviceCPU:
 
 
 class TestGetDeviceEmpty:
-    """Test 5 (02-02): get_device returns CPU for an empty module."""
+    """``get_device`` returns CPU for an empty module."""
 
     def test_get_device_empty(self):
         model = nn.Module()
@@ -255,7 +260,7 @@ class TestGetDeviceEmpty:
 
 
 class TestCreateGeneratorCPU:
-    """Test 6 (02-02): create_generator returns a CPU generator with deterministic output."""
+    """``create_generator`` returns a CPU generator with deterministic output."""
 
     def test_create_generator_cpu(self):
         gen = create_generator(seed=42, device=torch.device("cpu"))
@@ -268,7 +273,7 @@ class TestCreateGeneratorCPU:
 
 
 class TestCreateGeneratorDeterminism:
-    """Test 7 (02-02): Same seed -> identical tensors, different seed -> different."""
+    """Same seed yields identical tensors; different seeds differ."""
 
     def test_create_generator_determinism(self):
         gen_a = create_generator(seed=42, device=torch.device("cpu"))
@@ -282,8 +287,29 @@ class TestCreateGeneratorDeterminism:
         assert not torch.equal(ta, tc), "Different seed must produce different tensors"
 
 
+class TestDoubleDtype:
+    """``float64`` parameters survive the flatten / unflatten round-trip
+    bitwise and preserve their dtype."""
+
+    def test_double_dtype_round_trip(self):
+        model = nn.Sequential(nn.Linear(5, 3), nn.Linear(3, 2)).double()
+        layout = ParamLayout.from_module(model)
+
+        assert layout.dominant_dtype == torch.float64
+
+        particles = layout.flatten(model)
+        recovered = layout.unflatten(particles)
+
+        sd = model.state_dict()
+        for key in sd:
+            assert recovered[key].dtype == sd[key].dtype, (
+                f"{key}: dtype {recovered[key].dtype} != {sd[key].dtype}"
+            )
+            assert torch.equal(sd[key], recovered[key]), f"Mismatch in {key}"
+
+
 class TestSolverDeterminism:
-    """Test 8 (02-02): PolyStep.run with same seed -> identical trajectories."""
+    """``PolyStep.run`` with the same seed produces identical trajectories."""
 
     def test_solver_determinism(self):
         from polystep import PolyStep, Ackley

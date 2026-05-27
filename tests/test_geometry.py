@@ -88,59 +88,69 @@ class TestRotations:
     """Tests for rotation matrix generation."""
 
     @pytest.mark.parametrize("dim", [3, 5, 8])
-    def test_rotation_matrix_orthogonal(self, dim):
-        """Random rotation matrices are orthogonal: R^T R = I."""
-        torch.manual_seed(42)
-        gen = torch.Generator()
-        gen.manual_seed(42)
+    def test_rotation_matrix_is_in_so_d(self, dim):
+        """Random rotation matrices are orthogonal (``R R^T = I``) and
+        have determinant ``+1`` (SO(d), not O(d))."""
+        gen = torch.Generator().manual_seed(42)
 
         R = get_random_rotation_matrices(batch=4, dim=dim, generator=gen)
         eye = torch.eye(dim).unsqueeze(0).expand(4, -1, -1)
         RtR = torch.bmm(R.transpose(-1, -2), R)
-
         assert torch.allclose(RtR, eye, atol=1e-5), \
             f"Max orthogonality error: {(RtR - eye).abs().max():.8f}"
 
-    @pytest.mark.parametrize("dim", [3, 5, 8])
-    def test_rotation_matrix_det_positive(self, dim):
-        """Random rotation matrices have determinant +1."""
-        torch.manual_seed(42)
-        gen = torch.Generator()
-        gen.manual_seed(42)
-
-        R = get_random_rotation_matrices(batch=4, dim=dim, generator=gen)
         dets = torch.det(R)
-
         assert torch.allclose(dets, torch.ones(4), atol=1e-4), \
             f"Determinants: {dets.tolist()}"
 
-    def test_rotation_2d_uses_analytical(self):
-        """Dim=2 rotation uses analytical formula and produces valid result."""
-        gen = torch.Generator()
-        gen.manual_seed(42)
+    def test_rotation_is_haar_distributed(self):
+        """Mezzadri 2007 sign-corrected QR produces Haar-distributed
+        ``O(d)``, restricted to ``SO(d)`` by the det fix-up in
+        :func:`get_random_rotation_matrices`. Verify both moments:
+        ``E[R_ij] -> 0`` and ``Var[R_ij] -> 1/d``.
+        """
+        d = 8
+        n = 8000
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        R = get_random_rotation_matrices(batch=n, dim=d, generator=gen)
+        assert R.shape == (n, d, d)
 
+        # Empirical E[R_ij] -> 0 (Haar first moment). Std of mean over
+        # n samples is ~ sqrt(1/d) / sqrt(n); at n=8000, d=8 a 6-sigma
+        # upper bound is below 0.02.
+        mean = R.mean(dim=0)
+        assert mean.abs().max().item() < 0.02, (
+            f"E[R_ij] not centered: max |mean| = "
+            f"{mean.abs().max().item():.4f}"
+        )
+
+        # Per-entry Var[R_ij] -> 1/d (Haar second moment).
+        var = (R ** 2).mean(dim=0)
+        expected = torch.full_like(var, 1.0 / d)
+        rel_err = ((var - expected).abs() / expected).max().item()
+        assert rel_err < 0.05, (
+            f"Var[R_ij] differs from 1/d by {rel_err * 100:.1f}%"
+        )
+
+    def test_rotation_2d_uses_analytical(self):
+        """Dim=2 rotation uses the analytical SO(2) path and produces
+        valid orthogonal matrices with ``det = +1``."""
+        gen = torch.Generator().manual_seed(42)
         R = get_random_rotation_matrices(batch=3, dim=2, generator=gen)
         assert R.shape == (3, 2, 2)
 
-        # Check orthogonality
         eye = torch.eye(2).unsqueeze(0).expand(3, -1, -1)
         RtR = torch.bmm(R.transpose(-1, -2), R)
         assert torch.allclose(RtR, eye, atol=1e-6)
-
-        # Check det = +1
-        dets = torch.det(R)
-        assert torch.allclose(dets, torch.ones(3), atol=1e-6)
+        assert torch.allclose(torch.det(R), torch.ones(3), atol=1e-6)
 
     def test_rotation_deterministic_with_generator(self):
         """Same generator seed produces identical rotation matrices."""
-        gen1 = torch.Generator()
-        gen1.manual_seed(123)
+        gen1 = torch.Generator().manual_seed(123)
         R1 = get_random_rotation_matrices(batch=5, dim=4, generator=gen1)
 
-        gen2 = torch.Generator()
-        gen2.manual_seed(123)
+        gen2 = torch.Generator().manual_seed(123)
         R2 = get_random_rotation_matrices(batch=5, dim=4, generator=gen2)
-
         assert torch.equal(R1, R2), "Same seed should produce identical rotations"
 
 

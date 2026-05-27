@@ -1,14 +1,13 @@
 """02 - SNN starter: train a tiny spiking network without gradients.
 
 A small spiking neural network with hard-threshold LIF spikes (genuinely
-non-differentiable) trained via PolyStep in under a minute on CPU. This is
-the simplest end-to-end demonstration of PolyStep's core value proposition.
+non-differentiable) trained via PolyStep in under a minute on CPU.
 
 Why gradient-free for SNNs?
-  Hard LIF spikes have ``d(spike)/d(mem) == 0`` almost everywhere, so
-  backprop gives zero gradients. Standard practice is to introduce a
-  *surrogate* gradient (a smooth approximation), which is an engineering
-  hack. PolyStep evaluates the SNN forward only, so the spikes stay as-is.
+  Hard LIF spikes have ``d(spike) / d(mem) == 0`` almost everywhere, so
+  backpropagation gives zero gradients. The usual workaround is a
+  *surrogate* gradient that smooths the spike. PolyStep evaluates the
+  SNN forward only and leaves the spikes alone.
 
 What you should see:
   Training accuracy climbs from ~25% (chance, 4 classes) to >70% over 60

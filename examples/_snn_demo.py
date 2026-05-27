@@ -1,12 +1,9 @@
 """Shared tiny-SNN demo helpers.
 
-Single source of truth for the small spiking network used by both
-``examples/02_snn_starter.py`` and ``experiments/scripts/make_readme_gif.py``.
-Keeping the model, dataset, and optimizer recipe in one place ensures the
-runnable example and the README GIF train the *same* network.
-
-Intentionally tiny (~1-3 K params) so the GIF generator can render a 2D loss
-landscape on a 40x40 grid in under 90 s on CPU.
+Single source of truth for the small spiking network used by the
+``examples/02_snn_starter.py`` runnable demo. Kept tiny (~1-3K
+parameters) so the example finishes in under a couple of minutes on
+CPU and can also drive small 2D loss-landscape visualizations.
 """
 from __future__ import annotations
 

@@ -161,7 +161,12 @@ class CartPoleEvaluator:
         # Send stacked params to device.
         sp = {k: v.to(self.device) for k, v in stacked_params.items()}
 
-        for _ in range(self.horizon):
+        # Check ``active.any()`` only every ``early_stop_check`` steps to
+        # amortize the GPU-CPU sync cost. CartPole rewards stop accumulating
+        # once an env is inactive, so running a few extra "dead" iterations
+        # is cheap and keeps the inner loop fully on-device.
+        early_stop_check = max(1, self.horizon // 8)
+        for t in range(self.horizon):
             logits = _batched_mlp_logits(states, sp, n_candidates, R)  # (N, R, 2)
             actions = logits.argmax(dim=-1)  # (N, R)
             flat_states = states.reshape(-1, OBS_DIM)
@@ -175,7 +180,7 @@ class CartPoleEvaluator:
             lengths = lengths + active.float()
             states = torch.where(active.unsqueeze(-1), next_states, states)
             active = active & ~done
-            if not bool(active.any()):
+            if (t + 1) % early_stop_check == 0 and not bool(active.any()):
                 break
 
         successes = active  # survived all horizon steps

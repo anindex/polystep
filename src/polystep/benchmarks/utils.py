@@ -24,7 +24,6 @@ import pickle
 import platform
 import struct as pystruct
 import tarfile
-import time
 from collections import defaultdict
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
@@ -323,41 +322,6 @@ def _build_vocab(texts: List[str], vocab_size: int) -> Dict[str, int]:
     return vocab
 
 
-def _generate_synthetic_sst2(
-    num_samples: int,
-    max_seq_len: int,
-    vocab_size: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """Generate synthetic SST-2-like data for testing.
-
-    Args:
-        num_samples: Number of samples to generate.
-        max_seq_len: Maximum sequence length.
-        vocab_size: Vocabulary size.
-
-    Returns:
-        Tuple of (input_ids, attention_mask, labels, vocab_size).
-    """
-    print(f"  Generating {num_samples} synthetic SST-2 samples...")
-
-    # Random token sequences (excluding PAD=0)
-    input_ids = np.random.randint(1, vocab_size, (num_samples, max_seq_len), dtype=np.int64)
-
-    # Random sequence lengths between max_seq_len//2 and max_seq_len
-    seq_lens = np.random.randint(max_seq_len // 2, max_seq_len + 1, num_samples)
-
-    # Create attention masks and apply padding
-    attention_mask = np.zeros((num_samples, max_seq_len), dtype=np.int64)
-    for i, seq_len in enumerate(seq_lens):
-        attention_mask[i, :seq_len] = 1
-        input_ids[i, seq_len:] = 0  # PAD token
-
-    # Random binary labels
-    labels = np.random.randint(0, 2, num_samples, dtype=np.int64)
-
-    return input_ids, attention_mask, labels, vocab_size
-
-
 def get_sst2_loaders(
     max_train: int = 0,
     max_test: int = 0,
@@ -498,42 +462,6 @@ class CIFAR10Net(nn.Module):
         return self.classifier(self.features(x))
 
 
-class CIFAR10NetGroupNorm(nn.Module):
-    """CIFAR-10 CNN with GroupNorm (vmap-compatible normalization).
-
-    Same architecture as CIFAR10Net but with GroupNorm after each Conv2d.
-    GroupNorm normalizes over channel groups within each sample (no batch
-    statistics), making it fully compatible with vmap.
-    ~189K parameters + negligible GroupNorm affine params.
-    """
-
-    def __init__(self, num_groups: int = 8):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.GroupNorm(min(num_groups, 32), 32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.GroupNorm(min(num_groups, 64), 64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.GroupNorm(min(num_groups, 64), 64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 4 * 4, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.features(x))
-
-
 def create_model(
     dataset_name: str,
     hidden: int = 128,
@@ -557,7 +485,8 @@ def create_model(
     if dataset_name == "mnist":
         return MNISTNet(hidden=hidden)
     elif dataset_name == "cifar10":
-        return CIFAR10Net(hidden=hidden if hidden else 256)
+        # CIFAR10Net has a fixed architecture; ``hidden`` is ignored.
+        return CIFAR10Net()
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}. Supported: mnist, cifar10")
 
@@ -1024,7 +953,6 @@ def get_nmnist_loaders(
     """
     if _HAS_SNNTORCH:
         try:
-            from snntorch.spikevision import spikedata
             return _load_nmnist_snntorch(data_dir, num_steps, batch_size, max_train, max_test)
         except Exception as e:
             print(f"  snnTorch N-MNIST loading failed: {e}")
@@ -1179,7 +1107,6 @@ def get_dvs_gesture_loaders(
 
     if _HAS_SNNTORCH:
         try:
-            from snntorch.spikevision import spikedata
             return _load_dvs_gesture_snntorch(data_dir, num_steps, batch_size, max_train, max_test)
         except Exception as e:
             print(f"  snnTorch DVS-Gesture loading failed: {e}")

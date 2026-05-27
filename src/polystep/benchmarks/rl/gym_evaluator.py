@@ -33,7 +33,7 @@ from .policies import count_stacked_candidates
 class GymRolloutResult:
     returns: torch.Tensor   # (N, R)
     lengths: torch.Tensor   # (N, R)
-    successes: torch.Tensor  # (N, R) bool - episode reached terminal "good" state (env-specific)
+    successes: torch.Tensor  # (N, R) bool - "success" flag, env-specific
 
 
 def _make_vector_env(env_id: str, total_envs: int):
@@ -102,8 +102,13 @@ class GymVectorEvaluator:
     device:
         Device for policy forward passes. Env stays on CPU.
     success_fn:
-        Optional callable ``(returns: Tensor) -> Tensor[bool]`` mapping per-episode
-        return to a "success" flag for logging. Defaults to "survived to horizon".
+        Optional callable ``(returns: Tensor (N,R), lengths: Tensor (N,R)) ->
+        Tensor[bool] (N,R)`` mapping per-episode return and length to a
+        "success" flag for logging. Defaults to "survived to ``horizon``"
+        (i.e., ``lengths == horizon``), which is correct for fixed-horizon
+        balancing tasks like CartPole. For environments where "success"
+        means reaching a goal in less than ``horizon`` steps (e.g.,
+        Acrobot, MountainCar), pass a custom ``success_fn``.
     activation:
         Inner activation between linear layers. ``"tanh"`` (default) for the
         standard :class:`DiscreteMLPPolicy`; ``"int8"`` / ``"binary"`` /
@@ -220,17 +225,15 @@ class GymVectorEvaluator:
             if not active.any():
                 break
 
-        # Successes: env-specific. Default: episode terminated naturally (good)
-        # rather than being truncated. Without per-env knowledge we use `success_fn`
-        # if provided; otherwise mark "above-random" via finite return and let
-        # callers reinterpret.
+        # Successes: env-specific. ``success_fn`` lets the caller supply
+        # env-aware logic; the default "survived to horizon" is appropriate
+        # for fixed-horizon balancing tasks (CartPole) and clearly wrong for
+        # goal-reaching tasks (Acrobot), which is why custom ``success_fn``
+        # is encouraged.
         if self.success_fn is not None:
-            successes = self.success_fn(returns)
+            successes = self.success_fn(returns, lengths)
         else:
-            # Default: success if episode finished within horizon AND return >= 0
-            # (good for sparse-reward like Acrobot where return ~ -lengths).
-            ended = ~torch.from_numpy(active.reshape(N, R))
-            successes = ended & (returns >= 0)
+            successes = lengths >= float(self.horizon)
 
         return GymRolloutResult(
             returns=returns.to(self.device),

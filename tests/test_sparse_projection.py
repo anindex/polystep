@@ -5,7 +5,10 @@ Tests cover:
 - Memory efficiency (O(nnz) not O(n*k))
 - JLT distance preservation property
 - Device compatibility (CPU and CUDA)
+- Statistical properties (unit variance, extreme-compression warning)
 """
+import warnings
+
 import pytest
 import torch
 
@@ -304,3 +307,44 @@ class TestEdgeCases:
 
         expected = proj.nnz / (10000 * 64)
         assert abs(proj.actual_density - expected) < 1e-10
+
+
+class TestStatisticalProperties:
+    """Variance and warning behavior for the sparse JL projection."""
+
+    @pytest.mark.filterwarnings("ignore:Sparse invariant checks:UserWarning")
+    def test_project_transpose_has_unit_variance(self):
+        """``project_transpose`` computes ``P^T @ full`` with ``P`` having
+        ``nnz_per_col`` Rademacher entries scaled by
+        ``1/sqrt(nnz_per_col)``. For ``full ~ N(0, I)`` the projected
+        coordinate variance is ~1.
+        """
+        full_dim = 10000
+        subspace_dim = 256
+        proj = SparseRandomProjection(
+            full_dim=full_dim, subspace_dim=subspace_dim, seed=0,
+        )
+
+        gen = torch.Generator(device="cpu").manual_seed(1)
+        x = torch.randn(full_dim, generator=gen)
+        y = proj.project_transpose(x)
+        assert y.shape == (subspace_dim,)
+        sample_var = y.var().item()
+        assert 0.5 < sample_var < 2.0, (
+            f"projected coordinate variance off: got {sample_var:.3f}, "
+            "expected ~1.0"
+        )
+
+    def test_warns_at_extreme_compression(self):
+        """Subspace ratio below 1e-5 triggers a UserWarning."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            SparseRandomProjection(
+                full_dim=10_000_000, subspace_dim=64, seed=0,
+            )
+
+        msgs = [str(w.message).lower() for w in caught]
+        assert any(
+            "compression" in m or "below the empirical floor" in m
+            for m in msgs
+        ), f"expected extreme-compression warning; got {msgs}"

@@ -1,16 +1,14 @@
 """03 - RL starter: gradient-free policy training on CartPole.
 
 PolyStep optimizes the policy directly against the (non-differentiable)
-total episode return. No policy-gradient theorem, no value baselines, no
-Gym dependency: the reward signal *is* the optimization target.
+total episode return -- no policy gradient theorem, no value baselines,
+no Gym dependency at training time. The reward signal is the
+optimization target.
 
-Why this is a fair use case:
-  Standard RL pipelines apply a smoothing trick somewhere (likelihood-ratio
-  trick, advantage estimation, GAE, etc.) to get a usable gradient. PolyStep
-  treats the environment as a black-box objective and probes around the
-  current policy to find descent directions. The CartPole-v1 dynamics here
-  are vectorized in pure PyTorch (no Gymnasium), matching the official Gym
-  thresholds and reset distribution.
+The CartPole-v1 dynamics are vectorized in pure PyTorch (no Gymnasium)
+and match the official Gym thresholds and reset distribution, so this
+example doubles as a small reproducible test of zeroth-order policy
+search against a black-box objective.
 
 What you should see:
   Mean episode return rises from ~10-40 (random policy) toward 200+ over

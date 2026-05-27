@@ -1,46 +1,10 @@
-"""Amortized momentum step and related helpers.
-
-Extracted from optimizer.py for maintainability.
-"""
+"""Amortized momentum step and related helpers."""
 from __future__ import annotations
 
 import math
 from typing import Callable
 
 import torch
-
-logger = __import__("logging").getLogger(__name__)
-
-
-def amortize_should_revert(opt, amortized: float, last: float) -> bool:
-    """Decide whether the amortized momentum step regressed badly.
-
-    The natural threshold ``amortized > 1.5 * last`` only makes
-    sense for positive losses. Once losses go negative -- e.g.
-    entropic OT cost, log-likelihood, or any objective with a
-    symmetry-breaking constant -- the multiplicative test inverts
-    (``1.5 * -10 = -15`` is BETTER than -10). Fall back to an
-    additive tolerance whenever either value is negative or the
-    reference is too close to zero to anchor a relative test.
-
-    Args:
-        amortized: Loss after the cheap momentum step.
-        last: Reference loss from the previous fresh OT step.
-
-    Returns:
-        True if the optimizer should revert to the pre-momentum
-        state and recompute a fresh OT step.
-    """
-    if math.isnan(amortized) or amortized == float("inf"):
-        return True
-    threshold = opt.amortize_loss_gate_threshold
-    floor = opt.amortize_loss_gate_floor
-    if amortized < 0 or last < 0 or abs(last) < floor:
-        # Additive tolerance: revert when amortized exceeds last
-        # by more than (threshold - 1) * floor.
-        return amortized > last + (threshold - 1.0) * floor
-    return amortized > threshold * last
-
 
 
 def step_momentum(opt, closure: Callable) -> float:

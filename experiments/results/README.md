@@ -17,7 +17,7 @@ results/softmax/
 Each JSON file:
 ```json
 {
-  "method": "polystep",
+  "method": "pstorch",
   "dataset": "mnist",
   "seed": 42,
   "config": { ... },
@@ -28,6 +28,10 @@ Each JSON file:
   }
 }
 ```
+
+The package was previously named `pstorch`. JSON files in this
+directory record `"method": "pstorch"` for the main PolyStep results
+to keep the on-disk layout stable.
 
 ## Regeneration
 

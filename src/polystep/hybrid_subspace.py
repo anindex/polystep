@@ -1,30 +1,18 @@
-"""HybridSubspace: per-layer projections with coordinated rotation.
+"""Per-layer projections with coordinated rotation.
 
-Combines ``LinearSubspace``'s per-layer structure (better per-step coverage)
-with ``AdaptiveSubspace``'s synchronized rotation coordination.
+:class:`HybridSubspace` combines :class:`LinearSubspace`'s per-layer
+projections with :class:`AdaptiveSubspace`'s synchronized rotation:
 
-Key design principles:
-
-1. **Per-layer projections**: Like LinearSubspace, each parameter entry has
-   its own projection matrix P_layer of shape (num_params, num_coords). This
-   gives better per-step coverage than AdaptiveSubspace's global projection.
-
-2. **Synchronized rotation**: Like AdaptiveSubspace, all layer projections
-   rotate together on the same schedule (every N steps). This maintains
-   global coordination.
-
-3. **1/sqrt(N) scaling**: Projections use LinearSubspace's scaling convention
-   (P = randn * 1/sqrt(num_coords)) for unit-variance output, NOT QR-orthonormal
-   columns. This matches proven LinearSubspace behavior.
-
-4. **Displacement-biased rotation**: In 'displacement' mode, rotation is
-   biased toward productive directions discovered during optimization, but
-   applied per-layer using that layer's portion of the displacement history.
-
-The key insight: AdaptiveSubspace's global projection covers ~0.25% of
-parameters per step vs LinearSubspace's ~4.3%. HybridSubspace addresses
-this by using per-layer projections while keeping AdaptiveSubspace's
-rotation coordination.
+- **Per-layer projections.** Each parameter entry has its own
+  ``P_layer`` of shape ``(num_params, num_coords)``. Per-layer
+  projections cover more parameters per step than a single global one
+  (empirically ~4.3% vs ~0.25% on MNIST MLPs).
+- **Synchronized rotation.** All layer projections rotate on the same
+  schedule (every ``rotation_interval`` steps; ``0`` disables rotation).
+- **``1/sqrt(num_coords)`` scaling** for unit-variance output, matching
+  :class:`LinearSubspace`'s convention rather than QR-orthonormal columns.
+- **Displacement-biased rotation.** In ``'displacement'`` mode each layer
+  rotates toward its own slice of the displacement history.
 
 Example::
 
@@ -33,19 +21,13 @@ Example::
 
     model = nn.Sequential(nn.Linear(784, 128), nn.Linear(128, 10))
     layout = ParamLayout.from_module(model)
-
-    # Create with auto rank selection
     hybrid = HybridSubspace.auto_from_layout(layout)
-
-    # Initialize per-layer projections
     projections = hybrid.init_projections(torch.device('cpu'), torch.float32)
-
-    # Each iteration: rotate all projections together
     projections = hybrid.rotate_all(projections, step=i, total_steps=100)
 
 See Also:
-    ``LinearSubspace`` for fixed per-layer projections (no rotation).
-    ``AdaptiveSubspace`` for single global rotating projection.
+    :class:`LinearSubspace`: fixed per-layer projections (no rotation).
+    :class:`AdaptiveSubspace`: single global rotating projection.
 """
 from __future__ import annotations
 
@@ -57,6 +39,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 import torch
 
 from .projection.sparse import SparseRandomProjection
+from .subspace import _stable_entry_seed
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -181,7 +164,9 @@ class HybridSubspace:
         compression_ratio: subspace_dim / total_params.
         seed: Base seed for deterministic projection generation.
         rotation_mode: 'random' or 'displacement' (default 'displacement').
-        rotation_interval: Rotate every N steps (default 1).
+        rotation_interval: Rotate every N steps. ``0`` disables rotation
+            (default; rotating hurts accuracy on small MLPs because it
+            re-randomizes already-discovered descent directions).
         svd_ratio_init: Starting SVD ratio for displacement mode (default 0.0).
         svd_ratio_final: Ending SVD ratio for displacement mode (default 0.5).
         displacement_history_size: Rolling window for displacement history (default 5).
@@ -434,7 +419,7 @@ class HybridSubspace:
         for spec in self.specs:
             dense_bytes = spec.num_params * spec.num_coords * 4  # float32
             if spec.is_projected and dense_bytes > self.sparse_threshold_bytes:
-                entry_seed = hash((self.seed, spec.entry_key, 0)) % (2**31)
+                entry_seed = _stable_entry_seed(self.seed, spec.entry_key, 0)
                 projections[spec.entry_key] = SparseRandomProjection(
                     full_dim=spec.num_params,
                     subspace_dim=spec.num_coords,
@@ -486,7 +471,7 @@ class HybridSubspace:
         # QR orthogonalization (inspired by SubZero, ICCV 2025) gives lower
         # variance perturbations than i.i.d. scaled Gaussian columns, improving
         # per-step signal quality at negligible extra cost.
-        entry_seed = hash((self.seed, spec.entry_key, step)) % (2**31)
+        entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
         gen = torch.Generator(device='cpu')
         gen.manual_seed(entry_seed)
 
@@ -545,7 +530,7 @@ class HybridSubspace:
         actual_total_coords = coords_per_block * d_out
 
         # Deterministic seed from global seed + entry key + step
-        entry_seed = hash((self.seed, spec.entry_key, step)) % (2**31)
+        entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
         gen = torch.Generator(device='cpu')
         gen.manual_seed(entry_seed)
 
@@ -676,7 +661,7 @@ class HybridSubspace:
         for spec in self.specs:
             dense_bytes = spec.num_params * spec.num_coords * 4
             if spec.is_projected and dense_bytes > self.sparse_threshold_bytes:
-                entry_seed = hash((self.seed, spec.entry_key, step)) % (2**31)
+                entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
                 new_projections[spec.entry_key] = SparseRandomProjection(
                     full_dim=spec.num_params,
                     subspace_dim=spec.num_coords,
@@ -720,7 +705,7 @@ class HybridSubspace:
             P = projections[spec.entry_key]
             if isinstance(P, SparseRandomProjection):
                 # Sparse layers: fall back to random rotation (new seed)
-                entry_seed = hash((self.seed, spec.entry_key, step)) % (2**31)
+                entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
                 new_projections[spec.entry_key] = SparseRandomProjection(
                     full_dim=spec.num_params,
                     subspace_dim=spec.num_coords,
@@ -793,7 +778,7 @@ class HybridSubspace:
         k_random = spec.num_coords - k_svd
 
         # Generate random directions for the remainder directly on target device
-        entry_seed = hash((self.seed, spec.entry_key, step, "random")) % (2**31)
+        entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step, "random")
         gen = torch.Generator(device=device)
         gen.manual_seed(entry_seed)
 

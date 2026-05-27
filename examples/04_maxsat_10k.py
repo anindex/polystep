@@ -1,9 +1,10 @@
 """04 - MAX-SAT at scale: 10,000 variables.
 
-Random 3-SAT at the phase-transition density (clause/variable ratio 4.27)
-solved by direct gradient-free optimization on the variable-assignment
-vector. PolyStep treats the integer rounding step as a black-box and
-navigates the piecewise-constant SAT objective without surrogate gradients.
+Random 3-SAT at the phase-transition density (clause / variable ratio
+4.27) solved by direct gradient-free optimization on the variable
+assignment vector. The integer rounding step is treated as a black box
+and the piecewise-constant SAT objective is optimized without
+surrogate gradients.
 
 This is the headline scaling result from the paper, reduced to a single
 runnable script. The hyperparameters mirror the 10K row of

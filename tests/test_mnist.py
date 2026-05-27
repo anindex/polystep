@@ -1,7 +1,5 @@
 """End-to-end MNIST training tests for polystep.
 
-Covers requirement TEST-07: MNIST training achieves meaningful accuracy.
-
 The ``slow`` test trains on a 2000-sample subset and verifies accuracy
 above a threshold. The fast test verifies that loss decreases on a
 tiny subset using a very small model.

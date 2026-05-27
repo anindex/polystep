@@ -198,9 +198,8 @@ def step_monolithic(opt, closure: Callable) -> float:
         _is_subspace = opt.subspace is not None
         _sub_dim = state.subspace.subspace_dim if _is_subspace else 0
 
-        # EGGROLL-inspired fused path: detect if the closure's evaluator
-        # supports fused subspace-reconstruct + inplace-forward.
-        # This avoids materializing N full weight dicts entirely.
+        # Fused subspace reconstruct + in-place forward path: avoids
+        # materialising N full weight dicts when the evaluator supports it.
         _use_fused_inplace = (
             opt._hybrid
             and hasattr(state.subspace, 'apply_perturbation_inplace')
@@ -323,6 +322,29 @@ def step_monolithic(opt, closure: Callable) -> float:
         max_val = cost_matrix.where(finite_mask, torch.zeros_like(cost_matrix)).abs().amax()
         penalty = torch.clamp(max_val * 2.0 + 1.0, min=1e6)
         cost_matrix = cost_matrix.where(finite_mask, penalty)
+
+    # Deferred trust-region update: the cost matrix at this step is evaluated
+    # at the particle position produced by the *previous* step. Comparing the
+    # prediction stored on the previous step against this step's pre-OT min cost
+    # gives a real predicted-vs-actual reduction ratio.
+    if (opt.trust_region
+            and opt._prev_predicted_improvement is not None
+            and opt._prev_pre_step_loss is not None):
+        current_loss_proxy = cost_matrix.min(dim=1).values.mean().item()
+        actual_improvement = torch.tensor(
+            [opt._prev_pre_step_loss - current_loss_proxy]
+        )
+        from .quadratic_model import update_trust_region
+        opt._trust_region_multiplier = update_trust_region(
+            opt._prev_predicted_improvement,
+            actual_improvement,
+            opt._trust_region_multiplier,
+            min_radius=0.1,
+            max_radius=3.0,
+        )
+        state.trust_region_multipliers.append(opt._trust_region_multiplier)
+        opt._prev_predicted_improvement = None
+        opt._prev_pre_step_loss = None
 
     # Multi-fidelity screening: dampen low-contrast vertex directions
     # Uses previous step's cost to identify uninformative directions and
@@ -480,14 +502,14 @@ def step_monolithic(opt, closure: Callable) -> float:
             # Transform to original space
             newton_orig = torch.einsum("bij,bj->bi", rot_mats, newton_rot)
             opt._newton_direction = newton_orig.detach()
-            # Store predicted improvement for trust region
+            # Store predicted improvement and pre-step proxy loss. Both are
+            # consumed at the start of the next ``step`` call, where the
+            # actual loss reduction can be measured from the new cost matrix.
             if opt.trust_region:
                 from .quadratic_model import compute_predicted_improvement
                 opt._prev_predicted_improvement = compute_predicted_improvement(
                     fd_grad, fd_hess, newton_rot,
                 ).detach()  # (P,)
-                # Use per-particle min cost as post-step loss proxy:
-                # OT moves particles toward lowest-cost vertices
                 opt._prev_pre_step_loss = cost_matrix.min(dim=1).values.mean().item()
         else:
             # Fallback: OT descent direction (original biased_rotation)
@@ -658,7 +680,7 @@ def step_monolithic(opt, closure: Callable) -> float:
 
             # Compute OT-informed weights for rank-mu update
             # Particles that transported more mass should have higher influence
-            ot_weights = compute_ot_weights(ot_result.matrix, state.a)
+            ot_weights = compute_ot_weights(ot_result.matrix)
 
             state.C_diag = update_covariance_diagonal(
                 C_diag=state.C_diag,
@@ -750,21 +772,8 @@ def step_monolithic(opt, closure: Callable) -> float:
                     alpha * opt._transport_direction_ema + (1.0 - alpha) * raw_direction
                 )
 
-    # Trust region update: compare predicted vs actual improvement
-    if (opt.trust_region and opt._prev_predicted_improvement is not None
-            and opt._prev_pre_step_loss is not None and not _nan_reverted):
-        # Use per-particle min cost as post-step proxy (consistent with pre-step)
-        actual_loss = cost_matrix.min(dim=1).values.mean().item()
-        actual_improvement = torch.tensor([actual_loss - opt._prev_pre_step_loss])
-        from .quadratic_model import update_trust_region
-        opt._trust_region_multiplier = update_trust_region(
-            opt._prev_predicted_improvement,
-            actual_improvement,
-            opt._trust_region_multiplier,
-            min_radius=0.1,
-            max_radius=3.0,
-        )
-        state.trust_region_multipliers.append(opt._trust_region_multiplier)
+    # NB: trust-region update happens at the start of the next call to
+    # ``step`` (deferred), where we have a real post-step pre-OT measurement.
 
     # 11. Update diagnostics (defer GPU-CPU sync for displacement)
     per_particle_disp_sqnorms = torch.sum((state.X - X) ** 2, dim=-1)  # (P,)
@@ -834,19 +843,17 @@ def step_monolithic(opt, closure: Callable) -> float:
         )
 
         if should_absorb:
-            # Absorb: fold perturbation into base, zero coords, new random basis
+            # Absorb: fold perturbation into base, zero coords, new random basis.
             full_flat_sub = state.X.reshape(-1)[:adaptive_sub.subspace_dim]
             new_base, _zeroed = adaptive_sub.absorb(
                 state.projection, state.base_params, full_flat_sub,
             )
             state.base_params = new_base
-            # Design decision: reset subspace coordinates to zero after absorb
-            # rather than re-projecting onto the new basis. Zero reset is simpler,
-            # avoids numerical issues from re-projection, and the next OT solve
-            # will immediately find a good direction in the new subspace.
-            # Re-projection would require computing P_new^T @ P_old @ old_coords
-            # which adds complexity for minimal benefit since the old and new
-            # bases are largely uncorrelated after a full random redraw.
+            # Zero the subspace coordinates rather than re-projecting onto
+            # the new basis. The new and old bases are largely uncorrelated
+            # after a random redraw, so re-projection adds complexity for
+            # little benefit; the next OT solve will discover a fresh
+            # descent direction.
             state.X = torch.zeros_like(state.X)
             # New random projection
             # Sparse projection: create new SparseRandomProjection with fresh seed

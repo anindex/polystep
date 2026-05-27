@@ -151,8 +151,12 @@ class KLSoftmaxSolver:
             else:
                 converged = False
                 n_iters = self.max_iterations
+                # Only sync the convergence flag once per ``check_every``
+                # iterations to keep the dual updates GPU-resident.
+                check_every = max(1, self.max_iterations // 20)
+                threshold = float(self.threshold)
                 for it in range(self.max_iterations):
-                    # f-update: exact row-marginal enforcement
+                    # f-update: exact row-marginal enforcement.
                     f_new = eps * (log_a - torch.logsumexp(
                         (g.unsqueeze(0) - C) / eps, dim=1
                     ))
@@ -162,13 +166,17 @@ class KLSoftmaxSolver:
                     ))
                     g_new = alpha * g_target
 
-                    df = (f_new - f).abs().max().item()
-                    dg = (g_new - g).abs().max().item()
+                    if (it + 1) % check_every == 0 or it == self.max_iterations - 1:
+                        delta = torch.maximum(
+                            (f_new - f).abs().amax(),
+                            (g_new - g).abs().amax(),
+                        )
+                        if delta.item() < threshold:
+                            f, g = f_new, g_new
+                            converged = True
+                            n_iters = it + 1
+                            break
                     f, g = f_new, g_new
-                    if max(df, dg) < self.threshold:
-                        converged = True
-                        n_iters = it + 1
-                        break
 
             log_P = (f.unsqueeze(1) + g.unsqueeze(0) - C) / eps
             P = log_P.exp()

@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
-title: "polystep: Gradient-Free Neural Network Training via Entropic Optimal Transport"
+title: "polystep: Gradient-Free Neural Network Training via Optimal Transport"
 authors:
   - family-names: Le
     given-names: An T.
