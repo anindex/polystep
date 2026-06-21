@@ -34,33 +34,8 @@ def test_vectorized_step_produces_finite_cost():
     assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
 
 
-def test_vectorized_step_updates_model():
-    """Model params should change after a step."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    params_before = {k: v.clone() for k, v in model.named_parameters()}
-
-    optimizer = PolyStepOptimizer(model, epsilon=0.5, step_radius=0.5, num_probe=1, compile=False, seed=42)
-
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-
-    def closure(batched_params):
-        evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    cost = optimizer.step(closure)
-    assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-
-    # At least some params should have changed
-    changed = False
-    for k, v in model.named_parameters():
-        if not torch.equal(v, params_before[k]):
-            changed = True
-            break
-    assert changed, "Model params should change after step"
-
+# test_vectorized_step_updates_model removed: identical to the canonical
+# tests/test_optimizer.py::TestClosureInterface::test_step_updates_model.
 
 def test_cost_batch_size_parameter():
     """Verify cost_batch_size is stored and accessible."""
@@ -276,7 +251,8 @@ def test_adaptive_probe_count_parameter():
 
 
 def test_adaptive_probe_reduces_probes():
-    """After warmup, K should reduce to 1 when loss is decreasing."""
+    """On a steadily-improving objective the decreasing-loss counter must
+    increment after warmup -- that counter is what drops K_eff to 1."""
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
@@ -285,22 +261,21 @@ def test_adaptive_probe_reduces_probes():
         adaptive_num_probe=True, adaptive_probe_warmup=2,
     )
 
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-
+    # Convex bowl ||params||^2: the optimizer descends it monotonically, so the
+    # "3 consecutive decreasing costs" trigger reliably fires (random-data
+    # cross-entropy did not decrease, so the old >= 0 check was tautological).
     def closure(batched_params):
-        return evaluator.evaluate(batched_params, inputs, targets)
+        n = next(iter(batched_params.values())).shape[0]
+        total = torch.zeros(n)
+        for v in batched_params.values():
+            total = total + (v.reshape(n, -1) ** 2).sum(dim=1)
+        return total
 
-    # Warmup steps use full num_probe
-    for _ in range(3):
-        cost = optimizer.step(closure)
-        assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
+    for _ in range(12):
+        optimizer.step(closure)
 
-    # After warmup, adaptive probe logic should have run
-    # (K_eff is computed internally; _loss_decreasing_count tracks state)
-    assert optimizer._loss_decreasing_count >= 0
+    assert optimizer.state.costs[-1] < optimizer.state.costs[0], "objective did not decrease"
+    assert optimizer._loss_decreasing_count >= 1, "decreasing-loss tracking never fired"
 
 
 def test_adaptive_probe_step_works():

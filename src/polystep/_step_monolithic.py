@@ -10,6 +10,8 @@ from typing import Callable
 
 import torch
 
+from .costs import scale_cost_matrix
+from .solvers._prelude import sanitize_cost
 from .dynamics import apply_momentum, compute_momentum_coefficient, update_adaptive_radius
 from .geometry import get_random_rotation_matrices
 from .solvers import SinkhornSolver
@@ -241,7 +243,7 @@ def step_monolithic(opt, closure: Callable) -> float:
             if _use_fused_inplace and _is_subspace and opt._hybrid:
                 # Fused path (EGGROLL-inspired): reconstruct + forward one
                 # config at a time via in-place weight swap. Never materializes
-                # the full (N, *param_shape) stacked dict. Memory: O(1 × activation).
+                # the full (N, *param_shape) stacked dict. Memory: O(1 x activation).
                 flat_sub = flat_configs[:, :_sub_dim]
                 if opt._mixed_precision and getattr(state, 'projection', None) is not None:
                     flat_sub = flat_sub.to(dtype=state.projection.dtype)
@@ -316,12 +318,10 @@ def step_monolithic(opt, closure: Callable) -> float:
                 if opt.use_quadratic_model:
                     opt._prev_losses_3d = losses_3d_full.detach()
 
-    # Sanitize cost matrix before OT solve (pure-tensor path, no GPU-CPU sync)
-    if not torch.isfinite(cost_matrix).all():
-        finite_mask = cost_matrix.isfinite()
-        max_val = cost_matrix.where(finite_mask, torch.zeros_like(cost_matrix)).abs().amax()
-        penalty = torch.clamp(max_val * 2.0 + 1.0, min=1e6)
-        cost_matrix = cost_matrix.where(finite_mask, penalty)
+    # Sanitize cost (FP32 promote + finite penalty), branch-free / no host sync.
+    # Protects the downstream trust-region / multifidelity readers and BOTH
+    # solver paths -- the fused softmax scales this same sanitized tensor.
+    cost_matrix = sanitize_cost(cost_matrix)
 
     # Deferred trust-region update: the cost matrix at this step is evaluated
     # at the particle position produced by the *previous* step. Comparing the
@@ -411,10 +411,14 @@ def step_monolithic(opt, closure: Callable) -> float:
     opt.solver.epsilon = ot_epsilon
     if opt._use_fused_softmax:
         # Fused path: softmax + vertex-free projection in one compiled call
+        # Scale the cost outside the compiled kernel so every scale_cost mode
+        # ('mean'/'max_cost'/float/None) matches the non-fused solvers; the
+        # kernel then runs on the already-scaled cost (scale_cost_mean=False).
+        scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
         X_new_fused, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
-            cost_matrix, ot_epsilon, state.a,
+            scaled_cost, ot_epsilon, state.a,
             opt._polytope_vertices, rot_mats, step_r, X,
-            scale_cost_mean=opt._scale_cost_is_mean,
+            scale_cost_mean=False,
         )
         ent_cost = ent_cost_tensor.item()  # .item() OUTSIDE compiled boundary
         ot_result = SolverResult(
@@ -434,8 +438,6 @@ def step_monolithic(opt, closure: Callable) -> float:
         )
         if isinstance(opt.solver, SinkhornSolver) and state.last_solve_eps is not None:
             solve_kwargs["init_eps"] = state.last_solve_eps
-        if isinstance(opt.solver, SinkhornSolver) and opt._seed is not None:
-            solve_kwargs["seed"] = opt._seed
         ot_result = opt.solver.solve(**solve_kwargs)
     state.last_solve_eps = ot_epsilon
 

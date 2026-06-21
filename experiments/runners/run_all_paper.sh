@@ -54,7 +54,7 @@ echo ""
 
 # ------------------------------------------------------------------
 # 1. Non-Differentiable Model Training (§5.2)
-#    SNN, int8, argmax, staircase - 4 showcases × 5 methods × 5 seeds
+#    SNN, int8, argmax, staircase - 4 showcases x 5 methods x 5 seeds
 #    Configs: SNN=sm_sr2, INT8=rank8, Argmax=rank8, Staircase=sr64
 # ------------------------------------------------------------------
 echo ">>> [1/7] Non-Differentiable Showcases (elevation)..."
@@ -106,7 +106,7 @@ echo ""
 
 # ------------------------------------------------------------------
 # 5. MNIST Sanity Check (§5.5)
-#    5 methods × 5 seeds, softmax solver default
+#    5 methods x 5 seeds, softmax solver default
 # ------------------------------------------------------------------
 echo ">>> [5/7] MNIST Benchmark..."
 $PYTHON experiments/runners/run_mnist.py \
@@ -117,7 +117,7 @@ echo ""
 
 # ------------------------------------------------------------------
 # 6. LSTM Time-Series Forecasting (§5.6)
-#    ETTh1 dataset, 5 methods × 5 seeds, softmax solver default
+#    ETTh1 dataset, 5 methods x 5 seeds, softmax solver default
 # ------------------------------------------------------------------
 echo ">>> [6/7] LSTM Time-Series (ETTh1)..."
 $PYTHON experiments/runners/run_timeseries.py \

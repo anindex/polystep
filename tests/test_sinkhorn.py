@@ -1,4 +1,4 @@
-"""Unit tests for SinkhornSolver (full-rank and low-rank modes)."""
+"""Unit tests for SinkhornSolver (full-rank log-domain)."""
 import torch
 import pytest
 
@@ -70,84 +70,15 @@ class TestSinkhornSolver:
         assert torch.allclose(P.sum(dim=1), a, atol=1e-3), \
             f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
 
-    # ------------------------------------------------------------------
-    # Low-rank tests
-    # ------------------------------------------------------------------
-
-    def test_low_rank_marginals(self):
-        """Low-rank Sinkhorn produces valid transport plan with matching marginals."""
-        torch.manual_seed(42)
-        n, m = 20, 15
-        C = torch.rand(n, m)
-
-        solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-6,
-            rank=5, compile=False,
-        )
-        result = solver.solve(C)
-
-        P = result.matrix
-        a = torch.ones(n) / n
-        b = torch.ones(m) / m
-
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-3), \
-            f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-3), \
-            f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-
-    def test_low_rank_result_uses_dual_potential_path(self):
-        """Low-rank result uses cost_approx + dual potentials (no factored SVD)."""
-        torch.manual_seed(42)
-        C = torch.rand(20, 15)
-
-        solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=1000, rank=5, compile=False,
-        )
-        result = solver.solve(C)
-
-        # Low-rank stores approximated cost matrix and uses dual potential path
-        assert result._cost_matrix is not None, "_cost_matrix should be set"
-        assert result._cost_matrix.shape == (20, 15)
-        P = result.matrix
-        assert P.shape == (20, 15)
-        assert torch.isfinite(P).all()
-
-    def test_auto_rank_selection(self):
-        """Auto rank triggers when n+m > auto_rank_threshold."""
-        torch.manual_seed(42)
-        n, m = 20, 15
-        C = torch.rand(n, m)
-
-        # Set threshold very low so auto-rank triggers
-        solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=1000, threshold=1e-6,
-            auto_rank_threshold=30, compile=False,
-        )
-        result = solver.solve(C)
-
-        # Should have used low-rank since n+m=35 > 30
-        # Low-rank now uses cost_approx + dual potentials (not factored Q/R/g_lr)
-        assert result._cost_matrix is not None, "Auto rank should have triggered low-rank mode"
-        P = result.matrix
-        assert P.shape == (n, m)
-        assert torch.isfinite(P).all()
-
     def test_entropic_cost_finite(self):
-        """Entropic regularized cost should be finite for both modes."""
+        """Entropic regularized cost should be finite."""
         torch.manual_seed(42)
         C = torch.rand(10, 8)
 
-        # Full-rank
-        solver_fr = SinkhornSolver(epsilon=0.1, max_iterations=500, compile=False)
-        result_fr = solver_fr.solve(C)
-        assert torch.isfinite(torch.tensor(result_fr.ent_reg_cost)), \
-            f"Full-rank ent_reg_cost not finite: {result_fr.ent_reg_cost}"
-
-        # Low-rank
-        solver_lr = SinkhornSolver(epsilon=0.1, max_iterations=500, rank=3, compile=False)
-        result_lr = solver_lr.solve(C)
-        assert torch.isfinite(torch.tensor(result_lr.ent_reg_cost)), \
-            f"Low-rank ent_reg_cost not finite: {result_lr.ent_reg_cost}"
+        solver = SinkhornSolver(epsilon=0.1, max_iterations=500, compile=False)
+        result = solver.solve(C)
+        assert torch.isfinite(torch.tensor(result.ent_reg_cost)), \
+            f"ent_reg_cost not finite: {result.ent_reg_cost}"
 
 
 def test_warmstart_shape_mismatch_warns():

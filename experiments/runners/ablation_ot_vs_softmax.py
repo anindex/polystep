@@ -6,9 +6,9 @@ weighted updates. Sweeps subspace rank, particle dimension, epsilon, and
 tasks (MNIST, SNN).
 
 Phases (select via --step N):
-  1  Screening   - update_rule × rank × dp  (MNIST, 5 epochs, seed=42)
-  2  Epsilon     - update_rule × epsilon     (MNIST, 5 epochs, seed=42)
-  3  SNN         - update_rule × rank        (SNN, 20 epochs, seed=42)
+  1  Screening   - update_rule x rank x dp  (MNIST, 5 epochs, seed=42)
+  2  Epsilon     - update_rule x epsilon     (MNIST, 5 epochs, seed=42)
+  3  SNN         - update_rule x rank        (SNN, 20 epochs, seed=42)
   4  Profiling   - wall-clock per-step timing (50 steps per config)
   5  Convergence - OT vs softmax vs greedy   (MNIST, 10 epochs, per-step logs)
 
@@ -219,12 +219,12 @@ def _train_loop(
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Screening - update_rule × rank × dp
+# Step 1: Screening - update_rule x rank x dp
 # ---------------------------------------------------------------------------
 
 def run_phase1_screening(seed: int = 42, epochs: int = 5, epsilon: float = 3.0,
                          dry_run: bool = False):
-    """Sweep update_rule × rank × particle_dim on MNIST."""
+    """Sweep update_rule x rank x particle_dim on MNIST."""
     from polystep.cost_nn import NNCostEvaluator
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -284,12 +284,12 @@ def run_phase1_screening(seed: int = 42, epochs: int = 5, epsilon: float = 3.0,
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Epsilon sensitivity - update_rule × epsilon
+# Step 2: Epsilon sensitivity - update_rule x epsilon
 # ---------------------------------------------------------------------------
 
 def run_phase2_epsilon(seed: int = 42, epochs: int = 5, rank: int = 8, dp: int = 2,
                        dry_run: bool = False):
-    """Sweep update_rule × epsilon on MNIST at fixed rank/dp."""
+    """Sweep update_rule x epsilon on MNIST at fixed rank/dp."""
     from polystep.cost_nn import NNCostEvaluator
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -347,7 +347,7 @@ def run_phase2_epsilon(seed: int = 42, epochs: int = 5, rank: int = 8, dp: int =
 
 def run_phase3_snn(seed: int = 42, epochs: int = 20, dp: int = 2, epsilon: float = 0.5,
                    dry_run: bool = False):
-    """Sweep update_rule × rank on hard-LIF SNN task."""
+    """Sweep update_rule x rank on hard-LIF SNN task."""
     from polystep.cost_nn import NNCostEvaluator
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

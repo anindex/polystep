@@ -239,7 +239,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
 
         # Reshape back: (batch, num_heads, seq_q, head_dim) -> (batch, seq_q, embed_dim)
         # Use reshape instead of .contiguous().view() to avoid a full tensor copy
-        # per candidate under vmap (N candidates × this copy = ~1.3 GB overhead).
+        # per candidate under vmap (N candidates x this copy = ~1.3 GB overhead).
         context = context.transpose(1, 2).reshape(batch_size, seq_q, self.embed_dim)
 
         # Output projection

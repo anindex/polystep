@@ -70,7 +70,7 @@ SPSA_CONFIG = {"a": 0.1, "c": 0.1, "alpha": 0.602, "gamma": 0.101, "max_iters": 
 # polystep config - r4_sr12t4 config (90.92% at 20ep, seed 42)
 # HYBRID: flat eps + flat pr, but SCHEDULED sr only
 # eps ≤ 0.5 mandatory - eps scheduling causes MoE collapse (2.66% at eps=1.5)
-# sr scheduling (12->4) with rank=4 beats flat rank=8 while being 2× faster
+# sr scheduling (12->4) with rank=4 beats flat rank=8 while being 2x faster
 PSTORCH_CONFIG = {
     "epsilon": 0.5,                     # FLAT - eps scheduling -> collapse
     "step_radius_init": 12.0,          # sr scheduling: 12->4

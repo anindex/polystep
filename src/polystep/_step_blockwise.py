@@ -18,6 +18,8 @@ from .blockwise import (
     blocks_to_layout_flat,
     blocks_to_layout_flat_batch,
 )
+from .costs import scale_cost_matrix
+from .solvers._prelude import sanitize_cost
 from .dynamics import apply_momentum, compute_momentum_coefficient, update_adaptive_radius
 from .geometry import get_random_rotation_matrices
 from .solvers import SinkhornSolver
@@ -197,12 +199,8 @@ def step_blockwise(opt, closure: Callable) -> float:
         else:
             cost_matrix = losses.reshape(P, V, K).mean(dim=-1)
 
-        # Sanitize cost matrix before OT solve (pure-tensor path, no GPU-CPU sync)
-        if not torch.isfinite(cost_matrix).all():
-            finite_mask = cost_matrix.isfinite()
-            max_val = cost_matrix.where(finite_mask, torch.zeros_like(cost_matrix)).abs().amax()
-            penalty = torch.clamp(max_val * 2.0 + 1.0, min=1e6)
-            cost_matrix = cost_matrix.where(finite_mask, penalty)
+        # Sanitize cost (FP32 promote + finite penalty), branch-free / no sync.
+        cost_matrix = sanitize_cost(cost_matrix)
 
         # Per-block OT solve with dual momentum extrapolation
         opt.solver.epsilon = ot_epsilon
@@ -211,10 +209,11 @@ def step_blockwise(opt, closure: Callable) -> float:
             # Fused path: softmax + vertex-free projection in one compiled
             # call. ent_cost_tensor stays on-device; it gets summed with
             # the other blocks' tensors in a single .item() after the loop.
+            scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
             X_new_block, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
-                cost_matrix, ot_epsilon, block_a,
+                scaled_cost, ot_epsilon, block_a,
                 block_polytope_verts, rot_mats, step_r, block_X,
-                scale_cost_mean=opt._scale_cost_is_mean,
+                scale_cost_mean=False,
             )
             block_fused_ent_terms.append(ent_cost_tensor)
             # ot_result.cost / ent_reg_cost are only read by the
@@ -254,8 +253,6 @@ def step_blockwise(opt, closure: Callable) -> float:
                 last_eps = state.last_solve_eps
                 if last_eps is not None:
                     solve_bw_kwargs["init_eps"] = last_eps
-                if opt._seed is not None:
-                    solve_bw_kwargs["seed"] = opt._seed
             ot_result = opt.solver.solve(**solve_bw_kwargs)
 
             # Barycentric projection
@@ -618,12 +615,8 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         else:
             cost_matrix = losses.reshape(P, V, K).mean(dim=-1)
 
-        # Sanitize cost matrix before OT solve (pure-tensor path, no GPU-CPU sync)
-        if not torch.isfinite(cost_matrix).all():
-            finite_mask = cost_matrix.isfinite()
-            max_val = cost_matrix.where(finite_mask, torch.zeros_like(cost_matrix)).abs().amax()
-            penalty = torch.clamp(max_val * 2.0 + 1.0, min=1e6)
-            cost_matrix = cost_matrix.where(finite_mask, penalty)
+        # Sanitize cost (FP32 promote + finite penalty), branch-free / no sync.
+        cost_matrix = sanitize_cost(cost_matrix)
 
         # Per-block OT solve with dual momentum extrapolation
         opt.solver.epsilon = ot_epsilon
@@ -631,10 +624,11 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         if opt._use_fused_softmax:
             # See step_blockwise() above for the rationale behind the
             # 0.0 placeholders and the deferred .item() on ent_cost_tensor.
+            scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
             X_new_block, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
-                cost_matrix, ot_epsilon, block_a,
+                scaled_cost, ot_epsilon, block_a,
                 block_polytope_verts, rot_mats, step_r, block_X,
-                scale_cost_mean=opt._scale_cost_is_mean,
+                scale_cost_mean=False,
             )
             block_fused_ent_terms.append(ent_cost_tensor)
             ot_result = SolverResult(
@@ -670,8 +664,6 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 last_eps = state.last_solve_eps
                 if last_eps is not None:
                     solve_sbw_kwargs["init_eps"] = last_eps
-                if opt._seed is not None:
-                    solve_sbw_kwargs["seed"] = opt._seed
             ot_result = opt.solver.solve(**solve_sbw_kwargs)
 
             # Barycentric projection for this block

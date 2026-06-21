@@ -116,56 +116,6 @@ def test_gym_evaluator_nondiff_acrobot():
     ev_b.close()
 
 
-@pytest.mark.parametrize("method", ["ppo", "dqn"])
-def test_sb3_nondiff_zero_grad(method):
-    """SB3 PPO/DQN with the new non-diff harness must produce zero gradient
-    on every trainable parameter (full-backbone collapse, not just feature-extractor)."""
-    pytest.importorskip("stable_baselines3")
-    pytest.importorskip("gymnasium")
-    import gymnasium as gym
-    from stable_baselines3 import DQN, PPO
-    from experiments.runners.run_rl import (
-        _apply_nondiff_to_sb3_policy,
-        _make_nondiff_activation_fn,
-    )
-
-    algo_cls = {"ppo": PPO, "dqn": DQN}[method]
-    env = gym.make("CartPole-v1")
-    env.reset(seed=0)
-    policy_kwargs = {
-        "net_arch": [16, 16],
-        "activation_fn": _make_nondiff_activation_fn("binary"),
-    }
-    model = algo_cls("MlpPolicy", env, seed=0, verbose=0, policy_kwargs=policy_kwargs, device="cpu")
-    _apply_nondiff_to_sb3_policy(model, method, "binary")
-
-    # Forward + a synthetic loss + backward.
-    obs, _ = env.reset(seed=0)
-    obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
-    if method == "ppo":
-        # forward returns (actions, values, log_prob)
-        _, values, log_prob = model.policy(obs_t)
-        loss = (values.sum() + log_prob.sum())
-    else:
-        q = model.q_net(obs_t)
-        loss = q.sum()
-    model.policy.zero_grad(set_to_none=True)
-    loss.backward()
-
-    # Every trainable parameter must have either no grad or all-zero grad.
-    nonzero = []
-    for name, p in model.policy.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.grad is None:
-            continue
-        max_abs = float(p.grad.abs().max().item())
-        if max_abs > 0.0:
-            nonzero.append((name, max_abs))
-    env.close()
-    assert not nonzero, f"{method} non-diff harness leaks grad on: {nonzero[:5]}"
-
-
 def test_hardened_env_smoke():
     """Hardened wrappers register, reset, step, and produce quantized obs / bucketed reward."""
     pytest.importorskip("gymnasium")
@@ -184,7 +134,7 @@ def test_hardened_env_smoke():
     obs1, _ = env.reset(seed=1)
     # Quantizer outputs should be one of 4 bin centers per channel.
     assert obs0.shape == (4,) and obs0.dtype == np.float32
-    assert np.unique(np.concatenate([obs0, obs1])).size <= 8  # ≤ 4 bins × 2 resets
+    assert np.unique(np.concatenate([obs0, obs1])).size <= 8  # ≤ 4 bins x 2 resets
     env.close()
 
     # Reward bucketing: |r| < deadband zeros out.

@@ -6,10 +6,10 @@ the OT solver's memory from O(N^2) to O(K^2).
 
 Two factorisations are provided:
 
-- :class:`LowRankSubspace` — ``delta_W = B @ A``, bilinear in the subspace
+- :class:`LowRankSubspace` - ``delta_W = B @ A``, bilinear in the subspace
   coords. Near zero this bilinearity flattens the cost landscape and
   often gives uniform OT transport; useful for scalability diagnostics.
-- :class:`LinearSubspace` — ``delta_W = P @ coords`` with a fixed random
+- :class:`LinearSubspace` - ``delta_W = P @ coords`` with a fixed random
   projection ``P``. Linear in the subspace coords, so probing
   ``coords + alpha * direction`` produces a proportional cost change.
   Recommended for training.

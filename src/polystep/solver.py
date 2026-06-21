@@ -151,7 +151,6 @@ class PolyStep:
         max_iterations: Maximum outer iterations.
         min_iterations: Minimum outer iterations before convergence checks.
         threshold: Convergence threshold on relative displacement change.
-        rank: Sinkhorn rank (None=full-rank with auto-selection, int=low-rank).
         sinkhorn_max_iters: Max inner Sinkhorn iterations.
         chunk_size: Chunk size for cost evaluation memory control.
     """
@@ -172,7 +171,6 @@ class PolyStep:
     max_iterations: int = 50
     min_iterations: int = 5
     threshold: float = 1e-3
-    rank: Optional[int] = None
     sinkhorn_max_iters: int = 2000
     chunk_size: Optional[int] = None
     compile: bool = True
@@ -197,7 +195,6 @@ class PolyStep:
         self.probes = torch.linspace(0, 1, self.num_probe + 2)[1:self.num_probe + 1]
         self.sinkhorn_solver = SinkhornSolver(
             max_iterations=self.sinkhorn_max_iters,
-            rank=self.rank,
             compile=self.compile,
         )
         self._compiled = CompiledFunctions(
@@ -393,15 +390,22 @@ class PolyStep:
         ent_eps = self._get_ent_epsilon(iteration)
         ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
-        # 5. Solve entropic OT
+        # 5. Solve entropic OT. Forward the previous solve's epsilon so the
+        # solver can rescale the warm-started duals when the schedule moved
+        # epsilon -- consistent with PolyStepOptimizer's monolithic step,
+        # which previously was the only path that passed init_eps.
         self.sinkhorn_solver.epsilon = ot_epsilon
-        ot_result = self.sinkhorn_solver.solve(
+        solve_kwargs = dict(
             cost_matrix=cost_matrix,
             a=state.a,
             init_f=state.f,
             init_g=state.g,
             scale_cost=self.scale_cost,
         )
+        if state.last_solve_eps is not None:
+            solve_kwargs["init_eps"] = state.last_solve_eps
+        ot_result = self.sinkhorn_solver.solve(**solve_kwargs)
+        state.last_solve_eps = ot_epsilon
 
         # 6. Barycentric projection (compiled)
         transport_matrix = ot_result.matrix  # (batch, num_vertices)

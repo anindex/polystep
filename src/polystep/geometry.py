@@ -205,16 +205,16 @@ def get_random_rotation_matrices(
         Z = Z.to(device=compute_device)
     Q, R = torch.linalg.qr(Z)
 
-    # Sign correction for Haar measure (Mezzadri method)
-    d = torch.diagonal(R, dim1=-2, dim2=-1)  # (batch, dim)
-    phases = torch.sign(d)                     # (batch, dim)
-    Q = Q * phases.unsqueeze(-2)               # (batch, 1, dim) * (batch, dim, dim)
+    # Sign correction for Haar measure (Mezzadri method). Use a nonzero sign
+    # (sign(0) := +1) so an underflowed zero R-diagonal can't null a column.
+    d = torch.diagonal(R, dim1=-2, dim2=-1)              # (batch, dim)
+    phases = torch.where(d == 0, torch.ones_like(d), torch.sign(d))
+    Q = Q * phases.unsqueeze(-2)                          # (batch, 1, dim) * (batch, dim, dim)
 
-    # Ensure det = +1 (SO(n) not just O(n)): flip first column if det = -1
-    dets = torch.det(Q)                        # (batch,)
-    flip = torch.sign(dets).unsqueeze(-1).unsqueeze(-1)  # (batch, 1, 1)
-    Q = Q.clone()
-    Q[:, :, 0] = Q[:, :, 0] * flip.squeeze(-1)
+    # Ensure det = +1 (SO(n) not just O(n)): flip first column where det < 0.
+    # Q is a fresh tensor (product above), so the in-place column flip is safe.
+    flip = torch.where(torch.det(Q) < 0, -1.0, 1.0).to(Q.dtype)  # (batch,)
+    Q[:, :, 0] = Q[:, :, 0] * flip.unsqueeze(-1)
 
     # Convert to target dtype and device
     Q = Q.to(device=device, dtype=dtype)
@@ -266,16 +266,14 @@ def get_sobol_rotation_matrices(
     Z = normal.reshape(batch, dim, dim)
     Q, R = torch.linalg.qr(Z)
 
-    # Mezzadri sign correction
+    # Mezzadri sign correction (sign(0) := +1 to keep columns nonzero)
     d = torch.diagonal(R, dim1=-2, dim2=-1)
-    phases = torch.sign(d)
+    phases = torch.where(d == 0, torch.ones_like(d), torch.sign(d))
     Q = Q * phases.unsqueeze(-2)
 
-    # Ensure det = +1
-    dets = torch.det(Q)
-    flip = torch.sign(dets).unsqueeze(-1).unsqueeze(-1)
-    Q = Q.clone()
-    Q[:, :, 0] = Q[:, :, 0] * flip.squeeze(-1)
+    # Ensure det = +1 (Q is a fresh tensor, so the in-place flip is safe)
+    flip = torch.where(torch.det(Q) < 0, -1.0, 1.0).to(Q.dtype)
+    Q[:, :, 0] = Q[:, :, 0] * flip.unsqueeze(-1)
 
     return Q
 

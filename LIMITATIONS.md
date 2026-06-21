@@ -63,12 +63,11 @@ restrictions apply.
   and backed off to 1.0 if the iterate norm grows more than 5% per
   check for 3 consecutive checks.
 - `anderson_depth > 0` and `adaptive_omega=True` have no effect in
-  fixed-iteration mode (`threshold <= 0`) or low-rank mode
-  (`rank is not None`). Both emit a `UserWarning`.
-- Warm-started duals `init_f, init_g` are **ignored** in low-rank
-  mode (a `UserWarning` is emitted). Low-rank Sinkhorn always cold-
-  starts from zeros (or `data_dependent_init` cost-mean init).
+  fixed-iteration mode (`threshold <= 0`); they emit a `UserWarning`.
 - BF16 / FP16 cost matrices are promoted to FP32 internally.
+- The solver is full-rank only. PolyStep's OT problems are
+  (n particles x m=V vertices) with V small, so the cost is `O(n*V)`
+  and a low-rank approximation would not save memory or compute.
 
 ## Subspace and projection
 
@@ -161,9 +160,6 @@ runners expose the flag.
 
 ## Random-seed gotchas
 
-- The Sinkhorn low-rank SVD initializer uses the optimizer's seed
-  (propagated from `PolyStepOptimizer` through
-  `solver.solve(seed=...)`).
 - Tied weights are silently deduplicated in `ParamLayout.from_module`
   by `data_ptr()`. The dedup is logged at INFO level, so it is
   invisible unless `logging.basicConfig(level=logging.INFO)` is

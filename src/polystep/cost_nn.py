@@ -131,7 +131,7 @@ class NNCostEvaluator:
         # Auto-detect whether to use memory-efficient in-place evaluation.
         # For very large models (>500K params) on GPU, vmap materializes N
         # copies of all intermediate activations simultaneously, causing
-        # O(N × activation) memory. In-place evaluation uses O(1 × activation)
+        # O(N x activation) memory. In-place evaluation uses O(1 x activation)
         # regardless of N. For models ≤500K params (e.g. MNISTNet ~102K,
         # CIFAR10MLP ~199K), chunked vmap is fast and fits in GPU memory.
         # Pass use_inplace=True/False to override auto-detection.
@@ -210,7 +210,7 @@ class NNCostEvaluator:
                 return self._batched_linear.evaluate(stacked_params, inputs, targets)
 
             # Memory-efficient path: in-place weight swap for large GPU models.
-            # Uses O(1 × activation) memory instead of O(N × activation).
+            # Uses O(1 x activation) memory instead of O(N x activation).
             if self._use_inplace:
                 return self._evaluate_inplace(stacked_params, inputs, targets)
 
@@ -459,30 +459,40 @@ class BatchedLinearEvaluator:
         """Build if model is compatible, else return None."""
         supported = (nn.Linear, nn.ReLU, nn.LeakyReLU, nn.Sigmoid, nn.Tanh,
                      nn.GELU, nn.SiLU, nn.Flatten, nn.Dropout)
+        # Build an ordered (name, tag, module) plan. ``module`` is None for
+        # Linear layers (handled by bmm) and the actual nn.Module for
+        # activations so evaluate() applies their EXACT semantics
+        # (LeakyReLU.negative_slope, GELU.approximate, ...) instead of
+        # hardcoded functional defaults. Unsupported -> None (vmap fallback).
+        def _entry(full, submod):
+            if isinstance(submod, nn.Linear):
+                return (full, 'linear', None)
+            # A non-default Flatten reshapes differently from the bmm path's
+            # leading flatten; defer those models to the (correct) vmap path.
+            if isinstance(submod, nn.Flatten) and (submod.start_dim, submod.end_dim) != (1, -1):
+                return None
+            if isinstance(submod, supported):
+                return (full, type(submod).__name__.lower(), submod)
+            return None
+
         layer_keys = []
         for name, mod in model.named_children():
-            if isinstance(mod, nn.Linear):
-                layer_keys.append((name, 'linear'))
-            elif isinstance(mod, nn.Sequential):
+            if isinstance(mod, nn.Sequential):
                 # Walk one level of Sequential
-                for subname, submod in mod.named_children():
-                    full = f"{name}.{subname}"
-                    if isinstance(submod, nn.Linear):
-                        layer_keys.append((full, 'linear'))
-                    elif isinstance(submod, supported):
-                        layer_keys.append((full, type(submod).__name__.lower()))
-                    else:
-                        return None  # unsupported layer
-            elif isinstance(mod, supported):
-                layer_keys.append((name, type(mod).__name__.lower()))
+                children = [(f"{name}.{sub}", m) for sub, m in mod.named_children()]
             else:
-                return None  # unsupported layer (Conv2d, etc.)
+                children = [(name, mod)]
+            for full, submod in children:
+                entry = _entry(full, submod)
+                if entry is None:
+                    return None  # unsupported layer (Conv2d, non-default Flatten, ...)
+                layer_keys.append(entry)
         if not layer_keys:
             return None
         # Verify all named parameters are covered by detected Linear layers.
         # Models with extra parameters (e.g., learned scales) need vmap.
         linear_param_keys = set()
-        for name, tag in layer_keys:
+        for name, tag, _ in layer_keys:
             if tag == 'linear':
                 linear_param_keys.add(f"{name}.weight")
                 linear_param_keys.add(f"{name}.bias")
@@ -507,29 +517,21 @@ class BatchedLinearEvaluator:
             # Flatten spatial dims for non-2D inputs
             x = inputs.reshape(inputs.shape[0], -1).unsqueeze(0).expand(N, -1, -1)
 
-        for name, tag in self._layer_keys:
+        for name, tag, module in self._layer_keys:
             if tag == 'linear':
                 w_key = f"{name}.weight"
                 b_key = f"{name}.bias"
                 W = stacked_params[w_key]  # (N, out, in)
-                # bmm: (N, out, in) @ (N, in, B)^T -> (N, B, out)
+                # bmm: (N, B, in) @ (N, in, out) -> (N, B, out)
                 x = torch.bmm(x, W.transpose(1, 2))  # (N, B, out)
                 if b_key in stacked_params:
                     x = x + stacked_params[b_key].unsqueeze(1)  # (N, 1, out) broadcast
-            elif tag == 'relu':
-                x = torch.relu(x)
-            elif tag == 'leakyrelu':
-                x = torch.nn.functional.leaky_relu(x)
-            elif tag == 'sigmoid':
-                x = torch.sigmoid(x)
-            elif tag == 'tanh':
-                x = torch.tanh(x)
-            elif tag == 'gelu':
-                x = torch.nn.functional.gelu(x)
-            elif tag == 'silu':
-                x = torch.nn.functional.silu(x)
             elif tag in ('flatten', 'dropout'):
-                pass  # already flat / eval mode = identity
+                pass  # input is pre-flattened; dropout is identity in eval mode
+            else:
+                # Activation: apply the real module so its configuration
+                # (LeakyReLU negative_slope, GELU approximate, ...) is exact.
+                x = module(x)
 
         # x: (N, B, out_features) - compute per-config loss
         if targets is not None:

@@ -18,6 +18,11 @@ Based on the Sinkhorn Step algorithm ([Le et al., NeurIPS 2023](https://arxiv.or
 3. **Compute** softmax weights over the cost matrix.
 4. **Update** the parameters by barycentric projection from the weighted vertices.
 
+<p align="center">
+  <img src="docs/figures/method_diagram.png" width="840"
+       alt="One PolyStep: subspace projection, polytope probes, cost matrix, soft entropic-OT assignment, and barycentric projection -- plus the softmax-to-full-OT solver continuum.">
+</p>
+
 ## Installation
 
 ```bash
@@ -79,6 +84,13 @@ train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=
 
 See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST, and a Loihi 2 on-chip adaptation skeleton.
 
+<table>
+  <tr>
+    <td align="center"><img src="docs/figures/polystep_snn_progress.gif" width="330"><br><sub>Spiking net (hard LIF thresholds) trained with forward passes only</sub></td>
+    <td align="center"><img src="docs/figures/rl_cartpole_policy.gif" width="330"><br><sub>CartPole policy search - no value function, no gradients</sub></td>
+  </tr>
+</table>
+
 ## When to use PolyStep
 
 PolyStep is designed for models where gradients are **unavailable or unreliable**:
@@ -118,8 +130,8 @@ If your model is fully differentiable, Adam/SGD will be faster and more accurate
 
 | Timesteps | PolyStep | BPTT (surrogate) | Savings |
 |-----------|---------|------------------|---------|
-| T=25 | 31.8 MB | 132 MB | 4.2× |
-| T=400 | 51.6 MB | 1,538 MB | **29.8×** |
+| T=25 | 31.8 MB | 132 MB | 4.2x |
+| T=400 | 51.6 MB | 1,538 MB | **29.8x** |
 
 Across the non-differentiable tasks PolyStep wins by 10-60+ points against the other gradient-free baselines. The domain-specialized probSAT solver reaches roughly 99.6% on MAX-SAT at 100K variables (and around 98.9% at 1M variables) -- PolyStep is the strongest general-purpose gradient-free optimizer at the configurations we tested.
 
@@ -130,7 +142,7 @@ Across the non-differentiable tasks PolyStep wins by 10-60+ points against the o
 - **Block-wise OT** for per-layer decomposition.
 - **`torch.compile`** opt-in on hot paths.
 - **Vmap-safe layers**: drop-in attention and LSTM that play nicely with `torch.vmap`.
-- **Sub-linear memory**: forward-only evaluation, no BPTT activation tape (~30× savings at long SNN horizons).
+- **Sub-linear memory**: forward-only evaluation, no BPTT activation tape (~30x savings at long SNN horizons).
 - **CMA-ES inspired adaptation** of subspace rotations.
 - **MLP fast path** using batched `torch.bmm` instead of vmap for pure-MLP models.
 
@@ -138,7 +150,7 @@ Across the non-differentiable tasks PolyStep wins by 10-60+ points against the o
 
 - **Compute cost.** Roughly tens of millions of forward passes (on the SNN benchmark, around 30M) vs. tens of thousands of Adam gradient steps for the same MNIST accuracy. This is inherent to zeroth-order methods.
 - **High-dimensional NLP.** Near-random accuracy on SST-2 (4.2M parameters trained from scratch). Gradient-free methods do not scale to this regime in our experiments.
-- **Adam baseline.** On the SNN benchmark, Adam reaches around 78% test accuracy (`experiments/results/softmax/main/snn_adam_*.json`) vs. PolyStep's 93.4%. The surrogate-gradient baseline (paper §5.3) is not bundled with this release — see the arXiv preprint for the comparison.
+- **Adam baseline.** On the SNN benchmark, Adam reaches around 78% test accuracy (`experiments/results/softmax/main/snn_adam_*.json`) vs. PolyStep's 93.4%. The surrogate-gradient baseline (paper §5.3) is not bundled with this release - see the arXiv preprint for the comparison.
 
 See [`LIMITATIONS.md`](LIMITATIONS.md) for the full discussion.
 

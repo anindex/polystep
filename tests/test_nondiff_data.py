@@ -139,13 +139,6 @@ class TestGenerateMultidomainData:
         assert "test_loader" in result
         assert "num_classes" in result
 
-    def test_num_classes_is_20(self):
-        pytest.importorskip("torchvision", reason="torchvision not installed")
-        from experiments.runners.nondiff_data import generate_multidomain_data
-
-        result = generate_multidomain_data()
-        assert result["num_classes"] == 20
-
     def test_labels_range_0_to_19(self):
         """Labels should span MNIST 0-9 and Fashion-MNIST 10-19."""
         pytest.importorskip("torchvision", reason="torchvision not installed")

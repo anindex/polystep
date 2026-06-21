@@ -335,11 +335,18 @@ class TestCombinedModeStep:
             assert f is None
             assert g is None
 
-        optimizer.step(simple_closure)
+        loss = optimizer.step(simple_closure)
 
-        # After step, should have values (unless rotation reset them)
-        # Due to rotation, they might be reset to None, so we check they exist
-        assert optimizer._state.block_duals is not None
+        # The step must complete with a finite cost and keep block_duals a
+        # well-formed per-block list: one (f, g) slot per block, each either
+        # unset or a finite tensor pair. (The default subspace solver is
+        # softmax, which has no duals, so the prior `is not None` was vacuous.)
+        assert torch.isfinite(torch.tensor(loss))
+        assert len(optimizer._state.block_duals) == len(optimizer._subspace_blocks)
+        for f, g in optimizer._state.block_duals:
+            assert (f is None) == (g is None)
+            if f is not None:
+                assert torch.isfinite(f).all() and torch.isfinite(g).all()
 
 
 # ------------------------------------------------------------------
@@ -368,15 +375,20 @@ class TestSynchronizedAbsorb:
             **_FAST_OPT_KWARGS,
         )
 
-        # Run steps until absorb triggers
+        base_before = {k: v.clone() for k, v in optimizer._state.base_params.items()}
+
+        # Periodic absorb (interval=3) must actually fire within 4 steps.
         for _ in range(4):
             optimizer.step(simple_closure)
 
-        # Check absorb count increased
-        if optimizer._state.absorb_count > 0:
-            # After absorb, X should be zeros
-            # Note: the next step might have already started, so check absorb_count
-            assert optimizer._state.absorb_count >= 1
+        assert optimizer._state.absorb_count >= 1, "periodic absorb never triggered"
+        # Absorb folds the accumulated perturbation into the base weights, so at
+        # least one base tensor must change (the prior if-guard made this vacuous).
+        changed = any(
+            not torch.allclose(base_before[k], v)
+            for k, v in optimizer._state.base_params.items()
+        )
+        assert changed, "absorb did not fold the perturbation into base params"
 
     def test_absorb_rotates_projection(self, simple_model, simple_closure):
         """Test that absorb rotates the global projection matrix."""

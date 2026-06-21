@@ -82,13 +82,15 @@ class TestQuantizedLinear:
         assert out.shape == (2, 32)
 
     def test_weights_are_int8_rounded(self):
-        """Internal effective weights should be int8-quantized."""
-        ql = QuantizedLinear(16, 32, scale=0.01)
-        w_q = torch.clamp(torch.round(ql.weight / ql.scale), -128, 127) * ql.scale
-        # Check that quantized weights differ from raw weights (unless already quantized)
-        # The key property: w_q values are multiples of scale
-        remainder = (w_q / ql.scale) - torch.round(w_q / ql.scale)
-        assert remainder.abs().max() < 1e-5
+        """forward() must apply int8 round-quantization to the weights it uses."""
+        ql = QuantizedLinear(2, 1, scale=0.5)
+        with torch.no_grad():
+            ql.weight.copy_(torch.tensor([[0.4, -0.8]]))  # /0.5=[0.8,-1.6]->round[1,-2]->*0.5=[0.5,-1.0]
+            ql.bias.zero_()
+        x = torch.tensor([[1.0, 1.0]])
+        out = ql(x)
+        assert torch.allclose(out, torch.tensor([[-0.5]]), atol=1e-6)  # uses quantized weights
+        assert not torch.allclose(out, x @ ql.weight.t(), atol=1e-3)   # not the raw linear (-0.4)
 
 
 class TestBinaryLinear:
@@ -99,14 +101,15 @@ class TestBinaryLinear:
         assert out.shape == (2, 32)
 
     def test_effective_weights_binary(self):
-        """Effective weights in forward pass should be in {-1, +1}."""
-        bl = BinaryLinear(16, 32)
-        w_b = torch.sign(bl.weight)
-        unique_vals = w_b.unique()
-        for v in unique_vals:
-            assert v.item() in (-1.0, 0.0, 1.0), f"Binary weight {v.item()} unexpected"
-        # With randn init, we expect mostly -1 and +1 (0 is extremely rare)
-        assert (w_b.abs() > 0).float().mean() > 0.99
+        """forward() must binarize weights to {-1, +1} via sign()."""
+        bl = BinaryLinear(2, 1)
+        with torch.no_grad():
+            bl.weight.copy_(torch.tensor([[0.3, -0.7]]))  # sign -> [+1, -1]
+            bl.bias.zero_()
+        x = torch.tensor([[2.0, 5.0]])
+        out = bl(x)
+        assert torch.allclose(out, torch.tensor([[-3.0]]))           # 2*(+1) + 5*(-1)
+        assert not torch.allclose(out, x @ bl.weight.t())            # not the raw linear (-2.9)
 
 
 class TestTernaryLinear:
@@ -117,12 +120,15 @@ class TestTernaryLinear:
         assert out.shape == (2, 32)
 
     def test_effective_weights_ternary(self):
-        """Effective weights should be in {-1, 0, +1}."""
-        tl = TernaryLinear(16, 32, threshold=0.5)
-        w_t = torch.sign(tl.weight) * (tl.weight.abs() >= 0.5).float()
-        unique_vals = w_t.unique()
-        for v in unique_vals:
-            assert v.item() in (-1.0, 0.0, 1.0), f"Ternary weight {v.item()} unexpected"
+        """forward() must ternarize weights to {-1, 0, +1} using the threshold."""
+        tl = TernaryLinear(3, 1, threshold=0.5)
+        with torch.no_grad():
+            tl.weight.copy_(torch.tensor([[0.9, -0.1, 0.6]]))  # |.|>=0.5 -> [+1, 0, +1]
+            tl.bias.zero_()
+        x = torch.tensor([[1.0, 1.0, 1.0]])
+        out = tl(x)
+        assert torch.allclose(out, torch.tensor([[2.0]]))           # +1 + 0 + +1
+        assert not torch.allclose(out, x @ tl.weight.t())           # not the raw linear (1.4)
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +210,18 @@ class TestBinaryConv2d:
         assert out.shape == (2, 16, 8, 8)
 
     def test_weights_are_binary(self):
-        layer = BinaryConv2d(3, 16, 3, padding=1)
+        """forward() must convolve with sign-binarized weights, not the raw ones."""
+        layer = BinaryConv2d(1, 1, 1, padding=0)  # 1x1 conv -> per-pixel scale by the (binarized) weight
+        x = torch.randn(1, 1, 4, 4)
         with torch.no_grad():
-            w_b = torch.sign(layer.weight)
-        unique_vals = w_b.unique()
-        for v in unique_vals:
-            assert v.item() in (-1.0, 0.0, 1.0), f"Binary weight {v.item()} unexpected"
+            layer.bias.zero_()
+            layer.weight.copy_(torch.tensor([[[[0.3]]]]))   # sign -> +1
+        assert torch.allclose(layer(x), x, atol=1e-6)        # +1 -> identity
+        with torch.no_grad():
+            layer.weight.copy_(torch.tensor([[[[-0.2]]]]))  # sign -> -1
+        out = layer(x)
+        assert torch.allclose(out, -x, atol=1e-6)            # -1 -> negate
+        assert not torch.allclose(out, -0.2 * x, atol=1e-3)  # not the raw (-0.2) conv
 
 
 class TestBinaryConv2dSTE:
@@ -320,13 +332,19 @@ class TestHardMoELayer:
         out = moe(x)
         assert out.shape == (2, 64)
 
-    def test_all_experts_evaluated(self):
-        """HardMoELayer must evaluate ALL experts (vmap-safe pattern)."""
-        import inspect
-        source = inspect.getsource(HardMoELayer.forward)
-        assert "torch.stack" in source or "stack" in source, (
-            "HardMoELayer.forward should use torch.stack to evaluate all experts"
-        )
+    def test_hard_routing_selects_argmax_expert(self):
+        """forward() must return the argmax-gated expert's output (hard top-1),
+        not a soft average of the experts."""
+        torch.manual_seed(0)
+        moe = HardMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
+        x = torch.randn(5, 8)
+        out = moe(x)
+        gate_idx = moe.gate(x).argmax(dim=-1)
+        for i in range(x.shape[0]):
+            selected = moe.experts[int(gate_idx[i])](x[i:i + 1])[0]
+            assert torch.allclose(out[i], selected, atol=1e-5)
+        avg = torch.stack([e(x) for e in moe.experts], dim=1).mean(dim=1)
+        assert not torch.allclose(out, avg, atol=1e-4)  # genuinely hard, not averaging
 
 
 # ---------------------------------------------------------------------------
@@ -409,12 +427,18 @@ class TestSoftMoELayer:
         assert moe.gate.weight.grad is not None
         assert moe.gate.weight.grad.shape == (4, 32)
 
-    def test_softmax_not_argmax(self):
-        """SoftMoELayer must use softmax, not argmax."""
-        import inspect
-        source = inspect.getsource(SoftMoELayer.forward)
-        assert "softmax" in source, "SoftMoELayer.forward should use F.softmax"
-        assert "argmax" not in source, "SoftMoELayer.forward should NOT use argmax"
+    def test_soft_routing_is_softmax_weighted(self):
+        """forward() must return the softmax-weighted expert mix, not hard top-1."""
+        torch.manual_seed(0)
+        moe = SoftMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
+        x = torch.randn(5, 8)
+        out = moe(x)
+        weights = torch.softmax(moe.gate(x), dim=-1)
+        all_out = torch.stack([e(x) for e in moe.experts], dim=1)
+        expected = (all_out * weights.unsqueeze(-1)).sum(dim=1)
+        assert torch.allclose(out, expected, atol=1e-5)           # soft-weighted mix
+        hard = all_out[torch.arange(5), moe.gate(x).argmax(dim=-1)]
+        assert not torch.allclose(out, hard, atol=1e-4)           # not hard argmax
 
 
 class TestSoftMoENet:

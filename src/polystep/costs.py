@@ -3,6 +3,7 @@
 Wraps an objective function into a cost matrix by evaluating it at
 probe points and averaging over the probe dimension.
 """
+import math
 from typing import Callable, Optional, Union
 
 import torch
@@ -73,7 +74,12 @@ def scale_cost_matrix(
         s = torch.clamp(cost_matrix.abs().max(), min=1e-10)
         return cost_matrix / s
     elif isinstance(scale_cost, (int, float)):
-        return cost_matrix / float(scale_cost)
+        s = float(scale_cost)
+        if not math.isfinite(s) or s == 0.0:
+            raise ValueError(
+                f"Numeric scale_cost must be finite and non-zero, got {scale_cost!r}."
+            )
+        return cost_matrix / s
     else:
         raise ValueError(
             f"Unknown scale_cost: {scale_cost!r}. Expected 'mean', 'max_cost', or a float."

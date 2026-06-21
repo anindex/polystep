@@ -16,11 +16,11 @@ Differences from :class:`LinearSubspace`:
 
 Rotation modes:
 
-- ``'random'`` — fresh QR-orthogonal basis every call.
-- ``'displacement'`` — SVD of recent displacements keeps productive
+- ``'random'`` - fresh QR-orthogonal basis every call.
+- ``'displacement'`` - SVD of recent displacements keeps productive
   directions; the SVD share grows linearly from ``svd_ratio_init`` to
   ``svd_ratio_final`` over the schedule.
-- ``'ot_bias'`` — biases a fraction of columns toward high-transport
+- ``'ot_bias'`` - biases a fraction of columns toward high-transport
   directions extracted from the OT plan (falls back to random when the
   full-dim layout doesn't match the particle layout).
 

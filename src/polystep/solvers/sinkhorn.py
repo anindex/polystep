@@ -1,7 +1,8 @@
-"""Unified Sinkhorn solver for entropic optimal transport.
+"""Log-domain Sinkhorn solver for entropic optimal transport.
 
-Implements full-rank log-domain Sinkhorn with optional low-rank cost approximation
-via randomized SVD, and auto-selection based on problem size.
+PolyStep's OT problems are (n particles x m=V polytope vertices) with V small
+(2*particle_dim), so the cost is O(n*V) -- a full-rank log-domain solve is
+already optimal and there is no large dense kernel to approximate away.
 """
 import functools
 import warnings
@@ -11,6 +12,7 @@ from typing import List, Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
+from ._prelude import align_dual, align_marginal, sanitize_cost, validate_positive
 
 
 @dataclass
@@ -38,37 +40,22 @@ class SinkhornResult:
 
     # Internal fields for lazy .matrix computation
     _eps: float = float('nan')
-    _cost_matrix: Optional[torch.Tensor] = None  # Full-rank: (n, m)
-    _Q: Optional[torch.Tensor] = None             # Low-rank: (n, r)
-    _R: Optional[torch.Tensor] = None             # Low-rank: (m, r)
-    _g_lr: Optional[torch.Tensor] = None           # Low-rank: (r,)
+    _cost_matrix: Optional[torch.Tensor] = None  # (n, m)
 
     @functools.cached_property
     def matrix(self) -> torch.Tensor:
-        """Compute the transport matrix lazily.
-
-        Full-rank: P_ij = exp((f_i + g_j - C_ij) / eps)
-        Low-rank:  P = Q @ diag(1/g_lr) @ R^T
-        """
-        if self._Q is not None:
-            # Low-rank mode - guard against division by zero
-            # Note: SVD truncation may introduce small negative entries (~1e-3).
-            # These are negligible and clamping would break marginal constraints.
-            g_lr_safe = torch.clamp(self._g_lr, min=1e-10)
-            return self._Q @ torch.diag(1.0 / g_lr_safe) @ self._R.T
-        else:
-            # Full-rank mode
-            log_P = (
-                self.f.unsqueeze(1) / self._eps
-                + self.g.unsqueeze(0) / self._eps
-                - self._cost_matrix / self._eps
-            )
-            return torch.exp(log_P)
+        """Transport plan, computed lazily: P_ij = exp((f_i + g_j - C_ij) / eps)."""
+        log_P = (
+            self.f.unsqueeze(1) / self._eps
+            + self.g.unsqueeze(0) / self._eps
+            - self._cost_matrix / self._eps
+        )
+        return torch.exp(log_P)
 
 
 @dataclass
 class SinkhornSolver:
-    """Unified Sinkhorn solver with full-rank and low-rank modes.
+    """Full-rank log-domain Sinkhorn solver for entropic optimal transport.
 
     Solves the entropic optimal transport problem by alternating row and
     column scaling in log domain. The entropic regularization parameter
@@ -87,9 +74,6 @@ class SinkhornSolver:
         threshold: Convergence threshold on marginal error.
             Set <= 0 for fixed-iteration mode (no early stopping).
         check_every: Check convergence every N iterations.
-        rank: None for full-rank (with auto-selection), or int for low-rank.
-        gamma: Mirror descent step size inverse for low-rank mode.
-        auto_rank_threshold: Total particles (n+m) above which auto-selects low-rank.
         compile: Whether to use torch.compile for hot paths (requires CUDA).
     """
 
@@ -97,9 +81,6 @@ class SinkhornSolver:
     max_iterations: int = 2000
     threshold: float = 1e-6
     check_every: int = 10
-    rank: Optional[int] = None
-    gamma: float = 10.0
-    auto_rank_threshold: int = 50_000
     compile: bool = False
     omega: float = 1.0
     anderson_depth: int = 0         # 0 = disabled, >0 = ring buffer depth for Anderson acceleration
@@ -119,6 +100,11 @@ class SinkhornSolver:
                 f"Values < 0.5 cause divergence; values > 1.95 are numerically unstable. "
                 f"Recommended range: [1.0, 1.8] for acceleration."
             )
+        if self.check_every < 1:
+            raise ValueError(
+                f"check_every must be >= 1, got {self.check_every}. "
+                f"It is the modulus for periodic convergence checks."
+            )
 
         from .._compiled import CompiledFunctions
 
@@ -135,7 +121,6 @@ class SinkhornSolver:
         init_g: Optional[torch.Tensor] = None,
         scale_cost: Optional[Union[str, float]] = None,
         init_eps: Optional[float] = None,
-        seed: Optional[int] = None,
     ) -> SinkhornResult:
         """Solve entropic OT problem.
 
@@ -148,58 +133,31 @@ class SinkhornSolver:
             b: Target marginal of shape (m,). Defaults to uniform 1/m.
             init_f: Warm-start first dual potential of shape (n,).
             init_g: Warm-start second dual potential of shape (m,).
-            scale_cost: Cost scaling: 'mean', 'max_cost', or float divisor.
+            scale_cost: Cost scaling: 'mean', 'max_cost', float, or None.
             init_eps: Epsilon under which ``init_f`` / ``init_g`` were
                 computed by a previous solve. When provided and different
                 from ``self.epsilon``, the duals are rescaled by
-                ``self.epsilon / init_eps``; the cost-units potential
-                ``f = eps * u`` (with ``u`` in log-units), so a fixed
-                ``u`` corresponds to a rescaled ``f`` of
-                ``(eps_new / eps_old) * f_old``. Without this rescale,
-                warm-starting across an epsilon schedule inflates the
-                iteration count by 5-10x.
-            seed: Optional seed for randomized SVD in low-rank mode.
-                When None, defaults to 0 for backward compatibility.
+                ``self.epsilon / init_eps`` (holding the log-domain scaling
+                ``u = f / eps`` fixed). This is a numerical *heuristic*, not
+                an exact warm start -- entropic cost-unit potentials are not
+                homogeneous in epsilon. Benchmarks
+                (``experiments/scripts/bench_eps_rescale.py``) show it is
+                ~neutral for well-scaled costs and modestly reduces
+                non-converged solves in the large-cost / small-epsilon
+                regime, where un-rescaled duals risk ``exp`` overflow.
 
         Returns:
             SinkhornResult with dual potentials and transport plan access.
         """
-        n, m = cost_matrix.shape
-
-        # Auto-selection: switch to low-rank for large problems
-        rank = self.rank
-        if rank is None and (n + m) > self.auto_rank_threshold:
-            rank = min(n, m) // 2
-
-        if rank is not None:
-            if self.anderson_depth > 0:
-                warnings.warn(
-                    "anderson_depth > 0 has no effect in low-rank mode. "
-                    "Anderson acceleration is only supported in full-rank "
-                    "convergence-checking mode.",
-                    stacklevel=2,
-                )
-            if self.adaptive_omega:
-                warnings.warn(
-                    "adaptive_omega=True has no effect in low-rank mode. "
-                    "Adaptive omega is only supported in full-rank "
-                    "convergence-checking mode.",
-                    stacklevel=2,
-                )
-            if init_f is not None or init_g is not None:
-                warnings.warn(
-                    "init_f/init_g warm-start potentials are ignored in "
-                    "low-rank mode. Low-rank Sinkhorn always starts from "
-                    "zeros (or data-dependent init).",
-                    stacklevel=2,
-                )
-            return self._solve_low_rank(
-                cost_matrix, a, b, rank, scale_cost, seed=seed,
-            )
-        else:
-            return self._solve_full_rank(
-                cost_matrix, a, b, init_f, init_g, scale_cost, init_eps,
-            )
+        # Schedules mutate ``self.epsilon`` per step, so re-validate here (a
+        # plain float check, no host sync) rather than only at construction.
+        validate_positive(
+            self.epsilon, "epsilon",
+            "A zero/negative epsilon divides by zero in log-domain Sinkhorn.",
+        )
+        return self._solve_full_rank(
+            cost_matrix, a, b, init_f, init_g, scale_cost, init_eps,
+        )
 
     def _solve_full_rank(
         self,
@@ -212,39 +170,14 @@ class SinkhornSolver:
         init_eps: Optional[float] = None,
     ) -> SinkhornResult:
         """Full-rank log-domain Sinkhorn iterations."""
-        # log-sum-exp needs FP32 mantissa precision: BF16's 7 mantissa
-        # bits collapse the row-max-subtract trick once the cost spread
-        # exceeds ~15 nats. Promote half-precision inputs and run the
-        # iteration inside an autocast-disabled region (see below) so
-        # an outer mixed-precision context can't undo the promotion.
-        if cost_matrix.dtype in (torch.bfloat16, torch.float16):
-            cost_matrix = cost_matrix.to(torch.float32)
+        # Shared prelude: FP32 promotion (BF16's 7 mantissa bits collapse the
+        # log-sum-exp row-max trick past ~15 nats) + device-side non-finite
+        # cost handling (no host sync), then device/dtype-aligned marginals.
+        cost_matrix = sanitize_cost(cost_matrix)
         n, m = cost_matrix.shape
-        device = cost_matrix.device
-        dtype = cost_matrix.dtype
-
-        # Default uniform marginals
-        if a is None:
-            a = torch.ones(n, device=device, dtype=dtype) / n
-        if b is None:
-            b = torch.ones(m, device=device, dtype=dtype) / m
-
-        # Validate cost matrix is finite (NaN/Inf in cost propagates silently
-        # through log_K and all iterations; catching it here gives a clear error).
-        if not torch.isfinite(cost_matrix).all():
-            n_bad = (~torch.isfinite(cost_matrix)).sum().item()
-            warnings.warn(
-                f"Cost matrix has {n_bad} non-finite entries. "
-                "Replacing with max finite value + 1 penalty.",
-                stacklevel=2,
-            )
-            finite_mask = torch.isfinite(cost_matrix)
-            if finite_mask.any():
-                penalty = cost_matrix[finite_mask].abs().max().item() * 2.0 + 1.0
-            else:
-                penalty = 1e6
-            cost_matrix = torch.where(finite_mask, cost_matrix,
-                                      torch.full_like(cost_matrix, penalty))
+        device, dtype = cost_matrix.device, cost_matrix.dtype
+        a = align_marginal(a, n, device, dtype, "a")
+        b = align_marginal(b, m, device, dtype, "b")
 
         # Scale cost matrix (division creates a new tensor; no clone needed)
         cost_matrix = scale_cost_matrix(cost_matrix, scale_cost)
@@ -263,26 +196,14 @@ class SinkhornSolver:
             f = -cost_matrix.mean(dim=1)
             g = -cost_matrix.mean(dim=0)
         else:
-            f = torch.zeros(n, device=device, dtype=dtype)
-            g = torch.zeros(m, device=device, dtype=dtype)
-            if init_f is not None:
-                if init_f.shape == (n,):
-                    f = init_f.clone()
-                else:
-                    warnings.warn(
-                        f"warm-start init_f shape mismatch: expected ({n},), "
-                        f"got {tuple(init_f.shape)}. Falling back to zeros.",
-                        stacklevel=2,
-                    )
-            if init_g is not None:
-                if init_g.shape == (m,):
-                    g = init_g.clone()
-                else:
-                    warnings.warn(
-                        f"warm-start init_g shape mismatch: expected ({m},), "
-                        f"got {tuple(init_g.shape)}. Falling back to zeros.",
-                        stacklevel=2,
-                    )
+            # align_dual moves the warm start onto (device, dtype) and clones
+            # it; it returns None on a shape mismatch -> fall back to zeros.
+            f = align_dual(init_f, n, device, dtype, "init_f")
+            g = align_dual(init_g, m, device, dtype, "init_g")
+            if f is None:
+                f = torch.zeros(n, device=device, dtype=dtype)
+            if g is None:
+                g = torch.zeros(m, device=device, dtype=dtype)
 
         # Validate warm-started dual potentials. Dual potentials scale
         # with the cost matrix magnitude, not epsilon. ``cost_scale`` is
@@ -305,12 +226,15 @@ class SinkhornSolver:
                 f = f * scale_factor
                 g = g * scale_factor
 
-        # Re-center so ``|f|, |g|`` stay bounded under repeated solves
-        # where the cost matrix mean drifts. The entropic OT problem is
-        # invariant to ``f -> f + c, g -> g - c``; without this drift,
-        # warm-started duals can grow unboundedly across a long schedule.
-        f = f - f.mean()
-        g = g - g.mean()
+        # Re-center using the only valid dual gauge ``f -> f + c, g -> g - c``,
+        # which leaves ``f_i + g_j`` (and hence the plan ``P``) unchanged. The
+        # half-difference shift balances the two potentials' magnitudes so the
+        # warm-start clamp above keeps them bounded across a long schedule.
+        # NB: independent mean subtraction (``f -= f.mean(); g -= g.mean()``)
+        # is NOT a valid gauge and perturbs the iterate under overrelaxation.
+        c = 0.5 * (g.mean() - f.mean())
+        f = f + c
+        g = g - c
 
         # Determine if we should check convergence
         fixed_mode = self.threshold <= 0
@@ -527,143 +451,3 @@ class SinkhornSolver:
             _cost_matrix=cost_matrix,
         )
         return result
-
-    def _solve_low_rank(
-        self,
-        cost_matrix: torch.Tensor,
-        a: Optional[torch.Tensor],
-        b: Optional[torch.Tensor],
-        rank: int,
-        scale_cost: Optional[Union[str, float]],
-        seed: Optional[int] = None,
-    ) -> SinkhornResult:
-        """Low-rank Sinkhorn solver for large-scale OT problems.
-
-        Approximates the cost matrix via randomized SVD to rank r, then runs
-        standard log-domain Sinkhorn on the approximation. The transport plan
-        is computed from dual potentials via P_ij = exp((f_i + g_j - C_ij) / eps).
-
-        Note: The cost matrix approximation reduces rank, but the Sinkhorn
-        iterations still materialize full O(nm) log-kernel matrices. A warning
-        is emitted when the estimated memory exceeds 2GB.
-
-        Args:
-            seed: Optional seed for the randomized SVD. When None, defaults
-                to 0 for backward compatibility.
-        """
-        n, m = cost_matrix.shape
-        device = cost_matrix.device
-        dtype = cost_matrix.dtype
-        eps = self.epsilon
-
-        rank = min(rank, n, m)
-
-        # Warn if materializing full O(nm) matrices would use excessive memory
-        estimated_bytes = n * m * 4 * 4  # 4 copies (log_K, log_P, etc.), float32
-        if estimated_bytes > 2e9:  # 2GB threshold
-            warnings.warn(
-                f"Low-rank Sinkhorn will materialize ~{estimated_bytes / 1e9:.1f}GB "
-                f"of dense matrices for n={n}, m={m}. Consider reducing problem size.",
-                stacklevel=2,
-            )
-
-        if a is None:
-            a = torch.ones(n, device=device, dtype=dtype) / n
-        if b is None:
-            b = torch.ones(m, device=device, dtype=dtype) / m
-
-        cost_matrix = scale_cost_matrix(cost_matrix, scale_cost)
-        fixed_mode = self.threshold <= 0
-        omega = self.omega
-
-        # Randomized SVD approximation of cost matrix: C ~ L @ M^T
-        gen = torch.Generator(device=device)
-        gen.manual_seed(seed if seed is not None else 0)
-        Omega = torch.randn(m, rank, device=device, dtype=dtype, generator=gen)
-        Y = cost_matrix @ Omega                                  # (n, rank)
-        Q_orth, _ = torch.linalg.qr(Y)                          # (n, rank)
-        B_proj = Q_orth.T @ cost_matrix                          # (rank, m)
-        U_s, S_s, Vt_s = torch.linalg.svd(B_proj, full_matrices=False)
-        sqrt_S = torch.sqrt(torch.clamp(S_s[:rank], min=1e-30))
-        L = Q_orth @ U_s[:, :rank] * sqrt_S.unsqueeze(0)        # (n, rank)
-        M = Vt_s[:rank].T * sqrt_S.unsqueeze(0)                 # (m, rank)
-        cost_approx = L @ M.T                                    # (n, m)
-
-        # Standard log-domain Sinkhorn on the approximated cost
-        log_K = -cost_approx / eps
-        log_a = torch.log(torch.clamp(a, min=1e-30))
-        log_b = torch.log(torch.clamp(b, min=1e-30))
-
-        # Data-dependent initialization: low-rank path has no warm-start
-        if self.data_dependent_init:
-            f = -cost_approx.mean(dim=1)
-            g = -cost_approx.mean(dim=0)
-        else:
-            f = torch.zeros(n, device=device, dtype=dtype)
-            g = torch.zeros(m, device=device, dtype=dtype)
-
-        converged = False
-        n_iters = 0
-        errors: List[float] = []
-
-        with torch.no_grad(), \
-                torch.amp.autocast("cuda", enabled=False), \
-                torch.amp.autocast("cpu", enabled=False):
-            if fixed_mode:
-                # Fixed-iteration path: compiled body with post-loop NaN check
-                sinkhorn_iter = self._compiled.sinkhorn_iter
-                for i in range(self.max_iterations):
-                    f, g = sinkhorn_iter(f, g, log_K, log_a, log_b, eps, omega)
-                    n_iters = i + 1
-                if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
-                    f.zero_()
-                    g.zero_()
-            else:
-                # Convergence-checking path: stays fully eager with overrelaxation
-                for i in range(self.max_iterations):
-                    f_target = eps * (log_a - torch.logsumexp(log_K + g.unsqueeze(0) / eps, dim=1))
-                    f = (1 - omega) * f + omega * f_target
-                    g_target = eps * (log_b - torch.logsumexp(log_K + f.unsqueeze(1) / eps, dim=0))
-                    g = (1 - omega) * g + omega * g_target
-
-                    n_iters = i + 1
-
-                    if (i + 1) % self.check_every == 0:
-                        # NaN/Inf check (batched with convergence check to minimize GPU syncs)
-                        if (torch.isnan(f).any() or torch.isinf(f).any()
-                                or torch.isnan(g).any() or torch.isinf(g).any()):
-                            f.zero_()
-                            g.zero_()
-                            break
-
-                        log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
-                        marginal_a_hat = torch.exp(torch.logsumexp(log_P_row, dim=1))
-                        marginal_b_hat = torch.exp(torch.logsumexp(log_P_row, dim=0))
-                        # One host transfer for both marginal errors.
-                        err_a, err_b = torch.stack([
-                            torch.max(torch.abs(marginal_a_hat - a)),
-                            torch.max(torch.abs(marginal_b_hat - b)),
-                        ]).tolist()
-                        err = max(err_a, err_b)
-                        errors.append(err)
-                        if err < self.threshold:
-                            converged = True
-                            break
-
-        # Entropic regularized cost: <f, a> + <g, b>. One host transfer.
-        ent_reg_cost = torch.stack([(f * a).sum(), (g * b).sum()]).sum().item()
-
-        # Store transport plan via dual potentials + approximated cost matrix.
-        # The .matrix property computes P_ij = exp((f_i + g_j - C_ij) / eps)
-        # directly, avoiding an extra O(nm) SVD that would not improve accuracy
-        # (since g_lr = ones makes Q @ diag(1/g_lr) @ R^T = Q @ R^T anyway).
-        return SinkhornResult(
-            f=f,
-            g=g,
-            converged=converged,
-            n_iters=n_iters,
-            ent_reg_cost=ent_reg_cost,
-            errors=errors if errors else None,
-            _eps=eps,
-            _cost_matrix=cost_approx,
-        )

@@ -214,7 +214,6 @@ class PolyStepOptimizer:
         adaptive_probes_threshold: Displacement squared norm below which a
             particle is considered stagnant (default ``1e-6``).
         max_iterations: Maximum outer iterations (for momentum warmup schedule).
-        rank: Sinkhorn rank (None=full-rank with auto-selection, int=low-rank).
         sinkhorn_max_iters: Maximum inner Sinkhorn iterations.
         chunk_size: Chunk size for cost evaluation memory control.
         cost_batch_size: Optional mini-batch size for cost matrix evaluation.
@@ -315,7 +314,6 @@ class PolyStepOptimizer:
         adaptive_probes: bool = False,
         adaptive_probes_threshold: float = 1e-6,
         max_iterations: int = 50,
-        rank: Optional[int] = None,
         sinkhorn_max_iters: int = 2000,
         chunk_size: Optional[int] = None,
         # Micro-batch cost evaluation: subsample training batch for cost matrix
@@ -457,6 +455,12 @@ class PolyStepOptimizer:
                 f"Values >= 1 risk negative effective probe radius."
             )
         self.probe_radius_jitter = probe_radius_jitter
+        if num_probe < 1:
+            raise ValueError(
+                f"num_probe must be >= 1, got {num_probe}. "
+                f"At least one probe point per direction is required; "
+                f"num_probe=0 yields an empty probe tensor and NaN costs."
+            )
         self.num_probe = num_probe
         self.adaptive_num_probe = adaptive_num_probe
         self._adaptive_probe_warmup = adaptive_probe_warmup
@@ -702,7 +706,6 @@ class PolyStepOptimizer:
         elif solver == 'sinkhorn':
             self.solver = SinkhornSolver(
                 max_iterations=sinkhorn_max_iters,
-                rank=rank,
                 compile=compile,
                 anderson_depth=anderson_depth,
                 adaptive_omega=adaptive_omega,
@@ -729,9 +732,10 @@ class PolyStepOptimizer:
                 "Use LinearEpsilon or CosineEpsilon with non-iterative solvers."
             )
 
-        # Fused softmax fast path flag
+        # Fused softmax fast path flag. Cost scaling for the fused path is
+        # applied via scale_cost_matrix(...) in the step functions (honoring
+        # every scale_cost mode), so the compiled kernel does no scaling.
         self._use_fused_softmax = isinstance(self.solver, SoftmaxSolver)
-        self._scale_cost_is_mean = (self.scale_cost == 'mean' or self.scale_cost is None)
 
         # Compiled functions
         self._compiled = CompiledFunctions(
@@ -1058,8 +1062,8 @@ class PolyStepOptimizer:
         ``evaluator.evaluate_subspace_inplace()`` directly, which
         reconstructs weights one-at-a-time via in-place swap.
 
-        This reduces memory from O(N × model_params + N × activation) to
-        O(model_params + 1 × activation), enabling training of larger models.
+        This reduces memory from O(N x model_params + N x activation) to
+        O(model_params + 1 x activation), enabling training of larger models.
 
         Call this before each ``step()`` with the current mini-batch data.
         The fused path is only used when the evaluator has ``_use_inplace=True``

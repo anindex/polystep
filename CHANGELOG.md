@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.0 - 2026-06-21
+
+### Added
+
+- `solvers/_prelude.py`: one shared solver preamble (FP32 promotion, device-side
+  non-finite cost sanitization, device/dtype-aligned marginals and warm-start
+  duals) used by the Sinkhorn, softmax, and tempered-softmax solvers.
+- `experiments/scripts/bench_eps_rescale.py` and `tests/test_hardening.py`.
+
+### Changed
+
+- Fused-softmax now honors every `scale_cost` mode (`'mean'/'max_cost'/float/None`),
+  matching `SoftmaxSolver`; the compiled kernel no longer scales internally.
+- `TemperedSoftmaxSolver` gains FP32 promotion, non-finite handling, and an
+  autocast-disabled softmax (previously absent).
+- Warm-start dual re-centering uses the valid gauge `f -> f+c, g -> g-c` instead
+  of independent mean subtraction, which perturbed the iterate under `omega != 1`.
+- `BatchedLinearEvaluator` applies the real activation modules (exact
+  `LeakyReLU.negative_slope`, `GELU.approximate`) rather than hardcoded
+  functional defaults; non-default `Flatten` falls back to vmap.
+- Low-level `PolyStep.step()` forwards `init_eps` like the optimizer path.
+
+### Removed
+
+- Low-rank Sinkhorn (`SinkhornSolver.{rank,gamma,auto_rank_threshold}`,
+  `_solve_low_rank`, `SinkhornResult.{_Q,_R,_g_lr}`, the `solve(seed=...)` arg,
+  and the `rank` params on `PolyStepOptimizer` / `PolyStep`).
+
+### Fixed
+
+- Re-validate `epsilon > 0` inside `SinkhornSolver.solve()` (schedules mutate
+  it); reject `check_every < 1`, `num_probe < 1`, and `scale_cost` of 0 / non-finite.
+- Mezzadri rotation sign correction treats `sign(0)` as `+1` so an underflowed
+  QR diagonal can't null a column; dropped a redundant `Q.clone()`.
+
 ## 0.3.0 - 2026-05-27
 
 Cleanup. No public API changes.

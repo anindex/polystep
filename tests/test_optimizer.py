@@ -175,13 +175,15 @@ class TestMomentum:
         assert len(opt_no_mom.state.displacement_sqnorms) == n_steps
         assert len(opt_mom.state.displacement_sqnorms) == n_steps
 
-        # Momentum smooths trajectory -> smaller variance in displacements
-        import statistics
-        var_no_mom = statistics.variance(opt_no_mom.state.displacement_sqnorms)
-        var_mom = statistics.variance(opt_mom.state.displacement_sqnorms)
-        # We just check both ran without error; variance comparison is stochastic
-        # so we don't assert strict ordering, but log for informational purposes
-        assert var_no_mom >= 0 and var_mom >= 0
+        # Momentum must have a real effect: velocity accumulates and the
+        # trajectory diverges from the no-momentum run (both seeded identically,
+        # so any difference is momentum). The variance-ordering claim is
+        # stochastic, so we assert the mechanism rather than a flaky inequality.
+        assert opt_mom.state.velocity is not None
+        assert opt_mom.state.velocity.abs().sum() > 0
+        traj_no_mom = torch.tensor(opt_no_mom.state.displacement_sqnorms)
+        traj_mom = torch.tensor(opt_mom.state.displacement_sqnorms)
+        assert not torch.allclose(traj_no_mom, traj_mom)
 
 
 # ---------------------------------------------------------------------------
@@ -200,18 +202,9 @@ class TestAdaptiveRadius:
         opt.step(closure)
         assert opt.state.radius_multiplier == 1.0
 
-    def test_adaptive_enabled(self, model, closure):
-        opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
-            use_adaptive_radius=True,
-        )
-        # Run a few steps so radius has a chance to change
-        for _ in range(5):
-            opt.step(closure)
-        # After several steps, radius may have changed (stagnation or improvement)
-        # We check it's a valid float within bounds
-        assert 0.5 <= opt.state.radius_multiplier <= 3.0
+    # test_adaptive_enabled removed: a weaker subset of test_radius_stays_in_bounds
+    # below (same bounds assertion, fewer steps). The adaptation logic itself is
+    # covered in detail by tests/test_dynamics.py::TestAdaptiveRadius.
 
     def test_radius_stays_in_bounds(self, model, closure):
         opt = PolyStepOptimizer(

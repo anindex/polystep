@@ -11,6 +11,7 @@ from typing import Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
+from ._prelude import align_marginal, sanitize_cost, validate_positive
 from .base import SolverResult
 
 
@@ -59,28 +60,25 @@ class TemperedSoftmaxSolver:
         Raises:
             ValueError: If tau <= 0.
         """
-        if self.tau <= 0:
-            raise ValueError(
-                f"tau must be > 0, got {self.tau}. "
-                f"Tau is the temperature parameter in softmax(-C/tau); "
-                f"zero or negative values cause division by zero or undefined behavior."
-            )
+        validate_positive(
+            self.tau, "tau",
+            "tau is the temperature in softmax(-C/tau).",
+        )
 
         P, V = cost_matrix.shape
-        device = cost_matrix.device
-        dtype = cost_matrix.dtype
+        cost_matrix = sanitize_cost(cost_matrix)  # FP32 promote + finite costs
+        device, dtype = cost_matrix.device, cost_matrix.dtype
+        a = align_marginal(a, P, device, dtype)
 
-        if a is None:
-            a = torch.ones(P, device=device, dtype=dtype) / P
+        C = scale_cost_matrix(cost_matrix, scale_cost)
 
-        C = scale_cost_matrix(cost_matrix.clone(), scale_cost)
-
-        # Use fixed tau (NOT self.epsilon) for the softmax
-        W = torch.softmax(-C / self.tau, dim=-1)
-
-        transport = W * a.unsqueeze(-1)
-
-        ent_cost = (C * transport).sum().item()
+        # Use fixed tau (NOT self.epsilon) for the softmax. Pin inside an
+        # autocast-disabled FP32 region so an outer mixed-precision context
+        # can't downcast -C/tau before softmax subtracts the row max.
+        with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
+            W = torch.softmax(-C / self.tau, dim=-1)
+            transport = W * a.unsqueeze(-1)
+            ent_cost = (C * transport).sum().item()
 
         return SolverResult(
             matrix=transport,

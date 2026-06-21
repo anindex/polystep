@@ -17,6 +17,7 @@ from typing import Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
+from ._prelude import align_marginal, sanitize_cost, validate_positive
 from .base import SolverResult
 
 
@@ -73,20 +74,12 @@ class SoftmaxSolver:
         Raises:
             ValueError: If epsilon <= 0.
         """
-        if self.epsilon <= 0:
-            raise ValueError(
-                f"epsilon must be > 0, got {self.epsilon}. "
-                f"Epsilon is the temperature parameter in softmax(-C/epsilon); "
-                f"zero or negative values cause division by zero or undefined behavior."
-            )
+        validate_positive(
+            self.epsilon, "epsilon",
+            "epsilon is the temperature in softmax(-C/epsilon).",
+        )
 
         P, V = cost_matrix.shape
-        device = cost_matrix.device
-        dtype = cost_matrix.dtype
-
-        # Default uniform source marginal
-        if a is None:
-            a = torch.ones(P, device=device, dtype=dtype) / P
 
         # SoftmaxSolver is one-sided: it only enforces row sums equal `a`.
         # If a caller passes a non-uniform `b` they probably meant to call
@@ -101,31 +94,14 @@ class SoftmaxSolver:
                     stacklevel=2,
                 )
 
-        # Promote half-precision inputs to FP32. PyTorch's softmax
-        # subtracts the row max for stability, but the subtraction happens
-        # AFTER an outer autocast may have already downcast ``-C/epsilon``
-        # to BF16 (~7 mantissa bits), which collapses the transport plan
-        # to near-uniform once the cost spread exceeds ~15 nats.
-        if cost_matrix.dtype == torch.bfloat16 or cost_matrix.dtype == torch.float16:
-            cost_matrix = cost_matrix.to(torch.float32)
-            dtype = torch.float32
+        # FP32 promotion (softmax subtracts the row max only after an outer
+        # autocast may have downcast -C/epsilon) + finite-cost handling
+        # (+Inf models a hard "never pick this vertex" constraint).
+        cost_matrix = sanitize_cost(cost_matrix)
+        device, dtype = cost_matrix.device, cost_matrix.dtype
+        a = align_marginal(a, P, device, dtype)
 
-        # +Inf is a useful way to model a hard constraint ("never pick this
-        # vertex"). Replace it with a large finite penalty so the masked
-        # entry still gets near-zero weight without sending the whole row
-        # to -Inf inside ``-C/epsilon`` (which would NaN the softmax).
-        if not torch.isfinite(cost_matrix).all():
-            finite_mask = torch.isfinite(cost_matrix)
-            if finite_mask.any():
-                penalty = cost_matrix[finite_mask].abs().max().item() * 2.0 + 1.0
-            else:
-                penalty = 1e6
-            cost_matrix = torch.where(
-                finite_mask, cost_matrix,
-                torch.full_like(cost_matrix, penalty),
-            )
-
-        C = scale_cost_matrix(cost_matrix.clone(), scale_cost)
+        C = scale_cost_matrix(cost_matrix, scale_cost)
 
         # ``epsilon > 0`` is enough to avoid division-by-zero, but
         # eps=1e-30 with cost_max~10 still overflows -C/epsilon before

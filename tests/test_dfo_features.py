@@ -235,12 +235,11 @@ def test_all_dfo_features_compose():
     assert opt._state.iteration_count == 10
 
 
-@pytest.mark.filterwarnings("ignore:init_f/init_g warm-start.*ignored in low-rank:UserWarning")
 def test_dfo_features_with_subspace():
-    """DFO features should work with subspace mode (rank < param count)."""
+    """DFO features should work together (quadratic model + biased rotation)."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5, rank=2,
+        model, particle_dim=2, epsilon=0.5,
         use_quadratic_model=True, biased_rotation=True,
         amortize_steps=2,
         max_iterations=2, seed=42,

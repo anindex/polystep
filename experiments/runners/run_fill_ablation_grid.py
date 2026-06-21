@@ -283,12 +283,12 @@ def main():
     all_seeds = [42, 123, 456, 789, 1337]
 
     # === RADIUS GRID ===
-    # Clean 5×5 grid (drop sr=2.0,8.0 and pr=0.25,1.5)
+    # Clean 5x5 grid (drop sr=2.0,8.0 and pr=0.25,1.5)
     pr_vals = [0.1, 0.5, 1.0, 2.0, 3.0]
     sr_vals = [1.0, 3.0, 4.5, 6.0, 10.0]
     radius_dir = os.path.join(ABLATION_DIR, "radius")
 
-    print("=== RADIUS HEATMAP GRID (5×5) ===")
+    print("=== RADIUS HEATMAP GRID (5x5) ===")
     existing = scan_existing(radius_dir, "ablation_radius", pr_vals, sr_vals)
     radius_todo = []
     for pr in pr_vals:
@@ -309,7 +309,7 @@ def main():
     et_vals = [0.01, 0.1, 0.5]
     epsilon_dir = os.path.join(ABLATION_DIR, "epsilon")
 
-    print("\n=== EPSILON HEATMAP GRID (4×3) ===")
+    print("\n=== EPSILON HEATMAP GRID (4x3) ===")
     eps_existing = {}
     for ei in ei_vals:
         for et in et_vals:

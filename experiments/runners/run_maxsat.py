@@ -121,7 +121,7 @@ PSTORCH_TURBO_1M = {
     "momentum_final": 0.95,
     "mixed_precision": False,
     "clause_sample_size": 25_000,  # only used by non-delta fallback path
-    "particle_dim": 2,  # 500K particles × 4 vertices = 2M configs
+    "particle_dim": 2,  # 500K particles x 4 vertices = 2M configs
 }
 
 # Step budgets scale with problem size
@@ -442,7 +442,7 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         solver=solver,
     )
 
-    # Clause sampling for 1M+: evaluate random clause subset -> 43× compute reduction
+    # Clause sampling for 1M+: evaluate random clause subset -> 43x compute reduction
     clause_sample = cfg.get("clause_sample_size", 0) if turbo else 0
     base_closure = make_sat_closure(
         clause_vars, clause_signs, cra_lambda=cra_lambda, cra_alpha=CRA_ALPHA,
@@ -1354,7 +1354,7 @@ def main():
 
         # Run CMA-ES with step-matched budget
         # Skip CMA-ES at >= 1M vars: impractical even with GPU batch eval
-        # (sep-CMA-ES sampling + noise at 1M × popsize is prohibitive)
+        # (sep-CMA-ES sampling + noise at 1M x popsize is prohibitive)
         if "cmaes" in args.methods and num_vars >= 1000000:
             print("  Skipping cmaes at 1M+ vars (impractical scale)")
         elif "cmaes" in args.methods:
