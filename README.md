@@ -23,7 +23,7 @@ Based on the Sinkhorn Step algorithm ([Le et al., NeurIPS 2023](https://arxiv.or
        alt="One PolyStep: subspace projection, polytope probes, cost matrix, soft entropic-OT assignment, and barycentric projection -- plus the softmax-to-full-OT solver continuum.">
 </p>
 
-> Want to play around with parameters? [**Viet T. Nguyen**](https://vietngth.github.io/) built a gorgeous interactive walkthrough that animates every step of the method -> **[explore the PolyStep visualization](https://vietngth.github.io/polystep-visualization/how-it-works)**.
+> Want to play around with parameters? [**Viet T. Nguyen**](https://vietngth.github.io/) built a gorgeous interactive walkthrough that animates every step of the method -> **[explore the PolyStep visualization](https://vietngth.github.io/polystep-visualization/)**.
 
 ## Installation
 
@@ -192,7 +192,7 @@ If you find this work useful, please consider citing:
 
 ## Acknowledgments
 
-A huge thank you to [**Viet**](https://vietngth.github.io/) for building a beautiful interactive [PolyStep visualization](https://vietngth.github.io/polystep-visualization/how-it-works), it brings the method to life and makes every step click!
+A huge thank you to [**Viet**](https://vietngth.github.io/) for building a beautiful interactive [PolyStep visualization](https://vietngth.github.io/polystep-visualization/), it brings the method to life and makes every step click!
 
 ## License
 
