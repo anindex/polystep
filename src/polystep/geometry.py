@@ -4,6 +4,7 @@ Combines polytope vertex generators (orthoplex, simplex, cube), random rotation
 via QR decomposition (Mezzadri method) or analytical 2D formula, and deterministic
 probe point generation into a single module for PolyStep exploration directions.
 """
+
 import math
 from typing import Callable, Dict, Optional, Tuple
 
@@ -63,7 +64,7 @@ def get_simplex_vertices(
         Vertices of shape (dim+1, dim).
     """
     points = math.sqrt(1 + 1 / dim) * torch.eye(dim, dtype=dtype, device=device)
-    points = points - ((math.sqrt(dim + 1) + 1) / math.sqrt(dim ** 3))
+    points = points - ((math.sqrt(dim + 1) + 1) / math.sqrt(dim**3))
 
     last_vertex = (1 / math.sqrt(dim)) * torch.ones(1, dim, dtype=dtype, device=device)
     points = torch.cat([points, last_vertex], dim=0)
@@ -96,7 +97,7 @@ def get_cube_vertices(
     Returns:
         Vertices of shape (2^dim, dim).
     """
-    n_vertices = 2 ** dim
+    n_vertices = 2**dim
 
     indices = torch.arange(n_vertices, dtype=torch.int32, device=device).unsqueeze(1)
     shifts = torch.arange(dim, dtype=torch.int32, device=device).unsqueeze(0)
@@ -111,15 +112,15 @@ def get_cube_vertices(
 
 
 POLYTOPE_MAP: Dict[str, Callable] = {
-    'cube': get_cube_vertices,
-    'orthoplex': get_orthoplex_vertices,
-    'simplex': get_simplex_vertices,
+    "cube": get_cube_vertices,
+    "orthoplex": get_orthoplex_vertices,
+    "simplex": get_simplex_vertices,
 }
 
 POLYTOPE_NUM_VERTICES_MAP: Dict[str, Callable[[int], int]] = {
-    'cube': lambda dim: 2 ** dim,
-    'orthoplex': lambda dim: 2 * dim,
-    'simplex': lambda dim: dim + 1,
+    "cube": lambda dim: 2**dim,
+    "orthoplex": lambda dim: 2 * dim,
+    "simplex": lambda dim: dim + 1,
 }
 
 
@@ -178,13 +179,13 @@ def get_random_rotation_matrices(
     # QR decomposition requires FP32 on CPU (BF16 not supported for geqrf_cpu)
     # Generate in FP32, compute QR, then convert to target dtype
     # Resolve None device/dtype to concrete values for comparison
-    resolved_device = device if device is not None else torch.device('cpu')
+    resolved_device = device if device is not None else torch.device("cpu")
     resolved_dtype = dtype if dtype is not None else torch.float32
-    device_type = resolved_device.type if hasattr(resolved_device, 'type') else str(resolved_device)
-    is_cpu = device_type == 'cpu'
+    device_type = resolved_device.type if hasattr(resolved_device, "type") else str(resolved_device)
+    is_cpu = device_type == "cpu"
     needs_fp32_qr = resolved_dtype == torch.bfloat16 and is_cpu
     compute_dtype = torch.float32 if needs_fp32_qr else resolved_dtype
-    compute_device = 'cpu' if needs_fp32_qr else resolved_device
+    compute_device = "cpu" if needs_fp32_qr else resolved_device
 
     # Generator device must match tensor device for ``randn``. If the user
     # supplied a CUDA generator but we have to run QR on CPU (bfloat16
@@ -193,9 +194,9 @@ def get_random_rotation_matrices(
     gen_for_randn = generator
     sample_device = compute_device
     needs_post_move = False
-    if generator is not None and hasattr(generator, 'device'):
-        gen_device_type = generator.device.type if hasattr(generator.device, 'type') else str(generator.device)
-        compute_device_type = 'cpu' if needs_fp32_qr else device_type
+    if generator is not None and hasattr(generator, "device"):
+        gen_device_type = generator.device.type if hasattr(generator.device, "type") else str(generator.device)
+        compute_device_type = "cpu" if needs_fp32_qr else device_type
         if gen_device_type != compute_device_type:
             sample_device = generator.device
             needs_post_move = True
@@ -207,9 +208,9 @@ def get_random_rotation_matrices(
 
     # Sign correction for Haar measure (Mezzadri method). Use a nonzero sign
     # (sign(0) := +1) so an underflowed zero R-diagonal can't null a column.
-    d = torch.diagonal(R, dim1=-2, dim2=-1)              # (batch, dim)
+    d = torch.diagonal(R, dim1=-2, dim2=-1)  # (batch, dim)
     phases = torch.where(d == 0, torch.ones_like(d), torch.sign(d))
-    Q = Q * phases.unsqueeze(-2)                          # (batch, 1, dim) * (batch, dim, dim)
+    Q = Q * phases.unsqueeze(-2)  # (batch, 1, dim) * (batch, dim, dim)
 
     # Ensure det = +1 (SO(n) not just O(n)): flip first column where det < 0.
     # Q is a fresh tensor (product above), so the in-place column flip is safe.
@@ -350,13 +351,17 @@ def get_sampled_polytope_vertices(
 
     # 1. Generate rotation matrices (batch, dim, dim)
     rot_mats = get_random_rotation_matrices(
-        batch, dim, device=origin.device, dtype=origin.dtype, generator=generator,
+        batch,
+        dim,
+        device=origin.device,
+        dtype=origin.dtype,
+        generator=generator,
     )
 
     # 2. Apply rotation: R @ v for each vertex
     # rot_mats: (batch, dim, dim), polytope_vertices: (num_verts, dim)
     # Result: (batch, num_verts, dim)
-    rotated_vertices = torch.einsum('bji, ni -> bnj', rot_mats, polytope_vertices)
+    rotated_vertices = torch.einsum("bji, ni -> bnj", rot_mats, polytope_vertices)
 
     # 3. Translate step points
     step_points = rotated_vertices * step_radius + origin.unsqueeze(1)

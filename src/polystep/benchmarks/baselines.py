@@ -47,6 +47,7 @@ _EVOTORCH_ERROR = None
 try:
     from evotorch import Problem
     from evotorch.algorithms import CMAES
+
     _HAS_EVOTORCH = True
 except ImportError as e:
     _EVOTORCH_ERROR = str(e)
@@ -56,6 +57,7 @@ _HAS_NEVERGRAD = False
 _NEVERGRAD_ERROR = None
 try:
     import nevergrad as ng
+
     _HAS_NEVERGRAD = True
 except ImportError as e:
     _NEVERGRAD_ERROR = str(e)
@@ -76,6 +78,7 @@ def has_nevergrad() -> bool:
 # ---------------------------------------------------------------------------
 
 if _HAS_EVOTORCH:
+
     class NNOptimizationProblem(Problem):
         """EvoTorch Problem wrapper for neural network parameter optimization.
 
@@ -133,7 +136,7 @@ if _HAS_EVOTORCH:
             with torch.no_grad():
                 for p in model.parameters():
                     numel = p.numel()
-                    p.data.copy_(solution[offset:offset + numel].view(p.shape))
+                    p.data.copy_(solution[offset : offset + numel].view(p.shape))
                     offset += numel
 
         def _evaluate(self, solution) -> None:
@@ -282,14 +285,14 @@ def train_cmaes(
         """Evaluate ``solution`` on the full test set."""
         if solution is None:
             return 0.0
-        values = solution.values if hasattr(solution, 'values') else solution
+        values = solution.values if hasattr(solution, "values") else solution
 
         # Load weights into the reused model.
         offset = 0
         with torch.no_grad():
             for p in eval_model.parameters():
                 numel = p.numel()
-                p.data.copy_(values[offset:offset + numel].view(p.shape))
+                p.data.copy_(values[offset : offset + numel].view(p.shape))
                 offset += numel
 
         # Evaluate in batches
@@ -299,8 +302,8 @@ def train_cmaes(
 
         with torch.no_grad():
             for i in range(0, len(test_data_t), eval_batch_size):
-                batch_data = test_data_t[i:i + eval_batch_size]
-                batch_labels = test_labels_t[i:i + eval_batch_size]
+                batch_data = test_data_t[i : i + eval_batch_size]
+                batch_labels = test_labels_t[i : i + eval_batch_size]
                 outputs = eval_model(batch_data)
                 preds = outputs.argmax(dim=-1)
                 correct += (preds == batch_labels).sum().item()
@@ -324,21 +327,23 @@ def train_cmaes(
                 test_acc = evaluate_on_test(pop_best_sol)
                 if test_acc > best_test_acc:
                     best_test_acc = test_acc
-                    best_solution = pop_best_sol.clone() if hasattr(pop_best_sol, 'clone') else pop_best_sol
+                    best_solution = pop_best_sol.clone() if hasattr(pop_best_sol, "clone") else pop_best_sol
             else:
                 test_acc = 0.0
 
-            epoch_logs.append({
-                'epoch': gen + 1,
-                'generation': gen + 1,
-                'accuracy': test_acc,
-                'test_accuracy': test_acc,
-                'pop_best_fitness': pop_best_fitness,
-                'mean_fitness': mean_fitness,
-                'loss': -pop_best_fitness,
-                'sigma': sigma,
-                'time': time.time() - start_time,
-            })
+            epoch_logs.append(
+                {
+                    "epoch": gen + 1,
+                    "generation": gen + 1,
+                    "accuracy": test_acc,
+                    "test_accuracy": test_acc,
+                    "pop_best_fitness": pop_best_fitness,
+                    "mean_fitness": mean_fitness,
+                    "loss": -pop_best_fitness,
+                    "sigma": sigma,
+                    "time": time.time() - start_time,
+                }
+            )
 
             if verbose:
                 print(
@@ -359,7 +364,7 @@ def train_cmaes(
         peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
 
     return BenchmarkResult(
-        optimizer='cmaes',
+        optimizer="cmaes",
         seed=0,  # CMA-ES uses internal randomness
         final_accuracy=final_test_acc,
         best_accuracy=best_test_acc,
@@ -376,6 +381,7 @@ def train_cmaes(
 # ---------------------------------------------------------------------------
 # Nevergrad ES Implementation
 # ---------------------------------------------------------------------------
+
 
 def train_nevergrad(
     model: nn.Module,
@@ -448,7 +454,7 @@ def train_nevergrad(
         with torch.no_grad():
             for p in model.parameters():
                 numel = p.numel()
-                p.data.copy_(torch.from_numpy(params[offset:offset + numel]).view(p.shape).to(device))
+                p.data.copy_(torch.from_numpy(params[offset : offset + numel]).view(p.shape).to(device))
                 offset += numel
 
     def fitness(params: np.ndarray) -> float:
@@ -480,8 +486,8 @@ def train_nevergrad(
 
         with torch.no_grad():
             for i in range(0, len(test_data_t), eval_batch_size):
-                batch_data = test_data_t[i:i + eval_batch_size]
-                batch_labels = test_labels_t[i:i + eval_batch_size]
+                batch_data = test_data_t[i : i + eval_batch_size]
+                batch_labels = test_labels_t[i : i + eval_batch_size]
                 outputs = model(batch_data)
                 preds = outputs.argmax(dim=-1)
                 correct += (preds == batch_labels).sum().item()
@@ -517,17 +523,16 @@ def train_nevergrad(
             if test_acc > best_test_acc:
                 best_test_acc = test_acc
 
-            epoch_logs.append({
-                'eval_count': eval_count,
-                'fitness': -loss,  # Convert back to accuracy
-                'test_accuracy': test_acc,
-            })
+            epoch_logs.append(
+                {
+                    "eval_count": eval_count,
+                    "fitness": -loss,  # Convert back to accuracy
+                    "test_accuracy": test_acc,
+                }
+            )
 
             if verbose:
-                print(
-                    f"  Eval {eval_count:5d}/{budget} | "
-                    f"fitness={-loss:.4f} | test_acc={test_acc * 100:.1f}%"
-                )
+                print(f"  Eval {eval_count:5d}/{budget} | fitness={-loss:.4f} | test_acc={test_acc * 100:.1f}%")
 
     elapsed = time.time() - start_time
 
@@ -544,7 +549,7 @@ def train_nevergrad(
         peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
 
     return BenchmarkResult(
-        optimizer='nevergrad',
+        optimizer="nevergrad",
         seed=0,  # Nevergrad uses internal randomness
         final_accuracy=final_test_acc,
         best_accuracy=best_test_acc,
@@ -561,6 +566,7 @@ def train_nevergrad(
 # ---------------------------------------------------------------------------
 # Utility functions for benchmark scripts
 # ---------------------------------------------------------------------------
+
 
 def check_gradient_free_deps() -> Tuple[bool, bool, str]:
     """Check which gradient-free dependencies are available.
@@ -587,12 +593,12 @@ def get_available_optimizers(include_gradient_free: bool = True) -> List[str]:
     Returns:
         List of available optimizer names.
     """
-    optimizers = ['sgd', 'adam', 'adamw', 'polystep']
+    optimizers = ["sgd", "adam", "adamw", "polystep"]
 
     if include_gradient_free:
         if _HAS_EVOTORCH:
-            optimizers.append('cmaes')
+            optimizers.append("cmaes")
         if _HAS_NEVERGRAD:
-            optimizers.append('nevergrad')
+            optimizers.append("nevergrad")
 
     return optimizers

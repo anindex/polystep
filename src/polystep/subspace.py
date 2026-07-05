@@ -18,6 +18,7 @@ All factors/coords are packed into a single flat subspace vector with
 per-layer offsets. That vector *is* the particle array for the OT solver
 (reshaped to ``(num_particles, particle_dim)``).
 """
+
 from __future__ import annotations
 
 import math
@@ -34,6 +35,7 @@ def _stable_entry_seed(*parts: object) -> int:
     """
     key = "|".join(str(p) for p in parts).encode("utf-8")
     return int(zlib.adler32(key)) & 0x7FFFFFFF
+
 
 if TYPE_CHECKING:
     from .transform import ParamLayout
@@ -114,28 +116,32 @@ class LowRankSubspace:
                 b_shape = (d_out, effective_rank)
                 a_shape = (effective_rank, d_in)
                 num_elements = d_out * effective_rank + effective_rank * d_in
-                specs.append(FactorSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    is_lowrank=True,
-                    b_shape=b_shape,
-                    a_shape=a_shape,
-                    flat_start=offset,
-                    flat_end=offset + num_elements,
-                ))
+                specs.append(
+                    FactorSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        is_lowrank=True,
+                        b_shape=b_shape,
+                        a_shape=a_shape,
+                        flat_start=offset,
+                        flat_end=offset + num_elements,
+                    )
+                )
                 offset += num_elements
             else:
                 # 1D param (bias, LayerNorm): full perturbation
                 num_elements = entry.numel
-                specs.append(FactorSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    is_lowrank=False,
-                    b_shape=(),
-                    a_shape=(),
-                    flat_start=offset,
-                    flat_end=offset + num_elements,
-                ))
+                specs.append(
+                    FactorSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        is_lowrank=False,
+                        b_shape=(),
+                        a_shape=(),
+                        flat_start=offset,
+                        flat_end=offset + num_elements,
+                    )
+                )
                 offset += num_elements
 
         total_params = layout.total_params
@@ -184,27 +190,31 @@ class LowRankSubspace:
                 b_shape = (d_out, effective_rank)
                 a_shape = (effective_rank, d_in)
                 num_elements = d_out * effective_rank + effective_rank * d_in
-                specs.append(FactorSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    is_lowrank=True,
-                    b_shape=b_shape,
-                    a_shape=a_shape,
-                    flat_start=offset,
-                    flat_end=offset + num_elements,
-                ))
+                specs.append(
+                    FactorSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        is_lowrank=True,
+                        b_shape=b_shape,
+                        a_shape=a_shape,
+                        flat_start=offset,
+                        flat_end=offset + num_elements,
+                    )
+                )
                 offset += num_elements
             else:
                 num_elements = entry.numel
-                specs.append(FactorSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    is_lowrank=False,
-                    b_shape=(),
-                    a_shape=(),
-                    flat_start=offset,
-                    flat_end=offset + num_elements,
-                ))
+                specs.append(
+                    FactorSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        is_lowrank=False,
+                        b_shape=(),
+                        a_shape=(),
+                        flat_start=offset,
+                        flat_end=offset + num_elements,
+                    )
+                )
                 offset += num_elements
 
         total_params = layout.total_params
@@ -241,7 +251,7 @@ class LowRankSubspace:
         """
         result = {}
         for spec in self.specs:
-            chunk = flat_subspace[spec.flat_start:spec.flat_end]
+            chunk = flat_subspace[spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
             if spec.is_lowrank:
                 b_size = spec.b_shape[0] * spec.b_shape[1]
@@ -270,7 +280,7 @@ class LowRankSubspace:
         N = flat_subspace_batch.shape[0]
         result = {}
         for spec in self.specs:
-            chunk = flat_subspace_batch[:, spec.flat_start:spec.flat_end]
+            chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
             if spec.is_lowrank:
                 b_size = spec.b_shape[0] * spec.b_shape[1]
@@ -389,7 +399,10 @@ class LinearSubspace:
 
     @classmethod
     def from_layout(
-        cls, layout: ParamLayout, rank: int, seed: int = 0,
+        cls,
+        layout: ParamLayout,
+        rank: int,
+        seed: int = 0,
         max_subspace_dim: Optional[int] = None,
     ) -> LinearSubspace:
         """Create a LinearSubspace with fixed rank from a ParamLayout.
@@ -420,31 +433,36 @@ class LinearSubspace:
                 # Same formula as LowRankSubspace for drop-in compatibility
                 num_coords = d_out * effective_rank + effective_rank * d_in
                 num_params = math.prod(shape)
-                specs.append(ProjectionSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    is_projected=True,
-                    num_params=num_params,
-                    num_coords=num_coords,
-                    flat_start=offset,
-                    flat_end=offset + num_coords,
-                ))
+                specs.append(
+                    ProjectionSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        is_projected=True,
+                        num_params=num_params,
+                        num_coords=num_coords,
+                        flat_start=offset,
+                        flat_end=offset + num_coords,
+                    )
+                )
                 offset += num_coords
             else:
                 num_elements = entry.numel
-                specs.append(ProjectionSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    is_projected=False,
-                    num_params=num_elements,
-                    num_coords=num_elements,
-                    flat_start=offset,
-                    flat_end=offset + num_elements,
-                ))
+                specs.append(
+                    ProjectionSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        is_projected=False,
+                        num_params=num_elements,
+                        num_coords=num_elements,
+                        flat_start=offset,
+                        flat_end=offset + num_elements,
+                    )
+                )
                 offset += num_elements
 
         # Apply budget cap if specified
         from .hybrid_subspace import _scale_specs_to_budget
+
         specs, offset = _scale_specs_to_budget(specs, max_subspace_dim, offset)
 
         total_params = layout.total_params
@@ -497,31 +515,36 @@ class LinearSubspace:
                 effective_rank = min(auto_rank, d_in, d_out)
                 num_coords = d_out * effective_rank + effective_rank * d_in
                 num_params = math.prod(shape)
-                specs.append(ProjectionSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    is_projected=True,
-                    num_params=num_params,
-                    num_coords=num_coords,
-                    flat_start=offset,
-                    flat_end=offset + num_coords,
-                ))
+                specs.append(
+                    ProjectionSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        is_projected=True,
+                        num_params=num_params,
+                        num_coords=num_coords,
+                        flat_start=offset,
+                        flat_end=offset + num_coords,
+                    )
+                )
                 offset += num_coords
             else:
                 num_elements = entry.numel
-                specs.append(ProjectionSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    is_projected=False,
-                    num_params=num_elements,
-                    num_coords=num_elements,
-                    flat_start=offset,
-                    flat_end=offset + num_elements,
-                ))
+                specs.append(
+                    ProjectionSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        is_projected=False,
+                        num_params=num_elements,
+                        num_coords=num_elements,
+                        flat_start=offset,
+                        flat_end=offset + num_elements,
+                    )
+                )
                 offset += num_elements
 
         # Apply budget cap if specified
         from .hybrid_subspace import _scale_specs_to_budget
+
         specs, offset = _scale_specs_to_budget(specs, max_subspace_dim, offset)
 
         total_params = layout.total_params
@@ -541,7 +564,10 @@ class LinearSubspace:
     # ------------------------------------------------------------------
 
     def _get_projection(
-        self, spec: ProjectionSpec, device: torch.device, dtype: torch.dtype,
+        self,
+        spec: ProjectionSpec,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
         """Get or generate the projection matrix for a parameter entry.
 
@@ -565,13 +591,16 @@ class LinearSubspace:
 
         # Deterministic seed from global seed + entry key
         entry_seed = _stable_entry_seed(self.seed, spec.entry_key)
-        gen = torch.Generator(device='cpu')
+        gen = torch.Generator(device="cpu")
         gen.manual_seed(entry_seed)
 
         # Generate on CPU then move (Generator doesn't support CUDA)
         P = torch.randn(
-            spec.num_params, spec.num_coords,
-            generator=gen, dtype=dtype, device='cpu',
+            spec.num_params,
+            spec.num_coords,
+            generator=gen,
+            dtype=dtype,
+            device="cpu",
         )
         # Scale for unit-variance output
         P = P * (1.0 / math.sqrt(spec.num_coords))
@@ -603,7 +632,7 @@ class LinearSubspace:
         """
         result = {}
         for spec in self.specs:
-            chunk = flat_subspace[spec.flat_start:spec.flat_end]
+            chunk = flat_subspace[spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
             if spec.is_projected:
                 P = self._get_projection(spec, base.device, base.dtype)
@@ -633,7 +662,7 @@ class LinearSubspace:
         N = flat_subspace_batch.shape[0]
         result = {}
         for spec in self.specs:
-            chunk = flat_subspace_batch[:, spec.flat_start:spec.flat_end]
+            chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
             if spec.is_projected:
                 P = self._get_projection(spec, base.device, base.dtype)

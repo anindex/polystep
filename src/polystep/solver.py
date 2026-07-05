@@ -3,6 +3,7 @@
 Implements the core Sinkhorn Step algorithm that samples polytope vertices
 around particles, solves entropic OT, and updates via barycentric projection.
 """
+
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Union
 
@@ -81,7 +82,7 @@ class SolverState:
     velocity: Optional[torch.Tensor] = None
     stagnation_count: int = 0
     radius_multiplier: float = 1.0
-    prev_loss: float = float('inf')
+    prev_loss: float = float("inf")
     # Adaptive subspace state
     projection: Optional[torch.Tensor] = None
     displacement_history: Optional[torch.Tensor] = None
@@ -157,7 +158,7 @@ class PolyStep:
 
     objective_fn: Callable
     dim: int
-    polytope_type: str = 'orthoplex'
+    polytope_type: str = "orthoplex"
     epsilon: Union[float, LinearEpsilon] = 0.1
     ent_epsilon: Optional[Union[float, LinearEpsilon]] = None
     scale_cost: Optional[Union[str, float]] = 1.0
@@ -179,37 +180,37 @@ class PolyStep:
     layout: Optional[object] = None
     train_inputs: Optional[object] = None
     train_targets: Optional[object] = None
-    block_strategy: str = 'monolithic'
+    block_strategy: str = "monolithic"
     block_group_size: int = 2
 
     def __post_init__(self):
         """Initialize derived state: polytope template, probes, solver, compiled fns."""
         # Validate: subspace + block-wise not yet supported together
-        if self.subspace is not None and self.block_strategy != 'monolithic':
+        if self.subspace is not None and self.block_strategy != "monolithic":
             raise NotImplementedError(
                 "Combined subspace + block-wise mode is not yet supported. "
                 "Use subspace or block_strategy independently."
             )
 
         self.polytope_vertices = POLYTOPE_MAP[self.polytope_type](self.dim, radius=1.0)
-        self.probes = torch.linspace(0, 1, self.num_probe + 2)[1:self.num_probe + 1]
+        self.probes = torch.linspace(0, 1, self.num_probe + 2)[1 : self.num_probe + 1]
         self.sinkhorn_solver = SinkhornSolver(
             max_iterations=self.sinkhorn_max_iters,
             compile=self.compile,
         )
-        self._compiled = CompiledFunctions(
-            compile=self.compile and torch.cuda.is_available()
-        )
+        self._compiled = CompiledFunctions(compile=self.compile and torch.cuda.is_available())
 
         # Create blocks if block-wise mode
         self._blocks = None
-        if self.block_strategy != 'monolithic' and self.layout is not None:
+        if self.block_strategy != "monolithic" and self.layout is not None:
             from .blockwise import create_per_layer_blocks, create_grouped_blocks
-            if self.block_strategy == 'per_layer':
+
+            if self.block_strategy == "per_layer":
                 self._blocks = create_per_layer_blocks(
-                    self.layout, particle_dim=self.layout.particle_dim,
+                    self.layout,
+                    particle_dim=self.layout.particle_dim,
                 )
-            elif self.block_strategy == 'grouped':
+            elif self.block_strategy == "grouped":
                 self._blocks = create_grouped_blocks(
                     self.layout,
                     group_size=self.block_group_size,
@@ -217,8 +218,7 @@ class PolyStep:
                 )
             else:
                 raise ValueError(
-                    f"Unknown block_strategy: {self.block_strategy!r}. "
-                    f"Use 'monolithic', 'per_layer', or 'grouped'."
+                    f"Unknown block_strategy: {self.block_strategy!r}. Use 'monolithic', 'per_layer', or 'grouped'."
                 )
 
     @classmethod
@@ -330,8 +330,7 @@ class PolyStep:
 
         # Block-wise mode: independent OT solve per block
         if self._blocks is not None and self.nn_evaluator is not None:
-            return self._step_blockwise(state, generator, current_eps,
-                                         step_radius, probe_radius)
+            return self._step_blockwise(state, generator, current_eps, step_radius, probe_radius)
 
         # --- Monolithic mode (original path) ---
 
@@ -347,17 +346,27 @@ class PolyStep:
 
         # Generate rotation matrices eagerly (uses torch.Generator, not compilable)
         rot_mats = get_random_rotation_matrices(
-            batch, dim, device=device, dtype=X.dtype, generator=generator,
+            batch,
+            dim,
+            device=device,
+            dtype=X.dtype,
+            generator=generator,
         )
 
         # Compiled rotation + translation
         X_vertices, rotated = self._compiled.rotate_and_translate(
-            rot_mats, polytope_verts, X, step_radius,
+            rot_mats,
+            polytope_verts,
+            X,
+            step_radius,
         )
 
         # Compiled probe generation
         X_probe = self._compiled.compute_probe_points(
-            X, rotated, probes, probe_radius,
+            X,
+            rotated,
+            probes,
+            probe_radius,
         )
 
         # 3. Compute cost matrix
@@ -366,15 +375,20 @@ class PolyStep:
             P, V, K, D = X_probe.shape
             flat_probes = X_probe.reshape(P * V * K, D)
             stacked_params = state.subspace.reconstruct_batch(
-                state.base_params, flat_probes,
+                state.base_params,
+                flat_probes,
             )
             losses = self.nn_evaluator.evaluate(
-                stacked_params, self.train_inputs, self.train_targets,
+                stacked_params,
+                self.train_inputs,
+                self.train_targets,
             )
             cost_matrix = losses.reshape(P, V, K).mean(dim=-1)
         else:
             cost_matrix = compute_cost_matrix(
-                self.objective_fn, X_probe, chunk_size=self.chunk_size,
+                self.objective_fn,
+                X_probe,
+                chunk_size=self.chunk_size,
             )
 
         # Sanitize cost matrix before OT solve
@@ -382,7 +396,8 @@ class PolyStep:
             max_finite = cost_matrix[torch.isfinite(cost_matrix)]
             penalty = max_finite.abs().max().item() * 2.0 + 1.0 if max_finite.numel() > 0 else 1e6
             cost_matrix = torch.where(
-                torch.isfinite(cost_matrix), cost_matrix,
+                torch.isfinite(cost_matrix),
+                cost_matrix,
                 torch.full_like(cost_matrix, penalty),
             )
 
@@ -410,7 +425,9 @@ class PolyStep:
         # 6. Barycentric projection (compiled)
         transport_matrix = ot_result.matrix  # (batch, num_vertices)
         X_new = self._compiled.barycentric_projection(
-            transport_matrix, state.a, X_vertices,
+            transport_matrix,
+            state.a,
+            X_vertices,
         )
 
         # NaN-safe state update - revert if X_new has NaN
@@ -471,7 +488,9 @@ class PolyStep:
         # Convert layout-indexed flat to block-indexed before splitting.
         total_flat_size = sum(b.flat_end - b.flat_start for b in blocks)
         block_flat = layout_flat_to_block_flat(
-            X.reshape(-1), blocks, self.layout,
+            X.reshape(-1),
+            blocks,
+            self.layout,
         )
         block_X_2d = block_flat.reshape(-1, X.shape[-1]) if X.dim() > 1 else block_flat
         all_block_particles = split_particles(block_X_2d, blocks)
@@ -494,7 +513,10 @@ class PolyStep:
 
             # Per-block polytope template and probes
             block_polytope_verts = POLYTOPE_MAP[self.polytope_type](
-                block_dim, device=device, dtype=X.dtype, radius=1.0,
+                block_dim,
+                device=device,
+                dtype=X.dtype,
+                radius=1.0,
             )
             block_probes = self.probes.to(device=device, dtype=X.dtype)
 
@@ -504,18 +526,27 @@ class PolyStep:
 
             # Rotation matrices for this block
             rot_mats = get_random_rotation_matrices(
-                P_block, block_dim, device=device, dtype=X.dtype,
+                P_block,
+                block_dim,
+                device=device,
+                dtype=X.dtype,
                 generator=generator,
             )
 
             # Rotate and translate
             X_vertices, rotated = self._compiled.rotate_and_translate(
-                rot_mats, block_polytope_verts, block_X, step_radius,
+                rot_mats,
+                block_polytope_verts,
+                block_X,
+                step_radius,
             )
 
             # Probe generation
             X_probe = self._compiled.compute_probe_points(
-                block_X, rotated, block_probes, probe_radius,
+                block_X,
+                rotated,
+                block_probes,
+                probe_radius,
             )
 
             # Block cost: full forward, perturb only this block
@@ -545,7 +576,9 @@ class PolyStep:
             transport_matrix = ot_result.matrix
             block_a = torch.ones(P_block, device=device, dtype=X.dtype) / P_block
             X_new_block = self._compiled.barycentric_projection(
-                transport_matrix, block_a, X_vertices,
+                transport_matrix,
+                block_a,
+                X_vertices,
             )
 
             # Track per-block displacement
@@ -589,6 +622,7 @@ class PolyStep:
         if not state.costs:
             return False
         import math
+
         return not math.isfinite(state.costs[-1])
 
     def run(

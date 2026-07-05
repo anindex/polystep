@@ -4,6 +4,7 @@ Tests verify that the CMA-ES formulas are correctly implemented and
 produce expected behavior for hyperparameter computation, evolution
 path updates, covariance updates, and OT weight computation.
 """
+
 import math
 
 import pytest
@@ -32,7 +33,7 @@ class TestComputeCMAHyperparameters:
     def test_returns_all_expected_keys(self):
         """Hyperparameter dict contains all required keys."""
         params = compute_cma_hyperparameters(n=100, mu_eff=2.0)
-        expected_keys = {'c_sigma', 'c_c', 'c_1', 'c_mu', 'd_sigma', 'expected_norm'}
+        expected_keys = {"c_sigma", "c_c", "c_1", "c_mu", "d_sigma", "expected_norm"}
         assert set(params.keys()) == expected_keys
 
     def test_hyperparams_positive(self):
@@ -46,7 +47,7 @@ class TestComputeCMAHyperparameters:
         for n in [10, 50, 100, 500, 1000]:
             for mu_eff in [1.0, 2.0, 5.0, 10.0]:
                 params = compute_cma_hyperparameters(n=n, mu_eff=mu_eff)
-                assert params['c_1'] + params['c_mu'] <= 1.0 + 1e-9, (
+                assert params["c_1"] + params["c_mu"] <= 1.0 + 1e-9, (
                     f"c_1 + c_mu > 1 for n={n}, mu_eff={mu_eff}: "
                     f"{params['c_1']} + {params['c_mu']} = {params['c_1'] + params['c_mu']}"
                 )
@@ -56,30 +57,30 @@ class TestComputeCMAHyperparameters:
         n, mu_eff = 100, 2.0
         params = compute_cma_hyperparameters(n=n, mu_eff=mu_eff)
         expected = (mu_eff + 2) / (n + mu_eff + 3)  # +3 variant
-        assert params['c_sigma'] == pytest.approx(expected, rel=1e-6)
+        assert params["c_sigma"] == pytest.approx(expected, rel=1e-6)
 
     def test_expected_norm_formula(self):
         """expected_norm follows E[||N(0,I)||] ~ sqrt(n) * correction."""
         n = 100
         params = compute_cma_hyperparameters(n=n, mu_eff=2.0)
         # E[||N(0,I)||] ~ sqrt(n) * (1 - 1/(4n) + 1/(21n^2))
-        expected = math.sqrt(n) * (1 - 1/(4*n) + 1/(21*n**2))
-        assert params['expected_norm'] == pytest.approx(expected, rel=1e-6)
+        expected = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n**2))
+        assert params["expected_norm"] == pytest.approx(expected, rel=1e-6)
 
     def test_small_dimension(self):
         """Small dimensions (n=2) should work without error."""
         params = compute_cma_hyperparameters(n=2, mu_eff=1.0)
-        assert params['c_sigma'] > 0
-        assert params['c_c'] > 0
-        assert params['expected_norm'] > 0
+        assert params["c_sigma"] > 0
+        assert params["c_c"] > 0
+        assert params["expected_norm"] > 0
 
     def test_large_dimension(self):
         """Large dimensions (n=10000) should work."""
         params = compute_cma_hyperparameters(n=10000, mu_eff=50.0)
         # c_sigma should be small for large n
-        assert 0 < params['c_sigma'] < 0.1
+        assert 0 < params["c_sigma"] < 0.1
         # expected_norm should be close to sqrt(n)
-        assert params['expected_norm'] == pytest.approx(100, rel=0.1)
+        assert params["expected_norm"] == pytest.approx(100, rel=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -97,9 +98,7 @@ class TestEvolutionPathSigma:
         displacement = torch.randn(n)
         C_diag = torch.ones(n)
 
-        p_sigma_new = update_evolution_path_sigma(
-            p_sigma, displacement, C_diag, c_sigma=0.1, mu_eff=2.0
-        )
+        p_sigma_new = update_evolution_path_sigma(p_sigma, displacement, C_diag, c_sigma=0.1, mu_eff=2.0)
         assert p_sigma_new.shape == p_sigma.shape
 
     def test_zero_displacement_accumulates_decay(self):
@@ -110,9 +109,7 @@ class TestEvolutionPathSigma:
         C_diag = torch.ones(n)
         c_sigma = 0.1
 
-        p_sigma_new = update_evolution_path_sigma(
-            p_sigma, displacement, C_diag, c_sigma=c_sigma, mu_eff=2.0
-        )
+        p_sigma_new = update_evolution_path_sigma(p_sigma, displacement, C_diag, c_sigma=c_sigma, mu_eff=2.0)
         expected = (1 - c_sigma) * p_sigma
         assert torch.allclose(p_sigma_new, expected, atol=1e-6)
 
@@ -123,9 +120,7 @@ class TestEvolutionPathSigma:
         displacement = torch.ones(n) * 0.1
         C_diag = torch.ones(n)
 
-        p_sigma_new = update_evolution_path_sigma(
-            p_sigma, displacement, C_diag, c_sigma=0.1, mu_eff=2.0
-        )
+        p_sigma_new = update_evolution_path_sigma(p_sigma, displacement, C_diag, c_sigma=0.1, mu_eff=2.0)
         assert p_sigma_new.norm() > 0
 
     def test_evolution_path_sigma_tiny_covariance(self):
@@ -134,9 +129,7 @@ class TestEvolutionPathSigma:
         p_sigma = torch.zeros(n)
         displacement = torch.randn(n)
         C_diag = torch.full((n,), 1e-15)  # Extremely small
-        result = update_evolution_path_sigma(
-            p_sigma, displacement, C_diag, c_sigma=0.3, mu_eff=3.0
-        )
+        result = update_evolution_path_sigma(p_sigma, displacement, C_diag, c_sigma=0.3, mu_eff=3.0)
         assert torch.isfinite(result).all(), f"Non-finite result: {result}"
 
     def test_covariance_scaling_applied(self):
@@ -148,9 +141,7 @@ class TestEvolutionPathSigma:
         c_sigma = 0.1
         mu_eff = 2.0
 
-        p_sigma_new = update_evolution_path_sigma(
-            p_sigma, displacement, C_diag, c_sigma=c_sigma, mu_eff=mu_eff
-        )
+        p_sigma_new = update_evolution_path_sigma(p_sigma, displacement, C_diag, c_sigma=c_sigma, mu_eff=mu_eff)
 
         # Manual: sqrt_factor * (1/2) * 1.0 = sqrt_factor * 0.5
         sqrt_factor = math.sqrt(c_sigma * (2 - c_sigma) * mu_eff)
@@ -172,9 +163,7 @@ class TestEvolutionPathC:
         p_c = torch.zeros(n)
         displacement = torch.randn(n)
 
-        p_c_new = update_evolution_path_c(
-            p_c, displacement, h_sigma=True, c_c=0.1, mu_eff=2.0
-        )
+        p_c_new = update_evolution_path_c(p_c, displacement, h_sigma=True, c_c=0.1, mu_eff=2.0)
         assert p_c_new.shape == p_c.shape
 
     def test_h_sigma_false_disables_accumulation(self):
@@ -184,9 +173,7 @@ class TestEvolutionPathC:
         displacement = torch.ones(n) * 10.0  # Large, should be ignored
         c_c = 0.1
 
-        p_c_new = update_evolution_path_c(
-            p_c, displacement, h_sigma=False, c_c=c_c, mu_eff=2.0
-        )
+        p_c_new = update_evolution_path_c(p_c, displacement, h_sigma=False, c_c=c_c, mu_eff=2.0)
         expected = (1 - c_c) * p_c
         assert torch.allclose(p_c_new, expected, atol=1e-6)
 
@@ -198,9 +185,7 @@ class TestEvolutionPathC:
         c_c = 0.1
         mu_eff = 2.0
 
-        p_c_new = update_evolution_path_c(
-            p_c, displacement, h_sigma=True, c_c=c_c, mu_eff=mu_eff
-        )
+        p_c_new = update_evolution_path_c(p_c, displacement, h_sigma=True, c_c=c_c, mu_eff=mu_eff)
         sqrt_factor = math.sqrt(c_c * (2 - c_c) * mu_eff)
         expected_component = sqrt_factor * 0.1
         assert p_c_new[0].item() == pytest.approx(expected_component, rel=1e-5)
@@ -222,9 +207,7 @@ class TestHeavisideSigma:
 
         # p_sigma_norm slightly below threshold -> healthy
         p_sigma_norm = expected_norm * 0.5
-        h_sigma = compute_heaviside_sigma(
-            p_sigma_norm, expected_norm, n, c_sigma, generation=10
-        )
+        h_sigma = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=10)
         assert h_sigma is True
 
     def test_stalled_p_sigma_returns_false(self):
@@ -235,9 +218,7 @@ class TestHeavisideSigma:
 
         # p_sigma_norm much larger than threshold -> stalled
         p_sigma_norm = expected_norm * 10.0
-        h_sigma = compute_heaviside_sigma(
-            p_sigma_norm, expected_norm, n, c_sigma, generation=100
-        )
+        h_sigma = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=100)
         assert h_sigma is False
 
     def test_generation_zero_handled(self):
@@ -248,9 +229,7 @@ class TestHeavisideSigma:
         p_sigma_norm = expected_norm * 0.5
 
         # Should not raise, uses max(1, generation)
-        h_sigma = compute_heaviside_sigma(
-            p_sigma_norm, expected_norm, n, c_sigma, generation=0
-        )
+        h_sigma = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=0)
         assert isinstance(h_sigma, bool)
 
     def test_early_generation_higher_threshold(self):
@@ -261,14 +240,10 @@ class TestHeavisideSigma:
         p_sigma_norm = expected_norm * 0.3
 
         # At generation 1, cumulation factor is small, threshold is lower
-        h_sigma_early = compute_heaviside_sigma(
-            p_sigma_norm, expected_norm, n, c_sigma, generation=1
-        )
+        h_sigma_early = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=1)
 
         # At generation 100, cumulation factor is close to 1, threshold is higher
-        h_sigma_late = compute_heaviside_sigma(
-            p_sigma_norm, expected_norm, n, c_sigma, generation=100
-        )
+        h_sigma_late = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=100)
 
         # Same p_sigma_norm may be healthy early but stalled late is incorrect -
         # actually higher threshold at later generations means MORE values pass
@@ -289,41 +264,35 @@ class TestCSAStepSize:
     def test_p_sigma_at_expected_norm_no_change(self):
         """When ||p_sigma|| == E[||N(0,I)||], sigma stays roughly same."""
         n = 100
-        expected_norm = math.sqrt(n) * (1 - 1/(4*n) + 1/(21*n**2))
+        expected_norm = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n**2))
         p_sigma = torch.randn(n)
         p_sigma = p_sigma / p_sigma.norm() * expected_norm
 
         sigma = 1.0
-        sigma_new = update_step_size_csa(
-            sigma, p_sigma, c_sigma=0.1, d_sigma=1.1, n=n
-        )
+        sigma_new = update_step_size_csa(sigma, p_sigma, c_sigma=0.1, d_sigma=1.1, n=n)
         # Should be close to 1.0 (exponent ~ 0)
         assert sigma_new == pytest.approx(1.0, rel=0.1)
 
     def test_p_sigma_larger_than_expected_increases_sigma(self):
         """When ||p_sigma|| > E[||N(0,I)||], sigma increases."""
         n = 100
-        expected_norm = math.sqrt(n) * (1 - 1/(4*n) + 1/(21*n**2))
+        expected_norm = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n**2))
         p_sigma = torch.randn(n)
         p_sigma = p_sigma / p_sigma.norm() * (expected_norm * 2.0)  # 2x expected
 
         sigma = 1.0
-        sigma_new = update_step_size_csa(
-            sigma, p_sigma, c_sigma=0.1, d_sigma=1.1, n=n
-        )
+        sigma_new = update_step_size_csa(sigma, p_sigma, c_sigma=0.1, d_sigma=1.1, n=n)
         assert sigma_new > sigma
 
     def test_p_sigma_smaller_than_expected_decreases_sigma(self):
         """When ||p_sigma|| < E[||N(0,I)||], sigma decreases."""
         n = 100
-        expected_norm = math.sqrt(n) * (1 - 1/(4*n) + 1/(21*n**2))
+        expected_norm = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n**2))
         p_sigma = torch.randn(n)
         p_sigma = p_sigma / p_sigma.norm() * (expected_norm * 0.5)  # 0.5x expected
 
         sigma = 1.0
-        sigma_new = update_step_size_csa(
-            sigma, p_sigma, c_sigma=0.1, d_sigma=1.1, n=n
-        )
+        sigma_new = update_step_size_csa(sigma, p_sigma, c_sigma=0.1, d_sigma=1.1, n=n)
         assert sigma_new < sigma
 
     def test_clamping_lower_bound(self):
@@ -332,9 +301,7 @@ class TestCSAStepSize:
         p_sigma = torch.zeros(n)  # Norm = 0, should decrease sigma a lot
         sigma = 1e-5  # Already small
 
-        sigma_new = update_step_size_csa(
-            sigma, p_sigma, c_sigma=0.5, d_sigma=1.0, n=n
-        )
+        sigma_new = update_step_size_csa(sigma, p_sigma, c_sigma=0.5, d_sigma=1.0, n=n)
         assert sigma_new >= 1e-6
 
     def test_clamping_upper_bound(self):
@@ -343,9 +310,7 @@ class TestCSAStepSize:
         p_sigma = torch.randn(n) * 100  # Very large norm
         sigma = 50.0
 
-        sigma_new = update_step_size_csa(
-            sigma, p_sigma, c_sigma=0.5, d_sigma=1.0, n=n
-        )
+        sigma_new = update_step_size_csa(sigma, p_sigma, c_sigma=0.5, d_sigma=1.0, n=n)
         assert sigma_new <= 100.0
 
 
@@ -366,8 +331,7 @@ class TestCovarianceUpdate:
         weights = torch.ones(10) / 10
 
         C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights,
-            c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
+            C_diag, p_c, displacements, weights, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
         )
         assert C_new.shape == C_diag.shape
 
@@ -380,8 +344,7 @@ class TestCovarianceUpdate:
         weights = torch.ones(5) / 5
 
         C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights,
-            c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
+            C_diag, p_c, displacements, weights, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
         )
         assert (C_new >= 1e-6).all()
 
@@ -395,8 +358,7 @@ class TestCovarianceUpdate:
         weights = torch.ones(5) / 5
 
         C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights,
-            c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
+            C_diag, p_c, displacements, weights, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
         )
         assert (C_new >= 1e-6).all()
         assert (C_new <= 1e6).all()
@@ -415,8 +377,7 @@ class TestCovarianceUpdate:
         # h_sigma=True, h_factor = 1.0
         # C_new = 1.0 * (1-0.2-0) * 1 + 0.2 * 4 + 0 = 0.8 + 0.8 = 1.6
         C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights,
-            c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c
+            C_diag, p_c, displacements, weights, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c
         )
         expected = 0.8 * 1.0 + c_1 * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
@@ -437,8 +398,7 @@ class TestCovarianceUpdate:
         # rank_mu = w[0] * z[0]^2 = 1 * 4 = 4
         # C_new = 1.0 * (1-0-0.2) * 1 + 0 + 0.2 * 4 = 0.8 + 0.8 = 1.6
         C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights,
-            c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c
+            C_diag, p_c, displacements, weights, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c
         )
         expected = 0.8 * 1.0 + c_mu * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
@@ -458,14 +418,21 @@ class TestCovarianceUpdate:
         # rank_mu = w * disp^2 = 4 (not (disp / sqrt(C))^2 = 1)
         # C_new = 1.0 * (1 - 0 - 0.2) * 4 + 0.2 * 4 = 3.2 + 0.8 = 4.0
         C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights,
-            c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c,
+            C_diag,
+            p_c,
+            displacements,
+            weights,
+            c_1=c_1,
+            c_mu=c_mu,
+            h_sigma=True,
+            c_c=c_c,
         )
         expected = 0.8 * 4.0 + c_mu * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 
     def test_h_sigma_false_dampens_update(self):
-        """When h_sigma=False, h_factor < 1 dampens covariance retention."""
+        """When h_sigma=False, the missing rank-one mass is added back to the
+        old-C coefficient (canonical additive sep-CMA make-up)."""
         n = 16
         C_diag = torch.ones(n) * 2.0
         p_c = torch.zeros(n)
@@ -475,14 +442,12 @@ class TestCovarianceUpdate:
         c_mu = 0.1
         c_c = 0.1
 
-        # h_factor = 1 - c_1 * c_c * (2 - c_c)
-        h_factor = 1 - c_1 * c_c * (2 - c_c)
-        # C_new = h_factor * (1 - c_1 - c_mu) * C_diag + 0 + 0
-        expected = h_factor * (1 - c_1 - c_mu) * 2.0
+        # old_coeff = (1 - c_1 - c_mu) + c_1 * c_c * (2 - c_c); C_new = old_coeff * C_diag
+        old_coeff = (1 - c_1 - c_mu) + c_1 * c_c * (2 - c_c)
+        expected = old_coeff * 2.0
 
         C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights,
-            c_1=c_1, c_mu=c_mu, h_sigma=False, c_c=c_c
+            C_diag, p_c, displacements, weights, c_1=c_1, c_mu=c_mu, h_sigma=False, c_c=c_c
         )
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 

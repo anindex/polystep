@@ -28,6 +28,7 @@ Provides pure tensor functions suitable for torch.compile, plus a try_compile
 helper that gracefully falls back to eager mode on failure. The CompiledFunctions
 registry holds either compiled or eager versions depending on the compile flag.
 """
+
 import warnings
 from typing import Callable, Optional, Tuple
 
@@ -63,8 +64,7 @@ def try_compile(
         return torch.compile(fn, fullgraph=fullgraph, mode=mode)
     except Exception as e:
         warnings.warn(
-            f"torch.compile failed for '{label}': {e}. "
-            "Falling back to eager mode.",
+            f"torch.compile failed for '{label}': {e}. Falling back to eager mode.",
             stacklevel=2,
         )
         return fn
@@ -229,7 +229,7 @@ def _fused_softmax_project(
     # Vertex-free centroid: O(P*dim) instead of materializing O(P*V*dim) rotated vertices
     # Weighted centroid in template space, then rotate to particle frame
     w_centroid = W @ polytope_verts  # (P, dim)
-    rot_centroid = torch.einsum('bij,bj->bi', rot_mats, w_centroid)  # (P, dim)
+    rot_centroid = torch.einsum("bij,bj->bi", rot_mats, w_centroid)  # (P, dim)
 
     # Barycentric projection
     X_new = X + step_radius * rot_centroid  # (P, dim)
@@ -264,21 +264,11 @@ class CompiledFunctions:
     def __init__(self, compile: bool = True) -> None:
         self.compile = compile and torch.cuda.is_available()
         if self.compile:
-            self.sinkhorn_iter = try_compile(
-                _sinkhorn_iteration, name="sinkhorn_iteration"
-            )
-            self.rotate_and_translate = try_compile(
-                _rotate_and_translate, name="rotate_and_translate"
-            )
-            self.barycentric_projection = try_compile(
-                _barycentric_projection, name="barycentric_projection"
-            )
-            self.compute_probe_points = try_compile(
-                _compute_probe_points, name="compute_probe_points"
-            )
-            self.fused_softmax_project = try_compile(
-                _fused_softmax_project, name="fused_softmax_project"
-            )
+            self.sinkhorn_iter = try_compile(_sinkhorn_iteration, name="sinkhorn_iteration")
+            self.rotate_and_translate = try_compile(_rotate_and_translate, name="rotate_and_translate")
+            self.barycentric_projection = try_compile(_barycentric_projection, name="barycentric_projection")
+            self.compute_probe_points = try_compile(_compute_probe_points, name="compute_probe_points")
+            self.fused_softmax_project = try_compile(_fused_softmax_project, name="fused_softmax_project")
         else:
             self.sinkhorn_iter = _sinkhorn_iteration
             self.rotate_and_translate = _rotate_and_translate

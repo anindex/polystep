@@ -1,4 +1,5 @@
 """Unit tests for SinkhornSolver (full-rank log-domain)."""
+
 import torch
 import pytest
 
@@ -24,7 +25,10 @@ class TestSinkhornSolver:
         C = torch.rand(n, n)
 
         solver = SinkhornSolver(
-            epsilon=0.001, max_iterations=5000, threshold=1e-10, compile=False,
+            epsilon=0.001,
+            max_iterations=5000,
+            threshold=1e-10,
+            compile=False,
         )
         result = solver.solve(C)
 
@@ -32,8 +36,7 @@ class TestSinkhornSolver:
         row_sums = P.sum(dim=1)
         max_vals = P.max(dim=1).values
         ratios = max_vals / row_sums
-        assert (ratios > 0.9).all(), \
-            f"Row concentration ratios: {ratios.tolist()}"
+        assert (ratios > 0.9).all(), f"Row concentration ratios: {ratios.tolist()}"
 
     def test_known_ot_solution_diagonal(self):
         """Identity cost matrix should produce near-diagonal transport plan."""
@@ -43,7 +46,10 @@ class TestSinkhornSolver:
         C = 1.0 - torch.eye(n)  # 0 on diagonal, 1 off-diagonal
 
         solver = SinkhornSolver(
-            epsilon=0.01, max_iterations=5000, threshold=1e-10, compile=False,
+            epsilon=0.01,
+            max_iterations=5000,
+            threshold=1e-10,
+            compile=False,
         )
         result = solver.solve(C)
 
@@ -51,8 +57,9 @@ class TestSinkhornSolver:
         # Diagonal should dominate: P_ii > 0.5 / n for each i
         diag = torch.diag(P)
         off_diag_max = (P - torch.diag(diag)).max()
-        assert diag.min() > off_diag_max, \
+        assert diag.min() > off_diag_max, (
             f"Diagonal min {diag.min():.4f} should exceed off-diagonal max {off_diag_max:.4f}"
+        )
 
     def test_scale_cost_mean(self):
         """Scale cost='mean' should still produce valid marginals for large costs."""
@@ -60,15 +67,16 @@ class TestSinkhornSolver:
         C = torch.rand(5, 5) * 100  # Large costs
 
         solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-6,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-6,
             compile=False,
         )
-        result = solver.solve(C, scale_cost='mean')
+        result = solver.solve(C, scale_cost="mean")
 
         P = result.matrix
         a = torch.ones(5) / 5
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-3), \
-            f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
+        assert torch.allclose(P.sum(dim=1), a, atol=1e-3), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
 
     def test_entropic_cost_finite(self):
         """Entropic regularized cost should be finite."""
@@ -77,8 +85,7 @@ class TestSinkhornSolver:
 
         solver = SinkhornSolver(epsilon=0.1, max_iterations=500, compile=False)
         result = solver.solve(C)
-        assert torch.isfinite(torch.tensor(result.ent_reg_cost)), \
-            f"ent_reg_cost not finite: {result.ent_reg_cost}"
+        assert torch.isfinite(torch.tensor(result.ent_reg_cost)), f"ent_reg_cost not finite: {result.ent_reg_cost}"
 
 
 def test_warmstart_shape_mismatch_warns():
@@ -99,11 +106,15 @@ class TestOverrelaxation:
         C = torch.rand(10, 10)
 
         solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=500, threshold=1e-6,
+            epsilon=0.1,
+            max_iterations=500,
+            threshold=1e-6,
             compile=False,
         )
         result = solver.solve(C)
-        assert result.converged, f"Did not converge after {result.n_iters} iters, errors: {result.errors[-3:] if result.errors else 'none'}"
+        assert result.converged, (
+            f"Did not converge after {result.n_iters} iters, errors: {result.errors[-3:] if result.errors else 'none'}"
+        )
         assert solver.omega == 1.0
 
         # Verify valid transport plan
@@ -122,14 +133,22 @@ class TestOverrelaxation:
         C = torch.rand(n, n) * 10.0  # Wider cost range makes standard Sinkhorn work harder
 
         solver_standard = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            check_every=1, compile=False, omega=1.0,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=1,
+            compile=False,
+            omega=1.0,
         )
         result_standard = solver_standard.solve(C)
 
         solver_overrelaxed = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            check_every=1, compile=False, omega=1.5,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=1,
+            compile=False,
+            omega=1.5,
         )
         result_overrelaxed = solver_overrelaxed.solve(C)
 
@@ -148,14 +167,23 @@ class TestOverrelaxation:
         C = torch.rand(n, n) * 10.0
 
         static = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            check_every=1, compile=False, omega=1.0,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=1,
+            compile=False,
+            omega=1.0,
         )
         r_static = static.solve(C)
 
         adaptive = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            check_every=1, compile=False, omega=1.0, adaptive_omega=True,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=1,
+            compile=False,
+            omega=1.0,
+            adaptive_omega=True,
         )
         r_adaptive = adaptive.solve(C)
 
@@ -171,14 +199,19 @@ class TestOverrelaxation:
         C = torch.rand(8, 8)
 
         solver_default = SinkhornSolver(
-            epsilon=0.1, max_iterations=500, threshold=1e-8,
+            epsilon=0.1,
+            max_iterations=500,
+            threshold=1e-8,
             compile=False,
         )
         result_default = solver_default.solve(C)
 
         solver_explicit = SinkhornSolver(
-            epsilon=0.1, max_iterations=500, threshold=1e-8,
-            compile=False, omega=1.0,
+            epsilon=0.1,
+            max_iterations=500,
+            threshold=1e-8,
+            compile=False,
+            omega=1.0,
         )
         result_explicit = solver_explicit.solve(C)
 
@@ -207,14 +240,22 @@ class TestOverrelaxation:
         C = torch.rand(n, n) * 8.0  # Scaled costs for meaningful iteration counts
 
         solver_standard = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            check_every=1, compile=False, omega=1.0,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=1,
+            compile=False,
+            omega=1.0,
         )
         result_standard = solver_standard.solve(C)
 
         solver_overrelaxed = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            check_every=1, compile=False, omega=1.2,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=1,
+            compile=False,
+            omega=1.2,
         )
         result_overrelaxed = solver_overrelaxed.solve(C)
 
@@ -236,14 +277,19 @@ class TestAndersonAcceleration:
         C = torch.rand(n, m)
 
         solver_standard = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
             compile=False,
         )
         result_standard = solver_standard.solve(C)
 
         solver_aa = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
-            compile=False, anderson_depth=0,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
+            compile=False,
+            anderson_depth=0,
         )
         result_aa = solver_aa.solve(C)
 
@@ -264,14 +310,22 @@ class TestAndersonAcceleration:
         C = torch.rand(n, m)
 
         solver_standard = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            check_every=5, compile=False, anderson_depth=0,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=5,
+            compile=False,
+            anderson_depth=0,
         )
         result_standard = solver_standard.solve(C)
 
         solver_aa = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            check_every=5, compile=False, anderson_depth=5,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=5,
+            compile=False,
+            anderson_depth=5,
         )
         result_aa = solver_aa.solve(C)
 
@@ -290,18 +344,17 @@ class TestAndersonAcceleration:
         b = torch.ones(m) / m
 
         solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-6,
-            compile=False, anderson_depth=5,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-6,
+            compile=False,
+            anderson_depth=5,
         )
         result = solver.solve(C)
 
         P = result.matrix
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), (
-            f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        )
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), (
-            f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-        )
+        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
+        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
 
     def test_anderson_handles_ill_conditioning(self):
         """anderson_depth=5 on a nearly-singular cost matrix does not produce NaN."""
@@ -312,8 +365,11 @@ class TestAndersonAcceleration:
         C = v.unsqueeze(1) @ v.unsqueeze(0) + torch.rand(n, n) * 1e-4
 
         solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-6,
-            compile=False, anderson_depth=5,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-6,
+            compile=False,
+            anderson_depth=5,
         )
         result = solver.solve(C)
 
@@ -335,8 +391,12 @@ class TestAndersonAcceleration:
             C = v.unsqueeze(1) @ v.unsqueeze(0) + torch.rand(n, n) * 1e-6
 
             solver = SinkhornSolver(
-                epsilon=0.1, max_iterations=2000, threshold=1e-6,
-                compile=False, anderson_depth=5, check_every=1,
+                epsilon=0.1,
+                max_iterations=2000,
+                threshold=1e-6,
+                compile=False,
+                anderson_depth=5,
+                check_every=1,
             )
             result = solver.solve(C)
 
@@ -352,9 +412,7 @@ class TestAndersonAcceleration:
 
             # Transport plan must be finite (no NaN propagation)
             P = result.matrix
-            assert torch.isfinite(P).all(), (
-                f"seed={seed}: Transport matrix contains NaN or Inf"
-            )
+            assert torch.isfinite(P).all(), f"seed={seed}: Transport matrix contains NaN or Inf"
 
 
 class TestDataDependentInit:
@@ -367,14 +425,19 @@ class TestDataDependentInit:
         C = torch.rand(n, m)
 
         solver_standard = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
             compile=False,
         )
         result_standard = solver_standard.solve(C)
 
         solver_ddi = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
-            compile=False, data_dependent_init=False,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
+            compile=False,
+            data_dependent_init=False,
         )
         result_ddi = solver_ddi.solve(C)
 
@@ -392,14 +455,22 @@ class TestDataDependentInit:
         C = torch.rand(n, m)
 
         solver_cold = SinkhornSolver(
-            epsilon=0.1, max_iterations=5000, threshold=1e-6,
-            check_every=1, compile=False, data_dependent_init=False,
+            epsilon=0.1,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=1,
+            compile=False,
+            data_dependent_init=False,
         )
         result_cold = solver_cold.solve(C)
 
         solver_ddi = SinkhornSolver(
-            epsilon=0.1, max_iterations=5000, threshold=1e-6,
-            check_every=1, compile=False, data_dependent_init=True,
+            epsilon=0.1,
+            max_iterations=5000,
+            threshold=1e-6,
+            check_every=1,
+            compile=False,
+            data_dependent_init=True,
         )
         result_ddi = solver_ddi.solve(C)
 
@@ -417,27 +488,31 @@ class TestDataDependentInit:
 
         # First solve to get warm-start potentials
         solver_base = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
             compile=False,
         )
         result_base = solver_base.solve(C)
 
         # With DDI + warm-start: should use warm-start (same as without DDI + warm-start)
         solver_ddi_warm = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
-            compile=False, data_dependent_init=True,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
+            compile=False,
+            data_dependent_init=True,
         )
-        result_ddi_warm = solver_ddi_warm.solve(
-            C, init_f=result_base.f, init_g=result_base.g
-        )
+        result_ddi_warm = solver_ddi_warm.solve(C, init_f=result_base.f, init_g=result_base.g)
 
         solver_warm = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
-            compile=False, data_dependent_init=False,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
+            compile=False,
+            data_dependent_init=False,
         )
-        result_warm = solver_warm.solve(
-            C, init_f=result_base.f, init_g=result_base.g
-        )
+        result_warm = solver_warm.solve(C, init_f=result_base.f, init_g=result_base.g)
 
         assert torch.allclose(result_ddi_warm.f, result_warm.f, atol=1e-10), (
             f"f difference: {(result_ddi_warm.f - result_warm.f).abs().max():.2e}"
@@ -455,18 +530,17 @@ class TestDataDependentInit:
         b = torch.ones(m) / m
 
         solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-6,
-            compile=False, data_dependent_init=True,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-6,
+            compile=False,
+            data_dependent_init=True,
         )
         result = solver.solve(C)
 
         P = result.matrix
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), (
-            f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        )
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), (
-            f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-        )
+        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
+        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
 
 
 class TestAdaptiveOmega:
@@ -479,14 +553,19 @@ class TestAdaptiveOmega:
         C = torch.rand(n, m)
 
         solver_standard = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
             compile=False,
         )
         result_standard = solver_standard.solve(C)
 
         solver_ao = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-8,
-            compile=False, adaptive_omega=False,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-8,
+            compile=False,
+            adaptive_omega=False,
         )
         result_ao = solver_ao.solve(C)
 
@@ -504,8 +583,11 @@ class TestAdaptiveOmega:
         C = torch.rand(n, m) * 10.0
 
         solver = SinkhornSolver(
-            epsilon=0.5, max_iterations=2000, threshold=1e-6,
-            compile=False, adaptive_omega=True,
+            epsilon=0.5,
+            max_iterations=2000,
+            threshold=1e-6,
+            compile=False,
+            adaptive_omega=True,
         )
         result = solver.solve(C)
 
@@ -522,18 +604,17 @@ class TestAdaptiveOmega:
         b = torch.ones(m) / m
 
         solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=2000, threshold=1e-6,
-            compile=False, adaptive_omega=True,
+            epsilon=0.1,
+            max_iterations=2000,
+            threshold=1e-6,
+            compile=False,
+            adaptive_omega=True,
         )
         result = solver.solve(C)
 
         P = result.matrix
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), (
-            f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        )
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), (
-            f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-        )
+        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
+        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
 
     def test_convergence(self):
         """adaptive_omega=True converges on a standard problem."""
@@ -542,8 +623,11 @@ class TestAdaptiveOmega:
         C = torch.rand(n, m)
 
         solver = SinkhornSolver(
-            epsilon=0.5, max_iterations=5000, threshold=1e-6,
-            compile=False, adaptive_omega=True,
+            epsilon=0.5,
+            max_iterations=5000,
+            threshold=1e-6,
+            compile=False,
+            adaptive_omega=True,
         )
         result = solver.solve(C)
 
@@ -575,20 +659,19 @@ class TestFixedModeLogic:
         # check_every=9999 >> max_iterations=500, but threshold > 0
         # This enters the eager path (not the fixed/compiled path)
         solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=500, threshold=1e-6,
-            check_every=9999, compile=False,
+            epsilon=0.1,
+            max_iterations=500,
+            threshold=1e-6,
+            check_every=9999,
+            compile=False,
         )
         result = solver.solve(C)
 
         # Verify valid transport plan (eager path ran correctly)
         P = result.matrix
         a = torch.ones(n) / n
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), (
-            f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        )
-        assert torch.allclose(P.sum(dim=0), a, atol=1e-4), (
-            f"Col marginal error: {(P.sum(dim=0) - a).abs().max():.6f}"
-        )
+        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
+        assert torch.allclose(P.sum(dim=0), a, atol=1e-4), f"Col marginal error: {(P.sum(dim=0) - a).abs().max():.6f}"
         assert torch.isfinite(result.f).all(), "f contains NaN or Inf"
         assert torch.isfinite(result.g).all(), "g contains NaN or Inf"
 
@@ -600,6 +683,7 @@ class TestFixedModeLogic:
         warning is emitted because the solver correctly enters the eager path.
         """
         import warnings
+
         torch.manual_seed(42)
         n = 15
         C = torch.rand(n, n)
@@ -608,15 +692,16 @@ class TestFixedModeLogic:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             solver = SinkhornSolver(
-                epsilon=0.5, max_iterations=500, threshold=1e-6,
-                check_every=99999, compile=False, anderson_depth=5,
+                epsilon=0.5,
+                max_iterations=500,
+                threshold=1e-6,
+                check_every=99999,
+                compile=False,
+                anderson_depth=5,
             )
             result = solver.solve(C)
 
-        anderson_warnings = [
-            x for x in w
-            if "anderson_depth" in str(x.message) and "fixed-iteration" in str(x.message)
-        ]
+        anderson_warnings = [x for x in w if "anderson_depth" in str(x.message) and "fixed-iteration" in str(x.message)]
         assert len(anderson_warnings) == 0, (
             "Anderson acceleration should NOT be disabled when threshold > 0, "
             f"but got warning: {anderson_warnings[0].message}"
@@ -628,6 +713,7 @@ class TestFixedModeLogic:
     def test_adaptive_omega_not_silently_disabled_by_check_every(self):
         """adaptive_omega is not warned/disabled when check_every > max_iterations."""
         import warnings
+
         torch.manual_seed(42)
         n = 10
         C = torch.rand(n, n)
@@ -635,18 +721,18 @@ class TestFixedModeLogic:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             solver = SinkhornSolver(
-                epsilon=0.5, max_iterations=500, threshold=1e-6,
-                check_every=99999, compile=False, adaptive_omega=True,
+                epsilon=0.5,
+                max_iterations=500,
+                threshold=1e-6,
+                check_every=99999,
+                compile=False,
+                adaptive_omega=True,
             )
             result = solver.solve(C)
 
-        adaptive_warnings = [
-            x for x in w
-            if "adaptive_omega" in str(x.message) and "fixed-iteration" in str(x.message)
-        ]
+        adaptive_warnings = [x for x in w if "adaptive_omega" in str(x.message) and "fixed-iteration" in str(x.message)]
         assert len(adaptive_warnings) == 0, (
-            "adaptive_omega should NOT be disabled when threshold > 0, "
-            f"but got warning: {adaptive_warnings[0].message}"
+            f"adaptive_omega should NOT be disabled when threshold > 0, but got warning: {adaptive_warnings[0].message}"
         )
         assert torch.isfinite(result.f).all(), "f contains NaN or Inf"
 
@@ -656,37 +742,37 @@ class TestFixedModeLogic:
         C = torch.rand(5, 5)
 
         solver = SinkhornSolver(
-            epsilon=0.1, max_iterations=100, threshold=0,
-            check_every=1, compile=False,
+            epsilon=0.1,
+            max_iterations=100,
+            threshold=0,
+            check_every=1,
+            compile=False,
         )
         result = solver.solve(C)
 
         # In fixed mode, solver runs all max_iterations without convergence check
-        assert not result.converged, (
-            "With threshold=0, solver should be in fixed mode and not report convergence"
-        )
+        assert not result.converged, "With threshold=0, solver should be in fixed mode and not report convergence"
 
     def test_threshold_zero_warns_about_anderson(self):
         """threshold <= 0 with anderson_depth > 0 emits a warning."""
         import warnings
+
         torch.manual_seed(42)
         C = torch.rand(5, 5)
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             solver = SinkhornSolver(
-                epsilon=0.1, max_iterations=100, threshold=0,
-                compile=False, anderson_depth=5,
+                epsilon=0.1,
+                max_iterations=100,
+                threshold=0,
+                compile=False,
+                anderson_depth=5,
             )
             solver.solve(C)
 
-        anderson_warnings = [
-            x for x in w
-            if "anderson_depth" in str(x.message) and "fixed-iteration" in str(x.message)
-        ]
-        assert len(anderson_warnings) == 1, (
-            f"Expected 1 Anderson fixed-mode warning, got {len(anderson_warnings)}"
-        )
+        anderson_warnings = [x for x in w if "anderson_depth" in str(x.message) and "fixed-iteration" in str(x.message)]
+        assert len(anderson_warnings) == 1, f"Expected 1 Anderson fixed-mode warning, got {len(anderson_warnings)}"
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +786,7 @@ class TestDualClamping:
     def test_dual_clamping_not_too_aggressive_small_epsilon(self):
         """Dual potentials should not be aggressively clamped at small epsilon."""
         from polystep.solvers import SinkhornSolver
+
         # Small epsilon creates large dual potentials
         solver = SinkhornSolver(epsilon=0.05, max_iterations=100, threshold=1e-6, compile=False)
         n, m = 10, 10
@@ -728,16 +815,22 @@ class TestProgressiveEpsilon:
     def test_at_returns_init_value(self):
         """ProgressiveEpsilon.at(0) returns init value."""
         from polystep.epsilon import ProgressiveEpsilon
+
         pe = ProgressiveEpsilon(init=1.0, target=0.01)
         assert pe.at(0) == 1.0
 
     def test_fast_convergence_decreases_epsilon(self):
         """After update(n_iters=5, converged=True) (fast), next epsilon decreases."""
         from polystep.epsilon import ProgressiveEpsilon
+
         pe = ProgressiveEpsilon(
-            init=1.0, target=0.01, max_epsilon=5.0,
-            fast_threshold=0.1, slow_threshold=0.5,
-            decrease_factor=0.95, increase_factor=1.2,
+            init=1.0,
+            target=0.01,
+            max_epsilon=5.0,
+            fast_threshold=0.1,
+            slow_threshold=0.5,
+            decrease_factor=0.95,
+            increase_factor=1.2,
             ema_alpha=0.0,  # no smoothing for clear test
         )
         initial = pe.at()
@@ -748,10 +841,15 @@ class TestProgressiveEpsilon:
     def test_slow_convergence_increases_epsilon(self):
         """After update(n_iters=500, converged=False) (slow), next epsilon increases."""
         from polystep.epsilon import ProgressiveEpsilon
+
         pe = ProgressiveEpsilon(
-            init=1.0, target=0.01, max_epsilon=5.0,
-            fast_threshold=0.1, slow_threshold=0.5,
-            decrease_factor=0.95, increase_factor=1.2,
+            init=1.0,
+            target=0.01,
+            max_epsilon=5.0,
+            fast_threshold=0.1,
+            slow_threshold=0.5,
+            decrease_factor=0.95,
+            increase_factor=1.2,
             ema_alpha=0.0,  # no smoothing for clear test
         )
         initial = pe.at()
@@ -762,9 +860,13 @@ class TestProgressiveEpsilon:
     def test_epsilon_never_below_target(self):
         """Epsilon never goes below target floor."""
         from polystep.epsilon import ProgressiveEpsilon
+
         pe = ProgressiveEpsilon(
-            init=0.05, target=0.01, max_epsilon=5.0,
-            decrease_factor=0.5, ema_alpha=0.0,
+            init=0.05,
+            target=0.01,
+            max_epsilon=5.0,
+            decrease_factor=0.5,
+            ema_alpha=0.0,
         )
         # Repeatedly decrease
         for _ in range(100):
@@ -774,9 +876,13 @@ class TestProgressiveEpsilon:
     def test_epsilon_never_above_max(self):
         """Epsilon never goes above max_epsilon ceiling."""
         from polystep.epsilon import ProgressiveEpsilon
+
         pe = ProgressiveEpsilon(
-            init=1.0, target=0.01, max_epsilon=5.0,
-            increase_factor=2.0, ema_alpha=0.0,
+            init=1.0,
+            target=0.01,
+            max_epsilon=5.0,
+            increase_factor=2.0,
+            ema_alpha=0.0,
         )
         # Repeatedly increase
         for _ in range(100):
@@ -786,6 +892,7 @@ class TestProgressiveEpsilon:
     def test_drop_in_replacement_for_linear_epsilon(self):
         """ProgressiveEpsilon has .at() method compatible with LinearEpsilon."""
         from polystep.epsilon import ProgressiveEpsilon
+
         pe = ProgressiveEpsilon(init=1.0, target=0.01)
         # .at() should accept iteration parameter (ignored) and return float
         val = pe.at(42)
@@ -798,10 +905,15 @@ class TestProgressiveEpsilon:
     def test_ema_smoothing_prevents_oscillation(self):
         """Multiple update() calls with EMA smoothing create a smooth trajectory."""
         from polystep.epsilon import ProgressiveEpsilon
+
         pe = ProgressiveEpsilon(
-            init=1.0, target=0.01, max_epsilon=5.0,
-            fast_threshold=0.1, slow_threshold=0.5,
-            decrease_factor=0.8, increase_factor=1.5,
+            init=1.0,
+            target=0.01,
+            max_epsilon=5.0,
+            fast_threshold=0.1,
+            slow_threshold=0.5,
+            decrease_factor=0.8,
+            increase_factor=1.5,
             ema_alpha=0.7,  # heavy smoothing
         )
         values = [pe.at()]
@@ -815,12 +927,9 @@ class TestProgressiveEpsilon:
 
         # With heavy EMA smoothing, changes between consecutive steps
         # should be relatively small (smoothed, not jumping wildly)
-        max_change = max(
-            abs(values[i+1] - values[i]) for i in range(len(values) - 1)
-        )
+        max_change = max(abs(values[i + 1] - values[i]) for i in range(len(values) - 1))
         # Without EMA, changes would be large (0.8x or 1.5x swings)
         # With EMA=0.7, each step changes by at most 30% of the raw change
         assert max_change < 0.5, (
-            f"EMA smoothing failed: max step change = {max_change:.4f}, "
-            f"values = {[f'{v:.4f}' for v in values]}"
+            f"EMA smoothing failed: max step change = {max_change:.4f}, values = {[f'{v:.4f}' for v in values]}"
         )

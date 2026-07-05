@@ -29,6 +29,7 @@ We also support `lam = inf` explicitly (the user-facing default for
 "go to full Sinkhorn") so downstream code can pass `float('inf')`
 without arithmetic on infinity.
 """
+
 from __future__ import annotations
 
 import math
@@ -69,20 +70,14 @@ class KLSoftmaxSolver:
     def __post_init__(self) -> None:
         if self.epsilon <= 0:
             raise ValueError(
-                f"epsilon must be > 0, got {self.epsilon}. "
-                "epsilon is the entropic temperature and must be positive."
+                f"epsilon must be > 0, got {self.epsilon}. epsilon is the entropic temperature and must be positive."
             )
         if self.lam < 0:
-            raise ValueError(
-                f"lam must be >= 0, got {self.lam}. "
-                "lam is the KL penalty on the column marginal."
-            )
+            raise ValueError(f"lam must be >= 0, got {self.lam}. lam is the KL penalty on the column marginal.")
         if self.threshold < 0:
             raise ValueError(f"threshold must be >= 0, got {self.threshold}")
         if self.max_iterations < 1:
-            raise ValueError(
-                f"max_iterations must be >= 1, got {self.max_iterations}"
-            )
+            raise ValueError(f"max_iterations must be >= 1, got {self.max_iterations}")
 
     @property
     def alpha(self) -> float:
@@ -123,8 +118,16 @@ class KLSoftmaxSolver:
         # Disable any outer mixed-precision autocast inside the iteration -
         # downcast LSE to BF16 collapses the dual potentials.
         with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
-            f = init_f.to(dtype=dtype, device=device).clone() if init_f is not None else torch.zeros(n, device=device, dtype=dtype)
-            g = init_g.to(dtype=dtype, device=device).clone() if init_g is not None else torch.zeros(m, device=device, dtype=dtype)
+            f = (
+                init_f.to(dtype=dtype, device=device).clone()
+                if init_f is not None
+                else torch.zeros(n, device=device, dtype=dtype)
+            )
+            g = (
+                init_g.to(dtype=dtype, device=device).clone()
+                if init_g is not None
+                else torch.zeros(m, device=device, dtype=dtype)
+            )
 
             # Special-case alpha == 0 (softmax limit): single closed-form.
             if alpha == 0.0:
@@ -141,13 +144,9 @@ class KLSoftmaxSolver:
                 threshold = float(self.threshold)
                 for it in range(self.max_iterations):
                     # f-update: exact row-marginal enforcement.
-                    f_new = eps * (log_a - torch.logsumexp(
-                        (g.unsqueeze(0) - C) / eps, dim=1
-                    ))
+                    f_new = eps * (log_a - torch.logsumexp((g.unsqueeze(0) - C) / eps, dim=1))
                     # g-update: α-fraction of full-Sinkhorn target.
-                    g_target = eps * (log_b - torch.logsumexp(
-                        (f_new.unsqueeze(1) - C) / eps, dim=0
-                    ))
+                    g_target = eps * (log_b - torch.logsumexp((f_new.unsqueeze(1) - C) / eps, dim=0))
                     g_new = alpha * g_target
 
                     if (it + 1) % check_every == 0 or it == self.max_iterations - 1:
@@ -168,8 +167,7 @@ class KLSoftmaxSolver:
             # Numerical hygiene
             if not torch.isfinite(P).all():
                 warnings.warn(
-                    "KLSoftmaxSolver produced non-finite transport entries; "
-                    "consider raising epsilon or lowering lam.",
+                    "KLSoftmaxSolver produced non-finite transport entries; consider raising epsilon or lowering lam.",
                     stacklevel=2,
                 )
                 P = torch.where(torch.isfinite(P), P, torch.zeros_like(P))

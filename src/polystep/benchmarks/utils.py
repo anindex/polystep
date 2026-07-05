@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 # ---------------------------------------------------------------------------
-# Standard validation seeds 
+# Standard validation seeds
 # ---------------------------------------------------------------------------
 
 # Benchmark validation seeds (3 seeds). Paper experiments use 5 seeds
@@ -242,6 +242,7 @@ def get_cifar10_loaders(
 # Check for HuggingFace datasets at module load time
 try:
     from datasets import load_dataset as _hf_load_dataset
+
     HAS_DATASETS = True
 except ImportError:
     HAS_DATASETS = False
@@ -316,7 +317,7 @@ def _build_vocab(texts: List[str], vocab_size: int) -> Dict[str, int]:
     sorted_words = sorted(word_counts.items(), key=lambda x: -x[1])
     vocab = {"<PAD>": 0, "<UNK>": 1}
 
-    for word, _ in sorted_words[:vocab_size - 2]:
+    for word, _ in sorted_words[: vocab_size - 2]:
         vocab[word] = len(vocab)
 
     return vocab
@@ -352,10 +353,7 @@ def get_sst2_loaders(
         ImportError: If HuggingFace datasets is not installed.
     """
     if not HAS_DATASETS:
-        raise ImportError(
-            "HuggingFace datasets required for SST-2 benchmark. "
-            "Install with: pip install datasets"
-        )
+        raise ImportError("HuggingFace datasets required for SST-2 benchmark. Install with: pip install datasets")
 
     print("  Loading SST-2 from HuggingFace datasets...")
     dataset = _hf_load_dataset("glue", "sst2", cache_dir=data_dir)
@@ -410,6 +408,7 @@ def get_sst2_loaders(
 # ---------------------------------------------------------------------------
 # Model factories
 # ---------------------------------------------------------------------------
+
 
 class MNISTNet(nn.Module):
     """Two-layer MLP for MNIST digit classification.
@@ -495,6 +494,7 @@ def create_model(
 # Evaluation utilities
 # ---------------------------------------------------------------------------
 
+
 @torch.no_grad()
 def evaluate_accuracy(model: nn.Module, dataloader: DataLoader) -> float:
     """Compute classification accuracy on a DataLoader.
@@ -538,6 +538,7 @@ def evaluate_accuracy(model: nn.Module, dataloader: DataLoader) -> float:
 # BenchmarkResult dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class BenchmarkResult:
     """Single optimizer run result.
@@ -555,6 +556,7 @@ class BenchmarkResult:
         convergence_epoch: Epoch when target accuracy first reached (None if never)
         epoch_logs: List of per-epoch metrics dicts
     """
+
     optimizer: str
     seed: int
     final_accuracy: float
@@ -575,6 +577,7 @@ class BenchmarkResult:
 # ---------------------------------------------------------------------------
 # Environment info collection
 # ---------------------------------------------------------------------------
+
 
 def get_environment_info() -> Dict[str, Any]:
     """Collect environment info for reproducibility.
@@ -604,6 +607,7 @@ def get_environment_info() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Output utilities
 # ---------------------------------------------------------------------------
+
 
 def compute_summary_stats(results: List[BenchmarkResult]) -> Dict[str, Dict[str, float]]:
     """Compute summary statistics grouped by optimizer.
@@ -708,14 +712,16 @@ def format_results_table(results: List[BenchmarkResult]) -> str:
         mean_mem = sum(r.peak_gpu_memory_mb for r in runs) / len(runs)
         total_evals = sum(r.function_evals for r in runs) // len(runs)  # Average
 
-        rows.append([
-            opt,
-            f"{mean_acc * 100:.1f}%",
-            f"+/-{std_acc * 100:.1f}%",
-            f"{mean_time:.1f}s",
-            f"{mean_mem:.0f}",
-            f"{total_evals:,}",
-        ])
+        rows.append(
+            [
+                opt,
+                f"{mean_acc * 100:.1f}%",
+                f"+/-{std_acc * 100:.1f}%",
+                f"{mean_time:.1f}s",
+                f"{mean_mem:.0f}",
+                f"{total_evals:,}",
+            ]
+        )
 
     return tabulate(rows, headers=headers, tablefmt="github")
 
@@ -753,6 +759,7 @@ def _format_results_simple(results: List[BenchmarkResult]) -> str:
 _HAS_SNNTORCH = False
 try:
     import snntorch as snn
+
     _HAS_SNNTORCH = True
 except ImportError:
     pass
@@ -761,6 +768,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Pure-PyTorch LIF neuron (fallback when snnTorch unavailable)
 # ---------------------------------------------------------------------------
+
 
 class LIFNeuron(nn.Module):
     """Leaky Integrate-and-Fire neuron with hard threshold spike.
@@ -801,6 +809,7 @@ class LIFNeuron(nn.Module):
 # ---------------------------------------------------------------------------
 # SNN models
 # ---------------------------------------------------------------------------
+
 
 class SpikingNet(nn.Module):
     """SNN with LIF neurons for classification.
@@ -912,6 +921,7 @@ class SpikingNet(nn.Module):
 # ---------------------------------------------------------------------------
 # N-MNIST data loading
 # ---------------------------------------------------------------------------
+
 
 def get_nmnist_loaders(
     data_dir: str = "/tmp/nmnist",
@@ -1061,6 +1071,7 @@ def _generate_synthetic_nmnist(
 # ---------------------------------------------------------------------------
 # DVS-Gesture data loading
 # ---------------------------------------------------------------------------
+
 
 def get_dvs_gesture_loaders(
     data_dir: str = "/tmp/dvs_gesture",
@@ -1216,6 +1227,7 @@ def _generate_synthetic_dvs_gesture(
 # ---------------------------------------------------------------------------
 # SNN evaluation utilities
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def evaluate_snn_accuracy(model: nn.Module, dataloader: DataLoader, scale_output: float = 10.0) -> float:

@@ -18,6 +18,7 @@ jobs:
           cache-dependency-path: 'pyproject.toml'
       - run: pip install ruff==0.15.12
       - run: ruff check src/polystep/ tests/
+      - run: ruff format --check src/polystep/ tests/
 
   test:
     runs-on: ubuntu-latest

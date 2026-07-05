@@ -4,6 +4,7 @@ Covers the shared validated prelude, fused/non-fused softmax scale_cost parity,
 and the new input-validation guards (epsilon revalidation, check_every,
 num_probe, numeric scale_cost).
 """
+
 import warnings
 
 import pytest
@@ -36,7 +37,7 @@ def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
     match it."""
     torch.manual_seed(0)
     P, dim = 6, 2
-    verts = get_orthoplex_vertices(dim)               # (V, dim), V = 2*dim
+    verts = get_orthoplex_vertices(dim)  # (V, dim), V = 2*dim
     V = verts.shape[0]
     cost = torch.randn(P, V)
     if variant == "inf":
@@ -54,7 +55,13 @@ def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
     # Fused path as wired in the optimizer: step sanitizes, branch scales.
     scaled = scale_cost_matrix(sanitize_cost(cost), scale_cost)
     _, fused_T, _ = _fused_softmax_project(
-        scaled, eps, a.float(), verts.float(), rot.float(), 0.15, X.float(),
+        scaled,
+        eps,
+        a.float(),
+        verts.float(),
+        rot.float(),
+        0.15,
+        X.float(),
         scale_cost_mean=False,
     )
     assert torch.isfinite(fused_T).all()
@@ -139,8 +146,10 @@ def test_batched_linear_honors_nondefault_activations():
     previously hardcoded leaky_relu(0.01)/gelu('none') -> silently wrong loss."""
     torch.manual_seed(0)
     model = nn.Sequential(
-        nn.Linear(6, 8), nn.LeakyReLU(0.3),
-        nn.Linear(8, 5), nn.GELU(approximate="tanh"),
+        nn.Linear(6, 8),
+        nn.LeakyReLU(0.3),
+        nn.Linear(8, 5),
+        nn.GELU(approximate="tanh"),
         nn.Linear(5, 3),
     )
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
@@ -150,10 +159,7 @@ def test_batched_linear_honors_nondefault_activations():
     inputs = torch.randn(B, 6)
     targets = torch.randint(0, 3, (B,))
     base = dict(model.named_parameters())
-    stacked = {
-        k: v.detach()[None].expand(N, *v.shape) + 0.05 * torch.randn(N, *v.shape)
-        for k, v in base.items()
-    }
+    stacked = {k: v.detach()[None].expand(N, *v.shape) + 0.05 * torch.randn(N, *v.shape) for k, v in base.items()}
     fast = ev._batched_linear.evaluate(stacked, inputs, targets)
     ref = ev._evaluate_loop(stacked, inputs, targets)  # functional_call on real model
     assert torch.allclose(fast, ref, atol=1e-5)
@@ -163,6 +169,25 @@ def test_batched_linear_skips_nondefault_flatten():
     """A non-default Flatten must fall back to vmap, not the bmm fast path."""
     model = nn.Sequential(nn.Flatten(start_dim=2), nn.Linear(6, 3))
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    assert ev._batched_linear is None
+
+
+def test_batched_linear_rejects_inline_functional_activations():
+    """A custom module applying activations inline (torch.relu in forward) has
+    no activation submodule, so the bmm plan reconstructed from named_children()
+    would silently omit it and compute a wrong (activation-free) loss. try_build
+    must detect the non-Sequential forward and fall back to the correct vmap path."""
+
+    class InlineMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(6, 8)
+            self.fc2 = nn.Linear(8, 3)
+
+        def forward(self, x):
+            return self.fc2(torch.relu(self.fc1(x)))
+
+    ev = NNCostEvaluator(InlineMLP(), nn.CrossEntropyLoss())
     assert ev._batched_linear is None
 
 

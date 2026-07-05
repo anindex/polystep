@@ -34,14 +34,14 @@ from typing import Dict
 import torch
 
 __all__ = [
-    'compute_cma_hyperparameters',
-    'update_evolution_path_c',
-    'update_evolution_path_sigma',
-    'update_step_size_csa',
-    'update_covariance_diagonal',
-    'compute_ot_weights',
-    'compute_heaviside_sigma',
-    'compute_ot_bias_directions',
+    "compute_cma_hyperparameters",
+    "update_evolution_path_c",
+    "update_evolution_path_sigma",
+    "update_step_size_csa",
+    "update_covariance_diagonal",
+    "compute_ot_weights",
+    "compute_heaviside_sigma",
+    "compute_ot_bias_directions",
 ]
 
 
@@ -82,25 +82,22 @@ def compute_cma_hyperparameters(n: int, mu_eff: float = 2.0) -> Dict[str, float]
 
     # Rank-mu learning rate (Eq. 6)
     # Ensure c_1 + c_mu <= 1
-    c_mu = min(
-        1 - c_1,
-        2 * (mu_eff - 2 + 1 / mu_eff) / ((n + 2) ** 2 + mu_eff)
-    )
+    c_mu = min(1 - c_1, 2 * (mu_eff - 2 + 1 / mu_eff) / ((n + 2) ** 2 + mu_eff))
 
     # Damping factor for step-size (Eq. 7)
     d_sigma = 1 + 2 * max(0, math.sqrt((mu_eff - 1) / (n + 1)) - 1) + c_sigma
 
     # Expected norm of N(0,I) in n dimensions
     # E[||N(0,I)||] ~ sqrt(n) * (1 - 1/(4n) + 1/(21n^2))
-    expected_norm = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n ** 2))
+    expected_norm = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n**2))
 
     return {
-        'c_sigma': c_sigma,
-        'c_c': c_c,
-        'c_1': c_1,
-        'c_mu': c_mu,
-        'd_sigma': d_sigma,
-        'expected_norm': expected_norm,
+        "c_sigma": c_sigma,
+        "c_c": c_c,
+        "c_1": c_1,
+        "c_mu": c_mu,
+        "d_sigma": d_sigma,
+        "expected_norm": expected_norm,
     }
 
 
@@ -266,7 +263,7 @@ def update_step_size_csa(
         Hansen CMA-ES Tutorial (arXiv:1604.00772), Equation 7.
     """
     # Expected norm of N(0,I) in n dimensions
-    expected_norm = math.sqrt(n) * (1.0 - 1.0 / (4 * n) + 1.0 / (21 * n ** 2))
+    expected_norm = math.sqrt(n) * (1.0 - 1.0 / (4 * n) + 1.0 / (21 * n**2))
     if p_sigma_norm is None:
         p_sigma_norm = torch.norm(p_sigma).item()
 
@@ -300,10 +297,10 @@ def update_covariance_diagonal(
     from the same sigma-normalized displacements.
 
     Formula:
-        C_diag[j] = h_factor * (1 - c_1 - c_mu) * C_diag[j]
+        C_diag[j] = old_coeff * C_diag[j]
                   + c_1 * p_c[j]^2
                   + c_mu * sum_k w_k * y_{k,j}^2
-        h_factor  = 1.0 if h_sigma else (1 - c_1 * c_c * (2 - c_c))
+        old_coeff = (1 - c_1 - c_mu) + (0 if h_sigma else c_1 * c_c * (2 - c_c))
 
     Args:
         C_diag: Current diagonal covariance, shape ``(subspace_dim,)``.
@@ -327,16 +324,20 @@ def update_covariance_diagonal(
         Time and Space Complexity", PPSN 2008.
     """
     # Rank-one update from the covariance evolution path.
-    rank_one = p_c ** 2
+    rank_one = p_c**2
 
     # Rank-mu update: canonical sep-CMA-ES squares the sigma-normalized
     # displacements y_k = (x_k - m)/sigma (already normalized by the caller),
     # the same quantity p_c accumulates, so both terms share one scale.
-    rank_mu = (weights[:, None] * (displacements ** 2)).sum(dim=0)
+    rank_mu = (weights[:, None] * (displacements**2)).sum(dim=0)
 
-    h_factor = 1.0 if h_sigma else (1 - c_1 * c_c * (2 - c_c))
+    # sep-CMA-ES old-covariance coefficient. When the Heaviside h_sigma is 0
+    # (step-size path stalled), the missing rank-one mass c_1*c_c*(2-c_c) is
+    # added back to the old-C weight (additive make-up), matching Hansen's form,
+    # rather than multiplied in.
+    old_coeff = (1 - c_1 - c_mu) + (0.0 if h_sigma else c_1 * c_c * (2 - c_c))
 
-    C_new = h_factor * (1 - c_1 - c_mu) * C_diag + c_1 * rank_one + c_mu * rank_mu
+    C_new = old_coeff * C_diag + c_1 * rank_one + c_mu * rank_mu
 
     cov_min = 1e-6
     cov_max = 1e6

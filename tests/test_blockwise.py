@@ -1,4 +1,5 @@
 """Tests for block-wise Sinkhorn decomposition and solver integration."""
+
 import pytest
 import torch
 import torch.nn as nn
@@ -39,9 +40,12 @@ class SimpleMLP(nn.Module):
 class TestBlockConfig:
     def test_block_config_frozen(self):
         bc = BlockConfig(
-            name="test", leaf_indices=(0,),
-            flat_start=0, flat_end=10,
-            num_particles=5, particle_dim=2,
+            name="test",
+            leaf_indices=(0,),
+            flat_start=0,
+            flat_end=10,
+            num_particles=5,
+            particle_dim=2,
         )
         assert bc.name == "test"
         assert bc.num_particles == 5
@@ -227,7 +231,7 @@ class TestBlockwiseSolverIntegration:
         solver = PolyStep(
             objective_fn=lambda x: x.sum(),  # placeholder, not used in block mode
             dim=layout.particle_dim,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             nn_evaluator=evaluator,
             layout=layout,
             train_inputs=inputs,
@@ -270,7 +274,7 @@ class TestBlockwiseSolverIntegration:
         solver = PolyStep(
             objective_fn=lambda x: x.sum(),
             dim=layout.particle_dim,
-            block_strategy='grouped',
+            block_strategy="grouped",
             block_group_size=2,
             nn_evaluator=evaluator,
             layout=layout,
@@ -301,7 +305,7 @@ class TestBlockwiseSolverIntegration:
             PolyStep(
                 objective_fn=lambda x: x.sum(),
                 dim=layout.particle_dim,
-                block_strategy='per_layer',
+                block_strategy="per_layer",
                 subspace=subspace,
                 layout=layout,
                 compile=False,
@@ -315,7 +319,7 @@ class TestBlockwiseSolverIntegration:
             PolyStep(
                 objective_fn=lambda x: x.sum(),
                 dim=layout.particle_dim,
-                block_strategy='invalid',
+                block_strategy="invalid",
                 layout=layout,
                 compile=False,
             )
@@ -366,7 +370,7 @@ class TestBlockLayoutConversion:
             def __init__(self):
                 super().__init__()
                 self.fc1 = nn.Linear(13, 1, bias=False)  # 13 params
-                self.fc2 = nn.Linear(5, 1, bias=False)   # 5 params
+                self.fc2 = nn.Linear(5, 1, bias=False)  # 5 params
 
         model = MisalignedModel()
         with torch.no_grad():
@@ -381,19 +385,20 @@ class TestBlockLayoutConversion:
         block_flat = layout_flat_to_block_flat(flat, blocks, layout)
 
         # Block 0: 13 fc1 params + 3 padding zeros
-        b0_data = block_flat[blocks[0].flat_start:blocks[0].flat_end]
+        b0_data = block_flat[blocks[0].flat_start : blocks[0].flat_end]
         assert torch.all(b0_data[:13] == 1.0)
         assert torch.all(b0_data[13:] == 0.0)
 
         # Block 1: 5 fc2 params + 3 padding zeros
-        b1_data = block_flat[blocks[1].flat_start:blocks[1].flat_end]
+        b1_data = block_flat[blocks[1].flat_start : blocks[1].flat_end]
         assert torch.all(b1_data[:5] == 2.0)
         assert torch.all(b1_data[5:] == 0.0)
 
     def test_batch_conversion_matches_unbatched(self):
         """Batch conversion produces same result as looping over single conversion."""
         from polystep.blockwise import (
-            layout_flat_to_block_flat, blocks_to_layout_flat,
+            layout_flat_to_block_flat,
+            blocks_to_layout_flat,
             blocks_to_layout_flat_batch,
         )
 
@@ -445,6 +450,7 @@ class TestBlockLayoutConversion:
         # Block 1 should contain [100, 101, 102] + 1 padding zero
         b1_flat = block_parts[1].reshape(-1)
         torch.testing.assert_close(
-            b1_flat[:3], torch.arange(100, 103, dtype=torch.float32),
+            b1_flat[:3],
+            torch.arange(100, 103, dtype=torch.float32),
         )
         assert b1_flat[3].item() == 0.0

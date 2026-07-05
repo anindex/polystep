@@ -61,7 +61,7 @@ class TestFeatureInteractions:
 
         opt = PolyStepOptimizer(
             model,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             use_adaptive_radius=True,
             radius_min=0.5,
             radius_max=3.0,
@@ -91,7 +91,7 @@ class TestFeatureInteractions:
         opt = PolyStepOptimizer(
             model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             compile=False,
             seed=42,
         )
@@ -109,7 +109,7 @@ class TestFeatureInteractions:
 
         opt = PolyStepOptimizer(
             model,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             use_adaptive_radius=True,
             radius_min=0.5,
             radius_max=3.0,
@@ -199,8 +199,13 @@ class TestParticleDimAdaptiveProbes:
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
 
         opt = PolyStepOptimizer(
-            model, particle_dim=4, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            particle_dim=4,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
 
         closure = _make_integration_closure(model)
@@ -214,10 +219,7 @@ class TestParticleDimAdaptiveProbes:
 
         # Model params should have changed
         updated_params = model.state_dict()
-        any_changed = any(
-            not torch.equal(initial_params[k], updated_params[k])
-            for k in initial_params
-        )
+        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Model parameters should change after 3 steps with particle_dim=4"
         assert opt.state.iteration_count == 3
 
@@ -228,8 +230,12 @@ class TestParticleDimAdaptiveProbes:
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
 
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         opt.solver.omega = 1.5
 
@@ -241,10 +247,7 @@ class TestParticleDimAdaptiveProbes:
 
         # Verify optimization proceeded
         updated_params = model.state_dict()
-        any_changed = any(
-            not torch.equal(initial_params[k], updated_params[k])
-            for k in initial_params
-        )
+        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Optimization should proceed with omega=1.5"
         assert opt.state.iteration_count == 3
 
@@ -283,8 +286,13 @@ class TestParticleDimAdaptiveProbes:
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
 
         opt = PolyStepOptimizer(
-            model, adaptive_probes=True, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            adaptive_probes=True,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
 
         closure = _make_integration_closure(model)
@@ -300,10 +308,7 @@ class TestParticleDimAdaptiveProbes:
 
         # Verify optimization happened
         updated_params = model.state_dict()
-        any_changed = any(
-            not torch.equal(initial_params[k], updated_params[k])
-            for k in initial_params
-        )
+        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Optimization should proceed with adaptive_probes=True"
 
 
@@ -325,8 +330,8 @@ class TestSinkhornAccelerationComposition:
 
         opt = PolyStepOptimizer(
             model,
-            particle_dim=4,           # improvement 1
-            adaptive_probes=True,     # improvement 4
+            particle_dim=4,  # improvement 1
+            adaptive_probes=True,  # improvement 4
             epsilon=0.1,
             max_iterations=50,
             sinkhorn_max_iters=100,
@@ -345,10 +350,7 @@ class TestSinkhornAccelerationComposition:
 
         # Verify optimization happened (params changed)
         updated_params = model.state_dict()
-        any_changed = any(
-            not torch.equal(initial_params[k], updated_params[k])
-            for k in initial_params
-        )
+        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Full-space composition should produce parameter changes"
 
         # Verify no NaN in state
@@ -366,8 +368,8 @@ class TestSinkhornAccelerationComposition:
         opt = PolyStepOptimizer(
             model,
             subspace=subspace,
-            rank_schedule=schedule,     # improvement 3
-            adaptive_probes=True,       # improvement 4
+            rank_schedule=schedule,  # improvement 3
+            adaptive_probes=True,  # improvement 4
             epsilon=0.1,
             max_iterations=50,
             sinkhorn_max_iters=100,
@@ -430,10 +432,7 @@ class TestTurboBlockwiseRegression:
         # Verify optimization succeeded
         assert opt.state.iteration_count == 3
         updated_params = model.state_dict()
-        any_changed = any(
-            not torch.equal(initial_params[k], updated_params[k])
-            for k in initial_params
-        )
+        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Default optimization should still update parameters"
 
         # Verify reproducibility (same seed gives same results)
@@ -453,6 +452,4 @@ class TestTurboBlockwiseRegression:
             losses2.append(opt2.step(closure2))
 
         for i, (l1, l2) in enumerate(zip(losses, losses2)):
-            assert abs(l1 - l2) < 1e-6, (
-                f"Step {i}: losses differ ({l1} vs {l2}), default behavior not reproducible"
-            )
+            assert abs(l1 - l2) < 1e-6, f"Step {i}: losses differ ({l1} vs {l2}), default behavior not reproducible"

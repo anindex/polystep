@@ -1,4 +1,5 @@
 """Tests for LowRankSubspace and LinearSubspace compression and solver integration."""
+
 import math
 
 import pytest
@@ -40,6 +41,7 @@ class ConvModel(nn.Module):
 
 class BiasOnlyModel(nn.Module):
     """Model with only 1D parameters (biases)."""
+
     def __init__(self):
         super().__init__()
         self.ln = nn.LayerNorm(8)
@@ -155,9 +157,7 @@ class TestApplyPerturbation:
 
         for key in base_sd:
             if key in result:
-                assert torch.allclose(result[key], base_sd[key], atol=1e-6), (
-                    f"Key {key} differs with zero perturbation"
-                )
+                assert torch.allclose(result[key], base_sd[key], atol=1e-6), f"Key {key} differs with zero perturbation"
 
     def test_apply_perturbation_nonzero(self):
         """Nonzero perturbation changes parameters."""
@@ -201,8 +201,7 @@ class TestReconstructBatch:
             assert spec.entry_key in result
             expected_shape = (N, *spec.original_shape)
             assert result[spec.entry_key].shape == expected_shape, (
-                f"{spec.entry_key}: expected {expected_shape}, "
-                f"got {result[spec.entry_key].shape}"
+                f"{spec.entry_key}: expected {expected_shape}, got {result[spec.entry_key].shape}"
             )
 
     def test_reconstruct_batch_consistency(self):
@@ -220,9 +219,9 @@ class TestReconstructBatch:
         for i in range(N):
             single_result = sub.apply_perturbation(base_sd, flat_batch[i])
             for key in single_result:
-                assert torch.allclose(
-                    batch_result[key][i], single_result[key], atol=1e-5
-                ), f"Row {i}, key {key} mismatch between batch and single"
+                assert torch.allclose(batch_result[key][i], single_result[key], atol=1e-5), (
+                    f"Row {i}, key {key} mismatch between batch and single"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +407,7 @@ class TestSolverIntegration:
     def test_solver_state_optional_fields_default_none(self):
         """SolverState optional fields default to None."""
         from polystep.solver import SolverState
+
         state = SolverState(X=torch.randn(5, 2))
         assert state.base_params is None
         assert state.subspace is None
@@ -473,9 +473,7 @@ class TestLinearSubspaceApplyPerturbation:
 
         for key in base_sd:
             if key in result:
-                assert torch.allclose(result[key], base_sd[key], atol=1e-6), (
-                    f"Key {key} differs with zero perturbation"
-                )
+                assert torch.allclose(result[key], base_sd[key], atol=1e-6), f"Key {key} differs with zero perturbation"
 
     def test_apply_perturbation_nonzero_linear(self):
         """Nonzero perturbation changes parameters."""
@@ -513,8 +511,7 @@ class TestLinearSubspaceReconstructBatch:
             assert spec.entry_key in result
             expected_shape = (N, *spec.original_shape)
             assert result[spec.entry_key].shape == expected_shape, (
-                f"{spec.entry_key}: expected {expected_shape}, "
-                f"got {result[spec.entry_key].shape}"
+                f"{spec.entry_key}: expected {expected_shape}, got {result[spec.entry_key].shape}"
             )
 
     def test_reconstruct_batch_consistency_linear(self):
@@ -532,9 +529,9 @@ class TestLinearSubspaceReconstructBatch:
         for i in range(N):
             single_result = sub.apply_perturbation(base_sd, flat_batch[i])
             for key in single_result:
-                assert torch.allclose(
-                    batch_result[key][i], single_result[key], atol=1e-5
-                ), f"Row {i}, key {key} mismatch between batch and single"
+                assert torch.allclose(batch_result[key][i], single_result[key], atol=1e-5), (
+                    f"Row {i}, key {key} mismatch between batch and single"
+                )
 
 
 class TestLinearSubspaceAbsorb:

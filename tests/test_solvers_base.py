@@ -1,4 +1,5 @@
 """Unit tests for SolverResult dataclass schema."""
+
 import torch
 
 
@@ -8,6 +9,7 @@ class TestSolverResult:
     def test_solver_result_fields(self):
         """SolverResult has all required fields with correct defaults."""
         from polystep.solvers import SolverResult
+
         matrix = torch.rand(5, 8)
         result = SolverResult(matrix=matrix, cost=1.23)
         assert torch.equal(result.matrix, matrix)

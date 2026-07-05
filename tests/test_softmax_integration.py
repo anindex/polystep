@@ -4,6 +4,7 @@ Verifies the solver strategy pattern works end-to-end: solver selection,
 ProgressiveEpsilon blocking, functional step(), turbo features, subspace
 modes, and epsilon sharing.
 """
+
 import pytest
 import torch
 import torch.nn as nn
@@ -88,18 +89,18 @@ class TestSolverSelection:
     def test_explicit_sinkhorn_with_subspace(self, model, layout):
         """solver='sinkhorn' override with subspace uses SinkhornSolver."""
         sub = LinearSubspace.from_layout(layout, rank=4)
-        opt = PolyStepOptimizer(model, subspace=sub, solver='sinkhorn')
+        opt = PolyStepOptimizer(model, subspace=sub, solver="sinkhorn")
         assert isinstance(opt.solver, SinkhornSolver)
 
     def test_explicit_softmax_without_subspace(self, model):
         """solver='softmax' override without subspace uses SoftmaxSolver."""
-        opt = PolyStepOptimizer(model, solver='softmax')
+        opt = PolyStepOptimizer(model, solver="softmax")
         assert isinstance(opt.solver, SoftmaxSolver)
 
     def test_invalid_solver_raises_value_error(self, model):
         """solver='invalid' raises ValueError."""
         with pytest.raises(ValueError, match="Unknown solver"):
-            PolyStepOptimizer(model, solver='invalid')
+            PolyStepOptimizer(model, solver="invalid")
 
     def test_solver_none_auto_detects(self, model, layout):
         """solver=None auto-selects based on subspace presence."""
@@ -123,11 +124,11 @@ class TestProgressiveEpsilonBlocking:
     def test_auto_epsilon_with_softmax_raises(self, model):
         """auto_epsilon=True with solver='softmax' raises ValueError."""
         with pytest.raises(ValueError, match="ProgressiveEpsilon"):
-            PolyStepOptimizer(model, solver='softmax', auto_epsilon=True)
+            PolyStepOptimizer(model, solver="softmax", auto_epsilon=True)
 
     def test_auto_epsilon_with_sinkhorn_ok(self, model):
         """auto_epsilon=True with solver='sinkhorn' does NOT raise."""
-        opt = PolyStepOptimizer(model, solver='sinkhorn', auto_epsilon=True)
+        opt = PolyStepOptimizer(model, solver="sinkhorn", auto_epsilon=True)
         assert opt._progressive_epsilon is not None
 
     def test_auto_epsilon_auto_subspace_raises(self, model, layout):
@@ -148,7 +149,7 @@ class TestSoftmaxFunctionalStep:
     @pytest.mark.timeout(30)
     def test_step_with_softmax_returns_finite(self, model, closure):
         """Softmax step returns finite loss value."""
-        opt = PolyStepOptimizer(model, solver='softmax', epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         loss = opt.step(closure)
         assert isinstance(loss, float)
         assert not (loss != loss), "Loss is NaN"  # NaN check
@@ -157,7 +158,7 @@ class TestSoftmaxFunctionalStep:
     def test_step_updates_model_params(self, model, closure):
         """Softmax step actually updates model parameters."""
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-        opt = PolyStepOptimizer(model, solver='softmax', epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         opt.step(closure)
         changed = False
         for k, v in model.state_dict().items():
@@ -169,7 +170,7 @@ class TestSoftmaxFunctionalStep:
     @pytest.mark.timeout(60)
     def test_multiple_steps_no_crash(self, model, closure):
         """3 consecutive softmax steps execute without error."""
-        opt = PolyStepOptimizer(model, solver='softmax', epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         losses = []
         for _ in range(3):
             loss = opt.step(closure)
@@ -179,7 +180,7 @@ class TestSoftmaxFunctionalStep:
     @pytest.mark.timeout(30)
     def test_state_f_g_none_after_softmax_solve(self, model, closure):
         """After softmax solve step, state.f and state.g are None."""
-        opt = PolyStepOptimizer(model, solver='softmax', epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         opt.step(closure)
         state = opt._state
         assert state.f is None, "state.f should be None after softmax solve"
@@ -188,7 +189,7 @@ class TestSoftmaxFunctionalStep:
     @pytest.mark.timeout(30)
     def test_state_f_g_tensor_after_sinkhorn_solve(self, model, closure):
         """After sinkhorn solve step, state.f and state.g are tensors."""
-        opt = PolyStepOptimizer(model, solver='sinkhorn', epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="sinkhorn", epsilon=0.5)
         opt.step(closure)
         state = opt._state
         assert isinstance(state.f, torch.Tensor), "state.f should be Tensor after sinkhorn"
@@ -207,8 +208,11 @@ class TestTurboFeaturesWithSoftmax:
     def test_amortize_steps_with_softmax(self, model, closure):
         """EMA amortization (amortize_steps=2) works with softmax solver."""
         opt = PolyStepOptimizer(
-            model, solver='softmax', epsilon=0.5,
-            amortize_steps=2, amortize_ema=0.7,
+            model,
+            solver="softmax",
+            epsilon=0.5,
+            amortize_steps=2,
+            amortize_ema=0.7,
         )
         for _ in range(4):
             loss = opt.step(closure)
@@ -218,7 +222,9 @@ class TestTurboFeaturesWithSoftmax:
     def test_biased_rotation_with_softmax(self, model, closure):
         """Transport-biased rotation (biased_rotation=True) works with softmax."""
         opt = PolyStepOptimizer(
-            model, solver='softmax', epsilon=0.5,
+            model,
+            solver="softmax",
+            epsilon=0.5,
             biased_rotation=True,
         )
         for _ in range(3):
@@ -229,7 +235,9 @@ class TestTurboFeaturesWithSoftmax:
     def test_adaptive_probes_with_softmax(self, model, closure):
         """Adaptive probes (adaptive_probes=True) works with softmax."""
         opt = PolyStepOptimizer(
-            model, solver='softmax', epsilon=0.5,
+            model,
+            solver="softmax",
+            epsilon=0.5,
             adaptive_probes=True,
         )
         for _ in range(3):
@@ -240,7 +248,9 @@ class TestTurboFeaturesWithSoftmax:
     def test_momentum_with_softmax(self, model, closure):
         """Momentum (use_momentum=True) works with softmax."""
         opt = PolyStepOptimizer(
-            model, solver='softmax', epsilon=0.5,
+            model,
+            solver="softmax",
+            epsilon=0.5,
             use_momentum=True,
         )
         for _ in range(3):
@@ -280,7 +290,7 @@ class TestSubspaceModes:
     def test_hybrid_subspace_with_sinkhorn_override(self, model, layout):
         """HybridSubspace with solver='sinkhorn' override works."""
         sub = HybridSubspace.from_layout(layout, rank=4, rotation_interval=0)
-        opt = PolyStepOptimizer(model, subspace=sub, solver='sinkhorn', epsilon=0.5)
+        opt = PolyStepOptimizer(model, subspace=sub, solver="sinkhorn", epsilon=0.5)
         assert isinstance(opt.solver, SinkhornSolver)
         closure = _make_closure(model)
         loss = opt.step(closure)
@@ -300,7 +310,8 @@ class TestEpsilonSharing:
         """LinearEpsilon schedule updates solver.epsilon between steps."""
         eps_schedule = LinearEpsilon(init=1.0, target=0.01, decay=0.3)
         opt = PolyStepOptimizer(
-            model, solver='softmax',
+            model,
+            solver="softmax",
             epsilon=eps_schedule,
         )
         closure = _make_closure(model)
@@ -318,14 +329,12 @@ class TestEpsilonSharing:
         # The epsilon schedule should give decreasing values
         eps_step0 = eps_schedule.at(0)
         eps_step1 = eps_schedule.at(1)
-        assert eps_step1 < eps_step0, (
-            f"LinearEpsilon should decrease: step0={eps_step0}, step1={eps_step1}"
-        )
+        assert eps_step1 < eps_step0, f"LinearEpsilon should decrease: step0={eps_step0}, step1={eps_step1}"
 
     @pytest.mark.timeout(60)
     def test_fixed_epsilon_with_softmax(self, model):
         """Fixed float epsilon works with softmax solver."""
-        opt = PolyStepOptimizer(model, solver='softmax', epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         closure = _make_closure(model)
         loss = opt.step(closure)
         assert isinstance(loss, float)
@@ -345,7 +354,9 @@ class TestDualMomentumGuard:
     def test_dual_momentum_with_softmax_no_crash(self, model, closure):
         """dual_momentum_beta > 0 with softmax doesn't crash (None.clone guard)."""
         opt = PolyStepOptimizer(
-            model, solver='softmax', epsilon=0.5,
+            model,
+            solver="softmax",
+            epsilon=0.5,
             dual_momentum_beta=0.5,
         )
         for _ in range(3):
@@ -377,7 +388,7 @@ class TestFusedSoftmaxDispatch:
 
     def test_fused_softmax_path_inactive_with_sinkhorn(self, model):
         """Fused path is NOT active when solver='sinkhorn'."""
-        opt = PolyStepOptimizer(model, solver='sinkhorn', epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="sinkhorn", epsilon=0.5)
         assert opt._use_fused_softmax is False, "_use_fused_softmax should be False for sinkhorn solver"
 
     @pytest.mark.timeout(60)
@@ -385,9 +396,12 @@ class TestFusedSoftmaxDispatch:
         """Fused path works with biased_rotation + amortization."""
         sub = LinearSubspace.from_layout(layout, rank=4)
         opt = PolyStepOptimizer(
-            model, subspace=sub, epsilon=0.5,
+            model,
+            subspace=sub,
+            epsilon=0.5,
             biased_rotation=True,
-            amortize_steps=2, amortize_ema=0.7,
+            amortize_steps=2,
+            amortize_ema=0.7,
         )
         assert opt._use_fused_softmax is True
         closure = _make_closure(model)
@@ -411,7 +425,7 @@ class TestFusedSoftmaxDispatch:
     @pytest.mark.timeout(60)
     def test_fused_path_monolithic_no_subspace(self, model):
         """Fused path works in monolithic mode without subspace."""
-        opt = PolyStepOptimizer(model, solver='softmax', epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         assert opt._use_fused_softmax is True
         closure = _make_closure(model)
         losses = []
@@ -435,8 +449,11 @@ class TestK1ReshapeShortcut:
         sub = LinearSubspace.from_layout(layout, rank=4)
         # num_probe=1 means K=1
         opt = PolyStepOptimizer(
-            model, subspace=sub, epsilon=0.5,
-            num_probe=1, seed=42,
+            model,
+            subspace=sub,
+            epsilon=0.5,
+            num_probe=1,
+            seed=42,
         )
         closure = _make_closure(model)
         losses = []
@@ -451,8 +468,11 @@ class TestK1ReshapeShortcut:
         """K=3 (num_probe=3) still uses the .mean(dim=-1) path -- no breakage."""
         sub = LinearSubspace.from_layout(layout, rank=4)
         opt = PolyStepOptimizer(
-            model, subspace=sub, epsilon=0.5,
-            num_probe=3, seed=42,
+            model,
+            subspace=sub,
+            epsilon=0.5,
+            num_probe=3,
+            seed=42,
         )
         closure = _make_closure(model)
         losses = []
@@ -466,8 +486,11 @@ class TestK1ReshapeShortcut:
     def test_k1_with_sinkhorn_solver(self, model):
         """K=1 shortcut works with sinkhorn solver too (not just softmax)."""
         opt = PolyStepOptimizer(
-            model, solver='sinkhorn', epsilon=0.5,
-            num_probe=1, seed=42,
+            model,
+            solver="sinkhorn",
+            epsilon=0.5,
+            num_probe=1,
+            seed=42,
         )
         closure = _make_closure(model)
         loss = opt.step(closure)
@@ -489,7 +512,7 @@ class TestSoftmaxEdgeCases:
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
         optimizer = PolyStepOptimizer(
             model,
-            solver='softmax',
+            solver="softmax",
             compile=False,
             seed=42,
             particle_dim=49,
@@ -510,7 +533,7 @@ class TestSoftmaxEdgeCases:
     def test_no_gradient_leakage(self):
         """After softmax optimizer.step(), all param.grad is None."""
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
-        optimizer = PolyStepOptimizer(model, solver='softmax', compile=False, seed=42)
+        optimizer = PolyStepOptimizer(model, solver="softmax", compile=False, seed=42)
 
         evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
         inputs = torch.randn(16, 4)

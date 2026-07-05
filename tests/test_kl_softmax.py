@@ -6,6 +6,7 @@ Sinkhorn solver (`lam=inf`). Tests cover the limit recoveries,
 intermediate marginal interpolation, NaN-safety at small epsilon,
 and monotonic convergence of the marginal error.
 """
+
 from __future__ import annotations
 
 import math
@@ -130,16 +131,25 @@ def test_default_uniform_marginals_when_a_b_none() -> None:
     res = KLSoftmaxSolver(epsilon=0.1, lam=1.0).solve(C)
     # Default a uniform -> row sums uniform 1/6
     torch.testing.assert_close(
-        res.matrix.sum(dim=1), torch.full((6,), 1.0 / 6), atol=1e-3, rtol=0,
+        res.matrix.sum(dim=1),
+        torch.full((6,), 1.0 / 6),
+        atol=1e-3,
+        rtol=0,
     )
 
 
 def test_inf_lam_treated_as_full_sinkhorn() -> None:
     C, a, b = _make_problem()
     res_inf = KLSoftmaxSolver(
-        epsilon=0.1, lam=float("inf"), max_iterations=2000, threshold=1e-8,
+        epsilon=0.1,
+        lam=float("inf"),
+        max_iterations=2000,
+        threshold=1e-8,
     ).solve(C, a=a, b=b)
     res_huge = KLSoftmaxSolver(
-        epsilon=0.1, lam=1e6, max_iterations=2000, threshold=1e-8,
+        epsilon=0.1,
+        lam=1e6,
+        max_iterations=2000,
+        threshold=1e-8,
     ).solve(C, a=a, b=b)
     torch.testing.assert_close(res_inf.matrix, res_huge.matrix, atol=1e-3, rtol=1e-3)

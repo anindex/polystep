@@ -10,6 +10,7 @@ Key properties:
     - Single iteration (converged=True, n_iters=1)
     - Numerical stability via PyTorch's built-in softmax (subtracts row-max)
 """
+
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -75,7 +76,8 @@ class SoftmaxSolver:
             ValueError: If epsilon <= 0.
         """
         validate_positive(
-            self.epsilon, "epsilon",
+            self.epsilon,
+            "epsilon",
             "epsilon is the temperature in softmax(-C/epsilon).",
         )
 

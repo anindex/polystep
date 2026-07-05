@@ -14,6 +14,7 @@ Design note - no per-step host syncs: ``sanitize_cost`` is branch-free (no
 Value checks that would force a device->host sync are intentionally omitted so
 the hot path (a fresh solve every optimizer step) stays GPU-resident.
 """
+
 import warnings
 from typing import Optional
 
@@ -91,8 +92,7 @@ def align_dual(
         return None
     if init.shape != (n,):
         warnings.warn(
-            f"warm-start {name} shape mismatch: expected ({n},), "
-            f"got {tuple(init.shape)}. Falling back to zeros.",
+            f"warm-start {name} shape mismatch: expected ({n},), got {tuple(init.shape)}. Falling back to zeros.",
             stacklevel=2,
         )
         return None

@@ -9,6 +9,7 @@ Provides two non-iterative solvers that bypass entropic OT entirely:
 Both produce transport matrices compatible with the standard barycentric
 projection (Eq. 7) and conform to the ``Solver`` protocol.
 """
+
 from dataclasses import dataclass
 from typing import Optional, Union
 

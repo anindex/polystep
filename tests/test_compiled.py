@@ -1,4 +1,5 @@
 """Tests for compilation infrastructure: fallback, numerical equivalence."""
+
 import inspect
 import warnings
 
@@ -142,14 +143,10 @@ class TestRotateAndTranslateEquivalence:
         polytope_vertices = torch.randn(V, d)
         origin = torch.randn(B, d)
 
-        sp_direct, rot_direct = _rotate_and_translate(
-            rot_mats, polytope_vertices, origin, step_radius
-        )
+        sp_direct, rot_direct = _rotate_and_translate(rot_mats, polytope_vertices, origin, step_radius)
 
         cf = CompiledFunctions(compile=False)
-        sp_cf, rot_cf = cf.rotate_and_translate(
-            rot_mats, polytope_vertices, origin, step_radius
-        )
+        sp_cf, rot_cf = cf.rotate_and_translate(rot_mats, polytope_vertices, origin, step_radius)
 
         torch.testing.assert_close(sp_direct, sp_cf)
         torch.testing.assert_close(rot_direct, rot_cf)
@@ -193,10 +190,16 @@ class TestSinkhornSolverCompileFlagEquivalence:
         cost_matrix = torch.rand(n, m) + 0.01
 
         solver_compiled = SinkhornSolver(
-            compile=True, max_iterations=100, threshold=-1, epsilon=0.1,
+            compile=True,
+            max_iterations=100,
+            threshold=-1,
+            epsilon=0.1,
         )
         solver_eager = SinkhornSolver(
-            compile=False, max_iterations=100, threshold=-1, epsilon=0.1,
+            compile=False,
+            max_iterations=100,
+            threshold=-1,
+            epsilon=0.1,
         )
 
         result_compiled = solver_compiled.solve(cost_matrix.clone())
@@ -219,12 +222,20 @@ class TestPolyStepCompileFlagEquivalence:
             return x.pow(2).sum(-1)
 
         solver_compiled = PolyStep(
-            objective_fn=objective_fn, dim=dim, compile=True,
-            max_iterations=3, sinkhorn_max_iters=50, threshold=-1,
+            objective_fn=objective_fn,
+            dim=dim,
+            compile=True,
+            max_iterations=3,
+            sinkhorn_max_iters=50,
+            threshold=-1,
         )
         solver_eager = PolyStep(
-            objective_fn=objective_fn, dim=dim, compile=False,
-            max_iterations=3, sinkhorn_max_iters=50, threshold=-1,
+            objective_fn=objective_fn,
+            dim=dim,
+            compile=False,
+            max_iterations=3,
+            sinkhorn_max_iters=50,
+            threshold=-1,
         )
 
         X_init = torch.randn(num_particles, dim)
@@ -236,7 +247,10 @@ class TestPolyStepCompileFlagEquivalence:
         state_eager = solver_eager.run(X_init.clone(), generator=g2)
 
         torch.testing.assert_close(
-            state_compiled.X, state_eager.X, atol=1e-5, rtol=1e-5,
+            state_compiled.X,
+            state_eager.X,
+            atol=1e-5,
+            rtol=1e-5,
         )
 
 
@@ -253,25 +267,22 @@ class TestPolyStepCompileFlagEquivalence:
 class TestCompiledFunctionsNoGraphBreaks:
     """Test 12: Static check that compiled functions avoid graph-break patterns."""
 
-    @pytest.mark.parametrize("fn", [
-        _sinkhorn_iteration,
-        _rotate_and_translate,
-        _barycentric_projection,
-        _compute_probe_points,
-    ], ids=["sinkhorn_iteration", "rotate_and_translate",
-            "barycentric_projection", "compute_probe_points"])
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            _sinkhorn_iteration,
+            _rotate_and_translate,
+            _barycentric_projection,
+            _compute_probe_points,
+        ],
+        ids=["sinkhorn_iteration", "rotate_and_translate", "barycentric_projection", "compute_probe_points"],
+    )
     def test_no_graph_break_patterns(self, fn):
         source = inspect.getsource(fn)
 
-        assert ".item()" not in source, (
-            f"{fn.__name__} contains .item() which causes graph breaks"
-        )
-        assert ".append(" not in source, (
-            f"{fn.__name__} contains .append() which causes graph breaks"
-        )
-        assert ".tolist()" not in source, (
-            f"{fn.__name__} contains .tolist() which causes graph breaks"
-        )
+        assert ".item()" not in source, f"{fn.__name__} contains .item() which causes graph breaks"
+        assert ".append(" not in source, f"{fn.__name__} contains .append() which causes graph breaks"
+        assert ".tolist()" not in source, f"{fn.__name__} contains .tolist() which causes graph breaks"
 
 
 # ---------------------------------------------------------------------------
@@ -338,12 +349,15 @@ class TestGPUGraphBreakVerification:
     graph breaks.
     """
 
-    @pytest.mark.parametrize("fn_name,fn,make_args", [
-        ("sinkhorn_iteration", _sinkhorn_iteration, _make_sinkhorn_args),
-        ("rotate_and_translate", _rotate_and_translate, _make_rotate_args),
-        ("barycentric_projection", _barycentric_projection, _make_barycentric_args),
-        ("compute_probe_points", _compute_probe_points, _make_probe_args),
-    ])
+    @pytest.mark.parametrize(
+        "fn_name,fn,make_args",
+        [
+            ("sinkhorn_iteration", _sinkhorn_iteration, _make_sinkhorn_args),
+            ("rotate_and_translate", _rotate_and_translate, _make_rotate_args),
+            ("barycentric_projection", _barycentric_projection, _make_barycentric_args),
+            ("compute_probe_points", _compute_probe_points, _make_probe_args),
+        ],
+    )
     def test_fullgraph_compilation_succeeds(self, fn_name, fn, make_args):
         """fullgraph=True raises on graph breaks; success = zero breaks."""
         torch._dynamo.reset()
@@ -372,12 +386,15 @@ class TestDynamoExplainVerification:
     empty). This provides explicit proof of zero graph breaks.
     """
 
-    @pytest.mark.parametrize("fn_name,fn,make_args", [
-        ("sinkhorn_iteration", _sinkhorn_iteration, _make_sinkhorn_args),
-        ("rotate_and_translate", _rotate_and_translate, _make_rotate_args),
-        ("barycentric_projection", _barycentric_projection, _make_barycentric_args),
-        ("compute_probe_points", _compute_probe_points, _make_probe_args),
-    ])
+    @pytest.mark.parametrize(
+        "fn_name,fn,make_args",
+        [
+            ("sinkhorn_iteration", _sinkhorn_iteration, _make_sinkhorn_args),
+            ("rotate_and_translate", _rotate_and_translate, _make_rotate_args),
+            ("barycentric_projection", _barycentric_projection, _make_barycentric_args),
+            ("compute_probe_points", _compute_probe_points, _make_probe_args),
+        ],
+    )
     def test_single_graph_no_breaks(self, fn_name, fn, make_args):
         """torch._dynamo.explain confirms exactly 1 graph and 0 break reasons."""
         torch._dynamo.reset()
@@ -385,12 +402,10 @@ class TestDynamoExplainVerification:
         args = make_args(device)
         explanation = torch._dynamo.explain(fn)(*args)
         assert explanation.graph_count == 1, (
-            f"{fn_name}: expected 1 graph, got {explanation.graph_count}. "
-            f"Break reasons: {explanation.break_reasons}"
+            f"{fn_name}: expected 1 graph, got {explanation.graph_count}. Break reasons: {explanation.break_reasons}"
         )
         assert len(explanation.break_reasons) == 0, (
-            f"{fn_name}: expected 0 break reasons, got {len(explanation.break_reasons)}: "
-            f"{explanation.break_reasons}"
+            f"{fn_name}: expected 0 break reasons, got {len(explanation.break_reasons)}: {explanation.break_reasons}"
         )
 
 
@@ -419,11 +434,17 @@ class TestFusedSoftmaxProjectReturnTypes:
     """Test 15: _fused_softmax_project returns tuple of 3 tensors."""
 
     def test_returns_tuple_of_three_tensors(self):
-        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = (
-            _make_fused_softmax_args(torch.device("cpu"))
+        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = _make_fused_softmax_args(
+            torch.device("cpu")
         )
         result = _fused_softmax_project(
-            cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X,
+            cost_matrix,
+            epsilon,
+            a,
+            polytope_verts,
+            rot_mats,
+            step_radius,
+            X,
         )
         assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
         assert len(result) == 3, f"Expected 3 elements, got {len(result)}"
@@ -438,11 +459,17 @@ class TestFusedSoftmaxProjectShapes:
 
     def test_output_shapes(self):
         P, V, dim = 10, 8, 4
-        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = (
-            _make_fused_softmax_args(torch.device("cpu"), P=P, V=V, dim=dim)
+        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = _make_fused_softmax_args(
+            torch.device("cpu"), P=P, V=V, dim=dim
         )
         X_new, transport, ent_cost = _fused_softmax_project(
-            cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X,
+            cost_matrix,
+            epsilon,
+            a,
+            polytope_verts,
+            rot_mats,
+            step_radius,
+            X,
         )
         assert X_new.shape == (P, dim), f"X_new shape {X_new.shape} != ({P}, {dim})"
         assert transport.shape == (P, V), f"transport shape {transport.shape} != ({P}, {V})"
@@ -482,7 +509,13 @@ class TestFusedSoftmaxProjectEquivalence:
 
         # --- Fused path ---
         X_new_fused, transport_fused, ent_cost_fused = _fused_softmax_project(
-            cost_matrix.clone(), epsilon, a, polytope_verts, rot_mats, step_radius, X,
+            cost_matrix.clone(),
+            epsilon,
+            a,
+            polytope_verts,
+            rot_mats,
+            step_radius,
+            X,
         )
 
         # Check equivalence
@@ -502,11 +535,17 @@ class TestFusedSoftmaxProjectTransportRowSums:
 
     def test_transport_row_sums_equal_a(self):
         P, V, dim = 10, 8, 4
-        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = (
-            _make_fused_softmax_args(torch.device("cpu"), P=P, V=V, dim=dim)
+        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = _make_fused_softmax_args(
+            torch.device("cpu"), P=P, V=V, dim=dim
         )
         _, transport, _ = _fused_softmax_project(
-            cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X,
+            cost_matrix,
+            epsilon,
+            a,
+            polytope_verts,
+            rot_mats,
+            step_radius,
+            X,
         )
         row_sums = transport.sum(dim=-1)
         assert torch.allclose(row_sums, a, atol=1e-6), (
@@ -535,7 +574,13 @@ class TestFusedSoftmaxProjectNoScaling:
         transport_expected = W_expected * a.unsqueeze(-1)
 
         _, transport_fused, _ = _fused_softmax_project(
-            cost_matrix.clone(), epsilon, a, polytope_verts, rot_mats, step_radius, X,
+            cost_matrix.clone(),
+            epsilon,
+            a,
+            polytope_verts,
+            rot_mats,
+            step_radius,
+            X,
             scale_cost_mean=False,
         )
         assert torch.allclose(transport_fused, transport_expected, atol=1e-6), (
@@ -548,18 +593,22 @@ class TestFusedSoftmaxProjectCompiledFunctionsEager:
 
     def test_eager_registration(self):
         cf = CompiledFunctions(compile=False)
-        assert hasattr(cf, "fused_softmax_project"), (
-            "CompiledFunctions missing fused_softmax_project attribute"
-        )
+        assert hasattr(cf, "fused_softmax_project"), "CompiledFunctions missing fused_softmax_project attribute"
         assert callable(cf.fused_softmax_project)
 
         # Verify it returns correct shapes
         P, V, dim = 10, 8, 4
-        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = (
-            _make_fused_softmax_args(torch.device("cpu"), P=P, V=V, dim=dim)
+        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = _make_fused_softmax_args(
+            torch.device("cpu"), P=P, V=V, dim=dim
         )
         X_new, transport, ent_cost = cf.fused_softmax_project(
-            cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X,
+            cost_matrix,
+            epsilon,
+            a,
+            polytope_verts,
+            rot_mats,
+            step_radius,
+            X,
         )
         assert X_new.shape == (P, dim)
         assert transport.shape == (P, V)
@@ -580,12 +629,6 @@ class TestFusedSoftmaxProjectNoGraphBreaks:
 
     def test_no_graph_break_patterns(self):
         source = inspect.getsource(_fused_softmax_project)
-        assert ".item()" not in source, (
-            "_fused_softmax_project contains .item() which causes graph breaks"
-        )
-        assert ".append(" not in source, (
-            "_fused_softmax_project contains .append() which causes graph breaks"
-        )
-        assert ".tolist()" not in source, (
-            "_fused_softmax_project contains .tolist() which causes graph breaks"
-        )
+        assert ".item()" not in source, "_fused_softmax_project contains .item() which causes graph breaks"
+        assert ".append(" not in source, "_fused_softmax_project contains .append() which causes graph breaks"
+        assert ".tolist()" not in source, "_fused_softmax_project contains .tolist() which causes graph breaks"

@@ -10,7 +10,7 @@ from .attention import VmapSafeMultiHeadAttention
 from .rnn import VmapSafeLSTMCell, VmapSafeLSTM
 
 __all__ = [
-    'VmapSafeMultiHeadAttention',
-    'VmapSafeLSTMCell',
-    'VmapSafeLSTM',
+    "VmapSafeMultiHeadAttention",
+    "VmapSafeLSTMCell",
+    "VmapSafeLSTM",
 ]

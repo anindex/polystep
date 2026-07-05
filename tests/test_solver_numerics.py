@@ -6,6 +6,7 @@
 - A single ``+Inf`` cost entry must drive that transport entry to 0
   without NaN-propagating across the rest of the row.
 """
+
 from __future__ import annotations
 
 import warnings
@@ -29,8 +30,14 @@ def test_solver_promotes_bf16_inputs_to_fp32_internally(solver_cls):
     P, V = 12, 24
     torch.manual_seed(0)
     C = torch.randn(P, V, dtype=torch.bfloat16) * 30.0
-    solver = solver_cls(epsilon=0.1) if solver_cls is SoftmaxSolver else solver_cls(
-        epsilon=0.1, max_iterations=200, threshold=1e-4,
+    solver = (
+        solver_cls(epsilon=0.1)
+        if solver_cls is SoftmaxSolver
+        else solver_cls(
+            epsilon=0.1,
+            max_iterations=200,
+            threshold=1e-4,
+        )
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -52,8 +59,14 @@ def test_solver_disables_outer_bf16_autocast(solver_cls):
     P, V = 8, 16
     torch.manual_seed(0)
     C = torch.randn(P, V) * 5.0
-    solver = solver_cls(epsilon=0.5) if solver_cls is SoftmaxSolver else solver_cls(
-        epsilon=0.5, max_iterations=200, threshold=1e-4,
+    solver = (
+        solver_cls(epsilon=0.5)
+        if solver_cls is SoftmaxSolver
+        else solver_cls(
+            epsilon=0.5,
+            max_iterations=200,
+            threshold=1e-4,
+        )
     )
 
     device_type = "cpu"  # autocast(bfloat16) on CPU is universally available
@@ -79,15 +92,22 @@ def test_sinkhorn_no_nan_across_eps_cost_grid():
     torch.manual_seed(0)
 
     cells = [
-        (0.01, 10.0), (0.1, 10.0), (1.0, 10.0),
-        (0.01, 100.0), (0.1, 100.0), (1.0, 100.0),
-        (0.1, 1000.0), (1.0, 1000.0),
+        (0.01, 10.0),
+        (0.1, 10.0),
+        (1.0, 10.0),
+        (0.01, 100.0),
+        (0.1, 100.0),
+        (1.0, 100.0),
+        (0.1, 1000.0),
+        (1.0, 1000.0),
     ]
     failures = []
     for eps, scale in cells:
         C = torch.randn(P, V) * scale
         solver = SinkhornSolver(
-            epsilon=eps, max_iterations=300, threshold=1e-3,
+            epsilon=eps,
+            max_iterations=300,
+            threshold=1e-3,
         )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -116,14 +136,11 @@ def test_softmax_handles_single_inf_entry():
         warnings.simplefilter("ignore")
         result = solver.solve(C)
 
-    assert torch.isfinite(result.matrix).all(), (
-        "softmax produced NaN/Inf despite +Inf cost entry"
-    )
+    assert torch.isfinite(result.matrix).all(), "softmax produced NaN/Inf despite +Inf cost entry"
     masked_weight = result.matrix[0, 3].item()
     other_weights = result.matrix[0, [i for i in range(V) if i != 3]]
     assert masked_weight < other_weights.min().item() / 10, (
-        f"masked entry weight {masked_weight} not driven near zero; "
-        f"row = {result.matrix[0].tolist()}"
+        f"masked entry weight {masked_weight} not driven near zero; row = {result.matrix[0].tolist()}"
     )
 
 

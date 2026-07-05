@@ -1,6 +1,18 @@
 """Unit tests for cost matrix computation and scaling."""
+
+import pytest
 import torch
 from polystep.costs import compute_cost_matrix, scale_cost_matrix
+
+
+def test_scale_cost_matrix_rejects_nonpositive_float():
+    """A negative or zero numeric divisor flips/undefines the cost sign and
+    would reverse the objective; it must raise, not silently pass."""
+    C = torch.tensor([[0.0, 1.0]])
+    with pytest.raises(ValueError, match="positive"):
+        scale_cost_matrix(C, -1.0)
+    with pytest.raises(ValueError, match="positive"):
+        scale_cost_matrix(C, 0.0)
 
 
 def test_compute_cost_matrix_shape():
@@ -42,7 +54,7 @@ def test_scale_cost_matrix_none():
 def test_scale_cost_matrix_mean():
     """Mean scaling divides by the mean."""
     C = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
-    scaled = scale_cost_matrix(C, 'mean')
+    scaled = scale_cost_matrix(C, "mean")
     expected = C / C.mean()
     assert torch.allclose(scaled, expected)
 
@@ -50,7 +62,7 @@ def test_scale_cost_matrix_mean():
 def test_scale_cost_matrix_max():
     """Max scaling divides by the max."""
     C = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
-    scaled = scale_cost_matrix(C, 'max_cost')
+    scaled = scale_cost_matrix(C, "max_cost")
     expected = C / 8.0
     assert torch.allclose(scaled, expected)
 
@@ -65,5 +77,5 @@ def test_scale_cost_matrix_float():
 def test_scale_cost_matrix_zero_safe():
     """Scaling should not produce inf on zero-mean matrix."""
     C = torch.zeros(3, 5)
-    scaled = scale_cost_matrix(C, 'mean')
+    scaled = scale_cost_matrix(C, "mean")
     assert torch.isfinite(scaled).all()

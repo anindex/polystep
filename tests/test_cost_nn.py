@@ -1,4 +1,5 @@
 """Tests for NNCostEvaluator, ParamLayout.batch_unflatten(), chunked eval, and cost matrix."""
+
 import warnings
 
 import pytest
@@ -8,6 +9,36 @@ from torch.func import functional_call
 
 from polystep.transform import ParamLayout
 from polystep.cost_nn import NNCostEvaluator, compute_nn_cost_matrix, auto_detect_chunk_size
+
+
+def test_compile_vmap_tracks_changing_batch():
+    """compile_vmap must evaluate each call against its own batch, not bake in
+    the first call's inputs/targets into the cached compiled graph."""
+    torch.manual_seed(0)
+
+    class TinyNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(4, 3)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    model = TinyNet()
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_vmap=True)
+    ref = NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_vmap=False)
+    assert ev._batched_linear is None  # custom forward routes through vmap
+
+    N = 2
+    base = dict(model.named_parameters())
+    stacked = {k: v.detach()[None].expand(N, *v.shape).contiguous() for k, v in base.items()}
+    xa, ta = torch.randn(5, 4), torch.randint(0, 3, (5,))
+    xb, tb = torch.randn(7, 4), torch.randint(0, 3, (7,))
+
+    la = ev.evaluate(stacked, xa, ta)
+    lb = ev.evaluate(stacked, xb, tb)
+    torch.testing.assert_close(la, ref.evaluate(stacked, xa, ta), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(lb, ref.evaluate(stacked, xb, tb), rtol=1e-4, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -85,9 +116,7 @@ class TestBatchUnflattenShape:
         for key in sd:
             assert key in stacked, f"Missing key {key}"
             expected_shape = (N, *sd[key].shape)
-            assert stacked[key].shape == expected_shape, (
-                f"{key}: expected {expected_shape}, got {stacked[key].shape}"
-            )
+            assert stacked[key].shape == expected_shape, f"{key}: expected {expected_shape}, got {stacked[key].shape}"
 
 
 class TestBatchUnflattenValues:
@@ -142,9 +171,7 @@ class TestEvaluatorMlpVmap:
     def test_evaluator_mlp_vmap(self):
         from polystep.cost_nn import NNCostEvaluator
 
-        model = nn.Sequential(
-            nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)
-        )
+        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
         layout = ParamLayout.from_module(model)
         particle = layout.flatten(model)
 
@@ -176,9 +203,7 @@ class TestEvaluatorUnsupervised:
         batch = particle.unsqueeze(0).expand(N, -1, -1).clone()
         stacked = layout.batch_unflatten(batch)
 
-        evaluator = NNCostEvaluator(
-            model, loss_fn=lambda output: output.pow(2).mean()
-        )
+        evaluator = NNCostEvaluator(model, loss_fn=lambda output: output.pow(2).mean())
         inputs = torch.randn(16, 4)
         losses = evaluator.evaluate(stacked, inputs, targets=None)
 
@@ -207,9 +232,7 @@ class TestEvaluatorDifferentParams:
         losses = evaluator.evaluate(stacked, inputs, targets)
 
         # Not all losses should be identical
-        assert not torch.all(losses == losses[0]), (
-            "All losses identical despite different params"
-        )
+        assert not torch.all(losses == losses[0]), "All losses identical despite different params"
 
 
 class TestEvaluatorBatchNorm:
@@ -264,9 +287,7 @@ class TestEvaluatorFallbackWarning:
             losses = evaluator.evaluate(stacked, inputs, targets)
 
         # Check warning was emitted
-        fallback_warnings = [
-            x for x in w if "Falling back" in str(x.message)
-        ]
+        fallback_warnings = [x for x in w if "Falling back" in str(x.message)]
         assert len(fallback_warnings) > 0, "Expected 'Falling back' warning"
 
         # Results should still be valid
@@ -450,8 +471,9 @@ class TestAutoChunkSizeCached:
         cs2 = evaluator.chunk_size
         assert cs1 == cs2  # same value (None on CPU)
         # Verify internal cache attribute exists and sentinel was replaced
-        assert hasattr(evaluator, '_chunk_size_cached')
+        assert hasattr(evaluator, "_chunk_size_cached")
         from polystep.cost_nn import _UNSET
+
         assert evaluator._chunk_size_cached is not _UNSET
 
 

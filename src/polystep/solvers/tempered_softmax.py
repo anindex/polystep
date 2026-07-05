@@ -5,6 +5,7 @@ instead of the optimizer's epsilon schedule. This decouples the softmax
 sharpness from the entropic regularization so the ablation can sweep
 tau independently.
 """
+
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -61,7 +62,8 @@ class TemperedSoftmaxSolver:
             ValueError: If tau <= 0.
         """
         validate_positive(
-            self.tau, "tau",
+            self.tau,
+            "tau",
             "tau is the temperature in softmax(-C/tau).",
         )
 

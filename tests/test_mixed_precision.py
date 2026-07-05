@@ -1,4 +1,5 @@
 """Tests for mixed precision support in PolyStepOptimizer."""
+
 import pytest
 import torch
 import torch.nn as nn
@@ -62,6 +63,7 @@ class TestMixedPrecisionStep:
 
         def closure(batched_params):
             from torch.func import functional_call, vmap
+
             model.eval()
             x = torch.randn(4, 10)  # Will be cast by matmul rules
 
@@ -95,10 +97,12 @@ class TestMixedPrecisionStep:
         def patched_solve(cost_matrix, **kwargs):
             captured_dtype[0] = cost_matrix.dtype
             return original_solve(cost_matrix, **kwargs)
+
         opt.solver.solve = patched_solve
 
         def closure(batched_params):
             from torch.func import functional_call, vmap
+
             model.eval()
             x = torch.randn(4, 10)
 
@@ -198,7 +202,7 @@ class TestBF16SupportDetection:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_bf16_support(self):
         """GPU BF16 support based on compute capability."""
-        device = torch.device('cuda')
+        device = torch.device("cuda")
         cap = torch.cuda.get_device_capability(device)
 
         model = nn.Linear(10, 5).to(device)
@@ -232,6 +236,7 @@ class TestNaNHandling:
 
         def closure(batched_params):
             from torch.func import functional_call, vmap
+
             model.eval()
             x = torch.randn(8, 20)
             target = torch.randn(8, 10)

@@ -1,57 +1,106 @@
 """polystep: PyTorch PolyStep Optimizer."""
+
 __version__ = "0.4.0"
 
 __all__ = [
     # Core solver
-    "Solver", "SolverResult",
-    "SinkhornSolver", "SinkhornResult",
-    "SoftmaxSolver", "SoftmaxResult",
-    "KLSoftmaxSolver", "TemperedSoftmaxSolver",
+    "Solver",
+    "SolverResult",
+    "SinkhornSolver",
+    "SinkhornResult",
+    "SoftmaxSolver",
+    "SoftmaxResult",
+    "KLSoftmaxSolver",
+    "TemperedSoftmaxSolver",
     # Geometry
-    "get_orthoplex_vertices", "get_simplex_vertices", "get_cube_vertices",
-    "get_sampled_polytope_vertices", "get_random_rotation_matrices",
-    "POLYTOPE_MAP", "POLYTOPE_NUM_VERTICES_MAP",
+    "get_orthoplex_vertices",
+    "get_simplex_vertices",
+    "get_cube_vertices",
+    "get_sampled_polytope_vertices",
+    "get_random_rotation_matrices",
+    "POLYTOPE_MAP",
+    "POLYTOPE_NUM_VERTICES_MAP",
     # Cost & epsilon
-    "compute_cost_matrix", "scale_cost_matrix",
-    "LinearEpsilon", "CosineEpsilon", "ProgressiveEpsilon",
+    "compute_cost_matrix",
+    "scale_cost_matrix",
+    "LinearEpsilon",
+    "CosineEpsilon",
+    "ProgressiveEpsilon",
     # Solver
-    "PolyStep", "SolverState",
+    "PolyStep",
+    "SolverState",
     # Transform
-    "ParamEntry", "ParamLayout", "get_device", "create_generator",
+    "ParamEntry",
+    "ParamLayout",
+    "get_device",
+    "create_generator",
     # NN cost evaluation
-    "NNCostEvaluator", "compute_nn_cost_matrix", "auto_detect_chunk_size",
+    "NNCostEvaluator",
+    "compute_nn_cost_matrix",
+    "auto_detect_chunk_size",
     # Compilation
-    "CompiledFunctions", "try_compile",
+    "CompiledFunctions",
+    "try_compile",
     # Subspace
-    "FactorSpec", "LowRankSubspace", "LinearSubspace", "ProjectionSpec",
-    "AdaptiveSubspace", "CMAAdaptiveSubspace",
+    "FactorSpec",
+    "LowRankSubspace",
+    "LinearSubspace",
+    "ProjectionSpec",
+    "AdaptiveSubspace",
+    "CMAAdaptiveSubspace",
     # CMA
-    "compute_cma_hyperparameters", "update_step_size_csa", "compute_ot_weights",
+    "compute_cma_hyperparameters",
+    "update_step_size_csa",
+    "compute_ot_weights",
     # Blockwise
-    "BlockConfig", "create_per_layer_blocks", "create_grouped_blocks",
+    "BlockConfig",
+    "create_per_layer_blocks",
+    "create_grouped_blocks",
     # Dynamics
-    "apply_momentum", "update_adaptive_radius", "compute_momentum_coefficient",
+    "apply_momentum",
+    "update_adaptive_radius",
+    "compute_momentum_coefficient",
     # Optimizer
-    "PolyStepOptimizer", "RankSchedule",
+    "PolyStepOptimizer",
+    "RankSchedule",
     # High-level API
-    "train", "TrainConfig", "TrainCallback",
-    "LoggingCallback", "EarlyStoppingCallback", "get_diagnostics",
+    "train",
+    "TrainConfig",
+    "TrainCallback",
+    "LoggingCallback",
+    "EarlyStoppingCallback",
+    "get_diagnostics",
     # Objectives
-    "ObjectiveFn", "Ackley", "Rosenbrock", "Rastrigin", "StyblinskiTang",
-    "Levy", "Griewank", "Beale", "Branin", "Sphere",
+    "ObjectiveFn",
+    "Ackley",
+    "Rosenbrock",
+    "Rastrigin",
+    "StyblinskiTang",
+    "Levy",
+    "Griewank",
+    "Beale",
+    "Branin",
+    "Sphere",
     # Layers
-    "VmapSafeMultiHeadAttention", "VmapSafeLSTMCell", "VmapSafeLSTM",
+    "VmapSafeMultiHeadAttention",
+    "VmapSafeLSTMCell",
+    "VmapSafeLSTM",
     # Projection
     "SparseRandomProjection",
     # Hybrid subspace
-    "HybridSubspace", "LayerProjectionSpec",
+    "HybridSubspace",
+    "LayerProjectionSpec",
 ]
 
 from .solvers import (
-    Solver, SolverResult,
-    SinkhornSolver, SinkhornResult,
-    SoftmaxSolver, SoftmaxResult,
-    KLSoftmaxSolver, TemperedSoftmaxSolver,
+    Solver,
+    SolverResult,
+    SinkhornSolver,
+    SinkhornResult,
+    SoftmaxSolver,
+    SoftmaxResult,
+    KLSoftmaxSolver,
+    TemperedSoftmaxSolver,
 )
 
 from .geometry import (
@@ -93,15 +142,26 @@ from .dynamics import apply_momentum, update_adaptive_radius, compute_momentum_c
 from .optimizer import PolyStepOptimizer, RankSchedule
 
 from .api import (
-    train, TrainConfig, TrainCallback,
-    LoggingCallback, EarlyStoppingCallback, get_diagnostics,
+    train,
+    TrainConfig,
+    TrainCallback,
+    LoggingCallback,
+    EarlyStoppingCallback,
+    get_diagnostics,
 )
 
 # Objectives
 from .objectives import (
     ObjectiveFn,
-    Ackley, Rosenbrock, Rastrigin, StyblinskiTang,
-    Levy, Griewank, Beale, Branin, Sphere,
+    Ackley,
+    Rosenbrock,
+    Rastrigin,
+    StyblinskiTang,
+    Levy,
+    Griewank,
+    Beale,
+    Branin,
+    Sphere,
 )
 
 # Vmap-safe layers

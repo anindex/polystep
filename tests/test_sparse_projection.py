@@ -7,6 +7,7 @@ Tests cover:
 - Device compatibility (CPU and CUDA)
 - Statistical properties (unit variance, extreme-compression warning)
 """
+
 import warnings
 
 import pytest
@@ -83,7 +84,7 @@ class TestMemoryEfficiency:
 
         # Expected: nnz_per_col = int(0.01 * 100000) = 1000 per Li, Hastie, Church
         # Actually: density = 1/sqrt(100000) ~ 0.00316, nnz_per_col = 316
-        expected_nnz_per_col = max(1, int(1.0 / (100_000 ** 0.5) * 100_000))
+        expected_nnz_per_col = max(1, int(1.0 / (100_000**0.5) * 100_000))
         total_nnz = expected_nnz_per_col * 256
 
         # Memory: indices (2 * nnz * 8) + values (nnz * 4)
@@ -105,7 +106,7 @@ class TestMemoryEfficiency:
         # At default density 1/sqrt(100K) ~ 0.316%, should be >50x smaller
         # (Memory overhead from int64 indices reduces ratio vs float32-only dense)
         ratio = dense_bytes / sparse_bytes
-        assert ratio > 50, f'Expected >50x reduction, got {ratio:.1f}x'
+        assert ratio > 50, f"Expected >50x reduction, got {ratio:.1f}x"
 
     @pytest.mark.filterwarnings("ignore:SparseRandomProjection.*below the empirical floor:UserWarning")
     def test_large_scale_memory(self):
@@ -119,15 +120,13 @@ class TestMemoryEfficiency:
         # Sparse should be << 1GB
         sparse_gb = proj.memory_bytes / 1e9
 
-        assert sparse_gb < 1.0, f'Expected <1 GB, got {sparse_gb:.3f} GB'
-        assert dense_gb > 90, f'Dense baseline should be ~100GB, got {dense_gb:.1f}GB'
+        assert sparse_gb < 1.0, f"Expected <1 GB, got {sparse_gb:.3f} GB"
+        assert dense_gb > 90, f"Dense baseline should be ~100GB, got {dense_gb:.1f}GB"
 
     def test_custom_density(self):
         """Custom density is respected."""
         # Use 1% density explicitly
-        proj = SparseRandomProjection(
-            full_dim=10000, subspace_dim=64, density=0.01, seed=42
-        )
+        proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, density=0.01, seed=42)
 
         expected_nnz_per_col = max(1, int(0.01 * 10000))  # 100
         assert proj._nnz_per_col == expected_nnz_per_col
@@ -156,7 +155,7 @@ class TestJLTProperty:
         # Should be approximately equal
         # JLT allows multiplicative distortion; sparse JLT has similar bounds
         ratio = d_full / d_sub
-        assert 0.5 < ratio < 2.0, f'Distance ratio {ratio} outside [0.5, 2.0]'
+        assert 0.5 < ratio < 2.0, f"Distance ratio {ratio} outside [0.5, 2.0]"
 
     def test_multiple_distance_preservation(self):
         """Distance preservation holds across multiple pairs."""
@@ -176,7 +175,7 @@ class TestJLTProperty:
 
         # Most ratios should be reasonably close to 1
         mean_ratio = sum(ratios) / len(ratios)
-        assert 0.7 < mean_ratio < 1.5, f'Mean distance ratio {mean_ratio} too far from 1'
+        assert 0.7 < mean_ratio < 1.5, f"Mean distance ratio {mean_ratio} too far from 1"
 
     def test_zero_vector_maps_to_zero(self):
         """Zero vector maps to zero (linearity check)."""
@@ -227,10 +226,10 @@ class TestCUDA:
         """Projection works on GPU."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
 
-        coords = torch.randn(64, device='cuda')
+        coords = torch.randn(64, device="cuda")
         full = proj.project(coords)
 
-        assert full.device.type == 'cuda'
+        assert full.device.type == "cuda"
         assert full.shape == (10000,)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -238,10 +237,10 @@ class TestCUDA:
         """Batched projection works on GPU."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
 
-        coords = torch.randn(8, 64, device='cuda')
+        coords = torch.randn(8, 64, device="cuda")
         full = proj.project(coords)
 
-        assert full.device.type == 'cuda'
+        assert full.device.type == "cuda"
         assert full.shape == (8, 10000)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -249,10 +248,10 @@ class TestCUDA:
         """Transpose projection works on GPU."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
 
-        full = torch.randn(10000, device='cuda')
+        full = torch.randn(10000, device="cuda")
         coords = proj.project_transpose(full)
 
-        assert coords.device.type == 'cuda'
+        assert coords.device.type == "cuda"
         assert coords.shape == (64,)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -261,7 +260,7 @@ class TestCUDA:
         proj1 = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=777)
         proj2 = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=777)
 
-        coords = torch.randn(64, device='cuda')
+        coords = torch.randn(64, device="cuda")
         full1 = proj1.project(coords)
         full2 = proj2.project(coords)
 
@@ -276,11 +275,11 @@ class TestRepr:
         proj = SparseRandomProjection(full_dim=100000, subspace_dim=256, seed=42)
         r = repr(proj)
 
-        assert 'SparseRandomProjection' in r
-        assert 'full_dim=100000' in r
-        assert 'subspace_dim=256' in r
-        assert 'density=' in r
-        assert 'memory=' in r
+        assert "SparseRandomProjection" in r
+        assert "full_dim=100000" in r
+        assert "subspace_dim=256" in r
+        assert "density=" in r
+        assert "memory=" in r
 
 
 class TestEdgeCases:
@@ -289,9 +288,7 @@ class TestEdgeCases:
     def test_min_nnz_per_col(self):
         """At least 1 nonzero per column even at very low density."""
         # Very small full_dim with very low density
-        proj = SparseRandomProjection(
-            full_dim=10, subspace_dim=5, density=0.001, seed=42
-        )
+        proj = SparseRandomProjection(full_dim=10, subspace_dim=5, density=0.001, seed=42)
 
         # Should have at least 1 nonzero per column
         assert proj._nnz_per_col >= 1
@@ -322,7 +319,9 @@ class TestStatisticalProperties:
         full_dim = 10000
         subspace_dim = 256
         proj = SparseRandomProjection(
-            full_dim=full_dim, subspace_dim=subspace_dim, seed=0,
+            full_dim=full_dim,
+            subspace_dim=subspace_dim,
+            seed=0,
         )
 
         gen = torch.Generator(device="cpu").manual_seed(1)
@@ -330,21 +329,19 @@ class TestStatisticalProperties:
         y = proj.project_transpose(x)
         assert y.shape == (subspace_dim,)
         sample_var = y.var().item()
-        assert 0.5 < sample_var < 2.0, (
-            f"projected coordinate variance off: got {sample_var:.3f}, "
-            "expected ~1.0"
-        )
+        assert 0.5 < sample_var < 2.0, f"projected coordinate variance off: got {sample_var:.3f}, expected ~1.0"
 
     def test_warns_at_extreme_compression(self):
         """Subspace ratio below 1e-5 triggers a UserWarning."""
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             SparseRandomProjection(
-                full_dim=10_000_000, subspace_dim=64, seed=0,
+                full_dim=10_000_000,
+                subspace_dim=64,
+                seed=0,
             )
 
         msgs = [str(w.message).lower() for w in caught]
-        assert any(
-            "compression" in m or "below the empirical floor" in m
-            for m in msgs
-        ), f"expected extreme-compression warning; got {msgs}"
+        assert any("compression" in m or "below the empirical floor" in m for m in msgs), (
+            f"expected extreme-compression warning; got {msgs}"
+        )

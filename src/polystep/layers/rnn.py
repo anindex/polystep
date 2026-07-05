@@ -93,7 +93,7 @@ class VmapSafeLSTMCell(nn.Module):
         # Apply activations
         i = torch.sigmoid(i)  # Input gate
         f = torch.sigmoid(f)  # Forget gate
-        g = torch.tanh(g)     # Cell input (candidate)
+        g = torch.tanh(g)  # Cell input (candidate)
         o = torch.sigmoid(o)  # Output gate
 
         # Update cell state
@@ -163,15 +163,9 @@ class VmapSafeLSTM(nn.Module):
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {num_layers}")
         if bidirectional:
-            raise NotImplementedError(
-                "VmapSafeLSTM does not support bidirectional=True. "
-                "See LIMITATIONS.md."
-            )
+            raise NotImplementedError("VmapSafeLSTM does not support bidirectional=True. See LIMITATIONS.md.")
         if proj_size != 0:
-            raise NotImplementedError(
-                "VmapSafeLSTM does not support proj_size != 0. "
-                "See LIMITATIONS.md."
-            )
+            raise NotImplementedError("VmapSafeLSTM does not support proj_size != 0. See LIMITATIONS.md.")
         if not batch_first:
             raise NotImplementedError(
                 "VmapSafeLSTM only supports batch_first=True (input layout "
@@ -187,9 +181,7 @@ class VmapSafeLSTM(nn.Module):
         self.cells = nn.ModuleList()
         for layer in range(num_layers):
             layer_input_size = input_size if layer == 0 else hidden_size
-            self.cells.append(
-                VmapSafeLSTMCell(layer_input_size, hidden_size, bias=bias)
-            )
+            self.cells.append(VmapSafeLSTMCell(layer_input_size, hidden_size, bias=bias))
 
         # Dropout between layers (not applied after last layer)
         self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else None
@@ -219,8 +211,7 @@ class VmapSafeLSTM(nn.Module):
         # it up front with a clear message.
         if isinstance(x, nn.utils.rnn.PackedSequence):
             raise NotImplementedError(
-                "VmapSafeLSTM does not support PackedSequence input. "
-                "Pad to a dense tensor first. See LIMITATIONS.md."
+                "VmapSafeLSTM does not support PackedSequence input. Pad to a dense tensor first. See LIMITATIONS.md."
             )
 
         batch_size, seq_len, _ = x.shape
@@ -231,12 +222,10 @@ class VmapSafeLSTM(nn.Module):
         # Use list-based state tracking to avoid in-place updates under vmap
         if state is None:
             h_list = [
-                torch.zeros(batch_size, self.hidden_size, device=device, dtype=dtype)
-                for _ in range(self.num_layers)
+                torch.zeros(batch_size, self.hidden_size, device=device, dtype=dtype) for _ in range(self.num_layers)
             ]
             c_list = [
-                torch.zeros(batch_size, self.hidden_size, device=device, dtype=dtype)
-                for _ in range(self.num_layers)
+                torch.zeros(batch_size, self.hidden_size, device=device, dtype=dtype) for _ in range(self.num_layers)
             ]
         else:
             h, c = state

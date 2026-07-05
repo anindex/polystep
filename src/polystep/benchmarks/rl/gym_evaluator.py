@@ -31,8 +31,8 @@ from .policies import count_stacked_candidates
 
 @dataclass
 class GymRolloutResult:
-    returns: torch.Tensor   # (N, R)
-    lengths: torch.Tensor   # (N, R)
+    returns: torch.Tensor  # (N, R)
+    lengths: torch.Tensor  # (N, R)
     successes: torch.Tensor  # (N, R) bool - "success" flag, env-specific
 
 
@@ -64,12 +64,10 @@ def _batched_mlp_logits(
     """
 
     x = obs  # (N, R, obs_dim)
-    linear_indices = sorted(
-        int(k.split(".")[1]) for k in stacked_params if k.endswith(".weight")
-    )
+    linear_indices = sorted(int(k.split(".")[1]) for k in stacked_params if k.endswith(".weight"))
     for j, idx in enumerate(linear_indices):
         w = stacked_params[f"net.{idx}.weight"]  # (N, out, in)
-        b = stacked_params[f"net.{idx}.bias"]    # (N, out)
+        b = stacked_params[f"net.{idx}.bias"]  # (N, out)
         x = torch.bmm(x, w.transpose(1, 2)) + b.unsqueeze(1)
         if j < len(linear_indices) - 1:
             if activation == "tanh":
@@ -137,8 +135,7 @@ class GymVectorEvaluator:
         if probe.action_space.__class__.__name__ != "Discrete":
             probe.close()
             raise ValueError(
-                f"GymVectorEvaluator requires Discrete action space; got "
-                f"{probe.action_space} for {env_id}"
+                f"GymVectorEvaluator requires Discrete action space; got {probe.action_space} for {env_id}"
             )
         self.action_dim = int(probe.action_space.n)
         spec_horizon = getattr(probe.spec, "max_episode_steps", None) or 500

@@ -3,6 +3,7 @@
 Verifies convergence on standard test functions (Ackley, Rosenbrock,
 Rastrigin, Sphere) in low dimensions.
 """
+
 import math
 
 import pytest
@@ -19,11 +20,14 @@ class Sphere(ObjectiveFn):
         bounds = torch.tensor([[-5.0, 5.0]] * dim)
         optimizers = torch.zeros(1, dim)
         super().__init__(
-            dim=dim, bounds=bounds, optimizers=optimizers, optimal_value=0.0,
+            dim=dim,
+            bounds=bounds,
+            optimizers=optimizers,
+            optimal_value=0.0,
         )
 
     def evaluate(self, X: torch.Tensor) -> torch.Tensor:
-        return torch.sum(X ** 2, dim=-1)
+        return torch.sum(X**2, dim=-1)
 
 
 ALL_OBJECTIVES = [
@@ -66,6 +70,7 @@ def _run_benchmark(
 
 # --- Test class ---
 
+
 class TestSyntheticBenchmarks:
     """Convergence benchmarks for PolyStep on synthetic objectives."""
 
@@ -83,15 +88,18 @@ class TestSyntheticBenchmarks:
         init_dist = torch.norm(X_init, dim=-1).mean().item()
         final_dist = torch.norm(state.X, dim=-1).mean().item()
         assert final_dist < init_dist, (
-            f"Ackley particles did not move toward origin: "
-            f"init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
+            f"Ackley particles did not move toward origin: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
 
     def test_rosenbrock_convergence(self):
         """Particles move toward (1,1) and cost decreases on Rosenbrock."""
         obj = Rosenbrock(dim=2)
         state, X_init = _run_benchmark(
-            obj, dim=2, epsilon=0.5, step_radius=0.5, probe_radius=1.0,
+            obj,
+            dim=2,
+            epsilon=0.5,
+            step_radius=0.5,
+            probe_radius=1.0,
         )
 
         # Cost should decrease
@@ -104,8 +112,7 @@ class TestSyntheticBenchmarks:
         init_dist = torch.norm(X_init - optimum, dim=-1).mean().item()
         final_dist = torch.norm(state.X - optimum, dim=-1).mean().item()
         assert final_dist < init_dist, (
-            f"Rosenbrock particles did not move toward (1,1): "
-            f"init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
+            f"Rosenbrock particles did not move toward (1,1): init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
 
     def test_rastrigin_convergence(self):
@@ -122,8 +129,7 @@ class TestSyntheticBenchmarks:
         init_dist = torch.norm(X_init, dim=-1).mean().item()
         final_dist = torch.norm(state.X, dim=-1).mean().item()
         assert final_dist < init_dist, (
-            f"Rastrigin particles did not move toward origin: "
-            f"init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
+            f"Rastrigin particles did not move toward origin: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
 
     def test_sphere_convergence(self):
@@ -140,8 +146,7 @@ class TestSyntheticBenchmarks:
         init_dist = torch.norm(X_init, dim=-1).mean().item()
         final_dist = torch.norm(state.X, dim=-1).mean().item()
         assert final_dist < init_dist * 0.5, (
-            f"Sphere did not show strong convergence: "
-            f"init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
+            f"Sphere did not show strong convergence: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
 
     @pytest.mark.parametrize("name,objective", ALL_OBJECTIVES, ids=[n for n, _ in ALL_OBJECTIVES])
@@ -170,8 +175,13 @@ class TestSyntheticBenchmarks:
         """Ackley in 10D: solver runs without error and cost decreases."""
         obj = Ackley(dim=10)
         state, X_init = _run_benchmark(
-            obj, dim=10, num_particles=80, max_iters=60,
-            epsilon=1.0, step_radius=0.5, probe_radius=1.0,
+            obj,
+            dim=10,
+            num_particles=80,
+            max_iters=60,
+            epsilon=1.0,
+            step_radius=0.5,
+            probe_radius=1.0,
         )
 
         # Cost should decrease
@@ -183,8 +193,7 @@ class TestSyntheticBenchmarks:
         init_dist = torch.norm(X_init, dim=-1).mean().item()
         final_dist = torch.norm(state.X, dim=-1).mean().item()
         assert final_dist < init_dist, (
-            f"Ackley 10D particles did not move toward origin: "
-            f"init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
+            f"Ackley 10D particles did not move toward origin: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
 
         # No NaN
@@ -213,19 +222,15 @@ class TestSyntheticBenchmarks:
 
         # Cost should decrease
         assert state.costs[-1] < state.costs[0], (
-            f"Sphere+LinearEpsilon cost did not decrease: "
-            f"{state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
+            f"Sphere+LinearEpsilon cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
         )
 
         # Epsilon should have decayed (final epsilon < initial)
-        assert state.epsilon < 1.0, (
-            f"Epsilon did not decay: final epsilon={state.epsilon}"
-        )
+        assert state.epsilon < 1.0, f"Epsilon did not decay: final epsilon={state.epsilon}"
 
         # Particles should converge toward origin
         init_dist = torch.norm(X_init, dim=-1).mean().item()
         final_dist = torch.norm(state.X, dim=-1).mean().item()
         assert final_dist < init_dist, (
-            f"Sphere+LinearEpsilon did not converge: "
-            f"init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
+            f"Sphere+LinearEpsilon did not converge: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )

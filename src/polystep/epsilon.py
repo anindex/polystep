@@ -15,6 +15,7 @@ Provides three schedulers:
   Thornton, Niles-Weed & Cuturi, *Progressive Entropic Optimal Transport
   Solvers*, NeurIPS 2024, arXiv:2406.05061).
 """
+
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -129,21 +130,14 @@ class ProgressiveEpsilon:
 
         if not converged or ratio > self.slow_threshold:
             # Solver struggling: increase epsilon
-            self._current = min(
-                self._current * self.increase_factor, self.max_epsilon
-            )
+            self._current = min(self._current * self.increase_factor, self.max_epsilon)
         elif ratio < self.fast_threshold:
             # Solver converging fast: decrease epsilon
-            self._current = max(
-                self._current * self.decrease_factor, self.target
-            )
+            self._current = max(self._current * self.decrease_factor, self.target)
         # else: ratio in [fast_threshold, slow_threshold] -- keep current
 
         # EMA smooth
-        self._smoothed = (
-            self.ema_alpha * self._smoothed
-            + (1.0 - self.ema_alpha) * self._current
-        )
+        self._smoothed = self.ema_alpha * self._smoothed + (1.0 - self.ema_alpha) * self._current
         self._smoothed = max(self._smoothed, self.target)
         self._smoothed = min(self._smoothed, self.max_epsilon)
 
@@ -192,8 +186,10 @@ class CosineEpsilon:
         if iteration is None:
             return self.init
 
-        T = self.total_steps if self.total_steps > 0 else max(
-            1, int((self.init - self.target) / max(self.decay, 1e-12))
+        T = (
+            self.total_steps
+            if self.total_steps > 0
+            else max(1, int((self.init - self.target) / max(self.decay, 1e-12)))
         )
 
         if self.restart_mult > 1.0:
@@ -214,5 +210,8 @@ class CosineEpsilon:
             T_local = T
             t_local = min(iteration, T)
 
+        # Clamp so a maxed-out restart loop can't push cos past pi (which would
+        # drift epsilon outside [target, init]).
+        t_local = min(max(t_local, 0), T_local)
         cos_val = math.cos(math.pi * t_local / max(T_local, 1))
         return self.target + 0.5 * (self.init - self.target) * (1.0 + cos_val)

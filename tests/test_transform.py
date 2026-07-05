@@ -4,6 +4,7 @@ Covers the common architectures (MLP, CNN, tied weights, BatchNorm),
 ``float64`` round-trip, parameterless modules, particle shape,
 metadata preservation, device handling, and deterministic generators.
 """
+
 import dataclasses
 
 import pytest
@@ -93,10 +94,8 @@ class TestRoundtripCNN:
         # Non-trainable buffers (running_mean/var, num_batches_tracked)
         # are excluded from the particle layout - only trainable
         # parameters and their shared aliases are included.
-        trainable_ptrs = {p.data_ptr() for n, p in model.named_parameters()
-                          if p.requires_grad}
-        expected_keys = {k for k, v in sd.items()
-                         if v.data_ptr() in trainable_ptrs}
+        trainable_ptrs = {p.data_ptr() for n, p in model.named_parameters() if p.requires_grad}
+        expected_keys = {k for k, v in sd.items() if v.data_ptr() in trainable_ptrs}
         assert set(recovered.keys()) == expected_keys
         for key in recovered:
             assert torch.equal(sd[key], recovered[key]), f"Mismatch in {key}"
@@ -119,8 +118,7 @@ class TestRoundtripSharedParams:
         # Deduplication: particle array should be smaller than naive concat
         naive_total = sum(p.numel() for p in sd.values())
         assert layout.total_params < naive_total, (
-            f"Shared params not deduplicated: total_params={layout.total_params}, "
-            f"naive={naive_total}"
+            f"Shared params not deduplicated: total_params={layout.total_params}, naive={naive_total}"
         )
 
 
@@ -145,9 +143,7 @@ class TestParticleShape:
         assert particles.ndim == 2, f"Expected 2D, got {particles.ndim}D"
         assert particles.shape[1] == layout.particle_dim
         # Total elements must accommodate all params
-        assert (
-            particles.shape[0] * particles.shape[1] >= layout.total_params
-        )
+        assert particles.shape[0] * particles.shape[1] >= layout.total_params
 
 
 class TestEmptyModule:
@@ -178,15 +174,9 @@ class TestParamEntriesMetadata:
         for entry in layout.entries:
             assert entry.key in sd, f"Entry key {entry.key} not in state_dict"
             tensor = sd[entry.key]
-            assert entry.shape == tuple(tensor.shape), (
-                f"{entry.key}: shape {entry.shape} != {tuple(tensor.shape)}"
-            )
-            assert entry.dtype == tensor.dtype, (
-                f"{entry.key}: dtype {entry.dtype} != {tensor.dtype}"
-            )
-            assert entry.numel == tensor.numel(), (
-                f"{entry.key}: numel {entry.numel} != {tensor.numel()}"
-            )
+            assert entry.shape == tuple(tensor.shape), f"{entry.key}: shape {entry.shape} != {tuple(tensor.shape)}"
+            assert entry.dtype == tensor.dtype, f"{entry.key}: dtype {entry.dtype} != {tensor.dtype}"
+            assert entry.numel == tensor.numel(), f"{entry.key}: numel {entry.numel} != {tensor.numel()}"
             expected_grad = param_grad.get(entry.key, False)
             assert entry.requires_grad == expected_grad, (
                 f"{entry.key}: requires_grad {entry.requires_grad} != {expected_grad}"
@@ -238,9 +228,7 @@ class TestUnflattenPreservesDevice:
         particles = layout.flatten(model)
         recovered = layout.unflatten(particles)
         for key, tensor in recovered.items():
-            assert tensor.device == particles.device, (
-                f"{key} on {tensor.device}, expected {particles.device}"
-            )
+            assert tensor.device == particles.device, f"{key} on {tensor.device}, expected {particles.device}"
 
 
 class TestGetDeviceCPU:
@@ -302,9 +290,7 @@ class TestDoubleDtype:
 
         sd = model.state_dict()
         for key in sd:
-            assert recovered[key].dtype == sd[key].dtype, (
-                f"{key}: dtype {recovered[key].dtype} != {sd[key].dtype}"
-            )
+            assert recovered[key].dtype == sd[key].dtype, f"{key}: dtype {recovered[key].dtype} != {sd[key].dtype}"
             assert torch.equal(sd[key], recovered[key]), f"Mismatch in {key}"
 
 

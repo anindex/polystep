@@ -11,6 +11,7 @@ References:
     Li, P., Hastie, T. & Church, K. (2006). "Very sparse random
         projections."
 """
+
 import math
 import warnings
 from typing import Optional
@@ -116,7 +117,7 @@ class SparseRandomProjection:
             dtype: Data type for values.
         """
         # Use CPU generator for consistent behavior (avoids CUDA generator issues)
-        generator = torch.Generator(device='cpu')
+        generator = torch.Generator(device="cpu")
         generator.manual_seed(self.seed)
 
         total_nnz = self._nnz_per_col * self.subspace_dim
@@ -126,18 +127,34 @@ class SparseRandomProjection:
 
         # Vectorized row index sampling (with replacement -- negligible collisions)
         row_indices = torch.randint(
-            0, self.full_dim, (total_nnz,), generator=generator,
+            0,
+            self.full_dim,
+            (total_nnz,),
+            generator=generator,
         )
 
         # Column indices: each column gets nnz_per_col consecutive entries
-        col_indices = torch.arange(self.subspace_dim).unsqueeze(1).expand(
-            -1, self._nnz_per_col,
-        ).reshape(-1)
+        col_indices = (
+            torch.arange(self.subspace_dim)
+            .unsqueeze(1)
+            .expand(
+                -1,
+                self._nnz_per_col,
+            )
+            .reshape(-1)
+        )
 
         # Rademacher values: +1 or -1 with equal probability, vectorized
-        signs = torch.randint(
-            0, 2, (total_nnz,), generator=generator,
-        ) * 2 - 1
+        signs = (
+            torch.randint(
+                0,
+                2,
+                (total_nnz,),
+                generator=generator,
+            )
+            * 2
+            - 1
+        )
         values = signs.to(dtype) * scale
 
         # Store indices as (2, nnz) for sparse_coo_tensor
@@ -157,9 +174,7 @@ class SparseRandomProjection:
             Sparse COO tensor of shape (full_dim, subspace_dim).
         """
         # Initialize on first use or if device/dtype changed.
-        if (self._indices is None or
-            self._device != device or
-            self._dtype != dtype):
+        if self._indices is None or self._device != device or self._dtype != dtype:
             self._init_sparse_matrix(device, dtype)
             self._sparse_matrix = None
 

@@ -3,6 +3,7 @@
 Validates transport matrix properties, shape consistency, and integration
 with PolyStepOptimizer's solver selection.
 """
+
 import pytest
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ from polystep.solvers.tempered_softmax import TemperedSoftmaxSolver
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def cost_matrix():
@@ -32,6 +34,7 @@ def source_marginal():
 # ---------------------------------------------------------------------------
 # MinCostGreedySolver
 # ---------------------------------------------------------------------------
+
 
 class TestMinCostGreedySolver:
     def test_basic_assignment(self, cost_matrix, source_marginal):
@@ -83,6 +86,7 @@ class TestMinCostGreedySolver:
 # ---------------------------------------------------------------------------
 # TopKMeanSolver
 # ---------------------------------------------------------------------------
+
 
 class TestTopKMeanSolver:
     def test_basic_assignment(self, cost_matrix, source_marginal):
@@ -150,6 +154,7 @@ class TestTopKMeanSolver:
 # TemperedSoftmaxSolver
 # ---------------------------------------------------------------------------
 
+
 class TestTemperedSoftmaxSolver:
     def test_basic(self, cost_matrix, source_marginal):
         solver = TemperedSoftmaxSolver(tau=1.0)
@@ -190,11 +195,13 @@ class TestTemperedSoftmaxSolver:
     def test_low_tau_approaches_greedy(self):
         """Very low tau should approximate greedy (argmin) on unscaled costs."""
         # Use a well-separated cost matrix so there are no near-ties
-        C = torch.tensor([
-            [10.0, 1.0, 5.0, 8.0],
-            [3.0, 7.0, 2.0, 9.0],
-            [6.0, 4.0, 8.0, 1.0],
-        ])
+        C = torch.tensor(
+            [
+                [10.0, 1.0, 5.0, 8.0],
+                [3.0, 7.0, 2.0, 9.0],
+                [6.0, 4.0, 8.0, 1.0],
+            ]
+        )
         a = torch.ones(3) / 3
         solver = TemperedSoftmaxSolver(tau=0.001)
         result = solver.solve(C, a=a)
@@ -213,12 +220,16 @@ class TestTemperedSoftmaxSolver:
 # Shape Consistency: all solvers return (P, V) matrix
 # ---------------------------------------------------------------------------
 
+
 class TestShapeConsistency:
-    @pytest.mark.parametrize("solver_cls,kwargs", [
-        (MinCostGreedySolver, {}),
-        (TopKMeanSolver, {"k": 3}),
-        (TemperedSoftmaxSolver, {"tau": 1.0}),
-    ])
+    @pytest.mark.parametrize(
+        "solver_cls,kwargs",
+        [
+            (MinCostGreedySolver, {}),
+            (TopKMeanSolver, {"k": 3}),
+            (TemperedSoftmaxSolver, {"tau": 1.0}),
+        ],
+    )
     def test_output_shape(self, solver_cls, kwargs, cost_matrix, source_marginal):
         solver = solver_cls(**kwargs)
         result = solver.solve(cost_matrix, a=source_marginal)
@@ -228,8 +239,7 @@ class TestShapeConsistency:
     def test_various_sizes(self, P, V):
         C = torch.rand(P, V)
         a = torch.ones(P) / P
-        for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3),
-                        TemperedSoftmaxSolver(tau=1.0)]:
+        for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3), TemperedSoftmaxSolver(tau=1.0)]:
             result = solver.solve(C, a=a)
             assert result.matrix.shape == (P, V)
             assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-6)
@@ -239,14 +249,22 @@ class TestShapeConsistency:
 # PolyStepOptimizer solver selection integration
 # ---------------------------------------------------------------------------
 
+
 class TestSolverSelection:
     @pytest.fixture
     def simple_model(self):
         return nn.Sequential(nn.Linear(10, 5), nn.ReLU(), nn.Linear(5, 2))
 
-    @pytest.mark.parametrize("solver_name", [
-        "softmax", "sinkhorn", "min_cost_greedy", "top_k_mean", "tempered_softmax",
-    ])
+    @pytest.mark.parametrize(
+        "solver_name",
+        [
+            "softmax",
+            "sinkhorn",
+            "min_cost_greedy",
+            "top_k_mean",
+            "tempered_softmax",
+        ],
+    )
     def test_optimizer_accepts_solver(self, solver_name, simple_model):
         """PolyStepOptimizer should accept all solver strings without error."""
         from polystep.optimizer import PolyStepOptimizer
@@ -262,9 +280,14 @@ class TestSolverSelection:
             epsilon=1.0,
         )
         # Verify correct solver type
-        from polystep.solvers import (SoftmaxSolver, SinkhornSolver,
-                                      MinCostGreedySolver, TopKMeanSolver,
-                                      TemperedSoftmaxSolver)
+        from polystep.solvers import (
+            SoftmaxSolver,
+            SinkhornSolver,
+            MinCostGreedySolver,
+            TopKMeanSolver,
+            TemperedSoftmaxSolver,
+        )
+
         expected = {
             "softmax": SoftmaxSolver,
             "sinkhorn": SinkhornSolver,
@@ -276,5 +299,6 @@ class TestSolverSelection:
 
     def test_invalid_solver_raises(self, simple_model):
         from polystep.optimizer import PolyStepOptimizer
+
         with pytest.raises(ValueError, match="Unknown solver"):
             PolyStepOptimizer(simple_model, solver="nonexistent")

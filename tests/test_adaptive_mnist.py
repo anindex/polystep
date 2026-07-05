@@ -10,6 +10,7 @@ for the limited data and short training.
 
 Marked with @pytest.mark.slow since they involve actual training loops.
 """
+
 from __future__ import annotations
 
 import gzip
@@ -165,8 +166,11 @@ def test_adaptive_subspace_trains(mnist_loaders):
     model = SmallMLP(hidden=64)
     layout = ParamLayout.from_module(model)
     adaptive_sub = AdaptiveSubspace.from_layout(
-        layout, rank=4096, rotation_mode='displacement',
-        absorb_mode='periodic', absorb_interval=20,
+        layout,
+        rank=4096,
+        rotation_mode="displacement",
+        absorb_mode="periodic",
+        absorb_interval=20,
     )
 
     optimizer = PolyStepOptimizer(
@@ -194,10 +198,6 @@ def test_adaptive_subspace_trains(mnist_loaders):
     assert total_disp > 0, "Expected non-zero total displacement"
 
 
-
-
-
-
 @requires_mnist
 @pytest.mark.slow
 def test_adaptive_absorb_fires(mnist_loaders):
@@ -212,8 +212,11 @@ def test_adaptive_absorb_fires(mnist_loaders):
     model = SmallMLP(hidden=64)
     layout = ParamLayout.from_module(model)
     adaptive_sub = AdaptiveSubspace.from_layout(
-        layout, rank=128, rotation_mode='displacement',
-        absorb_mode='periodic', absorb_interval=5,
+        layout,
+        rank=128,
+        rotation_mode="displacement",
+        absorb_mode="periodic",
+        absorb_interval=5,
     )
 
     optimizer = PolyStepOptimizer(
@@ -294,10 +297,15 @@ def test_adaptive_convergence_vs_linear(mnist_loaders):
     linear_sub = LinearSubspace.from_layout(layout_l, rank=4)
 
     opt_l = PolyStepOptimizer(
-        model_l, compile=False, seed=42,
+        model_l,
+        compile=False,
+        seed=42,
         epsilon=0.5,
-        step_radius=4.5, probe_radius=2.0, num_probe=3,
-        sinkhorn_max_iters=50, subspace=linear_sub,
+        step_radius=4.5,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=linear_sub,
     )
 
     tracker_l = StepAccuracyTracker(model_l, test_loader, target_acc, check_every=1)
@@ -316,15 +324,23 @@ def test_adaptive_convergence_vs_linear(mnist_loaders):
     model_a = SmallMLP(hidden=64)
     layout_a = ParamLayout.from_module(model_a)
     adaptive_sub = AdaptiveSubspace.from_layout(
-        layout_a, rank=4096, rotation_mode='displacement',
-        absorb_mode='periodic', absorb_interval=20,
+        layout_a,
+        rank=4096,
+        rotation_mode="displacement",
+        absorb_mode="periodic",
+        absorb_interval=20,
     )
 
     opt_a = PolyStepOptimizer(
-        model_a, compile=False, seed=42,
+        model_a,
+        compile=False,
+        seed=42,
         epsilon=0.5,
-        step_radius=10.0, probe_radius=2.0, num_probe=3,
-        sinkhorn_max_iters=50, subspace=adaptive_sub,
+        step_radius=10.0,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=adaptive_sub,
     )
 
     tracker_a = StepAccuracyTracker(model_a, test_loader, target_acc, check_every=1)
@@ -337,25 +353,27 @@ def test_adaptive_convergence_vs_linear(mnist_loaders):
         adaptive_steps_to_target = opt_a.state.iteration_count
 
     # ---- Report steps_to_target comparison ----
-    print(f"\n  Convergence comparison (target={target_acc*100:.0f}% accuracy):")
-    print(f"    LinearSubspace:   steps_to_target={linear_steps_to_target}, final_acc={linear_final_acc*100:.1f}%")
-    print(f"    AdaptiveSubspace: steps_to_target={adaptive_steps_to_target}, final_acc={adaptive_final_acc*100:.1f}%")
+    print(f"\n  Convergence comparison (target={target_acc * 100:.0f}% accuracy):")
+    print(f"    LinearSubspace:   steps_to_target={linear_steps_to_target}, final_acc={linear_final_acc * 100:.1f}%")
+    print(
+        f"    AdaptiveSubspace: steps_to_target={adaptive_steps_to_target}, final_acc={adaptive_final_acc * 100:.1f}%"
+    )
 
     if linear_steps_to_target is not None and adaptive_steps_to_target is not None:
-        speedup = linear_steps_to_target / adaptive_steps_to_target if adaptive_steps_to_target > 0 else float('inf')
+        speedup = linear_steps_to_target / adaptive_steps_to_target if adaptive_steps_to_target > 0 else float("inf")
         print(f"    Steps-to-target speedup (linear/adaptive): {speedup:.2f}x")
 
     # ---- Assertions ----
     # 1. AdaptiveSubspace must reach the target accuracy (20% is well above 10% random chance)
     assert adaptive_steps_to_target is not None, (
-        f"AdaptiveSubspace should reach {target_acc*100:.0f}% accuracy within {epochs} epochs, "
-        f"but only achieved {adaptive_final_acc*100:.1f}%"
+        f"AdaptiveSubspace should reach {target_acc * 100:.0f}% accuracy within {epochs} epochs, "
+        f"but only achieved {adaptive_final_acc * 100:.1f}%"
     )
 
     # 2. LinearSubspace must also reach target (baseline validation)
     assert linear_steps_to_target is not None, (
-        f"LinearSubspace should reach {target_acc*100:.0f}% accuracy within {epochs} epochs, "
-        f"but only achieved {linear_final_acc*100:.1f}%"
+        f"LinearSubspace should reach {target_acc * 100:.0f}% accuracy within {epochs} epochs, "
+        f"but only achieved {linear_final_acc * 100:.1f}%"
     )
 
     # 3. Both produced valid steps_to_target metrics
@@ -364,7 +382,7 @@ def test_adaptive_convergence_vs_linear(mnist_loaders):
 
     # 4. AdaptiveSubspace achieves meaningful final accuracy (above random chance)
     assert adaptive_final_acc >= 0.15, (
-        f"AdaptiveSubspace should achieve at least 15% accuracy, got {adaptive_final_acc*100:.1f}%"
+        f"AdaptiveSubspace should achieve at least 15% accuracy, got {adaptive_final_acc * 100:.1f}%"
     )
 
 
@@ -385,12 +403,20 @@ def test_adaptive_vs_linear_step_speed(mnist_loaders):
     model_a = SmallMLP(hidden=64)
     layout_a = ParamLayout.from_module(model_a)
     adaptive_sub = AdaptiveSubspace.from_layout(
-        layout_a, rank=256, rotation_mode='random',
+        layout_a,
+        rank=256,
+        rotation_mode="random",
     )
     opt_a = PolyStepOptimizer(
-        model_a, compile=False, seed=42, epsilon=0.5,
-        step_radius=10.0, probe_radius=2.0, num_probe=3,
-        sinkhorn_max_iters=50, subspace=adaptive_sub,
+        model_a,
+        compile=False,
+        seed=42,
+        epsilon=0.5,
+        step_radius=10.0,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=adaptive_sub,
     )
     config = TrainConfig(epochs=1)
     t0 = time.time()
@@ -404,9 +430,15 @@ def test_adaptive_vs_linear_step_speed(mnist_loaders):
     layout_l = ParamLayout.from_module(model_l)
     linear_sub = LinearSubspace.from_layout(layout_l, rank=2)
     opt_l = PolyStepOptimizer(
-        model_l, compile=False, seed=42, epsilon=0.5,
-        step_radius=4.5, probe_radius=2.0, num_probe=3,
-        sinkhorn_max_iters=50, subspace=linear_sub,
+        model_l,
+        compile=False,
+        seed=42,
+        epsilon=0.5,
+        step_radius=4.5,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=linear_sub,
     )
     config = TrainConfig(epochs=1)
     t0 = time.time()

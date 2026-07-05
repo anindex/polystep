@@ -13,6 +13,7 @@ particle_dim). With particle_dim=2 and orthoplex polytope, each OT
 problem has 4 vertices per particle -- tractable but requiring P*V*K
 model evaluations per step. Smaller models are faster.
 """
+
 from __future__ import annotations
 
 import gzip
@@ -110,6 +111,7 @@ def _make_loaders(n_train: int, n_test: int, batch_size: int, downsample: int = 
 # Model
 # ---------------------------------------------------------------------------
 
+
 class SmallMNISTNet(nn.Module):
     """Tiny MLP for MNIST -- keeps parameter count low for OT feasibility.
 
@@ -150,6 +152,7 @@ class MNISTNet(nn.Module):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 @torch.no_grad()
 def _evaluate(model: nn.Module, loader: DataLoader) -> float:
     correct = total = 0
@@ -162,7 +165,9 @@ def _evaluate(model: nn.Module, loader: DataLoader) -> float:
 
 @torch.no_grad()
 def _evaluate_on_device(
-    model: nn.Module, loader: DataLoader, device: torch.device,
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
 ) -> float:
     correct = total = 0
     for inputs, targets in loader:
@@ -187,6 +192,7 @@ def _compute_loss(model: nn.Module, loader: DataLoader, loss_fn) -> float:
 # Tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.slow
 @pytest.mark.timeout(180)
 def test_mnist_accuracy():
@@ -201,7 +207,10 @@ def test_mnist_accuracy():
     """
     torch.manual_seed(42)
     train_loader, test_loader = _make_loaders(
-        n_train=2000, n_test=1000, batch_size=32, downsample=4,
+        n_train=2000,
+        n_test=1000,
+        batch_size=32,
+        downsample=4,
     )
 
     model = SmallMNISTNet(input_dim=49, hidden=16)
@@ -216,7 +225,7 @@ def test_mnist_accuracy():
         probe_radius=6.0,
         num_probe=2,
         sinkhorn_max_iters=100,
-        scale_cost='mean',
+        scale_cost="mean",
         chunk_size=512,
     )
 
@@ -224,9 +233,7 @@ def test_mnist_accuracy():
     model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
 
     accuracy = _evaluate(model, test_loader)
-    assert accuracy > 0.50, (
-        f"Expected accuracy > 50% on 1000-sample test subset, got {accuracy * 100:.1f}%"
-    )
+    assert accuracy > 0.50, f"Expected accuracy > 50% on 1000-sample test subset, got {accuracy * 100:.1f}%"
 
 
 def test_mnist_model_improves():
@@ -239,7 +246,10 @@ def test_mnist_model_improves():
     """
     torch.manual_seed(42)
     train_loader, test_loader = _make_loaders(
-        n_train=200, n_test=100, batch_size=32, downsample=4,
+        n_train=200,
+        n_test=100,
+        batch_size=32,
+        downsample=4,
     )
 
     model = SmallMNISTNet(input_dim=49, hidden=16)
@@ -257,7 +267,7 @@ def test_mnist_model_improves():
         probe_radius=6.0,
         num_probe=2,
         sinkhorn_max_iters=100,
-        scale_cost='mean',
+        scale_cost="mean",
         chunk_size=256,
     )
 
@@ -266,8 +276,7 @@ def test_mnist_model_improves():
 
     final_loss = _compute_loss(model, test_loader, loss_fn)
     assert final_loss < initial_loss, (
-        f"Expected loss to decrease after training. "
-        f"Initial: {initial_loss:.4f}, Final: {final_loss:.4f}"
+        f"Expected loss to decrease after training. Initial: {initial_loss:.4f}, Final: {final_loss:.4f}"
     )
 
 
@@ -295,7 +304,10 @@ def test_mnist_gpu_subspace():
     torch.manual_seed(42)
 
     train_loader, test_loader = _make_loaders(
-        n_train=500, n_test=200, batch_size=64, downsample=4,
+        n_train=500,
+        n_test=200,
+        batch_size=64,
+        downsample=4,
     )
 
     model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
@@ -315,7 +327,7 @@ def test_mnist_gpu_subspace():
         num_probe=1,
         sinkhorn_max_iters=100,
         subspace=subspace,
-        scale_cost='mean',
+        scale_cost="mean",
         chunk_size=256,
     )
 
@@ -326,9 +338,7 @@ def test_mnist_gpu_subspace():
     displacements = optimizer.state.displacement_sqnorms
     assert len(displacements) > 0, "No steps were taken"
     has_nonzero = any(d > 0 for d in displacements)
-    assert has_nonzero, (
-        "All displacements were zero -- OT solver produced uniform transport"
-    )
+    assert has_nonzero, "All displacements were zero -- OT solver produced uniform transport"
 
     # Verify model parameters actually changed
     current_params = model.state_dict()
@@ -358,7 +368,10 @@ def test_mnist_gpu_full_space():
     torch.manual_seed(42)
 
     train_loader, test_loader = _make_loaders(
-        n_train=2000, n_test=1000, batch_size=32, downsample=4,
+        n_train=2000,
+        n_test=1000,
+        batch_size=32,
+        downsample=4,
     )
 
     model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
@@ -374,7 +387,7 @@ def test_mnist_gpu_full_space():
         probe_radius=6.0,
         num_probe=2,
         sinkhorn_max_iters=100,
-        scale_cost='mean',
+        scale_cost="mean",
         chunk_size=512,
     )
 
@@ -382,10 +395,7 @@ def test_mnist_gpu_full_space():
     model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
 
     accuracy = _evaluate_on_device(model, test_loader, device)
-    assert accuracy > 0.70, (
-        f"Expected accuracy > 70% on 7x7 MNIST with GPU, "
-        f"got {accuracy * 100:.1f}%"
-    )
+    assert accuracy > 0.70, f"Expected accuracy > 70% on 7x7 MNIST with GPU, got {accuracy * 100:.1f}%"
 
 
 @pytest.mark.gpu
@@ -414,7 +424,10 @@ def test_mnist_gpu_subspace_higher_particle_dim():
     torch.manual_seed(42)
 
     train_loader, test_loader = _make_loaders(
-        n_train=500, n_test=200, batch_size=64, downsample=4,
+        n_train=500,
+        n_test=200,
+        batch_size=64,
+        downsample=4,
     )
 
     model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
@@ -435,15 +448,13 @@ def test_mnist_gpu_subspace_higher_particle_dim():
         subspace=subspace,
         subspace_particle_dim=8,
         absorb_every=10,
-        scale_cost='mean',
+        scale_cost="mean",
         chunk_size=256,
     )
 
     # Verify particle shape reflects subspace_particle_dim=8
     X = optimizer.state.X
-    assert X.shape[1] == 8, (
-        f"Expected particle_dim=8 for subspace mode, got {X.shape[1]}"
-    )
+    assert X.shape[1] == 8, f"Expected particle_dim=8 for subspace mode, got {X.shape[1]}"
 
     config = TrainConfig(epochs=2)
     model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
@@ -452,9 +463,7 @@ def test_mnist_gpu_subspace_higher_particle_dim():
     displacements = optimizer.state.displacement_sqnorms
     assert len(displacements) > 0, "No steps were taken"
     has_nonzero = any(d > 0 for d in displacements)
-    assert has_nonzero, (
-        "All displacements were zero -- OT solver produced uniform transport"
-    )
+    assert has_nonzero, "All displacements were zero -- OT solver produced uniform transport"
 
     # Verify model parameters actually changed (absorb folds into base)
     current_params = model.state_dict()
@@ -472,9 +481,7 @@ def test_mnist_gpu_subspace_higher_particle_dim():
         if not torch.equal(initial_params[key], base[key]):
             base_changed = True
             break
-    assert base_changed, (
-        "Base params did not change -- absorb_every did not trigger"
-    )
+    assert base_changed, "Base params did not change -- absorb_every did not trigger"
 
 
 @pytest.mark.gpu
@@ -504,7 +511,10 @@ def test_mnist_gpu_linear_subspace():
     torch.manual_seed(42)
 
     train_loader, test_loader = _make_loaders(
-        n_train=2000, n_test=1000, batch_size=32, downsample=4,
+        n_train=2000,
+        n_test=1000,
+        batch_size=32,
+        downsample=4,
     )
 
     model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
@@ -525,7 +535,7 @@ def test_mnist_gpu_linear_subspace():
         subspace=subspace,
         subspace_particle_dim=8,
         absorb_every=15,
-        scale_cost='mean',
+        scale_cost="mean",
         chunk_size=512,
     )
 
@@ -533,6 +543,4 @@ def test_mnist_gpu_linear_subspace():
     model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
 
     accuracy = _evaluate_on_device(model, test_loader, device)
-    assert accuracy > 0.55, (
-        f"Expected linear subspace accuracy > 55% on MNIST, got {accuracy * 100:.1f}%"
-    )
+    assert accuracy > 0.55, f"Expected linear subspace accuracy > 55% on MNIST, got {accuracy * 100:.1f}%"

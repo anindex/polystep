@@ -9,6 +9,7 @@ Vertex ordering convention (orthoplex):
   Vertices d..2d-1: -e_0, -e_1, ..., -e_{d-1}
   Pair for direction i: vertex i (+) and vertex i+d (-)
 """
+
 import torch
 
 
@@ -32,12 +33,15 @@ def extract_fd_gradient(
     Returns:
         Gradient in rotated frame of shape (P, pdim).
     """
-    fwd = losses_3d[:, :pdim, :]      # (P, pdim, K) at +directions
-    bwd = losses_3d[:, pdim:, :]      # (P, pdim, K) at -directions
+    assert losses_3d.shape[1] == 2 * pdim, (
+        f"FD gradient needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}"
+    )
+    fwd = losses_3d[:, :pdim, :]  # (P, pdim, K) at +directions
+    bwd = losses_3d[:, pdim:, :]  # (P, pdim, K) at -directions
 
     # Central difference at each scale
     denom = (2.0 * scales * probe_radius).unsqueeze(0).unsqueeze(0)  # (1, 1, K)
-    grad_per_scale = (fwd - bwd) / denom.clamp(min=1e-10)           # (P, pdim, K)
+    grad_per_scale = (fwd - bwd) / denom.clamp(min=1e-10)  # (P, pdim, K)
 
     return grad_per_scale.mean(dim=-1)  # (P, pdim)
 
@@ -63,8 +67,11 @@ def extract_fd_hessian_diag(
     Returns:
         Diagonal Hessian in rotated frame of shape (P, pdim).
     """
-    fwd = losses_3d[:, :pdim, :]      # (P, pdim, K)
-    bwd = losses_3d[:, pdim:, :]      # (P, pdim, K)
+    assert losses_3d.shape[1] == 2 * pdim, (
+        f"FD Hessian needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}"
+    )
+    fwd = losses_3d[:, :pdim, :]  # (P, pdim, K)
+    bwd = losses_3d[:, pdim:, :]  # (P, pdim, K)
 
     # Symmetric sum: L(+s) + L(-s) = 2a + H*s^2
     sym_sum = fwd + bwd  # (P, pdim, K)
@@ -76,12 +83,12 @@ def extract_fd_hessian_diag(
     s_sq_mean = s_sq.mean()
     sym_mean = sym_sum.mean(dim=-1, keepdim=True)  # (P, pdim, 1)
 
-    s_centered = s_sq - s_sq_mean             # (K,)
-    y_centered = sym_sum - sym_mean            # (P, pdim, K)
+    s_centered = s_sq - s_sq_mean  # (K,)
+    y_centered = sym_sum - sym_mean  # (P, pdim, K)
 
     # slope = sum(s_centered * y_centered) / sum(s_centered^2)
-    numerator = (s_centered.unsqueeze(0).unsqueeze(0) * y_centered).sum(dim=-1)   # (P, pdim)
-    denominator = (s_centered ** 2).sum().clamp(min=1e-10)
+    numerator = (s_centered.unsqueeze(0).unsqueeze(0) * y_centered).sum(dim=-1)  # (P, pdim)
+    denominator = (s_centered**2).sum().clamp(min=1e-10)
 
     return numerator / denominator  # (P, pdim) = Hessian diagonal
 
@@ -94,16 +101,16 @@ def compute_newton_step(
 ) -> torch.Tensor:
     """Compute a diagonal Newton step in the rotated frame.
 
-    Along positive-curvature coordinates returns ``-g_i / H_i``; along
-    nonpositive coordinates the Hessian is replaced by ``hessian_reg``
-    (so the step becomes a small gradient step in those directions, never
-    an ascent step). The full step is then clipped to ``max_step_norm``.
+    Where curvature is above ``hessian_reg`` returns ``-g_i / H_i``; where it
+    is at or below ``hessian_reg`` (small-positive or nonpositive) the Hessian
+    is floored to ``hessian_reg`` (a small gradient step, never an ascent step).
+    The full step is then clipped to ``max_step_norm``.
 
     Args:
         gradient: FD gradient of shape ``(P, pdim)``.
         hessian_diag: Diagonal Hessian of shape ``(P, pdim)``.
         max_step_norm: Maximum step norm (trust region bound).
-        hessian_reg: Floor used on nonpositive curvature entries.
+        hessian_reg: Floor applied to curvature entries at or below it.
 
     Returns:
         Newton step in rotated frame of shape ``(P, pdim)``.
@@ -139,7 +146,7 @@ def compute_predicted_improvement(
         Predicted loss change per particle of shape (P,). Negative = improvement.
     """
     linear = (gradient * step).sum(dim=-1)
-    quadratic = 0.5 * (hessian_diag * step ** 2).sum(dim=-1)
+    quadratic = 0.5 * (hessian_diag * step**2).sum(dim=-1)
     return linear + quadratic
 
 
@@ -192,7 +199,8 @@ def apply_newton_refinement(
 
     # 2. Compute Newton step in rotated frame
     delta_rot = compute_newton_step(
-        gradient, hessian_diag,
+        gradient,
+        hessian_diag,
         max_step_norm=max_step_norm,
         hessian_reg=hessian_reg,
     )
@@ -258,7 +266,10 @@ def update_trust_region(
     if ratio < 0:
         return max(current_radius * shrink_factor * 0.5, min_radius)
 
-    if ratio > expand_threshold:
+    # Only expand when the model predicted an improvement (pred < 0) and reality
+    # matched it. An accurate but worsening step (pred > 0, actual > 0) also gives
+    # ratio ~1 and must not grow the region.
+    if ratio > expand_threshold and pred < 0:
         return min(current_radius * expand_factor, max_radius)
     elif ratio < shrink_threshold:
         return max(current_radius * shrink_factor, min_radius)

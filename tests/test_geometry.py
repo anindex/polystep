@@ -1,4 +1,5 @@
 """Unit tests for geometry module: polytopes, rotations, and probe points."""
+
 import math
 
 import torch
@@ -28,30 +29,26 @@ class TestPolytopes:
     def test_orthoplex_vertex_count(self, dim):
         """Orthoplex generates exactly 2*dim vertices."""
         verts = get_orthoplex_vertices(dim)
-        assert verts.shape == (2 * dim, dim), \
-            f"Expected ({2*dim}, {dim}), got {verts.shape}"
+        assert verts.shape == (2 * dim, dim), f"Expected ({2 * dim}, {dim}), got {verts.shape}"
 
     @pytest.mark.parametrize("dim", [2, 3, 5, 10])
     def test_simplex_vertex_count(self, dim):
         """Simplex generates exactly dim+1 vertices."""
         verts = get_simplex_vertices(dim)
-        assert verts.shape == (dim + 1, dim), \
-            f"Expected ({dim+1}, {dim}), got {verts.shape}"
+        assert verts.shape == (dim + 1, dim), f"Expected ({dim + 1}, {dim}), got {verts.shape}"
 
     @pytest.mark.parametrize("dim", [2, 3, 4])
     def test_cube_vertex_count(self, dim):
         """Cube generates exactly 2^dim vertices."""
         verts = get_cube_vertices(dim)
-        assert verts.shape == (2 ** dim, dim), \
-            f"Expected ({2**dim}, {dim}), got {verts.shape}"
+        assert verts.shape == (2**dim, dim), f"Expected ({2**dim}, {dim}), got {verts.shape}"
 
     def test_orthoplex_centered_at_origin(self):
         """Orthoplex vertices are centered at the origin."""
         dim = 5
         verts = get_orthoplex_vertices(dim, radius=1.0)
         mean = verts.mean(dim=0)
-        assert torch.allclose(mean, torch.zeros(dim), atol=1e-6), \
-            f"Mean: {mean}"
+        assert torch.allclose(mean, torch.zeros(dim), atol=1e-6), f"Mean: {mean}"
 
     def test_simplex_equidistant(self):
         """Simplex vertices are pairwise equidistant."""
@@ -68,15 +65,16 @@ class TestPolytopes:
 
         dists_t = torch.tensor(dists)
         # All distances should be approximately equal
-        assert torch.allclose(dists_t, dists_t[0] * torch.ones_like(dists_t), atol=1e-5), \
+        assert torch.allclose(dists_t, dists_t[0] * torch.ones_like(dists_t), atol=1e-5), (
             f"Distance range: [{dists_t.min():.6f}, {dists_t.max():.6f}]"
+        )
 
     def test_vertex_count_map(self):
         """POLYTOPE_NUM_VERTICES_MAP returns correct counts."""
         dim = 5
-        assert POLYTOPE_NUM_VERTICES_MAP['orthoplex'](dim) == 2 * dim
-        assert POLYTOPE_NUM_VERTICES_MAP['simplex'](dim) == dim + 1
-        assert POLYTOPE_NUM_VERTICES_MAP['cube'](dim) == 2 ** dim
+        assert POLYTOPE_NUM_VERTICES_MAP["orthoplex"](dim) == 2 * dim
+        assert POLYTOPE_NUM_VERTICES_MAP["simplex"](dim) == dim + 1
+        assert POLYTOPE_NUM_VERTICES_MAP["cube"](dim) == 2**dim
 
 
 # ---------------------------------------------------------------------------
@@ -96,12 +94,10 @@ class TestRotations:
         R = get_random_rotation_matrices(batch=4, dim=dim, generator=gen)
         eye = torch.eye(dim).unsqueeze(0).expand(4, -1, -1)
         RtR = torch.bmm(R.transpose(-1, -2), R)
-        assert torch.allclose(RtR, eye, atol=1e-5), \
-            f"Max orthogonality error: {(RtR - eye).abs().max():.8f}"
+        assert torch.allclose(RtR, eye, atol=1e-5), f"Max orthogonality error: {(RtR - eye).abs().max():.8f}"
 
         dets = torch.det(R)
-        assert torch.allclose(dets, torch.ones(4), atol=1e-4), \
-            f"Determinants: {dets.tolist()}"
+        assert torch.allclose(dets, torch.ones(4), atol=1e-4), f"Determinants: {dets.tolist()}"
 
     def test_rotation_is_haar_distributed(self):
         """Mezzadri 2007 sign-corrected QR produces Haar-distributed
@@ -119,18 +115,13 @@ class TestRotations:
         # n samples is ~ sqrt(1/d) / sqrt(n); at n=8000, d=8 a 6-sigma
         # upper bound is below 0.02.
         mean = R.mean(dim=0)
-        assert mean.abs().max().item() < 0.02, (
-            f"E[R_ij] not centered: max |mean| = "
-            f"{mean.abs().max().item():.4f}"
-        )
+        assert mean.abs().max().item() < 0.02, f"E[R_ij] not centered: max |mean| = {mean.abs().max().item():.4f}"
 
         # Per-entry Var[R_ij] -> 1/d (Haar second moment).
-        var = (R ** 2).mean(dim=0)
+        var = (R**2).mean(dim=0)
         expected = torch.full_like(var, 1.0 / d)
         rel_err = ((var - expected).abs() / expected).max().item()
-        assert rel_err < 0.05, (
-            f"Var[R_ij] differs from 1/d by {rel_err * 100:.1f}%"
-        )
+        assert rel_err < 0.05, f"Var[R_ij] differs from 1/d by {rel_err * 100:.1f}%"
 
     def test_rotation_2d_uses_analytical(self):
         """Dim=2 rotation uses the analytical SO(2) path and produces
@@ -172,8 +163,9 @@ class TestProbes:
 
         probes = get_probe_points(origin, directions, scales, probe_radius=2.0)
 
-        assert probes.shape == (batch, num_points, num_probe, dim), \
+        assert probes.shape == (batch, num_points, num_probe, dim), (
             f"Expected ({batch}, {num_points}, {num_probe}, {dim}), got {probes.shape}"
+        )
 
     def test_probe_points_at_zero_scale(self):
         """Probe points at scale=0 should be at the origin."""
@@ -188,8 +180,9 @@ class TestProbes:
         # At scale=0 (index 0), probes should equal origin
         for b in range(batch):
             for p in range(num_points):
-                assert torch.allclose(probes[b, p, 0], origin[b], atol=1e-6), \
+                assert torch.allclose(probes[b, p, 0], origin[b], atol=1e-6), (
                     f"Probe at scale=0 differs from origin at batch={b}, point={p}"
+                )
 
     def test_sampled_polytope_vertices_shapes(self):
         """get_sampled_polytope_vertices returns correct shapes."""
@@ -205,17 +198,24 @@ class TestProbes:
         gen.manual_seed(42)
 
         step_pts, probe_pts, rot_verts = get_sampled_polytope_vertices(
-            origin, probes, polytope_verts,
-            step_radius=1.0, probe_radius=2.0, generator=gen,
+            origin,
+            probes,
+            polytope_verts,
+            step_radius=1.0,
+            probe_radius=2.0,
+            generator=gen,
         )
 
         n_verts = 2 * dim
-        assert step_pts.shape == (batch, n_verts, dim), \
+        assert step_pts.shape == (batch, n_verts, dim), (
             f"step_pts: expected ({batch}, {n_verts}, {dim}), got {step_pts.shape}"
-        assert probe_pts.shape == (batch, n_verts, num_probe, dim), \
+        )
+        assert probe_pts.shape == (batch, n_verts, num_probe, dim), (
             f"probe_pts: expected ({batch}, {n_verts}, {num_probe}, {dim}), got {probe_pts.shape}"
-        assert rot_verts.shape == (batch, n_verts, dim), \
+        )
+        assert rot_verts.shape == (batch, n_verts, dim), (
             f"rot_verts: expected ({batch}, {n_verts}, {dim}), got {rot_verts.shape}"
+        )
 
     def test_sampled_polytope_deterministic_with_generator(self):
         """Same generator seed produces identical sampled vertices."""
@@ -228,13 +228,19 @@ class TestProbes:
         gen1 = torch.Generator()
         gen1.manual_seed(99)
         s1, p1, r1 = get_sampled_polytope_vertices(
-            origin, probes, polytope_verts, generator=gen1,
+            origin,
+            probes,
+            polytope_verts,
+            generator=gen1,
         )
 
         gen2 = torch.Generator()
         gen2.manual_seed(99)
         s2, p2, r2 = get_sampled_polytope_vertices(
-            origin, probes, polytope_verts, generator=gen2,
+            origin,
+            probes,
+            polytope_verts,
+            generator=gen2,
         )
 
         assert torch.equal(s1, s2), "Step points differ with same seed"

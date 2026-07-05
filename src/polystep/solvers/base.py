@@ -5,6 +5,7 @@ Defines the ``Solver`` protocol for pluggable OT/weighting solvers and the
 (Protocol) so any class with a matching ``.solve()`` signature qualifies
 without explicit inheritance.
 """
+
 from dataclasses import dataclass
 from typing import Optional, Union
 

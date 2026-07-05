@@ -11,7 +11,7 @@ def test_fd_gradient_quadratic_function():
 
     true_grad = torch.tensor([[3.0, -2.0]])
     true_hess = torch.tensor([[2.0, 5.0]])
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
     c = 10.0
 
@@ -38,7 +38,7 @@ def test_fd_hessian_diagonal_quadratic_function():
 
     true_grad = torch.tensor([[3.0, -2.0]])
     true_hess = torch.tensor([[2.0, 5.0]])
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
     c = 10.0
 
@@ -91,6 +91,14 @@ def test_newton_step_regularizes_small_hessian():
     assert torch.norm(step).item() < 1e6
 
 
+def test_trust_region_no_expand_on_predicted_increase():
+    """A predicted loss increase (pred>0), even if accurate, must not expand."""
+    from polystep.quadratic_model import update_trust_region
+
+    r = update_trust_region(torch.tensor([1.0]), torch.tensor([1.0]), current_radius=1.0)
+    assert r <= 1.0
+
+
 def test_predicted_improvement():
     """Predicted improvement should match quadratic model."""
     gradient = torch.tensor([[3.0, -2.0]])
@@ -113,7 +121,7 @@ def test_fd_gradient_batch_particles():
 
     true_grad = torch.randn(P, pdim)
     true_hess = torch.rand(P, pdim) + 0.5
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 0.5
     c = 5.0
 
@@ -179,7 +187,7 @@ def test_newton_refinement_alpha_one_moves_toward_minimum():
     pdim = 2
     P = 1
     K = 5
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
 
     # Quadratic: minimum at x* = -g/H = [-1.5, 0.4]
@@ -221,7 +229,7 @@ def test_newton_refinement_anchors_at_probe_center_not_x_bary():
     pdim = 2
     P = 1
     K = 5
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
 
     # Quadratic centered at the probe center (origin); minimum at -g/H = [-1.5, 0.4].
@@ -229,8 +237,8 @@ def test_newton_refinement_anchors_at_probe_center_not_x_bary():
     true_hess = torch.tensor([[2.0, 5.0]])
     losses_3d = _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P)
 
-    X_current = torch.zeros(P, pdim)      # probe center
-    X_bary = torch.tensor([[0.5, 0.5]])   # OT result, offset from the center
+    X_current = torch.zeros(P, pdim)  # probe center
+    X_bary = torch.tensor([[0.5, 0.5]])  # OT result, offset from the center
     rot_mats = torch.eye(pdim).unsqueeze(0).expand(P, -1, -1)
 
     # alpha=1.0 must land at X_current + delta = [-1.5, 0.4] (the true minimum),
@@ -258,7 +266,7 @@ def test_newton_refinement_alpha_zero_returns_unchanged():
     pdim = 2
     P = 1
     K = 5
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
     true_grad = torch.tensor([[3.0, -2.0]])
     true_hess = torch.tensor([[2.0, 5.0]])
@@ -290,7 +298,7 @@ def test_newton_refinement_alpha_blending():
     pdim = 2
     P = 1
     K = 5
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
     true_grad = torch.tensor([[3.0, -2.0]])
     true_hess = torch.tensor([[2.0, 5.0]])
@@ -325,7 +333,7 @@ def test_newton_refinement_handles_near_zero_hessian():
     pdim = 2
     P = 1
     K = 5
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
 
     # Near-zero Hessian: flat landscape (H ~ 0)
@@ -362,7 +370,7 @@ def test_newton_refinement_respects_max_step_norm():
     pdim = 2
     P = 1
     K = 5
-    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
 
     # Large gradient, small Hessian -> large Newton step (will be clamped)

@@ -28,9 +28,13 @@ def test_fd_gradient_rotation_stores_direction():
     """With use_quadratic_model=True, optimizer should store FD gradient direction."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        biased_rotation=True, use_quadratic_model=True,
-        max_iterations=2, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        biased_rotation=True,
+        use_quadratic_model=True,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
     opt.step(closure)
@@ -44,9 +48,13 @@ def test_fd_gradient_rotation_produces_finite_direction():
     """FD gradient rotation should produce finite, non-zero directions."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        biased_rotation=True, use_quadratic_model=True,
-        max_iterations=2, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        biased_rotation=True,
+        use_quadratic_model=True,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
     opt.step(closure)
@@ -59,9 +67,13 @@ def test_losses_3d_retained():
     """Optimizer should retain the (P, V, K) loss tensor when use_quadratic_model=True."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        use_quadratic_model=True, num_probe=3,
-        max_iterations=2, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        use_quadratic_model=True,
+        num_probe=3,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
     opt.step(closure)
@@ -77,10 +89,16 @@ def test_newton_momentum_uses_fd_direction():
     """With use_quadratic_model=True, momentum steps should use Newton direction."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        amortize_steps=3, amortize_ema=0.7,
-        use_quadratic_model=True, biased_rotation=True,
-        num_probe=3, max_iterations=2, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        amortize_steps=3,
+        amortize_ema=0.7,
+        use_quadratic_model=True,
+        biased_rotation=True,
+        num_probe=3,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
 
@@ -98,10 +116,16 @@ def test_newton_momentum_fallback_without_qm():
     """Without use_quadratic_model, momentum should still use EMA transport."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        amortize_steps=3, amortize_ema=0.7,
-        use_quadratic_model=False, biased_rotation=True,
-        num_probe=3, max_iterations=2, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        amortize_steps=3,
+        amortize_ema=0.7,
+        use_quadratic_model=False,
+        biased_rotation=True,
+        num_probe=3,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
     opt.step(closure)
@@ -114,7 +138,7 @@ def test_sobol_rotations_low_discrepancy():
     """Sobol 2D rotations should have more uniform angle coverage than random."""
     from polystep.geometry import get_sobol_rotation_matrices
 
-    rots = get_sobol_rotation_matrices(16, 2, device=torch.device('cpu'))
+    rots = get_sobol_rotation_matrices(16, 2, device=torch.device("cpu"))
     assert rots.shape == (16, 2, 2)
     for i in range(16):
         R = rots[i]
@@ -132,7 +156,7 @@ def test_sobol_rotations_higher_dim():
     """Sobol higher-dim rotations should produce valid SO(d) matrices."""
     from polystep.geometry import get_sobol_rotation_matrices
 
-    rots = get_sobol_rotation_matrices(8, 4, device=torch.device('cpu'))
+    rots = get_sobol_rotation_matrices(8, 4, device=torch.device("cpu"))
     assert rots.shape == (8, 4, 4)
     for i in range(8):
         R = rots[i]
@@ -140,15 +164,19 @@ def test_sobol_rotations_higher_dim():
         assert torch.allclose(torch.det(R).abs(), torch.tensor(1.0), atol=1e-4)
 
 
-
 def test_trust_region_adapts_radius():
     """Trust region should change step radius based on predicted vs actual improvement."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        use_quadratic_model=True, trust_region=True,
-        biased_rotation=True, num_probe=3,
-        max_iterations=2, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        use_quadratic_model=True,
+        trust_region=True,
+        biased_rotation=True,
+        num_probe=3,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
 
@@ -157,11 +185,10 @@ def test_trust_region_adapts_radius():
         opt.step(closure)
 
     # Multiplier should exist and be positive
-    assert hasattr(opt, '_trust_region_multiplier')
+    assert hasattr(opt, "_trust_region_multiplier")
     assert opt._trust_region_multiplier > 0
     # Diagnostics should have been recorded
     assert len(opt._state.trust_region_multipliers) > 0
-
 
 
 def test_trust_region_expands_on_accurate_prediction():
@@ -174,10 +201,15 @@ def test_trust_region_expands_on_accurate_prediction():
     """
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        use_quadratic_model=True, trust_region=True,
-        biased_rotation=True, num_probe=3,
-        max_iterations=12, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        use_quadratic_model=True,
+        trust_region=True,
+        biased_rotation=True,
+        num_probe=3,
+        max_iterations=12,
+        seed=42,
     )
     closure = make_closure(opt)
     for _ in range(12):
@@ -193,8 +225,13 @@ def test_newton_refinement_invalidates_warmstart_duals():
     # Baseline: plain Sinkhorn keeps its duals for warm starting.
     model, make_closure = _make_model_and_closure()
     base = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5, solver="sinkhorn",
-        num_probe=3, max_iterations=3, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        solver="sinkhorn",
+        num_probe=3,
+        max_iterations=3,
+        seed=42,
     )
     base.step(make_closure(base))
     assert base._state.f is not None
@@ -203,9 +240,15 @@ def test_newton_refinement_invalidates_warmstart_duals():
     # encode old positions and must be cleared instead of kept.
     model2, make_closure2 = _make_model_and_closure()
     ref = PolyStepOptimizer(
-        model2, particle_dim=2, epsilon=0.5, solver="sinkhorn",
-        use_quadratic_model=True, newton_refinement=True,
-        num_probe=3, max_iterations=3, seed=42,
+        model2,
+        particle_dim=2,
+        epsilon=0.5,
+        solver="sinkhorn",
+        use_quadratic_model=True,
+        newton_refinement=True,
+        num_probe=3,
+        max_iterations=3,
+        seed=42,
     )
     ref.step(make_closure2(ref))
     assert ref._state.f is None
@@ -217,9 +260,14 @@ def test_adaptive_probes_reuses_rotation_for_stagnant_particles():
     stays consistent with the vertices that row was evaluated at."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        adaptive_probes=True, adaptive_probes_threshold=1e9,  # force all stagnant
-        num_probe=3, max_iterations=10, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        adaptive_probes=True,
+        adaptive_probes_threshold=1e9,  # force all stagnant
+        num_probe=3,
+        max_iterations=10,
+        seed=42,
     )
     closure = make_closure(opt)
 
@@ -239,9 +287,14 @@ def test_multifidelity_screening_runs():
     """Multi-fidelity screening should complete without errors."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=4, epsilon=0.5,  # pdim=4 -> 8 vertices
-        multifidelity_screen=True, screen_keep_ratio=0.5,
-        num_probe=5, max_iterations=2, seed=42,
+        model,
+        particle_dim=4,
+        epsilon=0.5,  # pdim=4 -> 8 vertices
+        multifidelity_screen=True,
+        screen_keep_ratio=0.5,
+        num_probe=5,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
     loss = opt.step(closure)
@@ -255,8 +308,11 @@ def test_multifidelity_off_by_default():
     """Multi-fidelity should be disabled by default."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        max_iterations=2, seed=42,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        max_iterations=2,
+        seed=42,
     )
     assert not opt.multifidelity_screen
 
@@ -266,10 +322,15 @@ def test_multifidelity_screening_skipped_for_non_orthoplex():
     model, make_closure = _make_model_and_closure()
     # simplex polytope: V = pdim + 1, not 2 * pdim - orthoplex-specific indexing would crash
     opt = PolyStepOptimizer(
-        model, particle_dim=4, epsilon=0.5,
-        polytope_type='simplex',
-        multifidelity_screen=True, screen_keep_ratio=0.5,
-        num_probe=5, max_iterations=2, seed=42,
+        model,
+        particle_dim=4,
+        epsilon=0.5,
+        polytope_type="simplex",
+        multifidelity_screen=True,
+        screen_keep_ratio=0.5,
+        num_probe=5,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
     loss1 = opt.step(closure)
@@ -283,7 +344,9 @@ def test_all_dfo_features_compose():
     """All DFO features should work together without errors."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
         # All DFO features enabled
         use_quadratic_model=True,
         trust_region=True,
@@ -292,7 +355,8 @@ def test_all_dfo_features_compose():
         amortize_steps=3,
         amortize_ema=0.7,
         num_probe=3,
-        max_iterations=3, seed=42,
+        max_iterations=3,
+        seed=42,
     )
     closure = make_closure(opt)
 
@@ -310,10 +374,14 @@ def test_dfo_features_with_subspace():
     """DFO features should work together (quadratic model + biased rotation)."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
-        model, particle_dim=2, epsilon=0.5,
-        use_quadratic_model=True, biased_rotation=True,
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        use_quadratic_model=True,
+        biased_rotation=True,
         amortize_steps=2,
-        max_iterations=2, seed=42,
+        max_iterations=2,
+        seed=42,
     )
     closure = make_closure(opt)
 

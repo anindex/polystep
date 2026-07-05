@@ -1,4 +1,5 @@
 """Amortized momentum step and related helpers."""
+
 from __future__ import annotations
 
 import math
@@ -22,8 +23,9 @@ def step_momentum(opt, closure: Callable) -> float:
         Reused cost from the last OT step.
     """
     state = opt._state
+    opt._update_sampling_projection()
     if opt._transport_direction_ema is None:
-        return state.costs[-1] if state.costs else float('inf')
+        return state.costs[-1] if state.costs else float("inf")
 
     # Linear decay: first momentum step gets full strength, last gets minimal
     phase = (opt._amortize_counter % opt.amortize_steps) / opt.amortize_steps
@@ -48,7 +50,7 @@ def step_momentum(opt, closure: Callable) -> float:
         opt._transport_direction_ema = None
         opt._newton_direction = None
         opt._sync_model()
-        prev_cost = state.costs[-1] if state.costs else float('inf')
+        prev_cost = state.costs[-1] if state.costs else float("inf")
         state.costs.append(prev_cost)
         state.linear_convergence.append(True)
         state.displacement_sqnorms.append(0.0)
@@ -59,7 +61,7 @@ def step_momentum(opt, closure: Callable) -> float:
     opt._sync_model()
 
     # Reuse last cost (no validation forward pass)
-    cost = state.costs[-1] if state.costs else float('inf')
+    cost = state.costs[-1] if state.costs else float("inf")
 
     # Update diagnostics
     disp_sqnorm = torch.mean(torch.sum((state.X - X_old) ** 2, dim=-1)).item()
@@ -86,20 +88,25 @@ def evaluate_current_loss(opt, closure: Callable) -> float:
     state = opt._state
     with torch.no_grad():
         if opt.subspace is not None:
-            flat_sub = state.X.reshape(-1)[:state.subspace.subspace_dim].unsqueeze(0)
+            flat_sub = state.X.reshape(-1)[: state.subspace.subspace_dim].unsqueeze(0)
             if opt._mixed_precision and state.projection is not None:
                 flat_sub = flat_sub.to(dtype=state.projection.dtype)
             if opt._adaptive or opt._cma_subspace:
                 val_params = state.subspace.reconstruct_batch(
-                    state.projection, state.base_params, flat_sub,
+                    opt._sampling_projection,
+                    state.base_params,
+                    flat_sub,
                 )
             elif opt._hybrid:
                 val_params = state.subspace.reconstruct_batch(
-                    state.hybrid_projections, state.base_params, flat_sub,
+                    state.hybrid_projections,
+                    state.base_params,
+                    flat_sub,
                 )
             else:
                 val_params = state.subspace.reconstruct_batch(
-                    state.base_params, flat_sub,
+                    state.base_params,
+                    flat_sub,
                 )
         else:
             flat_config = state.X.reshape(1, -1)
@@ -108,7 +115,8 @@ def evaluate_current_loss(opt, closure: Callable) -> float:
                 flat_for_layout = flat_config[:, :layout_flat]
             else:
                 flat_for_layout = torch.nn.functional.pad(
-                    flat_config, (0, layout_flat - flat_config.shape[1]),
+                    flat_config,
+                    (0, layout_flat - flat_config.shape[1]),
                 )
             val_params = opt.layout.batch_unflatten(flat_for_layout)
 
@@ -116,5 +124,5 @@ def evaluate_current_loss(opt, closure: Callable) -> float:
         val_loss = val_loss_tensor.mean().item()
         # Guard against NaN propagation - treat as infinite loss
         if math.isnan(val_loss):
-            return float('inf')
+            return float("inf")
         return val_loss

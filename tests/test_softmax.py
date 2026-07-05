@@ -11,6 +11,7 @@ in the paper. This file checks:
 - ``scale_cost`` does not mutate the caller's tensor in place
 - every headline runner explicitly pins ``solver=softmax``
 """
+
 from __future__ import annotations
 
 import re
@@ -52,10 +53,7 @@ def test_softmax_overflow_grid(cost_grid, dtype):
 
         if not torch.isfinite(result.matrix).all():
             n_bad = (~torch.isfinite(result.matrix)).sum().item()
-            failures.append(
-                f"dtype={dtype}, range={cost_range}, eps={eps}: "
-                f"{n_bad}/{P*V} non-finite entries"
-            )
+            failures.append(f"dtype={dtype}, range={cost_range}, eps={eps}: {n_bad}/{P * V} non-finite entries")
 
     assert not failures, "softmax produced non-finite entries:\n" + "\n".join(failures)
 
@@ -81,7 +79,8 @@ def test_softmax_identical_row_returns_uniform():
     # Each row is uniform with row-sum equal to a_p = 1/P.
     expected_row_value = 1.0 / (P * V)
     assert torch.allclose(
-        result.matrix, torch.full_like(result.matrix, expected_row_value),
+        result.matrix,
+        torch.full_like(result.matrix, expected_row_value),
         atol=1e-6,
     )
 
@@ -108,8 +107,7 @@ def test_softmax_source_marginal_preserved(dtype, tol):
     row_sums = result.matrix.sum(dim=-1)
     max_err = (row_sums - a).abs().max().item()
     assert max_err < tol, (
-        f"row sums deviate from a by {max_err} (tol={tol}, dtype={dtype}). "
-        f"a={a.tolist()}, row_sums={row_sums.tolist()}"
+        f"row sums deviate from a by {max_err} (tol={tol}, dtype={dtype}). a={a.tolist()}, row_sums={row_sums.tolist()}"
     )
 
 
@@ -135,12 +133,8 @@ def test_softmax_warns_on_nonuniform_b():
         solver.solve(C, b=b_nonuniform)
 
     msgs = [str(w.message).lower() for w in caught]
-    assert any(
-        "b" in m and ("ignore" in m or "softmax" in m or "marginal" in m)
-        for m in msgs
-    ), (
-        "expected SoftmaxSolver to warn that target marginal `b` is ignored; "
-        f"got warnings: {msgs}"
+    assert any("b" in m and ("ignore" in m or "softmax" in m or "marginal" in m) for m in msgs), (
+        f"expected SoftmaxSolver to warn that target marginal `b` is ignored; got warnings: {msgs}"
     )
 
 
@@ -165,12 +159,8 @@ def test_softmax_warns_on_tiny_epsilon():
         solver.solve(C)
 
     msgs = [str(w.message).lower() for w in caught]
-    assert any(
-        "epsilon" in m and ("underflow" in m or "small" in m or "scale" in m)
-        for m in msgs
-    ), (
-        "expected SoftmaxSolver to warn about tiny epsilon underflow; "
-        f"got warnings: {msgs}"
+    assert any("epsilon" in m and ("underflow" in m or "small" in m or "scale" in m) for m in msgs), (
+        f"expected SoftmaxSolver to warn about tiny epsilon underflow; got warnings: {msgs}"
     )
 
 
@@ -193,8 +183,7 @@ def test_softmax_does_not_mutate_caller_cost_matrix():
     solver.solve(C, scale_cost="mean")
 
     assert torch.equal(C, C_before), (
-        "solver mutated caller's cost matrix via scale_cost_matrix. "
-        "softmax.py:87 must clone before scaling."
+        "solver mutated caller's cost matrix via scale_cost_matrix. softmax.py:87 must clone before scaling."
     )
 
 

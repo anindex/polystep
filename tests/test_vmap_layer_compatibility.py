@@ -17,6 +17,7 @@ Covers:
 - ``state_dict`` round-trip is bitwise-identical for BF16 weights with
   tied params
 """
+
 from __future__ import annotations
 
 import logging
@@ -63,8 +64,7 @@ def test_tied_weights_deduplicated_with_info_log(caplog):
     canonical_keys = [e.key for e in layout.entries]
     assert "embedding.weight" in canonical_keys
     assert "lm_head.weight" not in canonical_keys, (
-        "lm_head.weight should be aliased to embedding.weight, not a "
-        "separate flat-param entry"
+        "lm_head.weight should be aliased to embedding.weight, not a separate flat-param entry"
     )
 
     # The canonical entry must record the alias.
@@ -73,10 +73,7 @@ def test_tied_weights_deduplicated_with_info_log(caplog):
 
     # The dedup must be visible in the log at any level.
     all_msgs = [r.getMessage().lower() for r in caplog.records]
-    assert any(
-        "tied" in m or "shared" in m or "alias" in m or "dedup" in m
-        for m in all_msgs
-    ), (
+    assert any("tied" in m or "shared" in m or "alias" in m or "dedup" in m for m in all_msgs), (
         f"expected a log message mentioning the tied weight; got: {all_msgs}"
     )
 
@@ -108,10 +105,7 @@ def test_dp_padding_round_trip_does_not_mutate_state_dict():
 
     layout = ParamLayout.from_module(model2, particle_dim=2)
     assert layout.total_params == 5
-    assert layout.padded_size == 6, (
-        f"expected padded_size=6 for 5 params with particle_dim=2; "
-        f"got {layout.padded_size}"
-    )
+    assert layout.padded_size == 6, f"expected padded_size=6 for 5 params with particle_dim=2; got {layout.padded_size}"
 
     flat = layout.flatten(model2)
     assert flat.numel() == 6
@@ -119,9 +113,7 @@ def test_dp_padding_round_trip_does_not_mutate_state_dict():
 
     # Padding must not appear as a state_dict key.
     expected_keys = {"0.weight", "0.bias", "1.weight"}
-    assert set(sd.keys()) == expected_keys, (
-        f"state_dict keys leaked padding: {set(sd.keys()) - expected_keys}"
-    )
+    assert set(sd.keys()) == expected_keys, f"state_dict keys leaked padding: {set(sd.keys()) - expected_keys}"
 
     # Values round-trip exactly.
     orig = model2.state_dict()
@@ -152,10 +144,7 @@ def test_upstream_nn_lstm_fails_under_vmap():
     stacked = {k: torch.stack([v, v, v], dim=0) for k, v in params.items()}
     try:
         vmap(call, in_dims=(0,))(stacked)
-        pytest.skip(
-            "nn.LSTM now works under vmap (PyTorch fixed #105982); "
-            "consider removing VmapSafeLSTM."
-        )
+        pytest.skip("nn.LSTM now works under vmap (PyTorch fixed #105982); consider removing VmapSafeLSTM.")
     except Exception:
         pass  # expected: upstream vmap does not support nn.LSTM
 
@@ -204,7 +193,7 @@ def test_vmap_safe_attention_bool_mask_zeros_attention():
     x = torch.randn(B, T, embed_dim)
     # Mask the second key position for every query: shape (T, T)
     bool_mask = torch.zeros(T, T, dtype=torch.bool)
-    bool_mask[:, 1] = True   # mask out key index 1
+    bool_mask[:, 1] = True  # mask out key index 1
 
     # Compute attention weights manually and check key-1 weight is zero.
     Q = attn.W_q(x).view(B, T, num_heads, embed_dim // num_heads).transpose(1, 2)
@@ -236,13 +225,16 @@ def test_vmap_safe_attention_bool_mask_zeros_attention():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kwargs", [
-    dict(kdim=16),
-    dict(vdim=16),
-    dict(add_bias_kv=True),
-    dict(add_zero_attn=True),
-    dict(batch_first=False),
-])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(kdim=16),
+        dict(vdim=16),
+        dict(add_bias_kv=True),
+        dict(add_zero_attn=True),
+        dict(batch_first=False),
+    ],
+)
 def test_vmap_safe_attention_raises_on_unsupported_kwargs(kwargs):
     """Constructor must raise a clear NotImplementedError for any
     unsupported nn.MultiheadAttention argument."""
@@ -250,10 +242,13 @@ def test_vmap_safe_attention_raises_on_unsupported_kwargs(kwargs):
         VmapSafeMultiHeadAttention(embed_dim=32, num_heads=4, **kwargs)
 
 
-@pytest.mark.parametrize("forward_kwargs", [
-    dict(need_weights=True),
-    dict(is_causal=True),
-])
+@pytest.mark.parametrize(
+    "forward_kwargs",
+    [
+        dict(need_weights=True),
+        dict(is_causal=True),
+    ],
+)
 def test_vmap_safe_attention_raises_on_unsupported_forward_kwargs(forward_kwargs):
     """Forward must reject need_weights / is_causal explicitly."""
     attn = VmapSafeMultiHeadAttention(embed_dim=32, num_heads=4)
@@ -267,11 +262,14 @@ def test_vmap_safe_attention_raises_on_unsupported_forward_kwargs(forward_kwargs
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kwargs", [
-    dict(bidirectional=True),
-    dict(proj_size=4),
-    dict(batch_first=False),
-])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(bidirectional=True),
+        dict(proj_size=4),
+        dict(batch_first=False),
+    ],
+)
 def test_vmap_safe_lstm_raises_on_unsupported_kwargs(kwargs):
     with pytest.raises(NotImplementedError, match="VmapSafeLSTM"):
         VmapSafeLSTM(input_size=4, hidden_size=8, **kwargs)
@@ -308,8 +306,7 @@ def test_state_dict_roundtrip_bf16_with_tied_weights():
     flat2 = layout.flatten(fresh)
 
     assert torch.equal(flat1, flat2), (
-        f"BF16 round-trip not bitwise stable: max diff "
-        f"{(flat1.float() - flat2.float()).abs().max().item():.3e}"
+        f"BF16 round-trip not bitwise stable: max diff {(flat1.float() - flat2.float()).abs().max().item():.3e}"
     )
 
     # Aliased: only one flat-param slot for both keys.

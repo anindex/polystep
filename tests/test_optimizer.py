@@ -66,8 +66,12 @@ class TestClosureInterface:
 
     def test_step_returns_float(self, model, closure):
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         loss = opt.step(closure)
         assert isinstance(loss, float)
@@ -75,15 +79,16 @@ class TestClosureInterface:
     def test_step_updates_model(self, model, closure):
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         opt.step(closure)
         updated_params = model.state_dict()
-        any_changed = any(
-            not torch.equal(initial_params[k], updated_params[k])
-            for k in initial_params
-        )
+        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Model parameters should change after step"
 
     def test_step_increments_iteration(self, optimizer, closure):
@@ -93,8 +98,12 @@ class TestClosureInterface:
 
     def test_multiple_steps(self, model, closure):
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         for _ in range(5):
             opt.step(closure)
@@ -112,8 +121,12 @@ class TestMomentum:
 
     def test_momentum_disabled_by_default(self, model, closure):
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         assert opt.state.velocity is None
         opt.step(closure)
@@ -121,8 +134,12 @@ class TestMomentum:
 
     def test_momentum_initializes_velocity(self, model):
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             use_momentum=True,
         )
         assert opt.state.velocity is not None
@@ -130,8 +147,12 @@ class TestMomentum:
 
     def test_momentum_updates_velocity(self, model, closure):
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             use_momentum=True,
         )
         opt.step(closure)
@@ -157,13 +178,23 @@ class TestMomentum:
         closure_mom = _make_closure(model_mom)
 
         opt_no_mom = PolyStepOptimizer(
-            model_no_mom, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model_no_mom,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         opt_mom = PolyStepOptimizer(
-            model_mom, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
-            use_momentum=True, momentum_init=0.5, momentum_final=0.95,
+            model_mom,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
+            use_momentum=True,
+            momentum_init=0.5,
+            momentum_final=0.95,
         )
 
         n_steps = 10
@@ -196,8 +227,12 @@ class TestAdaptiveRadius:
 
     def test_adaptive_disabled_by_default(self, model, closure):
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         opt.step(closure)
         assert opt.state.radius_multiplier == 1.0
@@ -208,8 +243,12 @@ class TestAdaptiveRadius:
 
     def test_radius_stays_in_bounds(self, model, closure):
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             use_adaptive_radius=True,
             radius_min=0.5,
             radius_max=3.0,
@@ -229,9 +268,14 @@ class TestIntegration:
 
     def test_momentum_and_adaptive_together(self, model, closure):
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
-            use_momentum=True, use_adaptive_radius=True,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
+            use_momentum=True,
+            use_adaptive_radius=True,
         )
         for _ in range(10):
             opt.step(closure)
@@ -264,8 +308,12 @@ class TestParticleDim:
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         assert opt.layout.particle_dim == 2
         assert opt._particle_dim == 2
@@ -275,8 +323,13 @@ class TestParticleDim:
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, particle_dim=4, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            particle_dim=4,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         assert opt.layout.particle_dim == 4
         assert opt._particle_dim == 4
@@ -289,8 +342,13 @@ class TestParticleDim:
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, particle_dim=8, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            particle_dim=8,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         assert opt.layout.particle_dim == 8
         assert opt._particle_dim == 8
@@ -305,18 +363,20 @@ class TestParticleDim:
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
 
         opt = PolyStepOptimizer(
-            model, particle_dim=4, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            particle_dim=4,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         closure = _make_closure(model)
         loss = opt.step(closure)
 
         assert isinstance(loss, float)
         updated_params = model.state_dict()
-        any_changed = any(
-            not torch.equal(initial_params[k], updated_params[k])
-            for k in initial_params
-        )
+        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Model parameters should change after step with particle_dim=4"
 
     def test_particle_dim_invalid(self):
@@ -325,21 +385,30 @@ class TestParticleDim:
         model = _make_model()
         with pytest.raises(ValueError, match="particle_dim must be >= 2"):
             PolyStepOptimizer(
-                model, particle_dim=1, max_iterations=50, epsilon=0.1,
+                model,
+                particle_dim=1,
+                max_iterations=50,
+                epsilon=0.1,
                 compile=False,
             )
 
     def test_particle_dim_cube_warning(self):
         """UserWarning when particle_dim=8 and polytope_type='cube'."""
         import warnings as _warnings
+
         torch.manual_seed(42)
         model = _make_model()
         with _warnings.catch_warnings(record=True) as w:
             _warnings.simplefilter("always")
             PolyStepOptimizer(
-                model, particle_dim=8, polytope_type='cube',
-                max_iterations=50, epsilon=0.1,
-                sinkhorn_max_iters=100, compile=False, seed=42,
+                model,
+                particle_dim=8,
+                polytope_type="cube",
+                max_iterations=50,
+                epsilon=0.1,
+                sinkhorn_max_iters=100,
+                compile=False,
+                seed=42,
             )
             cube_warnings = [x for x in w if "cube" in str(x.message).lower()]
             assert len(cube_warnings) >= 1, f"Expected cube warning, got: {[str(x.message) for x in w]}"
@@ -358,8 +427,12 @@ class TestAdaptiveProbes:
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         # Default should be off
         assert not opt._adaptive_probes
@@ -377,8 +450,13 @@ class TestAdaptiveProbes:
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, adaptive_probes=True, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            adaptive_probes=True,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         assert opt._adaptive_probes
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
@@ -396,10 +474,7 @@ class TestAdaptiveProbes:
 
         # Model should have changed
         updated_params = model.state_dict()
-        any_changed = any(
-            not torch.equal(initial_params[k], updated_params[k])
-            for k in initial_params
-        )
+        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Model parameters should change with adaptive_probes=True"
 
     def test_adaptive_probes_saves_evals(self):
@@ -412,10 +487,14 @@ class TestAdaptiveProbes:
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, adaptive_probes=True,
+            model,
+            adaptive_probes=True,
             adaptive_probes_threshold=1e10,  # Very high: ALL particles stagnant after step 1
-            max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
 
         call_counts = []
@@ -435,19 +514,21 @@ class TestAdaptiveProbes:
         opt.step(counting_closure)
         step2_evals = sum(call_counts)
 
-        assert step2_evals < step1_evals, (
-            f"Step 2 should have fewer evals than step 1: {step2_evals} vs {step1_evals}"
-        )
+        assert step2_evals < step1_evals, f"Step 2 should have fewer evals than step 1: {step2_evals} vs {step1_evals}"
 
     def test_adaptive_probes_threshold(self):
         """adaptive_probes_threshold controls which particles get reduced probes."""
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, adaptive_probes=True,
+            model,
+            adaptive_probes=True,
             adaptive_probes_threshold=0.0,  # Threshold 0: NO particles are stagnant
-            max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
 
         call_counts = []
@@ -468,8 +549,7 @@ class TestAdaptiveProbes:
         step2_evals = sum(call_counts)
 
         assert step2_evals == step1_evals, (
-            f"With threshold=0.0, step 2 should have same evals as step 1: "
-            f"{step2_evals} vs {step1_evals}"
+            f"With threshold=0.0, step 2 should have same evals as step 1: {step2_evals} vs {step1_evals}"
         )
 
 
@@ -500,12 +580,20 @@ class TestDualMomentum:
             return evaluator_beta0.evaluate(bp, inputs, targets)
 
         opt_default = PolyStepOptimizer(
-            model_default, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model_default,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         opt_beta0 = PolyStepOptimizer(
-            model_beta0, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model_beta0,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             dual_momentum_beta=0.0,
         )
 
@@ -522,8 +610,12 @@ class TestDualMomentum:
         model = _make_model()
         closure = _make_closure(model)
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             dual_momentum_beta=0.3,
         )
         for _ in range(5):
@@ -537,8 +629,12 @@ class TestDualMomentum:
         model = _make_model()
         closure = _make_closure(model)
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             dual_momentum_beta=0.3,
         )
         opt.step(closure)
@@ -552,8 +648,12 @@ class TestDualMomentum:
         model = _make_model()
         closure = _make_closure(model)
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             dual_momentum_beta=0.3,
         )
         for _ in range(5):
@@ -561,9 +661,7 @@ class TestDualMomentum:
         # Check that duals are within bounds
         if opt.state.f is not None:
             max_abs = 80.0 * max(opt.state.epsilon, 0.01)
-            assert opt.state.f.abs().max().item() <= max_abs + 1e-6, (
-                f"Dual f exceeds max_abs={max_abs}"
-            )
+            assert opt.state.f.abs().max().item() <= max_abs + 1e-6, f"Dual f exceeds max_abs={max_abs}"
 
 
 # ---------------------------------------------------------------------------
@@ -617,8 +715,12 @@ class TestSinkhornAccelerationIntegration:
         model = _make_model()
         closure = _make_closure(model)
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             dual_momentum_beta=0.3,
         )
         costs = []
@@ -648,12 +750,20 @@ class TestSinkhornAccelerationIntegration:
             return evaluator_defaults.evaluate(bp, inputs, targets)
 
         opt_baseline = PolyStepOptimizer(
-            model_baseline, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model_baseline,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         opt_defaults = PolyStepOptimizer(
-            model_defaults, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model_defaults,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             # All convergence acceleration params at default (off) values
             dual_momentum_beta=0.0,
         )
@@ -721,8 +831,12 @@ class TestEntEpsilon:
         model = _make_model()
         closure = _make_closure(model)
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             ent_epsilon=0.1,
         )
         cost = opt.step(closure)
@@ -737,8 +851,12 @@ class TestEntEpsilon:
         model = _make_model()
         closure = _make_closure(model)
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             ent_epsilon=LinearEpsilon(1.0, 0.1, 10),
         )
         cost = opt.step(closure)
@@ -750,8 +868,12 @@ class TestEntEpsilon:
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         assert opt.ent_epsilon is None
 
@@ -770,8 +892,12 @@ class TestStagnationThreshold:
         model = _make_model()
         closure = _make_closure(model)
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
             use_adaptive_radius=True,
             stagnation_threshold=0.001,
         )
@@ -787,8 +913,12 @@ class TestStagnationThreshold:
             model = _make_model()
             closure = _make_closure(model)
             opt = PolyStepOptimizer(
-                model, max_iterations=50, epsilon=0.1,
-                sinkhorn_max_iters=100, compile=False, seed=42,
+                model,
+                max_iterations=50,
+                epsilon=0.1,
+                sinkhorn_max_iters=100,
+                compile=False,
+                seed=42,
                 use_adaptive_radius=True,
                 stagnation_threshold=threshold,
             )
@@ -802,8 +932,12 @@ class TestStagnationThreshold:
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, max_iterations=50, epsilon=0.1,
-            sinkhorn_max_iters=100, compile=False, seed=42,
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            compile=False,
+            seed=42,
         )
         assert opt.stagnation_threshold == 1e-4
 
@@ -819,8 +953,13 @@ class TestAutoEpsilon:
         torch.manual_seed(42)
         model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
         optimizer = PolyStepOptimizer(
-            model, epsilon=1.0, step_radius=0.5, num_probe=2,
-            compile=False, seed=42, auto_epsilon=True,
+            model,
+            epsilon=1.0,
+            step_radius=0.5,
+            num_probe=2,
+            compile=False,
+            seed=42,
+            auto_epsilon=True,
         )
         inputs = torch.randn(8, 4)
         targets = torch.randint(0, 2, (8,))
@@ -828,6 +967,7 @@ class TestAutoEpsilon:
 
         def closure(batched_params):
             from polystep.cost_nn import NNCostEvaluator
+
             evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
             return evaluator.evaluate(batched_params, inputs, targets)
 
@@ -837,8 +977,7 @@ class TestAutoEpsilon:
             eps_values.append(optimizer._progressive_epsilon.at())
 
         # Epsilon should be changing (not stuck at init)
-        assert len(set(round(e, 6) for e in eps_values)) > 1, \
-            f"Epsilon did not change across steps: {eps_values}"
+        assert len(set(round(e, 6) for e in eps_values)) > 1, f"Epsilon did not change across steps: {eps_values}"
         # All values should be finite and positive
         assert all(0 < e < 100 for e in eps_values)
 
@@ -895,9 +1034,7 @@ class TestProbeRadiusJitter:
         and consumes NO random state from the optimizer's generator."""
         torch.manual_seed(0)
         model = _make_model()
-        opt = PolyStepOptimizer(
-            model, particle_dim=2, probe_radius=2.0, seed=42
-        )
+        opt = PolyStepOptimizer(model, particle_dim=2, probe_radius=2.0, seed=42)
         # Snapshot the generator state BEFORE calling the helper.
         state_before = opt._generator.get_state().clone()
         result = opt._apply_probe_radius_jitter(2.0)
@@ -914,8 +1051,11 @@ class TestProbeRadiusJitter:
         model = _make_model()
         eta_max = 0.05
         opt = PolyStepOptimizer(
-            model, particle_dim=2, probe_radius=2.0,
-            probe_radius_jitter=eta_max, seed=42,
+            model,
+            particle_dim=2,
+            probe_radius=2.0,
+            probe_radius_jitter=eta_max,
+            seed=42,
         )
         base = 2.0
         # Sample many jitter values and check (a) they are all in the interval,
@@ -924,12 +1064,9 @@ class TestProbeRadiusJitter:
         lo = base * (1.0 - eta_max)
         hi = base * (1.0 + eta_max)
         assert all(lo <= s <= hi for s in samples), (
-            f"jitter samples must lie in [{lo}, {hi}], got "
-            f"min={min(samples)} max={max(samples)}"
+            f"jitter samples must lie in [{lo}, {hi}], got min={min(samples)} max={max(samples)}"
         )
-        assert max(samples) - min(samples) > 0.01, (
-            "jitter samples should span a non-trivial range"
-        )
+        assert max(samples) - min(samples) > 0.01, "jitter samples should span a non-trivial range"
 
     def test_jitter_validation_rejects_out_of_range(self):
         """probe_radius_jitter must lie in [0, 1) - values >= 1 risk negative
@@ -948,8 +1085,11 @@ class TestProbeRadiusJitter:
         torch.manual_seed(0)
         model = _make_model()
         opt = PolyStepOptimizer(
-            model, particle_dim=2, probe_radius=2.0,
-            probe_radius_jitter=0.05, seed=42,
+            model,
+            particle_dim=2,
+            probe_radius=2.0,
+            probe_radius_jitter=0.05,
+            seed=42,
         )
         closure = _make_closure(model)
         params_before = torch.cat([p.detach().flatten() for p in model.parameters()])

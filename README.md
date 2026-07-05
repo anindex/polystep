@@ -2,12 +2,12 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2605.01928-b31b1b.svg)](https://arxiv.org/abs/2605.01928)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.8+](https://img.shields.io/badge/PyTorch-2.8%2B-ee4c2c.svg)](https://pytorch.org/)
+[![PyTorch 2.10+](https://img.shields.io/badge/PyTorch-2.10%2B-ee4c2c.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
 **Gradient-free neural network training via optimal transport.**
 
-PolyStep optimizes neural networks without backpropagation. At each step, it samples polytope vertices around current parameters, evaluates losses via forward passes only, and computes softmax-weighted projections to find descent directions. This enables training models with non-differentiable components - spiking networks, quantized layers, blackbox modules - where gradients are unavailable or undefined.
+PolyStep optimizes neural networks without backpropagation. At each step, it samples polytope vertices around current parameters, evaluates losses via forward passes only, and computes softmax-weighted projections to find descent directions. This enables training models with non-differentiable components (spiking networks, quantized layers, blackbox modules) where gradients are unavailable or undefined.
 
 Based on the Sinkhorn Step algorithm ([Le et al., NeurIPS 2023](https://arxiv.org/abs/2309.15970)), extended with subspace compression, a softmax solver, and convergence analysis for piecewise-smooth losses.
 
@@ -20,7 +20,7 @@ Based on the Sinkhorn Step algorithm ([Le et al., NeurIPS 2023](https://arxiv.or
 
 <p align="center">
   <img src="docs/figures/method_diagram.png" width="840"
-       alt="One PolyStep: subspace projection, polytope probes, cost matrix, soft entropic-OT assignment, and barycentric projection -- plus the softmax-to-full-OT solver continuum.">
+       alt="One PolyStep: subspace projection, polytope probes, cost matrix, soft entropic-OT assignment, and barycentric projection, plus the softmax-to-full-OT solver continuum.">
 </p>
 
 > Want to play around with parameters? [**Viet T. Nguyen**](https://vietngth.github.io/) built a gorgeous interactive walkthrough that animates every step of the method -> **[explore the PolyStep visualization](https://vietngth.github.io/polystep-visualization/)**.
@@ -89,7 +89,7 @@ See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST
 <table>
   <tr>
     <td align="center"><img src="docs/figures/polystep_snn_progress.gif" width="330"><br><sub>Spiking net (hard LIF thresholds) trained with forward passes only</sub></td>
-    <td align="center"><img src="docs/figures/rl_cartpole_policy.gif" width="330"><br><sub>CartPole policy search - no value function, no gradients</sub></td>
+    <td align="center"><img src="docs/figures/rl_cartpole_policy.gif" width="330"><br><sub>CartPole policy search: no value function, no gradients</sub></td>
   </tr>
 </table>
 
@@ -97,11 +97,11 @@ See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST
 
 PolyStep is designed for models where gradients are **unavailable or unreliable**:
 
-- **Spiking neural networks** - hard LIF thresholds, discrete spike events
-- **Quantized layers** - int8 weights, binary/ternary networks
-- **Blackbox modules** - external simulators, API-based models, hardware-in-the-loop
-- **Hard routing** - argmax gating, hard mixture-of-experts
-- **Combinatorial optimization** - MAX-SAT, discrete assignment problems
+- **Spiking neural networks**: hard LIF thresholds, discrete spike events
+- **Quantized layers**: int8 weights, binary/ternary networks
+- **Blackbox modules**: external simulators, API-based models, hardware-in-the-loop
+- **Hard routing**: argmax gating, hard mixture-of-experts
+- **Combinatorial optimization**: MAX-SAT, discrete assignment problems
 
 If your model is fully differentiable, Adam/SGD will be faster and more accurate.
 
@@ -135,7 +135,7 @@ If your model is fully differentiable, Adam/SGD will be faster and more accurate
 | T=25 | 31.8 MB | 132 MB | 4.2x |
 | T=400 | 51.6 MB | 1,538 MB | **29.8x** |
 
-Across the non-differentiable tasks PolyStep wins by 10-60+ points against the other gradient-free baselines. The domain-specialized probSAT solver reaches roughly 99.6% on MAX-SAT at 100K variables (and around 98.9% at 1M variables) -- PolyStep is the strongest general-purpose gradient-free optimizer at the configurations we tested.
+Across the non-differentiable tasks PolyStep wins by 10-60+ points against the other gradient-free baselines. The domain-specialized probSAT solver reaches roughly 99.6% on MAX-SAT at 100K variables (and around 98.9% at 1M variables). Among general-purpose gradient-free optimizers, PolyStep is the strongest at the configurations we tested.
 
 ## Features
 
@@ -146,13 +146,13 @@ Across the non-differentiable tasks PolyStep wins by 10-60+ points against the o
 - **Vmap-safe layers**: drop-in attention and LSTM that play nicely with `torch.vmap`.
 - **Sub-linear memory**: forward-only evaluation, no BPTT activation tape (~30x savings at long SNN horizons).
 - **CMA-ES inspired adaptation** of subspace rotations.
-- **MLP fast path** using batched `torch.bmm` instead of vmap for pure-MLP models.
+- **MLP fast path** using batched `torch.bmm` instead of vmap for pure-MLP `nn.Sequential` models.
 
 ## Limitations
 
 - **Compute cost.** Roughly tens of millions of forward passes (on the SNN benchmark, around 30M) vs. tens of thousands of Adam gradient steps for the same MNIST accuracy. This is inherent to zeroth-order methods.
 - **High-dimensional NLP.** Near-random accuracy on SST-2 (4.2M parameters trained from scratch). Gradient-free methods do not scale to this regime in our experiments.
-- **Adam baseline.** On the SNN benchmark, Adam reaches around 78% test accuracy (`experiments/results/softmax/main/snn_adam_*.json`) vs. PolyStep's 93.4%. The surrogate-gradient baseline (paper §5.3) is not bundled with this release - see the arXiv preprint for the comparison.
+- **Adam baseline.** On the SNN benchmark, Adam reaches around 78% test accuracy (`experiments/results/softmax/main/snn_adam_*.json`) vs. PolyStep's 93.4%. The surrogate-gradient baseline (paper §5.3) is not bundled with this release; see the arXiv preprint for the comparison.
 
 See [`LIMITATIONS.md`](LIMITATIONS.md) for the full discussion.
 

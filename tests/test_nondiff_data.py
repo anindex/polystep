@@ -5,6 +5,7 @@ Tests cover:
 - generate_sorting_data: Random sequences and target sort permutations
 - generate_multidomain_data: Combined MNIST + Fashion-MNIST with 20 classes
 """
+
 from __future__ import annotations
 
 import torch

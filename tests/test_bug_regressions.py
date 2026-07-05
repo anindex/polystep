@@ -1,4 +1,5 @@
 """Regression tests for specific bug fixes."""
+
 import torch
 import torch.nn as nn
 import pytest
@@ -12,6 +13,7 @@ from polystep.geometry import get_random_rotation_matrices
 # Biased rotation must preserve det(R) = +1
 # ---------------------------------------------------------------------------
 
+
 class TestBiasedRotationDet:
     """Biased rotation Gram-Schmidt must produce proper rotations, not reflections."""
 
@@ -21,7 +23,11 @@ class TestBiasedRotationDet:
         P = 50
         gen = torch.Generator().manual_seed(42)
         rot_mats = get_random_rotation_matrices(
-            P, pdim, device="cpu", dtype=torch.float32, generator=gen,
+            P,
+            pdim,
+            device="cpu",
+            dtype=torch.float32,
+            generator=gen,
         )
 
         # Simulate biased rotation (same as optimizer.py)
@@ -39,27 +45,22 @@ class TestBiasedRotationDet:
             raw_norm = torch.norm(v, dim=-1, keepdim=True)
             norms_v = raw_norm.clamp(min=1e-10)
             mask = (raw_norm > 1e-6).float()
-            rot_mats[:, :, col] = (
-                mask * (v / norms_v) + (1 - mask) * rot_mats_orig[:, :, col]
-            )
+            rot_mats[:, :, col] = mask * (v / norms_v) + (1 - mask) * rot_mats_orig[:, :, col]
 
         # THE FIX: det correction
         dets = torch.det(rot_mats)
         flip = (dets < 0).unsqueeze(-1)
-        rot_mats[:, :, -1] = torch.where(
-            flip, -rot_mats[:, :, -1], rot_mats[:, :, -1]
-        )
+        rot_mats[:, :, -1] = torch.where(flip, -rot_mats[:, :, -1], rot_mats[:, :, -1])
 
         dets_final = torch.det(rot_mats)
-        assert (dets_final > 0).all(), (
-            f"Found {(dets_final < 0).sum()} reflections out of {P}"
-        )
+        assert (dets_final > 0).all(), f"Found {(dets_final < 0).sum()} reflections out of {P}"
         assert torch.allclose(dets_final, torch.ones(P), atol=1e-3)
 
 
 # ---------------------------------------------------------------------------
 # Eval mode must be enforced during NNCostEvaluator.evaluate()
 # ---------------------------------------------------------------------------
+
 
 class TestEvalModeEnforced:
     """NNCostEvaluator must enforce eval mode even if user calls model.train()."""
@@ -91,9 +92,7 @@ class TestEvalModeEnforced:
         evaluator.evaluate(stacked, inputs, targets)
         rm_after = model.state_dict()["1.running_mean"]
 
-        assert torch.equal(rm_before, rm_after), (
-            "BatchNorm running stats were mutated during evaluation!"
-        )
+        assert torch.equal(rm_before, rm_after), "BatchNorm running stats were mutated during evaluation!"
         assert model.training, "Model should be restored to train mode after evaluate()"
 
     def test_eval_mode_restored_on_error(self):
@@ -121,6 +120,7 @@ class TestEvalModeEnforced:
 # ---------------------------------------------------------------------------
 # Non-trainable buffers excluded from particle layout
 # ---------------------------------------------------------------------------
+
 
 class TestBuffersExcluded:
     """Only requires_grad=True params should be in the particle layout."""
@@ -164,9 +164,7 @@ class TestBuffersExcluded:
             all_layout_keys.update(e.shared_with)
 
         assert "fc1.weight" in all_layout_keys
-        assert "fc2.weight" in all_layout_keys, (
-            "Shared param fc2.weight missing from layout"
-        )
+        assert "fc2.weight" in all_layout_keys, "Shared param fc2.weight missing from layout"
 
         # Round-trip should preserve both
         flat = layout.flatten(model)
@@ -197,14 +195,13 @@ class TestBuffersExcluded:
         model.load_state_dict(sd, strict=False)
 
         rm_after = model.state_dict()["1.running_mean"]
-        assert torch.equal(rm_original, rm_after), (
-            "BatchNorm running stats should be preserved by load_state_dict"
-        )
+        assert torch.equal(rm_original, rm_after), "BatchNorm running stats should be preserved by load_state_dict"
 
 
 # ---------------------------------------------------------------------------
 # Turbo features in blockwise and subspace_blockwise modes
 # ---------------------------------------------------------------------------
+
 
 class TestBlockwiseTurboFeatures:
     """Turbo features (dual momentum, biased rotation, amortized EMA) must
@@ -239,8 +236,7 @@ class TestBlockwiseTurboFeatures:
         optimizer.step(closure)
         ema = optimizer._transport_direction_ema
         assert ema is not None, (
-            "After blockwise OT step, _transport_direction_ema should be populated "
-            "for amortized momentum steps"
+            "After blockwise OT step, _transport_direction_ema should be populated for amortized momentum steps"
         )
 
     def test_blockwise_biased_rotation_descent_dirs_populated(self):
@@ -265,10 +261,9 @@ class TestBlockwiseTurboFeatures:
             return evaluator.evaluate(bp, inputs, targets)
 
         optimizer.step(closure)
-        dirs = getattr(optimizer, '_prev_block_descent_directions', None)
+        dirs = getattr(optimizer, "_prev_block_descent_directions", None)
         assert dirs is not None, (
-            "After blockwise step with biased_rotation=True, "
-            "_prev_block_descent_directions should be populated"
+            "After blockwise step with biased_rotation=True, _prev_block_descent_directions should be populated"
         )
         assert len(dirs) > 0, "Should have at least one block descent direction"
 
@@ -297,10 +292,9 @@ class TestBlockwiseTurboFeatures:
         optimizer.step(closure)
         # Second step: prev_prev_block_duals should now be populated
         optimizer.step(closure)
-        ppbd = getattr(optimizer._state, '_prev_prev_block_duals', None)
+        ppbd = getattr(optimizer._state, "_prev_prev_block_duals", None)
         assert ppbd is not None, (
-            "After 2 blockwise steps with dual_momentum_beta>0, "
-            "_prev_prev_block_duals should be populated"
+            "After 2 blockwise steps with dual_momentum_beta>0, _prev_prev_block_duals should be populated"
         )
         assert len(ppbd) > 0
         # At least one block should have non-None duals
@@ -311,6 +305,7 @@ class TestBlockwiseTurboFeatures:
 # ---------------------------------------------------------------------------
 # Regression: no-amort path equivalence and fixed epsilon stability
 # ---------------------------------------------------------------------------
+
 
 class TestNoAmortAndFixedEpsilon:
     """Verify no-amort (amortize_steps=1) and fixed epsilon behavior."""
@@ -386,3 +381,38 @@ class TestNoAmortAndFixedEpsilon:
         assert optimizer._state.iteration_count == n_steps, (
             f"Expected {n_steps} OT iterations, got {optimizer._state.iteration_count}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Edge-case hardening
+# ---------------------------------------------------------------------------
+
+
+def test_sinkhorn_rejects_empty_cost_matrix():
+    """An empty (0-row or 0-col) cost matrix must raise a clear error rather
+    than crash deep inside marginal alignment (1.0 / n)."""
+    from polystep.solvers.sinkhorn import SinkhornSolver
+
+    with pytest.raises(ValueError, match="empty cost matrix"):
+        SinkhornSolver(epsilon=0.5).solve(torch.zeros(0, 3))
+
+
+def test_cosine_epsilon_stays_in_range_past_schedule():
+    """Warm-restart cosine epsilon must stay within [target, init] even far
+    beyond the schedule (a maxed-out restart loop cannot push cos past pi)."""
+    from polystep.epsilon import CosineEpsilon
+
+    ce = CosineEpsilon(init=1.0, target=0.01, total_steps=50, restart_mult=1.0001)
+    for i in range(0, 100_000, 2500):
+        v = ce.at(i)
+        assert 0.01 - 1e-9 <= v <= 1.0 + 1e-9
+
+
+def test_fd_gradient_requires_orthoplex_vertices():
+    """FD gradient slices [:pdim]/[pdim:], so a non-orthoplex vertex count
+    (V != 2*pdim) must fail loudly, not silently return wrong gradients."""
+    from polystep.quadratic_model import extract_fd_gradient
+
+    losses = torch.randn(4, 5, 2)  # V=5, not 2*pdim
+    with pytest.raises(AssertionError, match="orthoplex"):
+        extract_fd_gradient(losses, torch.ones(2), probe_radius=0.1, pdim=3)

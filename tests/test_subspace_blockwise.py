@@ -10,11 +10,13 @@ Note: Tests that call optimizer.step() use minimal configs (low rank,
 few Sinkhorn iters) to keep wall-clock time under the 120s timeout.
 The sequential closure is inherently slow on CPU.
 """
+
 import pytest
 import torch
 import torch.nn as nn
 
 from polystep import PolyStepOptimizer, AdaptiveSubspace
+from polystep.optimizer import RankSchedule
 from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.blockwise import (
     create_subspace_blocks,
@@ -89,9 +91,7 @@ class TestSubspaceBlockFunctions:
 
     def test_create_subspace_blocks_basic(self):
         """Test block creation with divisible dimensions."""
-        blocks = create_subspace_blocks(
-            subspace_dim=256, num_blocks=4, subspace_particle_dim=8
-        )
+        blocks = create_subspace_blocks(subspace_dim=256, num_blocks=4, subspace_particle_dim=8)
 
         assert len(blocks) == 4
         # 256 / 8 = 32 particles total, 32 / 4 = 8 particles per block
@@ -108,9 +108,7 @@ class TestSubspaceBlockFunctions:
     def test_create_subspace_blocks_with_padding(self):
         """Test block creation when subspace_dim needs padding."""
         # 250 is not divisible by 8, needs padding to 256
-        blocks = create_subspace_blocks(
-            subspace_dim=250, num_blocks=4, subspace_particle_dim=8
-        )
+        blocks = create_subspace_blocks(subspace_dim=250, num_blocks=4, subspace_particle_dim=8)
 
         assert len(blocks) == 4
         total_particles = sum(b.num_particles for b in blocks)
@@ -163,13 +161,27 @@ class TestCombinedModeInitialization:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             epsilon=0.1,
         )
 
         assert optimizer._subspace_blockwise is True
         assert optimizer._subspace_blocks is not None
         assert len(optimizer._subspace_blocks) > 0
+
+    def test_rank_schedule_disabled_for_non_monolithic(self, simple_model):
+        """rank_schedule only runs in the monolithic step; with a block strategy
+        it must warn and disable rather than silently no-op or crash later."""
+        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5)
+        with pytest.warns(UserWarning, match="rank_schedule"):
+            opt = PolyStepOptimizer(
+                simple_model,
+                subspace=subspace,
+                block_strategy="per_layer",
+                rank_schedule=RankSchedule(stages=[(0, 2), (10, 4)]),
+                epsilon=0.1,
+            )
+        assert opt._rank_schedule is None
 
     def test_subspace_blocks_created(self, simple_model):
         """Verify _subspace_blocks is populated correctly."""
@@ -178,7 +190,7 @@ class TestCombinedModeInitialization:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             epsilon=0.1,
         )
 
@@ -197,7 +209,7 @@ class TestCombinedModeInitialization:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             epsilon=0.1,
         )
 
@@ -212,16 +224,14 @@ class TestCombinedModeInitialization:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             epsilon=0.1,
         )
 
         assert optimizer._subspace_block_polytopes is not None
         assert len(optimizer._subspace_block_polytopes) == len(optimizer._subspace_blocks)
 
-        for polytope, block in zip(
-            optimizer._subspace_block_polytopes, optimizer._subspace_blocks
-        ):
+        for polytope, block in zip(optimizer._subspace_block_polytopes, optimizer._subspace_blocks):
             # Polytope vertices should be in block.particle_dim space
             assert polytope.shape[1] == block.particle_dim
 
@@ -232,7 +242,7 @@ class TestCombinedModeInitialization:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             epsilon=0.1,
         )
 
@@ -256,7 +266,7 @@ class TestCombinedModeStep:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -272,7 +282,7 @@ class TestCombinedModeStep:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -290,7 +300,7 @@ class TestCombinedModeStep:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -309,7 +319,7 @@ class TestCombinedModeStep:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -326,7 +336,7 @@ class TestCombinedModeStep:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -364,14 +374,14 @@ class TestSynchronizedAbsorb:
             simple_model,
             compression_target=0.5,
             max_rank=16,
-            absorb_mode='periodic',
+            absorb_mode="periodic",
             absorb_interval=3,
         )
 
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -384,10 +394,7 @@ class TestSynchronizedAbsorb:
         assert optimizer._state.absorb_count >= 1, "periodic absorb never triggered"
         # Absorb folds the accumulated perturbation into the base weights, so at
         # least one base tensor must change (the prior if-guard made this vacuous).
-        changed = any(
-            not torch.allclose(base_before[k], v)
-            for k, v in optimizer._state.base_params.items()
-        )
+        changed = any(not torch.allclose(base_before[k], v) for k, v in optimizer._state.base_params.items())
         assert changed, "absorb did not fold the perturbation into base params"
 
     def test_absorb_rotates_projection(self, simple_model, simple_closure):
@@ -396,14 +403,14 @@ class TestSynchronizedAbsorb:
             simple_model,
             compression_target=0.5,
             max_rank=16,
-            absorb_mode='periodic',
+            absorb_mode="periodic",
             absorb_interval=2,
         )
 
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -424,14 +431,14 @@ class TestSynchronizedAbsorb:
             simple_model,
             compression_target=0.5,
             max_rank=16,
-            absorb_mode='periodic',
+            absorb_mode="periodic",
             absorb_interval=2,
         )
 
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -455,14 +462,12 @@ class TestCMACombinedMode:
 
     def test_cma_combined_mode_initializes(self, simple_model):
         """Test that CMAAdaptiveSubspace works in combined mode."""
-        cma_subspace = CMAAdaptiveSubspace.auto_from_params(
-            simple_model, compression_target=0.5, max_rank=16
-        )
+        cma_subspace = CMAAdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
 
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=cma_subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -471,14 +476,12 @@ class TestCMACombinedMode:
 
     def test_cma_combined_mode_step(self, simple_model, simple_closure):
         """Test that CMA combined mode step completes."""
-        cma_subspace = CMAAdaptiveSubspace.auto_from_params(
-            simple_model, compression_target=0.5, max_rank=16
-        )
+        cma_subspace = CMAAdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
 
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=cma_subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -514,7 +517,7 @@ class TestMemoryReduction:
         optimizer = PolyStepOptimizer(
             model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             epsilon=0.1,
             chunk_size=32,
         )
@@ -547,14 +550,12 @@ class TestEdgeCases:
     def test_single_block(self, simple_model, simple_closure):
         """Test with minimum number of blocks (2)."""
         # Create a very small subspace to force fewer blocks
-        subspace = AdaptiveSubspace.auto_from_params(
-            simple_model, compression_target=0.1, min_rank=8, max_rank=16
-        )
+        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.1, min_rank=8, max_rank=16)
 
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             **_FAST_OPT_KWARGS,
         )
 
@@ -571,7 +572,7 @@ class TestEdgeCases:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             use_momentum=True,
             momentum_init=0.5,
             momentum_final=0.9,
@@ -591,7 +592,7 @@ class TestEdgeCases:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='per_layer',
+            block_strategy="per_layer",
             use_adaptive_radius=True,
             **_FAST_OPT_KWARGS,
         )
@@ -608,7 +609,7 @@ class TestEdgeCases:
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
-            block_strategy='grouped',
+            block_strategy="grouped",
             **_FAST_OPT_KWARGS,
         )
 

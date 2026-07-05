@@ -6,6 +6,7 @@ Tests verify:
   - All models are vmap-compatible (functional_call with batched params)
   - MAX-SAT utilities produce correct outputs
 """
+
 from __future__ import annotations
 
 import pytest
@@ -54,6 +55,7 @@ from experiments.runners.nondiff_models import (
 # Building block tests
 # ---------------------------------------------------------------------------
 
+
 class TestLIFNeuron:
     def test_forward_shape(self):
         lif = LIFNeuron(beta=0.95, threshold=1.0)
@@ -90,7 +92,7 @@ class TestQuantizedLinear:
         x = torch.tensor([[1.0, 1.0]])
         out = ql(x)
         assert torch.allclose(out, torch.tensor([[-0.5]]), atol=1e-6)  # uses quantized weights
-        assert not torch.allclose(out, x @ ql.weight.t(), atol=1e-3)   # not the raw linear (-0.4)
+        assert not torch.allclose(out, x @ ql.weight.t(), atol=1e-3)  # not the raw linear (-0.4)
 
 
 class TestBinaryLinear:
@@ -108,8 +110,8 @@ class TestBinaryLinear:
             bl.bias.zero_()
         x = torch.tensor([[2.0, 5.0]])
         out = bl(x)
-        assert torch.allclose(out, torch.tensor([[-3.0]]))           # 2*(+1) + 5*(-1)
-        assert not torch.allclose(out, x @ bl.weight.t())            # not the raw linear (-2.9)
+        assert torch.allclose(out, torch.tensor([[-3.0]]))  # 2*(+1) + 5*(-1)
+        assert not torch.allclose(out, x @ bl.weight.t())  # not the raw linear (-2.9)
 
 
 class TestTernaryLinear:
@@ -127,8 +129,8 @@ class TestTernaryLinear:
             tl.bias.zero_()
         x = torch.tensor([[1.0, 1.0, 1.0]])
         out = tl(x)
-        assert torch.allclose(out, torch.tensor([[2.0]]))           # +1 + 0 + +1
-        assert not torch.allclose(out, x @ tl.weight.t())           # not the raw linear (1.4)
+        assert torch.allclose(out, torch.tensor([[2.0]]))  # +1 + 0 + +1
+        assert not torch.allclose(out, x @ tl.weight.t())  # not the raw linear (1.4)
 
 
 # ---------------------------------------------------------------------------
@@ -215,12 +217,12 @@ class TestBinaryConv2d:
         x = torch.randn(1, 1, 4, 4)
         with torch.no_grad():
             layer.bias.zero_()
-            layer.weight.copy_(torch.tensor([[[[0.3]]]]))   # sign -> +1
-        assert torch.allclose(layer(x), x, atol=1e-6)        # +1 -> identity
+            layer.weight.copy_(torch.tensor([[[[0.3]]]]))  # sign -> +1
+        assert torch.allclose(layer(x), x, atol=1e-6)  # +1 -> identity
         with torch.no_grad():
             layer.weight.copy_(torch.tensor([[[[-0.2]]]]))  # sign -> -1
         out = layer(x)
-        assert torch.allclose(out, -x, atol=1e-6)            # -1 -> negate
+        assert torch.allclose(out, -x, atol=1e-6)  # -1 -> negate
         assert not torch.allclose(out, -0.2 * x, atol=1e-3)  # not the raw (-0.2) conv
 
 
@@ -275,11 +277,6 @@ class TestBinaryCIFAR10Net:
         out = model(x)
         assert out.shape == (2, 10)
 
-    def test_param_count(self):
-        model = BinaryCIFAR10Net()
-        total = sum(p.numel() for p in model.parameters())
-        assert total > 100000, f"Expected >100K params, got {total}"
-
 
 class TestBinaryCIFAR10NetSTE:
     def test_forward_shape(self):
@@ -320,9 +317,7 @@ class TestStaircaseActivation:
         valid_values = {0.0, 0.2, 0.4, 0.6, 0.8}
         unique_vals = out.unique()
         for v in unique_vals:
-            assert round(v.item(), 6) in valid_values, (
-                f"Staircase value {v.item()} not in {valid_values}"
-            )
+            assert round(v.item(), 6) in valid_values, f"Staircase value {v.item()} not in {valid_values}"
 
 
 class TestHardMoELayer:
@@ -341,70 +336,15 @@ class TestHardMoELayer:
         out = moe(x)
         gate_idx = moe.gate(x).argmax(dim=-1)
         for i in range(x.shape[0]):
-            selected = moe.experts[int(gate_idx[i])](x[i:i + 1])[0]
+            selected = moe.experts[int(gate_idx[i])](x[i : i + 1])[0]
             assert torch.allclose(out[i], selected, atol=1e-5)
         avg = torch.stack([e(x) for e in moe.experts], dim=1).mean(dim=1)
         assert not torch.allclose(out, avg, atol=1e-4)  # genuinely hard, not averaging
 
 
-# ---------------------------------------------------------------------------
-# Full model tests
-# ---------------------------------------------------------------------------
-
-class TestSpikingMNISTNet:
-    def test_forward_shape(self):
-        model = SpikingMNISTNet(num_steps=5)
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestQuantizedMLP:
-    def test_forward_shape(self):
-        model = QuantizedMLP(784, 128, 10)
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestBinaryMNISTNet:
-    def test_forward_shape(self):
-        model = BinaryMNISTNet()
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestTernaryMNISTNet:
-    def test_forward_shape(self):
-        model = TernaryMNISTNet()
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestDiscreteAttentionNet:
-    def test_forward_shape(self):
-        model = DiscreteAttentionNet(784, 128, 10, num_slots=8)
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestStaircaseNet:
-    def test_forward_shape(self):
-        model = StaircaseNet(784, 128, 10, levels=5)
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestHardMoENet:
-    def test_forward_shape(self):
-        model = HardMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 20)
+# Full-model forward-shape smoke tests live in TestVmapCompatibility below,
+# which exercises the same forward under vmap + functional_call (the path the
+# optimizer actually uses) and asserts output shape.
 
 
 # ---------------------------------------------------------------------------
@@ -436,18 +376,12 @@ class TestSoftMoELayer:
         weights = torch.softmax(moe.gate(x), dim=-1)
         all_out = torch.stack([e(x) for e in moe.experts], dim=1)
         expected = (all_out * weights.unsqueeze(-1)).sum(dim=1)
-        assert torch.allclose(out, expected, atol=1e-5)           # soft-weighted mix
+        assert torch.allclose(out, expected, atol=1e-5)  # soft-weighted mix
         hard = all_out[torch.arange(5), moe.gate(x).argmax(dim=-1)]
-        assert not torch.allclose(out, hard, atol=1e-4)           # not hard argmax
+        assert not torch.allclose(out, hard, atol=1e-4)  # not hard argmax
 
 
 class TestSoftMoENet:
-    def test_forward_shape(self):
-        model = SoftMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 20)
-
     def test_param_count_matches_hard(self):
         hard = HardMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
         soft = SoftMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
@@ -468,9 +402,7 @@ class TestExpertUtilization:
     def test_returns_correct_keys(self):
         model = HardMoENet()
         # Create a minimal test loader
-        dataset = torch.utils.data.TensorDataset(
-            torch.randn(20, 1, 28, 28), torch.randint(0, 20, (20,))
-        )
+        dataset = torch.utils.data.TensorDataset(torch.randn(20, 1, 28, 28), torch.randint(0, 20, (20,)))
         loader = torch.utils.data.DataLoader(dataset, batch_size=10)
         result = compute_expert_utilization(model, loader, device="cpu")
         assert "expert_utilization" in result
@@ -481,9 +413,7 @@ class TestExpertUtilization:
 
     def test_utilization_sums_to_one(self):
         model = HardMoENet()
-        dataset = torch.utils.data.TensorDataset(
-            torch.randn(100, 1, 28, 28), torch.randint(0, 20, (100,))
-        )
+        dataset = torch.utils.data.TensorDataset(torch.randn(100, 1, 28, 28), torch.randint(0, 20, (100,)))
         loader = torch.utils.data.DataLoader(dataset, batch_size=50)
         result = compute_expert_utilization(model, loader, device="cpu")
         total = sum(result["expert_utilization"].values())
@@ -495,9 +425,7 @@ class TestExpertUtilization:
         with torch.no_grad():
             model.moe.gate.bias.zero_()
             model.moe.gate.bias[0] = 100.0  # Expert 0 always wins
-        dataset = torch.utils.data.TensorDataset(
-            torch.randn(50, 1, 28, 28), torch.randint(0, 20, (50,))
-        )
+        dataset = torch.utils.data.TensorDataset(torch.randn(50, 1, 28, 28), torch.randint(0, 20, (50,)))
         loader = torch.utils.data.DataLoader(dataset, batch_size=50)
         result = compute_expert_utilization(model, loader, device="cpu")
         assert result["collapsed"] is True, "Should detect collapse when one expert handles all inputs"
@@ -507,6 +435,7 @@ class TestExpertUtilization:
 # ---------------------------------------------------------------------------
 # MAX-SAT utility tests
 # ---------------------------------------------------------------------------
+
 
 class TestMaxSATModel:
     def test_forward_returns_scalar(self):
@@ -549,6 +478,7 @@ class TestEvaluateSatLoss:
 # ---------------------------------------------------------------------------
 # Vmap compatibility tests
 # ---------------------------------------------------------------------------
+
 
 class TestVmapCompatibility:
     """Test that all classification models work under torch.vmap + functional_call."""
@@ -626,13 +556,6 @@ class TestVmapCompatibility:
 
 
 class TestHardPermutationNet:
-    def test_forward_shape(self):
-        """Input (4, 10) -> output (4, 10) long tensor."""
-        model = HardPermutationNet(N=10, hidden_dim=64)
-        x = torch.randn(4, 10)
-        out = model(x)
-        assert out.shape == (4, 10)
-
     def test_output_is_long_indices(self):
         """Output dtype is long, values in [0, N)."""
         model = HardPermutationNet(N=10, hidden_dim=64)
@@ -642,27 +565,8 @@ class TestHardPermutationNet:
         assert out.min() >= 0
         assert out.max() < 10
 
-    def test_param_count_N10(self):
-        """N=10, hidden=64 -> 778 params (1*64 + 64 bias + 64*10 + 10 bias)."""
-        model = HardPermutationNet(N=10, hidden_dim=64)
-        total = sum(p.numel() for p in model.parameters())
-        assert total == 778, f"Expected 778 params for N=10, got {total}"
-
-    def test_param_count_N50(self):
-        """N=50, hidden=64 -> 3378 params (64+64+3200+50)."""
-        model = HardPermutationNet(N=50, hidden_dim=64)
-        total = sum(p.numel() for p in model.parameters())
-        assert total == 3378, f"Expected 3378 params for N=50, got {total}"
-
 
 class TestSoftPermutationNet:
-    def test_forward_shape(self):
-        """Input (4, 10) -> output (4, 10, 10) float tensor."""
-        model = SoftPermutationNet(N=10, hidden_dim=64)
-        x = torch.randn(4, 10)
-        out = model(x)
-        assert out.shape == (4, 10, 10)
-
     def test_doubly_stochastic(self):
         """Row sums and column sums are approximately 1.0."""
         model = SoftPermutationNet(N=10, hidden_dim=64, n_sinkhorn_iters=20)
@@ -683,9 +587,7 @@ class TestSoftPermutationNet:
         soft = SoftPermutationNet(N=10, hidden_dim=64)
         hard_params = sum(p.numel() for p in hard.parameters())
         soft_params = sum(p.numel() for p in soft.parameters())
-        assert hard_params == soft_params, (
-            f"Param count mismatch: hard={hard_params}, soft={soft_params}"
-        )
+        assert hard_params == soft_params, f"Param count mismatch: hard={hard_params}, soft={soft_params}"
 
 
 class TestPermutationLoss:

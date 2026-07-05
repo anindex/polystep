@@ -1,4 +1,5 @@
 """Abstract base class for optimization objective functions."""
+
 import abc
 from typing import Optional
 
@@ -66,7 +67,9 @@ class ObjectiveFn(abc.ABC):
         cost = self.evaluate(X)
         if self.noise_std is not None and self.noise_std > 0.0:
             noise = torch.empty_like(cost).normal_(
-                mean=0.0, std=float(self.noise_std), generator=generator,
+                mean=0.0,
+                std=float(self.noise_std),
+                generator=generator,
             )
             cost = cost + noise
         if self.negate:

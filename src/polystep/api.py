@@ -5,6 +5,7 @@ with an epoch-based training loop, callback system, and diagnostics.
 Users can train any ``nn.Module`` without manually managing closures,
 epoch iteration, or batch handling.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -131,8 +132,9 @@ def train(
         The same model object (mutated in-place by the optimizer).
     """
     evaluator = NNCostEvaluator(
-        model, loss_fn=loss_fn,
-        compile_vmap=getattr(optimizer, '_compile_evaluator', False),
+        model,
+        loss_fn=loss_fn,
+        compile_vmap=getattr(optimizer, "_compile_evaluator", False),
     )
     callbacks = list(config.callbacks)
     global_step = 0
@@ -153,9 +155,9 @@ def train(
             inputs, targets = inputs.to(device), targets.to(device)
 
             # Micro-batch: subsample for cost evaluation if configured.
-            cost_bs = getattr(optimizer, 'cost_batch_size', None)
+            cost_bs = getattr(optimizer, "cost_batch_size", None)
             if cost_bs is not None and cost_bs < inputs.shape[0]:
-                gen = getattr(optimizer, '_generator', None)
+                gen = getattr(optimizer, "_generator", None)
                 if gen is not None and gen.device.type == inputs.device.type:
                     idx = torch.randperm(inputs.shape[0], device=inputs.device, generator=gen)[:cost_bs]
                 else:
@@ -183,26 +185,14 @@ def train(
             # Build metrics dict
             state = optimizer.state
             metrics = {
-                'step': global_step,
-                'epoch': epoch,
-                'loss': train_loss,
-                'ot_cost': state.costs[-1] if state.costs else 0.0,
-                'displacement': (
-                    state.displacement_sqnorms[-1]
-                    if state.displacement_sqnorms
-                    else 0.0
-                ),
-                'velocity_mag': (
-                    torch.norm(state.velocity).item()
-                    if state.velocity is not None
-                    else 0.0
-                ),
-                'converged': (
-                    state.linear_convergence[-1]
-                    if state.linear_convergence
-                    else False
-                ),
-                'absorb_count': getattr(state, 'absorb_count', 0),
+                "step": global_step,
+                "epoch": epoch,
+                "loss": train_loss,
+                "ot_cost": state.costs[-1] if state.costs else 0.0,
+                "displacement": (state.displacement_sqnorms[-1] if state.displacement_sqnorms else 0.0),
+                "velocity_mag": (torch.norm(state.velocity).item() if state.velocity is not None else 0.0),
+                "converged": (state.linear_convergence[-1] if state.linear_convergence else False),
+                "absorb_count": getattr(state, "absorb_count", 0),
             }
 
             # Invoke on_step_end callbacks
@@ -222,8 +212,8 @@ def train(
         # Epoch-level metrics
         avg_loss = epoch_loss_sum / epoch_loss_count if epoch_loss_count > 0 else 0.0
         epoch_metrics = {
-            'epoch': epoch,
-            'avg_loss': avg_loss,
+            "epoch": epoch,
+            "avg_loss": avg_loss,
         }
         for cb in callbacks:
             cb.on_epoch_end(epoch_metrics)
@@ -247,7 +237,7 @@ class LoggingCallback(TrainCallback):
         self.log_every = log_every
 
     def on_step_end(self, metrics: dict) -> bool:
-        if metrics['step'] % self.log_every == 0:
+        if metrics["step"] % self.log_every == 0:
             print(
                 f"[Step {metrics['step']}] "
                 f"loss={metrics['loss']:.4f} "
@@ -272,11 +262,11 @@ class EarlyStoppingCallback(TrainCallback):
     def __init__(self, patience: int = 10, min_delta: float = 1e-4):
         self.patience = patience
         self.min_delta = min_delta
-        self.best_loss: float = float('inf')
+        self.best_loss: float = float("inf")
         self.counter: int = 0
 
     def on_step_end(self, metrics: dict) -> bool:
-        loss = metrics['loss']
+        loss = metrics["loss"]
         if loss < self.best_loss - self.min_delta:
             self.best_loss = loss
             self.counter = 0
@@ -306,16 +296,12 @@ def get_diagnostics(optimizer: PolyStepOptimizer) -> dict:
     """
     state = optimizer.state
     return {
-        'costs': list(state.costs),
-        'displacement_sqnorms': list(state.displacement_sqnorms),
-        'convergence': list(state.linear_convergence),
-        'velocity_magnitude': (
-            torch.norm(state.velocity).item()
-            if state.velocity is not None
-            else None
-        ),
-        'iteration_count': state.iteration_count,
-        'epsilon': state.epsilon,
-        'radius_multiplier': state.radius_multiplier,
-        'absorb_count': getattr(state, 'absorb_count', 0),
+        "costs": list(state.costs),
+        "displacement_sqnorms": list(state.displacement_sqnorms),
+        "convergence": list(state.linear_convergence),
+        "velocity_magnitude": (torch.norm(state.velocity).item() if state.velocity is not None else None),
+        "iteration_count": state.iteration_count,
+        "epsilon": state.epsilon,
+        "radius_multiplier": state.radius_multiplier,
+        "absorb_count": getattr(state, "absorb_count", 0),
     }

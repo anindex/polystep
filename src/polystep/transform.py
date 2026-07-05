@@ -4,13 +4,13 @@ Converts between nn.Module state_dict and flat particle arrays,
 handling padding, shared parameter deduplication, and reconstruction
 via ParamLayout metadata.
 """
+
 from __future__ import annotations
 
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Tuple
-
 
 
 import torch
@@ -231,10 +231,7 @@ class ParamLayout:
         # tied to lm_head). Otherwise the dedup happens silently and a
         # mysterious parameter-count gap is hard to track down.
         if shared_groups:
-            tied_summary = ", ".join(
-                f"{group[0]} <- {{{', '.join(group[1:])}}}"
-                for group in shared_groups
-            )
+            tied_summary = ", ".join(f"{group[0]} <- {{{', '.join(group[1:])}}}" for group in shared_groups)
             logger.info(
                 "ParamLayout deduplicated tied / shared weights: %s",
                 tied_summary,

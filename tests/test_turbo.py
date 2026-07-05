@@ -1,4 +1,5 @@
 """Tests for turbo mode speedups (vectorized loop, cost_batch_size, amortize_steps)."""
+
 import warnings
 
 import pytest
@@ -37,6 +38,7 @@ def test_vectorized_step_produces_finite_cost():
 # test_vectorized_step_updates_model removed: identical to the canonical
 # tests/test_optimizer.py::TestClosureInterface::test_step_updates_model.
 
+
 def test_cost_batch_size_parameter():
     """Verify cost_batch_size is stored and accessible."""
     torch.manual_seed(42)
@@ -56,8 +58,13 @@ def test_cost_batch_size_step_works():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=1,
-        compile=False, seed=42, cost_batch_size=4,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=1,
+        compile=False,
+        seed=42,
+        cost_batch_size=4,
     )
 
     # Use small batch matching cost_batch_size
@@ -92,8 +99,13 @@ def test_amortize_steps_alternates_ot_and_momentum():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=1,
-        compile=False, seed=42, amortize_steps=3,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=1,
+        compile=False,
+        seed=42,
+        amortize_steps=3,
     )
 
     inputs = torch.randn(8, 4)
@@ -130,8 +142,13 @@ def test_amortize_steps_model_updates_on_momentum():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=1,
-        compile=False, seed=42, amortize_steps=2,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=1,
+        compile=False,
+        seed=42,
+        amortize_steps=2,
     )
 
     inputs = torch.randn(8, 4)
@@ -166,8 +183,14 @@ def test_ema_transport_direction_stored():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=1,
-        compile=False, seed=42, amortize_steps=2, amortize_ema=0.7,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=1,
+        compile=False,
+        seed=42,
+        amortize_steps=2,
+        amortize_ema=0.7,
     )
     inputs = torch.randn(8, 4)
     targets = torch.randint(0, 2, (8,))
@@ -198,8 +221,14 @@ def test_momentum_step_reuses_last_cost():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=1,
-        compile=False, seed=42, amortize_steps=3, amortize_ema=0.7,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=1,
+        compile=False,
+        seed=42,
+        amortize_steps=3,
+        amortize_ema=0.7,
     )
     inputs = torch.randn(8, 4)
     targets = torch.randint(0, 2, (8,))
@@ -228,7 +257,9 @@ def test_amortize_ema_default_disabled():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, compile=False,
+        model,
+        epsilon=0.5,
+        compile=False,
     )
     assert optimizer._transport_direction_ema is None
     assert optimizer.amortize_ema == 0.7  # default value
@@ -243,8 +274,12 @@ def test_adaptive_probe_count_parameter():
     assert opt1.adaptive_num_probe is False
 
     opt2 = PolyStepOptimizer(
-        model, epsilon=0.5, compile=False, num_probe=3,
-        adaptive_num_probe=True, adaptive_probe_warmup=10,
+        model,
+        epsilon=0.5,
+        compile=False,
+        num_probe=3,
+        adaptive_num_probe=True,
+        adaptive_probe_warmup=10,
     )
     assert opt2.adaptive_num_probe is True
     assert opt2._adaptive_probe_warmup == 10
@@ -256,9 +291,14 @@ def test_adaptive_probe_reduces_probes():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=3,
-        compile=False, seed=42,
-        adaptive_num_probe=True, adaptive_probe_warmup=2,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=3,
+        compile=False,
+        seed=42,
+        adaptive_num_probe=True,
+        adaptive_probe_warmup=2,
     )
 
     # Convex bowl ||params||^2: the optimizer descends it monotonically, so the
@@ -283,9 +323,14 @@ def test_adaptive_probe_step_works():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=3,
-        compile=False, seed=42,
-        adaptive_num_probe=True, adaptive_probe_warmup=0,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=3,
+        compile=False,
+        seed=42,
+        adaptive_num_probe=True,
+        adaptive_probe_warmup=0,
     )
 
     inputs = torch.randn(8, 4)
@@ -324,8 +369,13 @@ def test_biased_rotation_stores_descent_direction():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=1,
-        compile=False, seed=42, biased_rotation=True,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=1,
+        compile=False,
+        seed=42,
+        biased_rotation=True,
     )
 
     inputs = torch.randn(8, 4)
@@ -348,8 +398,13 @@ def test_biased_rotation_step_works():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=1,
-        compile=False, seed=42, biased_rotation=True,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=1,
+        compile=False,
+        seed=42,
+        biased_rotation=True,
     )
 
     inputs = torch.randn(8, 4)
@@ -375,10 +430,16 @@ def test_all_three_features_compose():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=3,
-        compile=False, seed=42,
-        amortize_steps=2, amortize_ema=0.7,
-        adaptive_num_probe=True, adaptive_probe_warmup=2,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=3,
+        compile=False,
+        seed=42,
+        amortize_steps=2,
+        amortize_ema=0.7,
+        adaptive_num_probe=True,
+        adaptive_probe_warmup=2,
         biased_rotation=True,
     )
 
@@ -414,9 +475,14 @@ def test_adaptive_num_probe_with_num_probe_1():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=1,
-        compile=False, seed=42,
-        adaptive_num_probe=True, adaptive_probe_warmup=0,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=1,
+        compile=False,
+        seed=42,
+        adaptive_num_probe=True,
+        adaptive_probe_warmup=0,
     )
 
     inputs = torch.randn(8, 4)
@@ -443,8 +509,12 @@ def test_newton_refinement_runs_without_error():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=3,
-        compile=False, seed=42,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=3,
+        compile=False,
+        seed=42,
         newton_refinement=True,
         newton_refinement_alpha=0.3,
     )
@@ -476,15 +546,20 @@ def test_structured_projection_subspace_step():
 
     layout = ParamLayout.from_module(model)
     hybrid = HybridSubspace.from_layout(
-        layout, rank=2,
+        layout,
+        rank=2,
         rotation_interval=0,
-        projection_mode='structured',
+        projection_mode="structured",
     )
 
     optimizer = PolyStepOptimizer(
-        model, subspace=hybrid,
-        epsilon=0.5, step_radius=2.0, num_probe=2,
-        compile=False, seed=42,
+        model,
+        subspace=hybrid,
+        epsilon=0.5,
+        step_radius=2.0,
+        num_probe=2,
+        compile=False,
+        seed=42,
     )
 
     inputs = torch.randn(8, 4)
@@ -519,11 +594,11 @@ def test_structured_vs_random_projections_differ():
 
     layout = ParamLayout.from_module(model)
 
-    hybrid_random = HybridSubspace.from_layout(layout, rank=2, projection_mode='random')
-    hybrid_struct = HybridSubspace.from_layout(layout, rank=2, projection_mode='structured')
+    hybrid_random = HybridSubspace.from_layout(layout, rank=2, projection_mode="random")
+    hybrid_struct = HybridSubspace.from_layout(layout, rank=2, projection_mode="structured")
 
-    proj_random = hybrid_random.init_projections(torch.device('cpu'), torch.float32)
-    proj_struct = hybrid_struct.init_projections(torch.device('cpu'), torch.float32)
+    proj_random = hybrid_random.init_projections(torch.device("cpu"), torch.float32)
+    proj_struct = hybrid_struct.init_projections(torch.device("cpu"), torch.float32)
 
     # Get the first projected layer's projection matrix
     key = [k for k in proj_random.keys() if hybrid_random.specs[list(proj_random.keys()).index(k)].is_projected][0]
@@ -536,8 +611,7 @@ def test_structured_vs_random_projections_differ():
     # Structured should have zeros in off-diagonal blocks
     zero_count_struct = (P_struct == 0).sum().item()
     zero_count_random = (P_rand.abs() < 1e-10).sum().item()
-    assert zero_count_struct > zero_count_random, \
-        "Structured projection should have more zeros (block-diagonal)"
+    assert zero_count_struct > zero_count_random, "Structured projection should have more zeros (block-diagonal)"
 
 
 def test_amortize_steps_with_momentum():
@@ -551,10 +625,17 @@ def test_amortize_steps_with_momentum():
     params_before = {k: v.clone() for k, v in model.named_parameters()}
 
     optimizer = PolyStepOptimizer(
-        model, epsilon=0.5, step_radius=0.5, num_probe=2,
-        compile=False, seed=42,
-        amortize_steps=2, amortize_ema=0.7,
-        use_momentum=True, momentum_init=0.5, momentum_final=0.95,
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=2,
+        compile=False,
+        seed=42,
+        amortize_steps=2,
+        amortize_ema=0.7,
+        use_momentum=True,
+        momentum_init=0.5,
+        momentum_final=0.95,
     )
 
     inputs = torch.randn(8, 4)
@@ -645,13 +726,13 @@ def test_poly_step_low_level_num_probe_default_is_1():
     """The low-level PolyStep (synthetic objectives) used to default to
     K=5; the default is unified to K=1 to match
     PolyStepOptimizer and the paper's optimal value."""
+
     def dummy_obj(x):
-        return (x ** 2).sum(-1)
+        return (x**2).sum(-1)
 
     solver = PolyStep.create(dummy_obj, dim=4)
     assert solver.num_probe == 1, (
-        f"PolyStep.num_probe default should match PolyStepOptimizer "
-        f"(K=1 per paper); got {solver.num_probe}"
+        f"PolyStep.num_probe default should match PolyStepOptimizer (K=1 per paper); got {solver.num_probe}"
     )
 
 
@@ -688,13 +769,9 @@ def test_snn_with_cosine_step_radius_warns():
 
     msgs = [str(w.message).lower() for w in caught]
     assert any(
-        ("snn" in m or "leaky" in m or "lif" in m or "spik" in m)
-        and ("step_radius" in m or "cosine" in m)
+        ("snn" in m or "leaky" in m or "lif" in m or "spik" in m) and ("step_radius" in m or "cosine" in m)
         for m in msgs
-    ), (
-        "expected a warning about CosineEpsilon on step_radius for an "
-        f"SNN-like model; got: {msgs}"
-    )
+    ), f"expected a warning about CosineEpsilon on step_radius for an SNN-like model; got: {msgs}"
 
 
 def test_non_snn_with_cosine_step_radius_no_warn():
@@ -706,6 +783,4 @@ def test_non_snn_with_cosine_step_radius_no_warn():
         _PSO(model, epsilon=0.5, step_radius=cosine)
     msgs = [str(w.message).lower() for w in caught]
     snn_warnings = [m for m in msgs if "snn" in m or "leaky" in m or "lif" in m]
-    assert not snn_warnings, (
-        f"guard fired on a non-SNN MLP: {snn_warnings}"
-    )
+    assert not snn_warnings, f"guard fired on a non-SNN MLP: {snn_warnings}"

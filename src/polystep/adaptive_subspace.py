@@ -28,6 +28,7 @@ Rotation modes:
 weights and zeros the subspace vector. Combined with rotation each
 iteration explores a fresh subspace centered on the current best.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,6 +39,23 @@ import torch.nn as nn
 
 if TYPE_CHECKING:
     from .transform import ParamLayout
+
+
+def _spawn_cpu_generator(generator: Optional[torch.Generator]) -> Optional[torch.Generator]:
+    """Mirror a non-CPU generator onto CPU, seeding from a fresh draw.
+
+    CPU tensors cannot use a CUDA generator, so CPU-side QR needs a CPU one.
+    Seeding it from initial_seed() reuses the same constant every call and
+    freezes every basis to be identical; drawing a new integer advances the
+    source generator so successive calls differ. Returns the generator unchanged
+    when it is already CPU or None.
+    """
+    if generator is None or generator.device.type == "cpu":
+        return generator
+    seed = int(torch.randint(0, 2**31 - 1, (1,), generator=generator, device=generator.device).item())
+    cpu_gen = torch.Generator(device="cpu")
+    cpu_gen.manual_seed(seed)
+    return cpu_gen
 
 
 @dataclass(frozen=True)
@@ -127,9 +145,7 @@ class AdaptiveSubspace:
 
     def __post_init__(self) -> None:
         if self.compression_ratio == 0.0 and self.full_dim > 0:
-            object.__setattr__(
-                self, "compression_ratio", self.subspace_dim / self.full_dim
-            )
+            object.__setattr__(self, "compression_ratio", self.subspace_dim / self.full_dim)
 
     # ------------------------------------------------------------------
     # Projection initialization
@@ -161,7 +177,10 @@ class AdaptiveSubspace:
         projection_dtype = dtype if dtype is not None else torch.float32
         projection_device = device if device is not None else "cpu"
         return self._make_orthogonal_basis(
-            self.full_dim, self.subspace_dim, device=projection_device, dtype=projection_dtype,
+            self.full_dim,
+            self.subspace_dim,
+            device=projection_device,
+            dtype=projection_dtype,
             generator=generator,
         )
 
@@ -189,10 +208,7 @@ class AdaptiveSubspace:
         # Handle generator device mismatch: CUDA generator can't be used with CPU tensor.
         # Create a CPU generator seeded from the CUDA generator's state for reproducibility.
         gen_device = "cpu"
-        if generator is not None and generator.device.type != "cpu":
-            cpu_gen = torch.Generator(device="cpu")
-            cpu_gen.manual_seed(generator.initial_seed())
-            generator = cpu_gen
+        generator = _spawn_cpu_generator(generator)
         # QR decomposition requires FP32 on CPU (BF16 not supported for geqrf_cpu)
         # Generate in FP32, compute QR, then convert to target dtype
         Z = torch.randn(rows, cols, generator=generator, device=gen_device, dtype=torch.float32)
@@ -263,15 +279,15 @@ class AdaptiveSubspace:
 
         # Handle ot_bias mode
         if self.rotation_mode == "ot_bias":
-            has_ot_info = (
-                transport_matrix is not None
-                and X_vertices is not None
-                and X_current is not None
-            )
+            has_ot_info = transport_matrix is not None and X_vertices is not None and X_current is not None
             if has_ot_info:
                 return self._rotate_ot_bias(
-                    transport_matrix, X_vertices, X_current,
-                    device, dtype, generator,
+                    transport_matrix,
+                    X_vertices,
+                    X_current,
+                    device,
+                    dtype,
+                    generator,
                 )
             else:
                 # Fallback to random when OT info not available
@@ -279,9 +295,7 @@ class AdaptiveSubspace:
 
         # Fall back to random if displacement mode lacks history
         use_random = (
-            self.rotation_mode == "random"
-            or displacement_history is None
-            or displacement_history.shape[0] == 0
+            self.rotation_mode == "random" or displacement_history is None or displacement_history.shape[0] == 0
         )
 
         if not use_random:
@@ -298,8 +312,12 @@ class AdaptiveSubspace:
         else:
             svd_ratio = self.get_svd_ratio(step, total_steps)
             return self._rotate_displacement(
-                projection, displacement_history, svd_ratio,
-                device, dtype, generator,
+                projection,
+                displacement_history,
+                svd_ratio,
+                device,
+                dtype,
+                generator,
             )
 
     @torch.inference_mode()
@@ -320,7 +338,10 @@ class AdaptiveSubspace:
             New orthogonal projection of shape (full_dim, subspace_dim).
         """
         return self._make_orthogonal_basis(
-            self.full_dim, self.subspace_dim, device=device, dtype=dtype,
+            self.full_dim,
+            self.subspace_dim,
+            device=device,
+            dtype=dtype,
             generator=generator,
         )
 
@@ -365,6 +386,10 @@ class AdaptiveSubspace:
         if not torch.isfinite(D_full).all():
             return self._rotate_random(device, dtype, generator)
 
+        # SVD/QR reject bf16 on CPU; run the decomposition in fp32 and cast back.
+        compute_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
+        D_full = D_full.to(compute_dtype)
+
         # SVD of the full-space displacement matrix
         if k_svd < min(D_full.shape) // 2 and min(D_full.shape) > 6:
             # Randomized SVD: faster when k_svd << rank
@@ -378,13 +403,13 @@ class AdaptiveSubspace:
         # Generate random directions for the remainder
         gen_device = "cpu"
         # Handle generator device mismatch: create CPU generator for reproducibility
-        gen_to_use = generator
-        if generator is not None and generator.device.type != "cpu":
-            gen_to_use = torch.Generator(device="cpu")
-            gen_to_use.manual_seed(generator.initial_seed())
+        gen_to_use = _spawn_cpu_generator(generator)
         Z_random = torch.randn(
-            self.full_dim, k_random,
-            generator=gen_to_use, device=gen_device, dtype=dtype,
+            self.full_dim,
+            k_random,
+            generator=gen_to_use,
+            device=gen_device,
+            dtype=compute_dtype,
         )
         if str(device) != gen_device:
             Z_random = Z_random.to(device=device)
@@ -398,7 +423,9 @@ class AdaptiveSubspace:
         d = torch.sign(torch.diagonal(R))
         d[d == 0] = 1.0
         P_new = P_new * d
-        P_new = P_new[:, :self.subspace_dim]
+        P_new = P_new[:, : self.subspace_dim]
+        if P_new.dtype != dtype:
+            P_new = P_new.to(dtype)
 
         if P_new.device != device:
             P_new = P_new.to(device=device)
@@ -442,7 +469,10 @@ class AdaptiveSubspace:
 
         # Get high-transport directions in particle space.
         ot_dirs = compute_ot_bias_directions(
-            transport_matrix, X_vertices, X_current, top_k=k_ot,
+            transport_matrix,
+            X_vertices,
+            X_current,
+            top_k=k_ot,
         )
         # ot_dirs: (k_ot_actual, particle_dim)
         k_ot_actual = ot_dirs.shape[0]
@@ -468,19 +498,20 @@ class AdaptiveSubspace:
         # Generate random directions for the remainder
         gen_device = "cpu"
         # Handle generator device mismatch: create CPU generator for reproducibility
-        gen_to_use = generator
-        if generator is not None and generator.device.type != "cpu":
-            gen_to_use = torch.Generator(device="cpu")
-            gen_to_use.manual_seed(generator.initial_seed())
+        gen_to_use = _spawn_cpu_generator(generator)
+        # QR rejects bf16 on CPU; build in fp32 and cast the result back.
+        compute_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
         Z_random = torch.randn(
-            self.full_dim, k_random,
-            generator=gen_to_use, device=gen_device, dtype=dtype,
+            self.full_dim,
+            k_random,
+            generator=gen_to_use,
+            device=gen_device,
+            dtype=compute_dtype,
         )
         if str(device) != gen_device:
             Z_random = Z_random.to(device=device)
         if ot_cols is not None:
-            if ot_cols.device != Z_random.device:
-                ot_cols = ot_cols.to(device=Z_random.device)
+            ot_cols = ot_cols.to(device=Z_random.device, dtype=compute_dtype)
             combined = torch.cat([ot_cols, Z_random], dim=1)
         else:
             combined = Z_random
@@ -489,7 +520,9 @@ class AdaptiveSubspace:
         d = torch.sign(torch.diagonal(R))
         d[d == 0] = 1.0
         P_new = P_new * d
-        P_new = P_new[:, :self.subspace_dim]
+        P_new = P_new[:, : self.subspace_dim]
+        if P_new.dtype != dtype:
+            P_new = P_new.to(dtype)
 
         if P_new.device != device:
             P_new = P_new.to(device=device)
@@ -538,13 +571,14 @@ class AdaptiveSubspace:
         """
         # Handle sparse projection
         from .projection import SparseRandomProjection
+
         if isinstance(projection, SparseRandomProjection):
             delta_flat = projection.project(flat_subspace)  # (full_dim,)
         else:
             delta_flat = projection @ flat_subspace  # (full_dim,)
         result: Dict[str, torch.Tensor] = {}
         for spec in self._entry_specs:
-            delta_chunk = delta_flat[spec.flat_start:spec.flat_end]
+            delta_chunk = delta_flat[spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
             result[spec.entry_key] = base + delta_chunk.reshape(spec.original_shape)
         return result
@@ -572,6 +606,7 @@ class AdaptiveSubspace:
         N = flat_subspace_batch.shape[0]
         # Handle sparse projection
         from .projection import SparseRandomProjection
+
         if isinstance(projection, SparseRandomProjection):
             # Sparse projection: use project() method for batch
             delta_batch = projection.project(flat_subspace_batch)  # (N, full_dim)
@@ -580,11 +615,9 @@ class AdaptiveSubspace:
             delta_batch = flat_subspace_batch @ projection.T  # (N, full_dim)
         result: Dict[str, torch.Tensor] = {}
         for spec in self._entry_specs:
-            delta_chunk = delta_batch[:, spec.flat_start:spec.flat_end]
+            delta_chunk = delta_batch[:, spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
-            result[spec.entry_key] = (
-                base.unsqueeze(0) + delta_chunk.reshape(N, *spec.original_shape)
-            )
+            result[spec.entry_key] = base.unsqueeze(0) + delta_chunk.reshape(N, *spec.original_shape)
         return result
 
     def absorb(
@@ -717,11 +750,13 @@ class AdaptiveSubspace:
         """
         specs: List[EntrySpec] = []
         for entry in layout.entries:
-            specs.append(EntrySpec(
-                entry_key=entry.key,
-                original_shape=entry.shape,
-                num_params=entry.numel,
-                flat_start=entry.offset,
-                flat_end=entry.offset + entry.numel,
-            ))
+            specs.append(
+                EntrySpec(
+                    entry_key=entry.key,
+                    original_shape=entry.shape,
+                    num_params=entry.numel,
+                    flat_start=entry.offset,
+                    flat_end=entry.offset + entry.numel,
+                )
+            )
         return specs

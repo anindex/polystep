@@ -41,9 +41,7 @@ def _cplus_include_path():
     include_dir = _python_include_dir()
     previous = os.environ.get("CPLUS_INCLUDE_PATH")
     if include_dir not in (previous or ""):
-        os.environ["CPLUS_INCLUDE_PATH"] = (
-            f"{include_dir}:{previous}" if previous else include_dir
-        )
+        os.environ["CPLUS_INCLUDE_PATH"] = f"{include_dir}:{previous}" if previous else include_dir
     try:
         yield
     finally:
@@ -98,6 +96,7 @@ def make_closure():
             closure = make_closure(simple_mlp)
             # closure(batched_params) -> losses
     """
+
     def _make_closure(model, loss_fn=None, num_samples=16, input_dim=4, output_dim=None):
         torch.manual_seed(42)
         if loss_fn is None:

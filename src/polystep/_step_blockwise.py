@@ -2,6 +2,7 @@
 
 Extracted from optimizer.py for maintainability.
 """
+
 from __future__ import annotations
 
 import logging
@@ -48,8 +49,8 @@ def step_blockwise(opt, closure: Callable) -> float:
     radius_mult = state.radius_multiplier if opt.use_adaptive_radius else 1.0
     _sr = opt._get_step_radius(iteration)
     _pr = opt._get_probe_radius(iteration)
-    step_r = _sr * (1.0 if hasattr(opt.step_radius, 'at') else current_eps) * radius_mult
-    probe_r = _pr * (1.0 if hasattr(opt.probe_radius, 'at') else current_eps) * radius_mult
+    step_r = _sr * (1.0 if hasattr(opt.step_radius, "at") else current_eps) * radius_mult
+    probe_r = _pr * (1.0 if hasattr(opt.probe_radius, "at") else current_eps) * radius_mult
 
     # Probe-radius jitter (Thm. 4.2 condition (iv); no-op when probe_radius_jitter == 0).
     probe_r = opt._apply_probe_radius_jitter(probe_r)
@@ -63,7 +64,9 @@ def step_blockwise(opt, closure: Callable) -> float:
     # offsets from ParamLayout (contiguous concat + single end pad).
     total_flat_size = sum(b.flat_end - b.flat_start for b in blocks)
     block_flat = layout_flat_to_block_flat(
-        X.reshape(-1), blocks, opt.layout,
+        X.reshape(-1),
+        blocks,
+        opt.layout,
     )
     block_X_2d = block_flat.reshape(-1, opt._particle_dim)
     all_block_particles = split_particles(block_X_2d, blocks)
@@ -86,10 +89,17 @@ def step_blockwise(opt, closure: Callable) -> float:
     num_blocks_counted = 0
 
     # Per-block descent directions for biased rotation (populated from previous step)
-    _block_descent_dirs = getattr(opt, '_prev_block_descent_directions', None)
+    _block_descent_dirs = getattr(opt, "_prev_block_descent_directions", None)
 
     probes = opt._probes.to(device=device, dtype=X.dtype)
     chunk = opt.chunk_size or 1024  # default chunk for block-wise
+
+    # Drop per-block dual momentum history across an epsilon jump so the
+    # warm-start isn't extrapolated over a large epsilon change (matches monolithic).
+    if state.last_solve_eps is not None and (
+        ot_epsilon / state.last_solve_eps > 2.0 or state.last_solve_eps / ot_epsilon > 2.0
+    ):
+        state._prev_prev_block_duals = None
 
     for block_idx, block in enumerate(blocks):
         block_X = all_block_particles[block_idx]
@@ -101,12 +111,16 @@ def step_blockwise(opt, closure: Callable) -> float:
 
         # Per-block polytope
         block_polytope_verts = opt._block_polytopes[block_idx].to(
-            device=device, dtype=X.dtype,
+            device=device,
+            dtype=X.dtype,
         )
 
         # Rotation matrices
         rot_mats = get_random_rotation_matrices(
-            P_block, block_dim, device=device, dtype=X.dtype,
+            P_block,
+            block_dim,
+            device=device,
+            dtype=X.dtype,
             generator=opt._generator,
         )
 
@@ -115,11 +129,13 @@ def step_blockwise(opt, closure: Callable) -> float:
         # typically <=128 and small batched QR via cuSOLVER measured
         # slower than this loop on RTX 5090. The monolithic step uses
         # one big QR for the opposite reason.
-        if (opt.biased_rotation
-                and _block_descent_dirs is not None
-                and block_idx < len(_block_descent_dirs)
-                and _block_descent_dirs[block_idx] is not None
-                and _block_descent_dirs[block_idx].shape == (P_block, block_dim)):
+        if (
+            opt.biased_rotation
+            and _block_descent_dirs is not None
+            and block_idx < len(_block_descent_dirs)
+            and _block_descent_dirs[block_idx] is not None
+            and _block_descent_dirs[block_idx].shape == (P_block, block_dim)
+        ):
             bias_dir = _block_descent_dirs[block_idx]
             bias_norms = torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
             bias_dir_norm = bias_dir / bias_norms
@@ -140,12 +156,18 @@ def step_blockwise(opt, closure: Callable) -> float:
 
         # Rotate + translate
         X_vertices, rotated = opt._compiled.rotate_and_translate(
-            rot_mats, block_polytope_verts, block_X, step_r,
+            rot_mats,
+            block_polytope_verts,
+            block_X,
+            step_r,
         )
 
         # Probe generation
         X_probe = opt._compiled.compute_probe_points(
-            block_X, rotated, probes, probe_r,
+            block_X,
+            rotated,
+            probes,
+            probe_r,
         )
 
         # Build full params with only this block varying.
@@ -182,7 +204,9 @@ def step_blockwise(opt, closure: Callable) -> float:
             # Per-layer blocks pad each entry independently, creating
             # different offsets from ParamLayout.
             batch_for_layout = blocks_to_layout_flat_batch(
-                base_batch, blocks, opt.layout,
+                base_batch,
+                blocks,
+                opt.layout,
             )
 
             # Convert to param dicts and call closure
@@ -211,26 +235,37 @@ def step_blockwise(opt, closure: Callable) -> float:
             # the other blocks' tensors in a single .item() after the loop.
             scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
             X_new_block, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
-                scaled_cost, ot_epsilon, block_a,
-                block_polytope_verts, rot_mats, step_r, block_X,
+                scaled_cost,
+                ot_epsilon,
+                block_a,
+                block_polytope_verts,
+                rot_mats,
+                step_r,
+                block_X,
                 scale_cost_mean=False,
             )
             block_fused_ent_terms.append(ent_cost_tensor)
             # ot_result.cost / ent_reg_cost are only read by the
             # num_blocks_counted == 0 fallback below, so 0.0 is safe here.
             ot_result = SolverResult(
-                matrix=transport_matrix, cost=0.0,
-                f=None, g=None, converged=True, n_iters=1,
+                matrix=transport_matrix,
+                cost=0.0,
+                f=None,
+                g=None,
+                converged=True,
+                n_iters=1,
                 ent_reg_cost=0.0,
             )
         else:
             init_f, init_g = state.block_duals[block_idx]
             # Apply dual momentum per block
-            if (opt._dual_momentum_beta > 0.0
-                    and init_f is not None
-                    and hasattr(state, '_prev_prev_block_duals')
-                    and state._prev_prev_block_duals is not None
-                    and block_idx < len(state._prev_prev_block_duals)):
+            if (
+                opt._dual_momentum_beta > 0.0
+                and init_f is not None
+                and hasattr(state, "_prev_prev_block_duals")
+                and state._prev_prev_block_duals is not None
+                and block_idx < len(state._prev_prev_block_duals)
+            ):
                 ppf, ppg = state._prev_prev_block_duals[block_idx]
                 if ppf is not None and ppg is not None:
                     beta_dm = opt._dual_momentum_beta
@@ -257,22 +292,26 @@ def step_blockwise(opt, closure: Callable) -> float:
 
             # Barycentric projection
             X_new_block = opt._compiled.barycentric_projection(
-                ot_result.matrix, block_a, X_vertices,
+                ot_result.matrix,
+                block_a,
+                X_vertices,
             )
             # Non-fused solvers return a Python-float ent_reg_cost already.
             total_ent_cost += ot_result.ent_reg_cost
 
         # Track displacement and descent direction for biased rotation
         block_descent = (X_new_block - block_X).detach()
-        block_disp_terms.append(torch.sum(block_descent ** 2, dim=-1).sum())
+        block_disp_terms.append(torch.sum(block_descent**2, dim=-1).sum())
         total_particles += P_block
         new_block_descent_dirs.append(block_descent)
 
         updated_block_particles.append(X_new_block)
-        new_block_duals.append((
-            ot_result.f.detach() if ot_result.f is not None else None,
-            ot_result.g.detach() if ot_result.g is not None else None,
-        ))
+        new_block_duals.append(
+            (
+                ot_result.f.detach() if ot_result.f is not None else None,
+                ot_result.g.detach() if ot_result.g is not None else None,
+            )
+        )
         block_model_loss_terms.append(cost_matrix.mean().detach())
         num_blocks_counted += 1
         all_converged = all_converged and ot_result.converged
@@ -293,11 +332,17 @@ def step_blockwise(opt, closure: Callable) -> float:
     # Momentum (on full particles)
     if opt.use_momentum and state.velocity is not None:
         beta = compute_momentum_coefficient(
-            iteration, opt.max_iterations,
-            opt.momentum_init, opt.momentum_final,
+            iteration,
+            opt.max_iterations,
+            opt.momentum_init,
+            opt.momentum_final,
         )
         X_final, vel_new = apply_momentum(
-            X, X_new_full, state.velocity, beta, opt.velocity_lr,
+            X,
+            X_new_full,
+            state.velocity,
+            beta,
+            opt.velocity_lr,
         )
         state.velocity = vel_new
         state.X = X_final
@@ -334,19 +379,11 @@ def step_blockwise(opt, closure: Callable) -> float:
             if opt._transport_direction_ema is None:
                 opt._transport_direction_ema = raw_direction
             else:
-                opt._transport_direction_ema = (
-                    alpha * opt._transport_direction_ema + (1.0 - alpha) * raw_direction
-                )
+                opt._transport_direction_ema = alpha * opt._transport_direction_ema + (1.0 - alpha) * raw_direction
 
     # Reduce per-block accumulators with one host transfer each.
-    total_model_loss = (
-        torch.stack(block_model_loss_terms).sum().item()
-        if block_model_loss_terms else 0.0
-    )
-    total_disp = (
-        torch.stack(block_disp_terms).sum().item()
-        if block_disp_terms else 0.0
-    )
+    total_model_loss = torch.stack(block_model_loss_terms).sum().item() if block_model_loss_terms else 0.0
+    total_disp = torch.stack(block_disp_terms).sum().item() if block_disp_terms else 0.0
 
     # Adaptive radius (use model loss, not OT regularized cost)
     avg_model_loss = total_model_loss / num_blocks_counted if num_blocks_counted > 0 else total_ent_cost
@@ -378,10 +415,14 @@ def step_blockwise(opt, closure: Callable) -> float:
     if not _blockwise_nan_reverted:
         # Save previous block duals for dual momentum extrapolation
         if opt._dual_momentum_beta > 0.0:
-            state._prev_prev_block_duals = [
-                (f.clone() if f is not None else None, g.clone() if g is not None else None)
-                for f, g in state.block_duals
-            ] if state.block_duals is not None else None
+            state._prev_prev_block_duals = (
+                [
+                    (f.clone() if f is not None else None, g.clone() if g is not None else None)
+                    for f, g in state.block_duals
+                ]
+                if state.block_duals is not None
+                else None
+            )
         state.block_duals = new_block_duals
     state.epsilon = current_eps
     state.last_solve_eps = ot_epsilon
@@ -390,7 +431,6 @@ def step_blockwise(opt, closure: Callable) -> float:
     opt._sync_model()
 
     return avg_model_loss
-
 
 
 def step_subspace_blockwise(opt, closure: Callable) -> float:
@@ -441,8 +481,8 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         radius_mult = 1.0
     _sr = opt._get_step_radius(iteration)
     _pr = opt._get_probe_radius(iteration)
-    step_r = _sr * (1.0 if hasattr(opt.step_radius, 'at') else current_eps) * radius_mult
-    probe_r = _pr * (1.0 if hasattr(opt.probe_radius, 'at') else current_eps) * radius_mult
+    step_r = _sr * (1.0 if hasattr(opt.step_radius, "at") else current_eps) * radius_mult
+    probe_r = _pr * (1.0 if hasattr(opt.probe_radius, "at") else current_eps) * radius_mult
 
     # Probe-radius jitter (Thm. 4.2 condition (iv); no-op when probe_radius_jitter == 0).
     probe_r = opt._apply_probe_radius_jitter(probe_r)
@@ -484,7 +524,14 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     chunk = opt.chunk_size or 512  # default chunk for combined mode
 
     # Per-block descent directions for biased rotation (populated from previous step)
-    _block_descent_dirs = getattr(opt, '_prev_block_descent_directions', None)
+    _block_descent_dirs = getattr(opt, "_prev_block_descent_directions", None)
+
+    # Drop per-block dual momentum history across an epsilon jump so the
+    # warm-start isn't extrapolated over a large epsilon change (matches monolithic).
+    if state.last_solve_eps is not None and (
+        ot_epsilon / state.last_solve_eps > 2.0 or state.last_solve_eps / ot_epsilon > 2.0
+    ):
+        state._prev_prev_block_duals = None
 
     for block_idx, block in enumerate(blocks):
         block_X = all_block_particles[block_idx]
@@ -496,21 +543,27 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
         # Per-block polytope (in subspace_particle_dim space)
         block_polytope_verts = opt._subspace_block_polytopes[block_idx].to(
-            device=device, dtype=X.dtype,
+            device=device,
+            dtype=X.dtype,
         )
 
         # Rotation matrices for this block
         rot_mats = get_random_rotation_matrices(
-            P_block, block_dim, device=device, dtype=X.dtype,
+            P_block,
+            block_dim,
+            device=device,
+            dtype=X.dtype,
             generator=opt._generator,
         )
 
         # Same Gram-Schmidt-vs-QR trade-off as in step_blockwise() above.
-        if (opt.biased_rotation
-                and _block_descent_dirs is not None
-                and block_idx < len(_block_descent_dirs)
-                and _block_descent_dirs[block_idx] is not None
-                and _block_descent_dirs[block_idx].shape == (P_block, block_dim)):
+        if (
+            opt.biased_rotation
+            and _block_descent_dirs is not None
+            and block_idx < len(_block_descent_dirs)
+            and _block_descent_dirs[block_idx] is not None
+            and _block_descent_dirs[block_idx].shape == (P_block, block_dim)
+        ):
             bias_dir = _block_descent_dirs[block_idx]
             bias_norms = torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
             bias_dir_norm = bias_dir / bias_norms
@@ -531,12 +584,18 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
         # Rotate + translate
         X_vertices, rotated = opt._compiled.rotate_and_translate(
-            rot_mats, block_polytope_verts, block_X, step_r,
+            rot_mats,
+            block_polytope_verts,
+            block_X,
+            step_r,
         )
 
         # Probe generation
         X_probe = opt._compiled.compute_probe_points(
-            block_X, rotated, probes, probe_r,
+            block_X,
+            rotated,
+            probes,
+            probe_r,
         )
 
         # Build full params with only this block varying.
@@ -549,9 +608,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         total_evals = P * V * K
 
         # Assemble base subspace coords from all blocks
-        base_subspace = reassemble_blocks_to_subspace(
-            all_block_particles, blocks, sub_dim
-        )
+        base_subspace = reassemble_blocks_to_subspace(all_block_particles, blocks, sub_dim)
 
         losses_list = []
         _all_indices = torch.arange(total_evals, device=device)
@@ -580,7 +637,9 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 col_idx = row_starts + d
                 valid = col_idx < sub_dim
                 if valid.any():
-                    base_batch[local_range[valid], col_idx[valid]] = X_probe[i_idx[valid], v_idx[valid], k_idx[valid], d]
+                    base_batch[local_range[valid], col_idx[valid]] = X_probe[
+                        i_idx[valid], v_idx[valid], k_idx[valid], d
+                    ]
 
             # Apply global projection to get full params
             # base_batch: (chunk_size, sub_dim)
@@ -591,15 +650,20 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 base_batch = base_batch.to(dtype=state.projection.dtype)
             if opt._adaptive or opt._cma_subspace:
                 chunk_params = state.subspace.reconstruct_batch(
-                    state.projection, state.base_params, base_batch,
+                    state.projection,
+                    state.base_params,
+                    base_batch,
                 )
             elif opt._hybrid:
                 chunk_params = state.subspace.reconstruct_batch(
-                    state.hybrid_projections, state.base_params, base_batch,
+                    state.hybrid_projections,
+                    state.base_params,
+                    base_batch,
                 )
             else:
                 chunk_params = state.subspace.reconstruct_batch(
-                    state.base_params, base_batch,
+                    state.base_params,
+                    base_batch,
                 )
 
             # Evaluate full model via closure
@@ -626,24 +690,35 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             # 0.0 placeholders and the deferred .item() on ent_cost_tensor.
             scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
             X_new_block, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
-                scaled_cost, ot_epsilon, block_a,
-                block_polytope_verts, rot_mats, step_r, block_X,
+                scaled_cost,
+                ot_epsilon,
+                block_a,
+                block_polytope_verts,
+                rot_mats,
+                step_r,
+                block_X,
                 scale_cost_mean=False,
             )
             block_fused_ent_terms.append(ent_cost_tensor)
             ot_result = SolverResult(
-                matrix=transport_matrix, cost=0.0,
-                f=None, g=None, converged=True, n_iters=1,
+                matrix=transport_matrix,
+                cost=0.0,
+                f=None,
+                g=None,
+                converged=True,
+                n_iters=1,
                 ent_reg_cost=0.0,
             )
         else:
             init_f, init_g = state.block_duals[block_idx]
             # Apply dual momentum per block
-            if (opt._dual_momentum_beta > 0.0
-                    and init_f is not None
-                    and hasattr(state, '_prev_prev_block_duals')
-                    and state._prev_prev_block_duals is not None
-                    and block_idx < len(state._prev_prev_block_duals)):
+            if (
+                opt._dual_momentum_beta > 0.0
+                and init_f is not None
+                and hasattr(state, "_prev_prev_block_duals")
+                and state._prev_prev_block_duals is not None
+                and block_idx < len(state._prev_prev_block_duals)
+            ):
                 ppf, ppg = state._prev_prev_block_duals[block_idx]
                 if ppf is not None and ppg is not None:
                     beta_dm = opt._dual_momentum_beta
@@ -668,21 +743,25 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
             # Barycentric projection for this block
             X_new_block = opt._compiled.barycentric_projection(
-                ot_result.matrix, block_a, X_vertices,
+                ot_result.matrix,
+                block_a,
+                X_vertices,
             )
             total_ent_cost += ot_result.ent_reg_cost
 
         # Track displacement and descent direction for biased rotation
         block_descent = (X_new_block - block_X).detach()
-        block_disp_terms.append(torch.sum(block_descent ** 2, dim=-1).sum())
+        block_disp_terms.append(torch.sum(block_descent**2, dim=-1).sum())
         total_particles += P_block
         new_block_descent_dirs.append(block_descent)
 
         updated_block_particles.append(X_new_block)
-        new_block_duals.append((
-            ot_result.f.detach() if ot_result.f is not None else None,
-            ot_result.g.detach() if ot_result.g is not None else None,
-        ))
+        new_block_duals.append(
+            (
+                ot_result.f.detach() if ot_result.f is not None else None,
+                ot_result.g.detach() if ot_result.g is not None else None,
+            )
+        )
         block_model_loss_terms.append(cost_matrix.mean().detach())
         num_blocks_counted += 1
         all_converged = all_converged and ot_result.converged
@@ -696,9 +775,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         opt._prev_block_descent_directions = new_block_descent_dirs
 
     # Reassemble updated subspace coords from all blocks
-    new_subspace_coords = reassemble_blocks_to_subspace(
-        updated_block_particles, blocks, sub_dim
-    )
+    new_subspace_coords = reassemble_blocks_to_subspace(updated_block_particles, blocks, sub_dim)
 
     # Reshape back to (num_sub_particles, particle_dim) format for state.X
     # Pad to match original X shape
@@ -713,11 +790,17 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     # Momentum (on full particles)
     if opt.use_momentum and state.velocity is not None:
         beta = compute_momentum_coefficient(
-            iteration, opt.max_iterations,
-            opt.momentum_init, opt.momentum_final,
+            iteration,
+            opt.max_iterations,
+            opt.momentum_init,
+            opt.momentum_final,
         )
         X_final, vel_new = apply_momentum(
-            X, X_new_full, state.velocity, beta, opt.velocity_lr,
+            X,
+            X_new_full,
+            state.velocity,
+            beta,
+            opt.velocity_lr,
         )
         state.velocity = vel_new
         state.X = X_final
@@ -754,19 +837,11 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             if opt._transport_direction_ema is None:
                 opt._transport_direction_ema = raw_direction
             else:
-                opt._transport_direction_ema = (
-                    alpha * opt._transport_direction_ema + (1.0 - alpha) * raw_direction
-                )
+                opt._transport_direction_ema = alpha * opt._transport_direction_ema + (1.0 - alpha) * raw_direction
 
     # Reduce per-block accumulators with one host transfer each.
-    total_model_loss = (
-        torch.stack(block_model_loss_terms).sum().item()
-        if block_model_loss_terms else 0.0
-    )
-    total_disp = (
-        torch.stack(block_disp_terms).sum().item()
-        if block_disp_terms else 0.0
-    )
+    total_model_loss = torch.stack(block_model_loss_terms).sum().item() if block_model_loss_terms else 0.0
+    total_disp = torch.stack(block_disp_terms).sum().item() if block_disp_terms else 0.0
 
     # Adaptive radius (use model loss, not OT regularized cost)
     avg_model_loss = total_model_loss / num_blocks_counted if num_blocks_counted > 0 else total_ent_cost
@@ -798,10 +873,14 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     if not _blockwise_nan_reverted:
         # Save previous block duals for dual momentum extrapolation.
         if opt._dual_momentum_beta > 0.0:
-            state._prev_prev_block_duals = [
-                (f.clone() if f is not None else None, g.clone() if g is not None else None)
-                for f, g in state.block_duals
-            ] if state.block_duals is not None else None
+            state._prev_prev_block_duals = (
+                [
+                    (f.clone() if f is not None else None, g.clone() if g is not None else None)
+                    for f, g in state.block_duals
+                ]
+                if state.block_duals is not None
+                else None
+            )
         state.block_duals = new_block_duals
     state.epsilon = current_eps
     state.last_solve_eps = ot_epsilon
@@ -812,15 +891,13 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         adaptive_sub = opt.subspace
 
         # 1. Compute displacement in subspace coords
-        post_step_sub_coords = state.X.reshape(-1)[:adaptive_sub.subspace_dim]
+        post_step_sub_coords = state.X.reshape(-1)[: adaptive_sub.subspace_dim]
         displacement = post_step_sub_coords - _pre_step_sub_coords
 
         # 2. Update displacement history (rolling buffer)
         idx = state.displacement_history_idx
         state.displacement_history[idx] = displacement
-        state.displacement_history_idx = (
-            (idx + 1) % adaptive_sub.displacement_history_size
-        )
+        state.displacement_history_idx = (idx + 1) % adaptive_sub.displacement_history_size
         state.displacement_history_count = min(
             state.displacement_history_count + 1,
             adaptive_sub.displacement_history_size,
@@ -835,9 +912,11 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
         if should_absorb:
             # SYNCHRONIZED ABSORB: fold perturbation into base, zero ALL block coords
-            full_flat_sub = state.X.reshape(-1)[:adaptive_sub.subspace_dim]
+            full_flat_sub = state.X.reshape(-1)[: adaptive_sub.subspace_dim]
             new_base, _zeroed = adaptive_sub.absorb(
-                state.projection, state.base_params, full_flat_sub,
+                state.projection,
+                state.base_params,
+                full_flat_sub,
             )
             state.base_params = new_base
             # Reset ALL subspace coordinates (all blocks) to zero
@@ -845,6 +924,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             # Single global projection rotation
             # Sparse projection: create new SparseRandomProjection with fresh seed
             from .projection import SparseRandomProjection
+
             if isinstance(state.projection, SparseRandomProjection):
                 new_seed = state.projection.seed + state.absorb_count + 1000
                 state.projection = SparseRandomProjection(
@@ -890,6 +970,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             # Rotate projection basis for next step
             # Sparse projection: use seed increment instead of QR rotation
             from .projection import SparseRandomProjection
+
             if isinstance(state.projection, SparseRandomProjection):
                 new_seed = state.projection.seed + state.iteration_count
                 state.projection = SparseRandomProjection(
@@ -899,7 +980,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 )
             else:
                 hist = (
-                    state.displacement_history[:state.displacement_history_count]
+                    state.displacement_history[: state.displacement_history_count]
                     if state.displacement_history_count > 0
                     else None
                 )
@@ -918,4 +999,3 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     opt._sync_model()
 
     return avg_model_loss
-

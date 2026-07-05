@@ -19,6 +19,7 @@ LinearSubspace (~40-45% on this test setup).
 
 Marked with @pytest.mark.slow since they involve actual training loops.
 """
+
 from __future__ import annotations
 
 import gzip
@@ -198,14 +199,16 @@ def test_hybrid_subspace_trains(small_mnist_loaders):
     model = SmallMLP(hidden=64)
     layout = ParamLayout.from_module(model)
     hybrid_sub = HybridSubspace.from_layout(
-        layout, rank=4,
-        rotation_mode='random',
+        layout,
+        rank=4,
+        rotation_mode="random",
         rotation_interval=0,  # Disable rotation for stable convergence
-        absorb_mode='periodic',
+        absorb_mode="periodic",
         absorb_interval=20,
     )
 
     from polystep.epsilon import LinearEpsilon
+
     optimizer = PolyStepOptimizer(
         model,
         compile=False,
@@ -226,7 +229,7 @@ def test_hybrid_subspace_trains(small_mnist_loaders):
             self.epoch_losses = []
 
         def on_epoch_end(self, metrics):
-            self.epoch_losses.append(metrics['avg_loss'])
+            self.epoch_losses.append(metrics["avg_loss"])
 
     tracker = LossTracker()
     config = TrainConfig(epochs=3, callbacks=[tracker])
@@ -286,18 +289,24 @@ def test_hybrid_accuracy_above_adaptive(mnist_loaders):
     model_h = SmallMLP(hidden=64)
     layout_h = ParamLayout.from_module(model_h)
     hybrid_sub = HybridSubspace.from_layout(
-        layout_h, rank=4,
-        rotation_mode='random',
+        layout_h,
+        rank=4,
+        rotation_mode="random",
         rotation_interval=0,  # Disable rotation for stable convergence
-        absorb_mode='periodic',
+        absorb_mode="periodic",
         absorb_interval=20,
     )
 
     opt_h = PolyStepOptimizer(
-        model_h, compile=False, seed=42,
+        model_h,
+        compile=False,
+        seed=42,
         epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
-        step_radius=4.5, probe_radius=2.0, num_probe=3,
-        sinkhorn_max_iters=50, subspace=hybrid_sub,
+        step_radius=4.5,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=hybrid_sub,
     )
 
     config_h = TrainConfig(epochs=epochs)
@@ -310,38 +319,41 @@ def test_hybrid_accuracy_above_adaptive(mnist_loaders):
     model_a = SmallMLP(hidden=64)
     layout_a = ParamLayout.from_module(model_a)
     adaptive_sub = AdaptiveSubspace.from_layout(
-        layout_a, rank=256,
-        rotation_mode='displacement',
-        absorb_mode='periodic',
+        layout_a,
+        rank=256,
+        rotation_mode="displacement",
+        absorb_mode="periodic",
         absorb_interval=20,
     )
 
     opt_a = PolyStepOptimizer(
-        model_a, compile=False, seed=42,
+        model_a,
+        compile=False,
+        seed=42,
         epsilon=0.5,
-        step_radius=10.0, probe_radius=2.0, num_probe=3,
-        sinkhorn_max_iters=50, subspace=adaptive_sub,
+        step_radius=10.0,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=adaptive_sub,
     )
 
     config_a = TrainConfig(epochs=epochs)
     train(model_a, train_loader, nn.CrossEntropyLoss(), opt_a, config_a)
     adaptive_acc = _evaluate(model_a, test_loader)
 
-    print(f"\n  HybridSubspace accuracy: {hybrid_acc*100:.1f}%")
-    print(f"  AdaptiveSubspace accuracy: {adaptive_acc*100:.1f}%")
+    print(f"\n  HybridSubspace accuracy: {hybrid_acc * 100:.1f}%")
+    print(f"  AdaptiveSubspace accuracy: {adaptive_acc * 100:.1f}%")
 
     # HybridSubspace should be >= AdaptiveSubspace (or within 10% margin)
     # Allow margin due to stochasticity and different optimization dynamics
     assert hybrid_acc >= adaptive_acc - 0.10, (
-        f"HybridSubspace ({hybrid_acc*100:.1f}%) should be >= "
-        f"AdaptiveSubspace ({adaptive_acc*100:.1f}%) - 10%"
+        f"HybridSubspace ({hybrid_acc * 100:.1f}%) should be >= AdaptiveSubspace ({adaptive_acc * 100:.1f}%) - 10%"
     )
 
     # HybridSubspace should be meaningfully above random (10%)
     # Use relaxed threshold - gradient-free training on 1000 samples is highly stochastic
-    assert hybrid_acc >= 0.12, (
-        f"HybridSubspace should achieve above random chance, got {hybrid_acc*100:.1f}%"
-    )
+    assert hybrid_acc >= 0.12, f"HybridSubspace should achieve above random chance, got {hybrid_acc * 100:.1f}%"
 
 
 # ---------------------------------------------------------------------------
@@ -369,10 +381,11 @@ def test_hybrid_accuracy_threshold(mnist_loaders):
     model = SmallMLP(hidden=64)
     layout = ParamLayout.from_module(model)
     hybrid_sub = HybridSubspace.from_layout(
-        layout, rank=4,
-        rotation_mode='random',
+        layout,
+        rank=4,
+        rotation_mode="random",
         rotation_interval=0,  # Disable rotation for stable convergence
-        absorb_mode='periodic',
+        absorb_mode="periodic",
         absorb_interval=10,
     )
 
@@ -393,13 +406,11 @@ def test_hybrid_accuracy_threshold(mnist_loaders):
     model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
 
     accuracy = _evaluate(model, test_loader)
-    print(f"\n  HybridSubspace accuracy: {accuracy*100:.1f}%")
+    print(f"\n  HybridSubspace accuracy: {accuracy * 100:.1f}%")
 
     # Target: 15% accuracy - well above random (10%) but tolerant of stochastic variance
     # in gradient-free training with only 1000 samples and 5 epochs
-    assert accuracy >= 0.15, (
-        f"HybridSubspace should achieve above random chance, got {accuracy*100:.1f}%"
-    )
+    assert accuracy >= 0.15, f"HybridSubspace should achieve above random chance, got {accuracy * 100:.1f}%"
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +433,10 @@ def test_hybrid_absorb_fires(small_mnist_loaders):
     model = SmallMLP(hidden=64)
     layout = ParamLayout.from_module(model)
     hybrid_sub = HybridSubspace.from_layout(
-        layout, rank=4,
-        rotation_mode='random',  # Random mode for simplicity
-        absorb_mode='periodic',
+        layout,
+        rank=4,
+        rotation_mode="random",  # Random mode for simplicity
+        absorb_mode="periodic",
         absorb_interval=3,  # Absorb every 3 steps
     )
 
@@ -457,6 +469,5 @@ def test_hybrid_absorb_fires(small_mnist_loaders):
     # With 10 steps and absorb_interval=3, should have at least 2 absorbs
     expected_absorbs = (optimizer.state.iteration_count - 1) // 3
     assert optimizer.state.absorb_count >= expected_absorbs - 1, (
-        f"Expected at least {expected_absorbs - 1} absorbs, "
-        f"got {optimizer.state.absorb_count}"
+        f"Expected at least {expected_absorbs - 1} absorbs, got {optimizer.state.absorb_count}"
     )

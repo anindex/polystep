@@ -19,6 +19,7 @@ from polystep.layers import (
 # VmapSafeMultiHeadAttention Tests
 # =============================================================================
 
+
 class TestVmapSafeMultiHeadAttention:
     """Tests for VmapSafeMultiHeadAttention."""
 
@@ -57,10 +58,7 @@ class TestVmapSafeMultiHeadAttention:
         x = torch.randn(2, 10, 64)
         # Causal mask: prevent attending to future positions
         seq_len = 10
-        mask = torch.triu(
-            torch.full((seq_len, seq_len), float('-inf')),
-            diagonal=1
-        )
+        mask = torch.triu(torch.full((seq_len, seq_len), float("-inf")), diagonal=1)
         out = attn(x, x, x, attn_mask=mask)
         assert out.shape == (2, 10, 64)
 
@@ -96,7 +94,7 @@ class TestVmapSafeMultiHeadAttention:
         This simulates evaluating a batch of model instances on the same input.
         """
         # Use CPU for testing to avoid CUDA generator issues
-        device = 'cpu'
+        device = "cpu"
         attn = VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4).to(device)
         attn.eval()  # Disable dropout for deterministic testing
 
@@ -108,10 +106,7 @@ class TestVmapSafeMultiHeadAttention:
 
         # Create batched params (simulating multiple model instances)
         num_models = 5
-        batched_params = {
-            k: v.unsqueeze(0).expand(num_models, *v.shape).clone()
-            for k, v in params.items()
-        }
+        batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
 
         # Input with batch dimension: (batch=1, seq, embed)
         # The module expects 3D input, so we keep the batch dim
@@ -126,7 +121,7 @@ class TestVmapSafeMultiHeadAttention:
 
     def test_attention_vmap_with_batch(self):
         """Verify vmap works with batched inputs too."""
-        device = 'cpu'
+        device = "cpu"
         attn = VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4).to(device)
         attn.eval()
 
@@ -137,10 +132,7 @@ class TestVmapSafeMultiHeadAttention:
 
         # Batched params
         num_models = 3
-        batched_params = {
-            k: v.unsqueeze(0).expand(num_models, *v.shape).clone()
-            for k, v in params.items()
-        }
+        batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
 
         # Batched input: (batch, seq, embed)
         x = torch.randn(4, 10, 64, device=device)
@@ -155,6 +147,7 @@ class TestVmapSafeMultiHeadAttention:
 # =============================================================================
 # VmapSafeLSTMCell Tests
 # =============================================================================
+
 
 class TestVmapSafeLSTMCell:
     """Tests for VmapSafeLSTMCell."""
@@ -197,7 +190,7 @@ class TestVmapSafeLSTMCell:
 
     def test_lstm_cell_vmap(self):
         """CRITICAL: Verify LSTM cell works under vmap."""
-        device = 'cpu'
+        device = "cpu"
         cell = VmapSafeLSTMCell(input_size=32, hidden_size=64).to(device)
 
         params = dict(cell.named_parameters())
@@ -207,10 +200,7 @@ class TestVmapSafeLSTMCell:
             return h_new
 
         num_models = 5
-        batched_params = {
-            k: v.unsqueeze(0).expand(num_models, *v.shape).clone()
-            for k, v in params.items()
-        }
+        batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
 
         x = torch.randn(32, device=device)  # Single input
         h = torch.zeros(64, device=device)
@@ -225,6 +215,7 @@ class TestVmapSafeLSTMCell:
 # =============================================================================
 # VmapSafeLSTM Tests
 # =============================================================================
+
 
 class TestVmapSafeLSTM:
     """Tests for VmapSafeLSTM."""
@@ -272,9 +263,7 @@ class TestVmapSafeLSTM:
 
     def test_lstm_with_dropout(self):
         """Test LSTM with dropout between layers."""
-        lstm = VmapSafeLSTM(
-            input_size=32, hidden_size=64, num_layers=3, dropout=0.5
-        )
+        lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=3, dropout=0.5)
         lstm.train()  # Enable dropout
         x = torch.randn(4, 10, 32)
         out1, _ = lstm(x)
@@ -303,7 +292,7 @@ class TestVmapSafeLSTM:
         The vmap pattern used: vmap over params, broadcast over input.
         This simulates evaluating a batch of model instances on the same input.
         """
-        device = 'cpu'
+        device = "cpu"
         lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=2).to(device)
 
         params = dict(lstm.named_parameters())
@@ -313,10 +302,7 @@ class TestVmapSafeLSTM:
             return out
 
         num_models = 5
-        batched_params = {
-            k: v.unsqueeze(0).expand(num_models, *v.shape).clone()
-            for k, v in params.items()
-        }
+        batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
 
         # Input with batch dimension: (batch=1, seq, input)
         # The module expects 3D input, so we keep the batch dim
@@ -330,7 +316,7 @@ class TestVmapSafeLSTM:
 
     def test_lstm_vmap_with_batch(self):
         """Verify vmap works with batched sequence inputs."""
-        device = 'cpu'
+        device = "cpu"
         lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=2).to(device)
 
         params = dict(lstm.named_parameters())
@@ -340,10 +326,7 @@ class TestVmapSafeLSTM:
             return out
 
         num_models = 3
-        batched_params = {
-            k: v.unsqueeze(0).expand(num_models, *v.shape).clone()
-            for k, v in params.items()
-        }
+        batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
 
         # Batched sequence
         x = torch.randn(4, 10, 32, device=device)  # (batch, seq, input)
@@ -358,6 +341,7 @@ class TestVmapSafeLSTM:
 # =============================================================================
 # Integration Tests
 # =============================================================================
+
 
 class TestLayersIntegration:
     """Integration tests combining layers."""

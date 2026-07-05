@@ -83,9 +83,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
         super().__init__()
 
         if embed_dim % num_heads != 0:
-            raise ValueError(
-                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
-            )
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
 
         if kdim is not None and kdim != embed_dim:
             raise NotImplementedError(
@@ -99,13 +97,11 @@ class VmapSafeMultiHeadAttention(nn.Module):
             )
         if add_bias_kv:
             raise NotImplementedError(
-                "VmapSafeMultiHeadAttention does not support add_bias_kv=True. "
-                "See LIMITATIONS.md."
+                "VmapSafeMultiHeadAttention does not support add_bias_kv=True. See LIMITATIONS.md."
             )
         if add_zero_attn:
             raise NotImplementedError(
-                "VmapSafeMultiHeadAttention does not support add_zero_attn=True. "
-                "See LIMITATIONS.md."
+                "VmapSafeMultiHeadAttention does not support add_zero_attn=True. See LIMITATIONS.md."
             )
         if not batch_first:
             raise NotImplementedError(
@@ -176,8 +172,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
         # mode is loud, not "wrong but plausible-looking output".
         if need_weights:
             raise NotImplementedError(
-                "VmapSafeMultiHeadAttention does not support need_weights=True. "
-                "See LIMITATIONS.md."
+                "VmapSafeMultiHeadAttention does not support need_weights=True. See LIMITATIONS.md."
             )
         if is_causal:
             raise NotImplementedError(
@@ -219,7 +214,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
                     f"{attn_mask.dim()}D (shape {tuple(attn_mask.shape)})"
                 )
             if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(attn_mask, float('-inf'))
+                scores = scores.masked_fill(attn_mask, float("-inf"))
             else:
                 scores = scores + attn_mask
 
@@ -228,7 +223,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
             # (batch, seq_k) -> (batch, 1, 1, seq_k)
             padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
             # True means padding, so we mask with -inf
-            scores = scores.masked_fill(padding_mask, float('-inf'))
+            scores = scores.masked_fill(padding_mask, float("-inf"))
 
         # Softmax and dropout
         attn_weights = F.softmax(scores, dim=-1)

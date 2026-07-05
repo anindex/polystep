@@ -9,6 +9,7 @@
   for the in-repo Python WalkSAT) runs and returns sensible numbers on
   a tiny 50-var random 3-SAT instance.
 """
+
 from __future__ import annotations
 
 import os
@@ -38,12 +39,8 @@ _TURBO_TOKENS = (
     "data_dependent_init",
 )
 
-_BASELINE_DIRS = (
-    REPO_ROOT / "experiments" / "baselines",
-)
-_BASELINE_FILES = (
-    REPO_ROOT / "src" / "polystep" / "benchmarks" / "baselines.py",
-)
+_BASELINE_DIRS = (REPO_ROOT / "experiments" / "baselines",)
+_BASELINE_FILES = (REPO_ROOT / "src" / "polystep" / "benchmarks" / "baselines.py",)
 
 
 def _baseline_python_files():
@@ -95,12 +92,14 @@ def test_sls_pysat_baseline_runs_on_small_instance():
 
     instance = generate_maxsat_instance(num_vars=50, seed=42)
     result = run_sls_pysat(
-        instance=instance, wall_clock_seconds=2.0, seed=42, solver_name="g4",
+        instance=instance,
+        wall_clock_seconds=2.0,
+        seed=42,
+        solver_name="g4",
     )
     assert 0.0 <= result["sat_ratio"] <= 1.0
     assert result["num_satisfied"] <= result["num_clauses"]
     # 50-var random 3-SAT at ratio 4.27 is satisfiable with high probability.
     assert result["sat_ratio"] > 0.85, (
-        f"PySAT baseline sat_ratio = {result['sat_ratio']:.3f}, "
-        f"expected > 0.85 on a 50-var instance"
+        f"PySAT baseline sat_ratio = {result['sat_ratio']:.3f}, expected > 0.85 on a 50-var instance"
     )

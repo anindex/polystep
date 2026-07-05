@@ -35,9 +35,7 @@ INIT_RANGE = 0.05
 DEFAULT_HORIZON = 500
 
 
-def sample_initial_states(
-    num: int, *, seed: int, device: str | torch.device = "cpu"
-) -> torch.Tensor:
+def sample_initial_states(num: int, *, seed: int, device: str | torch.device = "cpu") -> torch.Tensor:
     """Uniform [-0.05, 0.05]^4 init matching Gym's ``CartPole-v1.reset``."""
 
     device = torch.device(device)
@@ -47,9 +45,7 @@ def sample_initial_states(
     return states.to(device)
 
 
-def cartpole_step(
-    states: torch.Tensor, actions: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def cartpole_step(states: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Vectorized CartPole transition.
 
     Args:
@@ -84,13 +80,8 @@ def cartpole_step(
     next_theta = theta + TAU * theta_dot
     next_theta_dot = theta_dot + TAU * thetaacc
 
-    next_states = torch.stack(
-        [next_x, next_x_dot, next_theta, next_theta_dot], dim=-1
-    )
-    done = (
-        (next_x.abs() > X_THRESHOLD)
-        | (next_theta.abs() > THETA_THRESHOLD)
-    )
+    next_states = torch.stack([next_x, next_x_dot, next_theta, next_theta_dot], dim=-1)
+    done = (next_x.abs() > X_THRESHOLD) | (next_theta.abs() > THETA_THRESHOLD)
     reward = torch.ones_like(x)
     return next_states, reward, done
 
@@ -111,12 +102,10 @@ def _batched_mlp_logits(
     """Apply N policies to (N, R, 4) observations via bmm. Returns (N, R, 2)."""
 
     x = obs  # (N, R, 4)
-    linear_indices = sorted(
-        int(k.split(".")[1]) for k in stacked_params if k.endswith(".weight")
-    )
+    linear_indices = sorted(int(k.split(".")[1]) for k in stacked_params if k.endswith(".weight"))
     for j, idx in enumerate(linear_indices):
         w = stacked_params[f"net.{idx}.weight"]  # (N, out, in)
-        b = stacked_params[f"net.{idx}.bias"]    # (N, out)
+        b = stacked_params[f"net.{idx}.bias"]  # (N, out)
         x = torch.bmm(x, w.transpose(1, 2)) + b.unsqueeze(1)
         if j < len(linear_indices) - 1:
             x = torch.tanh(x)
@@ -151,9 +140,16 @@ class CartPoleEvaluator:
         n_candidates = count_stacked_candidates(stacked_params)
         R = self.rollouts_per_candidate
         # CRN: same initial states for every candidate within a step; vary across steps.
-        states = sample_initial_states(
-            R, seed=int(seed) + 1009 * int(step), device=self.device,
-        ).unsqueeze(0).expand(n_candidates, R, OBS_DIM).contiguous()
+        states = (
+            sample_initial_states(
+                R,
+                seed=int(seed) + 1009 * int(step),
+                device=self.device,
+            )
+            .unsqueeze(0)
+            .expand(n_candidates, R, OBS_DIM)
+            .contiguous()
+        )
 
         returns = torch.zeros(n_candidates, R, device=self.device)
         lengths = torch.zeros(n_candidates, R, device=self.device)
@@ -223,15 +219,21 @@ def evaluate_policy_module(
     from .policies import stack_module_params
 
     evaluator = CartPoleEvaluator(
-        rollouts_per_candidate=int(episodes), horizon=horizon, device=device,
+        rollouts_per_candidate=int(episodes),
+        horizon=horizon,
+        device=device,
     )
     return evaluator.summarize_stacked_params(
-        stack_module_params(module, 1), seed=seed,
+        stack_module_params(module, 1),
+        seed=seed,
     )
 
 
 def random_policy_baseline(
-    *, seed: int, episodes: int = 100, horizon: int = DEFAULT_HORIZON,
+    *,
+    seed: int,
+    episodes: int = 100,
+    horizon: int = DEFAULT_HORIZON,
     device: str = "cpu",
 ) -> Dict[str, float]:
     """Uniform-random action baseline for CartPole."""

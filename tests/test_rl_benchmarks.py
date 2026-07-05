@@ -88,8 +88,7 @@ def test_nondiff_policy_zero_grad():
         first_w_grad = pol.net[0].weight.grad
         assert first_w_grad is not None
         assert torch.allclose(first_w_grad, torch.zeros_like(first_w_grad)), (
-            f"mode={mode}: expected zero grad through non-diff op, got "
-            f"max|g|={first_w_grad.abs().max().item()}"
+            f"mode={mode}: expected zero grad through non-diff op, got max|g|={first_w_grad.abs().max().item()}"
         )
 
 
@@ -122,14 +121,17 @@ def test_hardened_env_smoke():
     import gymnasium as gym
     import numpy as np
     from experiments.runners.hardened_env import (
-        QuantizedObsWrapper, SparseRewardWrapper, make_hardened_env,
-        register_hardened_envs, HARDENED_GYM_IDS,
+        QuantizedObsWrapper,
+        SparseRewardWrapper,
+        make_hardened_env,
+        register_hardened_envs,
+        HARDENED_GYM_IDS,
     )
 
     # Direct quantizer: only 4 distinct values per channel (bin centers).
-    env = QuantizedObsWrapper(gym.make("CartPole-v1"), bins=4,
-                              low=[-2.4, -3.0, -0.21, -3.5],
-                              high=[2.4, 3.0, 0.21, 3.5])
+    env = QuantizedObsWrapper(
+        gym.make("CartPole-v1"), bins=4, low=[-2.4, -3.0, -0.21, -3.5], high=[2.4, 3.0, 0.21, 3.5]
+    )
     obs0, _ = env.reset(seed=0)
     obs1, _ = env.reset(seed=1)
     # Quantizer outputs should be one of 4 bin centers per channel.

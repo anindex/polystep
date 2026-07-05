@@ -4,6 +4,7 @@ PolyStep's OT problems are (n particles x m=V polytope vertices) with V small
 (2*particle_dim), so the cost is O(n*V) -- a full-rank log-domain solve is
 already optimal and there is no large dense kernel to approximate away.
 """
+
 import functools
 import math
 import warnings
@@ -41,17 +42,13 @@ class SinkhornResult:
     errors: Optional[List[float]] = None
 
     # Internal fields for lazy .matrix computation
-    _eps: float = float('nan')
+    _eps: float = float("nan")
     _cost_matrix: Optional[torch.Tensor] = None  # (n, m)
 
     @functools.cached_property
     def matrix(self) -> torch.Tensor:
         """Transport plan, computed lazily: P_ij = exp((f_i + g_j - C_ij) / eps)."""
-        log_P = (
-            self.f.unsqueeze(1) / self._eps
-            + self.g.unsqueeze(0) / self._eps
-            - self._cost_matrix / self._eps
-        )
+        log_P = (self.f.unsqueeze(1) + self.g.unsqueeze(0) - self._cost_matrix) / self._eps
         return torch.exp(log_P)
 
 
@@ -85,8 +82,8 @@ class SinkhornSolver:
     check_every: int = 10
     compile: bool = False
     omega: float = 1.0
-    anderson_depth: int = 0         # 0 = disabled, >0 = ring buffer depth for Anderson acceleration
-    adaptive_omega: bool = False    # False = static omega, True = residual-ratio dynamic omega (Lehmann 2022)
+    anderson_depth: int = 0  # 0 = disabled, >0 = ring buffer depth for Anderson acceleration
+    adaptive_omega: bool = False  # False = static omega, True = residual-ratio dynamic omega (Lehmann 2022)
     data_dependent_init: bool = False  # False = zeros init, True = cost-mean init for cold starts
 
     def __post_init__(self):
@@ -104,15 +101,12 @@ class SinkhornSolver:
             )
         if self.check_every < 1:
             raise ValueError(
-                f"check_every must be >= 1, got {self.check_every}. "
-                f"It is the modulus for periodic convergence checks."
+                f"check_every must be >= 1, got {self.check_every}. It is the modulus for periodic convergence checks."
             )
 
         from .._compiled import CompiledFunctions
 
-        self._compiled = CompiledFunctions(
-            compile=self.compile and torch.cuda.is_available()
-        )
+        self._compiled = CompiledFunctions(compile=self.compile and torch.cuda.is_available())
 
     def solve(
         self,
@@ -154,11 +148,18 @@ class SinkhornSolver:
         # Schedules mutate ``self.epsilon`` per step, so re-validate here (a
         # plain float check, no host sync) rather than only at construction.
         validate_positive(
-            self.epsilon, "epsilon",
+            self.epsilon,
+            "epsilon",
             "A zero/negative epsilon divides by zero in log-domain Sinkhorn.",
         )
         return self._solve_full_rank(
-            cost_matrix, a, b, init_f, init_g, scale_cost, init_eps,
+            cost_matrix,
+            a,
+            b,
+            init_f,
+            init_g,
+            scale_cost,
+            init_eps,
         )
 
     def _solve_full_rank(
@@ -177,6 +178,11 @@ class SinkhornSolver:
         # cost handling (no host sync), then device/dtype-aligned marginals.
         cost_matrix = sanitize_cost(cost_matrix)
         n, m = cost_matrix.shape
+        if n == 0 or m == 0:
+            raise ValueError(
+                f"Sinkhorn received an empty cost matrix (shape {(n, m)}); "
+                "at least one source and target point are required."
+            )
         device, dtype = cost_matrix.device, cost_matrix.dtype
         a = align_marginal(a, n, device, dtype, "a")
         b = align_marginal(b, m, device, dtype, "b")
@@ -207,9 +213,20 @@ class SinkhornSolver:
             if g is None:
                 g = torch.zeros(m, device=device, dtype=dtype)
 
-        # Validate warm-started dual potentials. Dual potentials scale
-        # with the cost matrix magnitude, not epsilon. ``cost_scale`` is
-        # kept on-device so the clamp does not sync every solve.
+        # Rescale the warm-started duals when the caller changed epsilon since
+        # the previous solve (see ``init_eps`` docstring above). Do this before
+        # the clamp below so a large ``eps/init_eps`` ratio stays bounded and
+        # cannot blow the plan to Inf/NaN.
+        if init_eps is not None and init_eps > 0 and (init_f is not None or init_g is not None):
+            if abs(init_eps - eps) / max(eps, 1e-9) > 1e-6:
+                scale_factor = eps / init_eps
+                f = f * scale_factor
+                g = g * scale_factor
+
+        # Validate warm-started dual potentials. Dual potentials scale with the
+        # cost matrix magnitude, not epsilon. ``cost_scale`` is kept on-device so
+        # the clamp does not sync every solve. Runs after the rescale above so the
+        # bound holds.
         cost_scale = cost_matrix.abs().max().clamp(min=1e-6)
         max_abs_dual = 10.0 * cost_scale
         if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
@@ -218,15 +235,6 @@ class SinkhornSolver:
         else:
             f.clamp_(-max_abs_dual, max_abs_dual)
             g.clamp_(-max_abs_dual, max_abs_dual)
-
-        # Rescale the warm-started duals when the caller changed epsilon
-        # since the previous solve (see ``init_eps`` docstring above).
-        if (init_eps is not None and init_eps > 0
-                and (init_f is not None or init_g is not None)):
-            if abs(init_eps - eps) / max(eps, 1e-9) > 1e-6:
-                scale_factor = eps / init_eps
-                f = f * scale_factor
-                g = g * scale_factor
 
         # Re-center using the only valid dual gauge ``f -> f + c, g -> g - c``,
         # which leaves ``f_i + g_j`` (and hence the plan ``P``) unchanged. The
@@ -266,9 +274,7 @@ class SinkhornSolver:
         # Pin the iteration loop inside an autocast-disabled FP32
         # region so a caller running under ``autocast(bfloat16)`` can't
         # demote our log-sum-exp intermediates.
-        with torch.no_grad(), \
-                torch.amp.autocast("cuda", enabled=False), \
-                torch.amp.autocast("cpu", enabled=False):
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
             if fixed_mode:
                 # Fixed-iteration path: compiled body with post-loop NaN check.
                 # Warm-started solver with well-conditioned cost matrix rarely
@@ -286,8 +292,8 @@ class SinkhornSolver:
                 # Convergence-checking path: stays fully eager with overrelaxation
                 # Anderson acceleration: ring buffer for iterate mixing
                 if self.anderson_depth > 0:
-                    aa_history_x = []   # list of (f, g) pairs
-                    aa_history_r = []   # list of (r_f, r_g) residual pairs
+                    aa_history_x = []  # list of (f, g) pairs
+                    aa_history_r = []  # list of (r_f, r_g) residual pairs
 
                 # Adaptive omega: residual-ratio estimator state (Lehmann 2022)
                 if self.adaptive_omega:
@@ -297,7 +303,7 @@ class SinkhornSolver:
                 # growths of ``|f|.max + |g|.max``; if the iterate norm
                 # keeps growing across ``_divergence_patience`` checks,
                 # back omega off to 1.0 (Lehmann 2022's proven-safe value).
-                _divergence_prev_norm = float('inf')
+                _divergence_prev_norm = float("inf")
                 _divergence_growth_count = 0
                 _divergence_patience = 3
 
@@ -329,11 +335,18 @@ class SinkhornSolver:
                         if len(aa_history_r) >= 2:
                             k = len(aa_history_r) - 1
                             # Build residual difference matrix
-                            delta_r = torch.stack([
-                                torch.cat([aa_history_r[j+1][0] - aa_history_r[j][0],
-                                           aa_history_r[j+1][1] - aa_history_r[j][1]])
-                                for j in range(k)
-                            ], dim=1)  # (n+m, k)
+                            delta_r = torch.stack(
+                                [
+                                    torch.cat(
+                                        [
+                                            aa_history_r[j + 1][0] - aa_history_r[j][0],
+                                            aa_history_r[j + 1][1] - aa_history_r[j][1],
+                                        ]
+                                    )
+                                    for j in range(k)
+                                ],
+                                dim=1,
+                            )  # (n+m, k)
                             current_r = torch.cat([r_f, r_g])  # (n+m,)
 
                             # Tikhonov-regularized least-squares for stability
@@ -343,11 +356,18 @@ class SinkhornSolver:
 
                                 # Guard against NaN/Inf and huge alpha from ill-conditioning
                                 if torch.isfinite(alpha).all() and alpha.norm() < 1e3:
-                                    delta_x = torch.stack([
-                                        torch.cat([aa_history_x[j+1][0] - aa_history_x[j][0],
-                                                   aa_history_x[j+1][1] - aa_history_x[j][1]])
-                                        for j in range(k)
-                                    ], dim=1)
+                                    delta_x = torch.stack(
+                                        [
+                                            torch.cat(
+                                                [
+                                                    aa_history_x[j + 1][0] - aa_history_x[j][0],
+                                                    aa_history_x[j + 1][1] - aa_history_x[j][1],
+                                                ]
+                                            )
+                                            for j in range(k)
+                                        ],
+                                        dim=1,
+                                    )
                                     combined = torch.cat([f_new, g_new]) - delta_x @ alpha
                                     # Validate combined result before assigning
                                     if torch.isfinite(combined).all():
@@ -366,7 +386,7 @@ class SinkhornSolver:
                                         # GPU->CPU sync per Anderson iter; the
                                         # math is unchanged (broadcast scalar
                                         # bool selects between the two iterates).
-                                        accept = (lyap_combined >= lyap_plain - 1e-6)
+                                        accept = lyap_combined >= lyap_plain - 1e-6
                                         f_new = torch.where(accept, f_combined, f_new)
                                         g_new = torch.where(accept, g_combined, g_new)
                             except RuntimeError:
@@ -381,8 +401,7 @@ class SinkhornSolver:
                     # transfer per check to amortize the sync cost.
                     if (i + 1) % self.check_every == 0:
                         # Divergence check
-                        if (torch.isnan(f).any() or torch.isinf(f).any()
-                                or torch.isnan(g).any() or torch.isinf(g).any()):
+                        if torch.isnan(f).any() or torch.isinf(f).any() or torch.isnan(g).any() or torch.isinf(g).any():
                             f.zero_()
                             g.zero_()
                             break
@@ -398,9 +417,7 @@ class SinkhornSolver:
                             dual_norm_t = f.abs().max() + g.abs().max()
                         else:
                             dual_norm_t = err_a_t  # placeholder, value unused
-                        err_a, err_b, dual_norm_v = torch.stack(
-                            [err_a_t, err_b_t, dual_norm_t]
-                        ).tolist()
+                        err_a, err_b, dual_norm_v = torch.stack([err_a_t, err_b_t, dual_norm_t]).tolist()
                         err = max(err_a, err_b)
 
                         # Static-omega divergence detector. Lehmann et al.
@@ -449,9 +466,7 @@ class SinkhornSolver:
         # Entropic dual objective D(f,g) = <f,a> + <g,b> - eps*sum(a). The mass
         # term makes it the true regularized value (a bare <f,a>+<g,b> overstates
         # it by eps*sum(a)); at convergence sum(P) equals sum(a). One host transfer.
-        ent_reg_cost = (
-            torch.stack([(f * a).sum(), (g * b).sum()]).sum() - eps * a.sum()
-        ).item()
+        ent_reg_cost = (torch.stack([(f * a).sum(), (g * b).sum()]).sum() - eps * a.sum()).item()
 
         result = SinkhornResult(
             f=f,

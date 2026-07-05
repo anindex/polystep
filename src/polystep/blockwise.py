@@ -14,6 +14,7 @@ Usage::
 See Also:
     ``PolyStepOptimizer`` for the ``block_strategy`` parameter.
 """
+
 from __future__ import annotations
 
 import warnings
@@ -71,14 +72,16 @@ def create_per_layer_blocks(
         num_params = entry.numel
         padded = num_params + (-num_params % particle_dim)
         num_particles = padded // particle_dim
-        blocks.append(BlockConfig(
-            name=entry.key,
-            leaf_indices=(i,),
-            flat_start=offset,
-            flat_end=offset + padded,
-            num_particles=num_particles,
-            particle_dim=particle_dim,
-        ))
+        blocks.append(
+            BlockConfig(
+                name=entry.key,
+                leaf_indices=(i,),
+                flat_start=offset,
+                flat_end=offset + padded,
+                num_particles=num_particles,
+                particle_dim=particle_dim,
+            )
+        )
         offset += padded
 
     return blocks
@@ -113,14 +116,16 @@ def create_grouped_blocks(
         num_params = sum(e.numel for e in group_entries)
         padded = num_params + (-num_params % particle_dim)
         num_particles = padded // particle_dim
-        blocks.append(BlockConfig(
-            name=f"block_{g_start}_{g_end}",
-            leaf_indices=leaf_indices,
-            flat_start=offset,
-            flat_end=offset + padded,
-            num_particles=num_particles,
-            particle_dim=particle_dim,
-        ))
+        blocks.append(
+            BlockConfig(
+                name=f"block_{g_start}_{g_end}",
+                leaf_indices=leaf_indices,
+                flat_start=offset,
+                flat_end=offset + padded,
+                num_particles=num_particles,
+                particle_dim=particle_dim,
+            )
+        )
         offset += padded
 
     return blocks
@@ -144,7 +149,7 @@ def split_particles(
     result: List[torch.Tensor] = []
 
     for block in blocks:
-        block_flat = flat[block.flat_start:block.flat_end]
+        block_flat = flat[block.flat_start : block.flat_end]
         result.append(block_flat.reshape(block.num_particles, block.particle_dim))
 
     return result
@@ -171,13 +176,12 @@ def reassemble_blocks(
     if not block_particles:
         return torch.zeros(total_flat_size)
 
-    full_flat = torch.zeros(total_flat_size, dtype=block_particles[0].dtype,
-                            device=block_particles[0].device)
+    full_flat = torch.zeros(total_flat_size, dtype=block_particles[0].dtype, device=block_particles[0].device)
 
     for block_X, block in zip(block_particles, blocks):
         block_flat = block_X.reshape(-1)
         block_size = block.flat_end - block.flat_start
-        full_flat[block.flat_start:block.flat_end] = block_flat[:block_size]
+        full_flat[block.flat_start : block.flat_end] = block_flat[:block_size]
 
     return full_flat
 
@@ -186,7 +190,7 @@ def reassemble_blocks(
 def blocks_to_layout_flat(
     block_flat: torch.Tensor,
     blocks: List[BlockConfig],
-    layout: 'ParamLayout',
+    layout: "ParamLayout",
 ) -> torch.Tensor:
     """Map block-indexed flat vector to layout-indexed flat vector.
 
@@ -208,7 +212,9 @@ def blocks_to_layout_flat(
         1D tensor of shape ``(layout.padded_size,)`` in layout-indexed layout.
     """
     layout_flat = torch.zeros(
-        layout.padded_size, dtype=block_flat.dtype, device=block_flat.device,
+        layout.padded_size,
+        dtype=block_flat.dtype,
+        device=block_flat.device,
     )
 
     for block in blocks:
@@ -216,10 +222,9 @@ def blocks_to_layout_flat(
         for leaf_idx in block.leaf_indices:
             entry = layout.entries[leaf_idx]
             numel = entry.numel
-            layout_flat[entry.offset : entry.offset + numel] = (
-                block_flat[block.flat_start + internal_offset
-                           : block.flat_start + internal_offset + numel]
-            )
+            layout_flat[entry.offset : entry.offset + numel] = block_flat[
+                block.flat_start + internal_offset : block.flat_start + internal_offset + numel
+            ]
             internal_offset += numel
 
     return layout_flat
@@ -229,7 +234,7 @@ def blocks_to_layout_flat(
 def layout_flat_to_block_flat(
     layout_flat: torch.Tensor,
     blocks: List[BlockConfig],
-    layout: 'ParamLayout',
+    layout: "ParamLayout",
 ) -> torch.Tensor:
     """Map layout-indexed flat vector to block-indexed flat vector.
 
@@ -248,7 +253,9 @@ def layout_flat_to_block_flat(
     """
     total_block_flat_size = blocks[-1].flat_end if blocks else 0
     block_flat = torch.zeros(
-        total_block_flat_size, dtype=layout_flat.dtype, device=layout_flat.device,
+        total_block_flat_size,
+        dtype=layout_flat.dtype,
+        device=layout_flat.device,
     )
 
     for block in blocks:
@@ -256,10 +263,9 @@ def layout_flat_to_block_flat(
         for leaf_idx in block.leaf_indices:
             entry = layout.entries[leaf_idx]
             numel = entry.numel
-            block_flat[block.flat_start + internal_offset
-                       : block.flat_start + internal_offset + numel] = (
-                layout_flat[entry.offset : entry.offset + numel]
-            )
+            block_flat[block.flat_start + internal_offset : block.flat_start + internal_offset + numel] = layout_flat[
+                entry.offset : entry.offset + numel
+            ]
             internal_offset += numel
 
     return block_flat
@@ -269,7 +275,7 @@ def layout_flat_to_block_flat(
 def blocks_to_layout_flat_batch(
     block_flat_batch: torch.Tensor,
     blocks: List[BlockConfig],
-    layout: 'ParamLayout',
+    layout: "ParamLayout",
 ) -> torch.Tensor:
     """Batched version of ``blocks_to_layout_flat``.
 
@@ -283,7 +289,9 @@ def blocks_to_layout_flat_batch(
     """
     N = block_flat_batch.shape[0]
     layout_batch = torch.zeros(
-        N, layout.padded_size, dtype=block_flat_batch.dtype,
+        N,
+        layout.padded_size,
+        dtype=block_flat_batch.dtype,
         device=block_flat_batch.device,
     )
 
@@ -292,10 +300,9 @@ def blocks_to_layout_flat_batch(
         for leaf_idx in block.leaf_indices:
             entry = layout.entries[leaf_idx]
             numel = entry.numel
-            layout_batch[:, entry.offset : entry.offset + numel] = (
-                block_flat_batch[:, block.flat_start + internal_offset
-                                 : block.flat_start + internal_offset + numel]
-            )
+            layout_batch[:, entry.offset : entry.offset + numel] = block_flat_batch[
+                :, block.flat_start + internal_offset : block.flat_start + internal_offset + numel
+            ]
             internal_offset += numel
 
     return layout_batch
@@ -346,8 +353,7 @@ def create_subspace_blocks(
 
     if num_blocks > total_particles:
         warnings.warn(
-            f"num_blocks ({num_blocks}) exceeds total_particles ({total_particles}). "
-            f"Clamping to total_particles.",
+            f"num_blocks ({num_blocks}) exceeds total_particles ({total_particles}). Clamping to total_particles.",
             stacklevel=2,
         )
         num_blocks = total_particles
@@ -363,14 +369,16 @@ def create_subspace_blocks(
         # Distribute remainder: first 'remainder' blocks get one extra particle
         num_particles = base_particles_per_block + (1 if i < remainder else 0)
         flat_size = num_particles * subspace_particle_dim
-        blocks.append(BlockConfig(
-            name=f"subspace_block_{i}",
-            leaf_indices=(),  # Not used for subspace blocks
-            flat_start=offset,
-            flat_end=offset + flat_size,
-            num_particles=num_particles,
-            particle_dim=subspace_particle_dim,
-        ))
+        blocks.append(
+            BlockConfig(
+                name=f"subspace_block_{i}",
+                leaf_indices=(),  # Not used for subspace blocks
+                flat_start=offset,
+                flat_end=offset + flat_size,
+                num_particles=num_particles,
+                particle_dim=subspace_particle_dim,
+            )
+        )
         offset += flat_size
 
     return blocks
@@ -414,7 +422,7 @@ def split_subspace_to_blocks(
     result: List[torch.Tensor] = []
 
     for block in blocks:
-        block_flat = flat[block.flat_start:block.flat_end]
+        block_flat = flat[block.flat_start : block.flat_end]
         result.append(block_flat.reshape(block.num_particles, block.particle_dim))
 
     return result
@@ -459,7 +467,7 @@ def reassemble_blocks_to_subspace(
 
     for block_X, block in zip(block_particles, blocks):
         block_flat = block_X.reshape(-1)
-        full_flat[block.flat_start:block.flat_end] = block_flat
+        full_flat[block.flat_start : block.flat_end] = block_flat
 
     # Trim to actual subspace_dim (remove padding)
     return full_flat[:subspace_dim]

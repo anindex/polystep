@@ -7,6 +7,7 @@ Tests edge conditions that could expose hidden numerical issues:
 - NaN propagation
 - marginal constraint satisfaction under stress
 """
+
 import torch
 import torch.nn as nn
 import pytest
@@ -80,7 +81,7 @@ class TestSinkhornEdgeCases:
         n, m = 10, 6
         C = torch.rand(n, m) * 1000.0
         solver = SinkhornSolver(epsilon=10.0, max_iterations=500)
-        result = solver.solve(C, scale_cost='mean')
+        result = solver.solve(C, scale_cost="mean")
         T = result.matrix
         assert torch.isfinite(T).all()
         row_sums = T.sum(dim=1)
@@ -106,15 +107,14 @@ class TestSinkhornEdgeCases:
         torch.manual_seed(0)
         n, m = 8, 4
         C = torch.rand(n, m)
-        C[0, 0] = float('nan')
-        C[3, 2] = float('inf')
+        C[0, 0] = float("nan")
+        C[3, 2] = float("inf")
 
         solver = SinkhornSolver(epsilon=1.0, max_iterations=100)
         result = solver.solve(C)
         T = result.matrix
         assert torch.isfinite(T).all(), (
-            "SinkhornSolver should sanitize non-finite cost entries and "
-            "return a finite transport plan."
+            "SinkhornSolver should sanitize non-finite cost entries and return a finite transport plan."
         )
 
     def test_warm_start_after_scale_change(self):
@@ -141,9 +141,7 @@ class TestSinkhornEdgeCases:
         torch.manual_seed(0)
         n, m = 20, 8
         C = torch.rand(n, m)
-        solver = SinkhornSolver(
-            epsilon=0.5, max_iterations=500, threshold=1e-6, omega=1.9
-        )
+        solver = SinkhornSolver(epsilon=0.5, max_iterations=500, threshold=1e-6, omega=1.9)
         result = solver.solve(C)
         T = result.matrix
         assert torch.isfinite(T).all(), "Overrelaxation omega=1.9 diverged"

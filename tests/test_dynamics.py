@@ -50,9 +50,7 @@ class TestMomentumCoefficient:
 
     def test_custom_range(self):
         """Custom init/final values interpolate correctly."""
-        beta = compute_momentum_coefficient(
-            9, max_iterations=10, momentum_init=0.0, momentum_final=1.0
-        )
+        beta = compute_momentum_coefficient(9, max_iterations=10, momentum_init=0.0, momentum_final=1.0)
         assert beta == pytest.approx(1.0)
 
 

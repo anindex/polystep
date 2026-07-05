@@ -3,6 +3,7 @@
 Sparse projection: Tests covering projection_type parameter, sparse projection creation,
 step execution, rotation, absorb, and dtype compatibility.
 """
+
 import pytest
 import torch
 import torch.nn as nn
@@ -43,7 +44,7 @@ def medium_model():
     return nn.Sequential(
         nn.Linear(100, 100),  # 10100 params
         nn.ReLU(),
-        nn.Linear(100, 10),   # 1010 params
+        nn.Linear(100, 10),  # 1010 params
     )
 
 
@@ -73,14 +74,14 @@ class TestProjectionTypeSparse:
         opt = PolyStepOptimizer(
             medium_model,
             subspace=medium_subspace,
-            projection_type='sparse',
+            projection_type="sparse",
             seed=0,
             compile=False,
         )
         assert isinstance(opt.state.projection, SparseRandomProjection), (
             f"Expected SparseRandomProjection, got {type(opt.state.projection).__name__}"
         )
-        assert opt.projection_type == 'sparse'
+        assert opt.projection_type == "sparse"
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ class TestProjectionTypeDense:
         opt = PolyStepOptimizer(
             small_model,
             subspace=adaptive_subspace,
-            projection_type='dense',
+            projection_type="dense",
             seed=0,
             compile=False,
         )
@@ -102,7 +103,7 @@ class TestProjectionTypeDense:
             f"Expected torch.Tensor, got {type(opt.state.projection).__name__}"
         )
         assert not isinstance(opt.state.projection, SparseRandomProjection)
-        assert opt.projection_type == 'dense'
+        assert opt.projection_type == "dense"
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +118,7 @@ class TestProjectionTypeInvalid:
             PolyStepOptimizer(
                 small_model,
                 subspace=adaptive_subspace,
-                projection_type='invalid',
+                projection_type="invalid",
                 compile=False,
             )
 
@@ -136,14 +137,14 @@ class TestSparseProjectionStep:
         opt = PolyStepOptimizer(
             medium_model,
             subspace=medium_subspace,
-            projection_type='sparse',
+            projection_type="sparse",
             seed=42,
             compile=False,
         )
 
         # Create dummy closure returning random losses
         def closure(batched_params):
-            batch_size = batched_params['0.weight'].shape[0]
+            batch_size = batched_params["0.weight"].shape[0]
             return torch.rand(batch_size)
 
         # Run 3 steps to test rotation handling
@@ -159,9 +160,7 @@ class TestSparseProjectionStep:
         assert all(isinstance(c, float) for c in costs), "All costs should be floats"
 
         # Verify projection changed (seed incremented for rotation)
-        assert opt.state.projection.seed != initial_proj_seed, (
-            "Projection seed should change after rotation"
-        )
+        assert opt.state.projection.seed != initial_proj_seed, "Projection seed should change after rotation"
         assert isinstance(opt.state.projection, SparseRandomProjection), (
             "Projection should still be SparseRandomProjection after steps"
         )
@@ -182,7 +181,7 @@ class TestSparseProjectionAbsorb:
         sub = AdaptiveSubspace(
             full_dim=medium_subspace.full_dim,
             subspace_dim=medium_subspace.subspace_dim,
-            absorb_mode='periodic',
+            absorb_mode="periodic",
             absorb_interval=2,  # Absorb every 2 steps
             _entry_specs=medium_subspace._entry_specs,
         )
@@ -190,13 +189,13 @@ class TestSparseProjectionAbsorb:
         opt = PolyStepOptimizer(
             medium_model,
             subspace=sub,
-            projection_type='sparse',
+            projection_type="sparse",
             seed=42,
             compile=False,
         )
 
         def closure(batched_params):
-            batch_size = batched_params['0.weight'].shape[0]
+            batch_size = batched_params["0.weight"].shape[0]
             return torch.rand(batch_size)
 
         initial_seed = opt.state.projection.seed
@@ -206,9 +205,7 @@ class TestSparseProjectionAbsorb:
             opt.step(closure)
 
         # Verify absorb count increased
-        assert opt.state.absorb_count >= 1, (
-            f"Expected at least 1 absorb, got {opt.state.absorb_count}"
-        )
+        assert opt.state.absorb_count >= 1, f"Expected at least 1 absorb, got {opt.state.absorb_count}"
 
         # Verify projection is still SparseRandomProjection
         assert isinstance(opt.state.projection, SparseRandomProjection), (
@@ -216,9 +213,7 @@ class TestSparseProjectionAbsorb:
         )
 
         # Verify seed changed (absorb creates new projection)
-        assert opt.state.projection.seed != initial_seed, (
-            "Projection seed should change after absorb"
-        )
+        assert opt.state.projection.seed != initial_seed, "Projection seed should change after absorb"
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +230,7 @@ class TestSparseProjectionDtype:
         opt = PolyStepOptimizer(
             medium_model,
             subspace=medium_subspace,
-            projection_type='sparse',
+            projection_type="sparse",
             seed=42,
             compile=False,
             # Note: mixed_precision=True requires GPU with BF16 support
@@ -244,7 +239,7 @@ class TestSparseProjectionDtype:
 
         # Create closure returning FP32 losses
         def closure(batched_params):
-            batch_size = batched_params['0.weight'].shape[0]
+            batch_size = batched_params["0.weight"].shape[0]
             return torch.rand(batch_size, dtype=torch.float32)
 
         # Run a step
@@ -253,6 +248,7 @@ class TestSparseProjectionDtype:
         assert isinstance(cost, float), f"Cost should be float, got {type(cost)}"
         # Note: OT cost with entropic regularization can be negative
         import math
+
         assert math.isfinite(cost), "Cost should be finite"
 
     def test_sparse_projection_with_float64_coords(self, medium_model, medium_subspace):
@@ -263,7 +259,7 @@ class TestSparseProjectionDtype:
         opt = PolyStepOptimizer(
             medium_model,
             subspace=medium_subspace,
-            projection_type='sparse',
+            projection_type="sparse",
             seed=42,
             compile=False,
         )
@@ -292,7 +288,7 @@ class TestSparseProjectionDimensions:
         opt = PolyStepOptimizer(
             medium_model,
             subspace=medium_subspace,
-            projection_type='sparse',
+            projection_type="sparse",
             seed=42,
             compile=False,
         )
@@ -317,12 +313,12 @@ class TestProjectionTypeAuto:
         opt = PolyStepOptimizer(
             small_model,
             subspace=adaptive_subspace,
-            projection_type='auto',
+            projection_type="auto",
             seed=42,
             compile=False,
         )
         # Small model should auto-select dense
-        assert opt.projection_type == 'dense'
+        assert opt.projection_type == "dense"
         assert isinstance(opt.state.projection, torch.Tensor)
 
 
@@ -348,13 +344,11 @@ class TestAutoSelectsSparseForLargeModel:
         opt = PolyStepOptimizer(
             large_model,
             subspace=subspace,
-            projection_type='auto',
+            projection_type="auto",
             compile=False,
         )
 
-        assert opt.projection_type == 'sparse', (
-            f"Expected 'sparse' for large model, got '{opt.projection_type}'"
-        )
+        assert opt.projection_type == "sparse", f"Expected 'sparse' for large model, got '{opt.projection_type}'"
         assert isinstance(opt.state.projection, SparseRandomProjection)
 
 
@@ -372,13 +366,11 @@ class TestAutoSelectsDenseForSmallModel:
         opt = PolyStepOptimizer(
             small_model,
             subspace=adaptive_subspace,
-            projection_type='auto',
+            projection_type="auto",
             compile=False,
         )
 
-        assert opt.projection_type == 'dense', (
-            f"Expected 'dense' for small model, got '{opt.projection_type}'"
-        )
+        assert opt.projection_type == "dense", f"Expected 'dense' for small model, got '{opt.projection_type}'"
         assert isinstance(opt.state.projection, torch.Tensor)
         assert not isinstance(opt.state.projection, SparseRandomProjection)
 
@@ -396,7 +388,7 @@ class TestTinyModelFallbackToDense:
         tiny_model = nn.Sequential(
             nn.Linear(10, 10),  # 110 params
             nn.ReLU(),
-            nn.Linear(10, 2),   # 22 params
+            nn.Linear(10, 2),  # 22 params
         )
         num_params = sum(p.numel() for p in tiny_model.parameters())
         assert num_params < 10_000, f"Model should have <10K params, has {num_params}"
@@ -405,14 +397,12 @@ class TestTinyModelFallbackToDense:
         opt = PolyStepOptimizer(
             tiny_model,
             subspace=subspace,
-            projection_type='sparse',  # Explicitly request sparse
+            projection_type="sparse",  # Explicitly request sparse
             compile=False,
         )
 
         # Should fall back to dense because model is too small
-        assert opt.projection_type == 'dense', (
-            f"Expected 'dense' fallback for tiny model, got '{opt.projection_type}'"
-        )
+        assert opt.projection_type == "dense", f"Expected 'dense' fallback for tiny model, got '{opt.projection_type}'"
         assert isinstance(opt.state.projection, torch.Tensor)
         assert not isinstance(opt.state.projection, SparseRandomProjection)
 
@@ -430,7 +420,7 @@ class TestExplicitProjectionTypeOverride:
         model = nn.Sequential(
             nn.Linear(100, 100),  # 10.1K params
             nn.ReLU(),
-            nn.Linear(100, 10),   # 1010 params
+            nn.Linear(100, 10),  # 1010 params
         )
         num_params = sum(p.numel() for p in model.parameters())
         # Model should be above 10K (tiny threshold) but below 1M (sparse threshold)
@@ -440,13 +430,11 @@ class TestExplicitProjectionTypeOverride:
         opt = PolyStepOptimizer(
             model,
             subspace=subspace,
-            projection_type='sparse',  # Explicit sparse
+            projection_type="sparse",  # Explicit sparse
             compile=False,
         )
 
-        assert opt.projection_type == 'sparse', (
-            f"Expected 'sparse' with explicit request, got '{opt.projection_type}'"
-        )
+        assert opt.projection_type == "sparse", f"Expected 'sparse' with explicit request, got '{opt.projection_type}'"
         assert isinstance(opt.state.projection, SparseRandomProjection)
 
     def test_explicit_dense_creates_dense(self):
@@ -465,12 +453,10 @@ class TestExplicitProjectionTypeOverride:
         opt = PolyStepOptimizer(
             large_model,
             subspace=subspace,
-            projection_type='dense',  # Explicit dense
+            projection_type="dense",  # Explicit dense
             compile=False,
         )
 
-        assert opt.projection_type == 'dense', (
-            f"Expected 'dense' with explicit request, got '{opt.projection_type}'"
-        )
+        assert opt.projection_type == "dense", f"Expected 'dense' with explicit request, got '{opt.projection_type}'"
         assert isinstance(opt.state.projection, torch.Tensor)
         assert not isinstance(opt.state.projection, SparseRandomProjection)

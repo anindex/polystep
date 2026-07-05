@@ -11,6 +11,7 @@ is an independent unit in the OT problem. The polytope operates in
 particle_dim space (e.g., 4 orthoplex vertices in 2D), giving a tractable
 OT problem of shape (num_particles, num_vertices).
 """
+
 from __future__ import annotations
 
 import collections
@@ -37,8 +38,8 @@ logger = logging.getLogger(__name__)
 _MIN_PARAMS_FOR_SPARSE = 10_000
 
 # Threshold for auto-selecting sparse vs dense (device-dependent)
-_AUTO_SPARSE_THRESHOLD_CPU = 1_000_000   # 1M params for CPU
-_AUTO_SPARSE_THRESHOLD_GPU = 2_000_000   # 2M params for GPU
+_AUTO_SPARSE_THRESHOLD_CPU = 1_000_000  # 1M params for CPU
+_AUTO_SPARSE_THRESHOLD_GPU = 2_000_000  # 2M params for GPU
 
 
 def _select_projection_type(
@@ -61,19 +62,20 @@ def _select_projection_type(
         'dense' or 'sparse' (resolved projection type).
     """
     # Explicit user choice
-    if projection_type in ('dense', 'sparse'):
+    if projection_type in ("dense", "sparse"):
         return projection_type
 
     # Auto-selection based on device and model size
-    if device.type == 'cuda':
+    if device.type == "cuda":
         threshold = _AUTO_SPARSE_THRESHOLD_GPU
     else:
         threshold = _AUTO_SPARSE_THRESHOLD_CPU
 
     if num_params >= threshold:
-        return 'sparse'
+        return "sparse"
     else:
-        return 'dense'
+        return "dense"
+
 
 from ._compiled import CompiledFunctions
 from .blockwise import (
@@ -119,6 +121,7 @@ class RankSchedule:
         schedule = RankSchedule(stages=[(0, 2), (100, 4), (300, 8)])
         # rank=2 for steps 0-99, rank=4 for 100-299, rank=8 for 300+
     """
+
     stages: List[Tuple[int, int]]  # (start_step, rank) pairs
 
     def __post_init__(self):
@@ -288,7 +291,7 @@ class PolyStepOptimizer:
         self,
         model: nn.Module,
         *,
-        polytope_type: str = 'orthoplex',
+        polytope_type: str = "orthoplex",
         particle_dim: int = 2,
         epsilon: Union[float, LinearEpsilon] = 0.1,
         ent_epsilon: Optional[Union[float, LinearEpsilon]] = None,
@@ -328,7 +331,7 @@ class PolyStepOptimizer:
         subspace_particle_dim: int = 8,
         absorb_every: int = 0,
         rank_schedule: Optional[RankSchedule] = None,
-        block_strategy: str = 'monolithic',
+        block_strategy: str = "monolithic",
         block_group_size: int = 2,
         use_momentum: bool = False,
         momentum_init: float = 0.5,
@@ -367,31 +370,27 @@ class PolyStepOptimizer:
         # Mixed precision
         mixed_precision: bool = False,
         # Projection type
-        projection_type: str = 'dense',
+        projection_type: str = "dense",
         # Compile vmap in NNCostEvaluator (torch.compile the vectorized forward)
         compile_evaluator: bool = False,
     ) -> None:
         # Projection type validation
-        if projection_type not in ('dense', 'sparse', 'auto'):
-            raise ValueError(
-                f"Invalid projection_type: {projection_type!r}. "
-                f"Use 'dense', 'sparse', or 'auto'."
-            )
+        if projection_type not in ("dense", "sparse", "auto"):
+            raise ValueError(f"Invalid projection_type: {projection_type!r}. Use 'dense', 'sparse', or 'auto'.")
         self._requested_projection_type = projection_type
         self._compile_evaluator = compile_evaluator
 
         # Particle dimension validation
         if particle_dim < 2:
             raise ValueError(
-                f"particle_dim must be >= 2, got {particle_dim}. "
-                f"The OT polytope requires at least 2 dimensions."
+                f"particle_dim must be >= 2, got {particle_dim}. The OT polytope requires at least 2 dimensions."
             )
-        if particle_dim > 4 and polytope_type == 'cube':
+        if particle_dim > 4 and polytope_type == "cube":
             warnings.warn(
                 f"particle_dim={particle_dim} with polytope_type='cube' produces "
                 f"2^{particle_dim}={2**particle_dim} vertices (exponential). "
-                f"Consider polytope_type='orthoplex' (2*{particle_dim}={2*particle_dim} vertices) "
-                f"or 'simplex' ({particle_dim+1} vertices) for better scaling.",
+                f"Consider polytope_type='orthoplex' (2*{particle_dim}={2 * particle_dim} vertices) "
+                f"or 'simplex' ({particle_dim + 1} vertices) for better scaling.",
                 stacklevel=2,
             )
         self._full_space_particle_dim = particle_dim
@@ -409,7 +408,7 @@ class PolyStepOptimizer:
         # When both subspace and block_strategy are specified, operate in combined mode:
         # global projection compresses full params to subspace coords, then per-block OT
         # decomposes the subspace coordinate optimization.
-        self._subspace_blockwise = (subspace is not None and block_strategy != 'monolithic')
+        self._subspace_blockwise = subspace is not None and block_strategy != "monolithic"
 
         # Mixed precision config
         self._mixed_precision = mixed_precision
@@ -424,6 +423,7 @@ class PolyStepOptimizer:
         # Auto-epsilon: ProgressiveEpsilon with solver feedback
         if auto_epsilon:
             from .epsilon import ProgressiveEpsilon
+
             if isinstance(epsilon, LinearEpsilon):
                 prog_init = epsilon.init
                 prog_target = epsilon.target
@@ -435,14 +435,14 @@ class PolyStepOptimizer:
                 prog_target = 0.01
             config = auto_epsilon_config or {}
             self._progressive_epsilon = ProgressiveEpsilon(
-                init=config.get('init', prog_init),
-                target=config.get('target', prog_target),
-                max_epsilon=config.get('max_epsilon', prog_init * 5.0),
-                increase_factor=config.get('increase_factor', 1.2),
-                decrease_factor=config.get('decrease_factor', 0.95),
-                fast_threshold=config.get('fast_threshold', 0.1),
-                slow_threshold=config.get('slow_threshold', 0.5),
-                ema_alpha=config.get('ema_alpha', 0.7),
+                init=config.get("init", prog_init),
+                target=config.get("target", prog_target),
+                max_epsilon=config.get("max_epsilon", prog_init * 5.0),
+                increase_factor=config.get("increase_factor", 1.2),
+                decrease_factor=config.get("decrease_factor", 0.95),
+                fast_threshold=config.get("fast_threshold", 0.1),
+                slow_threshold=config.get("slow_threshold", 0.5),
+                ema_alpha=config.get("ema_alpha", 0.7),
             )
         else:
             self._progressive_epsilon = None
@@ -490,16 +490,10 @@ class PolyStepOptimizer:
         # schedule -- the discrete spike landscape is too chaotic for a
         # shrinking step. Warn loudly when we detect that combination.
         # Heuristic only -- matches substring of module class names.
-        if hasattr(step_radius, 'at'):
-            module_classes = {
-                type(m).__name__ for m in model.modules()
-            }
-            snn_markers = ('lif', 'leaky', 'spik', 'spiking', 'alif')
-            if any(
-                marker in cls.lower()
-                for cls in module_classes
-                for marker in snn_markers
-            ):
+        if hasattr(step_radius, "at"):
+            module_classes = {type(m).__name__ for m in model.modules()}
+            snn_markers = ("lif", "leaky", "spik", "spiking", "alif")
+            if any(marker in cls.lower() for cls in module_classes for marker in snn_markers):
                 warnings.warn(
                     "Detected SNN-like module (LIF/Leaky/Spiking) with a "
                     "scheduled step_radius (CosineEpsilon or similar). "
@@ -544,11 +538,20 @@ class PolyStepOptimizer:
         # Validate: rank_schedule requires a subspace
         if rank_schedule is not None and subspace is None:
             raise ValueError("rank_schedule requires a subspace")
+        # rank_schedule transitions only run in the monolithic step; disable it
+        # elsewhere so it is a clear no-op instead of a silent one (or a crash).
+        if rank_schedule is not None and block_strategy != "monolithic":
+            warnings.warn(
+                f"rank_schedule is only applied with block_strategy='monolithic'; "
+                f"ignored for block_strategy='{block_strategy}'.",
+                stacklevel=2,
+            )
+            self._rank_schedule = None
         self.block_strategy = block_strategy
         self.block_group_size = block_group_size
 
         # Warn if quadratic model used with non-monolithic block strategy
-        if use_quadratic_model and block_strategy != 'monolithic':
+        if use_quadratic_model and block_strategy != "monolithic":
             warnings.warn(
                 f"use_quadratic_model=True is not supported with "
                 f"block_strategy='{block_strategy}'. Quadratic model will be "
@@ -581,8 +584,7 @@ class PolyStepOptimizer:
         # Validate: CMA features require CMAAdaptiveSubspace
         if (use_covariance_adaptation or use_csa) and not self._cma_subspace:
             warnings.warn(
-                "use_covariance_adaptation or use_csa requires CMAAdaptiveSubspace. "
-                "CMA features will be disabled."
+                "use_covariance_adaptation or use_csa requires CMAAdaptiveSubspace. CMA features will be disabled."
             )
             use_covariance_adaptation = False
             use_csa = False
@@ -590,14 +592,16 @@ class PolyStepOptimizer:
         # Validate: CSA replaces heuristic adaptive radius
         if use_csa and use_adaptive_radius:
             warnings.warn(
-                "Both use_csa and use_adaptive_radius enabled. CSA will be used, "
-                "heuristic radius adaptation disabled."
+                "Both use_csa and use_adaptive_radius enabled. CSA will be used, heuristic radius adaptation disabled."
             )
             use_adaptive_radius = False
             self.use_adaptive_radius = False
 
         self.use_covariance_adaptation = use_covariance_adaptation
         self.use_csa = use_csa
+        # Coord-to-param projection for the current step, covariance-scaled for
+        # CMA. Cached so a step's probes and its sync share one metric.
+        self._sampling_projection = None
 
         # Create layout from model
         # Thread particle_dim for full-space mode; subspace mode ignores this
@@ -608,8 +612,7 @@ class PolyStepOptimizer:
         try:
             model_device = next(model.parameters()).device
         except StopIteration:
-            raise ValueError("Model has no trainable parameters. "
-                             "PolyStepOptimizer requires at least one parameter.")
+            raise ValueError("Model has no trainable parameters. PolyStepOptimizer requires at least one parameter.")
 
         # Auto-selection of projection type based on model size
         num_params = sum(p.numel() for p in model.parameters())
@@ -618,20 +621,19 @@ class PolyStepOptimizer:
         )
 
         # Log auto-selection choice
-        if self._requested_projection_type == 'auto':
+        if self._requested_projection_type == "auto":
             logger.info(
                 f"Auto-selected {self._actual_projection_type} projection for "
                 f"{num_params / 1e6:.1f}M params on {model_device}"
             )
 
         # Fallback for tiny models: sparse has overhead that isn't worth it
-        if (self._actual_projection_type == 'sparse'
-                and num_params < _MIN_PARAMS_FOR_SPARSE):
+        if self._actual_projection_type == "sparse" and num_params < _MIN_PARAMS_FOR_SPARSE:
             logger.info(
                 f"Model has {num_params:,} params (<{_MIN_PARAMS_FOR_SPARSE:,}). "
                 f"Using dense projection instead of sparse."
             )
-            self._actual_projection_type = 'dense'
+            self._actual_projection_type = "dense"
 
         # Mixed precision: cast model to BF16 for memory savings
         if mixed_precision:
@@ -675,8 +677,10 @@ class PolyStepOptimizer:
             # Use model_dtype for mixed precision compatibility
             x_dtype = self._model_dtype if self._mixed_precision else self.layout.dominant_dtype
             X_init = torch.zeros(
-                num_sub_particles, pdim,
-                dtype=x_dtype, device=model_device,
+                num_sub_particles,
+                pdim,
+                dtype=x_dtype,
+                device=model_device,
             )
             particle_dim = pdim
         else:
@@ -691,22 +695,25 @@ class PolyStepOptimizer:
         # Polytope template in particle_dim space (NOT full parameter space).
         # This gives a small number of vertices (e.g., 4 for orthoplex in 2D).
         # Skip when using block-wise mode (per-block polytopes used instead).
-        if block_strategy == 'monolithic':
+        if block_strategy == "monolithic":
             self._polytope_vertices = POLYTOPE_MAP[polytope_type](
-                particle_dim, device=device, dtype=X_init.dtype, radius=1.0,
+                particle_dim,
+                device=device,
+                dtype=X_init.dtype,
+                radius=1.0,
             )
         else:
             self._polytope_vertices = None  # per-block polytopes used instead
 
         # Probe linspace (exclude endpoints)
-        self._probes = torch.linspace(0, 1, num_probe + 2)[1:num_probe + 1]
+        self._probes = torch.linspace(0, 1, num_probe + 2)[1 : num_probe + 1]
 
         if solver is None:
-            solver = 'softmax' if subspace is not None else 'sinkhorn'
+            solver = "softmax" if subspace is not None else "sinkhorn"
 
-        if solver == 'softmax':
+        if solver == "softmax":
             self.solver = SoftmaxSolver(compile=compile)
-        elif solver == 'sinkhorn':
+        elif solver == "sinkhorn":
             self.solver = SinkhornSolver(
                 max_iterations=sinkhorn_max_iters,
                 compile=compile,
@@ -714,13 +721,14 @@ class PolyStepOptimizer:
                 adaptive_omega=adaptive_omega,
                 data_dependent_init=data_dependent_init,
             )
-        elif solver == 'min_cost_greedy':
+        elif solver == "min_cost_greedy":
             self.solver = MinCostGreedySolver(compile=compile)
-        elif solver == 'top_k_mean':
+        elif solver == "top_k_mean":
             self.solver = TopKMeanSolver(compile=compile)
-        elif solver == 'tempered_softmax':
+        elif solver == "tempered_softmax":
             self.solver = TemperedSoftmaxSolver(
-                tau=tempered_softmax_tau, compile=compile,
+                tau=tempered_softmax_tau,
+                compile=compile,
             )
         else:
             raise ValueError(
@@ -728,7 +736,7 @@ class PolyStepOptimizer:
                 f"'min_cost_greedy', 'top_k_mean', 'tempered_softmax', or None."
             )
 
-        _non_iterative_solvers = ('softmax', 'min_cost_greedy', 'top_k_mean', 'tempered_softmax')
+        _non_iterative_solvers = ("softmax", "min_cost_greedy", "top_k_mean", "tempered_softmax")
         if self._progressive_epsilon is not None and solver in _non_iterative_solvers:
             raise ValueError(
                 "ProgressiveEpsilon requires Sinkhorn convergence feedback. "
@@ -741,9 +749,7 @@ class PolyStepOptimizer:
         self._use_fused_softmax = isinstance(self.solver, SoftmaxSolver)
 
         # Compiled functions
-        self._compiled = CompiledFunctions(
-            compile=compile and torch.cuda.is_available()
-        )
+        self._compiled = CompiledFunctions(compile=compile and torch.cuda.is_available())
 
         # Random generator (created early so AdaptiveSubspace init can use it)
         self._seed = seed
@@ -771,8 +777,13 @@ class PolyStepOptimizer:
 
         # Initialize block-wise decomposition (polytopes, duals)
         self._init_blocks(
-            subspace, subspace_particle_dim, block_strategy,
-            block_group_size, polytope_type, X_init, device,
+            subspace,
+            subspace_particle_dim,
+            block_strategy,
+            block_group_size,
+            polytope_type,
+            X_init,
+            device,
         )
 
     # ------------------------------------------------------------------
@@ -786,8 +797,9 @@ class PolyStepOptimizer:
 
         # AdaptiveSubspace: initialize projection and displacement history
         if self._adaptive:
-            if self._actual_projection_type == 'sparse':
+            if self._actual_projection_type == "sparse":
                 from .projection import SparseRandomProjection
+
                 self._state.projection = SparseRandomProjection(
                     full_dim=subspace.full_dim,
                     subspace_dim=subspace.subspace_dim,
@@ -809,9 +821,10 @@ class PolyStepOptimizer:
         # HybridSubspace: initialize per-layer projections and displacement history
         if self._hybrid:
             self._state.hybrid_projections = subspace.init_projections(
-                model_device, self._model_dtype,
+                model_device,
+                self._model_dtype,
             )
-            if hasattr(subspace, 'build_fused_projection'):
+            if hasattr(subspace, "build_fused_projection"):
                 subspace.build_fused_projection(self._state.hybrid_projections)
             self._state.displacement_history = torch.zeros(
                 subspace.displacement_history_size,
@@ -827,8 +840,9 @@ class PolyStepOptimizer:
             return
 
         # CMAAdaptiveSubspace wraps AdaptiveSubspace, so it also needs projection init
-        if self._actual_projection_type == 'sparse':
+        if self._actual_projection_type == "sparse":
             from .projection import SparseRandomProjection
+
             self._state.projection = SparseRandomProjection(
                 full_dim=subspace.full_dim,
                 subspace_dim=subspace.subspace_dim,
@@ -852,27 +866,33 @@ class PolyStepOptimizer:
                 device=model_device,
                 dtype=self._model_dtype,
             )
-            self._state.p_c = cma_state['p_c']
-            self._state.p_sigma = cma_state['p_sigma']
-            self._state.C_diag = cma_state['C_diag']
+            self._state.p_c = cma_state["p_c"]
+            self._state.p_sigma = cma_state["p_sigma"]
+            self._state.C_diag = cma_state["C_diag"]
             self._state.sigma = 1.0
             self._state.generation = 0
             self._state.use_csa = self.use_csa
             self._cma_params = {
-                'c_c': subspace.c_c,
-                'c_sigma': subspace.c_sigma,
-                'c_1': subspace.c_1,
-                'c_mu': subspace.c_mu,
-                'd_sigma': subspace.d_sigma,
-                'expected_norm': subspace.expected_norm,
-                'mu_eff': subspace.mu_eff,
-                'cov_min': subspace.cov_min,
-                'cov_max': subspace.cov_max,
+                "c_c": subspace.c_c,
+                "c_sigma": subspace.c_sigma,
+                "c_1": subspace.c_1,
+                "c_mu": subspace.c_mu,
+                "d_sigma": subspace.d_sigma,
+                "expected_norm": subspace.expected_norm,
+                "mu_eff": subspace.mu_eff,
+                "cov_min": subspace.cov_min,
+                "cov_max": subspace.cov_max,
             }
 
     def _init_blocks(
-        self, subspace, subspace_particle_dim, block_strategy,
-        block_group_size, polytope_type, X_init, device,
+        self,
+        subspace,
+        subspace_particle_dim,
+        block_strategy,
+        block_group_size,
+        polytope_type,
+        X_init,
+        device,
     ) -> None:
         """Initialize block-wise decomposition: blocks, polytopes, duals."""
         self._blocks: Optional[List[BlockConfig]] = None
@@ -895,18 +915,22 @@ class PolyStepOptimizer:
             for block in self._subspace_blocks:
                 self._subspace_block_polytopes.append(
                     POLYTOPE_MAP[polytope_type](
-                        block.particle_dim, device=device, dtype=X_init.dtype, radius=1.0,
+                        block.particle_dim,
+                        device=device,
+                        dtype=X_init.dtype,
+                        radius=1.0,
                     )
                 )
 
             self._state.block_duals = [(None, None) for _ in self._subspace_blocks]
 
-        elif block_strategy != 'monolithic':
-            if block_strategy == 'per_layer':
+        elif block_strategy != "monolithic":
+            if block_strategy == "per_layer":
                 self._blocks = create_per_layer_blocks(
-                    self.layout, particle_dim=self.layout.particle_dim,
+                    self.layout,
+                    particle_dim=self.layout.particle_dim,
                 )
-            elif block_strategy == 'grouped':
+            elif block_strategy == "grouped":
                 self._blocks = create_grouped_blocks(
                     self.layout,
                     group_size=block_group_size,
@@ -914,18 +938,19 @@ class PolyStepOptimizer:
                 )
             else:
                 raise ValueError(
-                    f"Unknown block_strategy: {block_strategy!r}. "
-                    f"Use 'monolithic', 'per_layer', or 'grouped'."
+                    f"Unknown block_strategy: {block_strategy!r}. Use 'monolithic', 'per_layer', or 'grouped'."
                 )
             self._block_polytopes = []
             for block in self._blocks:
                 self._block_polytopes.append(
                     POLYTOPE_MAP[polytope_type](
-                        block.particle_dim, device=device, dtype=X_init.dtype, radius=1.0,
+                        block.particle_dim,
+                        device=device,
+                        dtype=X_init.dtype,
+                        radius=1.0,
                     )
                 )
             self._state.block_duals = [(None, None) for _ in self._blocks]
-
 
     # ------------------------------------------------------------------
     # Properties
@@ -963,19 +988,19 @@ class PolyStepOptimizer:
         """Resolve epsilon at current iteration."""
         if self._progressive_epsilon is not None:
             return self._progressive_epsilon.at(iteration)
-        if hasattr(self.epsilon, 'at'):
+        if hasattr(self.epsilon, "at"):
             return self.epsilon.at(iteration)
         return self.epsilon
 
     def _get_step_radius(self, iteration: int) -> float:
         """Resolve step_radius at current iteration (supports schedule objects)."""
-        if hasattr(self.step_radius, 'at'):
+        if hasattr(self.step_radius, "at"):
             return self.step_radius.at(iteration)
         return self.step_radius
 
     def _get_probe_radius(self, iteration: int) -> float:
         """Resolve probe_radius at current iteration (supports schedule objects)."""
-        if hasattr(self.probe_radius, 'at'):
+        if hasattr(self.probe_radius, "at"):
             return self.probe_radius.at(iteration)
         return self.probe_radius
 
@@ -991,11 +1016,7 @@ class PolyStepOptimizer:
             return probe_r
         if self._generator is not None:
             device = self._generator.device
-            eta = (
-                torch.empty((1,), device=device)
-                .uniform_(-eta_max, eta_max, generator=self._generator)
-                .item()
-            )
+            eta = torch.empty((1,), device=device).uniform_(-eta_max, eta_max, generator=self._generator).item()
         else:
             eta = float(torch.empty((1,)).uniform_(-eta_max, eta_max).item())
         return float(probe_r) * (1.0 + eta)
@@ -1004,7 +1025,7 @@ class PolyStepOptimizer:
         """Resolve ent_epsilon at current iteration."""
         if self.ent_epsilon is None:
             return None
-        if hasattr(self.ent_epsilon, 'at'):
+        if hasattr(self.ent_epsilon, "at"):
             return self.ent_epsilon.at(iteration)
         return self.ent_epsilon
 
@@ -1018,12 +1039,12 @@ class PolyStepOptimizer:
             device = next(self.model.parameters()).device
         except StopIteration:
             return False
-        if device.type == 'cuda':
+        if device.type == "cuda":
             if torch.cuda.is_available():
                 cap = torch.cuda.get_device_capability(device)
                 return cap[0] >= 7  # Volta (7.0) and newer
             return False
-        elif device.type == 'cpu':
+        elif device.type == "cpu":
             return True  # CPU BF16 works, may be slower without AMX
         else:
             return True  # MPS, XLA, etc. - let PyTorch error if unsupported
@@ -1120,9 +1141,11 @@ class PolyStepOptimizer:
             Scalar OT entropic regularized cost (float).
         """
         # Amortized OT: cheap momentum steps between full OT solves
-        if (self.amortize_steps > 1
-                and self._amortize_counter % self.amortize_steps != 0
-                and self._transport_direction_ema is not None):
+        if (
+            self.amortize_steps > 1
+            and self._amortize_counter % self.amortize_steps != 0
+            and self._transport_direction_ema is not None
+        ):
             result = self._step_momentum(closure)
             self._amortize_counter += 1
             return result
@@ -1200,35 +1223,39 @@ class PolyStepOptimizer:
         # 1. Absorb current perturbation into base weights
         old_subspace = self.subspace
         if isinstance(old_subspace, HybridSubspace):
-            flat_sub = state.X.reshape(-1)[:old_subspace.subspace_dim]
+            flat_sub = state.X.reshape(-1)[: old_subspace.subspace_dim]
             new_base, _ = old_subspace.absorb(
-                state.hybrid_projections, state.base_params, flat_sub,
+                state.hybrid_projections,
+                state.base_params,
+                flat_sub,
             )
             state.base_params = new_base
         elif isinstance(old_subspace, LinearSubspace):
-            flat_sub = state.X.reshape(-1)[:old_subspace.subspace_dim]
+            flat_sub = state.X.reshape(-1)[: old_subspace.subspace_dim]
             new_base, _ = old_subspace.absorb(state.base_params, flat_sub)
             state.base_params = new_base
         else:
             # Other subspace types: skip transition
             import warnings
-            warnings.warn(
-                f"Rank transition not supported for "
-                f"{type(old_subspace).__name__}, skipping"
-            )
+
+            warnings.warn(f"Rank transition not supported for {type(old_subspace).__name__}, skipping")
             return
 
         # 2. Reconstruct subspace at new rank
         if isinstance(old_subspace, HybridSubspace):
             self.subspace = HybridSubspace.from_layout(
-                self.layout, rank=new_rank, seed=old_subspace.seed,
+                self.layout,
+                rank=new_rank,
+                seed=old_subspace.seed,
                 rotation_mode=old_subspace.rotation_mode,
-                max_subspace_dim=getattr(old_subspace, '_max_subspace_dim', None),
+                max_subspace_dim=getattr(old_subspace, "_max_subspace_dim", None),
             )
         elif isinstance(old_subspace, LinearSubspace):
             self.subspace = LinearSubspace.from_layout(
-                self.layout, rank=new_rank, seed=old_subspace.seed,
-                max_subspace_dim=getattr(old_subspace, '_max_subspace_dim', None),
+                self.layout,
+                rank=new_rank,
+                seed=old_subspace.seed,
+                max_subspace_dim=getattr(old_subspace, "_max_subspace_dim", None),
             )
 
         # Update state reference
@@ -1239,8 +1266,10 @@ class PolyStepOptimizer:
         pdim = self._subspace_particle_dim
         padded_sub_dim = ((sub_dim + pdim - 1) // pdim) * pdim
         new_X = torch.zeros(
-            padded_sub_dim // pdim, pdim,
-            dtype=state.X.dtype, device=state.X.device,
+            padded_sub_dim // pdim,
+            pdim,
+            dtype=state.X.dtype,
+            device=state.X.device,
         )
         state.X = new_X
 
@@ -1260,15 +1289,15 @@ class PolyStepOptimizer:
             state.displacement_history_count = 0
             # Regenerate per-layer projections for new subspace
             state.hybrid_projections = self.subspace.init_projections(
-                state.X.device, state.X.dtype,
+                state.X.device,
+                state.X.dtype,
             )
             # Update hybrid subspace reference
             self._hybrid_subspace = self.subspace
 
         # Update uniform distribution to match new particle count
         num_points = state.X.shape[0]
-        state.a = torch.ones(num_points, device=state.X.device,
-                             dtype=state.X.dtype) / num_points
+        state.a = torch.ones(num_points, device=state.X.device, dtype=state.X.dtype) / num_points
 
         # Clear stale adaptive probe state (shape changed with new rank)
         self._invalidate_reuse_cache()
@@ -1277,14 +1306,30 @@ class PolyStepOptimizer:
         self._newton_direction = None
 
         logger.info(
-            f"Rank transition: rank={new_rank}, "
-            f"subspace_dim={self.subspace.subspace_dim}, "
-            f"particles={num_points}"
+            f"Rank transition: rank={new_rank}, subspace_dim={self.subspace.subspace_dim}, particles={num_points}"
         )
 
     # ------------------------------------------------------------------
     # Model synchronization
     # ------------------------------------------------------------------
+
+    def _update_sampling_projection(self) -> None:
+        """Cache the coord-to-param projection for this step.
+
+        Scaled by sqrt(C_diag) when CMA covariance adaptation is on, else the
+        plain projection. Cached at step start so a step's probes and its
+        end-of-step sync share one metric (C_diag only changes at step end).
+        """
+        state = self._state
+        proj = state.projection
+        if (
+            self._cma_subspace
+            and self.use_covariance_adaptation
+            and isinstance(proj, torch.Tensor)
+            and state.C_diag is not None
+        ):
+            proj = self.subspace.apply_covariance_scaling(proj, state.C_diag)
+        self._sampling_projection = proj
 
     def _sync_model(self) -> None:
         """Write current particles back to the model via load_state_dict."""
@@ -1294,20 +1339,28 @@ class PolyStepOptimizer:
             # Subspace: flatten multi-particle X back to subspace coords,
             # then reconstruct full params from base + perturbation.
             X = state.X  # (num_sub_particles, particle_dim)
-            flat_sub = X.reshape(-1)[:state.subspace.subspace_dim]
+            flat_sub = X.reshape(-1)[: state.subspace.subspace_dim]
             if self._hybrid:
                 # HybridSubspace requires hybrid_projections dict
                 full_sd = state.subspace.apply_perturbation(
-                    state.hybrid_projections, state.base_params, flat_sub,
+                    state.hybrid_projections,
+                    state.base_params,
+                    flat_sub,
                 )
             elif self._adaptive or self._cma_subspace:
-                # AdaptiveSubspace and CMAAdaptiveSubspace require projection argument
+                # AdaptiveSubspace and CMAAdaptiveSubspace require projection argument.
+                # Use the step's cached (possibly covariance-scaled) projection so
+                # the sync matches the metric the probes were evaluated in.
+                proj = self._sampling_projection if self._sampling_projection is not None else state.projection
                 full_sd = state.subspace.apply_perturbation(
-                    state.projection, state.base_params, flat_sub,
+                    proj,
+                    state.base_params,
+                    flat_sub,
                 )
             else:
                 full_sd = state.subspace.apply_perturbation(
-                    state.base_params, flat_sub,
+                    state.base_params,
+                    flat_sub,
                 )
             self.model.load_state_dict(full_sd, strict=False)
         else:

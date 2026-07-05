@@ -16,6 +16,7 @@ Covers:
 - Anderson history is per-call (implicit restart on epsilon change)
 - Anderson depth clamp: lstsq is well-defined for ``k in {1..5}``
 """
+
 from __future__ import annotations
 
 import warnings
@@ -36,10 +37,13 @@ def _gaussian_cost(P, V, dtype=torch.float32, seed=0, scale=1.0):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype,scale", [
-    (torch.float32, 50.0),     # FP32 with C entries up to 50/eps=500
-    (torch.bfloat16, 20.0),    # BF16 with C entries up to 20/eps=200
-])
+@pytest.mark.parametrize(
+    "dtype,scale",
+    [
+        (torch.float32, 50.0),  # FP32 with C entries up to 50/eps=500
+        (torch.bfloat16, 20.0),  # BF16 with C entries up to 20/eps=200
+    ],
+)
 def test_sinkhorn_lse_safety(dtype, scale):
     """logsumexp must not overflow even when -C/eps is large.
 
@@ -88,16 +92,39 @@ def test_sinkhorn_warm_start_rescale_on_eps_change():
     # Warm solve at eps_new with init_eps=eps_old: solver rescales internally.
     solver_warm = SinkhornSolver(epsilon=eps_new, max_iterations=500, threshold=1e-4)
     res_warm = solver_warm.solve(
-        C, init_f=res_old.f, init_g=res_old.g, init_eps=eps_old,
+        C,
+        init_f=res_old.f,
+        init_g=res_old.g,
+        init_eps=eps_old,
     )
     assert res_warm.converged
 
     # Warm-start with rescale should be at most 3x cold-start iters
     # (typically << 1x; 3x is a generous upper bound for noise).
     assert res_warm.n_iters <= 3 * res_cold.n_iters, (
-        f"warm-start with rescale used {res_warm.n_iters} iters vs cold "
-        f"{res_cold.n_iters}; rescale may not be active."
+        f"warm-start with rescale used {res_warm.n_iters} iters vs cold {res_cold.n_iters}; rescale may not be active."
     )
+
+
+def test_warmstart_rescale_stays_finite_on_large_eps_ratio():
+    """Warm-start duals are clamped after the eps/init_eps rescale, so a large
+    ratio cannot blow the plan to Inf/NaN when max_iterations < check_every."""
+    C = torch.zeros(2, 2)
+    solver = SinkhornSolver(
+        epsilon=1.0,
+        max_iterations=1,
+        threshold=1e-9,
+        check_every=10,
+        omega=1.95,
+    )
+    for init_eps in (1e-9, 1e-40):
+        res = solver.solve(
+            C,
+            init_f=torch.tensor([1.0, -1.0]),
+            init_g=torch.tensor([1.0, -1.0]),
+            init_eps=init_eps,
+        )
+        assert torch.isfinite(res.matrix).all()
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +144,10 @@ def test_sinkhorn_marginals_satisfied_at_convergence():
     for seed in range(n_problems):
         C = _gaussian_cost(P, V, seed=seed, scale=1.0)
         solver = SinkhornSolver(
-            epsilon=eps, max_iterations=2000, threshold=tol, check_every=10,
+            epsilon=eps,
+            max_iterations=2000,
+            threshold=tol,
+            check_every=10,
         )
         result = solver.solve(C)
         if not result.converged:
@@ -132,13 +162,9 @@ def test_sinkhorn_marginals_satisfied_at_convergence():
         err_a = (T.sum(dim=1) - a).abs().max().item()
         err_b = (T.sum(dim=0) - b).abs().max().item()
         if err_a > tol * 2 or err_b > tol * 2:
-            failures.append(
-                f"seed={seed}: err_a={err_a:.2e}, err_b={err_b:.2e}"
-            )
+            failures.append(f"seed={seed}: err_a={err_a:.2e}, err_b={err_b:.2e}")
 
-    assert converged_count > 0.9 * n_problems, (
-        f"only {converged_count}/{n_problems} problems converged"
-    )
+    assert converged_count > 0.9 * n_problems, f"only {converged_count}/{n_problems} problems converged"
     assert not failures, (
         f"marginal constraints violated on {len(failures)}/{converged_count} "
         f"converged problems:\n" + "\n".join(failures[:5])
@@ -154,22 +180,20 @@ def test_sinkhorn_ties_yield_symmetric_transport():
     """Equal cost rows must produce equal transport rows (broken by
     symmetry, not numerical noise)."""
     # 4x4 cost where rows 0 and 1 are identical, and rows 2 and 3 are identical.
-    C = torch.tensor([
-        [1.0, 2.0, 3.0, 4.0],
-        [1.0, 2.0, 3.0, 4.0],
-        [4.0, 3.0, 2.0, 1.0],
-        [4.0, 3.0, 2.0, 1.0],
-    ])
+    C = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [1.0, 2.0, 3.0, 4.0],
+            [4.0, 3.0, 2.0, 1.0],
+            [4.0, 3.0, 2.0, 1.0],
+        ]
+    )
     solver = SinkhornSolver(epsilon=0.5, max_iterations=500, threshold=1e-6)
     result = solver.solve(C)
 
     T = result.matrix
-    assert torch.allclose(T[0], T[1], atol=1e-5), (
-        f"rows 0 and 1 should be equal; got diff {(T[0]-T[1]).abs().max()}"
-    )
-    assert torch.allclose(T[2], T[3], atol=1e-5), (
-        f"rows 2 and 3 should be equal; got diff {(T[2]-T[3]).abs().max()}"
-    )
+    assert torch.allclose(T[0], T[1], atol=1e-5), f"rows 0 and 1 should be equal; got diff {(T[0] - T[1]).abs().max()}"
+    assert torch.allclose(T[2], T[3], atol=1e-5), f"rows 2 and 3 should be equal; got diff {(T[2] - T[3]).abs().max()}"
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +212,7 @@ def test_sinkhorn_omega_default_is_safe():
         warnings.simplefilter("always")
         solver.solve(C)
     msgs = [str(w.message).lower() for w in caught]
-    assert not any("diverg" in m for m in msgs), (
-        f"divergence detector fired on benign input: {msgs}"
-    )
+    assert not any("diverg" in m for m in msgs), f"divergence detector fired on benign input: {msgs}"
 
 
 def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
@@ -203,7 +225,10 @@ def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
     C = _gaussian_cost(P, V, scale=200.0)
     eps = 0.05
     solver = SinkhornSolver(
-        epsilon=eps, omega=1.95, max_iterations=200, threshold=1e-4,
+        epsilon=eps,
+        omega=1.95,
+        max_iterations=200,
+        threshold=1e-4,
         check_every=5,
     )
     with warnings.catch_warnings(record=True) as caught:
@@ -211,10 +236,7 @@ def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
         solver.solve(C)
     msgs = [str(w.message).lower() for w in caught]
     diverg = [m for m in msgs if "diverg" in m and "omega" in m]
-    assert diverg, (
-        f"expected divergence-detector warning on ill-conditioned cost with "
-        f"omega=1.95; got warnings: {msgs}"
-    )
+    assert diverg, f"expected divergence-detector warning on ill-conditioned cost with omega=1.95; got warnings: {msgs}"
 
 
 # ---------------------------------------------------------------------------
@@ -230,15 +252,16 @@ def test_sinkhorn_omega_sweep(omega):
     P, V = 32, 64
     C = _gaussian_cost(P, V, scale=100.0)
     solver = SinkhornSolver(
-        epsilon=0.1, omega=omega, max_iterations=500, threshold=1e-4,
+        epsilon=0.1,
+        omega=omega,
+        max_iterations=500,
+        threshold=1e-4,
         check_every=10,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = solver.solve(C)
-    assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all(), (
-        f"omega={omega} produced non-finite duals"
-    )
+    assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all(), f"omega={omega} produced non-finite duals"
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +287,7 @@ def test_sinkhorn_warm_start_centered_under_cost_shift():
     result2 = solver.solve(shifted_C, init_f=f0, init_g=g0)
     cost_scale = shifted_C.abs().max().item()
     assert result2.f.abs().max().item() < 100.0 * cost_scale, (
-        f"|f|.max blew up under cost shift: "
-        f"{result2.f.abs().max().item():.3e} vs cost_scale={cost_scale:.3e}"
+        f"|f|.max blew up under cost shift: {result2.f.abs().max().item():.3e} vs cost_scale={cost_scale:.3e}"
     )
 
 
@@ -289,12 +311,18 @@ def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
     C = _gaussian_cost(P, V, scale=10.0)
     eps = 0.1
     plain = SinkhornSolver(
-        epsilon=eps, max_iterations=3000, threshold=1e-4,
-        anderson_depth=0, check_every=10,
+        epsilon=eps,
+        max_iterations=3000,
+        threshold=1e-4,
+        anderson_depth=0,
+        check_every=10,
     )
     accel = SinkhornSolver(
-        epsilon=eps, max_iterations=3000, threshold=1e-4,
-        anderson_depth=5, check_every=10,
+        epsilon=eps,
+        max_iterations=3000,
+        threshold=1e-4,
+        anderson_depth=5,
+        check_every=10,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -311,7 +339,7 @@ def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
     rel_gap = abs(lyap_plain - lyap_accel) / max(abs(lyap_plain), 1e-9)
     assert rel_gap < 0.05, (
         f"Anderson Lyapunov {lyap_accel:.6e} differs from plain "
-        f"{lyap_plain:.6e} by {rel_gap*100:.2f}% (regression-check guard "
+        f"{lyap_plain:.6e} by {rel_gap * 100:.2f}% (regression-check guard "
         f"may be missing)"
     )
 
@@ -328,8 +356,11 @@ def test_sinkhorn_anderson_history_resets_per_call():
     P, V = 16, 32
     C = _gaussian_cost(P, V, scale=2.0)
     solver = SinkhornSolver(
-        epsilon=1.0, max_iterations=500, threshold=1e-5,
-        anderson_depth=5, check_every=5,
+        epsilon=1.0,
+        max_iterations=500,
+        threshold=1e-5,
+        anderson_depth=5,
+        check_every=5,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -351,8 +382,11 @@ def test_sinkhorn_anderson_depth_well_defined(depth):
     P, V = 16, 32
     C = _gaussian_cost(P, V, scale=2.0)
     solver = SinkhornSolver(
-        epsilon=0.5, max_iterations=300, threshold=1e-5,
-        anderson_depth=depth, check_every=5,
+        epsilon=0.5,
+        max_iterations=300,
+        threshold=1e-5,
+        anderson_depth=depth,
+        check_every=5,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

@@ -12,6 +12,7 @@ Pluggable solver implementations for the polytope step optimizer:
 - ``TemperedSoftmaxSolver``: softmax with a fixed temperature.
 - ``MinCostGreedySolver`` / ``TopKMeanSolver``: simple non-OT baselines.
 """
+
 from .base import Solver, SolverResult
 from .greedy import MinCostGreedySolver, TopKMeanSolver
 from .kl_softmax import KLSoftmaxSolver

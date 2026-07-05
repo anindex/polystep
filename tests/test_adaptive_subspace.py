@@ -1,4 +1,5 @@
 """Tests for AdaptiveSubspace: rotating projection, displacement-biased rotation, and factory methods."""
+
 import pytest
 import torch
 import torch.nn as nn
@@ -67,6 +68,25 @@ class TestInitProjection:
 
         assert torch.allclose(P1, P2, atol=1e-6), "Same seed should produce same P"
 
+    def test_spawn_cpu_generator_passthrough_and_none(self):
+        """CPU generators pass through unchanged; None stays None."""
+        from polystep.adaptive_subspace import _spawn_cpu_generator
+
+        assert _spawn_cpu_generator(None) is None
+        g = torch.Generator().manual_seed(7)
+        assert _spawn_cpu_generator(g) is g
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_cuda_generator_does_not_freeze_basis(self, adaptive_sub):
+        """A seeded CUDA generator must advance across successive basis draws,
+        not regenerate a byte-identical projection (the initial_seed() freeze)."""
+        gen = torch.Generator(device="cuda").manual_seed(123)
+        dev = torch.device("cuda")
+        P1 = adaptive_sub.init_projection(generator=gen, device=dev)
+        P2 = adaptive_sub.init_projection(generator=gen, device=dev)
+        assert not torch.allclose(P1, P2), "seeded CUDA basis is frozen"
+
 
 # ---------------------------------------------------------------------------
 # Rotation
@@ -83,8 +103,7 @@ class TestRotateRandom:
             _entry_specs=adaptive_sub._entry_specs,
         )
         P_old = sub.init_projection(generator=torch.Generator().manual_seed(0))
-        P_new = sub.rotate(P_old, step=5, total_steps=100,
-                           generator=torch.Generator().manual_seed(99))
+        P_new = sub.rotate(P_old, step=5, total_steps=100, generator=torch.Generator().manual_seed(99))
 
         # Orthogonality
         PtP = P_new.T @ P_new
@@ -104,15 +123,27 @@ class TestRotateDisplacement:
         torch.manual_seed(77)
         disp_history = torch.randn(3, adaptive_sub.subspace_dim) * 0.1
 
-        P_new = adaptive_sub.rotate(P, step=5, total_steps=100,
-                                    displacement_history=disp_history,
-                                    generator=torch.Generator().manual_seed(42))
+        P_new = adaptive_sub.rotate(
+            P, step=5, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(42)
+        )
 
         PtP = P_new.T @ P_new
         eye = torch.eye(adaptive_sub.subspace_dim)
-        assert torch.allclose(PtP, eye, atol=1e-4), (
-            f"Orthogonality error: {(PtP - eye).abs().max().item()}"
+        assert torch.allclose(PtP, eye, atol=1e-4), f"Orthogonality error: {(PtP - eye).abs().max().item()}"
+
+    def test_rotate_displacement_bf16_does_not_crash(self, adaptive_sub):
+        """Rotation upcasts for SVD/QR so bf16 mixed precision does not crash."""
+        sub = AdaptiveSubspace(
+            full_dim=adaptive_sub.full_dim,
+            subspace_dim=adaptive_sub.subspace_dim,
+            rotation_mode="displacement",
+            _entry_specs=adaptive_sub._entry_specs,
         )
+        P = sub.init_projection(dtype=torch.bfloat16)
+        disp = (torch.randn(3, sub.subspace_dim) * 0.1).to(torch.bfloat16)
+        P_new = sub.rotate(P, step=5, total_steps=100, displacement_history=disp)
+        assert P_new.dtype == torch.bfloat16
+        assert P_new.shape == (sub.full_dim, sub.subspace_dim)
 
     def test_rotate_displacement_zero_history_falls_back_to_random(self, adaptive_sub):
         """Zero displacement history falls back to random (still orthogonal)."""
@@ -120,9 +151,9 @@ class TestRotateDisplacement:
 
         disp_history = torch.zeros(3, adaptive_sub.subspace_dim)
 
-        P_new = adaptive_sub.rotate(P, step=5, total_steps=100,
-                                    displacement_history=disp_history,
-                                    generator=torch.Generator().manual_seed(42))
+        P_new = adaptive_sub.rotate(
+            P, step=5, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(42)
+        )
 
         # Should still be orthogonal
         PtP = P_new.T @ P_new
@@ -137,13 +168,17 @@ class TestRotateDisplacement:
             generator=torch.Generator().manual_seed(0),
         )
         P_new = adaptive_sub.rotate(
-            P, step=0, total_steps=100,
+            P,
+            step=0,
+            total_steps=100,
             displacement_history=None,
             generator=torch.Generator().manual_seed(456),
         )
         gram = P_new.T @ P_new
         assert torch.allclose(
-            gram, torch.eye(adaptive_sub.subspace_dim), atol=1e-5,
+            gram,
+            torch.eye(adaptive_sub.subspace_dim),
+            atol=1e-5,
         )
 
     def test_rotate_displacement_single_entry_history(self, adaptive_sub):
@@ -153,9 +188,9 @@ class TestRotateDisplacement:
         torch.manual_seed(55)
         disp_history = torch.randn(1, adaptive_sub.subspace_dim)
 
-        P_new = adaptive_sub.rotate(P, step=5, total_steps=100,
-                                    displacement_history=disp_history,
-                                    generator=torch.Generator().manual_seed(42))
+        P_new = adaptive_sub.rotate(
+            P, step=5, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(42)
+        )
 
         PtP = P_new.T @ P_new
         eye = torch.eye(adaptive_sub.subspace_dim)
@@ -166,13 +201,11 @@ class TestRotateDisplacement:
         P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
 
         torch.manual_seed(66)
-        disp_history = torch.randn(
-            adaptive_sub.displacement_history_size, adaptive_sub.subspace_dim
-        )
+        disp_history = torch.randn(adaptive_sub.displacement_history_size, adaptive_sub.subspace_dim)
 
-        P_new = adaptive_sub.rotate(P, step=5, total_steps=100,
-                                    displacement_history=disp_history,
-                                    generator=torch.Generator().manual_seed(42))
+        P_new = adaptive_sub.rotate(
+            P, step=5, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(42)
+        )
 
         PtP = P_new.T @ P_new
         eye = torch.eye(adaptive_sub.subspace_dim)
@@ -207,9 +240,9 @@ class TestRotateDisplacement:
         dominant_full = P @ dominant_dir
         dominant_full = dominant_full / dominant_full.norm()
 
-        P_new = sub.rotate(P, step=50, total_steps=100,
-                           displacement_history=disp_history,
-                           generator=torch.Generator().manual_seed(99))
+        P_new = sub.rotate(
+            P, step=50, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(99)
+        )
 
         # The new P should have at least one column correlated with the
         # projected dominant direction. Check max absolute dot product.
@@ -232,26 +265,22 @@ class TestRotateDisplacement:
 class TestSvdRatioSchedule:
     def test_svd_ratio_at_start(self):
         """SVD ratio at step=0 equals svd_ratio_init."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10,
-                               svd_ratio_init=0.0, svd_ratio_final=0.5)
+        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
         assert sub.get_svd_ratio(0, 100) == pytest.approx(0.0)
 
     def test_svd_ratio_at_midpoint(self):
         """SVD ratio at step=total/2 equals midpoint."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10,
-                               svd_ratio_init=0.0, svd_ratio_final=0.5)
+        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
         assert sub.get_svd_ratio(50, 100) == pytest.approx(0.25)
 
     def test_svd_ratio_at_end(self):
         """SVD ratio at step=total equals svd_ratio_final."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10,
-                               svd_ratio_init=0.0, svd_ratio_final=0.5)
+        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
         assert sub.get_svd_ratio(100, 100) == pytest.approx(0.5)
 
     def test_svd_ratio_clamps_beyond_total(self):
         """SVD ratio beyond total_steps is clamped to svd_ratio_final."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10,
-                               svd_ratio_init=0.0, svd_ratio_final=0.5)
+        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
         assert sub.get_svd_ratio(200, 100) == pytest.approx(0.5)
 
 
@@ -273,7 +302,7 @@ class TestApplyPerturbation:
         delta_flat = P @ flat_sub
         manual_result = {}
         for spec in adaptive_sub._entry_specs:
-            chunk = delta_flat[spec.flat_start:spec.flat_end]
+            chunk = delta_flat[spec.flat_start : spec.flat_end]
             manual_result[spec.entry_key] = base_sd[spec.entry_key] + chunk.reshape(spec.original_shape)
 
         # Method computation
@@ -317,9 +346,9 @@ class TestReconstructBatch:
         for i in range(N):
             single_result = adaptive_sub.apply_perturbation(P, base_sd, batch[i])
             for key in single_result:
-                assert torch.allclose(
-                    batch_result[key][i], single_result[key], atol=1e-5
-                ), f"Row {i}, key {key}: batch vs single mismatch"
+                assert torch.allclose(batch_result[key][i], single_result[key], atol=1e-5), (
+                    f"Row {i}, key {key}: batch vs single mismatch"
+                )
 
     def test_reconstruct_batch_shapes(self, model, adaptive_sub):
         """reconstruct_batch produces (N, *shape) tensors."""
@@ -371,16 +400,14 @@ class TestAbsorb:
 class TestShouldAbsorb:
     def test_should_absorb_stagnation(self):
         """stagnation_count >= absorb_patience returns True."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10,
-                               absorb_mode="stagnation", absorb_patience=20)
+        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, absorb_mode="stagnation", absorb_patience=20)
         assert not sub.should_absorb(stagnation_count=19, iteration=50)
         assert sub.should_absorb(stagnation_count=20, iteration=50)
         assert sub.should_absorb(stagnation_count=25, iteration=50)
 
     def test_should_absorb_periodic(self):
         """iteration % absorb_interval == 0 returns True (for iteration > 0)."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10,
-                               absorb_mode="periodic", absorb_interval=10)
+        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, absorb_mode="periodic", absorb_interval=10)
         assert not sub.should_absorb(stagnation_count=0, iteration=0)
         assert not sub.should_absorb(stagnation_count=0, iteration=5)
         assert sub.should_absorb(stagnation_count=0, iteration=10)
@@ -389,8 +416,7 @@ class TestShouldAbsorb:
 
     def test_should_absorb_periodic_disabled(self):
         """absorb_interval=0 with periodic mode never triggers."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10,
-                               absorb_mode="periodic", absorb_interval=0)
+        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, absorb_mode="periodic", absorb_interval=0)
         assert not sub.should_absorb(stagnation_count=100, iteration=100)
 
 
@@ -424,9 +450,7 @@ class TestFactoryMethods:
 
     def test_entry_specs_cover_all_params(self, adaptive_sub):
         """Sum of (flat_end - flat_start) for all entry_specs equals full_dim."""
-        total_covered = sum(
-            spec.flat_end - spec.flat_start for spec in adaptive_sub._entry_specs
-        )
+        total_covered = sum(spec.flat_end - spec.flat_start for spec in adaptive_sub._entry_specs)
         assert total_covered == adaptive_sub.full_dim
 
     def test_entry_specs_contiguous(self, adaptive_sub):
@@ -488,8 +512,7 @@ class TestDisplacementProductivity:
                 # Generate candidate perturbations in subspace
                 gen_step = torch.Generator().manual_seed(seed + step * 1000)
                 num_candidates = 50
-                candidates = torch.randn(num_candidates, subspace_dim,
-                                         generator=gen_step) * 0.5
+                candidates = torch.randn(num_candidates, subspace_dim, generator=gen_step) * 0.5
 
                 # Evaluate all candidates
                 best_cost = float("inf")
@@ -515,9 +538,7 @@ class TestDisplacementProductivity:
                 # Rotate projection for next step
                 disp_tensor = torch.stack(disp_history_list) if disp_history_list else None
                 gen_rot = torch.Generator().manual_seed(seed + step * 2000 + 1)
-                P = sub.rotate(P, step=step, total_steps=num_steps,
-                               displacement_history=disp_tensor,
-                               generator=gen_rot)
+                P = sub.rotate(P, step=step, total_steps=num_steps, displacement_history=disp_tensor, generator=gen_rot)
 
             return costs
 

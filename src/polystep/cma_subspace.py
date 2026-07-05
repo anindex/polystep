@@ -45,6 +45,7 @@ Example::
     # Apply covariance scaling to projection
     P_scaled = cma_sub.apply_covariance_scaling(P, cma_state['C_diag'])
 """
+
 from __future__ import annotations
 
 import math
@@ -174,7 +175,11 @@ class CMAAdaptiveSubspace:
             New projection matrix P_new.
         """
         return self.base.rotate(
-            projection, step, total_steps, displacement_history, generator,
+            projection,
+            step,
+            total_steps,
+            displacement_history,
+            generator,
             transport_matrix=transport_matrix,
             X_vertices=X_vertices,
             X_current=X_current,
@@ -396,6 +401,4 @@ class CMAAdaptiveSubspace:
             max_rank=max_rank,
             **kwargs,
         )
-        return cls.from_adaptive_subspace(
-            base, mu_eff=mu_eff, cov_min=cov_min, cov_max=cov_max
-        )
+        return cls.from_adaptive_subspace(base, mu_eff=mu_eff, cov_min=cov_min, cov_max=cov_max)

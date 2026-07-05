@@ -29,6 +29,7 @@ See Also:
     :class:`LinearSubspace`: fixed per-layer projections (no rotation).
     :class:`AdaptiveSubspace`: single global rotating projection.
 """
+
 from __future__ import annotations
 
 import math
@@ -107,18 +108,24 @@ def _scale_specs_to_budget(
         if spec.is_projected:
             new_coords = max(1, round(spec.num_coords * scale))
             new_coords = min(new_coords, spec.num_params)
-            new_specs.append(replace(spec,
-                num_coords=new_coords,
-                flat_start=new_offset,
-                flat_end=new_offset + new_coords,
-                is_projected=True,
-            ))
+            new_specs.append(
+                replace(
+                    spec,
+                    num_coords=new_coords,
+                    flat_start=new_offset,
+                    flat_end=new_offset + new_coords,
+                    is_projected=True,
+                )
+            )
         else:
             # Keep 1D params at full size, no projection
-            new_specs.append(replace(spec,
-                flat_start=new_offset,
-                flat_end=new_offset + spec.num_coords,
-            ))
+            new_specs.append(
+                replace(
+                    spec,
+                    flat_start=new_offset,
+                    flat_end=new_offset + spec.num_coords,
+                )
+            )
         new_offset += new_specs[-1].num_coords
     return new_specs, new_offset
 
@@ -203,9 +210,7 @@ class HybridSubspace:
                 stacklevel=2,
             )
         if self.compression_ratio == 0.0 and self._total_params > 0:
-            object.__setattr__(
-                self, "compression_ratio", self.subspace_dim / self._total_params
-            )
+            object.__setattr__(self, "compression_ratio", self.subspace_dim / self._total_params)
 
     # ------------------------------------------------------------------
     # Factory methods
@@ -256,28 +261,32 @@ class HybridSubspace:
                 # Same formula as LinearSubspace for drop-in compatibility
                 num_coords = d_out * effective_rank + effective_rank * d_in
                 num_params = math.prod(shape)
-                specs.append(LayerProjectionSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    num_params=num_params,
-                    num_coords=num_coords,
-                    flat_start=offset,
-                    flat_end=offset + num_coords,
-                    is_projected=True,
-                ))
+                specs.append(
+                    LayerProjectionSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        num_params=num_params,
+                        num_coords=num_coords,
+                        flat_start=offset,
+                        flat_end=offset + num_coords,
+                        is_projected=True,
+                    )
+                )
                 offset += num_coords
             else:
                 # 1D param (bias, LayerNorm): full perturbation, no projection
                 num_elements = entry.numel
-                specs.append(LayerProjectionSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    num_params=num_elements,
-                    num_coords=num_elements,
-                    flat_start=offset,
-                    flat_end=offset + num_elements,
-                    is_projected=False,
-                ))
+                specs.append(
+                    LayerProjectionSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        num_params=num_elements,
+                        num_coords=num_elements,
+                        flat_start=offset,
+                        flat_end=offset + num_elements,
+                        is_projected=False,
+                    )
+                )
                 offset += num_elements
 
         # Apply budget cap if specified
@@ -342,27 +351,31 @@ class HybridSubspace:
                 effective_rank = min(auto_rank, d_in, d_out)
                 num_coords = d_out * effective_rank + effective_rank * d_in
                 num_params = math.prod(shape)
-                specs.append(LayerProjectionSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    num_params=num_params,
-                    num_coords=num_coords,
-                    flat_start=offset,
-                    flat_end=offset + num_coords,
-                    is_projected=True,
-                ))
+                specs.append(
+                    LayerProjectionSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        num_params=num_params,
+                        num_coords=num_coords,
+                        flat_start=offset,
+                        flat_end=offset + num_coords,
+                        is_projected=True,
+                    )
+                )
                 offset += num_coords
             else:
                 num_elements = entry.numel
-                specs.append(LayerProjectionSpec(
-                    entry_key=entry.key,
-                    original_shape=shape,
-                    num_params=num_elements,
-                    num_coords=num_elements,
-                    flat_start=offset,
-                    flat_end=offset + num_elements,
-                    is_projected=False,
-                ))
+                specs.append(
+                    LayerProjectionSpec(
+                        entry_key=entry.key,
+                        original_shape=shape,
+                        num_params=num_elements,
+                        num_coords=num_elements,
+                        flat_start=offset,
+                        flat_end=offset + num_elements,
+                        is_projected=False,
+                    )
+                )
                 offset += num_elements
 
         # Apply budget cap if specified
@@ -417,6 +430,8 @@ class HybridSubspace:
         """
         projections: Dict[str, Union[torch.Tensor, SparseRandomProjection]] = {}
         for spec in self.specs:
+            if not spec.is_projected:
+                continue  # 1D params add coords directly; storing an eye wastes O(n^2)
             dense_bytes = spec.num_params * spec.num_coords * 4  # float32
             if spec.is_projected and dense_bytes > self.sparse_threshold_bytes:
                 entry_seed = _stable_entry_seed(self.seed, spec.entry_key, 0)
@@ -461,10 +476,12 @@ class HybridSubspace:
         # 1D params: identity-like projection
         if spec.num_params == spec.num_coords:
             return torch.eye(
-                spec.num_params, dtype=dtype, device=device,
+                spec.num_params,
+                dtype=dtype,
+                device=device,
             )
 
-        if self.projection_mode == 'structured':
+        if self.projection_mode == "structured":
             return self._init_structured_projection(spec, device, dtype, step)
 
         # Default: dense random Gaussian projection with QR-orthogonal columns.
@@ -472,19 +489,22 @@ class HybridSubspace:
         # variance perturbations than i.i.d. scaled Gaussian columns, improving
         # per-step signal quality at negligible extra cost.
         entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
-        gen = torch.Generator(device='cpu')
+        gen = torch.Generator(device="cpu")
         gen.manual_seed(entry_seed)
 
         # Generate on CPU then move (Generator doesn't support CUDA)
         P_raw = torch.randn(
-            spec.num_params, spec.num_coords,
-            generator=gen, dtype=dtype, device='cpu',
+            spec.num_params,
+            spec.num_coords,
+            generator=gen,
+            dtype=dtype,
+            device="cpu",
         )
         # QR-orthogonalize columns when num_params >= num_coords (tall matrix).
         # This produces orthonormal columns, giving isotropic perturbations.
         # For wide matrices (more coords than params), fall back to scaled Gaussian.
         if spec.num_params >= spec.num_coords:
-            P, _ = torch.linalg.qr(P_raw, mode='reduced')  # (num_params, num_coords)
+            P, _ = torch.linalg.qr(P_raw, mode="reduced")  # (num_params, num_coords)
         else:
             P = P_raw * (1.0 / math.sqrt(spec.num_coords))
         P = P.to(device=device)
@@ -531,19 +551,22 @@ class HybridSubspace:
 
         # Deterministic seed from global seed + entry key + step
         entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
-        gen = torch.Generator(device='cpu')
+        gen = torch.Generator(device="cpu")
         gen.manual_seed(entry_seed)
 
         # Build block-diagonal projection on CPU
-        P = torch.zeros(spec.num_params, actual_total_coords, dtype=dtype, device='cpu')
+        P = torch.zeros(spec.num_params, actual_total_coords, dtype=dtype, device="cpu")
         for i in range(d_out):
             row_start = i * d_in
             row_end = row_start + d_in
             col_start = i * coords_per_block
             col_end = col_start + coords_per_block
             block = torch.randn(
-                d_in, coords_per_block,
-                generator=gen, dtype=dtype, device='cpu',
+                d_in,
+                coords_per_block,
+                generator=gen,
+                dtype=dtype,
+                device="cpu",
             )
             block.mul_(1.0 / math.sqrt(coords_per_block))
             P[row_start:row_end, col_start:col_end] = block
@@ -551,12 +574,14 @@ class HybridSubspace:
         # Handle rounding: pad or truncate to match num_coords
         if actual_total_coords < spec.num_coords:
             pad = torch.zeros(
-                spec.num_params, spec.num_coords - actual_total_coords,
-                dtype=dtype, device='cpu',
+                spec.num_params,
+                spec.num_coords - actual_total_coords,
+                dtype=dtype,
+                device="cpu",
             )
             P = torch.cat([P, pad], dim=1)
         elif actual_total_coords > spec.num_coords:
-            P = P[:, :spec.num_coords]
+            P = P[:, : spec.num_coords]
 
         return P.to(device=device)
 
@@ -608,7 +633,7 @@ class HybridSubspace:
             return projections
 
         # Get device/dtype from first dense projection (sparse tensors lack .device/.dtype)
-        device, dtype = torch.device('cpu'), torch.float32  # safe defaults
+        device, dtype = torch.device("cpu"), torch.float32  # safe defaults
         for p in projections.values():
             if isinstance(p, torch.Tensor):
                 device, dtype = p.device, p.dtype
@@ -616,9 +641,7 @@ class HybridSubspace:
 
         # Determine rotation mode
         use_random = (
-            self.rotation_mode == "random"
-            or displacement_history is None
-            or displacement_history.shape[0] == 0
+            self.rotation_mode == "random" or displacement_history is None or displacement_history.shape[0] == 0
         )
 
         if not use_random:
@@ -634,8 +657,12 @@ class HybridSubspace:
         else:
             svd_ratio = self.get_svd_ratio(step, total_steps)
             return self._rotate_all_displacement(
-                projections, displacement_history, svd_ratio,
-                device, dtype, step,
+                projections,
+                displacement_history,
+                svd_ratio,
+                device,
+                dtype,
+                step,
             )
 
     def _rotate_all_random(
@@ -659,6 +686,8 @@ class HybridSubspace:
         """
         new_projections: Dict[str, Union[torch.Tensor, SparseRandomProjection]] = {}
         for spec in self.specs:
+            if not spec.is_projected:
+                continue  # 1D params add coords directly; storing an eye wastes O(n^2)
             dense_bytes = spec.num_params * spec.num_coords * 4
             if spec.is_projected and dense_bytes > self.sparse_threshold_bytes:
                 entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
@@ -702,6 +731,8 @@ class HybridSubspace:
         new_projections: Dict[str, Union[torch.Tensor, SparseRandomProjection]] = {}
 
         for spec in self.specs:
+            if not spec.is_projected:
+                continue  # 1D params have no stored projection
             P = projections[spec.entry_key]
             if isinstance(P, SparseRandomProjection):
                 # Sparse layers: fall back to random rotation (new seed)
@@ -713,9 +744,15 @@ class HybridSubspace:
                 )
             else:
                 # Dense layers: displacement-biased SVD rotation
-                layer_disp = displacement_history[:, spec.flat_start:spec.flat_end]
+                layer_disp = displacement_history[:, spec.flat_start : spec.flat_end]
                 new_P = self._rotate_layer_displacement(
-                    P, spec, layer_disp, svd_ratio, device, dtype, step,
+                    P,
+                    spec,
+                    layer_disp,
+                    svd_ratio,
+                    device,
+                    dtype,
+                    step,
                 )
                 new_projections[spec.entry_key] = new_P
 
@@ -734,9 +771,9 @@ class HybridSubspace:
         """Rotate a single layer's projection using displacement-biased SVD.
 
         Projects the layer's displacement history to parameter space, computes
-        SVD to find productive directions, keeps top k_svd directions, and
-        fills remainder with random directions. Final matrix is NOT QR-orthonormalized
-        (uses 1/sqrt(N) scaling like LinearSubspace).
+        SVD to find productive directions, keeps top k_svd directions, and fills
+        the remainder with random directions. Scaling matches _get_projection:
+        unit-norm QR columns when tall, 1/sqrt(num_coords) Gaussian when wide.
 
         Args:
             P_old: Current projection matrix for this layer, shape (num_params, num_coords).
@@ -783,25 +820,29 @@ class HybridSubspace:
         gen.manual_seed(entry_seed)
 
         Z_random = torch.randn(
-            spec.num_params, k_random,
-            generator=gen, dtype=dtype, device=device,
+            spec.num_params,
+            k_random,
+            generator=gen,
+            dtype=dtype,
+            device=device,
         )
 
         if U_top.device != Z_random.device:
             U_top = U_top.to(device=Z_random.device)
 
-        # Concatenate SVD directions + random, QR-orthogonalize then scale
+        # Match _get_projection so magnitude is continuous across the first
+        # rotation: unit-norm QR when tall, 1/sqrt(num_coords) Gaussian when wide
+        # (reduced QR would drop columns in the wide case).
         combined = torch.cat([U_top, Z_random], dim=1)
-        # QR requires float32 on CPU (BF16 unsupported); upcast and convert back
-        orig_dtype = combined.dtype
-        if combined.dtype == torch.bfloat16 and combined.device.type == 'cpu':
-            combined = combined.float()
-        Q, R = torch.linalg.qr(combined)
-        if Q.dtype != orig_dtype:
-            Q = Q.to(orig_dtype)
-        # QR preserves relative importance of SVD vs random directions
-        # Apply 1/sqrt(N) scaling for LinearSubspace convention
-        combined = Q * (1.0 / math.sqrt(spec.num_coords))
+        if spec.num_params >= spec.num_coords:
+            # QR requires float32 on CPU (BF16 unsupported); upcast and convert back
+            orig_dtype = combined.dtype
+            if combined.dtype == torch.bfloat16 and combined.device.type == "cpu":
+                combined = combined.float()
+            Q, _ = torch.linalg.qr(combined)
+            combined = Q.to(orig_dtype) if Q.dtype != orig_dtype else Q
+        else:
+            combined = combined * (1.0 / math.sqrt(spec.num_coords))
 
         return combined
 
@@ -887,7 +928,7 @@ class HybridSubspace:
         """
         result = {}
         for spec in self.specs:
-            chunk = flat_subspace[spec.flat_start:spec.flat_end]
+            chunk = flat_subspace[spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
 
             if spec.is_projected:
@@ -986,7 +1027,7 @@ class HybridSubspace:
             key = spec.entry_key
             if key not in param_dict:
                 continue
-            chunk = flat_subspace[spec.flat_start:spec.flat_end]
+            chunk = flat_subspace[spec.flat_start : spec.flat_end]
             base = base_sd[key]
             param = param_dict[key]
 
@@ -996,11 +1037,19 @@ class HybridSubspace:
                     delta = P.project(chunk)
                     param.data.copy_((base.reshape(-1) + delta).reshape(spec.original_shape))
                 else:
-                    # Fused: base + coords @ P^T, written directly into param.data
-                    torch.addmm(
-                        base.reshape(1, -1), chunk.unsqueeze(0), P.t(),
-                        out=param.data.reshape(1, -1),
-                    )
+                    # Fused: base + coords @ P^T. reshape(1, -1) is a view only
+                    # when param.data is contiguous; otherwise it is a copy and an
+                    # out= write would be silently discarded, so copy_ instead.
+                    if param.data.is_contiguous():
+                        torch.addmm(
+                            base.reshape(1, -1),
+                            chunk.unsqueeze(0),
+                            P.t(),
+                            out=param.data.reshape(1, -1),
+                        )
+                    else:
+                        res = torch.addmm(base.reshape(1, -1), chunk.unsqueeze(0), P.t())
+                        param.data.copy_(res.reshape(spec.original_shape))
             else:
                 param.data.copy_(base + chunk.reshape(spec.original_shape))
 
@@ -1032,7 +1081,7 @@ class HybridSubspace:
         result = {}
 
         # Fast path: fused block-diagonal matmul for all dense layers
-        if getattr(self, '_fused_P', None) is not None and self._fused_dense_specs:
+        if getattr(self, "_fused_P", None) is not None and self._fused_dense_specs:
             # Gather subspace coords for all dense layers.
             # If dense specs are laid out contiguously (common case), use a
             # single slice instead of a 72-iteration Python loop + torch.cat.
@@ -1047,7 +1096,7 @@ class HybridSubspace:
                 # Non-contiguous - fallback to cat
                 coord_slices = []
                 for spec, _ in self._fused_dense_specs:
-                    coord_slices.append(flat_subspace_batch[:, spec.flat_start:spec.flat_end])
+                    coord_slices.append(flat_subspace_batch[:, spec.flat_start : spec.flat_end])
                 fused_coords = torch.cat(coord_slices, dim=1)  # (N, total_dense_coords)
 
             # Single matmul: (N, total_dense_coords) @ (total_dense_coords, total_dense_params)
@@ -1056,13 +1105,13 @@ class HybridSubspace:
             # Split into per-layer deltas and add to base
             for spec, param_offset in self._fused_dense_specs:
                 base = base_sd[spec.entry_key]
-                delta = fused_delta[:, param_offset:param_offset + spec.num_params]
+                delta = fused_delta[:, param_offset : param_offset + spec.num_params]
                 result_flat = base.reshape(1, -1) + delta
                 result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
 
             # Sparse layers: per-layer fallback
             for spec, P in self._fused_sparse_specs:
-                chunk = flat_subspace_batch[:, spec.flat_start:spec.flat_end]
+                chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
                 base = base_sd[spec.entry_key]
                 delta = P.project(chunk)
                 result_flat = base.reshape(1, -1) + delta
@@ -1070,14 +1119,14 @@ class HybridSubspace:
 
             # 1D biases: direct add
             for spec in self._fused_bias_specs:
-                chunk = flat_subspace_batch[:, spec.flat_start:spec.flat_end]
+                chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
                 base = base_sd[spec.entry_key]
                 delta = chunk.reshape(N, *spec.original_shape)
                 result[spec.entry_key] = base.unsqueeze(0) + delta
         else:
             # Fallback: per-layer loop (no fused projection built yet)
             for spec in self.specs:
-                chunk = flat_subspace_batch[:, spec.flat_start:spec.flat_end]
+                chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
                 base = base_sd[spec.entry_key]
 
                 if spec.is_projected:
@@ -1107,7 +1156,7 @@ class HybridSubspace:
         """
         result = {}
         for spec in self.specs:
-            chunk = flat_subspace[spec.flat_start:spec.flat_end]
+            chunk = flat_subspace[spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
             if spec.is_projected:
                 P = projections[spec.entry_key]
@@ -1151,7 +1200,7 @@ class HybridSubspace:
 
         result = {}
         for spec in self.specs:
-            delta_chunk = delta_coords[:, spec.flat_start:spec.flat_end]  # (N, num_coords)
+            delta_chunk = delta_coords[:, spec.flat_start : spec.flat_end]  # (N, num_coords)
 
             # Check if any probe actually modifies this layer's coords
             # Use a fast check: if all deltas are zero, just broadcast base
@@ -1264,14 +1313,16 @@ def create_hybrid_blocks(
         num_particles = padded_coords // particle_dim
 
         # Use contiguous offset, not spec.flat_start, to avoid gaps/overlaps
-        blocks.append(BlockConfig(
-            name=spec.entry_key,
-            leaf_indices=(i,),  # Index into hybrid.specs
-            flat_start=offset,
-            flat_end=offset + padded_coords,
-            num_particles=num_particles,
-            particle_dim=particle_dim,
-        ))
+        blocks.append(
+            BlockConfig(
+                name=spec.entry_key,
+                leaf_indices=(i,),  # Index into hybrid.specs
+                flat_start=offset,
+                flat_end=offset + padded_coords,
+                num_particles=num_particles,
+                particle_dim=particle_dim,
+            )
+        )
         offset += padded_coords
 
     # Note: total offset (sum of padded block dims) may exceed hybrid.subspace_dim

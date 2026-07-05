@@ -10,6 +10,7 @@ When ``chunk_size`` is set, evaluations are batched to bound peak GPU
 memory. ``auto_detect_chunk_size`` estimates a safe value based on model
 size and available GPU memory.
 """
+
 from __future__ import annotations
 
 import warnings
@@ -53,7 +54,7 @@ def auto_detect_chunk_size(
     except StopIteration:
         return None  # No parameters
 
-    if param_device.type != 'cuda':
+    if param_device.type != "cuda":
         return None
 
     param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
@@ -111,9 +112,8 @@ class NNCostEvaluator:
             ``"auto"`` = auto-detect from model size and GPU memory.
             Positive int = evaluate in chunks of this size.
         compile_vmap: If True, wrap the vmap evaluation in
-            ``torch.compile(mode="reduce-overhead")`` for kernel fusion
-            and CUDA graph capture. Falls back to eager on failure.
-            Best for CUDA models with static shapes. Default False.
+            ``torch.compile(mode="default")`` for kernel fusion. Falls back
+            to eager on failure. Best for CUDA models. Default False.
     """
 
     def __init__(
@@ -158,7 +158,7 @@ class NNCostEvaluator:
         else:
             n_params = sum(p.numel() for p in model.parameters())
             try:
-                on_gpu = next(model.parameters()).device.type == 'cuda'
+                on_gpu = next(model.parameters()).device.type == "cuda"
             except StopIteration:
                 on_gpu = False
             self._use_inplace = on_gpu and n_params > 500_000
@@ -241,15 +241,13 @@ class NNCostEvaluator:
                     # Only catch vmap/functorch-related errors; re-raise real bugs
                     msg = str(e).lower()
                     is_vmap_issue = any(
-                        k in msg
-                        for k in ("vmap", "functorch", "batched tensor", "batched", "randomness")
+                        k in msg for k in ("vmap", "functorch", "batched tensor", "batched", "randomness")
                     )
                     if not is_vmap_issue:
                         raise
                     if not self._warned:
                         warnings.warn(
-                            f"vmap failed for {type(self.model).__name__}: {e}. "
-                            f"Falling back to sequential evaluation.",
+                            f"vmap failed for {type(self.model).__name__}: {e}. Falling back to sequential evaluation.",
                             stacklevel=2,
                         )
                         self._warned = True
@@ -272,7 +270,9 @@ class NNCostEvaluator:
         model = self.model
         resolved_chunk = self.chunk_size
 
-        def single_eval(params):
+        # inputs/targets are explicit args (in_dims=None), not closed-over, so a
+        # cached torch.compile graph does not bake in the first call's batch.
+        def single_eval(params, inputs, targets):
             # Buffers override params intentionally: stacked_params contains only
             # trainable entries from ParamLayout, while self._buffers holds frozen
             # model state (e.g., BatchNorm running_mean/var, num_batches_tracked).
@@ -288,7 +288,7 @@ class NNCostEvaluator:
                 loss = loss.mean()
             return loss
 
-        batched = vmap(single_eval, in_dims=(0,), chunk_size=resolved_chunk)
+        batched = vmap(single_eval, in_dims=(0, None, None), chunk_size=resolved_chunk)
 
         # Compiled path: torch.compile on vmap for kernel fusion + CUDA graphs.
         # Only attempted on CUDA with compile_vmap=True. Lazy-compiled on first call.
@@ -299,7 +299,9 @@ class NNCostEvaluator:
                     # "reduce-overhead" (CUDA graphs) has tensor ownership conflicts
                     # with vmap's chunked output concatenation.
                     self._compiled_vmap_fn = torch.compile(
-                        batched, mode="default", fullgraph=False,
+                        batched,
+                        mode="default",
+                        fullgraph=False,
                     )
                 except Exception:
                     self._compile_failed = True
@@ -307,17 +309,21 @@ class NNCostEvaluator:
 
             if self._compiled_vmap_fn is not None:
                 try:
-                    return self._compiled_vmap_fn(stacked_params)
+                    return self._compiled_vmap_fn(stacked_params, inputs, targets)
                 except Exception:
                     # Compilation or execution failed - fall back to eager permanently
                     self._compile_failed = True
                     self._compiled_vmap_fn = None
 
-        return batched(stacked_params)
+        return batched(stacked_params, inputs, targets)
 
     def _evaluate_loop(self, stacked_params, inputs, targets):
         """Sequential fallback when vmap is incompatible."""
+        if not stacked_params:
+            return torch.zeros(0, device=inputs.device)
         N = next(iter(stacked_params.values())).shape[0]
+        if N == 0:
+            return torch.zeros(0, device=inputs.device)
         losses = []
         for i in range(N):
             params_i = {k: v[i] for k, v in stacked_params.items()}
@@ -357,6 +363,10 @@ class NNCostEvaluator:
         # Save original weights (one copy, regardless of N)
         original_params = {}
         param_dict = self._param_dict_cache
+        if not stacked_params.keys() <= param_dict.keys():
+            # Model gained or renamed params since construction; refresh the cache
+            # so new keys aren't silently evaluated with stale weights.
+            param_dict = self._param_dict_cache = dict(self.model.named_parameters())
         for key in stacked_params:
             if key in param_dict:
                 original_params[key] = param_dict[key].data.clone()
@@ -385,7 +395,6 @@ class NNCostEvaluator:
                     param_dict[key].data.copy_(orig)
 
         return losses
-
 
     def evaluate_subspace_inplace(
         self,
@@ -430,7 +439,10 @@ class NNCostEvaluator:
             for i in range(N):
                 # Reconstruct weights for config i directly into model params
                 subspace.apply_perturbation_inplace(
-                    projections, self.model, base_sd, flat_subspace_batch[i],
+                    projections,
+                    self.model,
+                    base_sd,
+                    flat_subspace_batch[i],
                 )
                 # Forward pass - already under inference_mode from caller
                 output = self.model(inputs)
@@ -475,8 +487,13 @@ class BatchedLinearEvaluator:
     @classmethod
     def try_build(cls, model: nn.Module, loss_fn: Callable) -> "BatchedLinearEvaluator | None":
         """Build if model is compatible, else return None."""
-        supported = (nn.Linear, nn.ReLU, nn.LeakyReLU, nn.Sigmoid, nn.Tanh,
-                     nn.GELU, nn.SiLU, nn.Flatten, nn.Dropout)
+        # The bmm plan is rebuilt from named_children(), which misses activations
+        # applied inline in a custom forward (e.g. torch.relu) and would compute a
+        # wrong, activation-free loss. Only trust genuine nn.Sequential forwards.
+        if type(model).forward is not nn.Sequential.forward:
+            return None
+        supported = (nn.Linear, nn.ReLU, nn.LeakyReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Flatten, nn.Dropout)
+
         # Build an ordered (name, tag, module) plan. ``module`` is None for
         # Linear layers (handled by bmm) and the actual nn.Module for
         # activations so evaluate() applies their EXACT semantics
@@ -484,7 +501,7 @@ class BatchedLinearEvaluator:
         # hardcoded functional defaults. Unsupported -> None (vmap fallback).
         def _entry(full, submod):
             if isinstance(submod, nn.Linear):
-                return (full, 'linear', None)
+                return (full, "linear", None)
             # A non-default Flatten reshapes differently from the bmm path's
             # leading flatten; defer those models to the (correct) vmap path.
             if isinstance(submod, nn.Flatten) and (submod.start_dim, submod.end_dim) != (1, -1):
@@ -511,7 +528,7 @@ class BatchedLinearEvaluator:
         # Models with extra parameters (e.g., learned scales) need vmap.
         linear_param_keys = set()
         for name, tag, _ in layer_keys:
-            if tag == 'linear':
+            if tag == "linear":
                 linear_param_keys.add(f"{name}.weight")
                 linear_param_keys.add(f"{name}.bias")
         model_param_keys = {n for n, _ in model.named_parameters()}
@@ -536,7 +553,7 @@ class BatchedLinearEvaluator:
             x = inputs.reshape(inputs.shape[0], -1).unsqueeze(0).expand(N, -1, -1)
 
         for name, tag, module in self._layer_keys:
-            if tag == 'linear':
+            if tag == "linear":
                 w_key = f"{name}.weight"
                 b_key = f"{name}.bias"
                 W = stacked_params[w_key]  # (N, out, in)
@@ -544,7 +561,7 @@ class BatchedLinearEvaluator:
                 x = torch.bmm(x, W.transpose(1, 2))  # (N, B, out)
                 if b_key in stacked_params:
                     x = x + stacked_params[b_key].unsqueeze(1)  # (N, 1, out) broadcast
-            elif tag in ('flatten', 'dropout'):
+            elif tag in ("flatten", "dropout"):
                 pass  # input is pre-flattened; dropout is identity in eval mode
             else:
                 # Activation: apply the real module so its configuration
@@ -555,11 +572,15 @@ class BatchedLinearEvaluator:
         if targets is not None:
             tgt = targets.unsqueeze(0).expand(N, -1)  # (N, B)
             # Reshape for cross-entropy: (N*B, C) vs (N*B,)
-            losses = torch.nn.functional.cross_entropy(
-                x.reshape(N * targets.shape[0], -1),
-                tgt.reshape(-1),
-                reduction='none',
-            ).reshape(N, -1).mean(dim=1)  # (N,)
+            losses = (
+                torch.nn.functional.cross_entropy(
+                    x.reshape(N * targets.shape[0], -1),
+                    tgt.reshape(-1),
+                    reduction="none",
+                )
+                .reshape(N, -1)
+                .mean(dim=1)
+            )  # (N,)
         else:
             losses = self.loss_fn(x).mean(dim=1) if x.dim() > 2 else self.loss_fn(x)
         return losses
