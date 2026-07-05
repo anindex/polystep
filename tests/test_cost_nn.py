@@ -297,6 +297,48 @@ class TestEvaluatorNoGrad:
             assert param.grad is None, f"{name} has gradient attached"
 
 
+class TestBatchedLinearRespectsCrossEntropyConfig:
+    """Configured CrossEntropyLoss must not take the bmm fast path (it hardcodes
+    mean reduction and no class weights)."""
+
+    def test_vanilla_ce_uses_fast_path(self):
+        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+        evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+        assert evaluator._batched_linear is not None
+
+    def test_label_smoothing_falls_back_and_matches(self):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+        layout = ParamLayout.from_module(model)
+        particle = layout.flatten(model)
+
+        N = 6
+        batch = particle.unsqueeze(0).expand(N, -1, -1).clone()
+        batch += torch.randn_like(batch) * 0.05
+        stacked = layout.batch_unflatten(batch)
+
+        inputs = torch.randn(16, 4)
+        targets = torch.randint(0, 3, (16,))
+        loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+        evaluator = NNCostEvaluator(model, loss_fn)
+        # Configured loss must fall back so the real (smoothed) loss is used.
+        assert evaluator._batched_linear is None
+
+        losses = evaluator.evaluate(stacked, inputs, targets)
+
+        model.eval()
+        buffers = dict(model.named_buffers())
+        expected = torch.zeros(N)
+        for i in range(N):
+            sd = {k: v[i] for k, v in stacked.items()}
+            with torch.no_grad():
+                out = functional_call(model, {**sd, **buffers}, (inputs,))
+                expected[i] = loss_fn(out, targets)
+
+        torch.testing.assert_close(losses, expected, atol=1e-5, rtol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # Chunked evaluation tests# ---------------------------------------------------------------------------
 

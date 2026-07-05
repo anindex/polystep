@@ -140,6 +140,31 @@ class TestOverrelaxation:
             f"standard ({result_standard.n_iters} iters)"
         )
 
+    def test_adaptive_omega_converges_faster_than_static(self):
+        """adaptive_omega derives an overrelaxation from the residual ratio and
+        converges in fewer iterations than static omega=1.0."""
+        torch.manual_seed(42)
+        n = 30
+        C = torch.rand(n, n) * 10.0
+
+        static = SinkhornSolver(
+            epsilon=0.5, max_iterations=5000, threshold=1e-6,
+            check_every=1, compile=False, omega=1.0,
+        )
+        r_static = static.solve(C)
+
+        adaptive = SinkhornSolver(
+            epsilon=0.5, max_iterations=5000, threshold=1e-6,
+            check_every=1, compile=False, omega=1.0, adaptive_omega=True,
+        )
+        r_adaptive = adaptive.solve(C)
+
+        assert r_static.converged
+        assert r_adaptive.converged
+        assert r_adaptive.n_iters < r_static.n_iters, (
+            f"adaptive ({r_adaptive.n_iters}) should beat static ({r_static.n_iters})"
+        )
+
     def test_omega_backward_compatible(self):
         """Same cost matrix with omega=1.0 and no omega argument produce identical f, g values."""
         torch.manual_seed(42)

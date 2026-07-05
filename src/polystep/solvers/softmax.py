@@ -105,17 +105,23 @@ class SoftmaxSolver:
 
         # ``epsilon > 0`` is enough to avoid division-by-zero, but
         # eps=1e-30 with cost_max~10 still overflows -C/epsilon before
-        # softmax can subtract the row max. Warn at extreme ratios.
-        cost_max = C.detach().abs().max().item() if C.numel() > 0 else 0.0
-        if cost_max > 0 and self.epsilon < _TINY_EPSILON_RATIO * cost_max:
-            warnings.warn(
-                f"SoftmaxSolver epsilon={self.epsilon:.2e} is very small "
-                f"relative to the cost-matrix scale (max |C|={cost_max:.2e}); "
-                f"-C/epsilon may underflow / overflow before the row-max "
-                f"subtraction inside torch.softmax. Consider rescaling the "
-                f"cost or raising epsilon.",
-                stacklevel=2,
-            )
+        # softmax can subtract the row max. Warn at extreme ratios, but avoid a
+        # host sync every solve: only run the reduction when epsilon drops below
+        # the smallest value already checked (a new, sharper regime).
+        # Gated on epsilon decrease, so a fixed-epsilon cost blowup is not caught.
+        min_checked = getattr(self, "_min_eps_checked", None)
+        if min_checked is None or self.epsilon < min_checked:
+            self._min_eps_checked = self.epsilon
+            cost_max = C.detach().abs().max().item() if C.numel() > 0 else 0.0
+            if cost_max > 0 and self.epsilon < _TINY_EPSILON_RATIO * cost_max:
+                warnings.warn(
+                    f"SoftmaxSolver epsilon={self.epsilon:.2e} is very small "
+                    f"relative to the cost-matrix scale (max |C|={cost_max:.2e}); "
+                    f"-C/epsilon may underflow / overflow before the row-max "
+                    f"subtraction inside torch.softmax. Consider rescaling the "
+                    f"cost or raising epsilon.",
+                    stacklevel=2,
+                )
 
         # PyTorch's softmax subtracts the row max internally for stability.
         # Pin the whole block inside an autocast-disabled context so an outer

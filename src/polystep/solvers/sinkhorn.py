@@ -5,6 +5,7 @@ PolyStep's OT problems are (n particles x m=V polytope vertices) with V small
 already optimal and there is no large dense kernel to approximate away.
 """
 import functools
+import math
 import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -27,7 +28,8 @@ class SinkhornResult:
         g: Second dual potential of shape (m,). See ``f``.
         converged: Whether the solver converged within tolerance.
         n_iters: Number of iterations actually run.
-        ent_reg_cost: Entropic regularized cost = <f, a> + <g, b>.
+        ent_reg_cost: Entropic dual objective <f, a> + <g, b> - eps*sum(a),
+            which equals the regularized transport cost at convergence.
         errors: Per-check marginal errors (for diagnostics).
     """
 
@@ -84,7 +86,7 @@ class SinkhornSolver:
     compile: bool = False
     omega: float = 1.0
     anderson_depth: int = 0         # 0 = disabled, >0 = ring buffer depth for Anderson acceleration
-    adaptive_omega: bool = False    # False = static omega, True = Lyapunov-based dynamic omega
+    adaptive_omega: bool = False    # False = static omega, True = residual-ratio dynamic omega (Lehmann 2022)
     data_dependent_init: bool = False  # False = zeros init, True = cost-mean init for cold starts
 
     def __post_init__(self):
@@ -287,9 +289,9 @@ class SinkhornSolver:
                     aa_history_x = []   # list of (f, g) pairs
                     aa_history_r = []   # list of (r_f, r_g) residual pairs
 
-                # Adaptive omega: Lyapunov monitoring for dynamic overrelaxation
+                # Adaptive omega: residual-ratio estimator state (Lehmann 2022)
                 if self.adaptive_omega:
-                    prev_lyapunov = float('-inf')
+                    prev_err = None
 
                 # Divergence detector for static omega. Track consecutive
                 # growths of ``|f|.max + |g|.max``; if the iterate norm
@@ -298,6 +300,14 @@ class SinkhornSolver:
                 _divergence_prev_norm = float('inf')
                 _divergence_growth_count = 0
                 _divergence_patience = 3
+
+                def dual_objective(fv, gv):
+                    # D(f,g) = <f,a> + <g,b> - eps * sum_ij exp((f_i+g_j-C_ij)/eps).
+                    # The true Sinkhorn Lyapunov: unlike <f,a>+<g,b> alone, it is
+                    # valid off the marginal constraint (sum(P) != 1).
+                    log_P = fv.unsqueeze(1) / eps + gv.unsqueeze(0) / eps + log_K
+                    mass_p = torch.exp(torch.logsumexp(log_P.reshape(-1), dim=0))
+                    return (fv * a).sum() + (gv * b).sum() - eps * mass_p
 
                 for i in range(self.max_iterations):
                     f_target = eps * (log_a - torch.logsumexp(log_K + g.unsqueeze(0) / eps, dim=1))
@@ -342,17 +352,16 @@ class SinkhornSolver:
                                     # Validate combined result before assigning
                                     if torch.isfinite(combined).all():
                                         # Lyapunov regression check (Chizat 2020):
-                                        # the dual objective <f,a> + <g,b>
-                                        # increases monotonically in plain
-                                        # Sinkhorn, so only accept the Anderson
-                                        # step when it does not regress vs the
-                                        # plain iterate. Without this guard
-                                        # acceleration can push the iterate to
+                                        # the entropic dual objective increases
+                                        # monotonically in plain Sinkhorn, so only
+                                        # accept the Anderson step when it does not
+                                        # regress vs the plain iterate. Without this
+                                        # guard acceleration can push the iterate to
                                         # a worse Lyapunov on ill-conditioned C.
                                         f_combined = combined[:n]
                                         g_combined = combined[n:]
-                                        lyap_plain = (f_new * a).sum() + (g_new * b).sum()
-                                        lyap_combined = (f_combined * a).sum() + (g_combined * b).sum()
+                                        lyap_plain = dual_objective(f_new, g_new)
+                                        lyap_combined = dual_objective(f_combined, g_combined)
                                         # Device-side accept gate avoids a
                                         # GPU->CPU sync per Anderson iter; the
                                         # math is unchanged (broadcast scalar
@@ -389,13 +398,10 @@ class SinkhornSolver:
                             dual_norm_t = f.abs().max() + g.abs().max()
                         else:
                             dual_norm_t = err_a_t  # placeholder, value unused
-                        if self.adaptive_omega:
-                            lyap_t = (f * a).sum() + (g * b).sum()
-                        else:
-                            lyap_t = err_a_t  # placeholder, value unused
-                        err_a, err_b, dual_norm_v, lyap_v = torch.stack(
-                            [err_a_t, err_b_t, dual_norm_t, lyap_t]
+                        err_a, err_b, dual_norm_v = torch.stack(
+                            [err_a_t, err_b_t, dual_norm_t]
                         ).tolist()
+                        err = max(err_a, err_b)
 
                         # Static-omega divergence detector. Lehmann et al.
                         # 2022 give a safe range ``omega in (0, 2 - rho)``
@@ -423,22 +429,29 @@ class SinkhornSolver:
                                 _divergence_growth_count = 0
                             _divergence_prev_norm = dual_norm_v
 
-                        # Adaptive omega: adjust based on Lyapunov function
+                        # Adaptive omega via the Lehmann residual-ratio estimator
+                        # (arXiv:2012.12562): estimate the linear rate from the
+                        # ratio of successive marginal errors and pick the optimal
+                        # overrelaxation. Converges to omega_opt instead of
+                        # oscillating like a fixed step-up/step-down heuristic.
                         if self.adaptive_omega:
-                            if lyap_v >= prev_lyapunov:
-                                omega = min(omega * 1.05, 1.8)  # Good progress, cautiously increase
-                            else:
-                                omega = max(omega * 0.8, 1.0)   # Overshot, back off toward standard
-                            prev_lyapunov = lyap_v
+                            if prev_err is not None and prev_err > 1e-12 and err > 0.0:
+                                r = min(err / prev_err, 0.99)
+                                omega = 2.0 / (1.0 + math.sqrt(1.0 - r ** (1.0 / self.check_every)))
+                                omega = min(max(omega, 1.0), 1.95)
+                            prev_err = err
 
-                        err = max(err_a, err_b)
                         errors.append(err)
                         if err < self.threshold:
                             converged = True
                             break
 
-        # Entropic regularized cost: <f, a> + <g, b>. One host transfer.
-        ent_reg_cost = torch.stack([(f * a).sum(), (g * b).sum()]).sum().item()
+        # Entropic dual objective D(f,g) = <f,a> + <g,b> - eps*sum(a). The mass
+        # term makes it the true regularized value (a bare <f,a>+<g,b> overstates
+        # it by eps*sum(a)); at convergence sum(P) equals sum(a). One host transfer.
+        ent_reg_cost = (
+            torch.stack([(f * a).sum(), (g * b).sum()]).sum() - eps * a.sum()
+        ).item()
 
         result = SinkhornResult(
             f=f,

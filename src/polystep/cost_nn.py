@@ -77,6 +77,22 @@ def auto_detect_chunk_size(
 _UNSET = object()  # sentinel distinguishing "not yet computed" from None
 
 
+def _is_vanilla_cross_entropy(loss_fn: nn.CrossEntropyLoss) -> bool:
+    """True when a CrossEntropyLoss uses default reduction and no reweighting.
+
+    The batched-linear fast path reimplements cross-entropy with mean reduction
+    and no class weights, so it is only correct for an unconfigured loss. Weighted
+    classes, label smoothing, a custom ignore_index, or a non-mean reduction must
+    fall back to the vmap path, which calls the real loss_fn.
+    """
+    return (
+        loss_fn.weight is None
+        and loss_fn.ignore_index == -100
+        and float(loss_fn.label_smoothing) == 0.0
+        and loss_fn.reduction == "mean"
+    )
+
+
 class NNCostEvaluator:
     """Vectorized NN cost evaluation via vmap + functional_call.
 
@@ -122,8 +138,10 @@ class NNCostEvaluator:
         model.eval()
 
         # Try to build fast batched-linear evaluator (MLP-only models).
-        # Only for CrossEntropyLoss since the bmm path hardcodes it.
-        if isinstance(loss_fn, nn.CrossEntropyLoss):
+        # Only for a default CrossEntropyLoss: the bmm path hardcodes mean
+        # reduction with no class weights, so a configured loss (weights, label
+        # smoothing, custom ignore_index, non-mean reduction) must use vmap.
+        if isinstance(loss_fn, nn.CrossEntropyLoss) and _is_vanilla_cross_entropy(loss_fn):
             self._batched_linear = BatchedLinearEvaluator.try_build(model, loss_fn)
         else:
             self._batched_linear = None

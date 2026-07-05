@@ -39,6 +39,7 @@ from typing import Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
+from ._prelude import align_marginal, sanitize_cost
 from .base import SolverResult
 
 
@@ -101,34 +102,17 @@ class KLSoftmaxSolver:
         init_g: Optional[torch.Tensor] = None,
         scale_cost: Optional[Union[str, float]] = None,
     ) -> SolverResult:
+        # Shared prelude: FP32 promotion for LSE stability plus device-side
+        # non-finite handling, then device/dtype-aligned marginals. Sanitizing
+        # before scaling keeps a +Inf penalty out of the 'mean'/'max_cost' scale.
+        cost_matrix = sanitize_cost(cost_matrix)
         n, m = cost_matrix.shape
-        device = cost_matrix.device
-        dtype = cost_matrix.dtype
+        device, dtype = cost_matrix.device, cost_matrix.dtype
+        a = align_marginal(a, n, device, dtype, "a")
+        b = align_marginal(b, m, device, dtype, "b")
 
-        # Default uniform marginals
-        if a is None:
-            a = torch.full((n,), 1.0 / n, device=device, dtype=dtype)
-        if b is None:
-            b = torch.full((m,), 1.0 / m, device=device, dtype=dtype)
-
-        # Promote BF16/FP16 to FP32 for numerical stability inside LSE
-        if cost_matrix.dtype in (torch.bfloat16, torch.float16):
-            cost_matrix = cost_matrix.to(torch.float32)
-            a = a.to(torch.float32)
-            b = b.to(torch.float32)
-            dtype = torch.float32
-
-        # Optional cost rescaling
-        C = scale_cost_matrix(cost_matrix.clone(), scale_cost)
-
-        # Replace +Inf entries with a large finite penalty (matches SoftmaxSolver)
-        if not torch.isfinite(C).all():
-            finite_mask = torch.isfinite(C)
-            if finite_mask.any():
-                penalty = C[finite_mask].abs().max().item() * 2.0 + 1.0
-            else:
-                penalty = 1e6
-            C = torch.where(finite_mask, C, torch.full_like(C, penalty))
+        # Optional cost rescaling (on the already-sanitized, finite cost).
+        C = scale_cost_matrix(cost_matrix, scale_cost)
 
         eps = float(self.epsilon)
         alpha = self.alpha

@@ -104,6 +104,28 @@ def step_monolithic(opt, closure: Callable) -> float:
     if K_eff < K:
         probes = probes[K // 2:K // 2 + 1]  # center scale, shape (1,)
 
+    # Adaptive probes: decide reuse before generating rotations. A stagnant
+    # particle reuses its previous cost row AND its previous rotation, so the
+    # reused row still matches the vertices it was evaluated at. Reuse therefore
+    # requires a cached rotation of matching shape.
+    stagnant_mask = opt._get_stagnant_mask(P)
+    _can_reuse = (
+        stagnant_mask is not None
+        and opt._prev_cost_matrix is not None
+        and opt._prev_cost_matrix.shape == (P, V)
+        and opt._prev_rot_mats is not None
+        and opt._prev_rot_mats.shape == (P, pdim, pdim)
+        and opt._prev_k_eff == K_eff
+        and opt._prev_step_r == step_r
+    )
+    if _can_reuse:
+        active_mask = ~stagnant_mask
+        active_indices = torch.where(active_mask)[0]
+        P_active = active_indices.shape[0]
+    else:
+        active_indices = None
+        P_active = P
+
     # 2. Generate rotation matrices: (P, pdim, pdim)
     rot_mats = get_random_rotation_matrices(
         P, pdim, device=device, dtype=X.dtype, generator=opt._generator,
@@ -136,6 +158,11 @@ def step_monolithic(opt, closure: Callable) -> float:
         flip = (dets < 0).unsqueeze(-1)  # (P, 1)
         rot_mats[:, :, -1] = torch.where(flip, -rot_mats[:, :, -1], rot_mats[:, :, -1])
 
+    # Stagnant particles reuse their previous rotation so the cost rows reused
+    # below describe the same vertices those rows were evaluated at.
+    if _can_reuse and P_active < P:
+        rot_mats[stagnant_mask] = opt._prev_rot_mats[stagnant_mask]
+
     # 3. Rotate + translate: X_vertices (P, V, pdim), rotated (P, V, pdim)
     X_vertices, rotated = opt._compiled.rotate_and_translate(
         rot_mats, polytope_verts, X, step_r,
@@ -150,30 +177,8 @@ def step_monolithic(opt, closure: Callable) -> float:
     # For each (i, v, k), construct a full (P, pdim) config with row i
     # replaced by X_probe[i, v, k]. Then unflatten to params and evaluate.
 
-    # Adaptive probes: Determine which particles are stagnant.
-    # Stagnant particles reuse the previous step's cost matrix row instead
-    # of recomputing. This saves V*K forward passes per stagnant particle.
-    # We use cost-row reuse (rather than per-particle probe count) because
-    # the cost evaluation loop builds flat (P*V*K) indices, making per-particle
-    # probe counts require invasive restructuring of the evaluation batching.
-    # Cost-row reuse is simpler and achieves the same forward-pass savings.
-    stagnant_mask = opt._get_stagnant_mask(P)
-    _can_reuse = (
-        stagnant_mask is not None
-        and opt._prev_cost_matrix is not None
-        and opt._prev_cost_matrix.shape == (P, V)
-        and opt._prev_k_eff == K_eff
-        and opt._prev_step_r == step_r
-    )
-
-    if _can_reuse:
-        # Only evaluate active (non-stagnant) particles
-        active_mask = ~stagnant_mask
-        active_indices = torch.where(active_mask)[0]
-        P_active = active_indices.shape[0]
-    else:
-        active_indices = None
-        P_active = P
+    # Stagnant particles (adaptive probes) reuse their previous cost row; their
+    # stagnation and reuse were decided up front, before rotation generation.
 
     # All-stagnant shortcut: reuse entire previous cost matrix, skip evaluation
     if _can_reuse and P_active == 0:
@@ -331,8 +336,10 @@ def step_monolithic(opt, closure: Callable) -> float:
             and opt._prev_predicted_improvement is not None
             and opt._prev_pre_step_loss is not None):
         current_loss_proxy = cost_matrix.min(dim=1).values.mean().item()
+        # Sign convention matches update_trust_region and predicted improvement:
+        # negative means loss decreased.
         actual_improvement = torch.tensor(
-            [opt._prev_pre_step_loss - current_loss_proxy]
+            [current_loss_proxy - opt._prev_pre_step_loss]
         )
         from .quadratic_model import update_trust_region
         opt._trust_region_multiplier = update_trust_region(
@@ -415,16 +422,17 @@ def step_monolithic(opt, closure: Callable) -> float:
         # ('mean'/'max_cost'/float/None) matches the non-fused solvers; the
         # kernel then runs on the already-scaled cost (scale_cost_mean=False).
         scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
-        X_new_fused, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
+        X_new_fused, transport_matrix, _ent_cost_tensor = opt._compiled.fused_softmax_project(
             scaled_cost, ot_epsilon, state.a,
             opt._polytope_vertices, rot_mats, step_r, X,
             scale_cost_mean=False,
         )
-        ent_cost = ent_cost_tensor.item()  # .item() OUTSIDE compiled boundary
+        # The fused entropic cost is unused on the monolithic path (state.costs
+        # tracks cost_matrix.mean), so skip the per-step device-to-host sync.
         ot_result = SolverResult(
-            matrix=transport_matrix, cost=ent_cost,
+            matrix=transport_matrix, cost=0.0,
             f=None, g=None, converged=True, n_iters=1,
-            ent_reg_cost=ent_cost,
+            ent_reg_cost=0.0,
         )
     else:
         # Forward the previous solve's epsilon so SinkhornSolver
@@ -546,6 +554,8 @@ def step_monolithic(opt, closure: Callable) -> float:
         state.X = X_bary
 
     # 9a. Newton refinement: post-OT correction using quadratic model
+    # Tracks whether a post-solve move (refinement) makes the solve's duals stale.
+    _duals_invalidated = False
     if (opt._newton_refinement
             and opt._prev_losses_3d is not None
             and K_eff >= 2
@@ -558,18 +568,17 @@ def step_monolithic(opt, closure: Callable) -> float:
             probe_radius=probe_r,
             pdim=pdim,
             rot_mats=rot_mats,
+            X_current=X,
             alpha=opt._newton_refinement_alpha,
             max_step_norm=step_r * 0.5,
             hessian_reg=1e-4,
         )
         if torch.isfinite(X_refined).all():
             state.X = X_refined
-            # Newton refinement moved particles - dual potentials from
-            # the previous Sinkhorn solve encode the old positions and
-            # are now stale. Reset to avoid warm-starting from wrong
-            # potentials on the next step.
-            state.f = None
-            state.g = None
+            # Newton refinement moved particles, so the solve's dual potentials
+            # encode the old positions. Mark them stale so the dual-save block
+            # below does not warm-start the next step from them.
+            _duals_invalidated = True
 
     # 9b. CMA-ES updates
     if opt._cma_subspace and (opt.use_covariance_adaptation or opt.use_csa):
@@ -792,6 +801,7 @@ def step_monolithic(opt, closure: Callable) -> float:
     if opt._adaptive_probes:
         opt._prev_displacement_sqnorms = per_particle_disp_sqnorms.detach()
         opt._prev_cost_matrix = cost_matrix.detach()
+        opt._prev_rot_mats = rot_mats.detach()
         opt._prev_k_eff = K_eff
         opt._prev_step_r = step_r
     # 11-MF. Multi-fidelity screening: store cost matrix for next step's
@@ -800,8 +810,9 @@ def step_monolithic(opt, closure: Callable) -> float:
         opt._prev_cost_matrix = cost_matrix.detach()
         opt._prev_k_eff = K_eff
         opt._prev_step_r = step_r
-    # Save duals for warm-starting; reset if NaN reversion occurred
-    if _nan_reverted:
+    # Save duals for warm-starting; reset if the step reverted on NaN or a
+    # post-solve refinement moved the particles (duals now encode old positions).
+    if _nan_reverted or _duals_invalidated:
         state.f = None
         state.g = None
         # Also clear momentum history - can't extrapolate from invalid state
@@ -889,11 +900,7 @@ def step_monolithic(opt, closure: Callable) -> float:
             # Increment absorb count
             state.absorb_count += 1
             # Invalidate cached cost/probe state (cost landscape changed after absorb)
-            opt._prev_cost_matrix = None
-            opt._prev_losses_3d = None
-            opt._prev_displacement_sqnorms = None
-            opt._prev_k_eff = None
-            opt._prev_step_r = None
+            opt._invalidate_reuse_cache()
             opt._newton_direction = None
             opt._prev_descent_direction = None
             opt._prev_descent_direction_finite = False
@@ -952,9 +959,10 @@ def step_monolithic(opt, closure: Callable) -> float:
             state.g = None
             state.prev_prev_f = None
             state.prev_prev_g = None
-            # Invalidate EMA transport direction (cost geometry changed)
+            # Invalidate EMA transport direction and reuse cache (geometry changed)
             opt._transport_direction_ema = None
             opt._transport_direction = None
+            opt._invalidate_reuse_cache()
 
     # 11a-2. HybridSubspace: displacement tracking, absorb, and rotation
     # Similar to AdaptiveSubspace but uses per-layer projections dict
@@ -1010,11 +1018,7 @@ def step_monolithic(opt, closure: Callable) -> float:
             # Increment absorb count
             state.absorb_count += 1
             # Invalidate cached cost/probe state (cost landscape changed after absorb)
-            opt._prev_cost_matrix = None
-            opt._prev_losses_3d = None
-            opt._prev_displacement_sqnorms = None
-            opt._prev_k_eff = None
-            opt._prev_step_r = None
+            opt._invalidate_reuse_cache()
             opt._newton_direction = None
             opt._prev_descent_direction = None
             opt._prev_descent_direction_finite = False
@@ -1037,9 +1041,10 @@ def step_monolithic(opt, closure: Callable) -> float:
                 state.g = None
                 state.prev_prev_f = None
                 state.prev_prev_g = None
-                # Invalidate EMA transport direction (cost geometry changed)
+                # Invalidate EMA transport direction and reuse cache (geometry changed)
                 opt._transport_direction_ema = None
                 opt._transport_direction = None
+                opt._invalidate_reuse_cache()
             state.hybrid_projections = new_projections
             # Build fused block-diagonal projection for fast reconstruct_batch
             if hasattr(hybrid_sub, 'build_fused_projection'):
@@ -1062,9 +1067,10 @@ def step_monolithic(opt, closure: Callable) -> float:
         state.g = None
         state.prev_prev_f = None
         state.prev_prev_g = None
-        # Invalidate EMA transport direction (cost geometry changed)
+        # Invalidate EMA transport direction and reuse cache (geometry changed)
         opt._transport_direction_ema = None
         opt._transport_direction = None
+        opt._invalidate_reuse_cache()
 
     # 11c. Rank schedule transition check
     if opt._rank_schedule is not None and opt.subspace is not None:

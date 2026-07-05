@@ -150,6 +150,7 @@ def apply_newton_refinement(
     probe_radius: float,
     pdim: int,
     rot_mats: torch.Tensor,
+    X_current: torch.Tensor,
     alpha: float = 0.3,
     max_step_norm: float = 1.0,
     hessian_reg: float = 1e-4,
@@ -165,7 +166,7 @@ def apply_newton_refinement(
     1. Extract FD gradient and diagonal Hessian from losses_3d (rotated frame)
     2. Compute Newton step in rotated frame: delta_rot = -g / (H + reg)
     3. Transform Newton step to original space: delta_orig = rot_mats @ delta_rot
-    4. Compute Newton-corrected position: X_newton = X_bary + delta_orig
+    4. Newton-predicted minimum from the probe center: X_newton = X_current + delta_orig
     5. Blend: X_refined = (1 - alpha) * X_bary + alpha * X_newton
 
     Args:
@@ -175,6 +176,9 @@ def apply_newton_refinement(
         probe_radius: Probe distance multiplier.
         pdim: Particle dimension (number of orthoplex directions).
         rot_mats: Rotation matrices, shape (P, pdim, pdim).
+        X_current: Probe-center position the quadratic model is built around,
+            shape (P, pdim). The Newton step is measured from here, so the
+            predicted minimum is X_current + delta_orig.
         alpha: Blending weight. 0 = pure OT, 1 = pure Newton correction.
         max_step_norm: Maximum Newton correction norm (trust region bound).
         hessian_reg: Regularization for near-zero Hessian entries.
@@ -197,10 +201,12 @@ def apply_newton_refinement(
     # rot_mats: (P, pdim, pdim), delta_rot: (P, pdim)
     delta_orig = torch.einsum("bij,bj->bi", rot_mats, delta_rot)
 
-    # 4. Newton-corrected position
-    X_newton = X_bary + delta_orig
+    # 4. Newton-predicted minimum, anchored at the probe center X_current (the
+    # point the quadratic is built around). X_bary already carries the transport
+    # step, so anchoring the Newton step there would double-count that move.
+    X_newton = X_current + delta_orig
 
-    # 5. Blend
+    # 5. Blend the OT result with the Newton prediction
     X_refined = (1.0 - alpha) * X_bary + alpha * X_newton
 
     return X_refined

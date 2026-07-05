@@ -164,6 +164,77 @@ def test_trust_region_adapts_radius():
 
 
 
+def test_trust_region_expands_on_accurate_prediction():
+    """A correct improvement prediction must not shrink the trust region.
+
+    The ratio uses negative = improvement; feeding the wrong sign made an
+    accurate improving step read as a failure and collapse the radius to the
+    floor. A genuine expansion (multiplier > 1.0) is only reachable when the
+    signs agree.
+    """
+    model, make_closure = _make_model_and_closure()
+    opt = PolyStepOptimizer(
+        model, particle_dim=2, epsilon=0.5,
+        use_quadratic_model=True, trust_region=True,
+        biased_rotation=True, num_probe=3,
+        max_iterations=12, seed=42,
+    )
+    closure = make_closure(opt)
+    for _ in range(12):
+        opt.step(closure)
+
+    assert len(opt._state.trust_region_multipliers) > 0
+    assert max(opt._state.trust_region_multipliers) > 1.0
+
+
+def test_newton_refinement_invalidates_warmstart_duals():
+    """When Newton refinement moves particles after the solve, the solve's dual
+    potentials are stale and must not be kept as the next warm start."""
+    # Baseline: plain Sinkhorn keeps its duals for warm starting.
+    model, make_closure = _make_model_and_closure()
+    base = PolyStepOptimizer(
+        model, particle_dim=2, epsilon=0.5, solver="sinkhorn",
+        num_probe=3, max_iterations=3, seed=42,
+    )
+    base.step(make_closure(base))
+    assert base._state.f is not None
+
+    # Same solver, but refinement moves particles after the solve, so the duals
+    # encode old positions and must be cleared instead of kept.
+    model2, make_closure2 = _make_model_and_closure()
+    ref = PolyStepOptimizer(
+        model2, particle_dim=2, epsilon=0.5, solver="sinkhorn",
+        use_quadratic_model=True, newton_refinement=True,
+        num_probe=3, max_iterations=3, seed=42,
+    )
+    ref.step(make_closure2(ref))
+    assert ref._state.f is None
+    assert ref._state.g is None
+
+
+def test_adaptive_probes_reuses_rotation_for_stagnant_particles():
+    """A stagnant particle reuses its previous rotation so its reused cost row
+    stays consistent with the vertices that row was evaluated at."""
+    model, make_closure = _make_model_and_closure()
+    opt = PolyStepOptimizer(
+        model, particle_dim=2, epsilon=0.5,
+        adaptive_probes=True, adaptive_probes_threshold=1e9,  # force all stagnant
+        num_probe=3, max_iterations=10, seed=42,
+    )
+    closure = make_closure(opt)
+
+    # First step cannot reuse (no history yet) but stores the rotations.
+    opt.step(closure)
+    assert opt._prev_rot_mats is not None
+    rot_after_first = opt._prev_rot_mats.clone()
+
+    # Second step: all particles stagnant, so rotations (and cost rows) are
+    # reused unchanged rather than resampled.
+    opt.step(closure)
+    torch.testing.assert_close(opt._prev_rot_mats, rot_after_first)
+    assert torch.isfinite(opt._state.X).all()
+
+
 def test_multifidelity_screening_runs():
     """Multi-fidelity screening should complete without errors."""
     model, make_closure = _make_model_and_closure()

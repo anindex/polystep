@@ -199,6 +199,7 @@ def test_newton_refinement_alpha_one_moves_toward_minimum():
         probe_radius=probe_radius,
         pdim=pdim,
         rot_mats=rot_mats,
+        X_current=X_bary,
         alpha=1.0,
         max_step_norm=10.0,
         hessian_reg=1e-4,
@@ -208,6 +209,44 @@ def test_newton_refinement_alpha_one_moves_toward_minimum():
     # With alpha=1.0, X_refined = X_bary + Newton step
     # Newton step = -g/H = [-1.5, 0.4]
     # So X_refined should be close to [-1.5, 0.4] (the minimum)
+    expected_minimum = torch.tensor([[-1.5, 0.4]])
+    torch.testing.assert_close(X_refined, expected_minimum, atol=1e-3, rtol=1e-3)
+
+
+def test_newton_refinement_anchors_at_probe_center_not_x_bary():
+    """The Newton step is measured from the probe center X_current, so when
+    X_bary differs the refinement does not double-count the OT move."""
+    from polystep.quadratic_model import apply_newton_refinement
+
+    pdim = 2
+    P = 1
+    K = 5
+    scales = torch.linspace(0, 1, K + 2)[1:K + 1]
+    probe_radius = 1.0
+
+    # Quadratic centered at the probe center (origin); minimum at -g/H = [-1.5, 0.4].
+    true_grad = torch.tensor([[3.0, -2.0]])
+    true_hess = torch.tensor([[2.0, 5.0]])
+    losses_3d = _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P)
+
+    X_current = torch.zeros(P, pdim)      # probe center
+    X_bary = torch.tensor([[0.5, 0.5]])   # OT result, offset from the center
+    rot_mats = torch.eye(pdim).unsqueeze(0).expand(P, -1, -1)
+
+    # alpha=1.0 must land at X_current + delta = [-1.5, 0.4] (the true minimum),
+    # not X_bary + delta = [-1.0, 0.9].
+    X_refined = apply_newton_refinement(
+        X_bary=X_bary,
+        losses_3d=losses_3d,
+        scales=scales,
+        probe_radius=probe_radius,
+        pdim=pdim,
+        rot_mats=rot_mats,
+        X_current=X_current,
+        alpha=1.0,
+        max_step_norm=10.0,
+        hessian_reg=1e-4,
+    )
     expected_minimum = torch.tensor([[-1.5, 0.4]])
     torch.testing.assert_close(X_refined, expected_minimum, atol=1e-3, rtol=1e-3)
 
@@ -235,6 +274,7 @@ def test_newton_refinement_alpha_zero_returns_unchanged():
         probe_radius=probe_radius,
         pdim=pdim,
         rot_mats=rot_mats,
+        X_current=X_bary,
         alpha=0.0,
         max_step_norm=10.0,
         hessian_reg=1e-4,
@@ -266,6 +306,7 @@ def test_newton_refinement_alpha_blending():
         probe_radius=probe_radius,
         pdim=pdim,
         rot_mats=rot_mats,
+        X_current=X_bary,
         alpha=0.3,
         max_step_norm=10.0,
         hessian_reg=1e-4,
@@ -302,6 +343,7 @@ def test_newton_refinement_handles_near_zero_hessian():
         probe_radius=probe_radius,
         pdim=pdim,
         rot_mats=rot_mats,
+        X_current=X_bary,
         alpha=1.0,
         max_step_norm=1.0,
         hessian_reg=1e-4,
@@ -338,6 +380,7 @@ def test_newton_refinement_respects_max_step_norm():
         probe_radius=probe_radius,
         pdim=pdim,
         rot_mats=rot_mats,
+        X_current=X_bary,
         alpha=1.0,
         max_step_norm=0.5,
         hessian_reg=1e-4,

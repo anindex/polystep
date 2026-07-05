@@ -34,8 +34,6 @@ cd experiments/runners
 bash run_all_paper.sh
 ```
 
-Estimated runtime: 8–10 GPU hours on RTX 5090.
-
 ## Individual Experiments
 
 ### Non-Differentiable Showcases (SNN, INT8, Argmax, Staircase)

@@ -473,6 +473,9 @@ class PolyStepOptimizer:
         self._prev_displacement_sqnorms: Optional[torch.Tensor] = None
         # Previous cost matrix rows for reuse by stagnant particles
         self._prev_cost_matrix: Optional[torch.Tensor] = None
+        # Previous rotation matrices: stagnant particles reuse theirs so a reused
+        # cost row still describes the vertices it was evaluated at.
+        self._prev_rot_mats: Optional[torch.Tensor] = None
         # Track K_eff and step_r to invalidate _prev_cost_matrix on change
         self._prev_k_eff: Optional[int] = None
         self._prev_step_r: Optional[float] = None
@@ -1045,6 +1048,19 @@ class PolyStepOptimizer:
             return None
         return stagnant
 
+    def _invalidate_reuse_cache(self) -> None:
+        """Drop the cached cost rows, rotations, and probe state used by
+        adaptive-probe reuse. Call whenever the cost geometry changes (subspace
+        rotation or absorb, rank transition), since a reused row would then
+        describe stale directions.
+        """
+        self._prev_cost_matrix = None
+        self._prev_rot_mats = None
+        self._prev_losses_3d = None
+        self._prev_displacement_sqnorms = None
+        self._prev_k_eff = None
+        self._prev_step_r = None
+
     # ------------------------------------------------------------------
     # Fused inplace evaluation (EGGROLL-inspired)
     # ------------------------------------------------------------------
@@ -1255,10 +1271,7 @@ class PolyStepOptimizer:
                              dtype=state.X.dtype) / num_points
 
         # Clear stale adaptive probe state (shape changed with new rank)
-        self._prev_cost_matrix = None
-        self._prev_k_eff = None
-        self._prev_step_r = None
-        self._prev_displacement_sqnorms = None
+        self._invalidate_reuse_cache()
         self._transport_direction_ema = None
         self._transport_direction = None
         self._newton_direction = None

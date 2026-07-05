@@ -14,8 +14,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
-      - run: ruff check src/polystep/
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
+      - run: pip install ruff==0.15.12
+      - run: ruff check src/polystep/ tests/
 
   test:
     runs-on: ubuntu-latest
@@ -27,6 +29,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
       - run: pip install -e ".[dev]"
       - name: Core library tests
-        run: pytest tests/ -v -m "not slow and not gpu" --timeout=120 -x
+        run: pytest tests/ -v -m "not slow and not gpu" --timeout=120 -x --cov=polystep --cov-report=term-missing

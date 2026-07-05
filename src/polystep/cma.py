@@ -294,20 +294,16 @@ def update_covariance_diagonal(
     """Update diagonal covariance with rank-one and rank-mu terms.
 
     Implements the sep-CMA-ES diagonal covariance update (Ros & Hansen,
-    PPSN 2008). The rank-mu term squares Mahalanobis-normalized
-    displacements ``y_{k,j} = displacement_{k,j} / sqrt(C_diag_j)`` so that
-    well-scaled coordinates contribute on equal footing with poorly-scaled
-    ones; without this normalization the diagonal can drift toward whatever
-    coordinate happened to have the largest raw displacement.
+    PPSN 2008). The rank-mu term squares the sigma-normalized displacements
+    ``y_{k,j} = (x_{k,j} - m_j) / sigma`` supplied by the caller. This matches
+    the canonical formula and the rank-one term, which uses ``p_c`` accumulated
+    from the same sigma-normalized displacements.
 
     Formula:
         C_diag[j] = h_factor * (1 - c_1 - c_mu) * C_diag[j]
                   + c_1 * p_c[j]^2
                   + c_mu * sum_k w_k * y_{k,j}^2
         h_factor  = 1.0 if h_sigma else (1 - c_1 * c_c * (2 - c_c))
-
-    ``p_c`` is itself accumulated in Mahalanobis-normalized form by
-    ``update_evolution_path_c`` so its rank-one contribution is consistent.
 
     Args:
         C_diag: Current diagonal covariance, shape ``(subspace_dim,)``.
@@ -330,14 +326,13 @@ def update_covariance_diagonal(
         Ros & Hansen, "A Simple Modification in CMA-ES Achieving Linear
         Time and Space Complexity", PPSN 2008.
     """
-    # Rank-one update: p_c is already Mahalanobis-normalized.
+    # Rank-one update from the covariance evolution path.
     rank_one = p_c ** 2
 
-    # Rank-mu update: square Mahalanobis-normalized displacements
-    # y_{k,j} = displacement_{k,j} / sqrt(C_diag_j).
-    sqrt_C = C_diag.clamp(min=1e-12).sqrt()
-    y = displacements / sqrt_C  # (num_particles, subspace_dim)
-    rank_mu = (weights[:, None] * (y ** 2)).sum(dim=0)
+    # Rank-mu update: canonical sep-CMA-ES squares the sigma-normalized
+    # displacements y_k = (x_k - m)/sigma (already normalized by the caller),
+    # the same quantity p_c accumulates, so both terms share one scale.
+    rank_mu = (weights[:, None] * (displacements ** 2)).sum(dim=0)
 
     h_factor = 1.0 if h_sigma else (1 - c_1 * c_c * (2 - c_c))
 

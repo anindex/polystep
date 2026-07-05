@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Dict, Iterable
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -126,43 +126,8 @@ def stack_module_params(
     return stacked
 
 
-def _linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """Apply per-candidate linear layer to tensors shaped ``(N, R, D)``."""
-
-    return torch.einsum("nrd,nod->nro", x, weight) + bias.unsqueeze(1)
-
-
-def taxi_logits_from_stacked_params(
-    stacked_params: Dict[str, torch.Tensor],
-    states: torch.Tensor,
-    *,
-    num_states: int = 500,
-) -> torch.Tensor:
-    """Evaluate a stacked Taxi policy for candidate/state batches.
-
-    Args:
-        stacked_params: parameters from ``DiscreteMLPPolicy`` with leading
-            candidate dimension.
-        states: integer Taxi states with shape ``(N, R)``.
-        num_states: one-hot state count.
-
-    Returns:
-        Logits with shape ``(N, R, 6)``.
-    """
-
-    obs = torch.nn.functional.one_hot(states.long(), num_classes=num_states).to(dtype=torch.float32)
-    first = torch.tanh(_linear(obs, stacked_params["net.0.weight"], stacked_params["net.0.bias"]))
-    return _linear(first, stacked_params["net.2.weight"], stacked_params["net.2.bias"])
-
-
 def count_stacked_candidates(stacked_params: Dict[str, torch.Tensor]) -> int:
     """Return the leading candidate dimension for a stacked parameter dict."""
 
     first = next(iter(stacked_params.values()))
     return int(first.shape[0])
-
-
-def named_trainable_parameters(module: nn.Module) -> Iterable[tuple[str, nn.Parameter]]:
-    """Small wrapper to keep runner code independent of policy internals."""
-
-    return module.named_parameters()

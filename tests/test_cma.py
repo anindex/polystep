@@ -443,6 +443,27 @@ class TestCovarianceUpdate:
         expected = 0.8 * 1.0 + c_mu * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 
+    def test_rank_mu_uses_raw_sigma_normalized_displacements(self):
+        """Rank-mu squares the sigma-normalized displacement directly, with no
+        extra sqrt(C) (Mahalanobis) scaling, matching canonical sep-CMA-ES."""
+        n = 8
+        C_diag = torch.ones(n) * 4.0  # a Mahalanobis y would divide by sqrt(4)=2
+        p_c = torch.zeros(n)
+        displacements = torch.ones(1, n) * 2.0
+        weights = torch.ones(1)
+        c_1 = 0.0
+        c_mu = 0.2
+        c_c = 0.1
+
+        # rank_mu = w * disp^2 = 4 (not (disp / sqrt(C))^2 = 1)
+        # C_new = 1.0 * (1 - 0 - 0.2) * 4 + 0.2 * 4 = 3.2 + 0.8 = 4.0
+        C_new = update_covariance_diagonal(
+            C_diag, p_c, displacements, weights,
+            c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c,
+        )
+        expected = 0.8 * 4.0 + c_mu * 4.0
+        assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
+
     def test_h_sigma_false_dampens_update(self):
         """When h_sigma=False, h_factor < 1 dampens covariance retention."""
         n = 16
