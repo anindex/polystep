@@ -234,18 +234,21 @@ def update_step_size_csa(
     d_sigma: float,
     n: int,
     p_sigma_norm: float | None = None,
+    expected_norm: float | None = None,
 ) -> float:
     """Update step-size using CSA (Cumulative Step-size Adaptation) formula.
 
     CSA adapts the step-size based on the length of the evolution path p_sigma.
-    If ||p_sigma|| > E[||N(0,I)||], the step-size is increased (not exploring
-    enough). If ||p_sigma|| < E[||N(0,I)||], the step-size is decreased
-    (exploring too much/backtracking).
+    If ||p_sigma|| exceeds its expected norm the step-size is increased (not
+    exploring enough); below it, the step-size is decreased.
 
     Formula (CMA-ES Tutorial Eq. 7):
-        sigma^(g+1) = sigma^(g) * exp((c_sigma / d_sigma) * (||p_sigma|| / E[||N(0,I)||] - 1))
+        sigma^(g+1) = sigma^(g) * exp((c_sigma / d_sigma) * (||p_sigma|| / E - 1))
 
-    where E[||N(0,I)||] = sqrt(n) * (1 - 1/(4n) + 1/(21n^2)).
+    Canonical CMA-ES uses ``E = E[||N(0,I)||] = sqrt(n)``, valid for Gaussian
+    mutations. OT barycentric steps are far smaller, so passing ``expected_norm``
+    (a running mean of ||p_sigma||) calibrates CSA to the OT scale and prevents
+    sigma from collapsing every generation. Falls back to the Gaussian value.
 
     Args:
         sigma: Current step-size.
@@ -255,6 +258,8 @@ def update_step_size_csa(
         n: Subspace dimension.
         p_sigma_norm: Pre-computed ``||p_sigma||`` as a Python float. When
             provided, skips the internal ``torch.norm(...).item()`` sync.
+        expected_norm: Norm to compare ||p_sigma|| against. Defaults to the
+            Gaussian ``sqrt(n)`` value when None.
 
     Returns:
         Updated step-size, clamped to [1e-6, 100.0] for numerical stability.
@@ -262,8 +267,9 @@ def update_step_size_csa(
     References:
         Hansen CMA-ES Tutorial (arXiv:1604.00772), Equation 7.
     """
-    # Expected norm of N(0,I) in n dimensions
-    expected_norm = math.sqrt(n) * (1.0 - 1.0 / (4 * n) + 1.0 / (21 * n**2))
+    if expected_norm is None:
+        expected_norm = math.sqrt(n) * (1.0 - 1.0 / (4 * n) + 1.0 / (21 * n**2))
+    expected_norm = max(expected_norm, 1e-8)
     if p_sigma_norm is None:
         p_sigma_norm = torch.norm(p_sigma).item()
 
@@ -281,8 +287,7 @@ def update_step_size_csa(
 def update_covariance_diagonal(
     C_diag: torch.Tensor,
     p_c: torch.Tensor,
-    displacements: torch.Tensor,
-    weights: torch.Tensor,
+    rank_mu: torch.Tensor,
     c_1: float,
     c_mu: float,
     h_sigma: bool,
@@ -291,24 +296,20 @@ def update_covariance_diagonal(
     """Update diagonal covariance with rank-one and rank-mu terms.
 
     Implements the sep-CMA-ES diagonal covariance update (Ros & Hansen,
-    PPSN 2008). The rank-mu term squares the sigma-normalized displacements
-    ``y_{k,j} = (x_{k,j} - m_j) / sigma`` supplied by the caller. This matches
-    the canonical formula and the rank-one term, which uses ``p_c`` accumulated
-    from the same sigma-normalized displacements.
+    PPSN 2008). The caller supplies ``rank_mu``, the weighted mean of squared
+    sigma-normalized offspring steps ``sum_k w_k * y_{k,j}^2`` per coordinate.
+    It shares the sigma-normalized scale of the rank-one path ``p_c``.
 
     Formula:
-        C_diag[j] = old_coeff * C_diag[j]
-                  + c_1 * p_c[j]^2
-                  + c_mu * sum_k w_k * y_{k,j}^2
+        C_diag[j] = old_coeff * C_diag[j] + c_1 * p_c[j]^2 + c_mu * rank_mu[j]
         old_coeff = (1 - c_1 - c_mu) + (0 if h_sigma else c_1 * c_c * (2 - c_c))
 
     Args:
         C_diag: Current diagonal covariance, shape ``(subspace_dim,)``.
         p_c: Covariance evolution path, shape ``(subspace_dim,)``.
-        displacements: Per-particle displacements normalized by ``sigma``
-            (not by ``sqrt(C_diag)``), shape ``(num_particles, subspace_dim)``.
-        weights: Particle weights, shape ``(num_particles,)``, summing to
-            approximately ``1.0``.
+        rank_mu: Weighted squared offspring steps per coordinate, sigma-
+            normalized (not divided by ``sqrt(C_diag)``), shape
+            ``(subspace_dim,)``.
         c_1: Learning rate for rank-one update.
         c_mu: Learning rate for rank-mu update.
         h_sigma: Heaviside flag (``True`` if ``p_sigma`` healthy).
@@ -325,11 +326,6 @@ def update_covariance_diagonal(
     """
     # Rank-one update from the covariance evolution path.
     rank_one = p_c**2
-
-    # Rank-mu update: canonical sep-CMA-ES squares the sigma-normalized
-    # displacements y_k = (x_k - m)/sigma (already normalized by the caller),
-    # the same quantity p_c accumulates, so both terms share one scale.
-    rank_mu = (weights[:, None] * (displacements**2)).sum(dim=0)
 
     # sep-CMA-ES old-covariance coefficient. When the Heaviside h_sigma is 0
     # (step-size path stalled), the missing rank-one mass c_1*c_c*(2-c_c) is

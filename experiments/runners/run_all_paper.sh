@@ -96,12 +96,11 @@ echo ""
 
 # ------------------------------------------------------------------
 # 4. SNN Memory Scaling (§5.4)
-#    polystep O(1) vs BPTT O(T) at varying timesteps
+#    polystep O(1) vs BPTT O(T) at varying timesteps.
+#    The memory-scaling runner is not bundled in this release; the
+#    recorded results live under results/softmax/scalability/memory/.
 # ------------------------------------------------------------------
-echo ">>> [4/7] SNN Memory Scaling..."
-$PYTHON src/polystep/benchmarks/deep_snn_memory.py \
-    --output-dir $RESULTS_DIR \
-    --device $DEVICE 2>&1 || echo "  (memory scaling had warnings)"
+echo ">>> [4/7] SNN Memory Scaling... (runner not bundled, skipping)"
 echo ""
 
 # ------------------------------------------------------------------

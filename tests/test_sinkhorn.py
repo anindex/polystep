@@ -595,6 +595,28 @@ class TestAdaptiveOmega:
         assert torch.isfinite(result.g).all(), "g contains NaN or Inf"
         assert result.converged or result.n_iters > 0, "Solver produced no iterations"
 
+    def test_ill_conditioned_stays_finite(self):
+        """On a stiff cost the divergence back-off latches, so adaptive omega
+        cannot re-raise itself into a runaway; the plan stays valid."""
+        torch.manual_seed(0)
+        n = 20
+        C = torch.full((n, n), 10.0)
+        C[:, 0] = 0.0  # one vastly cheaper column stresses overrelaxation
+
+        solver = SinkhornSolver(
+            epsilon=0.01,
+            max_iterations=500,
+            threshold=1e-8,
+            check_every=10,
+            compile=False,
+            adaptive_omega=True,
+        )
+        result = solver.solve(C)
+
+        assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all()
+        a = torch.ones(n) / n
+        assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-3)
+
     def test_valid_marginals(self):
         """adaptive_omega=True produces valid transport plan."""
         torch.manual_seed(42)
@@ -750,8 +772,10 @@ class TestFixedModeLogic:
         )
         result = solver.solve(C)
 
-        # In fixed mode, solver runs all max_iterations without convergence check
-        assert not result.converged, "With threshold=0, solver should be in fixed mode and not report convergence"
+        # Fixed mode runs every iteration (no early stop) and reports success
+        # on a finite result so ProgressiveEpsilon does not inflate epsilon.
+        assert result.n_iters == 100
+        assert result.converged
 
     def test_threshold_zero_warns_about_anderson(self):
         """threshold <= 0 with anderson_depth > 0 emits a warning."""

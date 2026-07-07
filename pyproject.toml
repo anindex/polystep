@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "polystep"
-version = "0.4.0"
+version = "0.5.0"
 description = "PyTorch PolyStep Optimizer - gradient-free neural network training via entropic optimal transport"
 authors = [{name = "An T. Le"}]
 license = {text = "Apache-2.0"}
@@ -43,7 +43,7 @@ dev = [
     "pytest-timeout>=2.2",
     "pytest-rerunfailures>=14.0",
     "pytest-cov>=5.0",
-    "ruff>=0.15",
+    "ruff>=0.15.12",
 ]
 # Full experiment reproduction (paper results, ablations, baselines)
 experiments = [

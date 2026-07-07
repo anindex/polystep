@@ -96,6 +96,9 @@ class SolverState:
     sigma: float = 1.0
     generation: int = 0
     use_csa: bool = False
+    # Running mean of ||p_sigma|| that calibrates CSA to the OT step scale,
+    # which is far below the sqrt(n) a Gaussian mutation would give.
+    csa_norm_ema: Optional[float] = None
     # Dual potential momentum
     prev_prev_f: Optional[torch.Tensor] = None
     prev_prev_g: Optional[torch.Tensor] = None
@@ -128,7 +131,7 @@ class PolyStep:
     Example::
 
         from polystep.solver import PolyStep
-        from polystep.costs import Ackley
+        from polystep import Ackley
 
         objective = Ackley(dim=10)
         solver = PolyStep.create(objective, epsilon=0.5, max_iterations=100)

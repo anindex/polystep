@@ -6,7 +6,7 @@ import pytest
 
 from polystep import ParamLayout, PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
-from polystep.geometry import get_random_rotation_matrices
+from polystep.geometry import apply_biased_rotation, get_random_rotation_matrices
 
 
 # ---------------------------------------------------------------------------
@@ -19,42 +19,21 @@ class TestBiasedRotationDet:
 
     @pytest.mark.parametrize("pdim", [2, 3, 4, 8])
     def test_biased_rotation_preserves_det(self, pdim):
-        """After replacing column 0 + Gram-Schmidt + det fix, det must be +1."""
+        """The production apply_biased_rotation must return proper rotations
+        (det = +1, orthonormal) after biasing the first axis."""
         P = 50
         gen = torch.Generator().manual_seed(42)
-        rot_mats = get_random_rotation_matrices(
-            P,
-            pdim,
-            device="cpu",
-            dtype=torch.float32,
-            generator=gen,
-        )
+        rot_mats = get_random_rotation_matrices(P, pdim, device="cpu", dtype=torch.float32, generator=gen)
 
-        # Simulate biased rotation (same as optimizer.py)
         bias_dir = torch.randn(P, pdim)
-        bias_norms = torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
-        bias_dir_norm = bias_dir / bias_norms
-        rot_mats_orig = rot_mats.clone()
-        rot_mats[:, :, 0] = bias_dir_norm
+        bias_dir_norm = bias_dir / torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
+        biased = apply_biased_rotation(rot_mats, bias_dir_norm)
 
-        for col in range(1, pdim):
-            v = rot_mats[:, :, col].clone()
-            for prev_col in range(col):
-                proj = (v * rot_mats[:, :, prev_col]).sum(dim=-1, keepdim=True)
-                v = v - proj * rot_mats[:, :, prev_col]
-            raw_norm = torch.norm(v, dim=-1, keepdim=True)
-            norms_v = raw_norm.clamp(min=1e-10)
-            mask = (raw_norm > 1e-6).float()
-            rot_mats[:, :, col] = mask * (v / norms_v) + (1 - mask) * rot_mats_orig[:, :, col]
-
-        # THE FIX: det correction
-        dets = torch.det(rot_mats)
-        flip = (dets < 0).unsqueeze(-1)
-        rot_mats[:, :, -1] = torch.where(flip, -rot_mats[:, :, -1], rot_mats[:, :, -1])
-
-        dets_final = torch.det(rot_mats)
-        assert (dets_final > 0).all(), f"Found {(dets_final < 0).sum()} reflections out of {P}"
-        assert torch.allclose(dets_final, torch.ones(P), atol=1e-3)
+        dets = torch.det(biased)
+        assert (dets > 0).all(), f"Found {(dets < 0).sum()} reflections out of {P}"
+        assert torch.allclose(dets, torch.ones(P), atol=1e-3)
+        gram = biased.transpose(-1, -2) @ biased
+        assert torch.allclose(gram, torch.eye(pdim).expand(P, -1, -1), atol=1e-4)
 
 
 # ---------------------------------------------------------------------------

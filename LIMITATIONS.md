@@ -118,8 +118,7 @@ restrictions apply.
 - **SST-2 transformer from scratch**: collapses to near-random
   accuracy.
 - **GPT-2 124M all-parameter fine-tune**
-  (`src/polystep/benchmarks/gpt2_feasibility.py`,
-  `experiments/runners/run_gpt2_finetune.py`): collapses to random
+  (`experiments/runners/run_gpt2_finetune.py`): collapses to random
   predictions when projected to 128-dim subspace (ratio 1e-6, well
   below the 1e-5 floor - see Sparse JL warning above). Only head-only
   fine-tune is functional.

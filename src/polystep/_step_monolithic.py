@@ -14,7 +14,7 @@ import torch
 from .costs import scale_cost_matrix
 from .solvers._prelude import sanitize_cost
 from .dynamics import apply_momentum, compute_momentum_coefficient, update_adaptive_radius
-from .geometry import get_random_rotation_matrices
+from .geometry import apply_biased_rotation, get_random_rotation_matrices
 from .solvers import SinkhornSolver
 from .solvers.base import SolverResult
 from .adaptive_subspace import AdaptiveSubspace
@@ -24,7 +24,6 @@ from .cma import (
     compute_heaviside_sigma,
     update_evolution_path_c,
     update_covariance_diagonal,
-    compute_ot_weights,
     update_step_size_csa,
 )
 
@@ -149,24 +148,7 @@ def step_monolithic(opt, closure: Callable) -> float:
         bias_dir = opt._prev_descent_direction  # (P, pdim)
         bias_norms = torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
         bias_dir_norm = bias_dir / bias_norms  # (P, pdim)
-        # Save original rotation matrices BEFORE modification for fallback
-        rot_mats_orig = rot_mats.clone()
-        # Replace column 0 with normalized bias direction
-        rot_mats[:, :, 0] = bias_dir_norm
-        # Re-orthogonalize via QR decomposition (vectorized, replaces Python loop)
-        # QR on the transposed matrix: columns of rot_mats are rows of rot_mats^T
-        # QR preserves column 0 direction (bias), orthogonalizes the rest
-        Q, _ = torch.linalg.qr(rot_mats)
-        # Fall back to original for any batch element where QR produced NaN
-        # (degenerate case: bias direction nearly parallel to other columns)
-        valid = torch.isfinite(Q).all(dim=-1).all(dim=-1)  # (P,)
-        rot_mats = torch.where(valid[:, None, None], Q, rot_mats_orig)
-
-        # Fix determinant: QR can produce det=-1 matrices.
-        # Correct by flipping the last column for matrices with det < 0.
-        dets = torch.det(rot_mats)
-        flip = (dets < 0).unsqueeze(-1)  # (P, 1)
-        rot_mats[:, :, -1] = torch.where(flip, -rot_mats[:, :, -1], rot_mats[:, :, -1])
+        rot_mats = apply_biased_rotation(rot_mats, bias_dir_norm)
 
     # Stagnant particles reuse their previous rotation so the cost rows reused
     # below describe the same vertices those rows were evaluated at.
@@ -353,6 +335,10 @@ def step_monolithic(opt, closure: Callable) -> float:
     # solver paths -- the fused softmax scales this same sanitized tensor.
     cost_matrix = sanitize_cost(cost_matrix)
 
+    # Raw cost for next step's contrast/trust-region baseline; dampening below
+    # only shapes the current OT solve.
+    raw_cost_matrix = cost_matrix
+
     # Deferred trust-region update: the cost matrix at this step is evaluated
     # at the particle position produced by the *previous* step. Comparing the
     # prediction stored on the previous step against this step's pre-OT min cost
@@ -399,6 +385,7 @@ def step_monolithic(opt, closure: Callable) -> float:
                 # Dampen: blend dampened vertices toward row mean
                 row_mean = cost_matrix.mean(dim=1, keepdim=True)  # (P, 1)
                 dampen_factor = 0.8  # blend 80% toward mean
+                cost_matrix = cost_matrix.clone()
                 cost_matrix[:, vertex_dampen] = (1 - dampen_factor) * cost_matrix[
                     :, vertex_dampen
                 ] + dampen_factor * row_mean.expand_as(cost_matrix)[:, vertex_dampen]
@@ -487,24 +474,13 @@ def step_monolithic(opt, closure: Callable) -> float:
             converged=ot_result.converged,
         )
 
-    # 7b. Save pre-step subspace coords for displacement tracking (+ 13)
-    # Needed for: AdaptiveSubspace displacement history AND CMA evolution paths
-    # Declare unconditionally, populate conditionally
+    # 7b. Save pre-step subspace coords for AdaptiveSubspace displacement
+    # history and CMA evolution paths. Declared here, populated conditionally.
     _pre_step_sub_coords = None
-    _pre_step_particle_coords = None  # Per-particle coords for rank-mu
 
     if opt._adaptive or opt._hybrid or (opt._cma_subspace and (opt.use_covariance_adaptation or opt.use_csa)):
         sub_dim = opt.subspace.subspace_dim
         _pre_step_sub_coords = state.X.reshape(-1)[:sub_dim].clone()
-
-    # For rank-mu: store per-particle subspace coordinates
-    # Each particle's contribution to the subspace coordinate vector
-    if opt._cma_subspace and opt.use_covariance_adaptation:
-        # state.X is (P, particle_dim), reshape to get subspace view
-        # The subspace coords are the flattened X truncated to sub_dim
-        # For per-particle tracking, we need each particle's position
-        # We store the full X for per-particle displacement computation
-        _pre_step_particle_coords = state.X.clone()  # (P, particle_dim)
 
     # 7c. Capture X_vertices and X for OT-bias rotation
     # ORDERING: This capture MUST happen:
@@ -566,7 +542,7 @@ def step_monolithic(opt, closure: Callable) -> float:
                     fd_hess,
                     newton_rot,
                 ).detach()  # (P,)
-                opt._prev_pre_step_loss = cost_matrix.min(dim=1).values.mean().item()
+                opt._prev_pre_step_loss = raw_cost_matrix.min(dim=1).values.mean().item()
         else:
             # Fallback: OT descent direction (original biased_rotation)
             transport_weights = ot_result.matrix  # (P, V)
@@ -641,21 +617,7 @@ def step_monolithic(opt, closure: Callable) -> float:
         post_step_coords = state.X.reshape(-1)[:sub_dim]
         raw_displacement = post_step_coords - _pre_step_sub_coords
 
-        # Normalize displacement for CMA-ES evolution paths.
-        #
-        # CMA-ES expects ||normalized_displacement|| ≈ sqrt(n) for well-calibrated
-        # step-size. OT-based optimization produces much smaller displacements
-        # (typically 1-5% of polytope size), so we need to scale appropriately.
-        #
-        # For OT-based optimization, the standard CMA-ES evolution path
-        # mechanism doesn't work well because:
-        # 1. OT displacement is much smaller than CMA mutations
-        # 2. The displacement-sigma relationship is nonlinear in OT
-        #
-        # We use a simplified approach: normalize displacement by sigma
-        # as in standard CMA-ES, and let the CSA update rule work with
-        # bounded adjustments. The exponent clamp in cma.py prevents
-        # extreme sigma changes.
+        # Sigma-normalize the step, as in CMA-ES.
         normalized_displacement = raw_displacement / state.sigma
 
         # 1. Update p_sigma (step-size evolution path) using normalized displacement
@@ -667,11 +629,16 @@ def step_monolithic(opt, closure: Callable) -> float:
             mu_eff=opt._cma_params["mu_eff"],
         )
 
-        # 2. Compute Heaviside for stall detection
+        # 2. Compute Heaviside for stall detection. Compare ||p_sigma|| to its
+        # running mean, then fold the current norm in. This tracks the OT step
+        # scale instead of the Gaussian sqrt(n), which OT never reaches.
         p_sigma_norm = torch.norm(state.p_sigma).item()
+        prev_ema = state.csa_norm_ema
+        csa_expected_norm = max(prev_ema if prev_ema is not None else p_sigma_norm, 1e-8)
+        state.csa_norm_ema = p_sigma_norm if prev_ema is None else 0.9 * prev_ema + 0.1 * p_sigma_norm
         h_sigma = compute_heaviside_sigma(
             p_sigma_norm=p_sigma_norm,
-            expected_norm=opt._cma_params["expected_norm"],
+            expected_norm=csa_expected_norm,
             n=sub_dim,
             c_sigma=opt._cma_params["c_sigma"],
             generation=state.generation,
@@ -686,80 +653,35 @@ def step_monolithic(opt, closure: Callable) -> float:
             mu_eff=opt._cma_params["mu_eff"],
         )
 
-        # 4. Update diagonal covariance with full rank-mu (if enabled)
+        # 4. Update diagonal covariance with rank-mu (if enabled)
         if opt.use_covariance_adaptation:
-            # FULL RANK-MU: Compute actual per-particle displacements
-            # Each particle i moved from _pre_step_particle_coords[i] to state.X[i]
-            # These per-particle displacements inform the rank-mu covariance update
-            P_count = state.X.shape[0]
-            pdim_local = state.X.shape[1]
-
-            # Per-particle displacement: (P, particle_dim)
-            particle_displacements = state.X - _pre_step_particle_coords
-
-            # Project per-particle displacements to subspace dimension
-            # The subspace coordinate vector is (sub_dim,) flattened from (P, pdim)
-            # Each particle contributes pdim elements, so we reshape accordingly
-            # For rank-mu, we need (P, sub_dim) displacement vectors
-            # Strategy: Each particle's displacement in its particle_dim space
-            # contributes to the overall subspace displacement pattern
-
-            # Compute per-particle contribution to subspace displacement
-            # Tile particle displacements to match subspace dimension per particle
-            # sub_dim = P * pdim (approximately, truncated)
-            if sub_dim >= P_count * pdim_local:
-                # Full coverage: each particle's displacement maps directly
-                # Pad to sub_dim per particle for consistent shape
-                per_particle_sub_disp_full = torch.zeros(P_count, sub_dim, device=state.X.device, dtype=state.X.dtype)
-                # Vectorized scatter: build (P, pdim_local) index tensor for column positions
-                row_idx = torch.arange(P_count, device=state.X.device)
-                col_offsets = torch.arange(pdim_local, device=state.X.device).unsqueeze(0)  # (1, pdim_local)
-                col_idx = row_idx.unsqueeze(1) * pdim_local + col_offsets  # (P, pdim_local)
-                # Clamp to sub_dim and mask out-of-bounds columns
-                valid_mask = col_idx < sub_dim
-                col_idx = col_idx.clamp(max=sub_dim - 1)
-                src = particle_displacements[:, :pdim_local] * valid_mask
-                per_particle_sub_disp_full.scatter_(1, col_idx, src)
-            else:
-                # sub_dim < P*pdim: distribute particles across available dimensions
-                per_particle_sub_disp_full = torch.zeros(P_count, sub_dim, device=state.X.device, dtype=state.X.dtype)
-                dims_per_particle = max(1, sub_dim // P_count)
-                # Vectorized scatter: build (P, dims_per_particle) index tensor
-                row_idx = torch.arange(P_count, device=state.X.device)
-                col_offsets = torch.arange(dims_per_particle, device=state.X.device).unsqueeze(0)
-                col_idx = row_idx.unsqueeze(1) * dims_per_particle + col_offsets  # (P, dims_per_particle)
-                # Clamp to sub_dim and mask out-of-bounds columns
-                valid_mask = col_idx < sub_dim
-                col_idx = col_idx.clamp(max=sub_dim - 1)
-                src = particle_displacements[:, :dims_per_particle] * valid_mask
-                per_particle_sub_disp_full.scatter_(1, col_idx, src)
-
-            # Normalize per-particle displacements by sigma (same as mean displacement)
-            normalized_per_particle_disp = per_particle_sub_disp_full / state.sigma
-
-            # Compute OT-informed weights for rank-mu update
-            # Particles that transported more mass should have higher influence
-            ot_weights = compute_ot_weights(ot_result.matrix)
+            # Rank-mu offspring are the polytope vertices; the transport masses
+            # are the recombination weights. Each subspace coordinate belongs to
+            # one particle, so its variance is the transport-weighted mean of its
+            # V squared vertex steps, laid out to match the flattened C_diag.
+            vertex_steps = (X_vertices - X.unsqueeze(1)) / state.sigma  # (P, V, pdim)
+            transport = ot_result.matrix  # (P, V)
+            recomb = transport / transport.sum(dim=1, keepdim=True).clamp(min=1e-12)
+            rank_mu_local = (recomb.unsqueeze(-1) * vertex_steps**2).sum(dim=1)  # (P, pdim)
+            rank_mu = rank_mu_local.reshape(-1)[:sub_dim]
 
             state.C_diag = update_covariance_diagonal(
                 C_diag=state.C_diag,
                 p_c=state.p_c,
-                displacements=normalized_per_particle_disp,  # (P, sub_dim) normalized by sigma
-                weights=ot_weights,
+                rank_mu=rank_mu,
                 c_1=opt._cma_params["c_1"],
                 c_mu=opt._cma_params["c_mu"],
                 h_sigma=h_sigma,
                 c_c=opt._cma_params["c_c"],
             )
-            # Enforce bounds
             state.C_diag = torch.clamp(
                 state.C_diag,
                 opt._cma_params["cov_min"],
                 opt._cma_params["cov_max"],
             )
 
-        # 5. Update step-size via CSA (if enabled). Pass p_sigma_norm
-        # from the Heaviside check above to skip a redundant .item() sync.
+        # 5. Update step-size via CSA (if enabled). Reuse p_sigma_norm and the
+        # calibrated expected norm from the Heaviside check above.
         if opt.use_csa:
             state.sigma = update_step_size_csa(
                 sigma=state.sigma,
@@ -768,6 +690,7 @@ def step_monolithic(opt, closure: Callable) -> float:
                 d_sigma=opt._cma_params["d_sigma"],
                 n=sub_dim,
                 p_sigma_norm=p_sigma_norm,
+                expected_norm=csa_expected_norm,
             )
             # Floor sigma to prevent collapse to zero
             state.sigma = max(state.sigma, 1e-6)
@@ -820,7 +743,9 @@ def step_monolithic(opt, closure: Callable) -> float:
             opt._transport_direction = None  # NaN step, no valid direction
             opt._transport_direction_ema = None
         else:
-            raw_direction = (state.X - X).detach()
+            # Pure OT step from X_bary, not state.X: momentum and Newton are
+            # applied separately, so the coasting direction must not re-carry them.
+            raw_direction = (X_bary - X).detach()
             opt._transport_direction = raw_direction
             # EMA blend: smooth transport direction across OT steps
             alpha = opt.amortize_ema
@@ -846,14 +771,14 @@ def step_monolithic(opt, closure: Callable) -> float:
     # for next step's stagnation detection and cost-row reuse
     if opt._adaptive_probes:
         opt._prev_displacement_sqnorms = per_particle_disp_sqnorms.detach()
-        opt._prev_cost_matrix = cost_matrix.detach()
+        opt._prev_cost_matrix = raw_cost_matrix.detach()
         opt._prev_rot_mats = rot_mats.detach()
         opt._prev_k_eff = K_eff
         opt._prev_step_r = step_r
     # 11-MF. Multi-fidelity screening: store cost matrix for next step's
     # direction contrast analysis (independent of adaptive probes)
     if opt.multifidelity_screen and not opt._adaptive_probes:
-        opt._prev_cost_matrix = cost_matrix.detach()
+        opt._prev_cost_matrix = raw_cost_matrix.detach()
         opt._prev_k_eff = K_eff
         opt._prev_step_r = step_r
     # Save duals for warm-starting; reset if the step reverted on NaN or a

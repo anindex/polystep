@@ -344,6 +344,29 @@ def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
     )
 
 
+def test_sinkhorn_anderson_overrelaxed_stays_valid():
+    """Anderson with overrelaxation (omega>1) on an ill-conditioned cost stays
+    valid: the ridge solve and previous-iterate gate keep the dual from
+    regressing where the plain SOR step is not monotone."""
+    P, V = 32, 64
+    C = _gaussian_cost(P, V, scale=10.0)
+    solver = SinkhornSolver(
+        epsilon=0.1,
+        max_iterations=3000,
+        threshold=1e-4,
+        omega=1.5,
+        anderson_depth=5,
+        check_every=10,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = solver.solve(C)
+
+    assert torch.isfinite(res.f).all() and torch.isfinite(res.g).all()
+    a = torch.ones(P) / P
+    assert torch.allclose(res.matrix.sum(dim=1), a, atol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # Anderson restart on epsilon change (per-call history)
 # ---------------------------------------------------------------------------

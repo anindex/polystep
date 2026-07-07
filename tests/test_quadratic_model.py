@@ -259,6 +259,41 @@ def test_newton_refinement_anchors_at_probe_center_not_x_bary():
     torch.testing.assert_close(X_refined, expected_minimum, atol=1e-3, rtol=1e-3)
 
 
+def test_newton_refinement_gate_falls_back_when_blend_worse():
+    """When a clipped Newton step lands at a worse modeled point than the OT
+    step, the descent gate keeps X_bary instead of the ascent blend."""
+    from polystep.quadratic_model import apply_newton_refinement
+
+    pdim = 2
+    P = 1
+    K = 5
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
+    probe_radius = 1.0
+
+    # Steep quadratic with minimum at [-10, -10]; probe center at origin.
+    true_grad = torch.tensor([[10.0, 10.0]])
+    true_hess = torch.tensor([[1.0, 1.0]])
+    losses_3d = _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P)
+
+    X_current = torch.zeros(P, pdim)
+    X_bary = torch.tensor([[-10.0, -10.0]])  # OT already sits near the minimum
+    rot_mats = torch.eye(pdim).unsqueeze(0).expand(P, -1, -1)
+
+    X_refined = apply_newton_refinement(
+        X_bary=X_bary,
+        losses_3d=losses_3d,
+        scales=scales,
+        probe_radius=probe_radius,
+        pdim=pdim,
+        rot_mats=rot_mats,
+        X_current=X_current,
+        alpha=1.0,
+        max_step_norm=0.5,  # clips Newton far short of the minimum
+        hessian_reg=1e-4,
+    )
+    torch.testing.assert_close(X_refined, X_bary)
+
+
 def test_newton_refinement_alpha_zero_returns_unchanged():
     """apply_newton_refinement with alpha=0.0 returns X unchanged."""
     from polystep.quadratic_model import apply_newton_refinement

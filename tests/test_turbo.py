@@ -216,6 +216,33 @@ def test_ema_transport_direction_stored():
     assert not torch.equal(dir_after_1, dir_after_2)
 
 
+def test_amortize_with_momentum_stays_finite():
+    """Momentum and amortized coasting together must not compound: the coasting
+    direction is the pure OT step, so the trajectory stays finite and descends."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
+    optimizer = PolyStepOptimizer(
+        model,
+        epsilon=0.5,
+        step_radius=0.5,
+        compile=False,
+        seed=0,
+        amortize_steps=3,
+        use_momentum=True,
+    )
+    inputs = torch.randn(16, 4)
+    targets = torch.randn(16, 2)
+    loss_fn = nn.MSELoss()
+    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
+
+    def closure(batched_params):
+        return evaluator.evaluate(batched_params, inputs, targets)
+
+    losses = [optimizer.step(closure) for _ in range(24)]
+    assert all(torch.isfinite(torch.tensor(x)) for x in losses)
+    assert min(losses) < losses[0]
+
+
 def test_momentum_step_reuses_last_cost():
     """Momentum step should apply EMA direction and reuse last OT cost (no forward pass)."""
     torch.manual_seed(42)

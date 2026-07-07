@@ -148,7 +148,8 @@ def _barycentric_projection(
     Returns:
         Updated particle positions of shape (batch, dim).
     """
-    weights = transport_matrix / a.unsqueeze(-1)
+    # Clamp guards a user-supplied zero marginal from dividing by zero.
+    weights = transport_matrix / a.clamp(min=1e-12).unsqueeze(-1)
     X_new = torch.einsum("bkd,bk->bd", X_vertices, weights)
     return X_new
 

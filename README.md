@@ -84,7 +84,24 @@ optimizer = PolyStepOptimizer(
 train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 ```
 
-See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST, and a Loihi 2 on-chip adaptation skeleton.
+### Drop-in gradient-free optimizer (ask/tell)
+
+PolyStep also exposes the `ask`/`tell` interface used by evolution-strategy libraries, so it drops into ES benchmark harnesses (evosax, NeuroEvoBench) and any black-box loop:
+
+```python
+import torch
+from polystep import PolyStepES
+
+es = PolyStepES(dim=20, epsilon=0.1, step_radius=0.3, x0=torch.full((20,), 2.0))
+for _ in range(300):
+    candidates = es.ask()           # (popsize, dim) points to evaluate
+    es.tell(objective(candidates))  # lower fitness is better
+print(es.best_fitness, es.mean)
+```
+
+[`experiments/bench_ask_tell.py`](experiments/bench_ask_tell.py) compares it head-to-head with a Gaussian ES on the standard synthetic suite under a matched evaluation budget.
+
+See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST, a Loihi 2 on-chip adaptation skeleton, and STE-free binary-net training vs OpenAI-ES.
 
 <table>
   <tr>
@@ -147,6 +164,7 @@ Across the non-differentiable tasks PolyStep wins by 10-60+ points against the o
 - **Sub-linear memory**: forward-only evaluation, no BPTT activation tape (~30x savings at long SNN horizons).
 - **CMA-ES inspired adaptation** of subspace rotations.
 - **MLP fast path** using batched `torch.bmm` instead of vmap for pure-MLP `nn.Sequential` models.
+- **Ask/tell API**: `PolyStepES` drops into evosax / NeuroEvoBench-style ES harnesses and black-box loops.
 
 ## Limitations
 
@@ -161,7 +179,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for the full discussion.
 ```
 src/polystep/          Core library (optimizer, solvers, subspaces, geometry)
 tests/                 Unit, integration, and regression tests
-examples/              6 runnable demos (quickstart, SNN, RL, MAX-SAT, MNIST, Loihi 2)
+examples/              7 runnable demos (quickstart, SNN, RL, MAX-SAT, MNIST, Loihi 2, STE-free binary net)
 experiments/           Paper reproduction: runners, results, baselines
 docs/                  API overview, reproducibility guide
 ```
@@ -170,7 +188,7 @@ docs/                  API overview, reproducibility guide
 
 | Resource | Description |
 |----------|-------------|
-| [`examples/`](examples/) | 6 runnable demos with output figures |
+| [`examples/`](examples/) | 7 runnable demos with output figures |
 | [`experiments/`](experiments/) | Full paper reproduction harness |
 | [`docs/api_overview.md`](docs/api_overview.md) | API reference |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | Known limitations |

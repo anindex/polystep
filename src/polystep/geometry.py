@@ -223,6 +223,30 @@ def get_random_rotation_matrices(
     return Q
 
 
+def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir_norm: torch.Tensor) -> torch.Tensor:
+    """Bias the first rotation axis toward ``bias_dir_norm`` and re-orthonormalize.
+
+    Replaces column 0 with the unit bias direction, re-orthonormalizes via QR,
+    and flips the last column where needed so det = +1 (a proper rotation).
+    Batch elements where QR is non-finite fall back to the input rotation.
+
+    Args:
+        rot_mats: Rotation matrices of shape (batch, dim, dim).
+        bias_dir_norm: Unit bias directions of shape (batch, dim).
+
+    Returns:
+        Biased rotation matrices of shape (batch, dim, dim), det = +1.
+    """
+    biased = rot_mats.clone()
+    biased[:, :, 0] = bias_dir_norm
+    Q, _ = torch.linalg.qr(biased)
+    valid = torch.isfinite(Q).all(dim=-1).all(dim=-1)  # (batch,)
+    out = torch.where(valid[:, None, None], Q, rot_mats)
+    flip = (torch.det(out) < 0).unsqueeze(-1)
+    out[:, :, -1] = torch.where(flip, -out[:, :, -1], out[:, :, -1])
+    return out
+
+
 def get_sobol_rotation_matrices(
     batch: int,
     dim: int,

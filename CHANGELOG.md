@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0 - 2026-07-07
+
+### Added
+
+- `PolyStepES` and `minimize`: an ask/tell interface so PolyStep drops into
+  evolution-strategy harnesses (evosax, NeuroEvoBench) as a gradient-free optimizer.
+- `examples/07_binary_net_no_ste.py`: STE-free binary-net training, PolyStepES vs OpenAI-ES.
+- `experiments/bench_ask_tell.py`: ask/tell comparison against a Gaussian ES on the synthetic suite.
+
+### Changed
+
+- CMA covariance rank-mu now estimates per-coordinate variance from the
+  transport-weighted polytope vertices, and drops the per-step scatter allocation.
+- CSA calibrates the step-size against the running norm of the evolution path
+  instead of sqrt(n), so sigma no longer collapses on OT-scale steps.
+- Anderson acceleration uses a Tikhonov ridge solve and only accepts steps that
+  do not regress the dual objective.
+- Newton refinement keeps its step only when the quadratic model says it beats
+  the plain OT step.
+- Amortized momentum coasts along the OT step, not the OT-plus-momentum step.
+
+### Fixed
+
+- Multi-fidelity screening no longer feeds its own dampened cost back in, which
+  had permanently starved low-contrast directions.
+- Sinkhorn fixed-iteration mode reports convergence on a finite result, so
+  ProgressiveEpsilon stops inflating epsilon.
+- `adaptive_omega` no longer erases the divergence back-off within the same check.
+- Guarded the barycentric projection against a zero source marginal.
+
 ## 0.4.0 - 2026-06-21
 
 ### Added

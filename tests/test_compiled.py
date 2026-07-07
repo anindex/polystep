@@ -180,6 +180,14 @@ class TestBarycentricProjectionEquivalence:
         X_manual = torch.einsum("bkd,bk->bd", X_vertices, weights)
         torch.testing.assert_close(result_direct, X_manual)
 
+    def test_barycentric_projection_zero_marginal_is_finite(self):
+        B, V, d = 3, 4, 2
+        transport_matrix = torch.zeros(B, V)
+        a = torch.zeros(B)  # degenerate marginal
+        X_vertices = torch.randn(B, V, d)
+        result = _barycentric_projection(transport_matrix, a, X_vertices)
+        assert torch.isfinite(result).all()
+
 
 class TestSinkhornSolverCompileFlagEquivalence:
     """Test 8: SinkhornSolver compile=True vs compile=False on CPU."""

@@ -217,7 +217,16 @@ def apply_newton_refinement(
     # 5. Blend the OT result with the Newton prediction
     X_refined = (1.0 - alpha) * X_bary + alpha * X_newton
 
-    return X_refined
+    # 6. Descent gate: keep the blend only where the quadratic model predicts it
+    # is no worse than the pure-OT step, else fall back to X_bary. The model is
+    # diagonal in the rotated frame, so measure both steps there from X_current.
+    rot_mats_t = rot_mats.transpose(-1, -2)
+    ot_rot = torch.einsum("bij,bj->bi", rot_mats_t, X_bary - X_current)
+    refined_rot = torch.einsum("bij,bj->bi", rot_mats_t, X_refined - X_current)
+    pred_ot = (gradient * ot_rot + 0.5 * hessian_diag * ot_rot**2).sum(dim=-1)
+    pred_refined = (gradient * refined_rot + 0.5 * hessian_diag * refined_rot**2).sum(dim=-1)
+    accept = (pred_refined <= pred_ot).unsqueeze(-1)
+    return torch.where(accept, X_refined, X_bary)
 
 
 def update_trust_region(

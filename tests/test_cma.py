@@ -327,12 +327,9 @@ class TestCovarianceUpdate:
         n = 64
         C_diag = torch.ones(n)
         p_c = torch.randn(n)
-        displacements = torch.randn(10, n)
-        weights = torch.ones(10) / 10
+        rank_mu = torch.rand(n)
 
-        C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
-        )
+        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1)
         assert C_new.shape == C_diag.shape
 
     def test_positive_definiteness_preserved(self):
@@ -340,26 +337,19 @@ class TestCovarianceUpdate:
         n = 32
         C_diag = torch.ones(n)
         p_c = torch.randn(n)
-        displacements = torch.randn(5, n)
-        weights = torch.ones(5) / 5
+        rank_mu = torch.rand(n)
 
-        C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
-        )
+        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1)
         assert (C_new >= 1e-6).all()
 
     def test_cov_bounds_enforced(self):
         """Covariance is clamped to [1e-6, 1e6]."""
         n = 16
-        # Start with very small C_diag
         C_diag = torch.ones(n) * 1e-10
         p_c = torch.zeros(n)
-        displacements = torch.zeros(5, n)
-        weights = torch.ones(5) / 5
+        rank_mu = torch.zeros(n)
 
-        C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1
-        )
+        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1)
         assert (C_new >= 1e-6).all()
         assert (C_new <= 1e6).all()
 
@@ -368,65 +358,40 @@ class TestCovarianceUpdate:
         n = 16
         C_diag = torch.ones(n)
         p_c = torch.ones(n) * 2.0  # p_c^2 = 4
-        displacements = torch.zeros(5, n)  # No rank-mu contribution
-        weights = torch.ones(5) / 5
+        rank_mu = torch.zeros(n)
         c_1 = 0.2
         c_mu = 0.0
         c_c = 0.1
 
-        # h_sigma=True, h_factor = 1.0
-        # C_new = 1.0 * (1-0.2-0) * 1 + 0.2 * 4 + 0 = 0.8 + 0.8 = 1.6
-        C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c
-        )
+        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c)
         expected = 0.8 * 1.0 + c_1 * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 
-    def test_rank_mu_term_from_displacements(self):
-        """Rank-mu update term c_mu * sum(w_i * z_i^2) is present."""
+    def test_rank_mu_term_applied(self):
+        """Rank-mu update term c_mu * rank_mu is present."""
         n = 16
         C_diag = torch.ones(n)
-        p_c = torch.zeros(n)  # No rank-one contribution
-        # Single displacement of magnitude 2
-        displacements = torch.ones(1, n) * 2.0
-        weights = torch.ones(1)
+        p_c = torch.zeros(n)
+        rank_mu = torch.full((n,), 4.0)
         c_1 = 0.0
         c_mu = 0.2
         c_c = 0.1
 
-        # h_sigma=True, h_factor = 1.0
-        # rank_mu = w[0] * z[0]^2 = 1 * 4 = 4
-        # C_new = 1.0 * (1-0-0.2) * 1 + 0 + 0.2 * 4 = 0.8 + 0.8 = 1.6
-        C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c
-        )
+        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c)
         expected = 0.8 * 1.0 + c_mu * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 
-    def test_rank_mu_uses_raw_sigma_normalized_displacements(self):
-        """Rank-mu squares the sigma-normalized displacement directly, with no
-        extra sqrt(C) (Mahalanobis) scaling, matching canonical sep-CMA-ES."""
+    def test_rank_mu_not_rescaled_by_covariance(self):
+        """rank_mu is added raw, with no sqrt(C) (Mahalanobis) rescaling."""
         n = 8
-        C_diag = torch.ones(n) * 4.0  # a Mahalanobis y would divide by sqrt(4)=2
+        C_diag = torch.ones(n) * 4.0
         p_c = torch.zeros(n)
-        displacements = torch.ones(1, n) * 2.0
-        weights = torch.ones(1)
+        rank_mu = torch.full((n,), 4.0)
         c_1 = 0.0
         c_mu = 0.2
         c_c = 0.1
 
-        # rank_mu = w * disp^2 = 4 (not (disp / sqrt(C))^2 = 1)
-        # C_new = 1.0 * (1 - 0 - 0.2) * 4 + 0.2 * 4 = 3.2 + 0.8 = 4.0
-        C_new = update_covariance_diagonal(
-            C_diag,
-            p_c,
-            displacements,
-            weights,
-            c_1=c_1,
-            c_mu=c_mu,
-            h_sigma=True,
-            c_c=c_c,
-        )
+        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c)
         expected = 0.8 * 4.0 + c_mu * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 
@@ -436,19 +401,15 @@ class TestCovarianceUpdate:
         n = 16
         C_diag = torch.ones(n) * 2.0
         p_c = torch.zeros(n)
-        displacements = torch.zeros(5, n)
-        weights = torch.ones(5) / 5
+        rank_mu = torch.zeros(n)
         c_1 = 0.1
         c_mu = 0.1
         c_c = 0.1
 
-        # old_coeff = (1 - c_1 - c_mu) + c_1 * c_c * (2 - c_c); C_new = old_coeff * C_diag
         old_coeff = (1 - c_1 - c_mu) + c_1 * c_c * (2 - c_c)
         expected = old_coeff * 2.0
 
-        C_new = update_covariance_diagonal(
-            C_diag, p_c, displacements, weights, c_1=c_1, c_mu=c_mu, h_sigma=False, c_c=c_c
-        )
+        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=c_1, c_mu=c_mu, h_sigma=False, c_c=c_c)
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 
 

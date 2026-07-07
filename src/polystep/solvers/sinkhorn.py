@@ -284,10 +284,13 @@ class SinkhornSolver:
                 for i in range(self.max_iterations):
                     f, g = sinkhorn_iter(f, g, log_K, log_a, log_b, eps, omega)
                     n_iters = i + 1
-                # Post-loop NaN check: zero duals if solver diverged
+                # Fixed mode: a finite result is success. converged=False here
+                # would make ProgressiveEpsilon inflate epsilon.
                 if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
                     f.zero_()
                     g.zero_()
+                else:
+                    converged = True
             else:
                 # Convergence-checking path: stays fully eager with overrelaxation
                 # Anderson acceleration: ring buffer for iterate mixing
@@ -306,6 +309,9 @@ class SinkhornSolver:
                 _divergence_prev_norm = float("inf")
                 _divergence_growth_count = 0
                 _divergence_patience = 3
+                # Latch the divergence back-off so the adaptive estimator below
+                # cannot re-raise omega in the same check.
+                _omega_capped = False
 
                 def dual_objective(fv, gv):
                     # D(f,g) = <f,a> + <g,b> - eps * sum_ij exp((f_i+g_j-C_ij)/eps).
@@ -349,10 +355,23 @@ class SinkhornSolver:
                             )  # (n+m, k)
                             current_r = torch.cat([r_f, r_g])  # (n+m,)
 
-                            # Tikhonov-regularized least-squares for stability
+                            # Tikhonov-regularized least squares via the augmented
+                            # system [dR; sqrt(lambda) I] alpha = [r; 0], solved by
+                            # QR (more stable than the normal equations). lambda
+                            # scales with ||dR||^2 to track conditioning.
                             try:
-                                alpha, _, _, _ = torch.linalg.lstsq(delta_r, current_r.unsqueeze(1))
-                                alpha = alpha.squeeze(1)  # (k,)
+                                lam = 1e-8 * (delta_r * delta_r).sum().clamp(min=1e-30)
+                                aug_A = torch.cat(
+                                    [
+                                        delta_r,
+                                        torch.sqrt(lam) * torch.eye(k, device=delta_r.device, dtype=delta_r.dtype),
+                                    ],
+                                    dim=0,
+                                )
+                                aug_b = torch.cat(
+                                    [current_r, torch.zeros(k, device=delta_r.device, dtype=delta_r.dtype)]
+                                )
+                                alpha = torch.linalg.lstsq(aug_A, aug_b.unsqueeze(1)).solution.squeeze(1)  # (k,)
 
                                 # Guard against NaN/Inf and huge alpha from ill-conditioning
                                 if torch.isfinite(alpha).all() and alpha.norm() < 1e3:
@@ -371,22 +390,20 @@ class SinkhornSolver:
                                     combined = torch.cat([f_new, g_new]) - delta_x @ alpha
                                     # Validate combined result before assigning
                                     if torch.isfinite(combined).all():
-                                        # Lyapunov regression check (Chizat 2020):
-                                        # the entropic dual objective increases
-                                        # monotonically in plain Sinkhorn, so only
-                                        # accept the Anderson step when it does not
-                                        # regress vs the plain iterate. Without this
-                                        # guard acceleration can push the iterate to
-                                        # a worse Lyapunov on ill-conditioned C.
+                                        # Accept the Anderson step only when its dual
+                                        # objective beats the plain iterate and does
+                                        # not regress below the previous iterate. The
+                                        # previous-iterate gate stays monotone under
+                                        # overrelaxation, where the plain SOR step is
+                                        # not. Device-side compare avoids a sync.
                                         f_combined = combined[:n]
                                         g_combined = combined[n:]
+                                        lyap_prev = dual_objective(f, g)
                                         lyap_plain = dual_objective(f_new, g_new)
                                         lyap_combined = dual_objective(f_combined, g_combined)
-                                        # Device-side accept gate avoids a
-                                        # GPU->CPU sync per Anderson iter; the
-                                        # math is unchanged (broadcast scalar
-                                        # bool selects between the two iterates).
-                                        accept = lyap_combined >= lyap_plain - 1e-6
+                                        accept = (lyap_combined >= lyap_plain - 1e-6) & (
+                                            lyap_combined >= lyap_prev - 1e-6
+                                        )
                                         f_new = torch.where(accept, f_combined, f_new)
                                         g_new = torch.where(accept, g_combined, g_new)
                             except RuntimeError:
@@ -441,6 +458,7 @@ class SinkhornSolver:
                                         stacklevel=2,
                                     )
                                     omega = 1.0
+                                    _omega_capped = True
                                     _divergence_growth_count = 0
                             else:
                                 _divergence_growth_count = 0
@@ -451,7 +469,7 @@ class SinkhornSolver:
                         # ratio of successive marginal errors and pick the optimal
                         # overrelaxation. Converges to omega_opt instead of
                         # oscillating like a fixed step-up/step-down heuristic.
-                        if self.adaptive_omega:
+                        if self.adaptive_omega and not _omega_capped:
                             if prev_err is not None and prev_err > 1e-12 and err > 0.0:
                                 r = min(err / prev_err, 0.99)
                                 omega = 2.0 / (1.0 + math.sqrt(1.0 - r ** (1.0 / self.check_every)))

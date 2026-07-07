@@ -1,6 +1,6 @@
 """polystep: PyTorch PolyStep Optimizer."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     # Core solver
@@ -63,6 +63,9 @@ __all__ = [
     # Optimizer
     "PolyStepOptimizer",
     "RankSchedule",
+    # Ask/tell adapter
+    "PolyStepES",
+    "minimize",
     # High-level API
     "train",
     "TrainConfig",
@@ -140,6 +143,7 @@ from .blockwise import BlockConfig, create_per_layer_blocks, create_grouped_bloc
 from .dynamics import apply_momentum, update_adaptive_radius, compute_momentum_coefficient
 
 from .optimizer import PolyStepOptimizer, RankSchedule
+from .ask_tell import PolyStepES, minimize
 
 from .api import (
     train,

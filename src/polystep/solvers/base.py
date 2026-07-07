@@ -23,7 +23,8 @@ class SolverResult:
         g: Second dual potential (Sinkhorn) or None (softmax).
         converged: Whether the solver converged within tolerance.
         n_iters: Number of iterations actually run.
-        ent_reg_cost: Entropic regularized cost = <f, a> + <g, b>.
+        ent_reg_cost: Entropic regularized cost of the transport plan. For the
+            Sinkhorn dual this is <f, a> + <g, b> - eps * sum(a).
     """
 
     matrix: torch.Tensor

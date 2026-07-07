@@ -346,6 +346,72 @@ class TestOptimizerCMAIntegration:
         # p_sigma may change (unless displacement is exactly zero)
         # Just verify no errors occurred
 
+    def test_covariance_adaptation_rank_mu_updates_C_diag(self, simple_model):
+        """Rank-mu builds C_diag from transport-weighted vertex variance, so the
+        covariance adapts off the isotropic ones and stays bounded and finite."""
+        torch.manual_seed(0)
+        cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
+        opt = PolyStepOptimizer(
+            simple_model,
+            subspace=cma_sub,
+            use_covariance_adaptation=True,
+            epsilon=0.5,
+            max_iterations=10,
+            compile=False,
+        )
+        inputs = torch.randn(8, 20)
+        targets = torch.randn(8, 5)
+        loss_fn = nn.MSELoss()
+
+        def closure(batched_params):
+            N = list(batched_params.values())[0].shape[0]
+            losses = []
+            for i in range(N):
+                config = {k: v[i] for k, v in batched_params.items()}
+                simple_model.load_state_dict(config, strict=False)
+                losses.append(loss_fn(simple_model(inputs), targets).item())
+            return torch.tensor(losses)
+
+        C0 = opt.state.C_diag.clone()
+        for _ in range(4):
+            opt.step(closure)
+        C = opt.state.C_diag
+        assert torch.isfinite(C).all()
+        assert (C >= opt._cma_params["cov_min"]).all()
+        assert (C <= opt._cma_params["cov_max"]).all()
+        assert not torch.allclose(C, C0)
+
+    def test_csa_does_not_collapse_sigma(self, simple_model):
+        """CSA calibrated to the running ||p_sigma|| keeps sigma alive; the old
+        sqrt(n) normalizer drove it to the 1e-6 floor every generation."""
+        torch.manual_seed(0)
+        cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
+        opt = PolyStepOptimizer(
+            simple_model,
+            subspace=cma_sub,
+            use_csa=True,
+            epsilon=0.5,
+            max_iterations=40,
+            compile=False,
+        )
+        inputs = torch.randn(8, 20)
+        targets = torch.randn(8, 5)
+        loss_fn = nn.MSELoss()
+
+        def closure(batched_params):
+            N = list(batched_params.values())[0].shape[0]
+            losses = []
+            for i in range(N):
+                config = {k: v[i] for k, v in batched_params.items()}
+                simple_model.load_state_dict(config, strict=False)
+                losses.append(loss_fn(simple_model(inputs), targets).item())
+            return torch.tensor(losses)
+
+        sigma0 = opt.state.sigma
+        for _ in range(30):
+            opt.step(closure)
+        assert opt.state.sigma > 0.5 * sigma0
+
     def test_cma_absorb_does_not_crash(self, simple_model):
         """CMA subspace + absorb_every>0 used to hit the periodic-absorb branch
         with the wrong absorb() arity and raise TypeError; it must run cleanly."""
