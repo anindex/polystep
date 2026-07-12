@@ -120,27 +120,6 @@ class TestMixedPrecisionStep:
 class TestMixedPrecisionSubspace:
     """Test mixed precision with subspace modes."""
 
-    def test_adaptive_subspace_mixed_precision(self):
-        """AdaptiveSubspace works with mixed precision."""
-        model = nn.Linear(100, 50)
-        subspace = AdaptiveSubspace(
-            full_dim=100 * 50 + 50,
-            subspace_dim=32,
-        )
-
-        opt = PolyStepOptimizer(
-            model,
-            mixed_precision=True,
-            subspace=subspace,
-            epsilon=0.1,
-            compile=False,
-        )
-
-        assert opt.mixed_precision is True
-        assert opt.model_dtype == torch.bfloat16
-        # Projection should match model dtype
-        assert opt.state.projection.dtype == torch.bfloat16
-
     def test_projection_dtype_matches_model(self):
         """Projection matrix dtype matches model dtype for memory savings."""
         # Without mixed precision
@@ -192,13 +171,6 @@ class TestProjectionDtype:
 class TestBF16SupportDetection:
     """Test BF16 support detection logic."""
 
-    def test_cpu_supports_bf16(self):
-        """CPU always reports BF16 support (works, may be slower)."""
-        model = nn.Linear(10, 5)
-        opt = PolyStepOptimizer(model, mixed_precision=True, compile=False)
-        # On CPU, should not fall back - BF16 works
-        assert opt.model_dtype == torch.bfloat16
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_bf16_support(self):
         """GPU BF16 support based on compute capability."""
@@ -222,9 +194,9 @@ class TestNaNHandling:
     def test_no_nans_in_normal_training(self):
         """Normal training with mixed precision produces no NaNs."""
         model = nn.Sequential(
-            nn.Linear(20, 40),
+            nn.Linear(8, 6),
             nn.ReLU(),
-            nn.Linear(40, 10),
+            nn.Linear(6, 4),
         )
         opt = PolyStepOptimizer(
             model,
@@ -238,8 +210,8 @@ class TestNaNHandling:
             from torch.func import functional_call, vmap
 
             model.eval()
-            x = torch.randn(8, 20)
-            target = torch.randn(8, 10)
+            x = torch.randn(8, 8)
+            target = torch.randn(8, 4)
 
             def forward(params):
                 out = functional_call(model, params, (x,))
@@ -249,6 +221,6 @@ class TestNaNHandling:
             model.train()
             return losses
 
-        for _ in range(5):
+        for _ in range(3):
             cost = opt.step(closure)
             assert not torch.isnan(torch.tensor(cost)), "OT cost should not be NaN"

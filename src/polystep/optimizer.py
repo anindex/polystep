@@ -528,6 +528,27 @@ class PolyStepOptimizer:
         self._trust_region_multiplier = 1.0  # Multiplier on step_radius, range [0.1, 3.0]
         self._prev_predicted_improvement = None
         self._prev_pre_step_loss = None  # Per-particle min cost proxy
+        # Trust region needs the finite-difference model to form predicted-vs-actual
+        # ratios; auto-enable it (mirrors newton_refinement) and warn on the two
+        # prerequisites that would otherwise leave the multiplier frozen at 1.0.
+        if trust_region and not self.use_quadratic_model:
+            self.use_quadratic_model = True
+            logger.info(
+                "trust_region=True auto-enables use_quadratic_model=True "
+                "(needed for the predicted-vs-actual ratio test)"
+            )
+        if trust_region and num_probe < 2:
+            warnings.warn(
+                "trust_region needs num_probe>=2 to build the finite-difference model; "
+                "it stays inactive until num_probe>=2.",
+                stacklevel=2,
+            )
+        if trust_region and block_strategy != "monolithic":
+            warnings.warn(
+                f"trust_region is only applied with block_strategy='monolithic'; "
+                f"ignored for block_strategy='{block_strategy}'.",
+                stacklevel=2,
+            )
         # Multi-fidelity vertex screening: dampen low-contrast directions
         self.multifidelity_screen = multifidelity_screen
         self.screen_keep_ratio = screen_keep_ratio
@@ -585,6 +606,17 @@ class PolyStepOptimizer:
         if (use_covariance_adaptation or use_csa) and not self._cma_subspace:
             warnings.warn(
                 "use_covariance_adaptation or use_csa requires CMAAdaptiveSubspace. CMA features will be disabled."
+            )
+            use_covariance_adaptation = False
+            use_csa = False
+
+        # Validate: CMA covariance scaling and the CMA state update are wired
+        # only into the monolithic step; blockwise samples through per-block
+        # projections, so the paths/covariance never adapt there.
+        if (use_covariance_adaptation or use_csa) and self.block_strategy != "monolithic":
+            warnings.warn(
+                "use_covariance_adaptation/use_csa are only supported with block_strategy='monolithic'; "
+                f"disabled for block_strategy='{self.block_strategy}'."
             )
             use_covariance_adaptation = False
             use_csa = False

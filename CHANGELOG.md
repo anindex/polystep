@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0 - 2026-07-12
+
+### Added
+
+- `examples/08_direct_loss_minimization.py`: direct F1 minimization on an imbalanced
+  checkerboard where PolyStepES beats both a biased gradient (Adam+STE) and OpenAI-ES.
+- `experiments/runners/variant_sweep.py`: a reproducible sweep of the optimizer variants (solver, representation, block strategy,
+  adaptation flags, schedules, geometry) across nine tasks, ranked by forward-eval budget
+  with a state-mutation self-check that flags any variant whose state never changed.
+
+### Changed
+
+- CMA covariance updates use the covariance-metric offspring step `y = sqrt(C_diag) * z`,
+  so the evolution paths and rank-mu match the covariance-scaled sampling.
+- AdaptiveSubspace runs the per-step basis QR on the GPU in fp32 for CUDA targets, several
+  times faster than the previous CPU round-trip for large models.
+
+### Fixed
+
+- `SinkhornSolver` rejects `max_iterations < 1` and validates user-supplied marginals
+  (finite, nonnegative, positive mass) instead of clamping to an infeasible plan.
+- `PolyStepES` validates `dim`, `num_particles`, `epsilon`, and `step_radius` at construction.
+- CMA covariance and step-size adaptation are disabled with a warning under non-monolithic
+  block strategies, where they previously never updated.
+- `trust_region` now records its predicted improvement independent of `biased_rotation`, so
+  the step-radius multiplier adapts whenever `use_quadratic_model` and `num_probe >= 2` hold
+  instead of staying frozen at 1.0. `trust_region` also auto-enables the quadratic model.
+- Heaviside stall detection uses the correct generation index (`generation + 1`).
+
+### Removed
+
+- Dead `compute_ot_weights` export; the rank-mu path uses the transport masses directly.
+
 ## 0.5.0 - 2026-07-07
 
 ### Added

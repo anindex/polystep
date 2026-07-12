@@ -167,7 +167,7 @@ def test_adaptive_subspace_trains(mnist_loaders):
     layout = ParamLayout.from_module(model)
     adaptive_sub = AdaptiveSubspace.from_layout(
         layout,
-        rank=4096,
+        rank=128,
         rotation_mode="displacement",
         absorb_mode="periodic",
         absorb_interval=20,

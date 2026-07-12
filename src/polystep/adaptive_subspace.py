@@ -204,27 +204,27 @@ class AdaptiveSubspace:
         Returns:
             Orthogonal matrix of shape (rows, cols).
         """
-        # Generate on CPU (torch.linalg.qr is faster on CPU for moderate sizes)
-        # Handle generator device mismatch: CUDA generator can't be used with CPU tensor.
-        # Create a CPU generator seeded from the CUDA generator's state for reproducibility.
-        gen_device = "cpu"
+        # Generate Z on CPU in fp32 for reproducibility: a CUDA generator cannot
+        # drive a CPU tensor, so spawn a CPU generator seeded from it. The random
+        # stream is therefore identical on CPU and CUDA targets.
         generator = _spawn_cpu_generator(generator)
-        # QR decomposition requires FP32 on CPU (BF16 not supported for geqrf_cpu)
-        # Generate in FP32, compute QR, then convert to target dtype
-        Z = torch.randn(rows, cols, generator=generator, device=gen_device, dtype=torch.float32)
+        Z = torch.randn(rows, cols, generator=generator, device="cpu", dtype=torch.float32)
+        # QR of the tall (rows, cols) matrix dominates the per-step cost. Run it
+        # on the GPU when the target is CUDA (measured several times faster than
+        # CPU QR for large full_dim); bf16 QR is unsupported, so decompose in
+        # fp32 and cast below.
+        target_device = torch.device(device)
+        if target_device.type == "cuda":
+            Z = Z.to(target_device)
         P, R = torch.linalg.qr(Z)
-        # Fix sign ambiguity: ensure positive diagonal in R
+        # Fix sign ambiguity: positive diagonal in R (replace zeros with 1).
         d = torch.sign(torch.diagonal(R))
-        # Replace zeros with 1 (degenerate case)
         d[d == 0] = 1.0
-        P = P * d
-        # Slice to requested columns (QR may produce full Q for square input)
-        P = P[:, :cols]
-        # Convert to target dtype (e.g., BF16 for mixed precision)
+        P = (P * d)[:, :cols]  # slice in case QR returned a full square Q
         if dtype != torch.float32:
             P = P.to(dtype=dtype)
-        if str(device) != gen_device:
-            P = P.to(device=device)
+        if P.device != target_device:
+            P = P.to(device=target_device)
         return P
 
     # ------------------------------------------------------------------

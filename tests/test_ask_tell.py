@@ -41,6 +41,22 @@ def test_x0_particle_count_mismatch_raises():
         PolyStepES(4, num_particles=2, x0=torch.zeros(3, 4))
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dim": 0},
+        {"dim": 4, "num_particles": 0},
+        {"dim": 4, "epsilon": 0.0},
+        {"dim": 4, "epsilon": -1.0},
+        {"dim": 4, "step_radius": float("inf")},
+        {"dim": 4, "step_radius": -0.1},
+    ],
+)
+def test_invalid_construction_raises(kwargs):
+    with pytest.raises(ValueError):
+        PolyStepES(**kwargs)
+
+
 def test_sinkhorn_single_particle_warns():
     with pytest.warns(UserWarning):
         PolyStepES(4, num_particles=1, solver=SinkhornSolver(epsilon=0.1))

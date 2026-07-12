@@ -68,6 +68,7 @@ class TestFromLayout:
         assert sub.rank == 4
         assert sub.subspace_dim > 0
         assert sub.subspace_dim < layout.total_params  # compressed
+        assert sub.compression_ratio < 1.0
 
         # Check 2D entries are low-rank, 1D are full
         for spec in sub.specs:
@@ -118,6 +119,7 @@ class TestAutoFromLayout:
         assert sub.rank == 0  # auto mode marker
         assert sub.subspace_dim > 0
         assert sub.subspace_dim < layout.total_params
+        assert sub.compression_ratio < 1.0
 
         # Ranks should be bounded by min(auto_rank, d_in, d_out)
         for spec in sub.specs:
@@ -129,14 +131,6 @@ class TestAutoFromLayout:
                 # auto_rank >= min_rank=4, but effective_rank capped by layer dims
                 assert r <= min(64, d_in, d_out)
                 assert r <= 64  # max_rank default
-
-    def test_auto_compression_ratio(self):
-        """auto_from_layout produces significant compression (subspace << full)."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.auto_from_layout(layout)
-
-        assert sub.compression_ratio < 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -313,23 +307,6 @@ class TestOneDimParams:
 
 
 # ---------------------------------------------------------------------------
-# Test: compression ratio
-# ---------------------------------------------------------------------------
-
-
-class TestCompressionRatio:
-    def test_compression_ratio_significant(self):
-        """Subspace dimension is significantly smaller than full param count."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.from_layout(layout, rank=4)
-
-        # For a model with ~1K params, rank=4 should compress well
-        assert sub.compression_ratio < 1.0
-        assert sub.subspace_dim < layout.total_params
-
-
-# ---------------------------------------------------------------------------
 # Test: solver integration
 # ---------------------------------------------------------------------------
 
@@ -341,15 +318,16 @@ class TestSolverIntegration:
         from polystep.cost_nn import NNCostEvaluator
         from polystep.transform import ParamLayout
 
-        # Create a simple model and objective
-        model = SimpleMLP()
+        # Tiny model keeps subspace_dim small; the test checks the solver
+        # contract (iteration count, costs, displacements, X shape), not accuracy.
+        model = nn.Sequential(nn.Linear(4, 3))
         layout = ParamLayout.from_module(model)
         sub = LowRankSubspace.from_layout(layout, rank=4)
 
         # Create inputs and targets
         torch.manual_seed(0)
-        inputs = torch.randn(8, 10)
-        targets = torch.randint(0, 2, (8,)).long()
+        inputs = torch.randn(8, 4)
+        targets = torch.randint(0, 3, (8,)).long()
         loss_fn = nn.CrossEntropyLoss()
 
         # Create evaluator

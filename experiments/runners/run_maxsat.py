@@ -13,8 +13,9 @@ Methods:
   - sls: WalkSAT-style stochastic local search
 
 Each method uses the same continuous relaxation: sigmoid(assignments) with CRA
-penalty to encourage {0, 1} solutions. Function evaluation budgets are matched
-between polystep and ES methods by running polystep first and counting evals.
+penalty to encourage {0, 1} solutions. Budgets are step-matched, not eval-matched:
+ES methods get (polystep_steps * popsize) function evaluations, so polystep, which
+evaluates many polytope vertices and probes per step, uses far more evaluations.
 
 Results are saved as JSON: experiments/results/softmax/main/maxsat_{method}_{seed}.json
 

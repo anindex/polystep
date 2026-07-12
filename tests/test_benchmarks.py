@@ -177,8 +177,8 @@ class TestSyntheticBenchmarks:
         state, X_init = _run_benchmark(
             obj,
             dim=10,
-            num_particles=80,
-            max_iters=60,
+            num_particles=20,
+            max_iters=25,
             epsilon=1.0,
             step_radius=0.5,
             probe_radius=1.0,

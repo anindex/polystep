@@ -134,16 +134,6 @@ class TestSubspaceBlockFunctions:
 
         assert torch.allclose(coords, reassembled)
 
-    def test_block_particles_shapes(self):
-        """Verify block particle tensors have correct shapes."""
-        coords = torch.randn(256)
-        blocks = create_subspace_blocks(256, 4, 8)
-
-        block_particles = split_subspace_to_blocks(coords, blocks)
-
-        for i, (bp, block) in enumerate(zip(block_particles, blocks)):
-            assert bp.shape == (block.num_particles, block.particle_dim)
-
 
 # ------------------------------------------------------------------
 # Initialization tests

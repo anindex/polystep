@@ -1,6 +1,6 @@
 """polystep: PyTorch PolyStep Optimizer."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     # Core solver
@@ -51,7 +51,6 @@ __all__ = [
     # CMA
     "compute_cma_hyperparameters",
     "update_step_size_csa",
-    "compute_ot_weights",
     # Blockwise
     "BlockConfig",
     "create_per_layer_blocks",
@@ -135,7 +134,6 @@ from .cma_subspace import CMAAdaptiveSubspace
 from .cma import (
     compute_cma_hyperparameters,
     update_step_size_csa,
-    compute_ot_weights,
 )
 
 from .blockwise import BlockConfig, create_per_layer_blocks, create_grouped_blocks

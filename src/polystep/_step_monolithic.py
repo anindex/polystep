@@ -454,9 +454,10 @@ def step_monolithic(opt, closure: Callable) -> float:
     else:
         # Forward the previous solve's epsilon so SinkhornSolver
         # can rescale the warm-started duals when epsilon changed.
+        # a defaults to uniform 1/P inside the solver, which equals state.a; pass
+        # None so the solver skips the host-syncing user-marginal validation.
         solve_kwargs = dict(
             cost_matrix=cost_matrix,
-            a=state.a,
             init_f=init_f_for_solve,
             init_g=init_g_for_solve,
             scale_cost=opt.scale_cost,
@@ -491,67 +492,50 @@ def step_monolithic(opt, closure: Callable) -> float:
     _X_pre_barycentric = X.clone()  # (P, pdim) - clone to preserve pre-update state
 
     # 7d. Compute rotation bias direction
-    if opt.biased_rotation:
-        if (
-            opt.use_quadratic_model
-            and opt._prev_losses_3d is not None
-            and K_eff >= 2
-            and opt._prev_losses_3d.shape == (P, V, K_eff)
-        ):
-            # Use FD gradient from quadratic model (better signal than OT descent)
-            from .quadratic_model import extract_fd_gradient
+    # The finite-difference model feeds two independent features: biased_rotation
+    # (descent/Newton directions) and trust_region (predicted-vs-actual ratio).
+    # Build it whenever either is active so trust_region no longer needs
+    # biased_rotation to be on.
+    _quad_ready = (
+        opt.use_quadratic_model
+        and opt._prev_losses_3d is not None
+        and K_eff >= 2
+        and opt._prev_losses_3d.shape == (P, V, K_eff)
+        and opt.polytope_type == "orthoplex"  # FD extractors assume orthoplex vertex order
+    )
+    if (opt.biased_rotation or opt.trust_region) and _quad_ready:
+        from .quadratic_model import compute_newton_step, extract_fd_gradient, extract_fd_hessian_diag
 
-            fd_grad = extract_fd_gradient(
-                opt._prev_losses_3d,
-                probes,
-                probe_r,
-                pdim,
-            )  # (P, pdim) in rotated frame
-            # Transform to original space: grad_orig = rot_mats @ fd_grad
-            # rot_mats is (P, pdim, pdim), fd_grad is (P, pdim)
+        # FD gradient and diagonal Hessian in the rotated frame.
+        fd_grad = extract_fd_gradient(opt._prev_losses_3d, probes, probe_r, pdim)  # (P, pdim)
+        fd_hess = extract_fd_hessian_diag(opt._prev_losses_3d, probes, probe_r, pdim)  # (P, pdim)
+        newton_rot = compute_newton_step(fd_grad, fd_hess, max_step_norm=step_r, hessian_reg=1e-4)  # (P, pdim)
+
+        if opt.biased_rotation:
+            # Descent direction = negative gradient in original space (rot_mats @ .).
             grad_orig = torch.einsum("bij,bj->bi", rot_mats, fd_grad)  # (P, pdim)
-            # Descent direction = negative gradient
             opt._prev_descent_direction = -grad_orig.detach()
             opt._prev_descent_direction_finite = True
-            # Compute Newton direction for momentum steps
-            from .quadratic_model import extract_fd_hessian_diag, compute_newton_step
-
-            fd_hess = extract_fd_hessian_diag(
-                opt._prev_losses_3d,
-                probes,
-                probe_r,
-                pdim,
-            )  # (P, pdim) diagonal Hessian in rotated frame
-            newton_rot = compute_newton_step(
-                fd_grad,
-                fd_hess,
-                max_step_norm=step_r,
-                hessian_reg=1e-4,
-            )  # (P, pdim) Newton step in rotated frame
-            # Transform to original space
             newton_orig = torch.einsum("bij,bj->bi", rot_mats, newton_rot)
             opt._newton_direction = newton_orig.detach()
-            # Store predicted improvement and pre-step proxy loss. Both are
-            # consumed at the start of the next ``step`` call, where the
-            # actual loss reduction can be measured from the new cost matrix.
-            if opt.trust_region:
-                from .quadratic_model import compute_predicted_improvement
 
-                opt._prev_predicted_improvement = compute_predicted_improvement(
-                    fd_grad,
-                    fd_hess,
-                    newton_rot,
-                ).detach()  # (P,)
-                opt._prev_pre_step_loss = raw_cost_matrix.min(dim=1).values.mean().item()
-        else:
-            # Fallback: OT descent direction (original biased_rotation)
-            transport_weights = ot_result.matrix  # (P, V)
-            vertex_offsets = X_vertices - X.unsqueeze(1)  # (P, V, pdim)
-            weight_sums = transport_weights.sum(dim=1, keepdim=True).clamp(min=1e-10)
-            normalized_weights = transport_weights / weight_sums  # (P, V)
-            weighted_dir = (normalized_weights.unsqueeze(-1) * vertex_offsets).sum(dim=1)  # (P, pdim)
-            opt._prev_descent_direction = weighted_dir.detach()
-            opt._prev_descent_direction_finite = True
+        if opt.trust_region:
+            # Store predicted improvement and pre-step proxy loss. Both are
+            # consumed at the start of the next ``step`` call, where the actual
+            # loss reduction is measured from the new cost matrix.
+            from .quadratic_model import compute_predicted_improvement
+
+            opt._prev_predicted_improvement = compute_predicted_improvement(fd_grad, fd_hess, newton_rot).detach()
+            opt._prev_pre_step_loss = raw_cost_matrix.min(dim=1).values.mean().item()
+    elif opt.biased_rotation:
+        # Fallback: OT descent direction when the quadratic model is unavailable.
+        transport_weights = ot_result.matrix  # (P, V)
+        vertex_offsets = X_vertices - X.unsqueeze(1)  # (P, V, pdim)
+        weight_sums = transport_weights.sum(dim=1, keepdim=True).clamp(min=1e-10)
+        normalized_weights = transport_weights / weight_sums  # (P, V)
+        weighted_dir = (normalized_weights.unsqueeze(-1) * vertex_offsets).sum(dim=1)  # (P, pdim)
+        opt._prev_descent_direction = weighted_dir.detach()
+        opt._prev_descent_direction_finite = True
 
     # 8. Barycentric projection: (P, pdim)
     if opt._use_fused_softmax:
@@ -617,13 +601,18 @@ def step_monolithic(opt, closure: Callable) -> float:
         post_step_coords = state.X.reshape(-1)[:sub_dim]
         raw_displacement = post_step_coords - _pre_step_sub_coords
 
-        # Sigma-normalize the step, as in CMA-ES.
+        # Sigma-normalize the raw subspace step to the isotropic z coordinate.
         normalized_displacement = raw_displacement / state.sigma
+        # Sampling scales the projection columns by sqrt(C_diag), so the offspring
+        # step in covariance-metric coordinates is y = sqrt(C_diag) * z. The
+        # evolution paths and rank-mu are defined on y, not the raw z.
+        sqrt_C = torch.sqrt(torch.clamp(state.C_diag, min=opt._cma_params["cov_min"]))
+        y_displacement = sqrt_C * normalized_displacement
 
-        # 1. Update p_sigma (step-size evolution path) using normalized displacement
+        # 1. Update p_sigma; its internal C^{-1/2} whitens y back to z.
         state.p_sigma = update_evolution_path_sigma(
             p_sigma=state.p_sigma,
-            displacement=normalized_displacement,
+            displacement=y_displacement,
             C_diag=state.C_diag,
             c_sigma=opt._cma_params["c_sigma"],
             mu_eff=opt._cma_params["mu_eff"],
@@ -644,10 +633,10 @@ def step_monolithic(opt, closure: Callable) -> float:
             generation=state.generation,
         )
 
-        # 3. Update p_c (covariance evolution path) using normalized displacement
+        # 3. Update p_c (covariance evolution path) on the y-scaled step.
         state.p_c = update_evolution_path_c(
             p_c=state.p_c,
-            displacement=normalized_displacement,
+            displacement=y_displacement,
             h_sigma=h_sigma,
             c_c=opt._cma_params["c_c"],
             mu_eff=opt._cma_params["mu_eff"],
@@ -659,11 +648,12 @@ def step_monolithic(opt, closure: Callable) -> float:
             # are the recombination weights. Each subspace coordinate belongs to
             # one particle, so its variance is the transport-weighted mean of its
             # V squared vertex steps, laid out to match the flattened C_diag.
-            vertex_steps = (X_vertices - X.unsqueeze(1)) / state.sigma  # (P, V, pdim)
+            vertex_steps = (X_vertices - X.unsqueeze(1)) / state.sigma  # (P, V, pdim), raw z
             transport = ot_result.matrix  # (P, V)
             recomb = transport / transport.sum(dim=1, keepdim=True).clamp(min=1e-12)
             rank_mu_local = (recomb.unsqueeze(-1) * vertex_steps**2).sum(dim=1)  # (P, pdim)
-            rank_mu = rank_mu_local.reshape(-1)[:sub_dim]
+            # rank-mu is sum_v w_v * y_v^2 = C_diag * sum_v w_v * z_v^2.
+            rank_mu = state.C_diag * rank_mu_local.reshape(-1)[:sub_dim]
 
             state.C_diag = update_covariance_diagonal(
                 C_diag=state.C_diag,
@@ -888,11 +878,11 @@ def step_monolithic(opt, closure: Callable) -> float:
                 # Keep generation counter (don't reset to preserve cumulation history)
         else:
             # 4. Rotate projection basis for next step
-            # Design decision: rotate EVERY step (not every N steps) because
-            # the OT solve already provides a natural "information extraction"
-            # per step, and rotating ensures maximum exploration of the full
-            # parameter space. The computational cost of QR decomposition is
-            # negligible compared to the Sinkhorn solve.
+            # Design decision: rotate EVERY step (not every N steps) because the
+            # OT solve already provides a natural information-extraction per step,
+            # and rotating ensures maximum exploration of the full parameter space.
+            # Note: for large full_dim the basis QR/SVD dominates the step and far
+            # exceeds the tiny-V Sinkhorn solve, so it runs on the GPU in fp32.
 
             # Sparse projection: use seed increment instead of QR rotation
             from .projection import SparseRandomProjection

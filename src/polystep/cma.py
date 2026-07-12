@@ -10,6 +10,11 @@ Key adaptations for OT-based optimization:
 - Diagonal covariance only (O(n) complexity, not full O(n^2))
 - Evolution paths track cumulative information across optimization steps
 
+Sampling scales the projection columns by sqrt(C_diag), so the offspring step
+in covariance-metric coordinates is y = sqrt(C_diag) * z (z is the raw subspace
+step). The evolution paths and rank-mu are defined on y. These updates are wired
+into the monolithic step only; blockwise disables CMA (see PolyStepOptimizer).
+
 Warning - CSA Instability with OT:
     CSA (Cumulative Step-size Adaptation) may be unstable for OT-based
     optimization. In standard CMA-ES, mutations are `sigma * N(0, C)` with
@@ -39,7 +44,6 @@ __all__ = [
     "update_evolution_path_sigma",
     "update_step_size_csa",
     "update_covariance_diagonal",
-    "compute_ot_weights",
     "compute_heaviside_sigma",
     "compute_ot_bias_directions",
 ]
@@ -205,7 +209,8 @@ def compute_heaviside_sigma(
         expected_norm: Expected norm of N(0,I) in n dimensions.
         n: Subspace dimension.
         c_sigma: Cumulation factor for step-size path.
-        generation: Current generation/iteration count (1-indexed for formula).
+        generation: Count of completed generations (0-based); the formula uses
+            generation + 1 as the current generation index.
 
     Returns:
         True (h_sigma=1) if p_sigma is healthy, False (h_sigma=0) if stalled.
@@ -213,8 +218,9 @@ def compute_heaviside_sigma(
     References:
         Hansen CMA-ES Tutorial (arXiv:1604.00772), below Equation 4.
     """
-    # Use generation + 1 to handle generation=0 case
-    gen = max(1, generation)
+    # Caller passes a 0-based count of completed generations and increments it
+    # after the update, so the current generation is generation + 1.
+    gen = generation + 1
 
     # Compute threshold with cumulation correction
     # (1 - (1-c_sigma)^(2*g)) accounts for early-generation buildup
@@ -297,8 +303,9 @@ def update_covariance_diagonal(
 
     Implements the sep-CMA-ES diagonal covariance update (Ros & Hansen,
     PPSN 2008). The caller supplies ``rank_mu``, the weighted mean of squared
-    sigma-normalized offspring steps ``sum_k w_k * y_{k,j}^2`` per coordinate.
-    It shares the sigma-normalized scale of the rank-one path ``p_c``.
+    offspring steps ``sum_k w_k * y_{k,j}^2`` per coordinate, where the offspring
+    step ``y = sqrt(C_diag) * z`` is on the same covariance-metric scale as the
+    rank-one path ``p_c``.
 
     Formula:
         C_diag[j] = old_coeff * C_diag[j] + c_1 * p_c[j]^2 + c_mu * rank_mu[j]
@@ -307,9 +314,8 @@ def update_covariance_diagonal(
     Args:
         C_diag: Current diagonal covariance, shape ``(subspace_dim,)``.
         p_c: Covariance evolution path, shape ``(subspace_dim,)``.
-        rank_mu: Weighted squared offspring steps per coordinate, sigma-
-            normalized (not divided by ``sqrt(C_diag)``), shape
-            ``(subspace_dim,)``.
+        rank_mu: Weighted squared offspring steps ``sum_k w_k * y_{k,j}^2`` per
+            coordinate, with ``y = sqrt(C_diag) * z``, shape ``(subspace_dim,)``.
         c_1: Learning rate for rank-one update.
         c_mu: Learning rate for rank-mu update.
         h_sigma: Heaviside flag (``True`` if ``p_sigma`` healthy).
@@ -341,48 +347,6 @@ def update_covariance_diagonal(
 
 
 @torch.inference_mode()
-def compute_ot_weights(transport_matrix: torch.Tensor) -> torch.Tensor:
-    """Compute particle weights from OT transport plan for rank-mu update.
-
-    In standard CMA-ES, weights come from ranking (best ``mu`` out of
-    ``lambda``). Here we use the *transport entropy*: particles with
-    focused (low-entropy) transport indicate confident descent directions
-    and contribute more to the covariance update.
-
-    Row-sum mass does *not* work as a weight because, for a valid OT plan,
-    rows sum to the source marginal (uniform by default), making all
-    weights identical.
-
-    Args:
-        transport_matrix: OT transport plan of shape
-            ``(num_particles, num_vertices)``. Entry ``T[i, v]`` is the
-            mass transported from particle ``i`` to vertex ``v``.
-
-    Returns:
-        Normalized weights of shape ``(num_particles,)`` summing to ``~1.0``;
-        higher weights for particles with more focused transport.
-    """
-    # Normalize transport per particle to get a probability distribution
-    row_sums = transport_matrix.sum(dim=1, keepdim=True).clamp(min=1e-10)
-    probs = transport_matrix / row_sums  # (P, V)
-
-    # Compute per-particle transport entropy: H_i = -sum_v p(v|i) log p(v|i)
-    # Low entropy = focused transport = confident direction
-    log_probs = torch.log(probs.clamp(min=1e-30))
-    entropy = -(probs * log_probs).sum(dim=1)  # (P,)
-
-    # Convert entropy to weights: lower entropy -> higher weight
-    # Use inverse entropy (add eps to avoid division by zero for perfectly
-    # focused transport where entropy = 0)
-    weights = 1.0 / (entropy + 1e-6)
-
-    # Normalize to weights that sum to 1
-    weights = weights / (weights.sum() + 1e-10)
-
-    return weights
-
-
-@torch.inference_mode()
 def compute_ot_bias_directions(
     transport_matrix: torch.Tensor,
     X_vertices: torch.Tensor,
@@ -395,8 +359,9 @@ def compute_ot_bias_directions(
     to the transport-weighted vertex centroid, then rank particles by
     *transport entropy*: particles whose transport is concentrated on a
     single vertex have low entropy and provide the most confident descent
-    direction. The same row-sum pitfall noted in :func:`compute_ot_weights`
-    applies here, which is why entropy is used instead of mass moved.
+    direction. Row-sum mass does not work as a weight here: for a valid OT
+    plan rows sum to the source marginal, so entropy is used instead of mass
+    moved.
 
     Args:
         transport_matrix: OT transport plan of shape

@@ -302,7 +302,7 @@ class TestSolverDeterminism:
 
         obj = Ackley(dim=2)
         solver = PolyStep(objective_fn=obj, dim=2, max_iterations=5)
-        X = torch.randn(50, 2)
+        X = torch.randn(8, 2)
 
         gen1 = create_generator(seed=42, device=torch.device("cpu"))
         gen2 = create_generator(seed=42, device=torch.device("cpu"))

@@ -101,7 +101,7 @@ print(es.best_fitness, es.mean)
 
 [`experiments/bench_ask_tell.py`](experiments/bench_ask_tell.py) compares it head-to-head with a Gaussian ES on the standard synthetic suite under a matched evaluation budget.
 
-See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST, a Loihi 2 on-chip adaptation skeleton, and STE-free binary-net training vs OpenAI-ES.
+See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST, a Loihi 2 on-chip adaptation skeleton, STE-free binary-net training vs OpenAI-ES, and direct F1 minimization where PolyStep beats both a biased gradient (Adam+STE) and OpenAI-ES.
 
 <table>
   <tr>
@@ -126,19 +126,23 @@ If your model is fully differentiable, Adam/SGD will be faster and more accurate
 
 5-seed mean ± std (seeds: 42, 123, 456, 789, 1337). Hardware: NVIDIA RTX 5090.
 
-### Non-differentiable tasks (primary contribution)
+### Non-differentiable tasks
 
-| Task | PolyStep | CMA-ES | OpenAI-ES | SPSA | Non-diff op |
-|------|---------|--------|-----------|------|-------------|
-| SNN/LIF (MNIST) | **93.4% ± 0.2** | 16.2% | 33.1% | 29.4% | threshold() |
-| Int8 quantized | **97.1% ± 0.1** | 80.7% | 78.1% | - | round() |
-| Argmax attention | **86.8% ± 0.4** | - | - | - | argmax() |
-| Staircase activation | **93.2% ± 0.3** | - | - | - | floor() |
-| Hard MoE routing | **90.7% ± 0.2** | 62.8% | 63.5% | - | argmax() |
-| MAX-SAT 100K vars | **98.0% ± 0.01** | 90.1% | 88.9% | - | round() |
-| MAX-SAT 1M vars | **92.6% ± 0.02** | - | 87.8% | - | round() |
+Best accuracy (%), 5 seeds. Bold marks the best method on each row. Adam is gradient-based (backprop on a smoothed surrogate), so it is an unfair reference upper bound, not a gradient-free peer of PolyStep, CMA-ES, OpenAI-ES, and SPSA; it is shown only to bound how far the gradient-free methods sit from a gradient method. A dash means the run is not in this release.
+
+| Task | PolyStep | Adam (surrogate) | CMA-ES | OpenAI-ES | SPSA | Non-diff op |
+|------|----------|------------------|--------|-----------|------|-------------|
+| SNN/LIF (MNIST) | **93.4 ± 0.2** | 80.5 | 16.2 | 33.1 | 29.4 | threshold() |
+| Int8 quantized | 97.1 ± 0.1 | **98.1** | 80.7 | 78.1 | 91.2 | round() |
+| Argmax attention | 86.8 ± 0.4 | **89.1** | 72.6 | 75.7 | 77.7 | argmax() |
+| Staircase activation | 93.2 ± 0.3 | **97.6** | 72.8 | 85.5 | 49.3 | floor() |
+| Hard MoE routing | **90.7 ± 0.2** | - | 62.8 | 63.5 | 69.3 | argmax() |
+| MAX-SAT 100K vars | **98.0 ± 0.01** | - | 90.1 | 88.9 | - | round() |
+| MAX-SAT 1M vars | **92.6 ± 0.02** | - | - | 87.8 | - | round() |
 
 ### Differentiable sanity checks
+
+Adam here is gradient-based (backprop), an unfair reference rather than a peer; PolyStep stays gradient-free and forward-only. These rows only check that PolyStep lands close to a gradient method when gradients do exist.
 
 | Task | PolyStep | Adam | Architecture |
 |------|---------|------|--------------|
@@ -152,7 +156,7 @@ If your model is fully differentiable, Adam/SGD will be faster and more accurate
 | T=25 | 31.8 MB | 132 MB | 4.2x |
 | T=400 | 51.6 MB | 1,538 MB | **29.8x** |
 
-Across the non-differentiable tasks PolyStep wins by 10-60+ points against the other gradient-free baselines. The domain-specialized probSAT solver reaches roughly 99.6% on MAX-SAT at 100K variables (and around 98.9% at 1M variables). Among general-purpose gradient-free optimizers, PolyStep is the strongest at the configurations we tested.
+Among gradient-free optimizers PolyStep is the strongest on every task here, at 100 to 10,000x more evaluations than the ES and SPSA baselines. Against the gradient surrogate, PolyStep wins where the non-differentiability is hard (SNN hard LIF, hard MoE routing) and loses where an accurate smooth surrogate exists (int8, argmax, staircase), so its niche is hard non-differentiability rather than non-differentiability in general. On MAX-SAT the domain-specialized probSAT and WalkSAT-style SLS solvers beat every general optimizer (probSAT reaches about 99.6% at 100K variables and 98.9% at 1M); PolyStep is the strongest general-purpose gradient-free method here, not a replacement for a domain solver.
 
 ## Features
 
@@ -162,7 +166,7 @@ Across the non-differentiable tasks PolyStep wins by 10-60+ points against the o
 - **`torch.compile`** opt-in on hot paths.
 - **Vmap-safe layers**: drop-in attention and LSTM that play nicely with `torch.vmap`.
 - **Sub-linear memory**: forward-only evaluation, no BPTT activation tape (~30x savings at long SNN horizons).
-- **CMA-ES inspired adaptation** of subspace rotations.
+- **CMA-ES inspired adaptation** of subspace covariance (experimental, monolithic step only; `use_adaptive_radius` is the stable default).
 - **MLP fast path** using batched `torch.bmm` instead of vmap for pure-MLP `nn.Sequential` models.
 - **Ask/tell API**: `PolyStepES` drops into evosax / NeuroEvoBench-style ES harnesses and black-box loops.
 
@@ -170,7 +174,7 @@ Across the non-differentiable tasks PolyStep wins by 10-60+ points against the o
 
 - **Compute cost.** Roughly tens of millions of forward passes (on the SNN benchmark, around 30M) vs. tens of thousands of Adam gradient steps for the same MNIST accuracy. This is inherent to zeroth-order methods.
 - **High-dimensional NLP.** Near-random accuracy on SST-2 (4.2M parameters trained from scratch). Gradient-free methods do not scale to this regime in our experiments.
-- **Adam baseline.** On the SNN benchmark, Adam reaches around 78% test accuracy (`experiments/results/softmax/main/snn_adam_*.json`) vs. PolyStep's 93.4%. The surrogate-gradient baseline (paper §5.3) is not bundled with this release; see the arXiv preprint for the comparison.
+- **Adam baseline.** On a smoothed surrogate, Adam beats PolyStep on int8 (98.1 vs 97.1), argmax (89.1 vs 86.8), and staircase (97.6 vs 93.2), and only loses where the non-differentiability is hard (SNN hard LIF 93.4 vs 80.5; hard MoE routing). The stronger surrogate-gradient / BPTT baseline for SNNs (paper §5.3) is not bundled with this release; see the arXiv preprint.
 
 See [`LIMITATIONS.md`](LIMITATIONS.md) for the full discussion.
 
@@ -179,7 +183,7 @@ See [`LIMITATIONS.md`](LIMITATIONS.md) for the full discussion.
 ```
 src/polystep/          Core library (optimizer, solvers, subspaces, geometry)
 tests/                 Unit, integration, and regression tests
-examples/              7 runnable demos (quickstart, SNN, RL, MAX-SAT, MNIST, Loihi 2, STE-free binary net)
+examples/              8 runnable demos (quickstart, SNN, RL, MAX-SAT, MNIST, Loihi 2, STE-free binary net, direct loss minimization)
 experiments/           Paper reproduction: runners, results, baselines
 docs/                  API overview, reproducibility guide
 ```
@@ -188,7 +192,7 @@ docs/                  API overview, reproducibility guide
 
 | Resource | Description |
 |----------|-------------|
-| [`examples/`](examples/) | 7 runnable demos with output figures |
+| [`examples/`](examples/) | 8 runnable demos with output figures |
 | [`experiments/`](experiments/) | Full paper reproduction harness |
 | [`docs/api_overview.md`](docs/api_overview.md) | API reference |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | Known limitations |

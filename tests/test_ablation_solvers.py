@@ -222,19 +222,6 @@ class TestTemperedSoftmaxSolver:
 
 
 class TestShapeConsistency:
-    @pytest.mark.parametrize(
-        "solver_cls,kwargs",
-        [
-            (MinCostGreedySolver, {}),
-            (TopKMeanSolver, {"k": 3}),
-            (TemperedSoftmaxSolver, {"tau": 1.0}),
-        ],
-    )
-    def test_output_shape(self, solver_cls, kwargs, cost_matrix, source_marginal):
-        solver = solver_cls(**kwargs)
-        result = solver.solve(cost_matrix, a=source_marginal)
-        assert result.matrix.shape == cost_matrix.shape
-
     @pytest.mark.parametrize("P,V", [(1, 4), (10, 2), (50, 16), (100, 8)])
     def test_various_sizes(self, P, V):
         C = torch.rand(P, V)

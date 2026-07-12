@@ -103,6 +103,11 @@ class SinkhornSolver:
             raise ValueError(
                 f"check_every must be >= 1, got {self.check_every}. It is the modulus for periodic convergence checks."
             )
+        if self.max_iterations < 1:
+            raise ValueError(
+                f"max_iterations must be >= 1, got {self.max_iterations}. "
+                f"Zero iterations leave the duals at their init and return an infeasible plan."
+            )
 
         from .._compiled import CompiledFunctions
 

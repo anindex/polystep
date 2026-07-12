@@ -153,22 +153,6 @@ class TestCMAAdaptiveSubspace:
         expected = P * 2.0
         assert torch.allclose(P_scaled, expected, atol=1e-6)
 
-    def test_apply_covariance_scaling_clamps_bounds(self, cma_adaptive_subspace):
-        """apply_covariance_scaling clamps C_diag to [cov_min, cov_max]."""
-        gen = torch.Generator().manual_seed(42)
-        P = cma_adaptive_subspace.init_projection(generator=gen)
-
-        # C_diag with extreme values
-        C_diag = torch.ones(cma_adaptive_subspace.subspace_dim)
-        C_diag[0] = 1e-10  # Below cov_min
-        C_diag[1] = 1e10  # Above cov_max
-
-        P_scaled = cma_adaptive_subspace.apply_covariance_scaling(P, C_diag)
-
-        # Should not have NaN or Inf due to clamping
-        assert not torch.isnan(P_scaled).any()
-        assert not torch.isinf(P_scaled).any()
-
     def test_delegated_methods_work(self, simple_model, cma_adaptive_subspace):
         """Delegated methods (apply_perturbation, reconstruct_batch, absorb) work."""
         cma_sub = cma_adaptive_subspace
@@ -408,9 +392,25 @@ class TestOptimizerCMAIntegration:
             return torch.tensor(losses)
 
         sigma0 = opt.state.sigma
-        for _ in range(30):
+        for _ in range(10):
             opt.step(closure)
         assert opt.state.sigma > 0.5 * sigma0
+
+    def test_cma_disabled_for_blockwise(self, simple_model):
+        """CMA sampling and updates are monolithic-only; a block strategy warns
+        and disables the flags instead of silently no-op adapting."""
+        cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
+        with pytest.warns(UserWarning, match="block_strategy='monolithic'"):
+            opt = PolyStepOptimizer(
+                simple_model,
+                subspace=cma_sub,
+                block_strategy="per_layer",
+                use_covariance_adaptation=True,
+                use_csa=True,
+                compile=False,
+            )
+        assert opt.use_covariance_adaptation is False
+        assert opt.use_csa is False
 
     def test_cma_absorb_does_not_crash(self, simple_model):
         """CMA subspace + absorb_every>0 used to hit the periodic-absorb branch

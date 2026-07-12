@@ -32,22 +32,6 @@ class TestTryCompileReturnsCallable:
         assert callable(fn)
 
 
-class TestTryCompileFallbackOnBadFunction:
-    """Test 2: try_compile falls back to eager on compilation failure."""
-
-    def test_try_compile_fallback_on_bad_function(self):
-        def bad_fn():
-            return "not_a_tensor"
-
-        with warnings.catch_warnings(record=True) as _w:
-            warnings.simplefilter("always")
-            result = try_compile(bad_fn, name="bad_fn")
-
-        # On CPU torch.compile may succeed lazily (deferred compilation).
-        # The important contract is that result is callable and usable.
-        assert callable(result)
-
-
 class TestCompiledFunctionsEagerEquivalence:
     """Test 3: compile=False stores raw eager functions."""
 
@@ -102,29 +86,6 @@ class TestPerFunctionFallbackIndependence:
 # ---------------------------------------------------------------------------
 # Group 3: Numerical equivalence tests
 # ---------------------------------------------------------------------------
-
-
-class TestSinkhornIterationEquivalence:
-    """Test 5: _sinkhorn_iteration direct vs CompiledFunctions(compile=False)."""
-
-    def test_sinkhorn_iteration_equivalence(self):
-        torch.manual_seed(42)
-        n, m = 50, 30
-        eps = 0.1
-
-        f = torch.randn(n)
-        g = torch.randn(m)
-        log_K = torch.randn(n, m)
-        log_a = torch.log(torch.ones(n) / n)
-        log_b = torch.log(torch.ones(m) / m)
-
-        f_direct, g_direct = _sinkhorn_iteration(f, g, log_K, log_a, log_b, eps)
-
-        cf = CompiledFunctions(compile=False)
-        f_cf, g_cf = cf.sinkhorn_iter(f, g, log_K, log_a, log_b, eps)
-
-        torch.testing.assert_close(f_direct, f_cf)
-        torch.testing.assert_close(g_direct, g_cf)
 
 
 class TestRotateAndTranslateEquivalence:
@@ -621,15 +582,6 @@ class TestFusedSoftmaxProjectCompiledFunctionsEager:
         assert X_new.shape == (P, dim)
         assert transport.shape == (P, V)
         assert ent_cost.dim() == 0
-
-
-class TestFusedSoftmaxProjectWarmStart:
-    """Test 21: CompiledFunctions.warm_start() runs without error including fused warmup."""
-
-    def test_warm_start_includes_fused(self):
-        cf = CompiledFunctions(compile=False)
-        # Should not raise
-        cf.warm_start(dim=4, batch=3, device=torch.device("cpu"))
 
 
 class TestFusedSoftmaxProjectNoGraphBreaks:

@@ -63,15 +63,25 @@ def align_marginal(
     """Return a length-``n`` marginal on ``(device, dtype)``.
 
     ``None`` -> uniform ``1/n``. A provided marginal is moved onto the cost
-    tensor (a no-op when already aligned) and shape-checked. Nonnegativity /
-    mass checks are deliberately skipped to avoid a per-step host sync; the
-    integrated optimizer always supplies a valid uniform marginal.
+    tensor (a no-op when already aligned), shape-checked, and value-checked
+    (finite, nonnegative, positive total mass) so a malformed marginal fails
+    loudly instead of being silently clamped to an infeasible plan before the
+    ``log``. The value checks host-sync, so they run *only* on the user-supplied
+    path: the integrated optimizer passes ``a=None`` for its uniform marginal
+    (see :func:`solver.PolyStep.init_state`), keeping the per-step solve
+    sync-free.
     """
     if a is None:
         return torch.full((n,), 1.0 / n, device=device, dtype=dtype)
     a = a.to(device=device, dtype=dtype)
     if a.shape != (n,):
         raise ValueError(f"marginal {name} must have shape ({n},), got {tuple(a.shape)}.")
+    if not torch.isfinite(a).all():
+        raise ValueError(f"marginal {name} contains non-finite entries (NaN/Inf).")
+    if (a < 0).any():
+        raise ValueError(f"marginal {name} has negative entries; a transport marginal must be nonnegative.")
+    if not a.sum() > 0:
+        raise ValueError(f"marginal {name} has nonpositive total mass; it must sum to a positive value.")
     return a
 
 

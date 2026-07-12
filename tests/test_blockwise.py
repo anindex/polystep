@@ -154,25 +154,6 @@ class TestSplitReassemble:
 
 
 # ---------------------------------------------------------------------------
-# Per-block dual potentials tests
-# ---------------------------------------------------------------------------
-
-
-class TestBlockDuals:
-    def test_solver_state_block_duals_init(self):
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        blocks = create_per_layer_blocks(layout)
-        total_flat = sum(b.flat_end - b.flat_start for b in blocks)
-        X = torch.randn(total_flat // 2, 2)
-        state = SolverState(X=X, block_duals=[(None, None) for _ in blocks])
-        assert len(state.block_duals) == len(blocks)
-        for f, g in state.block_duals:
-            assert f is None
-            assert g is None
-
-
-# ---------------------------------------------------------------------------
 # compute_block_cost_matrix test
 # ---------------------------------------------------------------------------
 

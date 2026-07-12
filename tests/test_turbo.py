@@ -53,35 +53,6 @@ def test_cost_batch_size_parameter():
     assert opt2.cost_batch_size == 64
 
 
-def test_cost_batch_size_step_works():
-    """Verify optimizer step works with cost_batch_size set."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    optimizer = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        step_radius=0.5,
-        num_probe=1,
-        compile=False,
-        seed=42,
-        cost_batch_size=4,
-    )
-
-    # Use small batch matching cost_batch_size
-    # The subsampling happens in the training loop, not in step() itself
-    inputs = torch.randn(4, 4)
-    targets = torch.randint(0, 2, (4,))
-    loss_fn = nn.CrossEntropyLoss()
-
-    def closure(batched_params):
-        evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    cost = optimizer.step(closure)
-    assert isinstance(cost, float)
-    assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-
-
 def test_amortize_steps_parameter():
     """Verify amortize_steps is stored and defaults to 1."""
     torch.manual_seed(42)

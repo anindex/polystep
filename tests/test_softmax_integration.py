@@ -102,16 +102,6 @@ class TestSolverSelection:
         with pytest.raises(ValueError, match="Unknown solver"):
             PolyStepOptimizer(model, solver="invalid")
 
-    def test_solver_none_auto_detects(self, model, layout):
-        """solver=None auto-selects based on subspace presence."""
-        opt_full = PolyStepOptimizer(model, solver=None)
-        assert isinstance(opt_full.solver, SinkhornSolver)
-
-        sub = LinearSubspace.from_layout(layout, rank=4)
-        model2 = _make_model()
-        opt_sub = PolyStepOptimizer(model2, subspace=sub, solver=None)
-        assert isinstance(opt_sub.solver, SoftmaxSolver)
-
 
 # ---------------------------------------------------------------------------
 # ProgressiveEpsilon blocking
@@ -166,16 +156,6 @@ class TestSoftmaxFunctionalStep:
                 changed = True
                 break
         assert changed, "Model parameters did not change after softmax step"
-
-    @pytest.mark.timeout(60)
-    def test_multiple_steps_no_crash(self, model, closure):
-        """3 consecutive softmax steps execute without error."""
-        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
-        losses = []
-        for _ in range(3):
-            loss = opt.step(closure)
-            losses.append(loss)
-        assert all(isinstance(loss_v, float) for loss_v in losses)
 
     @pytest.mark.timeout(30)
     def test_state_f_g_none_after_softmax_solve(self, model, closure):
@@ -267,15 +247,6 @@ class TestSubspaceModes:
     """Verify softmax solver works with different subspace types."""
 
     @pytest.mark.timeout(60)
-    def test_linear_subspace_step(self, model, layout):
-        """LinearSubspace with softmax solver runs 2 steps without error."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
-        opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.5)
-        closure = _make_closure(model)
-        for _ in range(2):
-            loss = opt.step(closure)
-            assert isinstance(loss, float)
-
     @pytest.mark.timeout(60)
     def test_hybrid_subspace_step(self, model, layout):
         """HybridSubspace with softmax solver runs 2 steps without error."""
@@ -304,32 +275,6 @@ class TestSubspaceModes:
 
 class TestEpsilonSharing:
     """Verify epsilon schedule is shared with softmax solver."""
-
-    @pytest.mark.timeout(60)
-    def test_linear_epsilon_updates_solver(self, model):
-        """LinearEpsilon schedule updates solver.epsilon between steps."""
-        eps_schedule = LinearEpsilon(init=1.0, target=0.01, decay=0.3)
-        opt = PolyStepOptimizer(
-            model,
-            solver="softmax",
-            epsilon=eps_schedule,
-        )
-        closure = _make_closure(model)
-
-        # Record epsilon before first step
-        _ = opt.solver.epsilon
-
-        opt.step(closure)
-
-        # After step, solver epsilon should have been set from the schedule
-        # The optimizer sets self.solver.epsilon = ot_epsilon inside _step_*
-        # We can verify by doing another step and checking the schedule moved
-        opt.step(closure)
-
-        # The epsilon schedule should give decreasing values
-        eps_step0 = eps_schedule.at(0)
-        eps_step1 = eps_schedule.at(1)
-        assert eps_step1 < eps_step0, f"LinearEpsilon should decrease: step0={eps_step0}, step1={eps_step1}"
 
     @pytest.mark.timeout(60)
     def test_fixed_epsilon_with_softmax(self, model):

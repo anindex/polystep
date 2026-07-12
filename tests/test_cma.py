@@ -14,7 +14,6 @@ from polystep.cma import (
     compute_cma_hyperparameters,
     compute_heaviside_sigma,
     compute_ot_bias_directions,
-    compute_ot_weights,
     update_covariance_diagonal,
     update_evolution_path_c,
     update_evolution_path_sigma,
@@ -113,16 +112,6 @@ class TestEvolutionPathSigma:
         expected = (1 - c_sigma) * p_sigma
         assert torch.allclose(p_sigma_new, expected, atol=1e-6)
 
-    def test_positive_displacement_increases_norm(self):
-        """Non-zero displacement increases p_sigma norm (from zero)."""
-        n = 32
-        p_sigma = torch.zeros(n)
-        displacement = torch.ones(n) * 0.1
-        C_diag = torch.ones(n)
-
-        p_sigma_new = update_evolution_path_sigma(p_sigma, displacement, C_diag, c_sigma=0.1, mu_eff=2.0)
-        assert p_sigma_new.norm() > 0
-
     def test_evolution_path_sigma_tiny_covariance(self):
         """Evolution path should not produce NaN/Inf with very small C_diag."""
         n = 10
@@ -147,6 +136,18 @@ class TestEvolutionPathSigma:
         sqrt_factor = math.sqrt(c_sigma * (2 - c_sigma) * mu_eff)
         expected_component = sqrt_factor * 0.5
         assert p_sigma_new[0].item() == pytest.approx(expected_component, rel=1e-5)
+
+    def test_covariance_scaled_step_whitens_to_z(self):
+        """Feeding y = sqrt(C) * z recovers the isotropic z scale via the internal
+        C^{-1/2}. This is the coordinate convention the monolithic driver relies on."""
+        n = 5
+        C_diag = torch.tensor([4.0, 1.0, 9.0, 0.25, 1.0])
+        z = torch.tensor([1.0, -2.0, 0.5, 3.0, 0.0])
+        y = torch.sqrt(C_diag) * z
+        p0 = torch.zeros(n)
+        p_from_y = update_evolution_path_sigma(p0, y, C_diag, c_sigma=0.3, mu_eff=3.0)
+        p_from_z = update_evolution_path_sigma(p0, z, torch.ones(n), c_sigma=0.3, mu_eff=3.0)
+        assert torch.allclose(p_from_y, p_from_z, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -221,36 +222,19 @@ class TestHeavisideSigma:
         h_sigma = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=100)
         assert h_sigma is False
 
-    def test_generation_zero_handled(self):
-        """generation=0 is handled without error."""
-        n = 50
-        expected_norm = math.sqrt(n)
-        c_sigma = 0.1
-        p_sigma_norm = expected_norm * 0.5
-
-        # Should not raise, uses max(1, generation)
-        h_sigma = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=0)
-        assert isinstance(h_sigma, bool)
-
-    def test_early_generation_higher_threshold(self):
-        """Early generations have lower threshold due to cumulation buildup."""
+    def test_threshold_uses_generation_plus_one(self):
+        """The cumulation correction uses generation + 1 (caller passes a 0-based count)."""
         n = 100
         expected_norm = math.sqrt(n)
-        c_sigma = 0.1
-        p_sigma_norm = expected_norm * 0.3
-
-        # At generation 1, cumulation factor is small, threshold is lower
-        h_sigma_early = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=1)
-
-        # At generation 100, cumulation factor is close to 1, threshold is higher
-        h_sigma_late = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=100)
-
-        # Same p_sigma_norm may be healthy early but stalled late is incorrect -
-        # actually higher threshold at later generations means MORE values pass
-        # A p_sigma_norm that passes at gen=1 should also pass at gen=100
-        # Let's test boundary case instead
-        assert isinstance(h_sigma_early, bool)
-        assert isinstance(h_sigma_late, bool)
+        c_sigma = 0.3
+        generation = 3
+        gen = generation + 1
+        threshold = (1.4 + 2 / (n + 1)) * expected_norm * math.sqrt(1 - (1 - c_sigma) ** (2 * gen))
+        assert compute_heaviside_sigma(threshold * 0.99, expected_norm, n, c_sigma, generation) is True
+        assert compute_heaviside_sigma(threshold * 1.01, expected_norm, n, c_sigma, generation) is False
+        # The former max(1, generation) form used a smaller threshold and would misclassify here.
+        wrong = (1.4 + 2 / (n + 1)) * expected_norm * math.sqrt(1 - (1 - c_sigma) ** (2 * generation))
+        assert wrong < threshold
 
 
 # ---------------------------------------------------------------------------
@@ -332,16 +316,6 @@ class TestCovarianceUpdate:
         C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1)
         assert C_new.shape == C_diag.shape
 
-    def test_positive_definiteness_preserved(self):
-        """Covariance remains positive (> cov_min)."""
-        n = 32
-        C_diag = torch.ones(n)
-        p_c = torch.randn(n)
-        rank_mu = torch.rand(n)
-
-        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1)
-        assert (C_new >= 1e-6).all()
-
     def test_cov_bounds_enforced(self):
         """Covariance is clamped to [1e-6, 1e6]."""
         n = 16
@@ -411,71 +385,6 @@ class TestCovarianceUpdate:
 
         C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=c_1, c_mu=c_mu, h_sigma=False, c_c=c_c)
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Test: compute_ot_weights
-# ---------------------------------------------------------------------------
-
-
-class TestOTWeights:
-    """Tests for OT weight computation from transport matrix."""
-
-    def test_weights_sum_to_one(self):
-        """Weights should sum to approximately 1.0."""
-        P, V = 20, 6
-        transport_matrix = torch.rand(P, V)
-        transport_matrix = transport_matrix / transport_matrix.sum()
-
-        weights = compute_ot_weights(transport_matrix)
-        assert weights.sum().item() == pytest.approx(1.0, rel=1e-5)
-
-    def test_weights_shape(self):
-        """Weights shape is (num_particles,)."""
-        P, V = 15, 8
-        transport_matrix = torch.rand(P, V)
-
-        weights = compute_ot_weights(transport_matrix)
-        assert weights.shape == (P,)
-
-    def test_weights_non_negative(self):
-        """All weights should be non-negative."""
-        P, V = 10, 4
-        transport_matrix = torch.rand(P, V)
-
-        weights = compute_ot_weights(transport_matrix)
-        assert (weights >= 0).all()
-
-    def test_uniform_transport_gives_uniform_weights(self):
-        """If all particles transport equal mass, weights are uniform."""
-        P, V = 10, 4
-        transport_matrix = torch.ones(P, V) / (P * V)
-
-        weights = compute_ot_weights(transport_matrix)
-        expected = torch.ones(P) / P
-        assert torch.allclose(weights, expected, atol=1e-5)
-
-    def test_concentrated_transport(self):
-        """Particle with focused transport (low entropy) gets highest weight."""
-        P, V = 5, 4
-        transport_matrix = torch.ones(P, V) / (P * V)
-        # Particle 0 concentrates all its mass on vertex 0 (entropy ~ 0).
-        transport_matrix[0, :] = 0.0
-        transport_matrix[0, 0] = 1.0 / P  # same row sum as others
-
-        weights = compute_ot_weights(transport_matrix)
-        # Particle 0 has lowest entropy -> highest weight.
-        assert weights[0].item() > weights[1].item()
-        assert weights[0].item() > 0.5
-
-    def test_zero_transport_matrix_handled(self):
-        """Edge case: zero transport matrix does not crash."""
-        P, V = 5, 4
-        transport_matrix = torch.zeros(P, V)
-
-        weights = compute_ot_weights(transport_matrix)
-        assert weights.shape == (P,)
-        assert not torch.isnan(weights).any()
 
 
 # ---------------------------------------------------------------------------

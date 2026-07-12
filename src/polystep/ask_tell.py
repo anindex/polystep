@@ -10,6 +10,7 @@ drop-in gradient-free optimizer comparable to any ES.
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Callable, Optional, Union
 
@@ -53,6 +54,14 @@ class PolyStepES:
         device: Union[str, torch.device] = "cpu",
         dtype: torch.dtype = torch.float32,
     ):
+        if dim < 1:
+            raise ValueError(f"dim must be >= 1, got {dim}.")
+        if num_particles < 1:
+            raise ValueError(f"num_particles must be >= 1, got {num_particles}.")
+        if not epsilon > 0:
+            raise ValueError(f"epsilon must be > 0, got {epsilon}.")
+        if not (math.isfinite(step_radius) and step_radius >= 0):
+            raise ValueError(f"step_radius must be finite and >= 0, got {step_radius}.")
         self.dim = dim
         self.num_particles = num_particles
         self.epsilon = epsilon
@@ -121,7 +130,10 @@ class PolyStepES:
             self.num_particles, self.num_vertices
         )
         self.solver.epsilon = self.epsilon
-        transport = self.solver.solve(cost, a=self.a, scale_cost=self.scale_cost).matrix
+        # Source marginal defaults to uniform 1/P inside the solver, which is
+        # exactly ``self.a`` -- pass None so the solver skips the (host-syncing)
+        # user-marginal validation on this per-step path.
+        transport = self.solver.solve(cost, scale_cost=self.scale_cost).matrix
         X_new = _barycentric_projection(transport, self.a, self._pending)
         if torch.isfinite(X_new).all():
             self.X = X_new

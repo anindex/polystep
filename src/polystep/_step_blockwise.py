@@ -275,9 +275,10 @@ def step_blockwise(opt, closure: Callable) -> float:
                     init_f = init_f.clamp(-max_abs, max_abs)
                     init_g = init_g.clamp(-max_abs, max_abs)
 
+            # a defaults to uniform 1/P_block inside the solver (equals block_a);
+            # pass None to skip the host-syncing user-marginal validation.
             solve_bw_kwargs = dict(
                 cost_matrix=cost_matrix,
-                a=block_a,
                 init_f=init_f,
                 init_g=init_g,
                 scale_cost=opt.scale_cost,
@@ -728,9 +729,10 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                     init_f = init_f.clamp(-max_abs, max_abs)
                     init_g = init_g.clamp(-max_abs, max_abs)
 
+            # a defaults to uniform 1/P_block inside the solver (equals block_a);
+            # pass None to skip the host-syncing user-marginal validation.
             solve_sbw_kwargs = dict(
                 cost_matrix=cost_matrix,
-                a=block_a,
                 init_f=init_f,
                 init_g=init_g,
                 scale_cost=opt.scale_cost,

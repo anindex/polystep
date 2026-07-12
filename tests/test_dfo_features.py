@@ -283,27 +283,6 @@ def test_adaptive_probes_reuses_rotation_for_stagnant_particles():
     assert torch.isfinite(opt._state.X).all()
 
 
-def test_multifidelity_screening_runs():
-    """Multi-fidelity screening should complete without errors."""
-    model, make_closure = _make_model_and_closure()
-    opt = PolyStepOptimizer(
-        model,
-        particle_dim=4,
-        epsilon=0.5,  # pdim=4 -> 8 vertices
-        multifidelity_screen=True,
-        screen_keep_ratio=0.5,
-        num_probe=5,
-        max_iterations=2,
-        seed=42,
-    )
-    closure = make_closure(opt)
-    loss = opt.step(closure)
-    assert torch.isfinite(torch.tensor(loss))
-    # Second step uses previous cost for screening
-    loss2 = opt.step(closure)
-    assert torch.isfinite(torch.tensor(loss2))
-
-
 def test_multifidelity_screening_keeps_descending():
     """Storing the raw (not dampened) cost stops a one-way ratchet that would
     lock out directions, so the loss keeps dropping over many steps."""

@@ -162,11 +162,16 @@ class TestFeatureInteractions:
 
 
 def _make_small_model():
-    """Small model for integration tests: Linear(50, 30) -> ReLU -> Linear(30, 10)."""
-    return nn.Sequential(nn.Linear(50, 30), nn.ReLU(), nn.Linear(30, 10))
+    """Tiny model for integration tests: Linear(8, 6) -> ReLU -> Linear(6, 4).
+
+    Kept small on purpose; these tests check optimizer plumbing (finite loss,
+    param change, iteration counts, determinism), all of which are independent
+    of model size, so a tiny net keeps the per-step forward and OT solve cheap.
+    """
+    return nn.Sequential(nn.Linear(8, 6), nn.ReLU(), nn.Linear(6, 4))
 
 
-def _make_integration_closure(model, input_dim=50, output_dim=10):
+def _make_integration_closure(model, input_dim=8, output_dim=4):
     """Create a batched closure for integration testing."""
     evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
     inputs = torch.randn(16, input_dim)

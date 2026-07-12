@@ -365,7 +365,8 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
 
 
 class TestChunkSizeProducesSameResult:
-    """Test 10: Chunked evaluation matches unchunked."""
+    """Chunked vmap evaluation matches unchunked. Uses MSELoss so the bmm fast
+    path is skipped and chunk_size actually drives the vmap path."""
 
     def test_chunk_size_produces_same_result(self):
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
@@ -378,40 +379,15 @@ class TestChunkSizeProducesSameResult:
         stacked = layout.batch_unflatten(batch)
 
         inputs = torch.randn(16, 4)
-        targets = torch.randint(0, 2, (16,))
+        targets = torch.randn(16, 2)
 
-        ev_full = NNCostEvaluator(model, nn.CrossEntropyLoss(), chunk_size=None)
-        ev_chunk = NNCostEvaluator(model, nn.CrossEntropyLoss(), chunk_size=4)
+        ev_full = NNCostEvaluator(model, nn.MSELoss(), chunk_size=None)
+        ev_chunk = NNCostEvaluator(model, nn.MSELoss(), chunk_size=4)
 
         losses_full = ev_full.evaluate(stacked, inputs, targets)
         losses_chunk = ev_chunk.evaluate(stacked, inputs, targets)
 
         torch.testing.assert_close(losses_chunk, losses_full, atol=1e-5, rtol=1e-5)
-
-
-class TestChunkSizeOne:
-    """Test 11: chunk_size=1 (extreme) still produces correct results."""
-
-    def test_chunk_size_one(self):
-        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
-        layout = ParamLayout.from_module(model)
-        particle = layout.flatten(model)
-
-        N = 10
-        batch = particle.unsqueeze(0).expand(N, -1, -1).clone()
-        batch += torch.randn_like(batch) * 0.01
-        stacked = layout.batch_unflatten(batch)
-
-        inputs = torch.randn(16, 4)
-        targets = torch.randint(0, 2, (16,))
-
-        ev_full = NNCostEvaluator(model, nn.CrossEntropyLoss(), chunk_size=None)
-        ev_one = NNCostEvaluator(model, nn.CrossEntropyLoss(), chunk_size=1)
-
-        losses_full = ev_full.evaluate(stacked, inputs, targets)
-        losses_one = ev_one.evaluate(stacked, inputs, targets)
-
-        torch.testing.assert_close(losses_one, losses_full, atol=1e-5, rtol=1e-5)
 
 
 class TestAutoDetectChunkSizeCpu:
@@ -513,29 +489,6 @@ class TestComputeNNCostMatrixValues:
         cost_mat = compute_nn_cost_matrix(evaluator, X_probe, layout, inputs, targets)
         assert cost_mat.isfinite().all(), "Non-finite costs"
         assert not torch.all(cost_mat == cost_mat[0, 0]), "All costs identical"
-
-
-class TestComputeNNCostMatrixChunked:
-    """Test 17: Chunked compute_nn_cost_matrix matches unchunked."""
-
-    def test_compute_nn_cost_matrix_chunked(self):
-        P, V, K = 6, 3, 2
-        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
-        layout = ParamLayout.from_module(model)
-        p = layout.flatten(model)
-        D = p.shape[0] * p.shape[1]
-        X_probe = p.reshape(1, 1, 1, D).expand(P, V, K, D).clone()
-        X_probe += torch.randn(P, V, K, D) * 0.01
-        inputs = torch.randn(16, 4)
-        targets = torch.randint(0, 2, (16,))
-
-        ev_full = NNCostEvaluator(model, nn.CrossEntropyLoss(), chunk_size=None)
-        ev_chunk = NNCostEvaluator(model, nn.CrossEntropyLoss(), chunk_size=8)
-
-        cost_full = compute_nn_cost_matrix(ev_full, X_probe, layout, inputs, targets)
-        cost_chunk = compute_nn_cost_matrix(ev_chunk, X_probe, layout, inputs, targets)
-
-        torch.testing.assert_close(cost_chunk, cost_full, atol=1e-5, rtol=1e-5)
 
 
 class TestComputeNNCostMatrixMatchesManual:

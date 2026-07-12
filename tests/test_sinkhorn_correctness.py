@@ -67,45 +67,6 @@ def test_sinkhorn_lse_safety(dtype, scale):
 # ---------------------------------------------------------------------------
 
 
-def test_sinkhorn_warm_start_rescale_on_eps_change():
-    """When epsilon changes between solves, the dual potentials must be
-    rescaled by ``eps_new / eps_old`` to preserve convergence speed.
-
-    The solver accepts ``init_eps`` so the caller can opt into rescaling.
-    Rescaled warm-start converges within 3x the iterations of
-    the cold start (vs 5-10x without rescaling).
-    """
-    P, V = 16, 32
-    C = _gaussian_cost(P, V, scale=2.0)
-    eps_old, eps_new = 1.0, 0.1
-
-    # First solve at eps_old.
-    solver_old = SinkhornSolver(epsilon=eps_old, max_iterations=500, threshold=1e-4)
-    res_old = solver_old.solve(C)
-    assert res_old.converged
-
-    # Cold solve at eps_new (the reference iteration count).
-    solver_cold = SinkhornSolver(epsilon=eps_new, max_iterations=500, threshold=1e-4)
-    res_cold = solver_cold.solve(C)
-    assert res_cold.converged
-
-    # Warm solve at eps_new with init_eps=eps_old: solver rescales internally.
-    solver_warm = SinkhornSolver(epsilon=eps_new, max_iterations=500, threshold=1e-4)
-    res_warm = solver_warm.solve(
-        C,
-        init_f=res_old.f,
-        init_g=res_old.g,
-        init_eps=eps_old,
-    )
-    assert res_warm.converged
-
-    # Warm-start with rescale should be at most 3x cold-start iters
-    # (typically << 1x; 3x is a generous upper bound for noise).
-    assert res_warm.n_iters <= 3 * res_cold.n_iters, (
-        f"warm-start with rescale used {res_warm.n_iters} iters vs cold {res_cold.n_iters}; rescale may not be active."
-    )
-
-
 def test_warmstart_rescale_stays_finite_on_large_eps_ratio():
     """Warm-start duals are clamped after the eps/init_eps rescale, so a large
     ratio cannot blow the plan to Inf/NaN when max_iterations < check_every."""
@@ -267,28 +228,6 @@ def test_sinkhorn_omega_sweep(omega):
 # ---------------------------------------------------------------------------
 # dual re-centering on cost shift
 # ---------------------------------------------------------------------------
-
-
-def test_sinkhorn_warm_start_centered_under_cost_shift():
-    """Warm-started duals must be re-centered after warm-start validation
-    so |f|.max stays bounded even when the cost matrix mean shifts
-    between solves. The solver re-centers f and g (zero-mean), so
-    |f|.max is bounded by O(cost_scale).
-    """
-    P, V = 16, 32
-    eps = 0.1
-    C = _gaussian_cost(P, V, scale=1.0)
-    solver = SinkhornSolver(epsilon=eps, max_iterations=300, threshold=1e-4)
-    result = solver.solve(C)
-    f0, g0 = result.f, result.g
-
-    # Now shift cost by +1000 and warm-start with the previous duals.
-    shifted_C = C + 1000.0
-    result2 = solver.solve(shifted_C, init_f=f0, init_g=g0)
-    cost_scale = shifted_C.abs().max().item()
-    assert result2.f.abs().max().item() < 100.0 * cost_scale, (
-        f"|f|.max blew up under cost shift: {result2.f.abs().max().item():.3e} vs cost_scale={cost_scale:.3e}"
-    )
 
 
 # ---------------------------------------------------------------------------

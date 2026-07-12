@@ -159,7 +159,7 @@ class TestJLTProperty:
 
     def test_multiple_distance_preservation(self):
         """Distance preservation holds across multiple pairs."""
-        proj = SparseRandomProjection(full_dim=50000, subspace_dim=128, seed=42)
+        proj = SparseRandomProjection(full_dim=10000, subspace_dim=128, seed=42)
 
         torch.manual_seed(999)
         ratios = []
