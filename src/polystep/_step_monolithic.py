@@ -182,8 +182,6 @@ def step_monolithic(opt, closure: Callable) -> float:
     if _can_reuse and P_active == 0:
         cost_matrix = opt._prev_cost_matrix.clone()
     else:
-        chunk = opt.chunk_size or (P_active * V * K_eff)
-
         # More efficient: process all probes for each particle in a batch
         # Total evaluations: P_active * V * K_eff. Each builds full config (P, pdim)
         # flattened to (padded_size,), then batch-unflattened.
@@ -191,6 +189,16 @@ def step_monolithic(opt, closure: Callable) -> float:
         # Strategy: process in chunks to control memory.
         # Build indices for all (active_i, v, k) combinations.
         total_evals = P_active * V * K_eff
+
+        # batch_configs is (chunk, P, pdim). At chunk == total_evals that is
+        # ~O(n_params^2) in full-space mode (P ~ n_params/pdim), which OOMs at the
+        # default chunk_size=None. Cap the default to ~256 MB of fp32 configs;
+        # chunking only splits the loop, so results are unchanged.
+        if opt.chunk_size:
+            chunk = opt.chunk_size
+        else:
+            config_size = max(1, X.numel())  # P * pdim
+            chunk = min(total_evals, max(1, (1 << 26) // config_size))
         # Pre-allocate losses tensor to avoid list+cat overhead
         losses = torch.empty(total_evals, dtype=torch.float32, device=device)
 
@@ -1005,7 +1013,9 @@ def step_monolithic(opt, closure: Callable) -> float:
                 total_steps=opt.max_iterations,
                 displacement_history=hist,
             )
-            # Reset duals only if projections actually changed (rotation happened)
+            # Only act when projections changed (a rotation happened). With the
+            # default rotation_interval=0 rotate_all returns the same dict, so the
+            # block_diag rebuild below is skipped: it is a full, wasteful rebuild.
             if new_projections is not state.hybrid_projections:
                 state.f = None
                 state.g = None
@@ -1015,10 +1025,9 @@ def step_monolithic(opt, closure: Callable) -> float:
                 opt._transport_direction_ema = None
                 opt._transport_direction = None
                 opt._invalidate_reuse_cache()
-            state.hybrid_projections = new_projections
-            # Build fused block-diagonal projection for fast reconstruct_batch
-            if hasattr(hybrid_sub, "build_fused_projection"):
-                hybrid_sub.build_fused_projection(new_projections)
+                state.hybrid_projections = new_projections
+                if hasattr(hybrid_sub, "build_fused_projection"):
+                    hybrid_sub.build_fused_projection(new_projections)
 
     # 11b. Periodic absorb: fold perturbation into base, zero subspace
     # Only for non-adaptive/non-hybrid subspaces; their absorb handled separately.

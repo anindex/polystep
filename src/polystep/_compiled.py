@@ -148,9 +148,12 @@ def _barycentric_projection(
     Returns:
         Updated particle positions of shape (batch, dim).
     """
-    # Clamp guards a user-supplied zero marginal from dividing by zero.
-    weights = transport_matrix / a.clamp(min=1e-12).unsqueeze(-1)
-    X_new = torch.einsum("bkd,bk->bd", X_vertices, weights)
+    # Divide by the realized row sum (the OT barycenter), not the target marginal
+    # a. Equal for softmax rows; correct for unconverged Sinkhorn (a kept for API).
+    row_sum = transport_matrix.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    weights = transport_matrix / row_sum
+    # Cast to vertex dtype so the matmul works in mixed precision (no fp32/bf16 promote).
+    X_new = torch.einsum("bkd,bk->bd", X_vertices, weights.to(X_vertices.dtype))
     return X_new
 
 
@@ -227,9 +230,9 @@ def _fused_softmax_project(
     # Transport matrix: row sums equal source marginal a
     transport = W * a.unsqueeze(-1)  # (P, V)
 
-    # Vertex-free centroid: O(P*dim) instead of materializing O(P*V*dim) rotated vertices
-    # Weighted centroid in template space, then rotate to particle frame
-    w_centroid = W @ polytope_verts  # (P, dim)
+    # Vertex-free centroid: O(P*dim), not O(P*V*dim) rotated vertices. Cast W to the
+    # geometry dtype so the matmul works in mixed precision (W is fp32, geometry bf16).
+    w_centroid = W.to(polytope_verts.dtype) @ polytope_verts  # (P, dim)
     rot_centroid = torch.einsum("bij,bj->bi", rot_mats, w_centroid)  # (P, dim)
 
     # Barycentric projection

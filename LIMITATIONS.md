@@ -97,10 +97,13 @@ restrictions apply.
   receives a stacked param dict, not a no-arg callable.
 - `subspace` is passed as an instance, not a string enum. Typos give
   a `TypeError`, not a clean `ValueError`.
-- The `mixed_precision: bool = False` constructor flag casts the model
-  to BF16 but does not wire to any autocast region inside the solver;
-  the solvers themselves promote BF16 inputs back to FP32. This flag
-  is currently a documentation gap.
+- The `mixed_precision: bool = False` flag runs the model forward and
+  the polytope geometry in BF16 while the OT solvers promote the cost
+  to FP32. The barycentric and fused-softmax projections, the
+  `HybridSubspace` QR, and the cost evaluator bridge the BF16/FP32
+  boundary, so a step runs end to end. There is no autocast region
+  inside the model forward, so a model that needs autocast for its own
+  BF16 numerics must add it.
 - `dual_momentum_beta` defaults to `0.0`. Pass
   `dual_momentum_beta=0.3` explicitly to enable dual momentum in
   turbo mode.

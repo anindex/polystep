@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.6.1 - 2026-07-15
+
+### Added
+
+- `examples/09_hard_decision_tree.py`: a hard oblique decision tree with strict
+  argmax routing and no relaxation, trained on an XOR checkerboard. PolyStep
+  optimizes the hard tree directly while OpenAI-ES and SPSA stall on its
+  piecewise-constant loss; a soft-tree Adam baseline is scored after hardening.
+
+### Changed
+
+- The HybridSubspace fused block-diagonal projection is rebuilt only when the
+  projection rotates. With the default `rotation_interval=0` the projection is
+  static, so the previous per-step `block_diag` rebuild was pure overhead.
+
+### Fixed
+
+- `mixed_precision=True` runs end to end. The barycentric and fused-softmax
+  projections cast the FP32 OT weights to the BF16 geometry dtype, `HybridSubspace`
+  runs its projection QR in FP32 (no BF16 CPU `geqrf`), and the cost evaluator
+  matches float inputs to the parameter dtype. Previously the first step raised a
+  dtype mismatch.
+- The barycentric projection normalizes by the realized transport row sum instead
+  of the target marginal, so an unconverged Sinkhorn plan gives a
+  translation-invariant step. The softmax path is unchanged.
+- Full-space monolithic steps bound the default evaluation chunk to a fixed memory
+  budget, avoiding the `O(n_params^2)` config buffer that ran out of memory at the
+  default `chunk_size=None`.
+- `apply_biased_rotation` realigns the first search axis with the requested bias
+  (QR fixes the column only up to sign), so the biased search points toward descent
+  rather than ascent, and runs its QR and determinant in FP32 for BF16 inputs.
+
 ## 0.6.0 - 2026-07-12
 
 ### Added

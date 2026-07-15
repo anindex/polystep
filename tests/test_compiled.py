@@ -136,8 +136,11 @@ class TestBarycentricProjectionEquivalence:
         torch.testing.assert_close(result_direct, result_cf)
         assert result_direct.shape == (B, d)
 
-        # Verify against manual computation
-        weights = transport_matrix / a.unsqueeze(-1)
+        # Verify against manual computation. The barycentric projection normalizes
+        # by the realized row sum of the plan (the textbook OT definition), which
+        # equals ``a`` only when the plan's row marginal is exactly ``a``.
+        row_sum = transport_matrix.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        weights = transport_matrix / row_sum
         X_manual = torch.einsum("bkd,bk->bd", X_vertices, weights)
         torch.testing.assert_close(result_direct, X_manual)
 

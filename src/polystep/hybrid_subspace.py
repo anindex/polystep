@@ -504,7 +504,10 @@ class HybridSubspace:
         # This produces orthonormal columns, giving isotropic perturbations.
         # For wide matrices (more coords than params), fall back to scaled Gaussian.
         if spec.num_params >= spec.num_coords:
-            P, _ = torch.linalg.qr(P_raw, mode="reduced")  # (num_params, num_coords)
+            # geqrf has no bf16/fp16 CPU kernel; orthogonalize in fp32, cast back.
+            qr_in = P_raw.float() if P_raw.dtype in (torch.bfloat16, torch.float16) else P_raw
+            P, _ = torch.linalg.qr(qr_in, mode="reduced")  # (num_params, num_coords)
+            P = P.to(dtype=P_raw.dtype)
         else:
             P = P_raw * (1.0 / math.sqrt(spec.num_coords))
         P = P.to(device=device)

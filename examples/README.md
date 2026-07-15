@@ -1,6 +1,6 @@
 # Examples
 
-Run in order. Examples 01-05, 07, and 08 run in under a couple of minutes on a laptop CPU; example 06 is GPU-friendly and takes about 17 minutes on CUDA. Example 06 pretrains a full SNN with best-test early stopping and then runs an on-chip-style adaptation stage.
+Run in order. Examples 01-05 and 07-09 run in under a couple of minutes on a laptop CPU; example 06 is GPU-friendly and takes about 17 minutes on CUDA. Example 06 pretrains a full SNN with best-test early stopping and then runs an on-chip-style adaptation stage.
 
 | # | File | What it shows | Time |
 |---|------|---------------|------|
@@ -12,6 +12,7 @@ Run in order. Examples 01-05, 07, and 08 run in under a couple of minutes on a l
 | 06 | [`06_loihi_snn_polystep.py`](06_loihi_snn_polystep.py) | Loihi 2 skeleton: MNIST SNN pretrain + on-chip readout adaptation under input shift (~+13 pp paired shift-recovery on a ~1.3% writable subset, with near-zero clean-accuracy degradation) | ~17 min (GPU) |
 | 07 | [`07_binary_net_no_ste.py`](07_binary_net_no_ste.py) | STE-free binary (sign-activation) net via ask/tell: PolyStepES vs OpenAI-ES on 0-1 error. Beats OpenAI-ES by ~20 points on the hard XOR-checkerboard boundary | ~15 s |
 | 08 | [`08_direct_loss_minimization.py`](08_direct_loss_minimization.py) | Directly maximize a non-decomposable metric (F1) on an imbalanced checkerboard: PolyStepES beats both Adam+STE (biased gradient) and OpenAI-ES (stalls on the piecewise-constant metric), 5 seeds, no subspace | ~30 s |
+| 09 | [`09_hard_decision_tree.py`](09_hard_decision_tree.py) | Train a hard oblique decision tree (strict argmax routing, no relaxation) on an XOR checkerboard. PolyStep optimizes the hard tree directly while OpenAI-ES and SPSA stall on the piecewise-constant loss; matched to a soft-tree Adam baseline scored after hardening | ~40 s |
 
 ## Quick start
 

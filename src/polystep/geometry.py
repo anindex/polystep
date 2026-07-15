@@ -239,10 +239,19 @@ def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir_norm: torch.Tensor) -
     """
     biased = rot_mats.clone()
     biased[:, :, 0] = bias_dir_norm
-    Q, _ = torch.linalg.qr(biased)
+    # geqrf has no bf16/fp16 CPU kernel; run QR in fp32, cast back.
+    qr_in = biased.float() if biased.dtype in (torch.bfloat16, torch.float16) else biased
+    Q, _ = torch.linalg.qr(qr_in)
+    Q = Q.to(biased.dtype)
     valid = torch.isfinite(Q).all(dim=-1).all(dim=-1)  # (batch,)
     out = torch.where(valid[:, None, None], Q, rot_mats)
-    flip = (torch.det(out) < 0).unsqueeze(-1)
+    # QR fixes column 0 only up to sign; realign it with the bias so the search
+    # points toward descent, not ascent (sign 0 -> +1).
+    dot0 = (out[:, :, 0] * bias_dir_norm).sum(dim=1)  # (batch,)
+    sign0 = torch.where(dot0 < 0, -1.0, 1.0).to(out.dtype)
+    out[:, :, 0] = out[:, :, 0] * sign0.unsqueeze(-1)
+    # Flip the last column to keep det = +1 (det has no bf16 CPU kernel, use fp32).
+    flip = (torch.det(out.float()) < 0).unsqueeze(-1)
     out[:, :, -1] = torch.where(flip, -out[:, :, -1], out[:, :, -1])
     return out
 

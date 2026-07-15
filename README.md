@@ -101,7 +101,7 @@ print(es.best_fitness, es.mean)
 
 [`experiments/bench_ask_tell.py`](experiments/bench_ask_tell.py) compares it head-to-head with a Gaussian ES on the standard synthetic suite under a matched evaluation budget.
 
-See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST, a Loihi 2 on-chip adaptation skeleton, STE-free binary-net training vs OpenAI-ES, and direct F1 minimization where PolyStep beats both a biased gradient (Adam+STE) and OpenAI-ES.
+See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST, a Loihi 2 on-chip adaptation skeleton, STE-free binary-net training vs OpenAI-ES, direct F1 minimization where PolyStep beats both a biased gradient (Adam+STE) and OpenAI-ES, and a hard oblique decision tree with strict argmax routing that PolyStep trains directly while OpenAI-ES and SPSA stall.
 
 <table>
   <tr>
@@ -121,6 +121,14 @@ PolyStep is designed for models where gradients are **unavailable or unreliable*
 - **Combinatorial optimization**: MAX-SAT, discrete assignment problems
 
 If your model is fully differentiable, Adam/SGD will be faster and more accurate.
+
+## How PolyStep relates to other gradient-free methods
+
+Zeroth-order optimization splits into two camps. Memory-efficient fine-tuning (MeZO and successors) runs zeroth-order updates on differentiable networks to skip the backprop tape, but still assumes a useful local gradient. Evolution strategies and SPSA (CMA-ES, OpenAI-ES) optimize black-box objectives by estimating a local gradient from small perturbations.
+
+PolyStep is a randomized direct search: it probes a finite-radius polytope around the current parameters and moves toward the lowest-cost vertices through an optimal-transport barycenter. When the loss is piecewise-constant or genuinely non-differentiable, the local gradient is zero almost everywhere, so finite-difference estimates carry no signal and ES/SPSA stall, while a finite radius steps across the flat regions. This is the setting where direct search (generalized pattern search, MADS) has convergence guarantees on nonsmooth and discontinuous objectives that gradient-estimate methods lack. Example 09 shows the separation on a hard decision tree.
+
+Recent gradient-free work targets the same regime, including low-rank evolution strategies for spiking networks (arXiv:2605.30361) and gradient-free trust regions for recurrent spiking networks (arXiv:2601.21572). PolyStep is complementary: a general-purpose direct-search optimizer with subspace compression.
 
 ## Benchmarks
 

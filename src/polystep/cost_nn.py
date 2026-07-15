@@ -221,6 +221,13 @@ class NNCostEvaluator:
         if was_training:
             self.model.eval()
 
+        # Match float inputs to the (maybe bf16) param dtype so bmm/vmap don't hit a
+        # dtype mismatch under mixed precision. Integer inputs and targets untouched.
+        if stacked_params:
+            param_dtype = next(iter(stacked_params.values())).dtype
+            if inputs.is_floating_point() and inputs.dtype != param_dtype:
+                inputs = inputs.to(param_dtype)
+
         try:
             # Fast path: batched bmm for Linear-only models (MLP)
             # Only used for supervised (targets != None) with cross-entropy.
