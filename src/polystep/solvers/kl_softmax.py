@@ -40,7 +40,7 @@ from typing import Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
-from ._prelude import align_marginal, sanitize_cost
+from ._prelude import align_marginal, recenter_cost, sanitize_cost
 from .base import SolverResult
 
 
@@ -108,6 +108,9 @@ class KLSoftmaxSolver:
 
         # Optional cost rescaling (on the already-sanitized, finite cost).
         C = scale_cost_matrix(cost_matrix, scale_cost)
+        # Recenter to min(C)=0 so the log-sum-exp updates and the exp((f+g-C)/eps)
+        # plan keep FP32 precision when |C| is much larger than eps.
+        C, cost_shift = recenter_cost(C)
 
         eps = float(self.epsilon)
         alpha = self.alpha
@@ -172,7 +175,8 @@ class KLSoftmaxSolver:
                 )
                 P = torch.where(torch.isfinite(P), P, torch.zeros_like(P))
 
-            cost = (C * P).sum().item()
+            # Undo the recenter shift so cost is <C_scaled, P> (sum(P) == a.sum()).
+            cost = ((C * P).sum() + cost_shift * a.sum()).item()
 
             # Theorem 4.1 instrumentation: KL(P^T 1 || b).
             # P^T 1 is the realized column marginal; b is the target.

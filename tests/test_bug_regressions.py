@@ -326,37 +326,14 @@ class TestNoAmortAndFixedEpsilon:
         def closure(bp):
             return evaluator.evaluate(bp, inputs, targets)
 
-        for _ in range(5):
+        n_steps = 5
+        for _ in range(n_steps):
             optimizer.step(closure)
 
         # Transport direction EMA should never be populated
         assert optimizer._transport_direction_ema is None, (
             "amortize_steps=1 should never populate _transport_direction_ema"
         )
-
-    def test_noamort_all_steps_are_ot_steps(self):
-        """With amortize_steps=1, iteration_count should match total steps."""
-        model = self._make_model()
-        optimizer = PolyStepOptimizer(
-            model,
-            epsilon=0.5,
-            step_radius=1.0,
-            num_probe=1,
-            sinkhorn_max_iters=20,
-            amortize_steps=1,
-        )
-        loss_fn = nn.CrossEntropyLoss()
-        evaluator = NNCostEvaluator(model, loss_fn)
-        inputs = torch.randn(4, 10)
-        targets = torch.randint(0, 2, (4,))
-
-        def closure(bp):
-            return evaluator.evaluate(bp, inputs, targets)
-
-        n_steps = 5
-        for _ in range(n_steps):
-            optimizer.step(closure)
-
         assert optimizer._state.iteration_count == n_steps, (
             f"Expected {n_steps} OT iterations, got {optimizer._state.iteration_count}"
         )
@@ -395,3 +372,85 @@ def test_fd_gradient_requires_orthoplex_vertices():
     losses = torch.randn(4, 5, 2)  # V=5, not 2*pdim
     with pytest.raises(AssertionError, match="orthoplex"):
         extract_fd_gradient(losses, torch.ones(2), probe_radius=0.1, pdim=3)
+
+
+# ---------------------------------------------------------------------------
+# Large-cost-offset stability: the entropic-OT plan is invariant to a constant
+# shift of C, so solvers recenter the cost (min -> 0) to keep FP32 precision
+# when |C| is much larger than eps. See recenter_cost().
+# ---------------------------------------------------------------------------
+
+
+class TestLargeCostOffsetStability:
+    def test_sinkhorn_matrix_correct_under_large_offset(self):
+        """exp((f+g-C)/eps) must not lose the plan to FP32 cancellation. A
+        constant cost gives the product plan a (x) b regardless of the offset."""
+        from polystep.solvers import SinkhornSolver
+
+        C = torch.full((2, 2), 1_000_000.0)
+        res = SinkhornSolver(epsilon=1.0, max_iterations=200, threshold=1e-9).solve(C)
+        P = res.matrix
+        assert torch.isfinite(P).all()
+        # Uniform marginals a=b=[0.5,0.5] and constant C -> every entry 0.25.
+        assert torch.allclose(P, torch.full((2, 2), 0.25), atol=1e-4), P
+        assert torch.allclose(P.sum(dim=1), torch.full((2,), 0.5), atol=1e-4)
+        assert torch.allclose(P.sum(dim=0), torch.full((2,), 0.5), atol=1e-4)
+
+    def test_klsoftmax_lam0_matches_softmax_under_large_offset(self):
+        """KLSoftmax(lam=0) is exactly SoftmaxSolver, even at |C|~1e6."""
+        from polystep.solvers import KLSoftmaxSolver, SoftmaxSolver
+
+        C = torch.full((1, 3), 1_000_000.0)
+        kl = KLSoftmaxSolver(epsilon=1.0, lam=0.0).solve(C).matrix
+        sm = SoftmaxSolver(epsilon=1.0).solve(C).matrix
+        assert torch.isfinite(kl).all()
+        assert torch.allclose(kl, sm, atol=1e-6), (kl, sm)
+        assert torch.allclose(kl, torch.full((1, 3), 1.0 / 3.0), atol=1e-5)
+        assert torch.allclose(kl.sum(dim=1), torch.ones(1), atol=1e-5)
+
+    @pytest.mark.parametrize("solver_name", ["softmax", "tempered"])
+    def test_softmax_no_nan_at_extreme_epsilon(self, solver_name):
+        """A finite cost with a huge negative entry must not NaN the softmax;
+        the limiting weights put all mass on the minimum-cost vertex."""
+        from polystep.solvers import SoftmaxSolver, TemperedSoftmaxSolver
+
+        C = torch.tensor([[-1e20, 0.0]], dtype=torch.float32)
+        if solver_name == "softmax":
+            W = SoftmaxSolver(epsilon=1e-20).solve(C).matrix
+        else:
+            W = TemperedSoftmaxSolver(tau=1e-20).solve(C).matrix
+        assert torch.isfinite(W).all(), W
+        # a=[1.0]; all mass on the min-cost (col 0).
+        assert torch.allclose(W, torch.tensor([[1.0, 0.0]]), atol=1e-5), W
+
+
+class TestSinkhornMarginalBalance:
+    def test_warns_on_unequal_total_mass(self):
+        """Balanced OT with sum(a) != sum(b) is infeasible; warn instead of
+        silently reporting converged."""
+        from polystep.solvers import SinkhornSolver
+
+        C = torch.zeros(2, 1)
+        with pytest.warns(UserWarning, match="unequal total mass"):
+            SinkhornSolver(epsilon=0.5, max_iterations=50).solve(C, a=torch.tensor([1.0, 1.0]), b=torch.tensor([1.0]))
+
+    def test_no_warning_on_uniform_marginals(self):
+        """The hot path (a=b=None uniform) must never trip the balance warning."""
+        import warnings
+
+        from polystep.solvers import SinkhornSolver
+
+        C = torch.rand(4, 6)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning -> test failure
+            SinkhornSolver(epsilon=0.5, max_iterations=50).solve(C)
+
+
+def test_biased_rotation_1d_returns_identity():
+    """SO(1) = {[[1]]}; a 1D biased rotation cannot represent a sign flip (that
+    is a reflection), so it must return identity, not flip the aligned axis back."""
+    from polystep.geometry import apply_biased_rotation
+
+    out = apply_biased_rotation(torch.ones(1, 1, 1), torch.tensor([[-1.0]]))
+    assert torch.allclose(out, torch.ones(1, 1, 1)), out
+    assert torch.det(out[0]).item() > 0

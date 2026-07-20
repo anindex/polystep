@@ -115,13 +115,21 @@ class TestRotateRandom:
 
 
 class TestRotateDisplacement:
-    def test_rotate_displacement_produces_orthogonal_basis(self, adaptive_sub):
+    @pytest.mark.parametrize(
+        "num_rows, seed, scale",
+        [
+            (3, 77, 0.1),
+            (1, 55, 1.0),
+            (None, 66, 1.0),
+        ],
+    )
+    def test_rotate_displacement_produces_orthogonal_basis(self, adaptive_sub, num_rows, seed, scale):
         """Displacement rotation with non-zero history produces orthogonal P."""
         P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
 
-        # Create non-zero displacement history
-        torch.manual_seed(77)
-        disp_history = torch.randn(3, adaptive_sub.subspace_dim) * 0.1
+        rows = num_rows if num_rows is not None else adaptive_sub.displacement_history_size
+        torch.manual_seed(seed)
+        disp_history = torch.randn(rows, adaptive_sub.subspace_dim) * scale
 
         P_new = adaptive_sub.rotate(
             P, step=5, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(42)
@@ -145,71 +153,32 @@ class TestRotateDisplacement:
         assert P_new.dtype == torch.bfloat16
         assert P_new.shape == (sub.full_dim, sub.subspace_dim)
 
-    def test_rotate_displacement_zero_history_falls_back_to_random(self, adaptive_sub):
-        """Zero displacement history falls back to random (still orthogonal)."""
+    @pytest.mark.parametrize(
+        "use_zero_history, step, seed, atol",
+        [
+            (True, 5, 42, 1e-4),
+            (False, 0, 456, 1e-5),
+        ],
+    )
+    def test_rotate_displacement_zero_history_falls_back_to_random(
+        self, adaptive_sub, use_zero_history, step, seed, atol
+    ):
+        """Zero or None displacement history falls back to random (still orthogonal)."""
         P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
 
-        disp_history = torch.zeros(3, adaptive_sub.subspace_dim)
+        disp_history = torch.zeros(3, adaptive_sub.subspace_dim) if use_zero_history else None
 
-        P_new = adaptive_sub.rotate(
-            P, step=5, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(42)
-        )
-
-        # Should still be orthogonal
-        PtP = P_new.T @ P_new
-        eye = torch.eye(adaptive_sub.subspace_dim)
-        assert torch.allclose(PtP, eye, atol=1e-4)
-
-    def test_rotate_with_none_history_falls_back_to_random(self, adaptive_sub):
-        """Step-0 case: ``displacement_history=None`` triggers the
-        random fallback path, which must still produce an orthonormal
-        basis."""
-        P = adaptive_sub.init_projection(
-            generator=torch.Generator().manual_seed(0),
-        )
         P_new = adaptive_sub.rotate(
             P,
-            step=0,
+            step=step,
             total_steps=100,
-            displacement_history=None,
-            generator=torch.Generator().manual_seed(456),
-        )
-        gram = P_new.T @ P_new
-        assert torch.allclose(
-            gram,
-            torch.eye(adaptive_sub.subspace_dim),
-            atol=1e-5,
-        )
-
-    def test_rotate_displacement_single_entry_history(self, adaptive_sub):
-        """Single-entry displacement history works correctly."""
-        P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
-
-        torch.manual_seed(55)
-        disp_history = torch.randn(1, adaptive_sub.subspace_dim)
-
-        P_new = adaptive_sub.rotate(
-            P, step=5, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(42)
+            displacement_history=disp_history,
+            generator=torch.Generator().manual_seed(seed),
         )
 
         PtP = P_new.T @ P_new
         eye = torch.eye(adaptive_sub.subspace_dim)
-        assert torch.allclose(PtP, eye, atol=1e-4)
-
-    def test_rotate_displacement_full_history_buffer(self, adaptive_sub):
-        """Full history buffer (history_size entries) works correctly."""
-        P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
-
-        torch.manual_seed(66)
-        disp_history = torch.randn(adaptive_sub.displacement_history_size, adaptive_sub.subspace_dim)
-
-        P_new = adaptive_sub.rotate(
-            P, step=5, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(42)
-        )
-
-        PtP = P_new.T @ P_new
-        eye = torch.eye(adaptive_sub.subspace_dim)
-        assert torch.allclose(PtP, eye, atol=1e-4)
+        assert torch.allclose(PtP, eye, atol=atol)
 
     def test_rotate_displacement_incorporates_svd(self):
         """Displacement rotation incorporates SVD directions when history has clear dominant direction."""
@@ -263,25 +232,19 @@ class TestRotateDisplacement:
 
 
 class TestSvdRatioSchedule:
-    def test_svd_ratio_at_start(self):
-        """SVD ratio at step=0 equals svd_ratio_init."""
+    @pytest.mark.parametrize(
+        "step, total, expected",
+        [
+            (0, 100, 0.0),
+            (50, 100, 0.25),
+            (100, 100, 0.5),
+            (200, 100, 0.5),
+        ],
+    )
+    def test_svd_ratio_at_start(self, step, total, expected):
+        """SVD ratio interpolates from init to final and clamps beyond total_steps."""
         sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
-        assert sub.get_svd_ratio(0, 100) == pytest.approx(0.0)
-
-    def test_svd_ratio_at_midpoint(self):
-        """SVD ratio at step=total/2 equals midpoint."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
-        assert sub.get_svd_ratio(50, 100) == pytest.approx(0.25)
-
-    def test_svd_ratio_at_end(self):
-        """SVD ratio at step=total equals svd_ratio_final."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
-        assert sub.get_svd_ratio(100, 100) == pytest.approx(0.5)
-
-    def test_svd_ratio_clamps_beyond_total(self):
-        """SVD ratio beyond total_steps is clamped to svd_ratio_final."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
-        assert sub.get_svd_ratio(200, 100) == pytest.approx(0.5)
+        assert sub.get_svd_ratio(step, total) == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
@@ -349,19 +312,6 @@ class TestReconstructBatch:
                 assert torch.allclose(batch_result[key][i], single_result[key], atol=1e-5), (
                     f"Row {i}, key {key}: batch vs single mismatch"
                 )
-
-    def test_reconstruct_batch_shapes(self, model, adaptive_sub):
-        """reconstruct_batch produces (N, *shape) tensors."""
-        P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
-        base_sd = model.state_dict()
-
-        N = 3
-        batch = torch.randn(N, adaptive_sub.subspace_dim) * 0.01
-        result = adaptive_sub.reconstruct_batch(P, base_sd, batch)
-
-        for spec in adaptive_sub._entry_specs:
-            expected_shape = (N, *spec.original_shape)
-            assert result[spec.entry_key].shape == expected_shape
 
 
 # ---------------------------------------------------------------------------
@@ -561,29 +511,6 @@ class TestDisplacementProductivity:
             f"  Final cost - displacement: {final_disp:.4f}, random: {final_rand:.4f}\n"
             f"  AUC - displacement: {auc_disp:.4f}, random: {auc_rand:.4f}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Block-wise + AdaptiveSubspace mutual exclusion
-# ---------------------------------------------------------------------------
-
-
-class TestBlockwiseCombinedMode:
-    def test_blockwise_adaptive_combined(self, model):
-        """PolyStepOptimizer with subspace + block_strategy uses combined mode (combined subspace+block extension)."""
-        from polystep.optimizer import PolyStepOptimizer
-
-        sub = AdaptiveSubspace.auto_from_params(model)
-
-        opt = PolyStepOptimizer(
-            model,
-            subspace=sub,
-            block_strategy="per_layer",
-            compile=False,
-        )
-        # Verify combined mode is active
-        assert opt.subspace is not None
-        assert opt.block_strategy == "per_layer"
 
 
 # ---------------------------------------------------------------------------

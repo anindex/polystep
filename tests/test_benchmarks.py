@@ -74,79 +74,35 @@ def _run_benchmark(
 class TestSyntheticBenchmarks:
     """Convergence benchmarks for PolyStep on synthetic objectives."""
 
-    def test_ackley_convergence(self):
-        """Particles move toward origin and cost decreases on Ackley."""
-        obj = Ackley(dim=2)
-        state, X_init = _run_benchmark(obj, dim=2)
+    @pytest.mark.parametrize(
+        "objective,dim,run_kwargs,optimum,dist_factor",
+        [
+            (Ackley(dim=2), 2, {}, torch.zeros(2), 1.0),
+            (Rastrigin(dim=2), 2, {}, torch.zeros(2), 1.0),
+            (Sphere(dim=2), 2, {}, torch.zeros(2), 0.5),
+            (Rosenbrock(dim=2), 2, {"epsilon": 0.5, "step_radius": 0.5, "probe_radius": 1.0}, torch.ones(2), 1.0),
+            (
+                Ackley(dim=10),
+                10,
+                {"num_particles": 20, "max_iters": 25, "epsilon": 1.0, "step_radius": 0.5, "probe_radius": 1.0},
+                torch.zeros(10),
+                1.0,
+            ),
+        ],
+        ids=["ackley-2d", "rastrigin-2d", "sphere-2d", "rosenbrock-2d", "ackley-10d"],
+    )
+    def test_convergence(self, objective, dim, run_kwargs, optimum, dist_factor):
+        """Cost decreases and particles move toward the optimum across objectives."""
+        state, X_init = _run_benchmark(objective, dim=dim, **run_kwargs)
 
-        # Cost should decrease over the run
-        assert state.costs[-1] < state.costs[0], (
-            f"Ackley cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
-        )
+        assert state.costs[-1] < state.costs[0], f"cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
 
-        # Particles should be closer to origin than initial
-        init_dist = torch.norm(X_init, dim=-1).mean().item()
-        final_dist = torch.norm(state.X, dim=-1).mean().item()
-        assert final_dist < init_dist, (
-            f"Ackley particles did not move toward origin: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
-        )
+        assert torch.isfinite(state.X).all(), "NaN/Inf in final particles"
 
-    def test_rosenbrock_convergence(self):
-        """Particles move toward (1,1) and cost decreases on Rosenbrock."""
-        obj = Rosenbrock(dim=2)
-        state, X_init = _run_benchmark(
-            obj,
-            dim=2,
-            epsilon=0.5,
-            step_radius=0.5,
-            probe_radius=1.0,
-        )
-
-        # Cost should decrease
-        assert state.costs[-1] < state.costs[0], (
-            f"Rosenbrock cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
-        )
-
-        # Particles should be closer to (1,1) than initial
-        optimum = torch.ones(2)
         init_dist = torch.norm(X_init - optimum, dim=-1).mean().item()
         final_dist = torch.norm(state.X - optimum, dim=-1).mean().item()
-        assert final_dist < init_dist, (
-            f"Rosenbrock particles did not move toward (1,1): init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
-        )
-
-    def test_rastrigin_convergence(self):
-        """Particles move toward origin and cost decreases on Rastrigin."""
-        obj = Rastrigin(dim=2)
-        state, X_init = _run_benchmark(obj, dim=2)
-
-        # Cost should decrease
-        assert state.costs[-1] < state.costs[0], (
-            f"Rastrigin cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
-        )
-
-        # Particles should be closer to origin
-        init_dist = torch.norm(X_init, dim=-1).mean().item()
-        final_dist = torch.norm(state.X, dim=-1).mean().item()
-        assert final_dist < init_dist, (
-            f"Rastrigin particles did not move toward origin: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
-        )
-
-    def test_sphere_convergence(self):
-        """Strong convergence to origin on convex Sphere function."""
-        obj = Sphere(dim=2)
-        state, X_init = _run_benchmark(obj, dim=2)
-
-        # Cost should decrease
-        assert state.costs[-1] < state.costs[0], (
-            f"Sphere cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
-        )
-
-        # Particles should be much closer to origin (convex, easier)
-        init_dist = torch.norm(X_init, dim=-1).mean().item()
-        final_dist = torch.norm(state.X, dim=-1).mean().item()
-        assert final_dist < init_dist * 0.5, (
-            f"Sphere did not show strong convergence: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
+        assert final_dist < init_dist * dist_factor, (
+            f"particles did not converge: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
 
     @pytest.mark.parametrize("name,objective", ALL_OBJECTIVES, ids=[n for n, _ in ALL_OBJECTIVES])
@@ -170,34 +126,6 @@ class TestSyntheticBenchmarks:
             assert torch.isfinite(state.f).all(), f"{name}: NaN/Inf in dual potential f"
         if state.g is not None:
             assert torch.isfinite(state.g).all(), f"{name}: NaN/Inf in dual potential g"
-
-    def test_higher_dim_ackley(self):
-        """Ackley in 10D: solver runs without error and cost decreases."""
-        obj = Ackley(dim=10)
-        state, X_init = _run_benchmark(
-            obj,
-            dim=10,
-            num_particles=20,
-            max_iters=25,
-            epsilon=1.0,
-            step_radius=0.5,
-            probe_radius=1.0,
-        )
-
-        # Cost should decrease
-        assert state.costs[-1] < state.costs[0], (
-            f"Ackley 10D cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
-        )
-
-        # Particles should move toward origin
-        init_dist = torch.norm(X_init, dim=-1).mean().item()
-        final_dist = torch.norm(state.X, dim=-1).mean().item()
-        assert final_dist < init_dist, (
-            f"Ackley 10D particles did not move toward origin: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
-        )
-
-        # No NaN
-        assert torch.isfinite(state.X).all(), "NaN/Inf in 10D Ackley particles"
 
     def test_epsilon_schedule_synthetic(self):
         """LinearEpsilon schedule with Sphere: solver completes and converges."""

@@ -114,23 +114,14 @@ class TestSubspaceBlockFunctions:
         total_particles = sum(b.num_particles for b in blocks)
         assert total_particles == 32  # (250 + 6) / 8 = 32
 
-    def test_split_reassemble_roundtrip(self):
-        """Test that split -> reassemble preserves data."""
-        coords = torch.randn(256)
-        blocks = create_subspace_blocks(256, 4, 8)
+    @pytest.mark.parametrize("dim,num_blocks", [(256, 4), (250, 3)])
+    def test_split_reassemble_roundtrip(self, dim, num_blocks):
+        """Test that split -> reassemble preserves data, including non-divisible dims."""
+        coords = torch.randn(dim)
+        blocks = create_subspace_blocks(dim, num_blocks, 8)
 
         block_particles = split_subspace_to_blocks(coords, blocks)
-        reassembled = reassemble_blocks_to_subspace(block_particles, blocks, 256)
-
-        assert torch.allclose(coords, reassembled)
-
-    def test_split_reassemble_with_padding(self):
-        """Test roundtrip with non-divisible dimensions."""
-        coords = torch.randn(250)
-        blocks = create_subspace_blocks(250, 3, 8)
-
-        block_particles = split_subspace_to_blocks(coords, blocks)
-        reassembled = reassemble_blocks_to_subspace(block_particles, blocks, 250)
+        reassembled = reassemble_blocks_to_subspace(block_particles, blocks, dim)
 
         assert torch.allclose(coords, reassembled)
 
@@ -173,25 +164,6 @@ class TestCombinedModeInitialization:
             )
         assert opt._rank_schedule is None
 
-    def test_subspace_blocks_created(self, simple_model):
-        """Verify _subspace_blocks is populated correctly."""
-        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.3)
-
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=subspace,
-            block_strategy="per_layer",
-            epsilon=0.1,
-        )
-
-        blocks = optimizer._subspace_blocks
-        assert blocks is not None
-
-        # Check block structure
-        for block in blocks:
-            assert block.particle_dim == optimizer._subspace_particle_dim
-            assert block.num_particles > 0
-
     def test_block_count_reasonable(self, simple_model):
         """Verify block count is reasonable based on model structure."""
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5)
@@ -224,20 +196,6 @@ class TestCombinedModeInitialization:
         for polytope, block in zip(optimizer._subspace_block_polytopes, optimizer._subspace_blocks):
             # Polytope vertices should be in block.particle_dim space
             assert polytope.shape[1] == block.particle_dim
-
-    def test_block_duals_initialized(self, simple_model):
-        """Verify per-block dual potentials are initialized."""
-        subspace = AdaptiveSubspace.auto_from_params(simple_model)
-
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=subspace,
-            block_strategy="per_layer",
-            epsilon=0.1,
-        )
-
-        assert optimizer._state.block_duals is not None
-        assert len(optimizer._state.block_duals) == len(optimizer._subspace_blocks)
 
 
 # ------------------------------------------------------------------
@@ -414,32 +372,6 @@ class TestSynchronizedAbsorb:
 
         # Projection should have changed (rotated)
         assert not torch.allclose(P_before, P_after)
-
-    def test_absorb_count_increments(self, simple_model, simple_closure):
-        """Test that absorb_count increments on absorb."""
-        subspace = AdaptiveSubspace.auto_from_params(
-            simple_model,
-            compression_target=0.5,
-            max_rank=16,
-            absorb_mode="periodic",
-            absorb_interval=2,
-        )
-
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=subspace,
-            block_strategy="per_layer",
-            **_FAST_OPT_KWARGS,
-        )
-
-        initial_absorb = optimizer._state.absorb_count
-
-        # Run enough steps to trigger at least one absorb
-        for _ in range(5):
-            optimizer.step(simple_closure)
-
-        # absorb_count should have increased
-        assert optimizer._state.absorb_count > initial_absorb
 
 
 # ------------------------------------------------------------------

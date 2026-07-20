@@ -1,21 +1,21 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "polystep"
-version = "0.6.1"
+dynamic = ["version"]
 description = "PyTorch PolyStep Optimizer - gradient-free neural network training via entropic optimal transport"
 authors = [{name = "An T. Le"}]
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["torch>=2.10", "numpy>=2.0"]
+dependencies = ["torch>=2.4", "numpy>=1.24"]
 keywords = ["pytorch", "optimal-transport", "gradient-free", "sinkhorn", "polystep", "optimization", "neural-network"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -62,9 +62,15 @@ rl = [
     "swig>=4.2",
 ]
 
+[tool.setuptools.dynamic]
+version = {attr = "polystep.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["polystep*"]
+
+[tool.setuptools.package-data]
+polystep = ["py.typed"]
 
 [tool.ruff]
 line-length = 120

@@ -1,8 +1,9 @@
 # polystep
 
+[![PyPI](https://img.shields.io/pypi/v/polystep.svg)](https://pypi.org/project/polystep/)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.01928-b31b1b.svg)](https://arxiv.org/abs/2605.01928)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.10+](https://img.shields.io/badge/PyTorch-2.10%2B-ee4c2c.svg)](https://pytorch.org/)
+[![PyTorch 2.4+](https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
 **Gradient-free neural network training via optimal transport.**
@@ -26,6 +27,13 @@ Based on the Sinkhorn Step algorithm ([Le et al., NeurIPS 2023](https://arxiv.or
 > Want to play around with parameters? [**Viet T. Nguyen**](https://vietngth.github.io/) built a gorgeous interactive walkthrough that animates every step of the method -> **[explore the PolyStep visualization](https://vietngth.github.io/polystep-visualization/)**.
 
 ## Installation
+
+```bash
+pip install polystep                  # from PyPI (core: torch + numpy)
+uv add polystep                       # or with uv
+```
+
+From source:
 
 ```bash
 pip install -e .                      # core library (torch + numpy)

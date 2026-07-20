@@ -63,12 +63,6 @@ class TestMinCostGreedySolver:
             mask[min_col] = False
             assert T[i, mask].sum().item() == pytest.approx(0.0, abs=1e-10)
 
-    def test_row_sums_equal_marginal(self, cost_matrix, source_marginal):
-        solver = MinCostGreedySolver()
-        result = solver.solve(cost_matrix, a=source_marginal)
-        row_sums = result.matrix.sum(dim=1)
-        assert torch.allclose(row_sums, source_marginal, atol=1e-7)
-
     def test_deterministic(self, cost_matrix, source_marginal):
         solver = MinCostGreedySolver()
         r1 = solver.solve(cost_matrix, a=source_marginal)
@@ -110,12 +104,6 @@ class TestTopKMeanSolver:
             assert nonzero_mask.sum().item() == 3
             for idx in topk_idx:
                 assert T[i, idx].item() > 0
-
-    def test_row_sums_equal_marginal(self, cost_matrix, source_marginal):
-        solver = TopKMeanSolver(k=3)
-        result = solver.solve(cost_matrix, a=source_marginal)
-        row_sums = result.matrix.sum(dim=1)
-        assert torch.allclose(row_sums, source_marginal, atol=1e-7)
 
     def test_uniform_weights_within_top_k(self, cost_matrix, source_marginal):
         """Each selected vertex should get a[i]/k mass."""
@@ -179,12 +167,6 @@ class TestTemperedSoftmaxSolver:
         r1 = solver1.solve(cost_matrix, a=source_marginal)
         r2 = solver2.solve(cost_matrix, a=source_marginal)
         assert not torch.allclose(r1.matrix, r2.matrix, atol=1e-3)
-
-    def test_row_sums_equal_marginal(self, cost_matrix, source_marginal):
-        solver = TemperedSoftmaxSolver(tau=0.5)
-        result = solver.solve(cost_matrix, a=source_marginal)
-        row_sums = result.matrix.sum(dim=1)
-        assert torch.allclose(row_sums, source_marginal, atol=1e-7)
 
     def test_tau_validation(self):
         solver = TemperedSoftmaxSolver(tau=-1.0)

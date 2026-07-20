@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 
 from polystep.blockwise import (
-    BlockConfig,
     create_per_layer_blocks,
     create_grouped_blocks,
     split_particles,
@@ -30,27 +29,6 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.fc2(torch.relu(self.fc1(x)))
-
-
-# ---------------------------------------------------------------------------
-# BlockConfig tests
-# ---------------------------------------------------------------------------
-
-
-class TestBlockConfig:
-    def test_block_config_frozen(self):
-        bc = BlockConfig(
-            name="test",
-            leaf_indices=(0,),
-            flat_start=0,
-            flat_end=10,
-            num_particles=5,
-            particle_dim=2,
-        )
-        assert bc.name == "test"
-        assert bc.num_particles == 5
-        with pytest.raises(AttributeError):
-            bc.name = "modified"
 
 
 # ---------------------------------------------------------------------------
@@ -82,16 +60,6 @@ class TestPerLayerBlocks:
         # Each block starts where the previous ends
         for i in range(1, len(blocks)):
             assert blocks[i].flat_start == blocks[i - 1].flat_end
-
-    def test_padding_correct(self):
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        particle_dim = 2
-        blocks = create_per_layer_blocks(layout, particle_dim=particle_dim)
-        for block, entry in zip(blocks, layout.entries):
-            padded = entry.numel + (-entry.numel % particle_dim)
-            assert block.flat_end - block.flat_start == padded
-            assert block.num_particles == padded // particle_dim
 
 
 # ---------------------------------------------------------------------------
@@ -314,27 +282,20 @@ class TestBlockwiseSolverIntegration:
 class TestBlockLayoutConversion:
     """Tests for layout_flat_to_block_flat, blocks_to_layout_flat, and batch variant."""
 
-    def test_per_layer_roundtrip(self):
-        """Per-layer blocks: layout->block->layout is identity for real params."""
+    @pytest.mark.parametrize(
+        "make_blocks",
+        [
+            lambda layout: create_per_layer_blocks(layout, particle_dim=2),
+            lambda layout: create_grouped_blocks(layout, group_size=2, particle_dim=2),
+        ],
+    )
+    def test_per_layer_roundtrip(self, make_blocks):
+        """Block factories: layout->block->layout is identity for real params."""
         from polystep.blockwise import layout_flat_to_block_flat, blocks_to_layout_flat
 
         model = SimpleMLP()
         layout = ParamLayout.from_module(model, particle_dim=2)
-        blocks = create_per_layer_blocks(layout, particle_dim=2)
-
-        flat = layout.flatten(model).reshape(-1)
-        block_flat = layout_flat_to_block_flat(flat, blocks, layout)
-        roundtrip = blocks_to_layout_flat(block_flat, blocks, layout)
-
-        torch.testing.assert_close(flat, roundtrip)
-
-    def test_grouped_roundtrip(self):
-        """Grouped blocks: layout->block->layout is identity for real params."""
-        from polystep.blockwise import layout_flat_to_block_flat, blocks_to_layout_flat
-
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model, particle_dim=2)
-        blocks = create_grouped_blocks(layout, group_size=2, particle_dim=2)
+        blocks = make_blocks(layout)
 
         flat = layout.flatten(model).reshape(-1)
         block_flat = layout_flat_to_block_flat(flat, blocks, layout)

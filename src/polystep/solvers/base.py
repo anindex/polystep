@@ -24,7 +24,8 @@ class SolverResult:
         converged: Whether the solver converged within tolerance.
         n_iters: Number of iterations actually run.
         ent_reg_cost: Entropic regularized cost of the transport plan. For the
-            Sinkhorn dual this is <f, a> + <g, b> - eps * sum(a).
+            Sinkhorn dual this is <f, a> + <g, b> - eps * sum_ij P_ij (true plan
+            mass; equals the converged value when sum(P) == sum(a)).
     """
 
     matrix: torch.Tensor

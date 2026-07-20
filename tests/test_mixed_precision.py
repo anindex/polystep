@@ -12,36 +12,33 @@ from polystep.cma_subspace import CMAAdaptiveSubspace
 class TestMixedPrecisionProperties:
     """Test mixed precision properties and initialization."""
 
-    def test_mixed_precision_default_false(self):
-        """mixed_precision defaults to False."""
+    @pytest.mark.parametrize(
+        "kwargs,expected_mixed_precision,expected_dtype",
+        [
+            ({}, False, torch.float32),
+            ({"mixed_precision": True}, True, torch.bfloat16),
+        ],
+    )
+    def test_mixed_precision_default_false(self, kwargs, expected_mixed_precision, expected_dtype):
+        """mixed_precision property and model_dtype follow the mixed_precision flag."""
         model = nn.Linear(10, 5)
-        opt = PolyStepOptimizer(model, compile=False)
-        assert opt.mixed_precision is False
-        assert opt.model_dtype == torch.float32
-
-    def test_mixed_precision_enabled(self):
-        """mixed_precision=True sets property and dtype correctly."""
-        model = nn.Linear(10, 5)
-        opt = PolyStepOptimizer(model, mixed_precision=True, compile=False)
-        assert opt.mixed_precision is True
+        opt = PolyStepOptimizer(model, compile=False, **kwargs)
+        assert opt.mixed_precision is expected_mixed_precision
         # On CPU, BF16 is always supported
-        assert opt.model_dtype == torch.bfloat16
+        assert opt.model_dtype == expected_dtype
 
-    def test_model_cast_to_bfloat16(self):
-        """Model parameters are cast to BF16 when mixed precision enabled."""
+    @pytest.mark.parametrize(
+        "mixed_precision,expected_dtype",
+        [
+            (True, torch.bfloat16),
+            (False, torch.float32),
+        ],
+    )
+    def test_model_cast_to_bfloat16(self, mixed_precision, expected_dtype):
+        """Model parameters are cast to BF16 only when mixed precision enabled."""
         model = nn.Linear(10, 5)
-        original_dtype = next(model.parameters()).dtype
-        assert original_dtype == torch.float32
-
-        PolyStepOptimizer(model, mixed_precision=True, compile=False)
-        new_dtype = next(model.parameters()).dtype
-        assert new_dtype == torch.bfloat16
-
-    def test_model_stays_fp32_when_disabled(self):
-        """Model stays FP32 when mixed precision disabled."""
-        model = nn.Linear(10, 5)
-        PolyStepOptimizer(model, mixed_precision=False, compile=False)
-        assert next(model.parameters()).dtype == torch.float32
+        PolyStepOptimizer(model, mixed_precision=mixed_precision, compile=False)
+        assert next(model.parameters()).dtype == expected_dtype
 
 
 class TestMixedPrecisionStep:
@@ -138,23 +135,19 @@ class TestMixedPrecisionSubspace:
 class TestProjectionDtype:
     """Test AdaptiveSubspace init_projection dtype parameter."""
 
-    def test_init_projection_default_fp32(self):
-        """init_projection defaults to FP32."""
+    @pytest.mark.parametrize(
+        "dtype,expected_dtype",
+        [
+            (None, torch.float32),
+            (torch.float32, torch.float32),
+            (torch.bfloat16, torch.bfloat16),
+        ],
+    )
+    def test_init_projection_default_fp32(self, dtype, expected_dtype):
+        """init_projection defaults to FP32 and honors an explicit dtype."""
         subspace = AdaptiveSubspace(full_dim=100, subspace_dim=16)
-        projection = subspace.init_projection()
-        assert projection.dtype == torch.float32
-
-    def test_init_projection_explicit_fp32(self):
-        """init_projection with explicit FP32."""
-        subspace = AdaptiveSubspace(full_dim=100, subspace_dim=16)
-        projection = subspace.init_projection(dtype=torch.float32)
-        assert projection.dtype == torch.float32
-
-    def test_init_projection_bfloat16(self):
-        """init_projection with BF16."""
-        subspace = AdaptiveSubspace(full_dim=100, subspace_dim=16)
-        projection = subspace.init_projection(dtype=torch.bfloat16)
-        assert projection.dtype == torch.bfloat16
+        projection = subspace.init_projection(dtype=dtype)
+        assert projection.dtype == expected_dtype
 
     def test_cma_subspace_projection_dtype(self):
         """CMAAdaptiveSubspace passes dtype through."""

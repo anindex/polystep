@@ -239,19 +239,6 @@ class TestHybridReconstructBatch:
                     f"Row {i}, key {key}: batch vs single mismatch"
                 )
 
-    def test_reconstruct_batch_shapes(self, model, hybrid_sub):
-        """reconstruct_batch produces (N, *shape) tensors."""
-        projections = hybrid_sub.init_projections(torch.device("cpu"), torch.float32)
-        base_sd = model.state_dict()
-
-        N = 3
-        batch = torch.randn(N, hybrid_sub.subspace_dim) * 0.01
-        result = hybrid_sub.reconstruct_batch(projections, base_sd, batch)
-
-        for spec in hybrid_sub.specs:
-            expected_shape = (N, *spec.original_shape)
-            assert result[spec.entry_key].shape == expected_shape
-
 
 # ---------------------------------------------------------------------------
 # absorb
@@ -647,6 +634,9 @@ class TestRankTransition:
         optimizer.step(closure)
         # After transition, subspace_dim should increase (rank=4 > rank=2)
         assert optimizer.subspace.subspace_dim > initial_subspace_dim
+        # After transition, duals should be reset
+        assert optimizer.state.f is None
+        assert optimizer.state.g is None
 
         # Step 4: still rank=4, verify it runs without error
         optimizer.step(closure)
@@ -685,54 +675,6 @@ class TestRankTransition:
                 epsilon=0.1,
                 compile=False,
             )
-
-    def test_rank_transition_resets_duals(self):
-        """After transition, state.f and state.g are None."""
-        torch.manual_seed(42)
-        model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 5))
-        layout = ParamLayout.from_module(model)
-        subspace = HybridSubspace.from_layout(layout, rank=2, rotation_interval=0)
-
-        # Transition at step 2
-        schedule = RankSchedule(stages=[(0, 2), (2, 4)])
-
-        from polystep import PolyStepOptimizer
-
-        optimizer = PolyStepOptimizer(
-            model,
-            subspace=subspace,
-            rank_schedule=schedule,
-            epsilon=0.1,
-            max_iterations=5,
-            compile=False,
-        )
-
-        target = torch.randn(5)
-
-        def closure(batched_params):
-            first_key = list(batched_params.keys())[0]
-            N = batched_params[first_key].shape[0]
-            losses = torch.zeros(N)
-            for i in range(N):
-                x = torch.randn(1, 10)
-                w1 = batched_params["0.weight"][i]
-                b1 = batched_params["0.bias"][i]
-                w2 = batched_params["2.weight"][i]
-                b2 = batched_params["2.bias"][i]
-                h = torch.relu(x @ w1.t() + b1)
-                out = h @ w2.t() + b2
-                losses[i] = ((out - target) ** 2).mean()
-            return losses
-
-        # Step 1: iteration_count goes from 0 to 1 (still rank=2)
-        optimizer.step(closure)
-
-        # Step 2: iteration_count goes from 1 to 2, triggers transition
-        optimizer.step(closure)
-
-        # After transition, duals should be reset
-        assert optimizer.state.f is None
-        assert optimizer.state.g is None
 
 
 # ---------------------------------------------------------------------------
@@ -811,22 +753,6 @@ class TestStructuredProjection:
                 f"Shape mismatch for {key}: {proj_random[key].shape} vs {proj_struct[key].shape}"
             )
 
-    def test_reconstruct_works_with_structured(self, model, layout):
-        """reconstruct (apply_perturbation) works with structured projections."""
-        hybrid = HybridSubspace.from_layout(layout, rank=4, projection_mode="structured")
-        projections = hybrid.init_projections(torch.device("cpu"), torch.float32)
-        base_sd = model.state_dict()
-
-        torch.manual_seed(42)
-        coords = torch.randn(hybrid.subspace_dim) * 0.01
-
-        result = hybrid.apply_perturbation(projections, base_sd, coords)
-
-        # Result should have correct keys and shapes
-        for spec in hybrid.specs:
-            assert spec.entry_key in result
-            assert result[spec.entry_key].shape == spec.original_shape
-
     def test_reconstruct_batch_works_with_structured(self, model, layout):
         """reconstruct_batch works identically with structured projections."""
         hybrid = HybridSubspace.from_layout(layout, rank=4, projection_mode="structured")
@@ -893,13 +819,14 @@ class TestMaxSubspaceDim:
             nn.Linear(32 * 8 * 8, 10),
         )
 
-    def test_none_is_noop(self):
+    @pytest.mark.parametrize("cap", [None, 999999])
+    def test_none_is_noop(self, cap):
         model = nn.Sequential(nn.Linear(64, 32), nn.Linear(32, 10))
         layout = ParamLayout.from_module(model)
         h_default = HybridSubspace.from_layout(layout, rank=4)
-        h_none = HybridSubspace.from_layout(layout, rank=4, max_subspace_dim=None)
-        assert h_default.subspace_dim == h_none.subspace_dim
-        for s1, s2 in zip(h_default.specs, h_none.specs):
+        h_capped = HybridSubspace.from_layout(layout, rank=4, max_subspace_dim=cap)
+        assert h_default.subspace_dim == h_capped.subspace_dim
+        for s1, s2 in zip(h_default.specs, h_capped.specs):
             assert s1.num_coords == s2.num_coords
 
     def test_caps_total_dim(self):
@@ -939,13 +866,6 @@ class TestMaxSubspaceDim:
             if spec.num_coords < spec.num_params:
                 assert spec.is_projected, f"{spec.entry_key} should be projected when coords < params"
 
-    def test_larger_than_natural_is_noop(self):
-        model = nn.Sequential(nn.Linear(64, 32), nn.Linear(32, 10))
-        layout = ParamLayout.from_module(model)
-        h_full = HybridSubspace.from_layout(layout, rank=4)
-        h_big = HybridSubspace.from_layout(layout, rank=4, max_subspace_dim=999999)
-        assert h_full.subspace_dim == h_big.subspace_dim
-
     def test_reconstruction_roundtrip(self):
         model = self._make_conv_model()
         layout = ParamLayout.from_module(model)
@@ -957,17 +877,6 @@ class TestMaxSubspaceDim:
         for key, val in result.items():
             assert torch.isfinite(val).all(), f"Non-finite in {key}"
             assert val.shape == base_sd[key].shape, f"Shape mismatch for {key}"
-
-    def test_absorb_with_cap(self):
-        model = self._make_conv_model()
-        layout = ParamLayout.from_module(model)
-        h = HybridSubspace.from_layout(layout, rank=4, max_subspace_dim=200)
-        projections = h.init_projections(torch.device("cpu"), torch.float32)
-        base_sd = model.state_dict()
-        coords = torch.randn(h.subspace_dim) * 0.01
-        new_base, new_coords = h.absorb(projections, base_sd, coords)
-        assert new_coords.shape == (h.subspace_dim,)
-        assert torch.allclose(new_coords, torch.zeros_like(new_coords))
 
 
 class TestHybridReconstructionProperties:

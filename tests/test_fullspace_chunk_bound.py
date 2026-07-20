@@ -37,11 +37,6 @@ def _one_step(chunk_size):
     return float(opt.step(lambda s: ev.evaluate(s, x, y)))
 
 
-def test_fullspace_default_chunk_runs_and_is_finite():
-    loss = _one_step(chunk_size=None)
-    assert loss == loss  # not NaN
-
-
 def test_fullspace_default_chunk_matches_explicit_chunk():
     """Bounded default chunk must produce the same result as an explicit chunk."""
     loss_default = _one_step(chunk_size=None)
@@ -50,6 +45,5 @@ def test_fullspace_default_chunk_matches_explicit_chunk():
 
 
 if __name__ == "__main__":
-    test_fullspace_default_chunk_runs_and_is_finite()
     test_fullspace_default_chunk_matches_explicit_chunk()
     print("ok")

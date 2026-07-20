@@ -200,27 +200,16 @@ class TestEvolutionPathC:
 class TestHeavisideSigma:
     """Tests for Heaviside stall detection function."""
 
-    def test_healthy_p_sigma_returns_true(self):
-        """Normal p_sigma norm returns h_sigma=True (healthy)."""
+    @pytest.mark.parametrize("norm_mult, expected", [(0.5, True), (10.0, False)])
+    def test_healthy_p_sigma_returns_true(self, norm_mult, expected):
+        """p_sigma norm below threshold is healthy (True); far above is stalled (False)."""
         n = 100
         expected_norm = math.sqrt(n)
         c_sigma = 0.1
 
-        # p_sigma_norm slightly below threshold -> healthy
-        p_sigma_norm = expected_norm * 0.5
+        p_sigma_norm = expected_norm * norm_mult
         h_sigma = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=10)
-        assert h_sigma is True
-
-    def test_stalled_p_sigma_returns_false(self):
-        """Very large p_sigma norm returns h_sigma=False (stalled)."""
-        n = 100
-        expected_norm = math.sqrt(n)
-        c_sigma = 0.1
-
-        # p_sigma_norm much larger than threshold -> stalled
-        p_sigma_norm = expected_norm * 10.0
-        h_sigma = compute_heaviside_sigma(p_sigma_norm, expected_norm, n, c_sigma, generation=100)
-        assert h_sigma is False
+        assert h_sigma is expected
 
     def test_threshold_uses_generation_plus_one(self):
         """The cumulation correction uses generation + 1 (caller passes a 0-based count)."""
@@ -257,27 +246,20 @@ class TestCSAStepSize:
         # Should be close to 1.0 (exponent ~ 0)
         assert sigma_new == pytest.approx(1.0, rel=0.1)
 
-    def test_p_sigma_larger_than_expected_increases_sigma(self):
-        """When ||p_sigma|| > E[||N(0,I)||], sigma increases."""
+    @pytest.mark.parametrize("mult, expect_increase", [(2.0, True), (0.5, False)])
+    def test_p_sigma_larger_than_expected_increases_sigma(self, mult, expect_increase):
+        """||p_sigma|| above E[||N(0,I)||] increases sigma; below decreases it."""
         n = 100
         expected_norm = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n**2))
         p_sigma = torch.randn(n)
-        p_sigma = p_sigma / p_sigma.norm() * (expected_norm * 2.0)  # 2x expected
+        p_sigma = p_sigma / p_sigma.norm() * (expected_norm * mult)
 
         sigma = 1.0
         sigma_new = update_step_size_csa(sigma, p_sigma, c_sigma=0.1, d_sigma=1.1, n=n)
-        assert sigma_new > sigma
-
-    def test_p_sigma_smaller_than_expected_decreases_sigma(self):
-        """When ||p_sigma|| < E[||N(0,I)||], sigma decreases."""
-        n = 100
-        expected_norm = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n**2))
-        p_sigma = torch.randn(n)
-        p_sigma = p_sigma / p_sigma.norm() * (expected_norm * 0.5)  # 0.5x expected
-
-        sigma = 1.0
-        sigma_new = update_step_size_csa(sigma, p_sigma, c_sigma=0.1, d_sigma=1.1, n=n)
-        assert sigma_new < sigma
+        if expect_increase:
+            assert sigma_new > sigma
+        else:
+            assert sigma_new < sigma
 
     def test_clamping_lower_bound(self):
         """Sigma is clamped to minimum (1e-6)."""
@@ -341,10 +323,11 @@ class TestCovarianceUpdate:
         expected = 0.8 * 1.0 + c_1 * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 
-    def test_rank_mu_term_applied(self):
-        """Rank-mu update term c_mu * rank_mu is present."""
+    @pytest.mark.parametrize("c_diag_val", [1.0, 4.0])
+    def test_rank_mu_not_rescaled_by_covariance(self, c_diag_val):
+        """rank_mu is added raw (c_mu * rank_mu), with no sqrt(C) Mahalanobis rescaling."""
         n = 16
-        C_diag = torch.ones(n)
+        C_diag = torch.ones(n) * c_diag_val
         p_c = torch.zeros(n)
         rank_mu = torch.full((n,), 4.0)
         c_1 = 0.0
@@ -352,21 +335,7 @@ class TestCovarianceUpdate:
         c_c = 0.1
 
         C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c)
-        expected = 0.8 * 1.0 + c_mu * 4.0
-        assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
-
-    def test_rank_mu_not_rescaled_by_covariance(self):
-        """rank_mu is added raw, with no sqrt(C) (Mahalanobis) rescaling."""
-        n = 8
-        C_diag = torch.ones(n) * 4.0
-        p_c = torch.zeros(n)
-        rank_mu = torch.full((n,), 4.0)
-        c_1 = 0.0
-        c_mu = 0.2
-        c_c = 0.1
-
-        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=c_1, c_mu=c_mu, h_sigma=True, c_c=c_c)
-        expected = 0.8 * 4.0 + c_mu * 4.0
+        expected = 0.8 * c_diag_val + c_mu * 4.0
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
 
     def test_h_sigma_false_dampens_update(self):

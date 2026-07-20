@@ -15,32 +15,17 @@ import pytest
 class TestGenerateMaxsatInstance:
     """Tests for generate_maxsat_instance."""
 
-    def test_returns_dict_with_required_keys(self):
+    @pytest.mark.parametrize(
+        "key, expected_dtype",
+        [("clause_vars", torch.long), ("clause_signs", torch.float)],
+    )
+    def test_clause_vars_shape_and_dtype(self, key, expected_dtype):
         pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
         result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
-        assert isinstance(result, dict)
-        assert "clause_vars" in result
-        assert "clause_signs" in result
-        assert "num_vars" in result
-        assert "num_clauses" in result
-
-    def test_clause_vars_shape_and_dtype(self):
-        pytest.importorskip("pysat", reason="python-sat not installed")
-        from experiments.runners.nondiff_data import generate_maxsat_instance
-
-        result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
-        assert result["clause_vars"].shape == (86, 3)
-        assert result["clause_vars"].dtype == torch.long
-
-    def test_clause_signs_shape_and_dtype(self):
-        pytest.importorskip("pysat", reason="python-sat not installed")
-        from experiments.runners.nondiff_data import generate_maxsat_instance
-
-        result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
-        assert result["clause_signs"].shape == (86, 3)
-        assert result["clause_signs"].dtype == torch.float
+        assert result[key].shape == (86, 3)
+        assert result[key].dtype == expected_dtype
 
     def test_clause_vars_in_valid_range(self):
         pytest.importorskip("pysat", reason="python-sat not installed")

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.0 - 2026-07-20
+
+### Added
+
+- On PyPI now: `pip install polystep` (or `uv add polystep`).
+
+### Changed
+
+- Wider install range: `torch >= 2.4` (was 2.10) and `numpy >= 1.24` (was 2.0).
+- Blockwise and subspace-blockwise steps reuse one buffer for the per-chunk
+  configs instead of reallocating it every chunk, so a step allocates less.
+
+### Fixed
+
+- Solvers stay accurate when the cost matrix has a large constant offset
+  (`|C|` far above `epsilon`). The cost is recentered before the log-domain
+  math, which leaves the transport plan unchanged, so `SinkhornSolver.matrix`,
+  `KLSoftmaxSolver(lam=0)`, and the softmax solvers no longer lose precision or
+  return NaN in that regime.
+- `SinkhornSolver` computes `ent_reg_cost` from the actual plan mass, so it is
+  correct before convergence too, and it warns when the two marginals do not
+  sum to the same total.
+- A 1D biased rotation returns the identity instead of flipping the axis it just
+  aligned (`SO(1)` cannot represent a reflection).
+
 ## 0.6.1 - 2026-07-15
 
 ### Added

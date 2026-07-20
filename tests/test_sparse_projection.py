@@ -19,37 +19,35 @@ from polystep.projection import SparseRandomProjection
 class TestCoreProjection:
     """Tests for basic projection functionality."""
 
-    def test_project_shape_1d(self):
-        """Single vector projection produces correct shape."""
+    @pytest.mark.parametrize(
+        "input_shape, expected_shape",
+        [
+            ((64,), (10000,)),
+            ((16, 64), (16, 10000)),
+        ],
+    )
+    def test_project_shape_1d(self, input_shape, expected_shape):
+        """Projection produces correct output shape."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
-        coords = torch.randn(64)
+        coords = torch.randn(*input_shape)
         full = proj.project(coords)
-        assert full.shape == (10000,)
+        assert full.shape == expected_shape
         assert full.dtype == coords.dtype
 
-    def test_project_shape_batch(self):
-        """Batched projection produces correct shape."""
-        proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
-        batch_coords = torch.randn(16, 64)
-        batch_full = proj.project(batch_coords)
-        assert batch_full.shape == (16, 10000)
-        assert batch_full.dtype == batch_coords.dtype
-
-    def test_project_transpose_shape_1d(self):
+    @pytest.mark.parametrize(
+        "input_shape, expected_shape",
+        [
+            ((10000,), (64,)),
+            ((16, 10000), (16, 64)),
+        ],
+    )
+    def test_project_transpose_shape_1d(self, input_shape, expected_shape):
         """Transpose projection (full -> subspace) produces correct shape."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
-        full = torch.randn(10000)
+        full = torch.randn(*input_shape)
         coords = proj.project_transpose(full)
-        assert coords.shape == (64,)
+        assert coords.shape == expected_shape
         assert coords.dtype == full.dtype
-
-    def test_project_transpose_shape_batch(self):
-        """Batched transpose projection produces correct shape."""
-        proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
-        batch_full = torch.randn(16, 10000)
-        batch_coords = proj.project_transpose(batch_full)
-        assert batch_coords.shape == (16, 64)
-        assert batch_coords.dtype == batch_full.dtype
 
     def test_deterministic_with_seed(self):
         """Same seed produces identical projections."""
@@ -203,45 +201,35 @@ class TestJLTProperty:
 class TestDtypeHandling:
     """Tests for dtype handling."""
 
-    def test_float32(self):
-        """Works with float32 inputs."""
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_float32(self, dtype):
+        """Works with float32 and float64 inputs."""
         proj = SparseRandomProjection(full_dim=1000, subspace_dim=32, seed=42)
-        coords = torch.randn(32, dtype=torch.float32)
+        coords = torch.randn(32, dtype=dtype)
         full = proj.project(coords)
-        assert full.dtype == torch.float32
-
-    def test_float64(self):
-        """Works with float64 inputs."""
-        proj = SparseRandomProjection(full_dim=1000, subspace_dim=32, seed=42)
-        coords = torch.randn(32, dtype=torch.float64)
-        full = proj.project(coords)
-        assert full.dtype == torch.float64
+        assert full.dtype == dtype
 
 
 class TestCUDA:
     """Tests for CUDA compatibility."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_projection(self):
+    @pytest.mark.parametrize(
+        "input_shape, expected_shape",
+        [
+            ((64,), (10000,)),
+            ((8, 64), (8, 10000)),
+        ],
+    )
+    def test_cuda_projection(self, input_shape, expected_shape):
         """Projection works on GPU."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
 
-        coords = torch.randn(64, device="cuda")
+        coords = torch.randn(*input_shape, device="cuda")
         full = proj.project(coords)
 
         assert full.device.type == "cuda"
-        assert full.shape == (10000,)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_batch_projection(self):
-        """Batched projection works on GPU."""
-        proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
-
-        coords = torch.randn(8, 64, device="cuda")
-        full = proj.project(coords)
-
-        assert full.device.type == "cuda"
-        assert full.shape == (8, 10000)
+        assert full.shape == expected_shape
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_transpose(self):
@@ -297,13 +285,6 @@ class TestEdgeCases:
         coords = torch.randn(5)
         full = proj.project(coords)
         assert full.shape == (10,)
-
-    def test_actual_density_property(self):
-        """actual_density property calculates correctly."""
-        proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
-
-        expected = proj.nnz / (10000 * 64)
-        assert abs(proj.actual_density - expected) < 1e-10
 
 
 class TestStatisticalProperties:

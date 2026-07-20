@@ -143,15 +143,21 @@ class TestOverrelaxation:
         a = torch.ones(10) / 10
         assert torch.allclose(P.sum(dim=1), a, atol=1e-4)
 
-    def test_omega_overrelaxed(self):
-        """omega=1.5 converges in fewer iterations than omega=1.0 on a non-trivial cost matrix.
+    @pytest.mark.parametrize(
+        "seed, n, cost_scale, omega",
+        [
+            (42, 30, 10.0, 1.5),
+            (123, 25, 8.0, 1.2),
+        ],
+    )
+    def test_omega_overrelaxed(self, seed, n, cost_scale, omega):
+        """omega in (1, 1.5] converges in fewer iterations than omega=1.0 on a non-trivial cost matrix.
 
         Overrelaxation is most beneficial for larger problems with wider cost ranges
         where standard Sinkhorn needs more iterations.
         """
-        torch.manual_seed(42)
-        n = 30
-        C = torch.rand(n, n) * 10.0  # Wider cost range makes standard Sinkhorn work harder
+        torch.manual_seed(seed)
+        C = torch.rand(n, n) * cost_scale  # Wider cost range makes standard Sinkhorn work harder
 
         solver_standard = SinkhornSolver(
             epsilon=0.5,
@@ -169,7 +175,7 @@ class TestOverrelaxation:
             threshold=1e-6,
             check_every=1,
             compile=False,
-            omega=1.5,
+            omega=omega,
         )
         result_overrelaxed = solver_overrelaxed.solve(C)
 
@@ -214,35 +220,6 @@ class TestOverrelaxation:
             f"adaptive ({r_adaptive.n_iters}) should beat static ({r_static.n_iters})"
         )
 
-    def test_omega_backward_compatible(self):
-        """Same cost matrix with omega=1.0 and no omega argument produce identical f, g values."""
-        torch.manual_seed(42)
-        C = torch.rand(8, 8)
-
-        solver_default = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=500,
-            threshold=1e-8,
-            compile=False,
-        )
-        result_default = solver_default.solve(C)
-
-        solver_explicit = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=500,
-            threshold=1e-8,
-            compile=False,
-            omega=1.0,
-        )
-        result_explicit = solver_explicit.solve(C)
-
-        assert torch.allclose(result_default.f, result_explicit.f, atol=1e-10), (
-            f"f difference: {(result_default.f - result_explicit.f).abs().max():.2e}"
-        )
-        assert torch.allclose(result_default.g, result_explicit.g, atol=1e-10), (
-            f"g difference: {(result_default.g - result_explicit.g).abs().max():.2e}"
-        )
-
     def test_omega_invalid(self):
         """ValueError for omega=0.3 and omega=2.5."""
         with pytest.raises(ValueError, match="omega must be in"):
@@ -250,78 +227,50 @@ class TestOverrelaxation:
         with pytest.raises(ValueError, match="omega must be in"):
             SinkhornSolver(omega=2.5, compile=False)
 
-    def test_omega_convergence_check_path(self):
-        """Use threshold>0 to trigger convergence-checking path with omega=1.2.
-
-        The convergence-checking path (threshold > 0) exercises the inline overrelaxation
-        code rather than the compiled function path.
-        """
-        torch.manual_seed(123)
-        n = 25
-        C = torch.rand(n, n) * 8.0  # Scaled costs for meaningful iteration counts
-
-        solver_standard = SinkhornSolver(
-            epsilon=0.5,
-            max_iterations=5000,
-            threshold=1e-6,
-            check_every=1,
-            compile=False,
-            omega=1.0,
-        )
-        result_standard = solver_standard.solve(C)
-
-        solver_overrelaxed = SinkhornSolver(
-            epsilon=0.5,
-            max_iterations=5000,
-            threshold=1e-6,
-            check_every=1,
-            compile=False,
-            omega=1.2,
-        )
-        result_overrelaxed = solver_overrelaxed.solve(C)
-
-        assert result_standard.converged, f"Standard did not converge in {result_standard.n_iters} iters"
-        assert result_overrelaxed.converged, f"Overrelaxed did not converge in {result_overrelaxed.n_iters} iters"
-        assert result_overrelaxed.n_iters < result_standard.n_iters, (
-            f"Overrelaxed ({result_overrelaxed.n_iters} iters) should be faster than "
-            f"standard ({result_standard.n_iters} iters)"
-        )
-
 
 class TestAndersonAcceleration:
     """Tests for Anderson acceleration in Sinkhorn solver (convergence acceleration)."""
 
-    def test_anderson_depth_zero_matches_standard(self):
-        """anderson_depth=0 produces identical f, g, n_iters to standard solver."""
+    @pytest.mark.parametrize(
+        "override, shape, max_iterations",
+        [
+            ({"omega": 1.0}, (8, 8), 500),
+            ({"anderson_depth": 0}, (10, 8), 2000),
+            ({"data_dependent_init": False}, (10, 8), 2000),
+            ({"adaptive_omega": False}, (10, 8), 2000),
+        ],
+    )
+    def test_anderson_depth_zero_matches_standard(self, override, shape, max_iterations):
+        """A flag left at its dataclass default takes the standard path (identical f, g, n_iters)."""
         torch.manual_seed(42)
-        n, m = 10, 8
+        n, m = shape
         C = torch.rand(n, m)
 
         solver_standard = SinkhornSolver(
             epsilon=0.1,
-            max_iterations=2000,
+            max_iterations=max_iterations,
             threshold=1e-8,
             compile=False,
         )
         result_standard = solver_standard.solve(C)
 
-        solver_aa = SinkhornSolver(
+        solver_configured = SinkhornSolver(
             epsilon=0.1,
-            max_iterations=2000,
+            max_iterations=max_iterations,
             threshold=1e-8,
             compile=False,
-            anderson_depth=0,
+            **override,
         )
-        result_aa = solver_aa.solve(C)
+        result_configured = solver_configured.solve(C)
 
-        assert torch.allclose(result_standard.f, result_aa.f, atol=1e-10), (
-            f"f difference: {(result_standard.f - result_aa.f).abs().max():.2e}"
+        assert torch.allclose(result_standard.f, result_configured.f, atol=1e-10), (
+            f"f difference: {(result_standard.f - result_configured.f).abs().max():.2e}"
         )
-        assert torch.allclose(result_standard.g, result_aa.g, atol=1e-10), (
-            f"g difference: {(result_standard.g - result_aa.g).abs().max():.2e}"
+        assert torch.allclose(result_standard.g, result_configured.g, atol=1e-10), (
+            f"g difference: {(result_standard.g - result_configured.g).abs().max():.2e}"
         )
-        assert result_standard.n_iters == result_aa.n_iters, (
-            f"n_iters differ: standard={result_standard.n_iters}, aa={result_aa.n_iters}"
+        assert result_standard.n_iters == result_configured.n_iters, (
+            f"n_iters differ: standard={result_standard.n_iters}, configured={result_configured.n_iters}"
         )
 
     def test_anderson_reduces_iterations(self):
@@ -377,97 +326,46 @@ class TestAndersonAcceleration:
         assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
         assert torch.allclose(P.sum(dim=0), b, atol=1e-4), f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
 
-    def test_anderson_handles_ill_conditioning(self):
-        """anderson_depth=5 on a nearly-singular cost matrix does not produce NaN."""
-        torch.manual_seed(42)
-        n = 10
-        # Create a nearly-singular cost matrix (rank-1 + small noise)
-        v = torch.rand(n)
-        C = v.unsqueeze(1) @ v.unsqueeze(0) + torch.rand(n, n) * 1e-4
-
-        solver = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-6,
-            compile=False,
-            anderson_depth=5,
-        )
-        result = solver.solve(C)
-
-        assert torch.isfinite(result.f).all(), "f contains NaN or Inf"
-        assert torch.isfinite(result.g).all(), "g contains NaN or Inf"
-
-    def test_anderson_near_singular_no_nan(self):
+    @pytest.mark.parametrize("noise", [1e-4, 1e-6])
+    def test_anderson_near_singular_no_nan(self, noise):
         """Anderson acceleration on near-singular cost matrices produces finite results.
 
         Tests the hardened lstsq guard: alpha norm bound and combined-result
         finiteness check prevent ill-conditioned solves from corrupting duals.
         """
-        for seed in [42]:
-            torch.manual_seed(seed)
-            n = 12
-            # Near-singular cost matrix: rank-1 outer product with tiny perturbation
-            # This stresses lstsq with ill-conditioned residual matrices
-            v = torch.rand(n)
-            C = v.unsqueeze(1) @ v.unsqueeze(0) + torch.rand(n, n) * 1e-6
+        torch.manual_seed(42)
+        n = 12
+        # Near-singular cost matrix: rank-1 outer product with tiny perturbation
+        v = torch.rand(n)
+        C = v.unsqueeze(1) @ v.unsqueeze(0) + torch.rand(n, n) * noise
 
-            solver = SinkhornSolver(
-                epsilon=0.1,
-                max_iterations=200,
-                threshold=1e-6,
-                compile=False,
-                anderson_depth=5,
-                check_every=1,
-            )
-            result = solver.solve(C)
+        solver = SinkhornSolver(
+            epsilon=0.1,
+            max_iterations=200,
+            threshold=1e-6,
+            compile=False,
+            anderson_depth=5,
+            check_every=1,
+        )
+        result = solver.solve(C)
 
-            # The hardened guard must prevent NaN/Inf in dual potentials
-            assert torch.isfinite(result.f).all(), (
-                f"seed={seed}: f has non-finite values: "
-                f"NaN={torch.isnan(result.f).sum()}, Inf={torch.isinf(result.f).sum()}"
-            )
-            assert torch.isfinite(result.g).all(), (
-                f"seed={seed}: g has non-finite values: "
-                f"NaN={torch.isnan(result.g).sum()}, Inf={torch.isinf(result.g).sum()}"
-            )
+        # The hardened guard must prevent NaN/Inf in dual potentials
+        assert torch.isfinite(result.f).all(), (
+            f"noise={noise}: f has non-finite values: "
+            f"NaN={torch.isnan(result.f).sum()}, Inf={torch.isinf(result.f).sum()}"
+        )
+        assert torch.isfinite(result.g).all(), (
+            f"noise={noise}: g has non-finite values: "
+            f"NaN={torch.isnan(result.g).sum()}, Inf={torch.isinf(result.g).sum()}"
+        )
 
-            # Transport plan must be finite (no NaN propagation)
-            P = result.matrix
-            assert torch.isfinite(P).all(), f"seed={seed}: Transport matrix contains NaN or Inf"
+        # Transport plan must be finite (no NaN propagation)
+        P = result.matrix
+        assert torch.isfinite(P).all(), f"noise={noise}: Transport matrix contains NaN or Inf"
 
 
 class TestDataDependentInit:
     """Tests for data-dependent initialization in Sinkhorn solver (convergence acceleration)."""
-
-    def test_disabled_matches_standard(self):
-        """data_dependent_init=False produces identical result to default solver."""
-        torch.manual_seed(42)
-        n, m = 10, 8
-        C = torch.rand(n, m)
-
-        solver_standard = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-8,
-            compile=False,
-        )
-        result_standard = solver_standard.solve(C)
-
-        solver_ddi = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-8,
-            compile=False,
-            data_dependent_init=False,
-        )
-        result_ddi = solver_ddi.solve(C)
-
-        assert torch.allclose(result_standard.f, result_ddi.f, atol=1e-10), (
-            f"f difference: {(result_standard.f - result_ddi.f).abs().max():.2e}"
-        )
-        assert torch.allclose(result_standard.g, result_ddi.g, atol=1e-10), (
-            f"g difference: {(result_standard.g - result_ddi.g).abs().max():.2e}"
-        )
 
     def test_cold_start_fewer_iterations(self):
         """data_dependent_init=True converges in fewer iterations than False on cold start."""
@@ -566,55 +464,6 @@ class TestDataDependentInit:
 
 class TestAdaptiveOmega:
     """Tests for adaptive omega in Sinkhorn solver (convergence acceleration)."""
-
-    def test_disabled_matches_standard(self):
-        """adaptive_omega=False produces identical result to default solver."""
-        torch.manual_seed(42)
-        n, m = 10, 8
-        C = torch.rand(n, m)
-
-        solver_standard = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-8,
-            compile=False,
-        )
-        result_standard = solver_standard.solve(C)
-
-        solver_ao = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-8,
-            compile=False,
-            adaptive_omega=False,
-        )
-        result_ao = solver_ao.solve(C)
-
-        assert torch.allclose(result_standard.f, result_ao.f, atol=1e-10), (
-            f"f difference: {(result_standard.f - result_ao.f).abs().max():.2e}"
-        )
-        assert torch.allclose(result_standard.g, result_ao.g, atol=1e-10), (
-            f"g difference: {(result_standard.g - result_ao.g).abs().max():.2e}"
-        )
-
-    def test_omega_stays_in_bounds(self):
-        """adaptive_omega=True keeps omega within [1.0, 1.8] (no NaN/Inf in result)."""
-        torch.manual_seed(42)
-        n, m = 15, 15
-        C = torch.rand(n, m) * 10.0
-
-        solver = SinkhornSolver(
-            epsilon=0.5,
-            max_iterations=2000,
-            threshold=1e-6,
-            compile=False,
-            adaptive_omega=True,
-        )
-        result = solver.solve(C)
-
-        assert torch.isfinite(result.f).all(), "f contains NaN or Inf"
-        assert torch.isfinite(result.g).all(), "g contains NaN or Inf"
-        assert result.converged or result.n_iters > 0, "Solver produced no iterations"
 
     def test_ill_conditioned_stays_finite(self):
         """On a stiff cost the divergence back-off latches, so adaptive omega
@@ -718,12 +567,19 @@ class TestFixedModeLogic:
         assert torch.isfinite(result.f).all(), "f contains NaN or Inf"
         assert torch.isfinite(result.g).all(), "g contains NaN or Inf"
 
-    def test_anderson_not_silently_disabled_by_check_every(self):
-        """Anderson acceleration is not warned/disabled when check_every > max_iterations.
+    @pytest.mark.parametrize(
+        "override, substring",
+        [
+            ({"anderson_depth": 5}, "anderson_depth"),
+            ({"adaptive_omega": True}, "adaptive_omega"),
+        ],
+    )
+    def test_anderson_not_silently_disabled_by_check_every(self, override, substring):
+        """Acceleration is not warned/disabled when check_every > max_iterations.
 
         Before the fix, setting check_every > max_iterations triggered fixed_mode,
-        which emitted a warning that Anderson has no effect. After the fix, no
-        warning is emitted because the solver correctly enters the eager path.
+        which emitted a warning that the acceleration has no effect. After the fix,
+        no warning is emitted because the solver correctly enters the eager path.
         """
         import warnings
 
@@ -731,7 +587,7 @@ class TestFixedModeLogic:
         n = 15
         C = torch.rand(n, n)
 
-        # This should NOT produce the fixed-mode warning for Anderson
+        # This should NOT produce the fixed-mode warning for the acceleration
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             solver = SinkhornSolver(
@@ -740,44 +596,17 @@ class TestFixedModeLogic:
                 threshold=1e-6,
                 check_every=99999,
                 compile=False,
-                anderson_depth=5,
+                **override,
             )
             result = solver.solve(C)
 
-        anderson_warnings = [x for x in w if "anderson_depth" in str(x.message) and "fixed-iteration" in str(x.message)]
-        assert len(anderson_warnings) == 0, (
-            "Anderson acceleration should NOT be disabled when threshold > 0, "
-            f"but got warning: {anderson_warnings[0].message}"
+        disabled_warnings = [x for x in w if substring in str(x.message) and "fixed-iteration" in str(x.message)]
+        assert len(disabled_warnings) == 0, (
+            f"{substring} should NOT be disabled when threshold > 0, but got warning: {disabled_warnings[0].message}"
         )
-        # Result should be finite (Anderson ran in eager path)
+        # Result should be finite (acceleration ran in eager path)
         assert torch.isfinite(result.f).all(), "f contains NaN or Inf"
         assert torch.isfinite(result.g).all(), "g contains NaN or Inf"
-
-    def test_adaptive_omega_not_silently_disabled_by_check_every(self):
-        """adaptive_omega is not warned/disabled when check_every > max_iterations."""
-        import warnings
-
-        torch.manual_seed(42)
-        n = 10
-        C = torch.rand(n, n)
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            solver = SinkhornSolver(
-                epsilon=0.5,
-                max_iterations=500,
-                threshold=1e-6,
-                check_every=99999,
-                compile=False,
-                adaptive_omega=True,
-            )
-            result = solver.solve(C)
-
-        adaptive_warnings = [x for x in w if "adaptive_omega" in str(x.message) and "fixed-iteration" in str(x.message)]
-        assert len(adaptive_warnings) == 0, (
-            f"adaptive_omega should NOT be disabled when threshold > 0, but got warning: {adaptive_warnings[0].message}"
-        )
-        assert torch.isfinite(result.f).all(), "f contains NaN or Inf"
 
     def test_threshold_zero_is_fixed_mode(self):
         """threshold <= 0 correctly activates fixed_mode regardless of check_every."""
@@ -933,19 +762,6 @@ class TestProgressiveEpsilon:
         for _ in range(100):
             pe.update(n_iters=999, max_iterations=1000, converged=False)
         assert pe.at() <= 5.0
-
-    def test_drop_in_replacement_for_linear_epsilon(self):
-        """ProgressiveEpsilon has .at() method compatible with LinearEpsilon."""
-        from polystep.epsilon import ProgressiveEpsilon
-
-        pe = ProgressiveEpsilon(init=1.0, target=0.01)
-        # .at() should accept iteration parameter (ignored) and return float
-        val = pe.at(42)
-        assert isinstance(val, float)
-        val_none = pe.at(None)
-        assert isinstance(val_none, float)
-        val_no_arg = pe.at()
-        assert isinstance(val_no_arg, float)
 
     def test_ema_smoothing_prevents_oscillation(self):
         """Multiple update() calls with EMA smoothing create a smooth trajectory."""

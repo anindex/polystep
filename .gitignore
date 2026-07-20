@@ -7,12 +7,20 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
 # Distribution / packaging
 *.egg-info/
 *.egg
 dist/
 build/
 wheels/
+
+# uv (library: resolve from pyproject, no committed lockfile)
+uv.lock
 
 # Virtual environments
 .venv/

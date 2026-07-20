@@ -53,6 +53,26 @@ def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
     return torch.where(finite, cost_matrix, penalty)
 
 
+def recenter_cost(cost_matrix: torch.Tensor):
+    """Subtract the per-matrix minimum so ``|C|`` stays bounded.
+
+    The entropic-OT plan is invariant to a constant shift of the cost:
+    ``softmax(-C/eps)`` is shift-invariant, and a shift only translates the
+    dual potentials, leaving the plan ``P`` unchanged. Keeping ``min(C)=0``
+    preserves FP32 precision in the log-sum-exp and the ``exp((f+g-C)/eps)``
+    reconstruction when ``|C|`` is much larger than ``eps``, and removes the
+    ``+inf`` logit that would NaN a softmax at tiny ``eps``.
+
+    Returns ``(shifted_cost, shift)`` with ``shift = C.min()``. Add
+    ``shift * a.sum()`` back to any reported ``<C, P>`` or dual value (plan
+    mass ``sum(P)`` equals ``a.sum()``). One reduction, no host sync.
+    """
+    if cost_matrix.numel() == 0:
+        return cost_matrix, cost_matrix.new_zeros(())
+    shift = cost_matrix.amin()
+    return cost_matrix - shift, shift
+
+
 def align_marginal(
     a: Optional[torch.Tensor],
     n: int,

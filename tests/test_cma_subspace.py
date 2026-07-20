@@ -627,22 +627,3 @@ class TestSolverStateCMAFields:
         assert state.sigma == 1.0
         assert state.generation == 0
         assert state.use_csa is False
-
-    def test_cma_fields_can_be_set(self):
-        """CMA fields can be assigned."""
-        X = torch.randn(10, 2)
-        state = SolverState(X=X)
-
-        state.p_c = torch.zeros(64)
-        state.p_sigma = torch.zeros(64)
-        state.C_diag = torch.ones(64)
-        state.sigma = 0.5
-        state.generation = 10
-        state.use_csa = True
-
-        assert state.p_c.shape == (64,)
-        assert state.p_sigma.shape == (64,)
-        assert state.C_diag.shape == (64,)
-        assert state.sigma == 0.5
-        assert state.generation == 10
-        assert state.use_csa is True

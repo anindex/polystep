@@ -14,7 +14,7 @@ from typing import List, Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
-from ._prelude import align_dual, align_marginal, sanitize_cost, validate_positive
+from ._prelude import align_dual, align_marginal, recenter_cost, sanitize_cost, validate_positive
 
 
 @dataclass
@@ -29,8 +29,9 @@ class SinkhornResult:
         g: Second dual potential of shape (m,). See ``f``.
         converged: Whether the solver converged within tolerance.
         n_iters: Number of iterations actually run.
-        ent_reg_cost: Entropic dual objective <f, a> + <g, b> - eps*sum(a),
-            which equals the regularized transport cost at convergence.
+        ent_reg_cost: Entropic dual objective <f, a> + <g, b> - eps*sum_ij P_ij
+            (true plan mass), reported in the original cost frame. Equals the
+            regularized transport cost at convergence.
         errors: Per-check marginal errors (for diagnostics).
     """
 
@@ -189,11 +190,26 @@ class SinkhornSolver:
                 "at least one source and target point are required."
             )
         device, dtype = cost_matrix.device, cost_matrix.dtype
+        # Balanced Sinkhorn needs sum(a) == sum(b). Only check when the caller
+        # gave both marginals; the default uniform a=b=None is balanced, so the
+        # hot path stays free of a host sync.
+        marginals_given = a is not None and b is not None
         a = align_marginal(a, n, device, dtype, "a")
         b = align_marginal(b, m, device, dtype, "b")
+        if marginals_given and not torch.isclose(a.sum(), b.sum(), rtol=1e-3, atol=1e-6):
+            warnings.warn(
+                f"Sinkhorn marginals have unequal total mass (a.sum()={a.sum().item():.6g}, "
+                f"b.sum()={b.sum().item():.6g}); balanced OT is infeasible, so 'converged' "
+                f"and the returned plan may be meaningless. Use KLSoftmaxSolver for unbalanced OT.",
+                stacklevel=2,
+            )
 
         # Scale cost matrix (division creates a new tensor; no clone needed)
         cost_matrix = scale_cost_matrix(cost_matrix, scale_cost)
+        # Recenter to min(C)=0 so the log-sum-exp and the exp((f+g-C)/eps) plan
+        # keep FP32 precision when |C| is much larger than eps. cost_shift is
+        # added back into ent_reg_cost below.
+        cost_matrix, cost_shift = recenter_cost(cost_matrix)
 
         # Log kernel: log_K = -C / eps
         eps = self.epsilon
@@ -398,7 +414,7 @@ class SinkhornSolver:
                                         # Accept the Anderson step only when its dual
                                         # objective beats the plain iterate and does
                                         # not regress below the previous iterate. The
-                                        # previous-iterate gate stays monotone under
+                                        # previous-iterate check stays monotone under
                                         # overrelaxation, where the plain SOR step is
                                         # not. Device-side compare avoids a sync.
                                         f_combined = combined[:n]
@@ -486,10 +502,12 @@ class SinkhornSolver:
                             converged = True
                             break
 
-        # Entropic dual objective D(f,g) = <f,a> + <g,b> - eps*sum(a). The mass
-        # term makes it the true regularized value (a bare <f,a>+<g,b> overstates
-        # it by eps*sum(a)); at convergence sum(P) equals sum(a). One host transfer.
-        ent_reg_cost = (torch.stack([(f * a).sum(), (g * b).sum()]).sum() - eps * a.sum()).item()
+        # Dual objective <f,a> + <g,b> - eps*sum_ij P_ij, using the true plan mass
+        # (equals eps*sum(a) only at convergence). cost_shift*sum(a) undoes the
+        # recenter so the value is in the original cost frame.
+        log_P_final = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
+        plan_mass = torch.exp(torch.logsumexp(log_P_final.reshape(-1), dim=0))
+        ent_reg_cost = ((f * a).sum() + (g * b).sum() - eps * plan_mass + cost_shift * a.sum()).item()
 
         result = SinkhornResult(
             f=f,

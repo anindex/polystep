@@ -94,18 +94,6 @@ def test_intermediate_lam_softens_column_constraint() -> None:
     )
 
 
-def test_returns_solver_result_with_expected_fields() -> None:
-    C, a, b = _make_problem()
-    res = KLSoftmaxSolver(epsilon=0.1, lam=1.0).solve(C, a=a, b=b)
-    assert hasattr(res, "matrix")
-    assert hasattr(res, "cost")
-    assert hasattr(res, "n_iters")
-    assert hasattr(res, "converged")
-    assert res.matrix.shape == C.shape
-    # Row marginals enforced
-    torch.testing.assert_close(res.matrix.sum(dim=1), a, atol=1e-3, rtol=0)
-
-
 def test_nan_safe_at_small_epsilon() -> None:
     """Tiny epsilon should not produce NaN/Inf via log-domain stability."""
     C, a, b = _make_problem()
@@ -114,16 +102,17 @@ def test_nan_safe_at_small_epsilon() -> None:
     assert res.matrix.min() >= 0
 
 
-def test_validation_negative_lam_raises() -> None:
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"epsilon": 0.1, "lam": -1.0},
+        {"epsilon": 0.0, "lam": 1.0},
+        {"epsilon": -0.1, "lam": 1.0},
+    ],
+)
+def test_validation_invalid_constructor_args_raise(kwargs) -> None:
     with pytest.raises(ValueError):
-        KLSoftmaxSolver(epsilon=0.1, lam=-1.0)
-
-
-def test_validation_zero_or_negative_epsilon_raises() -> None:
-    with pytest.raises(ValueError):
-        KLSoftmaxSolver(epsilon=0.0, lam=1.0)
-    with pytest.raises(ValueError):
-        KLSoftmaxSolver(epsilon=-0.1, lam=1.0)
+        KLSoftmaxSolver(**kwargs)
 
 
 def test_default_uniform_marginals_when_a_b_none() -> None:

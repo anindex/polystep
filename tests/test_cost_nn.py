@@ -165,30 +165,6 @@ class TestBatchUnflattenSharedParams:
 # ---------------------------------------------------------------------------
 
 
-class TestEvaluatorMlpVmap:
-    """Test 4: Evaluator returns (N,) losses via vmap for MLP."""
-
-    def test_evaluator_mlp_vmap(self):
-        from polystep.cost_nn import NNCostEvaluator
-
-        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
-        layout = ParamLayout.from_module(model)
-        particle = layout.flatten(model)
-
-        N = 16
-        batch = particle.unsqueeze(0).expand(N, -1, -1).clone()
-        batch += torch.randn_like(batch) * 0.01
-        stacked = layout.batch_unflatten(batch)
-
-        evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
-        inputs = torch.randn(32, 4)
-        targets = torch.randint(0, 2, (32,))
-        losses = evaluator.evaluate(stacked, inputs, targets)
-
-        assert losses.shape == (N,), f"Expected ({N},), got {losses.shape}"
-        assert losses.isfinite().all(), "Non-finite losses"
-
-
 class TestEvaluatorUnsupervised:
     """Test 5: Unsupervised loss (targets=None) works."""
 

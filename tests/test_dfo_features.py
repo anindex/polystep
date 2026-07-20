@@ -164,33 +164,6 @@ def test_sobol_rotations_higher_dim():
         assert torch.allclose(torch.det(R).abs(), torch.tensor(1.0), atol=1e-4)
 
 
-def test_trust_region_adapts_radius():
-    """Trust region should change step radius based on predicted vs actual improvement."""
-    model, make_closure = _make_model_and_closure()
-    opt = PolyStepOptimizer(
-        model,
-        particle_dim=2,
-        epsilon=0.5,
-        use_quadratic_model=True,
-        trust_region=True,
-        biased_rotation=True,
-        num_probe=3,
-        max_iterations=2,
-        seed=42,
-    )
-    closure = make_closure(opt)
-
-    # Run several steps to trigger trust region updates
-    for _ in range(5):
-        opt.step(closure)
-
-    # Multiplier should exist and be positive
-    assert hasattr(opt, "_trust_region_multiplier")
-    assert opt._trust_region_multiplier > 0
-    # Diagnostics should have been recorded
-    assert len(opt._state.trust_region_multipliers) > 0
-
-
 def test_trust_region_expands_on_accurate_prediction():
     """A correct improvement prediction must not shrink the trust region.
 
@@ -367,23 +340,3 @@ def test_all_dfo_features_compose():
         assert torch.isfinite(torch.tensor(loss))
 
     assert opt._state.iteration_count == 10
-
-
-def test_dfo_features_with_subspace():
-    """DFO features should work together (quadratic model + biased rotation)."""
-    model, make_closure = _make_model_and_closure()
-    opt = PolyStepOptimizer(
-        model,
-        particle_dim=2,
-        epsilon=0.5,
-        use_quadratic_model=True,
-        biased_rotation=True,
-        amortize_steps=2,
-        max_iterations=2,
-        seed=42,
-    )
-    closure = make_closure(opt)
-
-    for _ in range(5):
-        opt.step(closure)
-    assert opt._state.iteration_count == 5

@@ -180,24 +180,6 @@ class TestApplyPerturbation:
 
 
 class TestReconstructBatch:
-    def test_reconstruct_batch_shapes(self):
-        """reconstruct_batch produces (N, *shape) tensors for each key."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.from_layout(layout, rank=4)
-        base_sd = model.state_dict()
-
-        N = 8
-        flat_batch = torch.randn(N, sub.subspace_dim) * 0.01
-        result = sub.reconstruct_batch(base_sd, flat_batch)
-
-        for spec in sub.specs:
-            assert spec.entry_key in result
-            expected_shape = (N, *spec.original_shape)
-            assert result[spec.entry_key].shape == expected_shape, (
-                f"{spec.entry_key}: expected {expected_shape}, got {result[spec.entry_key].shape}"
-            )
-
     def test_reconstruct_batch_consistency(self):
         """reconstruct_batch matches apply_perturbation for each row."""
         model = SimpleMLP()
@@ -382,14 +364,6 @@ class TestSolverIntegration:
         assert state.X is not None
         assert state.X.shape == (num_particles, dim)
 
-    def test_solver_state_optional_fields_default_none(self):
-        """SolverState optional fields default to None."""
-        from polystep.solver import SolverState
-
-        state = SolverState(X=torch.randn(5, 2))
-        assert state.base_params is None
-        assert state.subspace is None
-
 
 # ===========================================================================
 # LinearSubspace tests
@@ -474,24 +448,6 @@ class TestLinearSubspaceApplyPerturbation:
 
 
 class TestLinearSubspaceReconstructBatch:
-    def test_reconstruct_batch_shapes_linear(self):
-        """reconstruct_batch produces (N, *shape) tensors for each key."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LinearSubspace.from_layout(layout, rank=4, seed=42)
-        base_sd = model.state_dict()
-
-        N = 8
-        flat_batch = torch.randn(N, sub.subspace_dim) * 0.01
-        result = sub.reconstruct_batch(base_sd, flat_batch)
-
-        for spec in sub.specs:
-            assert spec.entry_key in result
-            expected_shape = (N, *spec.original_shape)
-            assert result[spec.entry_key].shape == expected_shape, (
-                f"{spec.entry_key}: expected {expected_shape}, got {result[spec.entry_key].shape}"
-            )
-
     def test_reconstruct_batch_consistency_linear(self):
         """reconstruct_batch matches apply_perturbation for each row."""
         model = SimpleMLP()

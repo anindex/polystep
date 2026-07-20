@@ -192,44 +192,16 @@ class TestParticleDimAdaptiveProbes:
     4. ``adaptive_probes`` (cost-row reuse for stagnant particles).
     """
 
-    def test_particle_dim_4_mnist_step(self):
-        """particle_dim=4 on a small model runs 3 steps successfully.
-
-        Uses a small model (not full MNIST) because particle_dim=4 in full-space
-        mode creates P*8*K evaluations which are prohibitive for large models.
-        """
-        torch.manual_seed(42)
-        # Small model: keeps particle count manageable with particle_dim=4
-        model = _make_small_model()  # Linear(50, 30) -> ReLU -> Linear(30, 10)
-        initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-
-        opt = PolyStepOptimizer(
-            model,
-            particle_dim=4,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-
-        closure = _make_integration_closure(model)
-
-        losses = []
-        for _ in range(3):
-            loss = opt.step(closure)
-            losses.append(loss)
-            assert isinstance(loss, float)
-            assert torch.isfinite(torch.tensor(loss))
-
-        # Model params should have changed
-        updated_params = model.state_dict()
-        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
-        assert any_changed, "Model parameters should change after 3 steps with particle_dim=4"
-        assert opt.state.iteration_count == 3
-
-    def test_overrelaxed_sinkhorn_integration(self):
-        """Overrelaxed Sinkhorn (omega=1.5) runs 3 steps without error."""
+    @pytest.mark.parametrize(
+        "extra_kwargs, omega",
+        [
+            ({"particle_dim": 4}, None),
+            ({}, 1.5),
+        ],
+        ids=["particle_dim_4", "overrelaxed_sinkhorn"],
+    )
+    def test_particle_dim_4_mnist_step(self, extra_kwargs, omega):
+        """particle_dim=4 (full-space) and omega=1.5 (overrelaxed Sinkhorn) each run 3 steps."""
         torch.manual_seed(42)
         model = _make_small_model()
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
@@ -241,8 +213,10 @@ class TestParticleDimAdaptiveProbes:
             sinkhorn_max_iters=100,
             compile=False,
             seed=42,
+            **extra_kwargs,
         )
-        opt.solver.omega = 1.5
+        if omega is not None:
+            opt.solver.omega = omega
 
         closure = _make_integration_closure(model)
         for _ in range(3):
@@ -250,10 +224,9 @@ class TestParticleDimAdaptiveProbes:
             assert isinstance(loss, float)
             assert torch.isfinite(torch.tensor(loss))
 
-        # Verify optimization proceeded
         updated_params = model.state_dict()
         any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
-        assert any_changed, "Optimization should proceed with omega=1.5"
+        assert any_changed, "Model parameters should change after 3 steps"
         assert opt.state.iteration_count == 3
 
     def test_rank_schedule_integration(self):

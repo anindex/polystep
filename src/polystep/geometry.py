@@ -237,6 +237,11 @@ def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir_norm: torch.Tensor) -
     Returns:
         Biased rotation matrices of shape (batch, dim, dim), det = +1.
     """
+    if rot_mats.shape[-1] == 1:
+        # SO(1) = {[[1]]}: the only proper 1D rotation is the identity, so
+        # aligning axis 0 with the bias is not representable (a sign flip is a
+        # reflection). Return identity instead of flipping the aligned axis back.
+        return torch.ones_like(rot_mats)
     biased = rot_mats.clone()
     biased[:, :, 0] = bias_dir_norm
     # geqrf has no bf16/fp16 CPU kernel; run QR in fp32, cast back.

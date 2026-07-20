@@ -253,9 +253,17 @@ class TestBinaryMNISTNetSTE:
         out = model(x)
         assert out.shape == (2, 10)
 
-    def test_gradient_flows(self):
-        model = BinaryMNISTNetSTE()
-        x = torch.randn(2, 1, 28, 28)
+    @pytest.mark.parametrize(
+        "model_fn, input_shape",
+        [
+            (lambda: BinaryMNISTNetSTE(), (2, 1, 28, 28)),
+            (lambda: BinaryCIFAR10NetSTE(), (2, 3, 32, 32)),
+            (lambda: SoftMoENet(), (2, 1, 28, 28)),
+        ],
+    )
+    def test_gradient_flows(self, model_fn, input_shape):
+        model = model_fn()
+        x = torch.randn(*input_shape)
         out = model(x).sum()
         out.backward()
         for name, p in model.named_parameters():
@@ -284,14 +292,6 @@ class TestBinaryCIFAR10NetSTE:
         x = torch.randn(2, 3, 32, 32)
         out = model(x)
         assert out.shape == (2, 10)
-
-    def test_gradient_flows(self):
-        model = BinaryCIFAR10NetSTE()
-        x = torch.randn(2, 3, 32, 32)
-        out = model(x).sum()
-        out.backward()
-        for name, p in model.named_parameters():
-            assert p.grad is not None, f"No gradient for {name}"
 
 
 class TestDiscreteAttention:
@@ -388,14 +388,6 @@ class TestSoftMoENet:
         hard_params = sum(p.numel() for p in hard.parameters())
         soft_params = sum(p.numel() for p in soft.parameters())
         assert hard_params == soft_params, f"Param count mismatch: hard={hard_params}, soft={soft_params}"
-
-    def test_gradient_flows(self):
-        model = SoftMoENet()
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x).sum()
-        out.backward()
-        for name, p in model.named_parameters():
-            assert p.grad is not None, f"No gradient for {name}"
 
 
 class TestExpertUtilization:
@@ -501,53 +493,34 @@ class TestVmapCompatibility:
         outputs = vmap(call_single)(batched_params)
         return outputs
 
-    def test_spiking_mnist_vmap(self):
-        model = SpikingMNISTNet(num_steps=3)  # Few steps for speed
-        x = torch.randn(2, 1, 28, 28)
+    @pytest.mark.parametrize(
+        "model_fn, input_shape, expected_shape",
+        [
+            (lambda: SpikingMNISTNet(num_steps=3), (2, 1, 28, 28), (2, 2, 10)),
+            (lambda: QuantizedMLP(784, 128, 10), (2, 1, 28, 28), (2, 2, 10)),
+            (lambda: BinaryMNISTNet(), (2, 1, 28, 28), (2, 2, 10)),
+            (lambda: TernaryMNISTNet(), (2, 1, 28, 28), (2, 2, 10)),
+            (lambda: DiscreteAttentionNet(784, 128, 10, num_slots=8), (2, 1, 28, 28), (2, 2, 10)),
+            (lambda: StaircaseNet(784, 128, 10, levels=5), (2, 1, 28, 28), (2, 2, 10)),
+            (
+                lambda: HardMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4),
+                (2, 1, 28, 28),
+                (2, 2, 20),
+            ),
+            (
+                lambda: SoftMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4),
+                (2, 1, 28, 28),
+                (2, 2, 20),
+            ),
+            (lambda: HardPermutationNet(N=10, hidden_dim=64), (4, 10), (2, 4, 10)),
+            (lambda: SoftPermutationNet(N=10, hidden_dim=64), (4, 10), (2, 4, 10, 10)),
+        ],
+    )
+    def test_spiking_mnist_vmap(self, model_fn, input_shape, expected_shape):
+        model = model_fn()
+        x = torch.randn(*input_shape)
         outputs = self._vmap_test(model, x)
-        assert outputs.shape == (2, 2, 10)  # (num_perturb, batch, classes)
-
-    def test_quantized_mlp_vmap(self):
-        model = QuantizedMLP(784, 128, 10)
-        x = torch.randn(2, 1, 28, 28)
-        outputs = self._vmap_test(model, x)
-        assert outputs.shape == (2, 2, 10)
-
-    def test_binary_mnist_vmap(self):
-        model = BinaryMNISTNet()
-        x = torch.randn(2, 1, 28, 28)
-        outputs = self._vmap_test(model, x)
-        assert outputs.shape == (2, 2, 10)
-
-    def test_ternary_mnist_vmap(self):
-        model = TernaryMNISTNet()
-        x = torch.randn(2, 1, 28, 28)
-        outputs = self._vmap_test(model, x)
-        assert outputs.shape == (2, 2, 10)
-
-    def test_discrete_attention_vmap(self):
-        model = DiscreteAttentionNet(784, 128, 10, num_slots=8)
-        x = torch.randn(2, 1, 28, 28)
-        outputs = self._vmap_test(model, x)
-        assert outputs.shape == (2, 2, 10)
-
-    def test_staircase_vmap(self):
-        model = StaircaseNet(784, 128, 10, levels=5)
-        x = torch.randn(2, 1, 28, 28)
-        outputs = self._vmap_test(model, x)
-        assert outputs.shape == (2, 2, 10)
-
-    def test_hard_moe_vmap(self):
-        model = HardMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
-        x = torch.randn(2, 1, 28, 28)
-        outputs = self._vmap_test(model, x)
-        assert outputs.shape == (2, 2, 20)
-
-    def test_soft_moe_vmap(self):
-        model = SoftMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
-        x = torch.randn(2, 1, 28, 28)
-        outputs = self._vmap_test(model, x)
-        assert outputs.shape == (2, 2, 20)
+        assert outputs.shape == expected_shape
 
 
 # ---------------------------------------------------------------------------
@@ -591,45 +564,19 @@ class TestSoftPermutationNet:
 
 
 class TestPermutationLoss:
-    def test_perfect_match(self):
-        """Identical permutations -> loss 0.0."""
+    @pytest.mark.parametrize(
+        "pred, target, expected",
+        [
+            (
+                torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
+                torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
+                0.0,
+            ),
+            (torch.tensor([[1, 0, 3, 2]]), torch.tensor([[0, 1, 2, 3]]), 1.0),
+            (torch.tensor([[0, 1, 3, 2]]), torch.tensor([[0, 1, 2, 3]]), 0.5),
+        ],
+    )
+    def test_perfect_match(self, pred, target, expected):
         loss_fn = PermutationLoss()
-        perm = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
-        loss = loss_fn(perm, perm)
-        assert loss.item() == pytest.approx(0.0)
-
-    def test_complete_mismatch(self):
-        """Completely wrong -> loss close to 1.0."""
-        loss_fn = PermutationLoss()
-        pred = torch.tensor([[1, 0, 3, 2]])  # all wrong
-        target = torch.tensor([[0, 1, 2, 3]])
         loss = loss_fn(pred, target)
-        assert loss.item() == pytest.approx(1.0)
-
-    def test_partial_match(self):
-        """Known partial match -> expected fraction."""
-        loss_fn = PermutationLoss()
-        pred = torch.tensor([[0, 1, 3, 2]])  # 2 correct (positions 0,1), 2 wrong
-        target = torch.tensor([[0, 1, 2, 3]])
-        loss = loss_fn(pred, target)
-        assert loss.item() == pytest.approx(0.5)  # 2/4 wrong
-
-
-class TestHardPermutationNetVmap:
-    """Vmap compatibility test for HardPermutationNet."""
-
-    def test_hard_permutation_vmap(self):
-        model = HardPermutationNet(N=10, hidden_dim=64)
-        x = torch.randn(4, 10)
-        outputs = TestVmapCompatibility._vmap_test(model, x, num_perturbations=2)
-        assert outputs.shape == (2, 4, 10), f"Expected (2, 4, 10), got {outputs.shape}"
-
-
-class TestSoftPermutationNetVmap:
-    """Vmap compatibility test for SoftPermutationNet."""
-
-    def test_soft_permutation_vmap(self):
-        model = SoftPermutationNet(N=10, hidden_dim=64)
-        x = torch.randn(4, 10)
-        outputs = TestVmapCompatibility._vmap_test(model, x, num_perturbations=2)
-        assert outputs.shape == (2, 4, 10, 10), f"Expected (2, 4, 10, 10), got {outputs.shape}"
+        assert loss.item() == pytest.approx(expected)

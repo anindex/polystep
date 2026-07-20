@@ -60,29 +60,19 @@ class TestTrainConfig:
         assert config.log_every == 10
         assert config.callbacks == []
 
-    def test_invalid_epochs_zero(self):
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("epochs", 0),
+            ("epochs", -1),
+            ("log_every", 0),
+            ("batch_size", 0),
+            ("batch_size", -1),
+        ],
+    )
+    def test_invalid_epochs_zero(self, field, value):
         with pytest.raises(ValueError):
-            TrainConfig(epochs=0)
-
-    def test_invalid_epochs_negative(self):
-        with pytest.raises(ValueError):
-            TrainConfig(epochs=-1)
-
-    def test_invalid_log_every(self):
-        with pytest.raises(ValueError):
-            TrainConfig(log_every=0)
-
-    def test_invalid_batch_size_zero(self):
-        with pytest.raises(ValueError):
-            TrainConfig(batch_size=0)
-
-    def test_invalid_batch_size_negative(self):
-        with pytest.raises(ValueError):
-            TrainConfig(batch_size=-1)
-
-    def test_callbacks_none_becomes_list(self):
-        config = TrainConfig(callbacks=None)
-        assert config.callbacks == []
+            TrainConfig(**{field: value})
 
 
 # ---------------------------------------------------------------------------

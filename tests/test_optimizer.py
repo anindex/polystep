@@ -9,6 +9,7 @@ import torch.nn as nn
 from polystep import PolyStepOptimizer, SolverState
 from polystep.cost_nn import NNCostEvaluator
 from polystep.dynamics import compute_momentum_coefficient
+from polystep.epsilon import LinearEpsilon
 
 
 # ---------------------------------------------------------------------------
@@ -318,43 +319,24 @@ class TestParticleDim:
         assert opt.layout.particle_dim == 2
         assert opt._particle_dim == 2
 
-    def test_particle_dim_4(self):
-        """particle_dim=4 creates layout with 4-dim particles and orthoplex 8 vertices."""
+    @pytest.mark.parametrize("dim, verts", [(4, 8), (8, 16)])
+    def test_particle_dim_4(self, dim, verts):
+        """particle_dim=D creates layout with D-dim particles and orthoplex 2*D vertices."""
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
             model,
-            particle_dim=4,
+            particle_dim=dim,
             max_iterations=50,
             epsilon=0.1,
             sinkhorn_max_iters=100,
             compile=False,
             seed=42,
         )
-        assert opt.layout.particle_dim == 4
-        assert opt._particle_dim == 4
-        # Orthoplex in 4D has 2*4 = 8 vertices
-        assert opt._polytope_vertices.shape[0] == 8
-        assert opt._polytope_vertices.shape[1] == 4
-
-    def test_particle_dim_8(self):
-        """particle_dim=8 creates layout with 8-dim particles and orthoplex 16 vertices."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            particle_dim=8,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        assert opt.layout.particle_dim == 8
-        assert opt._particle_dim == 8
-        # Orthoplex in 8D has 2*8 = 16 vertices
-        assert opt._polytope_vertices.shape[0] == 16
-        assert opt._polytope_vertices.shape[1] == 8
+        assert opt.layout.particle_dim == dim
+        assert opt._particle_dim == dim
+        assert opt._polytope_vertices.shape[0] == verts
+        assert opt._polytope_vertices.shape[1] == dim
 
     def test_particle_dim_step(self):
         """particle_dim=4 optimizer can run step() without error and updates model."""
@@ -758,8 +740,9 @@ class TestSinkhornParamWiring:
 class TestEntEpsilon:
     """Tests for the ent_epsilon parameter (separate OT solver epsilon)."""
 
-    def test_ent_epsilon_float_accepted(self):
-        """ent_epsilon=0.1 (float) is accepted and step completes without error."""
+    @pytest.mark.parametrize("ent_epsilon", [0.1, LinearEpsilon(1.0, 0.1, 10)])
+    def test_ent_epsilon_float_accepted(self, ent_epsilon):
+        """ent_epsilon (float or LinearEpsilon schedule) is accepted and step completes."""
         torch.manual_seed(42)
         model = _make_model()
         closure = _make_closure(model)
@@ -770,27 +753,7 @@ class TestEntEpsilon:
             sinkhorn_max_iters=100,
             compile=False,
             seed=42,
-            ent_epsilon=0.1,
-        )
-        cost = opt.step(closure)
-        assert isinstance(cost, float)
-        assert cost == cost  # not NaN
-
-    def test_ent_epsilon_linear_schedule_accepted(self):
-        """ent_epsilon=LinearEpsilon(...) is accepted and step completes without error."""
-        from polystep.epsilon import LinearEpsilon
-
-        torch.manual_seed(42)
-        model = _make_model()
-        closure = _make_closure(model)
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-            ent_epsilon=LinearEpsilon(1.0, 0.1, 10),
+            ent_epsilon=ent_epsilon,
         )
         cost = opt.step(closure)
         assert isinstance(cost, float)
@@ -930,20 +893,18 @@ class TestAutoEpsilon:
 class TestRemovedParameters:
     """Parameters removed in cleanup should raise TypeError."""
 
-    def test_curvature_aware_radius_removed(self):
+    @pytest.mark.parametrize(
+        "param_name, value",
+        [
+            ("curvature_aware_radius", True),
+            ("entropy_target", 0.7),
+            ("nesterov_lookahead", True),
+        ],
+    )
+    def test_curvature_aware_radius_removed(self, param_name, value):
         model = nn.Linear(4, 2)
-        with pytest.raises(TypeError, match="curvature_aware_radius"):
-            PolyStepOptimizer(model, curvature_aware_radius=True)
-
-    def test_entropy_target_removed(self):
-        model = nn.Linear(4, 2)
-        with pytest.raises(TypeError, match="entropy_target"):
-            PolyStepOptimizer(model, entropy_target=0.7)
-
-    def test_nesterov_lookahead_removed(self):
-        model = nn.Linear(4, 2)
-        with pytest.raises(TypeError, match="nesterov_lookahead"):
-            PolyStepOptimizer(model, nesterov_lookahead=True)
+        with pytest.raises(TypeError, match=param_name):
+            PolyStepOptimizer(model, **{param_name: value})
 
 
 class TestProbeRadiusJitter:

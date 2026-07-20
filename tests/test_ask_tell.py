@@ -36,11 +36,6 @@ def test_ask_twice_before_tell_raises():
         es.ask()
 
 
-def test_x0_particle_count_mismatch_raises():
-    with pytest.raises(ValueError):
-        PolyStepES(4, num_particles=2, x0=torch.zeros(3, 4))
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -50,6 +45,7 @@ def test_x0_particle_count_mismatch_raises():
         {"dim": 4, "epsilon": -1.0},
         {"dim": 4, "step_radius": float("inf")},
         {"dim": 4, "step_radius": -0.1},
+        {"dim": 4, "num_particles": 2, "x0": torch.zeros(3, 4)},
     ],
 )
 def test_invalid_construction_raises(kwargs):

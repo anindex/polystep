@@ -54,7 +54,7 @@ def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
 
     # Fused path as wired in the optimizer: step sanitizes, branch scales.
     scaled = scale_cost_matrix(sanitize_cost(cost), scale_cost)
-    _, fused_T, _ = _fused_softmax_project(
+    _, fused_T = _fused_softmax_project(
         scaled,
         eps,
         a.float(),

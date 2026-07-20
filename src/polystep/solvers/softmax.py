@@ -18,7 +18,7 @@ from typing import Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
-from ._prelude import align_marginal, sanitize_cost, validate_positive
+from ._prelude import align_marginal, recenter_cost, sanitize_cost, validate_positive
 from .base import SolverResult
 
 
@@ -104,13 +104,16 @@ class SoftmaxSolver:
         a = align_marginal(a, P, device, dtype)
 
         C = scale_cost_matrix(cost_matrix, scale_cost)
+        # softmax is shift-invariant, so recentering leaves the weights unchanged
+        # while min(C)=0 avoids a +inf logit that would NaN the softmax at tiny eps.
+        C, cost_shift = recenter_cost(C)
 
         # ``epsilon > 0`` is enough to avoid division-by-zero, but
         # eps=1e-30 with cost_max~10 still overflows -C/epsilon before
         # softmax can subtract the row max. Warn at extreme ratios, but avoid a
         # host sync every solve: only run the reduction when epsilon drops below
         # the smallest value already checked (a new, sharper regime).
-        # Gated on epsilon decrease, so a fixed-epsilon cost blowup is not caught.
+        # Only runs on an epsilon decrease, so a fixed-epsilon cost blowup is not caught.
         min_checked = getattr(self, "_min_eps_checked", None)
         if min_checked is None or self.epsilon < min_checked:
             self._min_eps_checked = self.epsilon
@@ -134,8 +137,8 @@ class SoftmaxSolver:
             # Row sums equal source marginal a
             transport = W * a.to(W.dtype).unsqueeze(-1)
 
-            # Compute entropic cost
-            ent_cost = (C * transport).sum().item()
+            # Undo the recenter shift so the reported cost is <C_scaled, transport>.
+            ent_cost = ((C * transport).sum() + cost_shift * a.to(W.dtype).sum()).item()
 
         return SolverResult(
             matrix=transport,

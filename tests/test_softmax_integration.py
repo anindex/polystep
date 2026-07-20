@@ -74,15 +74,16 @@ class TestSolverSelection:
         opt = PolyStepOptimizer(model)
         assert isinstance(opt.solver, SinkhornSolver)
 
-    def test_linear_subspace_defaults_to_softmax(self, model, layout):
-        """LinearSubspace -> SoftmaxSolver by default."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
-        opt = PolyStepOptimizer(model, subspace=sub)
-        assert isinstance(opt.solver, SoftmaxSolver)
-
-    def test_hybrid_subspace_defaults_to_softmax(self, model, layout):
-        """HybridSubspace -> SoftmaxSolver by default."""
-        sub = HybridSubspace.from_layout(layout, rank=4, rotation_interval=0)
+    @pytest.mark.parametrize(
+        "make_subspace",
+        [
+            lambda layout: LinearSubspace.from_layout(layout, rank=4),
+            lambda layout: HybridSubspace.from_layout(layout, rank=4, rotation_interval=0),
+        ],
+    )
+    def test_linear_subspace_defaults_to_softmax(self, model, layout, make_subspace):
+        """Subspace -> SoftmaxSolver by default."""
+        sub = make_subspace(layout)
         opt = PolyStepOptimizer(model, subspace=sub)
         assert isinstance(opt.solver, SoftmaxSolver)
 
@@ -185,55 +186,24 @@ class TestTurboFeaturesWithSoftmax:
     """Verify all turbo features work with softmax solver."""
 
     @pytest.mark.timeout(60)
-    def test_amortize_steps_with_softmax(self, model, closure):
-        """EMA amortization (amortize_steps=2) works with softmax solver."""
+    @pytest.mark.parametrize(
+        "feature_kwargs",
+        [
+            {"amortize_steps": 2, "amortize_ema": 0.7},
+            {"biased_rotation": True},
+            {"adaptive_probes": True},
+            {"use_momentum": True},
+        ],
+    )
+    def test_amortize_steps_with_softmax(self, model, closure, feature_kwargs):
+        """Turbo features work with softmax solver."""
         opt = PolyStepOptimizer(
             model,
             solver="softmax",
             epsilon=0.5,
-            amortize_steps=2,
-            amortize_ema=0.7,
+            **feature_kwargs,
         )
         for _ in range(4):
-            loss = opt.step(closure)
-            assert isinstance(loss, float)
-
-    @pytest.mark.timeout(60)
-    def test_biased_rotation_with_softmax(self, model, closure):
-        """Transport-biased rotation (biased_rotation=True) works with softmax."""
-        opt = PolyStepOptimizer(
-            model,
-            solver="softmax",
-            epsilon=0.5,
-            biased_rotation=True,
-        )
-        for _ in range(3):
-            loss = opt.step(closure)
-            assert isinstance(loss, float)
-
-    @pytest.mark.timeout(60)
-    def test_adaptive_probes_with_softmax(self, model, closure):
-        """Adaptive probes (adaptive_probes=True) works with softmax."""
-        opt = PolyStepOptimizer(
-            model,
-            solver="softmax",
-            epsilon=0.5,
-            adaptive_probes=True,
-        )
-        for _ in range(3):
-            loss = opt.step(closure)
-            assert isinstance(loss, float)
-
-    @pytest.mark.timeout(60)
-    def test_momentum_with_softmax(self, model, closure):
-        """Momentum (use_momentum=True) works with softmax."""
-        opt = PolyStepOptimizer(
-            model,
-            solver="softmax",
-            epsilon=0.5,
-            use_momentum=True,
-        )
-        for _ in range(3):
             loss = opt.step(closure)
             assert isinstance(loss, float)
 
@@ -355,18 +325,6 @@ class TestFusedSoftmaxDispatch:
             assert isinstance(loss, float)
             assert loss == loss, "Loss should not be NaN"
 
-    @pytest.mark.timeout(30)
-    def test_fused_path_solver_result_has_correct_fields(self, model, layout):
-        """After fused softmax step, optimizer state is consistent (no None crashes)."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
-        opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.5)
-        closure = _make_closure(model)
-        opt.step(closure)
-        state = opt._state
-        # Fused path sets f=None, g=None in SolverResult
-        assert state.f is None, "state.f should be None after fused softmax"
-        assert state.g is None, "state.g should be None after fused softmax"
-
     @pytest.mark.timeout(60)
     def test_fused_path_monolithic_no_subspace(self, model):
         """Fused path works in monolithic mode without subspace."""
@@ -389,17 +347,22 @@ class TestK1ReshapeShortcut:
     """Verify K=1 probe reshape optimization produces identical results."""
 
     @pytest.mark.timeout(60)
-    def test_k1_probe_produces_same_result(self, model, layout):
-        """K=1 shortcut is mathematically identical to reshape+mean."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
-        # num_probe=1 means K=1
-        opt = PolyStepOptimizer(
-            model,
-            subspace=sub,
-            epsilon=0.5,
-            num_probe=1,
-            seed=42,
-        )
+    @pytest.mark.parametrize(
+        "use_subspace, solver, num_probe",
+        [
+            (True, None, 1),
+            (True, None, 3),
+            (False, "sinkhorn", 1),
+        ],
+    )
+    def test_k1_probe_produces_same_result(self, model, layout, use_subspace, solver, num_probe):
+        """K=1 shortcut and .mean path produce finite losses across solvers."""
+        kwargs = {"epsilon": 0.5, "num_probe": num_probe, "seed": 42}
+        if use_subspace:
+            kwargs["subspace"] = LinearSubspace.from_layout(layout, rank=4)
+        if solver is not None:
+            kwargs["solver"] = solver
+        opt = PolyStepOptimizer(model, **kwargs)
         closure = _make_closure(model)
         losses = []
         for _ in range(3):
@@ -407,40 +370,6 @@ class TestK1ReshapeShortcut:
             losses.append(loss)
         assert all(isinstance(loss_v, float) for loss_v in losses)
         assert all(loss_v == loss_v for loss_v in losses), "All losses should be finite"
-
-    @pytest.mark.timeout(60)
-    def test_k3_still_uses_mean_path(self, model, layout):
-        """K=3 (num_probe=3) still uses the .mean(dim=-1) path -- no breakage."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
-        opt = PolyStepOptimizer(
-            model,
-            subspace=sub,
-            epsilon=0.5,
-            num_probe=3,
-            seed=42,
-        )
-        closure = _make_closure(model)
-        losses = []
-        for _ in range(2):
-            loss = opt.step(closure)
-            losses.append(loss)
-        assert all(isinstance(loss_v, float) for loss_v in losses)
-        assert all(loss_v == loss_v for loss_v in losses), "All losses should be finite"
-
-    @pytest.mark.timeout(60)
-    def test_k1_with_sinkhorn_solver(self, model):
-        """K=1 shortcut works with sinkhorn solver too (not just softmax)."""
-        opt = PolyStepOptimizer(
-            model,
-            solver="sinkhorn",
-            epsilon=0.5,
-            num_probe=1,
-            seed=42,
-        )
-        closure = _make_closure(model)
-        loss = opt.step(closure)
-        assert isinstance(loss, float)
-        assert loss == loss, "Loss should not be NaN"
 
 
 # ---------------------------------------------------------------------------

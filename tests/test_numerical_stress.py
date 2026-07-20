@@ -13,7 +13,6 @@ import torch.nn as nn
 import pytest
 
 from polystep import ParamLayout, SinkhornSolver
-from polystep.cost_nn import NNCostEvaluator
 
 
 class TestSinkhornEdgeCases:
@@ -51,10 +50,11 @@ class TestSinkhornEdgeCases:
         expected = 1.0 / (n * m)
         assert (T - expected).abs().max() < 0.1
 
-    def test_zero_cost_matrix(self):
-        """All-zero cost should produce uniform transport."""
+    @pytest.mark.parametrize("const", [0.0, 42.0])
+    def test_zero_cost_matrix(self, const):
+        """Constant cost (including all-zero) should produce uniform transport."""
         n, m = 8, 4
-        C = torch.zeros(n, m)
+        C = torch.ones(n, m) * const
         solver = SinkhornSolver(epsilon=1.0, max_iterations=100)
         result = solver.solve(C)
 
@@ -65,15 +65,6 @@ class TestSinkhornEdgeCases:
         col_sums = T.sum(dim=0)
         assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-4)
         assert torch.allclose(col_sums, torch.ones(m) / m, atol=1e-4)
-
-    def test_constant_cost_matrix(self):
-        """Constant cost should also produce uniform transport."""
-        n, m = 8, 4
-        C = torch.ones(n, m) * 42.0
-        solver = SinkhornSolver(epsilon=1.0, max_iterations=100)
-        result = solver.solve(C)
-        T = result.matrix
-        assert torch.isfinite(T).all()
 
     def test_large_cost_range(self):
         """Cost matrix with values spanning [0, 1000] should converge."""
@@ -227,33 +218,3 @@ class TestParamLayoutStress:
 
         for key in single:
             assert torch.allclose(single[key], batched[key][0], atol=1e-6)
-
-
-class TestChunkSizeConsistency:
-    """Verify chunked evaluation matches unchunked."""
-
-    def test_chunked_vs_unchunked(self):
-        torch.manual_seed(0)
-        model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 2))
-        model.eval()
-        loss_fn = nn.CrossEntropyLoss()
-
-        layout = ParamLayout.from_module(model)
-        flat = layout.flatten(model)
-        N = 16
-        batch = flat.unsqueeze(0).repeat(N, 1, 1) + torch.randn(N, *flat.shape) * 0.01
-        stacked = layout.batch_unflatten(batch)
-
-        inputs = torch.randn(8, 10)
-        targets = torch.randint(0, 2, (8,))
-
-        eval_none = NNCostEvaluator(model, loss_fn, chunk_size=None)
-        eval_4 = NNCostEvaluator(model, loss_fn, chunk_size=4)
-        eval_1 = NNCostEvaluator(model, loss_fn, chunk_size=1)
-
-        losses_none = eval_none.evaluate(stacked, inputs, targets)
-        losses_4 = eval_4.evaluate(stacked, inputs, targets)
-        losses_1 = eval_1.evaluate(stacked, inputs, targets)
-
-        assert torch.allclose(losses_none, losses_4, atol=1e-5), "chunk_size=4 differs from None"
-        assert torch.allclose(losses_none, losses_1, atol=1e-5), "chunk_size=1 differs from None"

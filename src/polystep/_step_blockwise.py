@@ -83,7 +83,6 @@ def step_blockwise(opt, closure: Callable) -> float:
     # after the loop, to avoid one GPU->CPU sync per block per step.
     block_disp_terms: list = []
     block_model_loss_terms: list = []
-    block_fused_ent_terms: list = []  # 0-d ent_cost tensors, fused path
     all_converged = True
     total_particles = 0
     num_blocks_counted = 0
@@ -93,6 +92,12 @@ def step_blockwise(opt, closure: Callable) -> float:
 
     probes = opt._probes.to(device=device, dtype=X.dtype)
     chunk = opt.chunk_size or 1024  # default chunk for block-wise
+
+    # base_flat holds every block at its current value and is invariant across
+    # the block loop (updates are collected and applied after it). Build it once
+    # and reuse a single scatter buffer for every block and chunk.
+    base_flat = reassemble_blocks(all_block_particles, blocks, total_flat_size)
+    base_batch_buf = base_flat.new_empty((chunk, total_flat_size))
 
     # Drop per-block dual momentum history across an epsilon jump so the
     # warm-start isn't extrapolated over a large epsilon change (matches monolithic).
@@ -176,17 +181,16 @@ def step_blockwise(opt, closure: Callable) -> float:
         P, V, K, D = X_probe.shape
         total_evals = P * V * K
 
-        # Assemble base flat from all blocks
-        base_flat = reassemble_blocks(all_block_particles, blocks, total_flat_size)
-
         losses_list = []
         _all_indices = torch.arange(total_evals, device=device)
         for chunk_start in range(0, total_evals, chunk):
             chunk_end = min(chunk_start + chunk, total_evals)
             chunk_size_actual = chunk_end - chunk_start
 
-            # Build batch of flat configs (vectorized)
-            base_batch = base_flat.unsqueeze(0).expand(chunk_size_actual, -1).clone()
+            # Refill the reuse buffer with base_flat instead of allocating a
+            # fresh (chunk x total_flat_size) tensor each chunk.
+            base_batch = base_batch_buf[:chunk_size_actual]
+            base_batch.copy_(base_flat.unsqueeze(0).expand(chunk_size_actual, -1))
 
             global_indices = _all_indices[chunk_start:chunk_end]  # view, no alloc
             i_idx = global_indices // (V * K)
@@ -230,11 +234,9 @@ def step_blockwise(opt, closure: Callable) -> float:
         opt.solver.epsilon = ot_epsilon
         block_a = torch.ones(P_block, device=device, dtype=X.dtype) / P_block
         if opt._use_fused_softmax:
-            # Fused path: softmax + vertex-free projection in one compiled
-            # call. ent_cost_tensor stays on-device; it gets summed with
-            # the other blocks' tensors in a single .item() after the loop.
+            # Fused path: softmax + vertex-free projection in one compiled call.
             scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
-            X_new_block, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
+            X_new_block, transport_matrix = opt._compiled.fused_softmax_project(
                 scaled_cost,
                 ot_epsilon,
                 block_a,
@@ -244,9 +246,7 @@ def step_blockwise(opt, closure: Callable) -> float:
                 block_X,
                 scale_cost_mean=False,
             )
-            block_fused_ent_terms.append(ent_cost_tensor)
-            # ot_result.cost / ent_reg_cost are only read by the
-            # num_blocks_counted == 0 fallback below, so 0.0 is safe here.
+            # Per-block model loss is tracked below; the OT cost is unused here.
             ot_result = SolverResult(
                 matrix=transport_matrix,
                 cost=0.0,
@@ -316,10 +316,6 @@ def step_blockwise(opt, closure: Callable) -> float:
         block_model_loss_terms.append(cost_matrix.mean().detach())
         num_blocks_counted += 1
         all_converged = all_converged and ot_result.converged
-
-    # Resolve fused-softmax entropic cost in a single host transfer.
-    if block_fused_ent_terms:
-        total_ent_cost += torch.stack(block_fused_ent_terms).sum().item()
 
     # Save per-block descent directions for biased rotation in next step
     if opt.biased_rotation:
@@ -516,13 +512,18 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     # the loop to avoid one GPU->CPU sync per block per step.
     block_disp_terms: list = []
     block_model_loss_terms: list = []
-    block_fused_ent_terms: list = []  # 0-d ent_cost tensors, fused path
     all_converged = True
     total_particles = 0
     num_blocks_counted = 0
 
     probes = opt._probes.to(device=device, dtype=X.dtype)
     chunk = opt.chunk_size or 512  # default chunk for combined mode
+
+    # base_subspace holds every block's coords and is invariant across the block
+    # loop (updates are applied after it). Build it once and reuse one scatter
+    # buffer for every block and chunk.
+    base_subspace = reassemble_blocks_to_subspace(all_block_particles, blocks, sub_dim)
+    base_batch_buf = base_subspace.new_empty((chunk, sub_dim))
 
     # Per-block descent directions for biased rotation (populated from previous step)
     _block_descent_dirs = getattr(opt, "_prev_block_descent_directions", None)
@@ -608,19 +609,16 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         P, V, K, D = X_probe.shape
         total_evals = P * V * K
 
-        # Assemble base subspace coords from all blocks
-        base_subspace = reassemble_blocks_to_subspace(all_block_particles, blocks, sub_dim)
-
         losses_list = []
         _all_indices = torch.arange(total_evals, device=device)
         for chunk_start in range(0, total_evals, chunk):
             chunk_end = min(chunk_start + chunk, total_evals)
             chunk_size_actual = chunk_end - chunk_start
 
-            # Build batch of subspace coords with this block perturbed (vectorized)
-            # base_subspace: (sub_dim,)
-            # We create (chunk_size, sub_dim) and modify the block region
-            base_batch = base_subspace.unsqueeze(0).expand(chunk_size_actual, -1).clone()
+            # Refill the reuse buffer with base_subspace instead of allocating a
+            # fresh (chunk x sub_dim) tensor each chunk, then perturb this block.
+            base_batch = base_batch_buf[:chunk_size_actual]
+            base_batch.copy_(base_subspace.unsqueeze(0).expand(chunk_size_actual, -1))
 
             global_indices = _all_indices[chunk_start:chunk_end]  # view, no alloc
             i_idx = global_indices // (V * K)
@@ -687,10 +685,8 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         opt.solver.epsilon = ot_epsilon
         block_a = torch.ones(P_block, device=device, dtype=X.dtype) / P_block
         if opt._use_fused_softmax:
-            # See step_blockwise() above for the rationale behind the
-            # 0.0 placeholders and the deferred .item() on ent_cost_tensor.
             scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
-            X_new_block, transport_matrix, ent_cost_tensor = opt._compiled.fused_softmax_project(
+            X_new_block, transport_matrix = opt._compiled.fused_softmax_project(
                 scaled_cost,
                 ot_epsilon,
                 block_a,
@@ -700,7 +696,6 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 block_X,
                 scale_cost_mean=False,
             )
-            block_fused_ent_terms.append(ent_cost_tensor)
             ot_result = SolverResult(
                 matrix=transport_matrix,
                 cost=0.0,
@@ -767,10 +762,6 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         block_model_loss_terms.append(cost_matrix.mean().detach())
         num_blocks_counted += 1
         all_converged = all_converged and ot_result.converged
-
-    # Resolve fused-softmax entropic cost in a single host transfer.
-    if block_fused_ent_terms:
-        total_ent_cost += torch.stack(block_fused_ent_terms).sum().item()
 
     # Save per-block descent directions for biased rotation in next step
     if opt.biased_rotation:

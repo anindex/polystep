@@ -6,6 +6,7 @@ handle it. The barycentric projection also divides by the realized row sum, so a
 unconverged Sinkhorn plan gives a translation-invariant step.
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -36,7 +37,7 @@ def test_fused_softmax_project_mixed_dtype_no_crash():
     pv = torch.randn(V, d, dtype=torch.bfloat16)
     rot = torch.eye(d, dtype=torch.bfloat16).expand(b, d, d).contiguous()
     X = torch.randn(b, d, dtype=torch.bfloat16)
-    X_new, transport, _ = _fused_softmax_project(C, 0.1, a, pv, rot, 1.0, X, scale_cost_mean=False)
+    X_new, transport = _fused_softmax_project(C, 0.1, a, pv, rot, 1.0, X, scale_cost_mean=False)
     assert X_new.dtype == torch.bfloat16
     assert torch.isfinite(X_new.float()).all()
 
@@ -89,15 +90,10 @@ def _run_mixed_precision_steps(solver: str, n_steps: int = 3) -> float:
     return loss
 
 
-def test_optimizer_mixed_precision_softmax_step():
-    """End-to-end mixed_precision=True must run on CPU with HybridSubspace and softmax."""
-    loss = _run_mixed_precision_steps("softmax")
-    assert loss == loss  # not NaN
-
-
-def test_optimizer_mixed_precision_sinkhorn_step():
-    """End-to-end mixed_precision=True must run on CPU with HybridSubspace and Sinkhorn."""
-    loss = _run_mixed_precision_steps("sinkhorn")
+@pytest.mark.parametrize("solver", ["softmax", "sinkhorn"])
+def test_optimizer_mixed_precision_step(solver):
+    """End-to-end mixed_precision=True must run on CPU with HybridSubspace."""
+    loss = _run_mixed_precision_steps(solver)
     assert loss == loss  # not NaN
 
 

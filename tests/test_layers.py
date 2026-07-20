@@ -28,12 +28,6 @@ class TestVmapSafeMultiHeadAttention:
         """Create a test attention module."""
         return VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4)
 
-    def test_attention_shapes(self, attn):
-        """Verify output shape matches (batch, seq, embed)."""
-        x = torch.randn(2, 10, 64)
-        out = attn(x, x, x)
-        assert out.shape == (2, 10, 64)
-
     def test_attention_self_attention(self, attn):
         """Self-attention: Q=K=V same tensor."""
         x = torch.randn(4, 20, 64)
@@ -84,7 +78,8 @@ class TestVmapSafeMultiHeadAttention:
         with pytest.raises(ValueError):
             VmapSafeMultiHeadAttention(embed_dim=64, num_heads=5)
 
-    def test_attention_vmap(self):
+    @pytest.mark.parametrize("num_models,batch", [(5, 1), (3, 4)])
+    def test_attention_vmap(self, num_models, batch):
         """CRITICAL: Verify attention works under torch.vmap.
 
         This is the main reason for this implementation - nn.MultiheadAttention
@@ -105,43 +100,19 @@ class TestVmapSafeMultiHeadAttention:
             return torch.func.functional_call(attn, params_dict, (x, x, x))
 
         # Create batched params (simulating multiple model instances)
-        num_models = 5
         batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
 
-        # Input with batch dimension: (batch=1, seq, embed)
+        # Input with batch dimension: (batch, seq, embed)
         # The module expects 3D input, so we keep the batch dim
-        x = torch.randn(1, 10, 64, device=device)
+        x = torch.randn(batch, 10, 64, device=device)
 
         # This should NOT error (unlike nn.MultiheadAttention)
         vmapped = torch.vmap(forward_fn, in_dims=(0, None))
         out = vmapped(batched_params, x)
 
         # Output: (num_models, batch, seq, embed)
-        assert out.shape == (5, 1, 10, 64), f"Expected (5, 1, 10, 64), got {out.shape}"
-
-    def test_attention_vmap_with_batch(self):
-        """Verify vmap works with batched inputs too."""
-        device = "cpu"
-        attn = VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4).to(device)
-        attn.eval()
-
-        params = dict(attn.named_parameters())
-
-        def forward_fn(params_dict, x):
-            return torch.func.functional_call(attn, params_dict, (x, x, x))
-
-        # Batched params
-        num_models = 3
-        batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
-
-        # Batched input: (batch, seq, embed)
-        x = torch.randn(4, 10, 64, device=device)
-
-        vmapped = torch.vmap(forward_fn, in_dims=(0, None))
-        out = vmapped(batched_params, x)
-
-        # Output: (num_models, batch, seq, embed)
-        assert out.shape == (3, 4, 10, 64), f"Expected (3, 4, 10, 64), got {out.shape}"
+        expected = (num_models, batch, 10, 64)
+        assert out.shape == expected, f"Expected {expected}, got {out.shape}"
 
 
 # =============================================================================
@@ -225,14 +196,6 @@ class TestVmapSafeLSTM:
         """Create a test LSTM."""
         return VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=2)
 
-    def test_lstm_shapes(self, lstm):
-        """Verify sequence output shapes."""
-        x = torch.randn(4, 10, 32)  # (batch, seq, input)
-        out, (h_n, c_n) = lstm(x)
-        assert out.shape == (4, 10, 64)
-        assert h_n.shape == (2, 4, 64)  # (num_layers, batch, hidden)
-        assert c_n.shape == (2, 4, 64)
-
     def test_lstm_with_initial_state(self, lstm):
         """Non-zero initial state."""
         x = torch.randn(4, 10, 32)
@@ -243,17 +206,9 @@ class TestVmapSafeLSTM:
         # Final states should differ from initial
         assert not torch.allclose(h_n, h0)
 
-    def test_lstm_single_layer(self):
-        """Test single layer LSTM."""
-        lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=1)
-        x = torch.randn(4, 10, 32)
-        out, (h_n, c_n) = lstm(x)
-        assert out.shape == (4, 10, 64)
-        assert h_n.shape == (1, 4, 64)
-
     def test_lstm_multi_layer(self):
-        """Test multi-layer LSTM (num_layers > 1)."""
-        for num_layers in [2, 3, 4]:
+        """Test LSTM across layer counts."""
+        for num_layers in [1, 2, 3, 4]:
             lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=num_layers)
             x = torch.randn(4, 10, 32)
             out, (h_n, c_n) = lstm(x)
@@ -283,7 +238,8 @@ class TestVmapSafeLSTM:
             assert cell.W_i.weight.grad is not None
             assert cell.W_h.weight.grad is not None
 
-    def test_lstm_vmap(self):
+    @pytest.mark.parametrize("num_models,batch", [(5, 1), (3, 4)])
+    def test_lstm_vmap(self, num_models, batch):
         """CRITICAL: Verify LSTM works under vmap.
 
         This is the main reason for this implementation - nn.LSTM
@@ -301,41 +257,18 @@ class TestVmapSafeLSTM:
             out, _ = torch.func.functional_call(lstm, params_dict, (x,))
             return out
 
-        num_models = 5
         batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
 
-        # Input with batch dimension: (batch=1, seq, input)
+        # Input with batch dimension: (batch, seq, input)
         # The module expects 3D input, so we keep the batch dim
-        x = torch.randn(1, 10, 32, device=device)
+        x = torch.randn(batch, 10, 32, device=device)
 
         vmapped = torch.vmap(forward_fn, in_dims=(0, None))
         out = vmapped(batched_params, x)
 
         # Output: (num_models, batch, seq, hidden)
-        assert out.shape == (5, 1, 10, 64), f"Expected (5, 1, 10, 64), got {out.shape}"
-
-    def test_lstm_vmap_with_batch(self):
-        """Verify vmap works with batched sequence inputs."""
-        device = "cpu"
-        lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=2).to(device)
-
-        params = dict(lstm.named_parameters())
-
-        def forward_fn(params_dict, x):
-            out, _ = torch.func.functional_call(lstm, params_dict, (x,))
-            return out
-
-        num_models = 3
-        batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
-
-        # Batched sequence
-        x = torch.randn(4, 10, 32, device=device)  # (batch, seq, input)
-
-        vmapped = torch.vmap(forward_fn, in_dims=(0, None))
-        out = vmapped(batched_params, x)
-
-        # Output: (num_models, batch, seq, hidden)
-        assert out.shape == (3, 4, 10, 64), f"Expected (3, 4, 10, 64), got {out.shape}"
+        expected = (num_models, batch, 10, 64)
+        assert out.shape == expected, f"Expected {expected}, got {out.shape}"
 
 
 # =============================================================================

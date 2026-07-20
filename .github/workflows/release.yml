@@ -1,0 +1,23 @@
+name: Publish to PyPI
+
+# Publishes on a GitHub Release via PyPI Trusted Publishing (OIDC), no API tokens.
+# One-time setup on PyPI: Project -> Publishing -> add a trusted publisher for
+#   owner=anindex, repo=polystep, workflow=release.yml, environment=pypi.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

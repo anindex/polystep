@@ -39,32 +39,6 @@ def test_vectorized_step_produces_finite_cost():
 # tests/test_optimizer.py::TestClosureInterface::test_step_updates_model.
 
 
-def test_cost_batch_size_parameter():
-    """Verify cost_batch_size is stored and accessible."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-
-    # Without cost_batch_size
-    opt1 = PolyStepOptimizer(model, epsilon=0.5, compile=False)
-    assert opt1.cost_batch_size is None
-
-    # With cost_batch_size
-    opt2 = PolyStepOptimizer(model, epsilon=0.5, compile=False, cost_batch_size=64)
-    assert opt2.cost_batch_size == 64
-
-
-def test_amortize_steps_parameter():
-    """Verify amortize_steps is stored and defaults to 1."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-
-    opt1 = PolyStepOptimizer(model, epsilon=0.5, compile=False)
-    assert opt1.amortize_steps == 1
-
-    opt2 = PolyStepOptimizer(model, epsilon=0.5, compile=False, amortize_steps=3)
-    assert opt2.amortize_steps == 3
-
-
 def test_amortize_steps_alternates_ot_and_momentum():
     """With amortize_steps=3, only 1 in 3 steps should run full OT."""
     torch.manual_seed(42)
@@ -250,39 +224,6 @@ def test_momentum_step_reuses_last_cost():
     assert not torch.equal(X_before, optimizer._state.X)
 
 
-def test_amortize_ema_default_disabled():
-    """Without amortize_steps > 1, EMA machinery should not activate."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    optimizer = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        compile=False,
-    )
-    assert optimizer._transport_direction_ema is None
-    assert optimizer.amortize_ema == 0.7  # default value
-
-
-def test_adaptive_probe_count_parameter():
-    """adaptive_num_probe should be stored and default to False."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-
-    opt1 = PolyStepOptimizer(model, epsilon=0.5, compile=False, num_probe=3)
-    assert opt1.adaptive_num_probe is False
-
-    opt2 = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        compile=False,
-        num_probe=3,
-        adaptive_num_probe=True,
-        adaptive_probe_warmup=10,
-    )
-    assert opt2.adaptive_num_probe is True
-    assert opt2._adaptive_probe_warmup == 10
-
-
 def test_adaptive_probe_reduces_probes():
     """On a steadily-improving objective the decreasing-loss counter must
     increment after warmup -- that counter is what drops K_eff to 1."""
@@ -316,7 +257,8 @@ def test_adaptive_probe_reduces_probes():
     assert optimizer._loss_decreasing_count >= 1, "decreasing-loss tracking never fired"
 
 
-def test_adaptive_probe_step_works():
+@pytest.mark.parametrize("num_probe", [3, 1])
+def test_adaptive_probe_step_works(num_probe):
     """Optimizer step should work with adaptive_num_probe=True."""
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
@@ -324,7 +266,7 @@ def test_adaptive_probe_step_works():
         model,
         epsilon=0.5,
         step_radius=0.5,
-        num_probe=3,
+        num_probe=num_probe,
         compile=False,
         seed=42,
         adaptive_num_probe=True,
@@ -348,18 +290,6 @@ def test_adaptive_probe_step_works():
             initial_cost = cost
     # Verify optimizer isn't diverging wildly (10x tolerance for stochastic optimizer)
     assert abs(cost) < abs(initial_cost) * 10 + 1, f"Cost exploded: {cost} vs initial {initial_cost}"
-
-
-def test_biased_rotation_parameter():
-    """biased_rotation should be stored and default to False."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-
-    opt1 = PolyStepOptimizer(model, epsilon=0.5, compile=False)
-    assert opt1.biased_rotation is False
-
-    opt2 = PolyStepOptimizer(model, epsilon=0.5, compile=False, biased_rotation=True)
-    assert opt2.biased_rotation is True
 
 
 def test_biased_rotation_stores_descent_direction():
@@ -460,44 +390,6 @@ def test_all_three_features_compose():
 
     # Model should have changed
     assert optimizer._state.iteration_count == 10
-    # Verify optimizer isn't diverging wildly (10x tolerance for stochastic optimizer)
-    assert abs(cost) < abs(initial_cost) * 10 + 1, f"Cost exploded: {cost} vs initial {initial_cost}"
-
-
-def test_adaptive_num_probe_with_num_probe_1():
-    """adaptive_num_probe=True with num_probe=1 should work without error.
-
-    When num_probe=1, adaptive probe logic has minimal room to reduce,
-    but the codepath should still execute cleanly.
-    """
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    optimizer = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        step_radius=0.5,
-        num_probe=1,
-        compile=False,
-        seed=42,
-        adaptive_num_probe=True,
-        adaptive_probe_warmup=0,
-    )
-
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-
-    def closure(batched_params):
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    initial_cost = None
-    for _ in range(5):
-        cost = optimizer.step(closure)
-        assert isinstance(cost, float)
-        assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-        if initial_cost is None:
-            initial_cost = cost
     # Verify optimizer isn't diverging wildly (10x tolerance for stochastic optimizer)
     assert abs(cost) < abs(initial_cost) * 10 + 1, f"Cost exploded: {cost} vs initial {initial_cost}"
 

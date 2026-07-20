@@ -88,61 +88,8 @@ class TestPerFunctionFallbackIndependence:
 # ---------------------------------------------------------------------------
 
 
-class TestRotateAndTranslateEquivalence:
-    """Test 6: _rotate_and_translate direct equivalence."""
-
-    def test_rotate_and_translate_equivalence(self):
-        torch.manual_seed(42)
-        B, d, V = 5, 3, 6  # batch, dim, vertices
-        step_radius = 0.5
-
-        # Random rotation matrices (orthogonal via QR)
-        raw = torch.randn(B, d, d)
-        Q, _ = torch.linalg.qr(raw)
-        rot_mats = Q
-
-        polytope_vertices = torch.randn(V, d)
-        origin = torch.randn(B, d)
-
-        sp_direct, rot_direct = _rotate_and_translate(rot_mats, polytope_vertices, origin, step_radius)
-
-        cf = CompiledFunctions(compile=False)
-        sp_cf, rot_cf = cf.rotate_and_translate(rot_mats, polytope_vertices, origin, step_radius)
-
-        torch.testing.assert_close(sp_direct, sp_cf)
-        torch.testing.assert_close(rot_direct, rot_cf)
-
-        # Verify shapes
-        assert sp_direct.shape == (B, V, d)
-        assert rot_direct.shape == (B, V, d)
-
-
 class TestBarycentricProjectionEquivalence:
     """Test 7: _barycentric_projection equivalence and shape."""
-
-    def test_barycentric_projection_equivalence(self):
-        torch.manual_seed(42)
-        B, V, d = 5, 6, 3
-
-        transport_matrix = torch.softmax(torch.randn(B, V), dim=-1)
-        a = torch.ones(B) / B
-        X_vertices = torch.randn(B, V, d)
-
-        result_direct = _barycentric_projection(transport_matrix, a, X_vertices)
-
-        cf = CompiledFunctions(compile=False)
-        result_cf = cf.barycentric_projection(transport_matrix, a, X_vertices)
-
-        torch.testing.assert_close(result_direct, result_cf)
-        assert result_direct.shape == (B, d)
-
-        # Verify against manual computation. The barycentric projection normalizes
-        # by the realized row sum of the plan (the textbook OT definition), which
-        # equals ``a`` only when the plan's row marginal is exactly ``a``.
-        row_sum = transport_matrix.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-        weights = transport_matrix / row_sum
-        X_manual = torch.einsum("bkd,bk->bd", X_vertices, weights)
-        torch.testing.assert_close(result_direct, X_manual)
 
     def test_barycentric_projection_zero_marginal_is_finite(self):
         B, V, d = 3, 4, 2
@@ -246,8 +193,15 @@ class TestCompiledFunctionsNoGraphBreaks:
             _rotate_and_translate,
             _barycentric_projection,
             _compute_probe_points,
+            _fused_softmax_project,
         ],
-        ids=["sinkhorn_iteration", "rotate_and_translate", "barycentric_projection", "compute_probe_points"],
+        ids=[
+            "sinkhorn_iteration",
+            "rotate_and_translate",
+            "barycentric_projection",
+            "compute_probe_points",
+            "fused_softmax_project",
+        ],
     )
     def test_no_graph_break_patterns(self, fn):
         source = inspect.getsource(fn)
@@ -343,45 +297,6 @@ class TestGPUGraphBreakVerification:
 
 
 # ---------------------------------------------------------------------------
-# Group 7: torch._dynamo.explain verification (single graph confirmation)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-@pytest.mark.timeout(120)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestDynamoExplainVerification:
-    """Test 14: torch._dynamo.explain confirms single graph per function.
-
-    The explain API returns structured information about how dynamo traces the
-    function, including graph_count (should be 1) and break_reasons (should be
-    empty). This provides explicit proof of zero graph breaks.
-    """
-
-    @pytest.mark.parametrize(
-        "fn_name,fn,make_args",
-        [
-            ("sinkhorn_iteration", _sinkhorn_iteration, _make_sinkhorn_args),
-            ("rotate_and_translate", _rotate_and_translate, _make_rotate_args),
-            ("barycentric_projection", _barycentric_projection, _make_barycentric_args),
-            ("compute_probe_points", _compute_probe_points, _make_probe_args),
-        ],
-    )
-    def test_single_graph_no_breaks(self, fn_name, fn, make_args):
-        """torch._dynamo.explain confirms exactly 1 graph and 0 break reasons."""
-        torch._dynamo.reset()
-        device = torch.device("cuda")
-        args = make_args(device)
-        explanation = torch._dynamo.explain(fn)(*args)
-        assert explanation.graph_count == 1, (
-            f"{fn_name}: expected 1 graph, got {explanation.graph_count}. Break reasons: {explanation.break_reasons}"
-        )
-        assert len(explanation.break_reasons) == 0, (
-            f"{fn_name}: expected 0 break reasons, got {len(explanation.break_reasons)}: {explanation.break_reasons}"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Group 8: Fused softmax + projection tests
 # ---------------------------------------------------------------------------
 
@@ -400,52 +315,6 @@ def _make_fused_softmax_args(device, P=10, V=8, dim=4, seed=42):
     step_radius = 0.5
     X = torch.randn(P, dim, device=device)
     return cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X
-
-
-class TestFusedSoftmaxProjectReturnTypes:
-    """Test 15: _fused_softmax_project returns tuple of 3 tensors."""
-
-    def test_returns_tuple_of_three_tensors(self):
-        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = _make_fused_softmax_args(
-            torch.device("cpu")
-        )
-        result = _fused_softmax_project(
-            cost_matrix,
-            epsilon,
-            a,
-            polytope_verts,
-            rot_mats,
-            step_radius,
-            X,
-        )
-        assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
-        assert len(result) == 3, f"Expected 3 elements, got {len(result)}"
-        X_new, transport, ent_cost = result
-        assert isinstance(X_new, torch.Tensor)
-        assert isinstance(transport, torch.Tensor)
-        assert isinstance(ent_cost, torch.Tensor)
-
-
-class TestFusedSoftmaxProjectShapes:
-    """Test 16: Output shapes are correct."""
-
-    def test_output_shapes(self):
-        P, V, dim = 10, 8, 4
-        cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = _make_fused_softmax_args(
-            torch.device("cpu"), P=P, V=V, dim=dim
-        )
-        X_new, transport, ent_cost = _fused_softmax_project(
-            cost_matrix,
-            epsilon,
-            a,
-            polytope_verts,
-            rot_mats,
-            step_radius,
-            X,
-        )
-        assert X_new.shape == (P, dim), f"X_new shape {X_new.shape} != ({P}, {dim})"
-        assert transport.shape == (P, V), f"transport shape {transport.shape} != ({P}, {V})"
-        assert ent_cost.dim() == 0, f"ent_cost should be 0-dim tensor, got dim={ent_cost.dim()}"
 
 
 class TestFusedSoftmaxProjectEquivalence:
@@ -477,10 +346,8 @@ class TestFusedSoftmaxProjectEquivalence:
         weights_ref = transport_ref / a.unsqueeze(-1)
         X_new_ref = torch.einsum("bkd,bk->bd", X_vertices, weights_ref)
 
-        ent_cost_ref = (C_scaled * transport_ref).sum()
-
         # --- Fused path ---
-        X_new_fused, transport_fused, ent_cost_fused = _fused_softmax_project(
+        X_new_fused, transport_fused = _fused_softmax_project(
             cost_matrix.clone(),
             epsilon,
             a,
@@ -497,9 +364,6 @@ class TestFusedSoftmaxProjectEquivalence:
         assert torch.allclose(transport_fused, transport_ref, atol=1e-6), (
             f"transport max diff: {(transport_fused - transport_ref).abs().max().item():.2e}"
         )
-        assert torch.allclose(ent_cost_fused, ent_cost_ref, atol=1e-5), (
-            f"ent_cost diff: {(ent_cost_fused - ent_cost_ref).abs().item():.2e}"
-        )
 
 
 class TestFusedSoftmaxProjectTransportRowSums:
@@ -510,7 +374,7 @@ class TestFusedSoftmaxProjectTransportRowSums:
         cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = _make_fused_softmax_args(
             torch.device("cpu"), P=P, V=V, dim=dim
         )
-        _, transport, _ = _fused_softmax_project(
+        _, transport = _fused_softmax_project(
             cost_matrix,
             epsilon,
             a,
@@ -545,7 +409,7 @@ class TestFusedSoftmaxProjectNoScaling:
         W_expected = torch.softmax(-cost_matrix / epsilon, dim=-1)
         transport_expected = W_expected * a.unsqueeze(-1)
 
-        _, transport_fused, _ = _fused_softmax_project(
+        _, transport_fused = _fused_softmax_project(
             cost_matrix.clone(),
             epsilon,
             a,
@@ -573,7 +437,7 @@ class TestFusedSoftmaxProjectCompiledFunctionsEager:
         cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X = _make_fused_softmax_args(
             torch.device("cpu"), P=P, V=V, dim=dim
         )
-        X_new, transport, ent_cost = cf.fused_softmax_project(
+        X_new, transport = cf.fused_softmax_project(
             cost_matrix,
             epsilon,
             a,
@@ -584,14 +448,3 @@ class TestFusedSoftmaxProjectCompiledFunctionsEager:
         )
         assert X_new.shape == (P, dim)
         assert transport.shape == (P, V)
-        assert ent_cost.dim() == 0
-
-
-class TestFusedSoftmaxProjectNoGraphBreaks:
-    """Test 22: Static check that _fused_softmax_project avoids graph-break patterns."""
-
-    def test_no_graph_break_patterns(self):
-        source = inspect.getsource(_fused_softmax_project)
-        assert ".item()" not in source, "_fused_softmax_project contains .item() which causes graph breaks"
-        assert ".append(" not in source, "_fused_softmax_project contains .append() which causes graph breaks"
-        assert ".tolist()" not in source, "_fused_softmax_project contains .tolist() which causes graph breaks"

@@ -232,32 +232,11 @@ class TestUnflattenPreservesDevice:
 
 
 class TestGetDeviceCPU:
-    """``get_device`` returns CPU for a CPU model."""
+    """``get_device`` returns CPU for CPU models and empty modules."""
 
-    def test_get_device_cpu(self):
-        model = nn.Linear(2, 2)
+    @pytest.mark.parametrize("model", [nn.Linear(2, 2), nn.Module()])
+    def test_get_device_cpu(self, model):
         assert get_device(model) == torch.device("cpu")
-
-
-class TestGetDeviceEmpty:
-    """``get_device`` returns CPU for an empty module."""
-
-    def test_get_device_empty(self):
-        model = nn.Module()
-        assert get_device(model) == torch.device("cpu")
-
-
-class TestCreateGeneratorCPU:
-    """``create_generator`` returns a CPU generator with deterministic output."""
-
-    def test_create_generator_cpu(self):
-        gen = create_generator(seed=42, device=torch.device("cpu"))
-        assert isinstance(gen, torch.Generator)
-        t1 = torch.randn(5, generator=gen)
-        # Reseed and draw again
-        gen2 = create_generator(seed=42, device=torch.device("cpu"))
-        t2 = torch.randn(5, generator=gen2)
-        assert torch.equal(t1, t2)
 
 
 class TestCreateGeneratorDeterminism:

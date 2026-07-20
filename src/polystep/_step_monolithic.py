@@ -438,7 +438,7 @@ def step_monolithic(opt, closure: Callable) -> float:
         # ('mean'/'max_cost'/float/None) matches the non-fused solvers; the
         # kernel then runs on the already-scaled cost (scale_cost_mean=False).
         scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
-        X_new_fused, transport_matrix, _ent_cost_tensor = opt._compiled.fused_softmax_project(
+        X_new_fused, transport_matrix = opt._compiled.fused_softmax_project(
             scaled_cost,
             ot_epsilon,
             state.a,
@@ -448,8 +448,7 @@ def step_monolithic(opt, closure: Callable) -> float:
             X,
             scale_cost_mean=False,
         )
-        # The fused entropic cost is unused on the monolithic path (state.costs
-        # tracks cost_matrix.mean), so skip the per-step device-to-host sync.
+        # state.costs tracks cost_matrix.mean, so the OT cost is unused here.
         ot_result = SolverResult(
             matrix=transport_matrix,
             cost=0.0,

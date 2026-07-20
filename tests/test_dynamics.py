@@ -20,15 +20,25 @@ from polystep.dynamics import (
 class TestMomentumCoefficient:
     """Tests for compute_momentum_coefficient linear warmup."""
 
-    def test_warmup_start(self):
-        """At iteration 0, beta equals momentum_init."""
-        beta = compute_momentum_coefficient(0, max_iterations=100)
-        assert beta == pytest.approx(0.5)
-
-    def test_warmup_end(self):
-        """At final iteration, beta equals momentum_final."""
-        beta = compute_momentum_coefficient(99, max_iterations=100)
-        assert beta == pytest.approx(0.95)
+    @pytest.mark.parametrize(
+        "iteration, max_iterations, momentum_init, momentum_final, expected",
+        [
+            (0, 100, 0.5, 0.95, 0.5),
+            (99, 100, 0.5, 0.95, 0.95),
+            (200, 100, 0.5, 0.95, 0.95),
+            (0, 1, 0.5, 0.95, 0.5),
+            (9, 10, 0.0, 1.0, 1.0),
+        ],
+    )
+    def test_warmup_start(self, iteration, max_iterations, momentum_init, momentum_final, expected):
+        """Warmup endpoints, cap beyond max, div-guard at max_iterations=1, and custom range."""
+        beta = compute_momentum_coefficient(
+            iteration,
+            max_iterations=max_iterations,
+            momentum_init=momentum_init,
+            momentum_final=momentum_final,
+        )
+        assert beta == pytest.approx(expected)
 
     def test_warmup_midpoint(self):
         """At midpoint, beta is halfway between init and final."""
@@ -36,22 +46,6 @@ class TestMomentumCoefficient:
         beta = compute_momentum_coefficient(mid, max_iterations=100)
         expected = 0.5 + (mid / 99) * (0.95 - 0.5)
         assert beta == pytest.approx(expected)
-
-    def test_beyond_max(self):
-        """Iteration beyond max_iterations caps at momentum_final."""
-        beta = compute_momentum_coefficient(200, max_iterations=100)
-        assert beta == pytest.approx(0.95)
-
-    def test_single_iteration(self):
-        """Edge case: max_iterations=1 clamps progress correctly."""
-        # max(1, 1-1) = max(1, 0) = 1, progress = min(1.0, 0/1) = 0.0
-        beta = compute_momentum_coefficient(0, max_iterations=1)
-        assert beta == pytest.approx(0.5)
-
-    def test_custom_range(self):
-        """Custom init/final values interpolate correctly."""
-        beta = compute_momentum_coefficient(9, max_iterations=10, momentum_init=0.0, momentum_final=1.0)
-        assert beta == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -157,16 +151,6 @@ class TestAdaptiveRadius:
             radius_increase=1.5,
         )
         assert rm == pytest.approx(1.5)
-
-    def test_boost_resets_count(self):
-        """After boost, stagnation_count resets to 0."""
-        rm, sc, pl = update_adaptive_radius(
-            current_loss=1.0,
-            prev_loss=1.0 + 1e-6,
-            stagnation_count=9,
-            radius_multiplier=1.0,
-            stagnation_patience=10,
-        )
         assert sc == 0
 
     def test_decay_on_improvement(self):

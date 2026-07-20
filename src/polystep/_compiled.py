@@ -193,7 +193,7 @@ def _fused_softmax_project(
     step_radius: float,
     X: torch.Tensor,
     scale_cost_mean: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused softmax weighting + vertex-free barycentric projection (pure tensor ops).
 
     Combines softmax OT solve and barycentric projection into a single compiled
@@ -212,19 +212,18 @@ def _fused_softmax_project(
         scale_cost_mean: If True, normalize cost matrix by its mean absolute value.
 
     Returns:
-        Tuple of (X_new, transport, ent_cost):
+        Tuple of (X_new, transport):
             - X_new: Updated particle positions of shape (P, dim).
             - transport: Transport matrix of shape (P, V) with row sums equal to a.
-            - ent_cost: Entropic cost as a 0-dim tensor (kept as tensor for compile safety).
     """
-    # Cost scaling (inline for compile safety -- avoids cross-module string dispatch)
+    # Cost scaling (inline for compile safety, avoids cross-module string dispatch)
     if scale_cost_mean:
         s = torch.clamp(cost_matrix.abs().mean(), min=1e-10)
         C = cost_matrix / s
     else:
         C = cost_matrix
 
-    # Softmax weights -- PyTorch's softmax subtracts row-max internally for stability
+    # Softmax weights: PyTorch's softmax subtracts row-max internally for stability
     W = torch.softmax(-C / epsilon, dim=-1)  # (P, V)
 
     # Transport matrix: row sums equal source marginal a
@@ -238,10 +237,7 @@ def _fused_softmax_project(
     # Barycentric projection
     X_new = X + step_radius * rot_centroid  # (P, dim)
 
-    # Entropic cost -- kept as tensor to avoid graph break in compiled path
-    ent_cost = (C * transport).sum()
-
-    return X_new, transport, ent_cost
+    return X_new, transport
 
 
 # ---------------------------------------------------------------------------
