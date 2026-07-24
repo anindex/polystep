@@ -33,9 +33,8 @@ def extract_fd_gradient(
     Returns:
         Gradient in rotated frame of shape (P, pdim).
     """
-    assert losses_3d.shape[1] == 2 * pdim, (
-        f"FD gradient needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}"
-    )
+    if not losses_3d.shape[1] == 2 * pdim:
+        raise ValueError(f"FD gradient needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}")
     fwd = losses_3d[:, :pdim, :]  # (P, pdim, K) at +directions
     bwd = losses_3d[:, pdim:, :]  # (P, pdim, K) at -directions
 
@@ -67,9 +66,8 @@ def extract_fd_hessian_diag(
     Returns:
         Diagonal Hessian in rotated frame of shape (P, pdim).
     """
-    assert losses_3d.shape[1] == 2 * pdim, (
-        f"FD Hessian needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}"
-    )
+    if not losses_3d.shape[1] == 2 * pdim:
+        raise ValueError(f"FD Hessian needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}")
     fwd = losses_3d[:, :pdim, :]  # (P, pdim, K)
     bwd = losses_3d[:, pdim:, :]  # (P, pdim, K)
 

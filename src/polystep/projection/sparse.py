@@ -266,7 +266,7 @@ class SparseRandomProjection:
         Returns:
             Estimated memory usage in bytes.
         """
-        total_nnz = self._nnz_per_col * self.subspace_dim
+        total_nnz = self.nnz
         # 2 index arrays (row, col) with int64
         indices_bytes = 2 * total_nnz * 8
         element_size = self._dtype.itemsize if self._dtype else 4
@@ -275,7 +275,15 @@ class SparseRandomProjection:
 
     @property
     def nnz(self) -> int:
-        """Total number of nonzeros in projection matrix."""
+        """Number of nonzeros in the realized (coalesced) projection matrix.
+
+        With-replacement row sampling can put duplicate entries in a column;
+        ``coalesce()`` sums them, so the realized nnz is at or below the
+        pre-coalesce estimate ``nnz_per_col * subspace_dim``. Reports the
+        coalesced count once the matrix is built, else the estimate.
+        """
+        if self._sparse_matrix is not None:
+            return self._sparse_matrix._nnz()
         return self._nnz_per_col * self.subspace_dim
 
     @property

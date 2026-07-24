@@ -62,10 +62,13 @@ class TestMixedPrecisionStep:
             from torch.func import functional_call, vmap
 
             model.eval()
-            x = torch.randn(4, 10)  # Will be cast by matmul rules
+            x = torch.randn(4, 10)
 
             def forward(params):
-                return functional_call(model, params, (x,)).mean()
+                # Candidate params are BF16 under mixed_precision (the real
+                # NNCostEvaluator casts inputs to the param dtype); mirror that.
+                xc = x.to(next(iter(params.values())).dtype)
+                return functional_call(model, params, (xc,)).mean()
 
             losses = vmap(forward)(batched_params)
             model.train()
@@ -92,7 +95,13 @@ class TestMixedPrecisionStep:
         original_solve = opt.solver.solve
 
         def patched_solve(cost_matrix, **kwargs):
-            captured_dtype[0] = cost_matrix.dtype
+            # Under mixed_precision the BF16 forward yields a BF16 cost matrix;
+            # the guarantee is that the solver promotes it to FP32 (sanitize_cost)
+            # so the log-domain Sinkhorn stays numerically stable. Assert the
+            # promotion, not the pre-promotion entry dtype.
+            from polystep.solvers._prelude import sanitize_cost
+
+            captured_dtype[0] = sanitize_cost(cost_matrix).dtype
             return original_solve(cost_matrix, **kwargs)
 
         opt.solver.solve = patched_solve
@@ -104,14 +113,15 @@ class TestMixedPrecisionStep:
             x = torch.randn(4, 10)
 
             def forward(params):
-                return functional_call(model, params, (x,)).mean()
+                xc = x.to(next(iter(params.values())).dtype)
+                return functional_call(model, params, (xc,)).mean()
 
             losses = vmap(forward)(batched_params)
             model.train()
             return losses
 
         opt.step(closure)
-        assert captured_dtype[0] == torch.float32, "Cost matrix should be FP32"
+        assert captured_dtype[0] == torch.float32, "Sinkhorn must run the cost matrix in FP32"
 
 
 class TestMixedPrecisionSubspace:
@@ -207,8 +217,9 @@ class TestNaNHandling:
             target = torch.randn(8, 4)
 
             def forward(params):
-                out = functional_call(model, params, (x,))
-                return ((out - target) ** 2).mean()
+                xc = x.to(next(iter(params.values())).dtype)
+                out = functional_call(model, params, (xc,))
+                return ((out - target.to(out.dtype)) ** 2).mean()
 
             losses = vmap(forward)(batched_params)
             model.train()

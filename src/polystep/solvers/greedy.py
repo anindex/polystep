@@ -16,6 +16,7 @@ from typing import Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
+from ._prelude import sanitize_cost
 from .base import SolverResult
 
 
@@ -64,7 +65,9 @@ class MinCostGreedySolver:
         if a is None:
             a = torch.ones(P, device=device, dtype=dtype) / P
 
-        C = scale_cost_matrix(cost_matrix.clone(), scale_cost)
+        # Replace non-finite costs with a finite penalty first: argmin over a
+        # NaN is undefined and would happily assign all mass to a masked vertex.
+        C = scale_cost_matrix(sanitize_cost(cost_matrix), scale_cost)
 
         # Greedy: each particle picks the single lowest-cost vertex
         min_indices = C.argmin(dim=-1)  # (P,)
@@ -104,6 +107,15 @@ class TopKMeanSolver:
     compile: bool = False
     k: int = 3
 
+    def __post_init__(self):
+        if self.k < 1:
+            raise ValueError(
+                f"TopKMeanSolver.k must be >= 1, got {self.k}. k=0 yields an "
+                f"all-zero transport plan, violating the row-mass contract "
+                f"(rows must sum to the source marginal a) that the barycentric "
+                f"projection assumes."
+            )
+
     def solve(
         self,
         cost_matrix: torch.Tensor,
@@ -133,7 +145,7 @@ class TopKMeanSolver:
         if a is None:
             a = torch.ones(P, device=device, dtype=dtype) / P
 
-        C = scale_cost_matrix(cost_matrix.clone(), scale_cost)
+        C = scale_cost_matrix(sanitize_cost(cost_matrix), scale_cost)
 
         # Graceful fallback when fewer vertices than k
         k_eff = min(self.k, V)

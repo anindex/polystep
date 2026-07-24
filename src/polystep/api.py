@@ -8,6 +8,7 @@ epoch iteration, or batch handling.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -76,12 +77,20 @@ class TrainConfig:
         log_every: Step interval for built-in logging. Must be > 0.
         callbacks: List of ``TrainCallback`` instances. ``None`` is
             normalized to an empty list.
+        restore_best: If ``True`` (default), snapshot the model weights
+            whenever the tracked loss reaches a new minimum and restore that
+            best snapshot before ``train()`` returns. Gradient-free search is
+            noisy and updates the model in place, so the *last* step is not
+            necessarily the best; this reverts a late divergence. The tracked
+            loss is the exact full-batch loss when a callback consumes per-step
+            metrics, otherwise the (cheap, already-computed) OT cost proxy.
     """
 
     epochs: int = 10
     batch_size: int = 32
     log_every: int = 10
     callbacks: Optional[List[TrainCallback]] = None
+    restore_best: bool = True
 
     def __post_init__(self):
         if self.epochs <= 0:
@@ -147,6 +156,10 @@ def train(
     except StopIteration:
         raise ValueError("Model has no trainable parameters")
 
+    # Track the lowest-loss weights so a noisy run is not left at a late step.
+    best_loss = float("inf")
+    best_state = None
+
     for epoch in range(config.epochs):
         epoch_loss_sum = 0.0
         epoch_loss_count = 0
@@ -159,8 +172,17 @@ def train(
             cost_bs = getattr(optimizer, "cost_batch_size", None)
             if cost_bs is not None and cost_bs < inputs.shape[0]:
                 gen = getattr(optimizer, "_generator", None)
-                if gen is not None and gen.device.type == inputs.device.type:
-                    idx = torch.randperm(inputs.shape[0], device=inputs.device, generator=gen)[:cost_bs]
+                if gen is not None:
+                    if gen.device == inputs.device:
+                        idx = torch.randperm(inputs.shape[0], device=inputs.device, generator=gen)[:cost_bs]
+                    else:
+                        # Devices differ (seeded CPU generator with CUDA inputs,
+                        # or cuda:0 vs cuda:1). randperm needs the generator and
+                        # tensor on the same device: sample on the generator's
+                        # device to keep the seed, then move the index.
+                        idx = torch.randperm(inputs.shape[0], device=gen.device, generator=gen)[:cost_bs].to(
+                            inputs.device
+                        )
                 else:
                     idx = torch.randperm(inputs.shape[0], device=inputs.device)[:cost_bs]
                 cost_inputs = inputs[idx]
@@ -175,32 +197,43 @@ def train(
 
             optimizer.step(closure)
 
-            # Compute training loss separately (not the OT cost)
-            with torch.no_grad():
-                output = model(inputs)
-                train_loss = loss_fn(output, targets).item()
+            state = optimizer.state
+            ot_cost = state.costs[-1] if state.costs else 0.0
+
+            if callbacks:
+                # A callback consumes per-step metrics: compute the exact
+                # full-batch training loss (separate from the OT cost) and build
+                # the full metrics dict (velocity_mag included).
+                with torch.no_grad():
+                    output = model(inputs)
+                    train_loss = loss_fn(output, targets).item()
+                metrics = {
+                    "step": global_step,
+                    "epoch": epoch,
+                    "loss": train_loss,
+                    "ot_cost": ot_cost,
+                    "displacement": (state.displacement_sqnorms[-1] if state.displacement_sqnorms else 0.0),
+                    "velocity_mag": (torch.norm(state.velocity).item() if state.velocity is not None else 0.0),
+                    "converged": (state.linear_convergence[-1] if state.linear_convergence else False),
+                    "absorb_count": getattr(state, "absorb_count", 0),
+                }
+                for cb in callbacks:
+                    if cb.on_step_end(metrics):
+                        stop = True
+                        break
+            else:
+                # No callback consumes per-step metrics: skip the extra
+                # full-batch forward + its host syncs (.item()/velocity norm)
+                # and track the OT cost as the loss signal for logging / best.
+                train_loss = ot_cost
 
             epoch_loss_sum += train_loss
             epoch_loss_count += 1
 
-            # Build metrics dict
-            state = optimizer.state
-            metrics = {
-                "step": global_step,
-                "epoch": epoch,
-                "loss": train_loss,
-                "ot_cost": state.costs[-1] if state.costs else 0.0,
-                "displacement": (state.displacement_sqnorms[-1] if state.displacement_sqnorms else 0.0),
-                "velocity_mag": (torch.norm(state.velocity).item() if state.velocity is not None else 0.0),
-                "converged": (state.linear_convergence[-1] if state.linear_convergence else False),
-                "absorb_count": getattr(state, "absorb_count", 0),
-            }
-
-            # Invoke on_step_end callbacks
-            for cb in callbacks:
-                if cb.on_step_end(metrics):
-                    stop = True
-                    break
+            # Snapshot the weights at the lowest tracked loss.
+            if config.restore_best and train_loss < best_loss:
+                best_loss = train_loss
+                best_state = copy.deepcopy(model.state_dict())
 
             if stop:
                 break
@@ -218,6 +251,10 @@ def train(
         }
         for cb in callbacks:
             cb.on_epoch_end(epoch_metrics)
+
+    # Restore the best-seen weights (load_state_dict copies in place, keeping dtype/device).
+    if config.restore_best and best_state is not None:
+        model.load_state_dict(best_state)
 
     return model
 

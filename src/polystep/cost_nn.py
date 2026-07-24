@@ -270,7 +270,7 @@ class NNCostEvaluator:
                 except Exception as e:
                     # Only catch vmap/functorch-specific errors; re-raise real bugs.
                     # Keywords are deliberately narrow: a bare "batched" would also
-                    # match a genuine bug in a user forward ("batched input not
+                    # match a real bug in a user forward ("batched input not
                     # supported by op X") and silently demote it to the ~N-times-slower
                     # sequential loop, hiding the real error. Match functorch's own
                     # markers instead ("batched tensor" is the BatchedTensor repr;
@@ -434,9 +434,7 @@ class NNCostEvaluator:
                 return loss
 
             try:
-                self._compiled_fwd_loss = torch.compile(
-                    fwd_loss, mode="reduce-overhead", fullgraph=False
-                )
+                self._compiled_fwd_loss = torch.compile(fwd_loss, mode="reduce-overhead", fullgraph=False)
             except Exception as e:  # noqa: BLE001
                 self._compile_forward_failed = True
                 self._compiled_fwd_loss = None
@@ -536,6 +534,18 @@ class NNCostEvaluator:
         """
         N = flat_subspace_batch.shape[0]
         device = inputs.device
+
+        # Cast float inputs to the model param dtype. This path is called
+        # directly, so under mixed_precision the model is BF16 while inputs may
+        # arrive FP32; without the cast the forward mismatches. Integer inputs
+        # (token ids, class targets) are left untouched.
+        try:
+            param_dtype = next(self.model.parameters()).dtype
+            if inputs.is_floating_point() and inputs.dtype != param_dtype:
+                inputs = inputs.to(param_dtype)
+        except StopIteration:
+            pass
+
         losses = torch.empty(N, device=device)
 
         was_training = self.model.training
@@ -591,7 +601,7 @@ class BatchedLinearEvaluator:
         """Build if model is compatible, else return None."""
         # The bmm plan is rebuilt from named_children(), which misses activations
         # applied inline in a custom forward (e.g. torch.relu) and would compute a
-        # wrong, activation-free loss. Only trust genuine nn.Sequential forwards.
+        # wrong, activation-free loss. Only trust real nn.Sequential forwards.
         if type(model).forward is not nn.Sequential.forward:
             return None
         supported = (nn.Linear, nn.ReLU, nn.LeakyReLU, nn.Sigmoid, nn.Tanh, nn.GELU, nn.SiLU, nn.Flatten, nn.Dropout)

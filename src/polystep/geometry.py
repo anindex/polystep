@@ -176,14 +176,13 @@ def get_random_rotation_matrices(
         return get_rotation_matrix_2d(angles)
 
     # Batched QR decomposition for dim > 2
-    # QR decomposition requires FP32 on CPU (BF16 not supported for geqrf_cpu)
-    # Generate in FP32, compute QR, then convert to target dtype
+    # QR has no bf16/fp16 kernel outside CUDA (geqrf_cpu, and MPS/others too);
+    # generate in FP32, compute QR, then convert back to the target dtype.
     # Resolve None device/dtype to concrete values for comparison
     resolved_device = device if device is not None else torch.device("cpu")
     resolved_dtype = dtype if dtype is not None else torch.float32
     device_type = resolved_device.type if hasattr(resolved_device, "type") else str(resolved_device)
-    is_cpu = device_type == "cpu"
-    needs_fp32_qr = resolved_dtype == torch.bfloat16 and is_cpu
+    needs_fp32_qr = resolved_dtype in (torch.bfloat16, torch.float16) and device_type != "cuda"
     compute_dtype = torch.float32 if needs_fp32_qr else resolved_dtype
     compute_device = "cpu" if needs_fp32_qr else resolved_device
 

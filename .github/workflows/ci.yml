@@ -35,3 +35,19 @@ jobs:
       - run: pip install -e ".[dev]"
       - name: Core library tests
         run: pytest tests/ -v -m "not slow and not gpu" --timeout=120 -x --cov=polystep --cov-report=term-missing
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Install wheel into a clean venv
+        run: |
+          uv venv
+          uv pip install dist/*.whl
+      - name: Clean-import smoke test
+        run: .venv/bin/python -c "import polystep; from polystep import *; print(polystep.__version__)"
+      - name: Verify py.typed ships in the wheel
+        run: .venv/bin/python -c "import importlib.resources, polystep; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"

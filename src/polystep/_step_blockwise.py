@@ -55,9 +55,7 @@ def step_blockwise(opt, closure: Callable) -> float:
     # Probe-radius jitter (Thm. 4.2 condition (iv); no-op when probe_radius_jitter == 0).
     probe_r = opt._apply_probe_radius_jitter(probe_r)
 
-    # Ensure 2D
-    if X.dim() == 1:
-        X = X.unsqueeze(0)
+    # state.X is always 2-D (num_particles, particle_dim); no reshape needed.
 
     # Convert layout-indexed flat to block-indexed flat before splitting.
     # Per-layer blocks pad each entry independently, creating different
@@ -484,9 +482,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     # Probe-radius jitter (Thm. 4.2 condition (iv); no-op when probe_radius_jitter == 0).
     probe_r = opt._apply_probe_radius_jitter(probe_r)
 
-    # Ensure 2D
-    if X.dim() == 1:
-        X = X.unsqueeze(0)
+    # state.X is always 2-D (num_sub_particles, subspace_particle_dim); no reshape needed.
 
     # Get subspace dimension
     sub_dim = opt.subspace.subspace_dim
@@ -645,7 +641,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             # projection: (full_dim, sub_dim)
             # reconstruct_batch needs projection argument for AdaptiveSubspace
             # Match dtype with projection for mixed precision compatibility
-            if opt._mixed_precision and state.projection is not None:
+            if opt._mixed_precision and state.projection is not None and state.projection.dtype is not None:
                 base_batch = base_batch.to(dtype=state.projection.dtype)
             if opt._adaptive or opt._cma_subspace:
                 chunk_params = state.subspace.reconstruct_batch(

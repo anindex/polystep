@@ -250,12 +250,12 @@ class SinkhornSolver:
         # bound holds.
         cost_scale = cost_matrix.abs().max().clamp(min=1e-6)
         max_abs_dual = 10.0 * cost_scale
-        if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
-            f.zero_()
-            g.zero_()
-        else:
-            f.clamp_(-max_abs_dual, max_abs_dual)
-            g.clamp_(-max_abs_dual, max_abs_dual)
+        # Device-side finite guard (no host sync): reset a non-finite warm start
+        # to zero, else clamp to the cost-scaled bound. finite is a 0-dim mask,
+        # avoiding an .all()-in-a-Python-if that would sync every solve.
+        finite = torch.isfinite(f).all() & torch.isfinite(g).all()
+        f = torch.where(finite, f.clamp(-max_abs_dual, max_abs_dual), torch.zeros_like(f))
+        g = torch.where(finite, g.clamp(-max_abs_dual, max_abs_dual), torch.zeros_like(g))
 
         # Re-center using the only valid dual gauge ``f -> f + c, g -> g - c``,
         # which leaves ``f_i + g_j`` (and hence the plan ``P``) unchanged. The

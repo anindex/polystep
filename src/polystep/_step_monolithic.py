@@ -474,8 +474,12 @@ def step_monolithic(opt, closure: Callable) -> float:
         ot_result = opt.solver.solve(**solve_kwargs)
     state.last_solve_eps = ot_epsilon
 
-    # Auto-epsilon feedback: update progressive epsilon from solver stats
-    if opt._progressive_epsilon is not None:
+    # Update progressive epsilon from solver stats. Skip in fixed-iteration
+    # Sinkhorn mode (threshold <= 0): there the solver always returns
+    # converged=True with n_iters == max_iterations, so the ratio is 1.0 and the
+    # increase branch would push epsilon to max_epsilon every step. Progressive
+    # epsilon is only paired with SinkhornSolver, so threshold always exists.
+    if opt._progressive_epsilon is not None and getattr(opt.solver, "threshold", 1.0) > 0:
         opt._progressive_epsilon.update(
             n_iters=ot_result.n_iters,
             max_iterations=getattr(opt.solver, "max_iterations", 1),
@@ -981,8 +985,12 @@ def step_monolithic(opt, closure: Callable) -> float:
                 hist = state.displacement_history[: state.displacement_history_count]
                 svd_ratio = hybrid_sub.get_svd_ratio(state.iteration_count, opt.max_iterations or 1)
                 state.hybrid_projections = hybrid_sub._rotate_all_displacement(
-                    state.hybrid_projections, hist, svd_ratio,
-                    state.X.device, state.X.dtype, state.iteration_count,
+                    state.hybrid_projections,
+                    hist,
+                    svd_ratio,
+                    state.X.device,
+                    state.X.dtype,
+                    state.iteration_count,
                 )
             else:
                 state.hybrid_projections = hybrid_sub.init_projections(

@@ -14,6 +14,7 @@ from .costs import compute_cost_matrix
 from .epsilon import LinearEpsilon
 from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
 from .solvers import SinkhornSolver
+from .solvers._prelude import sanitize_cost
 
 
 @dataclass
@@ -168,7 +169,7 @@ class PolyStep:
     step_radius: float = 1.0
     probe_radius: float = 2.0
     # K=1 is empirically optimal for the softmax solver and is what
-    # every headline runner uses; matches PolyStepOptimizer's default.
+    # every runner uses; matches PolyStepOptimizer's default.
     # Multi-probe averaging adds variance reduction that the entropic
     # regularization already provides.
     num_probe: int = 1
@@ -272,6 +273,13 @@ class PolyStep:
         Returns:
             Initial SolverState.
         """
+        # Normalize a 1-D point ``(dim,)`` to a single particle ``(1, dim)`` so
+        # the source marginal ``a`` is sized by particle count, not by ``dim``
+        # (``step()`` unsqueezes the cost matrix to ``(1, V)``, so a length-dim
+        # ``a`` would mismatch the Sinkhorn marginal).
+        if X_init.dim() == 1:
+            X_init = X_init.unsqueeze(0)
+
         num_points = X_init.shape[0]
         a = torch.ones(num_points, device=X_init.device, dtype=X_init.dtype) / num_points
 
@@ -288,16 +296,21 @@ class PolyStep:
         return state
 
     def _get_epsilon(self, iteration: int) -> float:
-        """Resolve epsilon at current iteration."""
-        if isinstance(self.epsilon, LinearEpsilon):
+        """Resolve epsilon at current iteration.
+
+        Duck-types on ``.at()`` so any scheduler (``LinearEpsilon``,
+        ``CosineEpsilon``, ``ProgressiveEpsilon``) resolves to a float; a
+        plain float passes through.
+        """
+        if hasattr(self.epsilon, "at"):
             return self.epsilon.at(iteration)
         return self.epsilon
 
     def _get_ent_epsilon(self, iteration: int) -> Optional[float]:
-        """Resolve ent_epsilon at current iteration."""
+        """Resolve ent_epsilon at current iteration (supports schedule objects)."""
         if self.ent_epsilon is None:
             return None
-        if isinstance(self.ent_epsilon, LinearEpsilon):
+        if hasattr(self.ent_epsilon, "at"):
             return self.ent_epsilon.at(iteration)
         return self.ent_epsilon
 
@@ -394,15 +407,10 @@ class PolyStep:
                 chunk_size=self.chunk_size,
             )
 
-        # Sanitize cost matrix before OT solve
-        if not torch.isfinite(cost_matrix).all():
-            max_finite = cost_matrix[torch.isfinite(cost_matrix)]
-            penalty = max_finite.abs().max().item() * 2.0 + 1.0 if max_finite.numel() > 0 else 1e6
-            cost_matrix = torch.where(
-                torch.isfinite(cost_matrix),
-                cost_matrix,
-                torch.full_like(cost_matrix, penalty),
-            )
+        # Sanitize cost matrix before OT solve. Use the shared branch-free
+        # helper (no host sync, FP32 promotion, clamped penalty) rather than an
+        # inline copy that .item()-synced and could overflow the penalty to inf.
+        cost_matrix = sanitize_cost(cost_matrix)
 
         # 4. Resolve OT epsilon
         ent_eps = self._get_ent_epsilon(iteration)
@@ -442,7 +450,11 @@ class PolyStep:
         disp_sqnorm = torch.mean(torch.sum((X_new - X) ** 2, dim=-1)).item()
 
         state.X = X_new
-        state.costs.append(ot_result.ent_reg_cost)
+        # Record the raw mean objective (not the OT-regularized dual) so
+        # ``min(state.costs)`` reports the best objective value, matching the
+        # integrated optimizer path (which appends the raw cost mean). The
+        # regularized dual remains available as ``ot_result.ent_reg_cost``.
+        state.costs.append(cost_matrix.mean().item())
         state.linear_convergence.append(ot_result.converged)
         state.displacement_sqnorms.append(disp_sqnorm)
         state.iteration_count += 1

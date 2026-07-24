@@ -6,8 +6,8 @@ authors:
   - family-names: Le
     given-names: An T.
 license: Apache-2.0
-version: 0.7.0
-date-released: "2026-07-20"
+version: 0.8.0
+date-released: "2026-07-24"
 repository-code: "https://github.com/anindex/polystep"
 keywords:
   - gradient-free optimization

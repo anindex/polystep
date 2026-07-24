@@ -277,7 +277,10 @@ class PolyStepOptimizer:
       ``step_radius=0.15``, ``probe_radius=0.12``.
     - **HybridSubspace.** ``rank=4``, ``rotation_interval=0``, decaying
       ``epsilon``, ``step_radius=4.5``, ``probe_radius=2.0``.
-    - **LinearSubspace.** Same radii as HybridSubspace; decaying ``epsilon``.
+    - **LinearSubspace.** Decaying ``epsilon``, but a *larger* ``step_radius``
+      than HybridSubspace: its scaled-Gaussian columns (``~1/sqrt(num_params)``)
+      dilute the perturbation vs Hybrid's QR-orthonormal columns (see the
+      ``LinearSubspace`` / ``HybridSubspace`` docstrings for the exact factor).
     - **AdaptiveSubspace.** Large ``rank`` (e.g. 4096), *fixed* ``epsilon=0.5``,
       ``step_radius=10.0``, ``probe_radius=2.0``, ``use_adaptive_radius=True``.
 
@@ -641,11 +644,6 @@ class PolyStepOptimizer:
         # CMA. Cached so a step's probes and its sync share one metric.
         self._sampling_projection = None
 
-        # Create layout from model
-        # Thread particle_dim for full-space mode; subspace mode ignores this
-        # (subspace uses subspace_particle_dim instead)
-        self.layout = ParamLayout.from_module(model, particle_dim=self._full_space_particle_dim)
-
         # Detect model device for tensor creation
         try:
             model_device = next(model.parameters()).device
@@ -683,6 +681,12 @@ class PolyStepOptimizer:
             else:
                 model.bfloat16()
                 self._model_dtype = torch.bfloat16
+
+        # Build the layout after any mixed-precision cast so it captures the
+        # BF16 param dtype; building it first left full-space candidates FP32
+        # while the model was BF16. Thread particle_dim for full-space mode;
+        # subspace mode ignores it (uses subspace_particle_dim).
+        self.layout = ParamLayout.from_module(model, particle_dim=self._full_space_particle_dim)
 
         # ------------------------------------------------------------------
         # Multi-particle architecture:
@@ -999,6 +1003,89 @@ class PolyStepOptimizer:
         """Read-only access to the current solver state."""
         return self._state
 
+    # ------------------------------------------------------------------
+    # Checkpoint / resume
+    # ------------------------------------------------------------------
+
+    def state_dict(self) -> dict:
+        """Serialize the resumable optimizer state (NOT the model weights).
+
+        Captures the solver state (particle positions, warm-start duals,
+        momentum velocity, adaptive radius, subspace projection / CMA evolution
+        paths and rolling histories, and step counters), the
+        ``ProgressiveEpsilon`` scheduler internals, and the RNG generator
+        state. Save the model weights separately with ``model.state_dict()``.
+
+        Restore with :meth:`load_state_dict` onto an optimizer built with the
+        same configuration and (weight-loaded) model to resume a run. Reuse
+        caches for the ``adaptive_probes`` / ``use_quadratic_model`` paths are
+        not serialized (they rebuild on the next step), so exact resume is
+        guaranteed for the standard configuration.
+        """
+
+        def _ser(v):
+            if isinstance(v, torch.Tensor):
+                return v.detach().to("cpu").clone()
+            if isinstance(v, dict):
+                return {k: _ser(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                out = [_ser(x) for x in v]
+                return tuple(out) if isinstance(v, tuple) else out
+            return v
+
+        solver_state = {}
+        for name in type(self._state).__dataclass_fields__:
+            if name == "subspace":
+                continue  # object; re-linked from construction on load
+            solver_state[name] = _ser(getattr(self._state, name))
+
+        sd = {"format": 1, "solver_state": solver_state}
+
+        if self._progressive_epsilon is not None:
+            sd["progressive_epsilon"] = {
+                "current": self._progressive_epsilon._current,
+                "smoothed": self._progressive_epsilon._smoothed,
+            }
+        if self._generator is not None:
+            # torch.Generator state is a CPU ByteTensor for CPU *and* CUDA generators.
+            sd["generator_state"] = self._generator.get_state().clone()
+        return sd
+
+    def load_state_dict(self, sd: dict) -> None:
+        """Restore optimizer state saved by :meth:`state_dict` (in place).
+
+        The optimizer must have been constructed with the same configuration
+        and model as the one that produced ``sd``. Restored tensors are moved
+        onto the current optimizer device; the linked subspace object is
+        preserved (only its tensor state is restored).
+        """
+        device = self._state.X.device
+        valid = set(type(self._state).__dataclass_fields__)
+
+        def _de(v):
+            if isinstance(v, torch.Tensor):
+                return v.to(device)
+            if isinstance(v, dict):
+                return {k: _de(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                out = [_de(x) for x in v]
+                return tuple(out) if isinstance(v, tuple) else out
+            return v
+
+        for name, value in sd.get("solver_state", {}).items():
+            if name == "subspace" or name not in valid:
+                continue
+            setattr(self._state, name, _de(value))
+
+        pe = sd.get("progressive_epsilon")
+        if pe is not None and self._progressive_epsilon is not None:
+            self._progressive_epsilon._current = pe["current"]
+            self._progressive_epsilon._smoothed = pe["smoothed"]
+
+        gs = sd.get("generator_state")
+        if gs is not None and self._generator is not None:
+            self._generator.set_state(gs.to("cpu"))
+
     @property
     def mixed_precision(self) -> bool:
         """Whether mixed precision (BF16) is enabled."""
@@ -1205,7 +1292,8 @@ class PolyStepOptimizer:
                 is a 1D tensor of shape ``(N,)``.
 
         Returns:
-            Scalar OT entropic regularized cost (float).
+            Mean raw model cost for this step (a diagnostic scalar, the mean of
+            the cost matrix), not the OT entropic-regularized dual.
         """
         # Amortized OT: cheap momentum steps between full OT solves
         if (

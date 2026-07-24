@@ -20,7 +20,7 @@ Based on the Sinkhorn Step algorithm ([Le et al., NeurIPS 2023](https://arxiv.or
 4. **Update** the parameters by barycentric projection from the weighted vertices.
 
 <p align="center">
-  <img src="docs/figures/method_diagram.png" width="840"
+  <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/method_diagram.png" width="840"
        alt="One PolyStep: subspace projection, polytope probes, cost matrix, soft entropic-OT assignment, and barycentric projection, plus the softmax-to-full-OT solver continuum.">
 </p>
 
@@ -113,8 +113,8 @@ See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST
 
 <table>
   <tr>
-    <td align="center"><img src="docs/figures/polystep_snn_progress.gif" width="330"><br><sub>Spiking net (hard LIF thresholds) trained with forward passes only</sub></td>
-    <td align="center"><img src="docs/figures/rl_cartpole_policy.gif" width="330"><br><sub>CartPole policy search: no value function, no gradients</sub></td>
+    <td align="center"><img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/polystep_snn_progress.gif" width="330"><br><sub>Spiking net (hard LIF thresholds) trained with forward passes only</sub></td>
+    <td align="center"><img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/rl_cartpole_policy.gif" width="330"><br><sub>CartPole policy search: no value function, no gradients</sub></td>
   </tr>
 </table>
 
@@ -134,7 +134,7 @@ If your model is fully differentiable, Adam/SGD will be faster and more accurate
 
 Zeroth-order optimization splits into two camps. Memory-efficient fine-tuning (MeZO and successors) runs zeroth-order updates on differentiable networks to skip the backprop tape, but still assumes a useful local gradient. Evolution strategies and SPSA (CMA-ES, OpenAI-ES) optimize black-box objectives by estimating a local gradient from small perturbations.
 
-PolyStep is a randomized direct search: it probes a finite-radius polytope around the current parameters and moves toward the lowest-cost vertices through an optimal-transport barycenter. When the loss is piecewise-constant or genuinely non-differentiable, the local gradient is zero almost everywhere, so finite-difference estimates carry no signal and ES/SPSA stall, while a finite radius steps across the flat regions. This is the setting where direct search (generalized pattern search, MADS) has convergence guarantees on nonsmooth and discontinuous objectives that gradient-estimate methods lack. Example 09 shows the separation on a hard decision tree.
+PolyStep is a randomized direct search: it probes a finite-radius polytope around the current parameters and moves toward the lowest-cost vertices through an optimal-transport barycenter. When the loss is piecewise-constant or truly non-differentiable, the local gradient is zero almost everywhere, so finite-difference estimates carry no signal and ES/SPSA stall, while a finite radius steps across the flat regions. This is the setting where direct search (generalized pattern search, MADS) has convergence guarantees on nonsmooth and discontinuous objectives that gradient-estimate methods lack. Example 09 shows the separation on a hard decision tree.
 
 Recent gradient-free work targets the same regime, including low-rank evolution strategies for spiking networks (arXiv:2605.30361) and gradient-free trust regions for recurrent spiking networks (arXiv:2601.21572). PolyStep is complementary: a general-purpose direct-search optimizer with subspace compression.
 

@@ -9,8 +9,14 @@ projections with :class:`AdaptiveSubspace`'s synchronized rotation:
   (empirically ~4.3% vs ~0.25% on MNIST MLPs).
 - **Synchronized rotation.** All layer projections rotate on the same
   schedule (every ``rotation_interval`` steps; ``0`` disables rotation).
-- **``1/sqrt(num_coords)`` scaling** for unit-variance output, matching
-  :class:`LinearSubspace`'s convention rather than QR-orthonormal columns.
+- **QR-orthonormal per-layer columns** in the common tall case
+  (``num_params >= num_coords``), giving isotropic unit-norm perturbations
+  (``||delta||^2 ~ num_coords`` for unit-variance coords); the rare wide case
+  falls back to ``1/sqrt(num_coords)`` scaled Gaussian. This differs from
+  :class:`LinearSubspace`'s scaled-Gaussian columns (``||delta||^2 ~ num_params``):
+  switching ``LinearSubspace`` -> ``HybridSubspace`` at the *same* ``step_radius``
+  changes the actual perturbation magnitude by ``sqrt(num_coords / num_params)``
+  (often 10-100x smaller), so retune ``step_radius`` when switching.
 - **Displacement-biased rotation.** In ``'displacement'`` mode each layer
   rotates toward its own slice of the displacement history.
 
@@ -201,7 +207,7 @@ class HybridSubspace:
     # fresh RANDOM redraw. Safe precisely at absorb: the duals are already reset there, so this dodges the
     # per-step-rotation dual-reset degradation that keeps rotation_interval=0. Lets a SMALLER rank stay
     # aligned with descent across absorbs -> fewer working dims -> fewer forward-evals/step (if the local
-    # descent is genuinely low-rank; else it is an owned no-op, per the certificate ceiling).
+    # descent is truly low-rank; else it is a no-op).
     absorb_aligned_active: bool = False
 
     # Track total params for compression ratio calculation
@@ -814,6 +820,12 @@ class HybridSubspace:
         if not torch.isfinite(D_full).all():
             return self._get_projection(spec, device, dtype, step=step)
 
+        # SVD/PCA reject bf16/fp16 on CPU; run the decomposition in fp32 and
+        # cast the result back (mirrors AdaptiveSubspace._rotate_displacement).
+        svd_dtype = D_full.dtype
+        if D_full.dtype in (torch.bfloat16, torch.float16):
+            D_full = D_full.float()
+
         # SVD of the full-space displacement matrix
         if k_svd < min(D_full.shape) // 2 and min(D_full.shape) > 6:
             # Randomized SVD: faster when k_svd << rank
@@ -823,6 +835,8 @@ class HybridSubspace:
             k_svd = min(k_svd, U.shape[1])
             U_top = U[:, :k_svd]
         k_random = spec.num_coords - k_svd
+        if U_top.dtype != svd_dtype:
+            U_top = U_top.to(svd_dtype)
 
         # Generate random directions for the remainder directly on target device
         entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step, "random")
@@ -869,7 +883,7 @@ class HybridSubspace:
         Returns:
             SVD ratio in [svd_ratio_init, svd_ratio_final].
         """
-        progress = min(1.0, step / max(1, total_steps))
+        progress = min(1.0, step / max(1, total_steps or 1))
         return self.svd_ratio_init + progress * (self.svd_ratio_final - self.svd_ratio_init)
 
     # ------------------------------------------------------------------

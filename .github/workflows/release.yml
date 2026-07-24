@@ -19,5 +19,12 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Build sdist + wheel
         run: uv build
+      - name: Check artifact metadata
+        run: uvx twine check dist/*
+      - name: Install wheel + import smoke test
+        run: |
+          uv venv
+          uv pip install dist/*.whl
+          .venv/bin/python -c "import polystep; from polystep import *"
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

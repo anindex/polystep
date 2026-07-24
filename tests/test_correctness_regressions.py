@@ -1,4 +1,5 @@
-"""Regression tests for specific bug fixes."""
+"""Regression tests guarding correctness fixes across geometry, solvers, epsilon
+schedules, and the optimizer state machine."""
 
 import torch
 import torch.nn as nn
@@ -370,7 +371,8 @@ def test_fd_gradient_requires_orthoplex_vertices():
     from polystep.quadratic_model import extract_fd_gradient
 
     losses = torch.randn(4, 5, 2)  # V=5, not 2*pdim
-    with pytest.raises(AssertionError, match="orthoplex"):
+    # Raises ValueError (not AssertionError) so the check survives `python -O`.
+    with pytest.raises(ValueError, match="orthoplex"):
         extract_fd_gradient(losses, torch.ones(2), probe_radius=0.1, pdim=3)
 
 

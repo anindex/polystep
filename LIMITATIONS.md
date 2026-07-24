@@ -21,7 +21,7 @@ What does not work in `polystep`, with source-file references for each entry.
   `model.eval()` before vmap evaluation.
 
 Note: PyTorch 2.12 fixes native `vmap(nn.MultiheadAttention)` (issue
-#151558). The wrapper is retained for the `torch>=2.8` floor; users on
+#151558). The wrapper is retained for the `torch>=2.4` floor; users on
 2.12+ may use `nn.MultiheadAttention` directly when none of the above
 restrictions apply.
 

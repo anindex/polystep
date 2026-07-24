@@ -542,7 +542,7 @@ class AdaptiveSubspace:
         Returns:
             SVD ratio in [svd_ratio_init, svd_ratio_final].
         """
-        progress = min(1.0, step / max(1, total_steps))
+        progress = min(1.0, step / max(1, total_steps or 1))
         return self.svd_ratio_init + progress * (self.svd_ratio_final - self.svd_ratio_init)
 
     # ------------------------------------------------------------------
