@@ -112,8 +112,21 @@ class NNCostEvaluator:
             ``"auto"`` = auto-detect from model size and GPU memory.
             Positive int = evaluate in chunks of this size.
         compile_vmap: If True, wrap the vmap evaluation in
-            ``torch.compile(mode="default")`` for kernel fusion. Falls back
-            to eager on failure. Best for CUDA models. Default False.
+            ``torch.compile(mode="default")`` for Inductor kernel fusion
+            (fusion only -- NOT CUDA graphs, so launch overhead is not
+            eliminated; expect ~2-4x, architecture-dependent). Falls back to
+            eager on failure. Best for CUDA models. Default False. For the
+            launch-bound CUDA-graph win on large recurrent nets, use the
+            in-place ``compile_forward`` path instead.
+        compile_forward: If True, on the in-place path compile the
+            forward+loss closure with ``torch.compile(mode="reduce-overhead")``
+            (CUDA graphs). Unlike ``compile_vmap`` this DOES eliminate per-kernel
+            launch overhead -- the launch-bound win -- because the in-place path
+            has no vmap chunk-concat. The Python swap loop stays; only the
+            captured ``model(inputs)`` is replayed per candidate. Requires CUDA
+            and a static input/param shape; falls back to eager on failure.
+            Default False. (No effect unless the in-place path is used --
+            auto for >500K-param GPU models, or force with ``use_inplace=True``.)
     """
 
     def __init__(
@@ -123,6 +136,7 @@ class NNCostEvaluator:
         chunk_size: Union[None, int, str] = None,
         compile_vmap: bool = False,
         use_inplace: Optional[bool] = None,
+        compile_forward: bool = False,
     ):
         self.model = model
         self.loss_fn = loss_fn
@@ -133,6 +147,11 @@ class NNCostEvaluator:
         self._compile_vmap = compile_vmap
         self._compiled_vmap_fn = None
         self._compile_failed = False
+
+        # In-place forward+loss compile (CUDA graphs, launch-bound win).
+        self._compile_forward = compile_forward
+        self._compiled_fwd_loss = None
+        self._compile_forward_failed = False
 
         # Force eval mode for consistent behavior (frozen BN stats, no dropout)
         model.eval()
@@ -170,14 +189,18 @@ class NNCostEvaluator:
         self._param_dict_cache = dict(self.model.named_parameters())
 
     def reset_vmap(self) -> None:
-        """Reset the vmap failure flag so vmap is attempted again.
+        """Reset the vmap/compile failure flags so both are attempted again.
 
         Useful after changing the model architecture (e.g., swapping layers),
         moving the model to a different device, or upgrading PyTorch (vmap
-        op coverage expands across releases).
+        op coverage and torch.compile support both expand across releases).
         """
         self._vmap_failed = False
         self._warned = False
+        # Symmetric recovery: a prior compile failure should not stay latched
+        # after the model/device changed under us.
+        self._compile_failed = False
+        self._compiled_vmap_fn = None
 
     @property
     def chunk_size(self) -> Optional[int]:
@@ -245,16 +268,25 @@ class NNCostEvaluator:
                 try:
                     result = self._evaluate_vmap(stacked_params, inputs, targets)
                 except Exception as e:
-                    # Only catch vmap/functorch-related errors; re-raise real bugs
+                    # Only catch vmap/functorch-specific errors; re-raise real bugs.
+                    # Keywords are deliberately narrow: a bare "batched" would also
+                    # match a genuine bug in a user forward ("batched input not
+                    # supported by op X") and silently demote it to the ~N-times-slower
+                    # sequential loop, hiding the real error. Match functorch's own
+                    # markers instead ("batched tensor" is the BatchedTensor repr;
+                    # "vmap"/"functorch"/"torch.func" name the transform; "randomness"
+                    # is vmap's stochastic-op guard).
                     msg = str(e).lower()
                     is_vmap_issue = any(
-                        k in msg for k in ("vmap", "functorch", "batched tensor", "batched", "randomness")
+                        k in msg for k in ("vmap", "functorch", "torch.func", "batched tensor", "randomness")
                     )
                     if not is_vmap_issue:
                         raise
                     if not self._warned:
                         warnings.warn(
-                            f"vmap failed for {type(self.model).__name__}: {e}. Falling back to sequential evaluation.",
+                            f"vmap failed for {type(self.model).__name__}: {e}. Falling back to sequential "
+                            f"evaluation (~N x slower). If this masks a real bug in the model's forward, "
+                            f"the error text is above.",
                             stacklevel=2,
                         )
                         self._warned = True
@@ -269,8 +301,15 @@ class NNCostEvaluator:
         """Vectorized evaluation via vmap + functional_call.
 
         When ``compile_vmap=True`` (set at init), wraps the batched evaluation
-        in ``torch.compile(mode="reduce-overhead")`` for kernel fusion and
-        CUDA graph capture. Falls back to eager vmap on compilation failure.
+        in ``torch.compile(mode="default")`` for **Inductor kernel fusion only**.
+        This does NOT capture CUDA graphs and so does NOT eliminate per-kernel
+        launch overhead -- ``mode="reduce-overhead"`` (CUDA graphs) is
+        deliberately not used here because vmap's chunked-output concatenation
+        conflicts with CUDA-graph tensor ownership. Expect a modest fusion win
+        (roughly 2-4x, architecture-dependent), not the launch-bound speedup.
+        The CUDA-graph / launch-elimination lever lives on the in-place path
+        (``compile_forward``), which has no chunk-concat. Falls back to eager
+        vmap permanently on compilation failure (with a one-time warning).
         """
         buffers = self._buffers
         loss_fn = self.loss_fn
@@ -297,30 +336,44 @@ class NNCostEvaluator:
 
         batched = vmap(single_eval, in_dims=(0, None, None), chunk_size=resolved_chunk)
 
-        # Compiled path: torch.compile on vmap for kernel fusion + CUDA graphs.
-        # Only attempted on CUDA with compile_vmap=True. Lazy-compiled on first call.
+        # Compiled path: torch.compile on the vmapped forward for Inductor kernel
+        # FUSION ONLY (mode="default", no CUDA graphs -- see the method docstring).
+        # Only attempted with compile_vmap=True. Lazy-compiled on first call.
         if self._compile_vmap and not self._compile_failed:
             if self._compiled_vmap_fn is None:
                 try:
-                    # Use "default" mode: kernel fusion without CUDA graphs.
-                    # "reduce-overhead" (CUDA graphs) has tensor ownership conflicts
-                    # with vmap's chunked output concatenation.
+                    # "default" = kernel fusion without CUDA graphs. "reduce-overhead"
+                    # (CUDA graphs) has tensor-ownership conflicts with vmap's chunked
+                    # output concatenation, so the launch-elimination win is not
+                    # reachable here; it lives on the in-place compile_forward path.
                     self._compiled_vmap_fn = torch.compile(
                         batched,
                         mode="default",
                         fullgraph=False,
                     )
-                except Exception:
+                except Exception as e:  # noqa: BLE001
                     self._compile_failed = True
                     self._compiled_vmap_fn = None
+                    warnings.warn(
+                        f"compile_vmap: torch.compile failed for "
+                        f"{type(self.model).__name__} ({e}); using eager vmap for the "
+                        f"rest of the run.",
+                        stacklevel=2,
+                    )
 
             if self._compiled_vmap_fn is not None:
                 try:
                     return self._compiled_vmap_fn(stacked_params, inputs, targets)
-                except Exception:
-                    # Compilation or execution failed - fall back to eager permanently
+                except Exception as e:  # noqa: BLE001
+                    # Execution of the compiled graph failed - fall back permanently.
                     self._compile_failed = True
                     self._compiled_vmap_fn = None
+                    warnings.warn(
+                        f"compile_vmap: compiled forward raised at run time for "
+                        f"{type(self.model).__name__} ({e}); using eager vmap for the "
+                        f"rest of the run.",
+                        stacklevel=2,
+                    )
 
         return batched(stacked_params, inputs, targets)
 
@@ -344,6 +397,56 @@ class NNCostEvaluator:
                 loss = loss.mean()
             losses.append(loss)
         return torch.stack(losses)
+
+    def _forward_loss(self, inputs, targets):
+        """Eager forward + reduced scalar loss on the model's CURRENT params."""
+        output = self.model(inputs)
+        loss = self.loss_fn(output, targets) if targets is not None else self.loss_fn(output)
+        if loss.dim() > 0:
+            loss = loss.mean()
+        return loss
+
+    def _forward_loss_fn(self):
+        """Return the per-candidate forward+loss callable for the in-place path.
+
+        With ``compile_forward=True`` on CUDA, lazily compile a forward+loss
+        closure with ``mode="reduce-overhead"`` (CUDA graphs), so replaying it
+        per candidate eliminates kernel-launch overhead -- the launch-bound win.
+        The closure reads the model's current parameters, which the swap loop
+        mutates via ``.data.copy_`` / ``_foreach_copy_`` between calls; ``copy_``
+        preserves storage addresses, so graph replay reads the fresh weights.
+        Safe here (unlike the vmap path) because there is no chunk-concat.
+        Falls back to the eager closure permanently on failure.
+        """
+        if not (self._compile_forward and not self._compile_forward_failed):
+            return self._forward_loss
+        first = next(self.model.parameters(), None)
+        if first is None or not first.is_cuda:
+            return self._forward_loss  # CUDA-graph capture needs CUDA
+        if self._compiled_fwd_loss is None:
+            model, loss_fn = self.model, self.loss_fn
+
+            def fwd_loss(inputs, targets):
+                output = model(inputs)
+                loss = loss_fn(output, targets) if targets is not None else loss_fn(output)
+                if loss.dim() > 0:
+                    loss = loss.mean()
+                return loss
+
+            try:
+                self._compiled_fwd_loss = torch.compile(
+                    fwd_loss, mode="reduce-overhead", fullgraph=False
+                )
+            except Exception as e:  # noqa: BLE001
+                self._compile_forward_failed = True
+                self._compiled_fwd_loss = None
+                warnings.warn(
+                    f"compile_forward: torch.compile failed for "
+                    f"{type(self.model).__name__} ({e}); using eager forward.",
+                    stacklevel=2,
+                )
+                return self._forward_loss
+        return self._compiled_fwd_loss
 
     def _evaluate_inplace(self, stacked_params, inputs, targets):
         """Memory-minimal evaluation via in-place weight swapping.
@@ -378,23 +481,20 @@ class NNCostEvaluator:
             if key in param_dict:
                 original_params[key] = param_dict[key].data.clone()
 
+        fwd_loss = self._forward_loss_fn()
+        # Resolve the destination param views once so each swap is a single fused
+        # foreach op instead of one kernel launch per parameter tensor.
+        dst_keys = [k for k in stacked_params if k in param_dict]
+        dsts = [param_dict[k].data for k in dst_keys]
         try:
             for i in range(N):
-                # Swap weights in-place - no copies, just overwrite .data
-                for key in stacked_params:
-                    if key in param_dict:
-                        param_dict[key].data.copy_(stacked_params[key][i])
-
+                # Swap all candidate weights in-place with one fused copy.
+                torch._foreach_copy_(dsts, [stacked_params[k][i] for k in dst_keys])
                 # Forward pass - already under inference_mode from evaluate()
-                output = self.model(inputs)
-                if targets is not None:
-                    loss = self.loss_fn(output, targets)
-                else:
-                    loss = self.loss_fn(output)
-                if loss.dim() > 0:
-                    loss = loss.mean()
-                # .item()-free: store tensor directly, detach from graph
-                losses[i] = loss.detach()
+                # (compiled + CUDA-graph-replayed when compile_forward=True).
+                # .item()-free: store the detached scalar, read out before the
+                # next replay overwrites the graph's static output buffer.
+                losses[i] = fwd_loss(inputs, targets).detach()
         finally:
             # Always restore original weights, even on error
             for key, orig in original_params.items():
@@ -442,6 +542,7 @@ class NNCostEvaluator:
         if was_training:
             self.model.eval()
 
+        fwd_loss = self._forward_loss_fn()
         try:
             for i in range(N):
                 # Reconstruct weights for config i directly into model params
@@ -452,14 +553,8 @@ class NNCostEvaluator:
                     flat_subspace_batch[i],
                 )
                 # Forward pass - already under inference_mode from caller
-                output = self.model(inputs)
-                if targets is not None:
-                    loss = self.loss_fn(output, targets)
-                else:
-                    loss = self.loss_fn(output)
-                if loss.dim() > 0:
-                    loss = loss.mean()
-                losses[i] = loss.detach()
+                # (compiled + CUDA-graph-replayed when compile_forward=True).
+                losses[i] = fwd_loss(inputs, targets).detach()
         finally:
             # Restore base weights
             param_dict = dict(self.model.named_parameters())

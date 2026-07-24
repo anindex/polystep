@@ -371,14 +371,20 @@ class PolyStepOptimizer:
         mixed_precision: bool = False,
         # Projection type
         projection_type: str = "dense",
-        # Compile vmap in NNCostEvaluator (torch.compile the vectorized forward)
+        # Compile vmap in NNCostEvaluator (fusion-only torch.compile of the
+        # vectorized forward; ~2-4x, no CUDA graphs -- see NNCostEvaluator).
         compile_evaluator: bool = False,
+        # CUDA-graph-compile the in-place forward+loss closure (reduce-overhead).
+        # Only bites on the in-place path (>500K-param GPU models); the
+        # launch-bound win for recurrent nets. See NNCostEvaluator.compile_forward.
+        compile_forward: bool = False,
     ) -> None:
         # Projection type validation
         if projection_type not in ("dense", "sparse", "auto"):
             raise ValueError(f"Invalid projection_type: {projection_type!r}. Use 'dense', 'sparse', or 'auto'.")
         self._requested_projection_type = projection_type
         self._compile_evaluator = compile_evaluator
+        self._compile_forward = compile_forward
 
         # Particle dimension validation
         if particle_dim < 2:
@@ -1118,6 +1124,25 @@ class PolyStepOptimizer:
     # Fused inplace evaluation (EGGROLL-inspired)
     # ------------------------------------------------------------------
 
+    @property
+    def compile_evaluator(self) -> bool:
+        """Whether evaluators should fusion-compile the vmapped forward.
+
+        Public, read-only view of the constructor flag. Consumed by
+        ``api.train()`` and propagated to a registered evaluator's
+        ``compile_vmap`` in ``register_evaluator``.
+        """
+        return self._compile_evaluator
+
+    @property
+    def compile_forward(self) -> bool:
+        """Whether evaluators should CUDA-graph-compile the in-place forward.
+
+        Public, read-only view of the constructor flag. Propagated to a
+        registered evaluator's ``compile_forward`` in ``register_evaluator``.
+        """
+        return self._compile_forward
+
     def register_evaluator(
         self,
         evaluator: "NNCostEvaluator",
@@ -1136,7 +1161,13 @@ class PolyStepOptimizer:
 
         Call this before each ``step()`` with the current mini-batch data.
         The fused path is only used when the evaluator has ``_use_inplace=True``
-        (auto-detected for GPU models >50K params).
+        (auto-detected for GPU models >500K params).
+
+        The optimizer's ``compile_evaluator`` / ``compile_forward`` flags are
+        propagated to the evaluator here, so those public knobs work on the
+        fused/runner path too (not only via ``api.train()``). torch.compile is
+        lazy inside the evaluator, so setting the flags before the first
+        ``evaluate*`` call is sufficient.
 
         Args:
             evaluator: NNCostEvaluator instance.
@@ -1146,6 +1177,10 @@ class PolyStepOptimizer:
         self._cost_evaluator = evaluator
         self._fused_inputs = inputs
         self._fused_targets = targets
+        if self._compile_evaluator:
+            evaluator._compile_vmap = True
+        if self._compile_forward:
+            evaluator._compile_forward = True
 
     # ------------------------------------------------------------------
     # Step: entry point

@@ -179,7 +179,9 @@ Among gradient-free optimizers PolyStep is the strongest on every task here, at 
 - **Softmax OT solver** with an entropic Sinkhorn alternative.
 - **Subspace compression**: `HybridSubspace` (recommended), `AdaptiveSubspace`, and sparse projection for very large models.
 - **Block-wise OT** for per-layer decomposition.
-- **`torch.compile`** opt-in on hot paths.
+- **`torch.compile`** opt-in on the OT hot paths (`compile=True`) and on the
+  candidate forward (`compile_evaluator` = fusion; `compile_forward` = CUDA
+  graphs on the in-place path). See [`docs/performance.md`](docs/performance.md).
 - **Vmap-safe layers**: drop-in attention and LSTM that play nicely with `torch.vmap`.
 - **Sub-linear memory**: forward-only evaluation, no BPTT activation tape (~30x savings at long SNN horizons).
 - **CMA-ES inspired adaptation** of subspace covariance (experimental, monolithic step only; `use_adaptive_radius` is the stable default).
@@ -211,6 +213,7 @@ docs/                  API overview, reproducibility guide
 | [`examples/`](examples/) | 8 runnable demos with output figures |
 | [`experiments/`](experiments/) | Full paper reproduction harness |
 | [`docs/api_overview.md`](docs/api_overview.md) | API reference |
+| [`docs/performance.md`](docs/performance.md) | Per-step cost & the compile flags (`compile_evaluator`, `compile_forward`) |
 | [`LIMITATIONS.md`](LIMITATIONS.md) | Known limitations |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |

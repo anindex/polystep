@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `compile_forward` on `NNCostEvaluator` / `PolyStepOptimizer`: on the in-place
+  path, CUDA-graph the forward+loss closure (`torch.compile(mode="reduce-overhead")`)
+  and replay it per candidate, so the sequential per-candidate eval loses its
+  kernel-launch overhead. It is a launch-boundness lever (not a size lever) that
+  *rescues* the memory-forced in-place path: ~6× within the in-place path on a small
+  recurrent SNN, ~2.3× on a large recurrent net (h=2048, T=30), ~1.1× on dense nets.
+  It does NOT beat `compile_evaluator` / compiled-vmap, which stays the fastest
+  backend when it fits (incl. the large recurrent net); the in-place path is chosen
+  for memory (vmap's activation memory is O(N) in candidates and OOMs at large
+  N/batch), and `compile_forward` keeps it competitive there. The swap loop fuses its
+  per-parameter copies with `torch._foreach_copy_`.
+- `docs/performance.md`: measured per-step-cost guide (vmap already amortizes
+  launches; `compile_evaluator` fusion ~1.2–1.9×; `compile_forward` CUDA graphs on
+  the in-place path), plus two benchmarks —
+  `experiments/scripts/bench_forward_backends.py` (backend × architecture matrix)
+  and `experiments/scripts/bench_large_net_inplace.py` (large dense vs recurrent).
+
+### Changed
+
+- `compile_evaluator` / `compile_forward` now propagate to a registered evaluator
+  via `register_evaluator` (public `compile_evaluator` / `compile_forward`
+  properties), so the flags work on the runner/fused path, not only `api.train()`.
+
+### Fixed
+
+- `NNCostEvaluator` docstrings/comments no longer claim `mode="reduce-overhead"` +
+  "CUDA graph capture" for the vmap path — it ships `mode="default"` (Inductor
+  fusion only; CUDA graphs are skipped once the sweep is vmap-amortized). The
+  `register_evaluator` docstring now states the real >500K-param in-place threshold.
+- The vmap-fallback exception filter no longer treats any error mentioning
+  "batched" as a vmap issue (a genuine bug in a model's forward was silently
+  demoted to the ~N×-slower sequential loop); it now matches functorch-specific
+  markers and warns. A permanently-disabled `compile_vmap` now emits a one-time
+  warning, and `reset_vmap()` also clears the compile-failure latch.
+
 ## 0.7.0 - 2026-07-20
 
 ### Added
