@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `compile_forward` on `NNCostEvaluator` / `PolyStepOptimizer`: on the in-place
+  path, CUDA-graph the forward+loss closure (`torch.compile(mode="reduce-overhead")`)
+  and replay it per candidate, so the sequential per-candidate eval loses its
+  kernel-launch overhead — up to ~6× within the in-place path on a recurrent SNN
+  (proportional to launch-boundness; ~1.1× on a CNN). The swap loop now fuses its
+  per-parameter copies with `torch._foreach_copy_`.
+- `docs/performance.md`: measured per-step-cost guide (vmap already amortizes
+  launches; `compile_evaluator` fusion ~1.2–1.9×; `compile_forward` CUDA graphs on
+  the in-place path) plus `experiments/scripts/bench_forward_backends.py`, a
+  backend × architecture wall-clock matrix.
+
+### Changed
+
+- `compile_evaluator` / `compile_forward` now propagate to a registered evaluator
+  via `register_evaluator` (public `compile_evaluator` / `compile_forward`
+  properties), so the flags work on the runner/fused path, not only `api.train()`.
+
+### Fixed
+
+- `NNCostEvaluator` docstrings/comments no longer claim `mode="reduce-overhead"` +
+  "CUDA graph capture" for the vmap path — it ships `mode="default"` (Inductor
+  fusion only; CUDA graphs are skipped once the sweep is vmap-amortized). The
+  `register_evaluator` docstring now states the real >500K-param in-place threshold.
+- The vmap-fallback exception filter no longer treats any error mentioning
+  "batched" as a vmap issue (a genuine bug in a model's forward was silently
+  demoted to the ~N×-slower sequential loop); it now matches functorch-specific
+  markers and warns. A permanently-disabled `compile_vmap` now emits a one-time
+  warning, and `reset_vmap()` also clears the compile-failure latch.
+
 ## 0.7.0 - 2026-07-20
 
 ### Added

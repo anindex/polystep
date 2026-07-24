@@ -265,7 +265,12 @@ def run_polystep(showcase_name, seed, device, results_dir, dry_run=False,
 
     import copy
 
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
+    evaluator = NNCostEvaluator(
+        model,
+        loss_fn=loss_fn,
+        compile_vmap=polystep_cfg.get("compile_evaluator", False),
+        compile_forward=polystep_cfg.get("compile_forward", False),
+    )
     epoch_logs = []
     step_logs = []
     best_accuracy = 0.0

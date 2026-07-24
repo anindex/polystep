@@ -1096,7 +1096,12 @@ def _run_polystep(model, train_loader, test_loader, loss_fn, epochs, device, see
         solver=config.get('solver'),
     )
 
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
+    evaluator = NNCostEvaluator(
+        model,
+        loss_fn=loss_fn,
+        compile_vmap=config.get('compile_evaluator', False),
+        compile_forward=config.get('compile_forward', False),
+    )
     epoch_logs = []
     best_accuracy = 0.0
     step_count = 0

@@ -134,7 +134,8 @@ def train(
     evaluator = NNCostEvaluator(
         model,
         loss_fn=loss_fn,
-        compile_vmap=getattr(optimizer, "_compile_evaluator", False),
+        compile_vmap=getattr(optimizer, "compile_evaluator", False),
+        compile_forward=getattr(optimizer, "compile_forward", False),
     )
     callbacks = list(config.callbacks)
     global_step = 0
