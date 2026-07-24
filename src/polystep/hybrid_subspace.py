@@ -196,6 +196,13 @@ class HybridSubspace:
     absorb_interval: int = 0
     sparse_threshold_bytes: int = 1_000_000_000  # 1GB: layers exceeding this use sparse projection
     projection_mode: str = "random"  # 'random' (dense Gaussian) or 'structured' (block-diagonal)
+    # Absorb-aligned active subspace (opt-in, default off = unchanged behavior). When True, the absorb
+    # boundary regenerates projections via displacement-SVD (retain productive directions) instead of a
+    # fresh RANDOM redraw. Safe precisely at absorb: the duals are already reset there, so this dodges the
+    # per-step-rotation dual-reset degradation that keeps rotation_interval=0. Lets a SMALLER rank stay
+    # aligned with descent across absorbs -> fewer working dims -> fewer forward-evals/step (if the local
+    # descent is genuinely low-rank; else it is an owned no-op, per the certificate ceiling).
+    absorb_aligned_active: bool = False
 
     # Track total params for compression ratio calculation
     _total_params: int = 0

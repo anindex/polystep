@@ -972,11 +972,23 @@ def step_monolithic(opt, closure: Callable) -> float:
             state.base_params = new_base
             # Reset subspace coordinates to zero
             state.X = torch.zeros_like(state.X)
-            # Regenerate ALL per-layer projections
-            state.hybrid_projections = hybrid_sub.init_projections(
-                state.X.device,
-                state.X.dtype,
-            )
+            # Regenerate ALL per-layer projections. Default: fresh RANDOM redraw. Opt-in
+            # absorb_aligned_active: bias the new basis toward the just-completed window's productive
+            # directions (displacement-SVD) BEFORE the history is zeroed below. Safe here because the
+            # duals are reset in this same block, so no live Sinkhorn dual is disrupted (the reason
+            # per-step rotation is disabled). Lets a smaller rank track descent across absorbs.
+            if getattr(hybrid_sub, "absorb_aligned_active", False) and state.displacement_history_count > 0:
+                hist = state.displacement_history[: state.displacement_history_count]
+                svd_ratio = hybrid_sub.get_svd_ratio(state.iteration_count, opt.max_iterations or 1)
+                state.hybrid_projections = hybrid_sub._rotate_all_displacement(
+                    state.hybrid_projections, hist, svd_ratio,
+                    state.X.device, state.X.dtype, state.iteration_count,
+                )
+            else:
+                state.hybrid_projections = hybrid_sub.init_projections(
+                    state.X.device,
+                    state.X.dtype,
+                )
             # Reset displacement history
             state.displacement_history.zero_()
             state.displacement_history_idx = 0
