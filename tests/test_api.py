@@ -17,11 +17,6 @@ from polystep import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 def _make_model():
     """Small MLP for fast testing."""
     return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
@@ -47,11 +42,6 @@ def _make_optimizer(model):
     )
 
 
-# ---------------------------------------------------------------------------
-# TestTrainConfig
-# ---------------------------------------------------------------------------
-
-
 class TestTrainConfig:
     def test_defaults(self):
         config = TrainConfig()
@@ -75,11 +65,6 @@ class TestTrainConfig:
             TrainConfig(**{field: value})
 
 
-# ---------------------------------------------------------------------------
-# TestTrainCallback
-# ---------------------------------------------------------------------------
-
-
 class TestTrainCallback:
     def test_base_on_step_end_returns_false(self):
         cb = TrainCallback()
@@ -89,11 +74,6 @@ class TestTrainCallback:
         cb = TrainCallback()
         result = cb.on_epoch_end({})
         assert result is None
-
-
-# ---------------------------------------------------------------------------
-# TestTrain
-# ---------------------------------------------------------------------------
 
 
 class TestTrain:
@@ -201,11 +181,6 @@ class TestTrain:
         assert counter.count == 3
 
 
-# ---------------------------------------------------------------------------
-# TestLoggingCallback
-# ---------------------------------------------------------------------------
-
-
 class TestLoggingCallback:
     def test_logs_at_interval(self, capsys):
         cb = LoggingCallback(log_every=2)
@@ -230,18 +205,13 @@ class TestLoggingCallback:
         assert "Epoch 1" in captured
 
 
-# ---------------------------------------------------------------------------
-# TestEarlyStoppingCallback
-# ---------------------------------------------------------------------------
-
-
 class TestEarlyStoppingCallback:
     def test_stops_after_patience(self):
         cb = EarlyStoppingCallback(patience=3, min_delta=0.01)
-        # Improving losses -- all return False
+        # Improving losses: all return False
         for loss in [1.0, 0.9, 0.8]:
             assert cb.on_step_end({"loss": loss, "step": 0}) is False
-        # Stagnating losses -- counter increments
+        # Stagnating losses: counter increments
         assert cb.on_step_end({"loss": 0.8, "step": 1}) is False  # counter=1
         assert cb.on_step_end({"loss": 0.8, "step": 2}) is False  # counter=2
         assert cb.on_step_end({"loss": 0.8, "step": 3}) is True  # counter=3 >= patience
@@ -264,11 +234,6 @@ class TestEarlyStoppingCallback:
         # 0.95 is NOT 0.1 better than 1.0 -> stagnation
         assert cb.on_step_end({"loss": 0.95, "step": 1}) is False  # counter=1
         assert cb.on_step_end({"loss": 0.92, "step": 2}) is True  # counter=2 >= patience
-
-
-# ---------------------------------------------------------------------------
-# TestGetDiagnostics
-# ---------------------------------------------------------------------------
 
 
 class TestGetDiagnostics:
@@ -330,11 +295,6 @@ class TestGetDiagnostics:
         diag = get_diagnostics(opt)
         assert isinstance(diag["velocity_magnitude"], float)
         assert diag["velocity_magnitude"] >= 0.0
-
-
-# ---------------------------------------------------------------------------
-# TestIntegration (callbacks + train)
-# ---------------------------------------------------------------------------
 
 
 class TestIntegration:

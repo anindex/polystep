@@ -35,13 +35,51 @@ def validate_positive(value: float, name: str, context: str = "") -> None:
         raise ValueError(msg)
 
 
+def thin_qr(matrix: torch.Tensor):
+    """Reduced QR, pinned to one thread on CPU.
+
+    LAPACK spreads a tall-thin QR over every core and the synchronization dominates at
+    subspace shapes: ``(784, 64)`` fp32 took 1602 ms on 24 threads, 0.30 ms on one.
+    CUDA tensors skip the pinning. The thread count is restored before returning.
+    """
+    if matrix.device.type != "cpu":
+        return torch.linalg.qr(matrix, mode="reduced")
+    prev = torch.get_num_threads()
+    if prev == 1:
+        return torch.linalg.qr(matrix, mode="reduced")
+    torch.set_num_threads(1)
+    try:
+        return torch.linalg.qr(matrix, mode="reduced")
+    finally:
+        torch.set_num_threads(prev)
+
+
+def loss_buffer_dtype(particle_dtype: torch.dtype) -> torch.dtype:
+    """Accumulation dtype for probe losses.
+
+    Half precision is promoted to FP32 for log-sum-exp stability, but FP64 is kept:
+    a double objective whose probe costs differ below FP32 resolution collapses to a
+    constant cost matrix, and the particle stops moving.
+    """
+    return particle_dtype if particle_dtype == torch.float64 else torch.float32
+
+
 def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
     """Promote half precision to FP32 and replace non-finite costs, on-device.
 
-    Non-finite entries (a hard-constraint ``+inf`` or an upstream NaN) are
-    replaced with ``2 * max|finite| + 1`` (floored at ``1e6``) so a masked
-    vertex still gets near-zero weight without sending ``-C/eps`` to ``-inf``
-    and NaN-ing the whole row. Branch-free: no host sync on the finite path.
+    A hard-constraint ``+inf`` or an upstream NaN becomes ``2 * max|finite| + 1`` so the
+    masked vertex ranks below every finite one without sending ``-C/eps`` to ``-inf`` and
+    NaN-ing the whole row. ``-inf`` is the opposite case: for a minimization it is the
+    best possible value, so it maps to the finite minimum instead of the penalty.
+    Branch-free: no host sync on the finite path. How strongly the masked vertex is
+    suppressed depends on epsilon and the cost scale, which are not visible here.
+
+    The penalty is relative to the finite scale, not an absolute floor. An absolute
+    floor of 1e6 survives into the ``'mean'`` and ``'max_cost'`` reductions in
+    :func:`~polystep.costs.scale_cost_matrix`, which run after this, and divides every
+    real cost difference down to ~1e-6 of the scale, flattening the plan to uniform for
+    that step. When no entry is finite the result is a constant matrix, which is
+    shift-invariant and therefore already the uniform plan.
     """
     if cost_matrix.dtype in (torch.bfloat16, torch.float16):
         cost_matrix = cost_matrix.to(torch.float32)
@@ -49,8 +87,12 @@ def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
         return cost_matrix
     finite = torch.isfinite(cost_matrix)
     max_finite = torch.where(finite, cost_matrix, cost_matrix.new_zeros(())).abs().amax()
-    penalty = torch.clamp(max_finite * 2.0 + 1.0, min=1e6)
-    return torch.where(finite, cost_matrix, penalty)
+    penalty = max_finite * 2.0 + 1.0
+    # Fill non-finite slots with a value no smaller than any finite entry so the
+    # reduction returns the finite minimum.
+    min_finite = torch.where(finite, cost_matrix, max_finite).amin()
+    replacement = torch.where(cost_matrix == float("-inf"), min_finite, penalty)
+    return torch.where(finite, cost_matrix, replacement)
 
 
 def recenter_cost(cost_matrix: torch.Tensor):

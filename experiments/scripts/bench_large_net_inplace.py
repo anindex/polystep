@@ -2,11 +2,11 @@
 scale where the in-place path is actually used (vmap OOMs / balloons)?
 
 The small-net matrix (bench_forward_backends.py) showed ~6x within the in-place
-path on a *tiny* recurrent SNN. The review (Gemini, Kimi) warned that must NOT be
+path on a *tiny* recurrent SNN. That must NOT be
 extrapolated: the in-place path only runs for nets large enough to OOM vmap, and
 "large" is usually dense/compute-bound, where CUDA graphs help little (~1.1x like
 the small CNN). This benchmark tests that prediction directly by measuring
-inplace_eager vs inplace_graph on genuinely large nets that span the
+inplace_eager vs inplace_graph on large nets that span the
 dense<->recurrent axis, and reports vmap peak memory (why in-place is needed).
 
 Hypothesis under test: the graph win is proportional to LAUNCH-boundness, not
@@ -91,8 +91,10 @@ MODELS = [
 
 def _stacked(model, n, noise=0.005, gen=None):
     return {
-        name: (p.detach().unsqueeze(0).expand(n, *p.shape).contiguous()
-               + noise * torch.randn(n, *p.shape, device=p.device, dtype=p.dtype, generator=gen))
+        name: (
+            p.detach().unsqueeze(0).expand(n, *p.shape).contiguous()
+            + noise * torch.randn(n, *p.shape, device=p.device, dtype=p.dtype, generator=gen)
+        )
         for name, p in model.named_parameters()
     }
 
@@ -150,7 +152,7 @@ def run_model(name, build, in_shape, seeds=(0, 1)):
         if vmap_mem[-1] is not None:
             with torch.inference_mode():
                 vmap_ms.append(_time(lambda: vev.evaluate(stacked, x, y)))
-        # compiled vmap (fusion) -- the STRONGEST vmap baseline; gates any "beats vmap"
+        # compiled vmap (fusion): the STRONGEST vmap baseline; gates any "beats vmap"
         cvev = NNCostEvaluator(model, loss_fn, use_inplace=False, compile_vmap=True)
         try:
             with torch.inference_mode():
@@ -172,7 +174,7 @@ def run_model(name, build, in_shape, seeds=(0, 1)):
             assert torch.unique(lg).numel() > N_CAND // 2, f"{name}: graphed losses collapsed (stale)"
             max_diff = (le - lg).abs().max().item()
             # For hard-threshold nets (SNN) compile can flip a boundary spike via fp
-            # reassociation near `mem >= thr`, perturbing the loss ~1e-3 -- a genuine
+            # reassociation near `mem >= thr`, perturbing the loss ~1e-3: a real
             # reproducibility caveat, NOT a stale-weight bug. Assert only against gross
             # wrongness (staleness would give an O(1) diff); report the actual diff.
             assert max_diff < 0.05, f"{name}: graphed vs eager diff {max_diff:.4f} too large (stale/wrong?)"
@@ -190,22 +192,23 @@ def run_model(name, build, in_shape, seeds=(0, 1)):
     best_vmap = min([v for v in (vm, cvm) if v is not None], default=None)
     vmem = None if any(m is None for m in vmap_mem) else statistics.median([m for m in vmap_mem])
     ipm = statistics.median(ip_mem)
-    print(f"\n{name}   params={params/1e6:.1f}M  batch={BATCH}  N_cand={N_CAND}  ({len(seeds)} seeds)")
+    print(f"\n{name}   params={params / 1e6:.1f}M  batch={BATCH}  N_cand={N_CAND}  ({len(seeds)} seeds)")
     vmem_s = "OOM" if vmem is None else f"{vmem:.0f}MB"
     # Via the evaluate(stacked) API both paths hold the O(N) stacked params; vmap
-    # ADDITIONALLY materialises O(N) activations, in-place O(1) -- so this gap is
+    # ADDITIONALLY materialises O(N) activations, in-place O(1): so this gap is
     # the ACTIVATION saving (grows with N). Full O(1)-in-params is the
     # subspace-reconstruct path (evaluate_subspace_inplace), not benchmarked here.
-    print(f"  vmap peak mem={vmem_s}   inplace peak mem={ipm:.0f}MB   "
-          f"(gap = O(N) vs O(1) ACTIVATIONS; grows with N)")
+    print(f"  vmap peak mem={vmem_s}   inplace peak mem={ipm:.0f}MB   (gap = O(N) vs O(1) ACTIVATIONS; grows with N)")
     print(f"  eager_vmap        {vm:9.3f} ms/sweep" if vm else "  eager_vmap        OOM")
     print(f"  compiled_vmap     {cvm:9.3f} ms/sweep" if cvm else "  compiled_vmap     n/a")
     print(f"  inplace_eager     {iem:9.3f} ms/sweep")
     vs = f"   vs BEST vmap {best_vmap / igm:.2f}x" if best_vmap else ""
     print(f"  inplace_graph     {igm:9.3f} ms/sweep   {iem / igm:.2f}x within in-place{vs}")
     md = statistics.median(diffs)
-    print(f"  numerics: max|graph-eager| loss diff = {md:.2e}  "
-          f"({'hard-threshold spike-flip (fp reassoc)' if md > 1e-4 else 'fp-fusion rounding'})")
+    print(
+        f"  numerics: max|graph-eager| loss diff = {md:.2e}  "
+        f"({'hard-threshold spike-flip (fp reassoc)' if md > 1e-4 else 'fp-fusion rounding'})"
+    )
     return name, iem / igm, (best_vmap / igm if best_vmap else None)
 
 
@@ -213,8 +216,9 @@ def main():
     if not torch.cuda.is_available():
         print("SKIP: needs CUDA.")
         return
-    print(f"Large-net in-place / compile_forward test  device={torch.cuda.get_device_name(0)}  "
-          f"torch={torch.__version__}")
+    print(
+        f"Large-net in-place / compile_forward test  device={torch.cuda.get_device_name(0)}  torch={torch.__version__}"
+    )
     print("Q: does the CUDA-graph (compile_forward) win survive at the scale where in-place is used?")
     res = [run_model(*m) for m in MODELS]
     print("\n=== VERDICT ===")
@@ -223,7 +227,7 @@ def main():
         print(f"  {name:42s} inplace_graph {sp:4.2f}x over inplace_eager{tag}")
     print("  - compiled_vmap (fusion) is the FASTEST backend when it fits (SNN 37 ms < all).")
     print("  - compile_forward RESCUES the in-place path (recurrent 2.24x, dense 1.16x within in-place)")
-    print("    but does NOT beat compiled_vmap (SNN 0.93x) -- it makes the MEMORY-forced path (used when")
+    print("    but does NOT beat compiled_vmap (SNN 0.93x): it makes the MEMORY-forced path (used when")
     print("    vmap OOMs on O(N) activations) competitive, not fastest.")
     print("  - Win tracks launch/dispatch-boundness, not size (small-SNN 6x -> large-SNN 2.24x).")
     print("  - Caveat: on hard-threshold nets (SNN) compile perturbs the loss ~1e-3 via spike flips.")

@@ -23,6 +23,7 @@ import os
 import pickle
 import platform
 import struct as pystruct
+import tempfile
 import tarfile
 from collections import defaultdict
 from dataclasses import dataclass, asdict, field
@@ -36,18 +37,19 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
-# ---------------------------------------------------------------------------
-# Standard validation seeds
-# ---------------------------------------------------------------------------
+def _default_data_dir(name: str) -> str:
+    """Default download location for a dataset, under the platform temp dir.
 
-# Benchmark validation seeds (3 seeds). Paper experiments use 5 seeds
-# defined in paper/experiments/common.py instead.
+    Hardcoding "/tmp/..." makes these defaults unusable on Windows, which the package
+    does not otherwise exclude.
+    """
+    return os.path.join(tempfile.gettempdir(), name)
+
+
+# Benchmark validation seeds. The published experiments use 5 seeds, set in
+# experiments/runners/common.py.
 SEEDS = [42, 123, 456]
 
-
-# ---------------------------------------------------------------------------
-# MNIST data loading (no torchvision required)
-# ---------------------------------------------------------------------------
 
 MNIST_URL = "https://storage.googleapis.com/cvdf-datasets/mnist/"
 MNIST_FILES = {
@@ -91,7 +93,7 @@ def _load_mnist_labels(filepath: str) -> np.ndarray:
 
 
 def get_mnist_loaders(
-    data_dir: str = "/tmp/mnist",
+    data_dir: Optional[str] = None,
     batch_size: int = 512,
     normalize: bool = True,
     max_train: int = 0,
@@ -109,6 +111,7 @@ def get_mnist_loaders(
     Returns:
         Tuple of (train_loader, test_loader)
     """
+    data_dir = data_dir or _default_data_dir("mnist")
     _download_mnist(data_dir)
 
     train_images = _load_mnist_images(os.path.join(data_dir, MNIST_FILES["train_images"]))
@@ -135,10 +138,6 @@ def get_mnist_loaders(
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
     return train_loader, test_loader
 
-
-# ---------------------------------------------------------------------------
-# CIFAR-10 data loading (no torchvision required)
-# ---------------------------------------------------------------------------
 
 CIFAR10_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
 CIFAR10_FILENAME = "cifar-10-python.tar.gz"
@@ -169,7 +168,7 @@ def _load_cifar10_batch(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def get_cifar10_loaders(
-    data_dir: str = "/tmp/cifar10",
+    data_dir: Optional[str] = None,
     batch_size: int = 512,
     normalize: bool = True,
     max_train: int = 0,
@@ -187,6 +186,7 @@ def get_cifar10_loaders(
     Returns:
         Tuple of (train_loader, test_loader)
     """
+    data_dir = data_dir or _default_data_dir("cifar10")
     _download_cifar10(data_dir)
 
     batch_dir = os.path.join(data_dir, "cifar-10-batches-py")
@@ -234,10 +234,6 @@ def get_cifar10_loaders(
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
     return train_loader, test_loader
 
-
-# ---------------------------------------------------------------------------
-# SST-2 data loading (HuggingFace with simple tokenization)
-# ---------------------------------------------------------------------------
 
 # Check for HuggingFace datasets at module load time
 try:
@@ -329,7 +325,7 @@ def get_sst2_loaders(
     max_seq_len: int = 64,
     batch_size: int = 32,
     vocab_size: int = 10000,
-    data_dir: str = "/tmp/sst2",
+    data_dir: Optional[str] = None,
 ) -> Tuple[DataLoader, DataLoader, int, str]:
     """Load SST-2 sentiment dataset as PyTorch DataLoaders.
 
@@ -356,6 +352,7 @@ def get_sst2_loaders(
         raise ImportError("HuggingFace datasets required for SST-2 benchmark. Install with: pip install datasets")
 
     print("  Loading SST-2 from HuggingFace datasets...")
+    data_dir = data_dir or _default_data_dir("sst2")
     dataset = _hf_load_dataset("glue", "sst2", cache_dir=data_dir)
 
     # Get train/validation splits (SST-2 test set has no labels)
@@ -403,11 +400,6 @@ def get_sst2_loaders(
     print(f"  Train: {len(train_ds)} samples, Test: {len(test_ds)} samples")
     print(f"  Data type: {data_type} (HuggingFace SST-2)")
     return train_loader, test_loader, actual_vocab_size, data_type
-
-
-# ---------------------------------------------------------------------------
-# Model factories
-# ---------------------------------------------------------------------------
 
 
 class MNISTNet(nn.Module):
@@ -490,11 +482,6 @@ def create_model(
         raise ValueError(f"Unknown dataset: {dataset_name}. Supported: mnist, cifar10")
 
 
-# ---------------------------------------------------------------------------
-# Evaluation utilities
-# ---------------------------------------------------------------------------
-
-
 @torch.no_grad()
 def evaluate_accuracy(model: nn.Module, dataloader: DataLoader) -> float:
     """Compute classification accuracy on a DataLoader.
@@ -534,11 +521,6 @@ def evaluate_accuracy(model: nn.Module, dataloader: DataLoader) -> float:
     return correct / total if total > 0 else 0.0
 
 
-# ---------------------------------------------------------------------------
-# BenchmarkResult dataclass
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class BenchmarkResult:
     """Single optimizer run result.
@@ -574,11 +556,6 @@ class BenchmarkResult:
         return asdict(self)
 
 
-# ---------------------------------------------------------------------------
-# Environment info collection
-# ---------------------------------------------------------------------------
-
-
 def get_environment_info() -> Dict[str, Any]:
     """Collect environment info for reproducibility.
 
@@ -602,11 +579,6 @@ def get_environment_info() -> Dict[str, Any]:
         info["gpu_count"] = 0
 
     return info
-
-
-# ---------------------------------------------------------------------------
-# Output utilities
-# ---------------------------------------------------------------------------
 
 
 def compute_summary_stats(results: List[BenchmarkResult]) -> Dict[str, Dict[str, float]]:
@@ -752,10 +724,6 @@ def _format_results_simple(results: List[BenchmarkResult]) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# snnTorch availability check
-# ---------------------------------------------------------------------------
-
 _HAS_SNNTORCH = False
 try:
     import snntorch as snn
@@ -763,11 +731,6 @@ try:
     _HAS_SNNTORCH = True
 except ImportError:
     pass
-
-
-# ---------------------------------------------------------------------------
-# Pure-PyTorch LIF neuron (fallback when snnTorch unavailable)
-# ---------------------------------------------------------------------------
 
 
 class LIFNeuron(nn.Module):
@@ -806,11 +769,6 @@ class LIFNeuron(nn.Module):
         return spike, mem
 
 
-# ---------------------------------------------------------------------------
-# SNN models
-# ---------------------------------------------------------------------------
-
-
 class SpikingNet(nn.Module):
     """SNN with LIF neurons for classification.
 
@@ -823,7 +781,7 @@ class SpikingNet(nn.Module):
         SNNs use hard threshold spikes: d(spike)/d(membrane) = 0.
         Backpropagation gives zero gradients through spikes.
         Surrogate gradients are an approximation hack.
-        polystep needs NO gradients -- only forward passes!
+        polystep needs NO gradients: only forward passes!
 
     Args:
         input_dim: Input dimension (flattened).
@@ -918,17 +876,13 @@ class SpikingNet(nn.Module):
         return total_spikes / num_steps  # Spike rate in [0, 1]
 
 
-# ---------------------------------------------------------------------------
-# N-MNIST data loading
-# ---------------------------------------------------------------------------
-
-
 def get_nmnist_loaders(
-    data_dir: str = "/tmp/nmnist",
+    data_dir: Optional[str] = None,
     num_steps: int = 25,
     batch_size: int = 64,
     max_train: int = 0,
     max_test: int = 0,
+    synthetic: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """Load N-MNIST neuromorphic dataset.
 
@@ -936,7 +890,8 @@ def get_nmnist_loaders(
     digits on a monitor and recording with a DVS (Dynamic Vision Sensor) camera.
     It contains ON and OFF polarity events encoding digit patterns.
 
-    Uses snnTorch spikevision if available, falls back to synthetic spike data.
+    Uses snnTorch spikevision. Pass ``synthetic=True`` for generated spike data;
+    a load failure raises rather than silently substituting it.
 
     Args:
         data_dir: Directory to store/load N-MNIST data.
@@ -961,14 +916,24 @@ def get_nmnist_loaders(
         ...     # data: (batch, time, polarity, H, W)
         ...     pass
     """
-    if _HAS_SNNTORCH:
-        try:
-            return _load_nmnist_snntorch(data_dir, num_steps, batch_size, max_train, max_test)
-        except Exception as e:
-            print(f"  snnTorch N-MNIST loading failed: {e}")
-            print("  Falling back to synthetic spike data...")
+    if synthetic:
+        return _generate_synthetic_nmnist(num_steps, batch_size, max_train, max_test)
 
-    return _generate_synthetic_nmnist(num_steps, batch_size, max_train, max_test)
+    data_dir = data_dir or _default_data_dir("nmnist")
+    if not _HAS_SNNTORCH:
+        raise RuntimeError(
+            "N-MNIST needs snnTorch (pip install 'polystep[experiments]'). "
+            "Pass synthetic=True to benchmark on generated spike data instead."
+        )
+    try:
+        return _load_nmnist_snntorch(data_dir, num_steps, batch_size, max_train, max_test)
+    except Exception as e:
+        # Substituting synthetic data here would report a benchmark number that has
+        # nothing to do with N-MNIST, so the caller has to ask for it.
+        raise RuntimeError(
+            f"Loading N-MNIST from {data_dir} failed: {e}. Pass synthetic=True to "
+            "benchmark on generated spike data instead."
+        ) from e
 
 
 def _load_nmnist_snntorch(
@@ -1068,13 +1033,8 @@ def _generate_synthetic_nmnist(
     return train_loader, test_loader
 
 
-# ---------------------------------------------------------------------------
-# DVS-Gesture data loading
-# ---------------------------------------------------------------------------
-
-
 def get_dvs_gesture_loaders(
-    data_dir: str = "/tmp/dvs_gesture",
+    data_dir: Optional[str] = None,
     num_steps: int = 50,
     batch_size: int = 16,
     max_train: int = 0,
@@ -1086,7 +1046,8 @@ def get_dvs_gesture_loaders(
     DVS-Gesture contains 11 hand gestures recorded with a DVS camera.
     The dataset is ~1.5GB, so fallback to synthetic is supported.
 
-    Uses snnTorch spikevision if available, falls back to synthetic spike data.
+    Uses snnTorch spikevision. Pass ``synthetic=True`` for generated spike data;
+    a load failure raises rather than silently substituting it.
 
     Args:
         data_dir: Directory to store/load DVS-Gesture data.
@@ -1116,14 +1077,19 @@ def get_dvs_gesture_loaders(
     if synthetic:
         return _generate_synthetic_dvs_gesture(num_steps, batch_size, max_train, max_test)
 
-    if _HAS_SNNTORCH:
-        try:
-            return _load_dvs_gesture_snntorch(data_dir, num_steps, batch_size, max_train, max_test)
-        except Exception as e:
-            print(f"  snnTorch DVS-Gesture loading failed: {e}")
-            print("  Falling back to synthetic spike data...")
-
-    return _generate_synthetic_dvs_gesture(num_steps, batch_size, max_train, max_test)
+    data_dir = data_dir or _default_data_dir("dvs_gesture")
+    if not _HAS_SNNTORCH:
+        raise RuntimeError(
+            "DVS-Gesture needs snnTorch (pip install 'polystep[experiments]'). "
+            "Pass synthetic=True to benchmark on generated spike data instead."
+        )
+    try:
+        return _load_dvs_gesture_snntorch(data_dir, num_steps, batch_size, max_train, max_test)
+    except Exception as e:
+        raise RuntimeError(
+            f"Loading DVS-Gesture from {data_dir} failed: {e}. Pass synthetic=True to "
+            "benchmark on generated spike data instead."
+        ) from e
 
 
 def _load_dvs_gesture_snntorch(
@@ -1222,11 +1188,6 @@ def _generate_synthetic_dvs_gesture(
 
     print(f"  Generated {num_train} train, {num_test} test samples (synthetic gestures)")
     return train_loader, test_loader
-
-
-# ---------------------------------------------------------------------------
-# SNN evaluation utilities
-# ---------------------------------------------------------------------------
 
 
 @torch.no_grad()

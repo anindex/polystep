@@ -56,7 +56,7 @@ def train_sgd(
     train_loader batches, compute loss, backpropagate, step optimizer.
     After each epoch, evaluate full test accuracy.
 
-    This serves as the "ceiling" baseline -- gradient methods have
+    This serves as the "ceiling" baseline: gradient methods have
     access to exact gradient information and should achieve the highest
     accuracy. The paper honestly reports the gap between gradient-free
     methods and this ceiling.
@@ -86,9 +86,7 @@ def train_sgd(
 
     optimizer_name_lower = optimizer_name.lower()
     if optimizer_name_lower not in ("adam", "sgd"):
-        raise ValueError(
-            f"optimizer_name must be 'adam' or 'sgd', got '{optimizer_name}'"
-        )
+        raise ValueError(f"optimizer_name must be 'adam' or 'sgd', got '{optimizer_name}'")
 
     set_seed(seed)
     model = model.to(device)
@@ -96,13 +94,9 @@ def train_sgd(
 
     # Create optimizer
     if optimizer_name_lower == "adam":
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=lr, weight_decay=weight_decay
-        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     else:
-        optimizer = torch.optim.SGD(
-            model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay
-        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
 
     scheduler = None
     if cosine_lr:
@@ -150,13 +144,15 @@ def train_sgd(
             if test_acc > best_accuracy:
                 best_accuracy = test_acc
 
-            epoch_logs.append({
-                "epoch": epoch,
-                "accuracy": test_acc,
-                "train_accuracy": train_acc,
-                "loss": avg_loss,
-                "time": elapsed,
-            })
+            epoch_logs.append(
+                {
+                    "epoch": epoch,
+                    "accuracy": test_acc,
+                    "train_accuracy": train_acc,
+                    "loss": avg_loss,
+                    "time": elapsed,
+                }
+            )
 
     wall_time = time.time() - start_time
     final_accuracy = evaluate_accuracy(model, test_loader, device=device)

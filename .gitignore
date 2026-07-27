@@ -58,3 +58,6 @@ logs/
 examples/figures/*.png
 examples/figures/*.gif
 !examples/figures/.gitkeep
+
+# scratch dir for local verification runs
+.tmp/

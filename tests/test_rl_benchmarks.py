@@ -115,7 +115,7 @@ def test_gym_evaluator_nondiff_acrobot():
     ev_b.close()
 
 
-def test_hardened_env_smoke():
+def test_hardened_env_smoke(require_experiments):
     """Hardened wrappers register, reset, step, and produce quantized obs / bucketed reward."""
     pytest.importorskip("gymnasium")
     import gymnasium as gym
@@ -136,7 +136,7 @@ def test_hardened_env_smoke():
     obs1, _ = env.reset(seed=1)
     # Quantizer outputs should be one of 4 bin centers per channel.
     assert obs0.shape == (4,) and obs0.dtype == np.float32
-    assert np.unique(np.concatenate([obs0, obs1])).size <= 8  # ≤ 4 bins x 2 resets
+    assert np.unique(np.concatenate([obs0, obs1])).size <= 8  # <= 4 bins x 2 resets
     env.close()
 
     # Reward bucketing: |r| < deadband zeros out.

@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The runners have no GPU. The default PyPI torch drags in ~2.7 GB of nvidia-*
+  # CUDA wheels on top of a 1.1 GB torch; the CPU index ships one ~200 MB wheel.
+  UV_TORCH_BACKEND: cpu
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -17,24 +27,35 @@ jobs:
           cache: 'pip'
           cache-dependency-path: 'pyproject.toml'
       - run: pip install ruff==0.15.12
-      - run: ruff check src/polystep/ tests/
-      - run: ruff format --check src/polystep/ tests/
+      - run: ruff check src/polystep/ tests/ examples/ experiments/scripts/
+      - run: ruff format --check src/polystep/ tests/ examples/ experiments/scripts/
 
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'pyproject.toml'
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: 'pip'
-          cache-dependency-path: 'pyproject.toml'
-      - run: pip install -e ".[dev]"
+      # Coverage instrumentation costs ~30% and the number is identical on every
+      # leg, so only 3.12 pays for it.
       - name: Core library tests
-        run: pytest tests/ -v -m "not slow and not gpu" --timeout=120 -x --cov=polystep --cov-report=term-missing
+        run: |
+          uv pip install --system -e ".[dev]"
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then
+            pytest tests/ -m "not slow and not gpu" --timeout=120 -n auto \
+              --cov=polystep --cov-report=term-missing
+          else
+            pytest tests/ -q -m "not slow and not gpu" --timeout=120 -n auto
+          fi
 
   build:
     runs-on: ubuntu-latest
@@ -51,3 +72,22 @@ jobs:
         run: .venv/bin/python -c "import polystep; from polystep import *; print(polystep.__version__)"
       - name: Verify py.typed ships in the wheel
         run: .venv/bin/python -c "import importlib.resources, polystep; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
+
+  sdist:
+    # The sdist ships the test suite, so it must actually be runnable from the tarball.
+    # setuptools' default selection picks up tests/test*.py but not conftest.py, which
+    # silently shipped a suite that errored on every fixture lookup.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Unpack, install and run the shipped tests
+        run: |
+          uv build --sdist
+          mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          cd /tmp/sdist
+          uv pip install --system ".[dev]"
+          pytest tests/ -q -m "not slow and not gpu" --timeout=120 -n auto

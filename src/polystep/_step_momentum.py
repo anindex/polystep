@@ -49,6 +49,10 @@ def step_momentum(opt, closure: Callable) -> float:
         opt._transport_direction = None
         opt._transport_direction_ema = None
         opt._newton_direction = None
+        # X_old is where the last OT step left the particles only on the first
+        # momentum step of a run; after that it is itself a momentum position, so
+        # the cached cost rows still describe somewhere the particles have left.
+        opt._invalidate_reuse_cache()
         opt._sync_model()
         prev_cost = state.costs[-1] if state.costs else float("inf")
         state.costs.append(prev_cost)
@@ -56,6 +60,11 @@ def step_momentum(opt, closure: Callable) -> float:
         state.displacement_sqnorms.append(0.0)
         state.iteration_count += 1
         return prev_cost
+
+    # The particles moved, so the adaptive-probe cache now describes a position
+    # they have left. Its reuse guards check K_eff and both radii, none of which
+    # change on a momentum step, so nothing else would catch it.
+    opt._invalidate_reuse_cache()
 
     # Sync model parameters from updated particles
     opt._sync_model()
@@ -71,58 +80,3 @@ def step_momentum(opt, closure: Callable) -> float:
     state.iteration_count += 1
 
     return cost
-
-
-def evaluate_current_loss(opt, closure: Callable) -> float:
-    """Evaluate model loss at current particle position via single forward pass.
-
-    Not called by the core optimization loop (momentum validation was
-    removed), but retained as a public diagnostic utility.
-
-    Builds a batched param config (batch=1) from current state.X and
-    calls the closure. Handles both subspace and full-space modes.
-
-    Returns:
-        Scalar loss value (float).
-    """
-    state = opt._state
-    with torch.no_grad():
-        if opt.subspace is not None:
-            flat_sub = state.X.reshape(-1)[: state.subspace.subspace_dim].unsqueeze(0)
-            if opt._mixed_precision and state.projection is not None:
-                flat_sub = flat_sub.to(dtype=state.projection.dtype)
-            if opt._adaptive or opt._cma_subspace:
-                val_params = state.subspace.reconstruct_batch(
-                    opt._sampling_projection,
-                    state.base_params,
-                    flat_sub,
-                )
-            elif opt._hybrid:
-                val_params = state.subspace.reconstruct_batch(
-                    state.hybrid_projections,
-                    state.base_params,
-                    flat_sub,
-                )
-            else:
-                val_params = state.subspace.reconstruct_batch(
-                    state.base_params,
-                    flat_sub,
-                )
-        else:
-            flat_config = state.X.reshape(1, -1)
-            layout_flat = opt.layout.padded_size
-            if flat_config.shape[1] >= layout_flat:
-                flat_for_layout = flat_config[:, :layout_flat]
-            else:
-                flat_for_layout = torch.nn.functional.pad(
-                    flat_config,
-                    (0, layout_flat - flat_config.shape[1]),
-                )
-            val_params = opt.layout.batch_unflatten(flat_for_layout)
-
-        val_loss_tensor = closure(val_params)
-        val_loss = val_loss_tensor.mean().item()
-        # Guard against NaN propagation - treat as infinite loss
-        if math.isnan(val_loss):
-            return float("inf")
-        return val_loss

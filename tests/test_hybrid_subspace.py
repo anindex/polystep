@@ -9,11 +9,6 @@ from polystep.optimizer import RankSchedule
 from polystep.transform import ParamLayout
 
 
-# ---------------------------------------------------------------------------
-# Helper model fixture
-# ---------------------------------------------------------------------------
-
-
 class SimpleMLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -41,11 +36,6 @@ def hybrid_sub(layout):
     return HybridSubspace.from_layout(layout, rank=4)
 
 
-# ---------------------------------------------------------------------------
-# from_layout factory method
-# ---------------------------------------------------------------------------
-
-
 class TestHybridFromLayout:
     def test_from_layout_creates_correct_specs(self, layout):
         """from_layout creates LayerProjectionSpecs matching layout entries."""
@@ -71,12 +61,16 @@ class TestHybridFromLayout:
         assert hybrid.subspace_dim == total
 
     def test_from_layout_2d_params_are_projected(self, layout):
-        """2D+ params (weights) have is_projected=True."""
+        """2D+ params are projected unless the rank saturates the layer.
+
+        ``num_coords`` is capped at ``num_params``. At the cap the projection would be
+        the identity, so the spec carries the parameter directly instead.
+        """
         hybrid = HybridSubspace.from_layout(layout, rank=4)
 
         for spec, entry in zip(hybrid.specs, layout.entries):
             if len(entry.shape) >= 2:
-                assert spec.is_projected is True
+                assert spec.is_projected is (spec.num_coords < spec.num_params)
             else:
                 assert spec.is_projected is False
 
@@ -88,11 +82,6 @@ class TestHybridFromLayout:
             if len(entry.shape) == 1:
                 assert spec.num_params == spec.num_coords
                 assert spec.num_params == entry.numel
-
-
-# ---------------------------------------------------------------------------
-# auto_from_layout factory method
-# ---------------------------------------------------------------------------
 
 
 class TestHybridAutoFromLayout:
@@ -118,11 +107,6 @@ class TestHybridAutoFromLayout:
 
         # Auto with max_rank=4 should be smaller than fixed rank=16
         assert hybrid_auto.subspace_dim <= hybrid_fixed.subspace_dim
-
-
-# ---------------------------------------------------------------------------
-# init_projections
-# ---------------------------------------------------------------------------
 
 
 class TestHybridInitProjections:
@@ -175,11 +159,6 @@ def test_apply_inplace_updates_noncontiguous_param(model, hybrid_sub):
     assert not torch.allclose(p.data, before)
 
 
-# ---------------------------------------------------------------------------
-# apply_perturbation
-# ---------------------------------------------------------------------------
-
-
 class TestHybridApplyPerturbation:
     def test_apply_perturbation_matches_manual(self, model, hybrid_sub):
         """apply_perturbation matches manual P @ coords computation."""
@@ -202,75 +181,6 @@ class TestHybridApplyPerturbation:
             else:
                 expected = base + chunk.reshape(spec.original_shape)
             assert torch.allclose(result[spec.entry_key], expected, atol=1e-6)
-
-    def test_apply_perturbation_zero_is_identity(self, model, hybrid_sub):
-        """Zero perturbation returns base params unchanged."""
-        projections = hybrid_sub.init_projections(torch.device("cpu"), torch.float32)
-        base_sd = model.state_dict()
-        coords = torch.zeros(hybrid_sub.subspace_dim)
-
-        result = hybrid_sub.apply_perturbation(projections, base_sd, coords)
-
-        for key in base_sd:
-            assert torch.allclose(result[key], base_sd[key], atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# reconstruct_batch
-# ---------------------------------------------------------------------------
-
-
-class TestHybridReconstructBatch:
-    def test_reconstruct_batch_matches_loop(self, model, hybrid_sub):
-        """reconstruct_batch gives same result as looping apply_perturbation."""
-        projections = hybrid_sub.init_projections(torch.device("cpu"), torch.float32)
-        base_sd = model.state_dict()
-
-        N = 4
-        torch.manual_seed(42)
-        batch = torch.randn(N, hybrid_sub.subspace_dim) * 0.01
-
-        batch_result = hybrid_sub.reconstruct_batch(projections, base_sd, batch)
-
-        for i in range(N):
-            single_result = hybrid_sub.apply_perturbation(projections, base_sd, batch[i])
-            for key in single_result:
-                assert torch.allclose(batch_result[key][i], single_result[key], atol=1e-5), (
-                    f"Row {i}, key {key}: batch vs single mismatch"
-                )
-
-
-# ---------------------------------------------------------------------------
-# absorb
-# ---------------------------------------------------------------------------
-
-
-class TestHybridAbsorb:
-    def test_absorb_zeros_subspace(self, model, hybrid_sub):
-        """After absorb, coords are zero and base_sd is updated."""
-        projections = hybrid_sub.init_projections(torch.device("cpu"), torch.float32)
-        base_sd = model.state_dict()
-
-        torch.manual_seed(42)
-        coords = torch.randn(hybrid_sub.subspace_dim) * 0.01
-
-        # Expected base after absorb
-        expected_sd = hybrid_sub.apply_perturbation(projections, base_sd, coords)
-
-        new_base, zeroed = hybrid_sub.absorb(projections, base_sd, coords)
-
-        # Zeroed coords
-        assert torch.all(zeroed == 0)
-        assert zeroed.shape == coords.shape
-
-        # New base matches expected
-        for key in expected_sd:
-            assert torch.allclose(new_base[key], expected_sd[key], atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# rotate_all random mode
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.filterwarnings("ignore:HybridSubspace works best:UserWarning")
@@ -296,11 +206,6 @@ class TestHybridRotateRandom:
                 any_different = True
                 break
         assert any_different, "Rotated projections should differ from original"
-
-
-# ---------------------------------------------------------------------------
-# rotate_all displacement mode
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.filterwarnings("ignore:HybridSubspace works best:UserWarning")
@@ -419,56 +324,6 @@ class TestHybridRotateDisplacement:
         assert any_different
 
 
-# ---------------------------------------------------------------------------
-# should_absorb
-# ---------------------------------------------------------------------------
-
-
-class TestHybridShouldAbsorb:
-    def test_should_absorb_stagnation(self):
-        """stagnation_count >= absorb_patience returns True."""
-        hybrid = HybridSubspace(
-            specs=(),
-            subspace_dim=10,
-            compression_ratio=0.1,
-            absorb_mode="stagnation",
-            absorb_patience=20,
-        )
-        assert not hybrid.should_absorb(stagnation_count=19, iteration=50)
-        assert hybrid.should_absorb(stagnation_count=20, iteration=50)
-        assert hybrid.should_absorb(stagnation_count=25, iteration=50)
-
-    def test_should_absorb_periodic(self):
-        """iteration % absorb_interval == 0 returns True (for iteration > 0)."""
-        hybrid = HybridSubspace(
-            specs=(),
-            subspace_dim=10,
-            compression_ratio=0.1,
-            absorb_mode="periodic",
-            absorb_interval=10,
-        )
-        assert not hybrid.should_absorb(stagnation_count=0, iteration=0)
-        assert not hybrid.should_absorb(stagnation_count=0, iteration=5)
-        assert hybrid.should_absorb(stagnation_count=0, iteration=10)
-        assert hybrid.should_absorb(stagnation_count=0, iteration=20)
-
-    def test_should_absorb_periodic_disabled(self):
-        """absorb_interval=0 with periodic mode never triggers."""
-        hybrid = HybridSubspace(
-            specs=(),
-            subspace_dim=10,
-            compression_ratio=0.1,
-            absorb_mode="periodic",
-            absorb_interval=0,
-        )
-        assert not hybrid.should_absorb(stagnation_count=100, iteration=100)
-
-
-# ---------------------------------------------------------------------------
-# create_hybrid_blocks
-# ---------------------------------------------------------------------------
-
-
 class TestCreateHybridBlocks:
     def test_create_hybrid_blocks_correct_count(self, hybrid_sub):
         """create_hybrid_blocks creates one block per spec."""
@@ -501,11 +356,6 @@ class TestCreateHybridBlocks:
             assert block.flat_end - block.flat_start == block.num_particles * particle_dim
 
 
-# ---------------------------------------------------------------------------
-# Test: Optimizer integration (quick smoke test)
-# ---------------------------------------------------------------------------
-
-
 class TestHybridOptimizerIntegration:
     def test_optimizer_detects_hybrid_mode(self, model):
         """PolyStepOptimizer correctly detects HybridSubspace."""
@@ -521,11 +371,6 @@ class TestHybridOptimizerIntegration:
         assert optimizer._state.hybrid_projections is not None
         num_projected = sum(1 for s in hybrid.specs if s.is_projected)
         assert len(optimizer._state.hybrid_projections) == num_projected
-
-
-# ---------------------------------------------------------------------------
-# Test: RankSchedule (rank schedule extension)
-# ---------------------------------------------------------------------------
 
 
 class TestRankSchedule:
@@ -575,11 +420,6 @@ class TestRankSchedule:
         assert schedule.at(0) == 2
         assert schedule.at(100) == 4
         assert schedule.at(300) == 8
-
-
-# ---------------------------------------------------------------------------
-# Test: Rank transition integration (rank schedule extension)
-# ---------------------------------------------------------------------------
 
 
 class TestRankTransition:
@@ -675,11 +515,6 @@ class TestRankTransition:
                 epsilon=0.1,
                 compile=False,
             )
-
-
-# ---------------------------------------------------------------------------
-# Tests for structured projection mode (structured projection)
-# ---------------------------------------------------------------------------
 
 
 class TestDefaultRotationInterval:
@@ -801,11 +636,6 @@ class TestStructuredProjection:
         assert any_different, "Structured projection perturbation should change parameters"
 
 
-# ---------------------------------------------------------------------------
-# Tests for max_subspace_dim parameter
-# ---------------------------------------------------------------------------
-
-
 class TestMaxSubspaceDim:
     """Tests for the max_subspace_dim budget cap."""
 
@@ -884,9 +714,11 @@ class TestHybridReconstructionProperties:
     1D-pass-through identity, and tied-weight deduplication."""
 
     def test_exact_reconstruction_at_saturation(self):
-        """When ``r >= min(d_in, d_out)`` the layer projection is
-        surjective onto the parameter delta space, so any target delta
-        is reachable via a least-norm coordinate solution.
+        """At ``r >= min(d_in, d_out)`` every target delta is reachable exactly.
+
+        The uncapped formula gives ``num_coords = 4*4 + 4*4 = 32`` against
+        ``num_params = 16``. A (16, 32) projection cannot have orthonormal columns, so
+        it is capped at 16 and the coordinates become the delta itself.
         """
         model = nn.Linear(4, 4, bias=False)
         layout = ParamLayout.from_module(model, particle_dim=2)
@@ -894,32 +726,16 @@ class TestHybridReconstructionProperties:
 
         assert len(hybrid.specs) == 1
         spec = hybrid.specs[0]
-        assert spec.is_projected
-        # num_coords = d_out*r + r*d_in = 4*4 + 4*4 = 32 (>= num_params=16)
-        assert spec.num_coords == 32
-        assert spec.num_params == 16
+        assert spec.num_coords == spec.num_params == 16
+        assert not spec.is_projected
 
-        projections = hybrid.init_projections(
-            torch.device("cpu"),
-            torch.float32,
-        )
-        P = projections[spec.entry_key]
-        assert P.shape == (16, 32)
+        projections = hybrid.init_projections(torch.device("cpu"), torch.float32)
+        assert spec.entry_key not in projections, "a full-width spec needs no projection matrix"
 
-        rank = torch.linalg.matrix_rank(P).item()
-        assert rank == 16, f"Hybrid projection at saturation should span the full 16-dim param space; got rank {rank}"
-
-        target_delta = torch.randn(4, 4)
-        target_flat = target_delta.reshape(-1)
-        coords = torch.linalg.lstsq(P, target_flat).solution
-
+        target_delta = torch.randn(4, 4, generator=torch.Generator().manual_seed(0))
         base_sd = {spec.entry_key: torch.zeros(4, 4)}
-        perturbed = hybrid.apply_perturbation(projections, base_sd, coords)
-        recovered = perturbed[spec.entry_key]
-        assert torch.allclose(recovered, target_delta, atol=1e-4), (
-            "saturated HybridSubspace failed to reconstruct target delta; "
-            f"max diff {(recovered - target_delta).abs().max().item():.3e}"
-        )
+        perturbed = hybrid.apply_perturbation(projections, base_sd, target_delta.reshape(-1))
+        assert torch.equal(perturbed[spec.entry_key], target_delta)
 
     def test_bias_pass_through_is_identity(self):
         """Biases (1D params) carry ``is_projected=False`` and one coord

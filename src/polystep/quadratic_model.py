@@ -21,7 +21,7 @@ def extract_fd_gradient(
 ) -> torch.Tensor:
     """Extract finite-difference gradient from orthoplex cost evaluations.
 
-    Central difference at each probe scale, averaged for robustness:
+    Central difference at each probe scale, averaged over scales:
         g_i = mean_k[(L(+s_k*d_i) - L(-s_k*d_i)) / (2 * s_k * r)]
 
     Args:
@@ -99,10 +99,10 @@ def compute_newton_step(
 ) -> torch.Tensor:
     """Compute a diagonal Newton step in the rotated frame.
 
-    Where curvature is above ``hessian_reg`` returns ``-g_i / H_i``; where it
-    is at or below ``hessian_reg`` (small-positive or nonpositive) the Hessian
-    is floored to ``hessian_reg`` (a small gradient step, never an ascent step).
-    The full step is then clipped to ``max_step_norm``.
+    Where curvature is above ``hessian_reg`` returns ``-g_i / H_i``; where it is at or
+    below ``hessian_reg`` (small-positive or nonpositive) the step falls back to a
+    gradient step whose length is capped per coordinate, never an ascent step. The full
+    step is then clipped to ``max_step_norm``.
 
     Args:
         gradient: FD gradient of shape ``(P, pdim)``.
@@ -113,14 +113,19 @@ def compute_newton_step(
     Returns:
         Newton step in rotated frame of shape ``(P, pdim)``.
     """
-    # Where curvature is positive use H_i directly; otherwise fall back to
-    # the regulariser so the direction stays a descent step.
+    # Where curvature is positive use H_i directly; otherwise fall back to the
+    # regulariser so the direction stays a descent step.
     H_safe = torch.where(
         hessian_diag > hessian_reg,
         hessian_diag,
         torch.full_like(hessian_diag, hessian_reg),
     )
     delta = -gradient / H_safe  # (P, pdim)
+
+    # Cap per coordinate before the global clip. A flat coordinate divides by hessian_reg,
+    # giving a 1e4x step that dominates the norm, and the clip is a single rescale, so it
+    # would shrink every well-conditioned coordinate by that same factor.
+    delta = delta.clamp(-max_step_norm, max_step_norm)
 
     # Clamp step norm
     norms = torch.norm(delta, dim=-1, keepdim=True).clamp(min=1e-10)
@@ -191,11 +196,11 @@ def apply_newton_refinement(
     Returns:
         Refined position of shape (P, pdim).
     """
-    # 1. Extract gradient and Hessian in rotated frame
+    # Extract gradient and Hessian in rotated frame
     gradient = extract_fd_gradient(losses_3d, scales, probe_radius, pdim)
     hessian_diag = extract_fd_hessian_diag(losses_3d, scales, probe_radius, pdim)
 
-    # 2. Compute Newton step in rotated frame
+    # Compute Newton step in rotated frame
     delta_rot = compute_newton_step(
         gradient,
         hessian_diag,
@@ -203,19 +208,19 @@ def apply_newton_refinement(
         hessian_reg=hessian_reg,
     )
 
-    # 3. Transform Newton step to original space: delta_orig = rot_mats @ delta_rot
+    # Transform Newton step to original space: delta_orig = rot_mats @ delta_rot
     # rot_mats: (P, pdim, pdim), delta_rot: (P, pdim)
     delta_orig = torch.einsum("bij,bj->bi", rot_mats, delta_rot)
 
-    # 4. Newton-predicted minimum, anchored at the probe center X_current (the
+    # Newton-predicted minimum, anchored at the probe center X_current (the
     # point the quadratic is built around). X_bary already carries the transport
     # step, so anchoring the Newton step there would double-count that move.
     X_newton = X_current + delta_orig
 
-    # 5. Blend the OT result with the Newton prediction
+    # Blend the OT result with the Newton prediction
     X_refined = (1.0 - alpha) * X_bary + alpha * X_newton
 
-    # 6. Descent gate: keep the blend only where the quadratic model predicts it
+    # Descent gate: keep the blend only where the quadratic model predicts it
     # is no worse than the pure-OT step, else fall back to X_bary. The model is
     # diagonal in the rotated frame, so measure both steps there from X_current.
     rot_mats_t = rot_mats.transpose(-1, -2)

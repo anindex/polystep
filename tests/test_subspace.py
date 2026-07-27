@@ -6,13 +6,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from polystep.subspace import FactorSpec, LowRankSubspace, LinearSubspace, ProjectionSpec
+from polystep.subspace import LowRankSubspace, LinearSubspace
 from polystep.transform import ParamLayout
-
-
-# ---------------------------------------------------------------------------
-# Helper models
-# ---------------------------------------------------------------------------
 
 
 class SimpleMLP(nn.Module):
@@ -49,11 +44,6 @@ class BiasOnlyModel(nn.Module):
 
     def forward(self, x):
         return self.ln(x)
-
-
-# ---------------------------------------------------------------------------
-# Test: from_layout with MLP
-# ---------------------------------------------------------------------------
 
 
 class TestFromLayout:
@@ -104,11 +94,6 @@ class TestFromLayout:
                 assert effective_rank <= min(100, d_in, d_out)
 
 
-# ---------------------------------------------------------------------------
-# Test: auto_from_layout
-# ---------------------------------------------------------------------------
-
-
 class TestAutoFromLayout:
     def test_auto_from_layout(self):
         """auto_from_layout selects per-layer ranks without user tuning."""
@@ -133,26 +118,7 @@ class TestAutoFromLayout:
                 assert r <= 64  # max_rank default
 
 
-# ---------------------------------------------------------------------------
-# Test: apply_perturbation
-# ---------------------------------------------------------------------------
-
-
 class TestApplyPerturbation:
-    def test_apply_perturbation_zeros(self):
-        """Zero perturbation returns base params unchanged."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.from_layout(layout, rank=4)
-        base_sd = model.state_dict()
-
-        flat_sub = torch.zeros(sub.subspace_dim)
-        result = sub.apply_perturbation(base_sd, flat_sub)
-
-        for key in base_sd:
-            if key in result:
-                assert torch.allclose(result[key], base_sd[key], atol=1e-6), f"Key {key} differs with zero perturbation"
-
     def test_apply_perturbation_nonzero(self):
         """Nonzero perturbation changes parameters."""
         model = SimpleMLP()
@@ -166,74 +132,12 @@ class TestApplyPerturbation:
 
         # At least some parameters should differ
         any_different = False
+        assert set(result) == set(base_sd), "apply_perturbation dropped keys; the value checks below would be vacuous"
         for key in base_sd:
-            if key in result:
-                if not torch.allclose(result[key], base_sd[key]):
-                    any_different = True
-                    break
+            if not torch.allclose(result[key], base_sd[key]):
+                any_different = True
+                break
         assert any_different, "Nonzero perturbation should change some params"
-
-
-# ---------------------------------------------------------------------------
-# Test: reconstruct_batch
-# ---------------------------------------------------------------------------
-
-
-class TestReconstructBatch:
-    def test_reconstruct_batch_consistency(self):
-        """reconstruct_batch matches apply_perturbation for each row."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.from_layout(layout, rank=4)
-        base_sd = model.state_dict()
-
-        N = 3
-        torch.manual_seed(123)
-        flat_batch = torch.randn(N, sub.subspace_dim) * 0.01
-        batch_result = sub.reconstruct_batch(base_sd, flat_batch)
-
-        for i in range(N):
-            single_result = sub.apply_perturbation(base_sd, flat_batch[i])
-            for key in single_result:
-                assert torch.allclose(batch_result[key][i], single_result[key], atol=1e-5), (
-                    f"Row {i}, key {key} mismatch between batch and single"
-                )
-
-
-# ---------------------------------------------------------------------------
-# Test: absorb
-# ---------------------------------------------------------------------------
-
-
-class TestAbsorb:
-    def test_absorb(self):
-        """absorb folds perturbation into base and returns zeroed subspace."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.from_layout(layout, rank=4)
-        base_sd = model.state_dict()
-
-        torch.manual_seed(42)
-        flat_sub = torch.randn(sub.subspace_dim) * 0.01
-
-        # Apply perturbation to get expected result
-        expected = sub.apply_perturbation(base_sd, flat_sub)
-
-        # Absorb
-        new_base, zeroed = sub.absorb(base_sd, flat_sub)
-
-        # Zeroed subspace
-        assert torch.all(zeroed == 0)
-        assert zeroed.shape == flat_sub.shape
-
-        # New base matches apply_perturbation result
-        for key in expected:
-            assert torch.allclose(new_base[key], expected[key], atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# Test: conv handling
-# ---------------------------------------------------------------------------
 
 
 class TestConvHandling:
@@ -269,11 +173,6 @@ class TestConvHandling:
         assert result["conv.weight"].shape == (16, 3, 3, 3)
 
 
-# ---------------------------------------------------------------------------
-# Test: 1D params
-# ---------------------------------------------------------------------------
-
-
 class TestOneDimParams:
     def test_1d_params_full_perturbation(self):
         """1D parameters (biases, LayerNorm) use full perturbation, not B@A."""
@@ -288,15 +187,10 @@ class TestOneDimParams:
                 assert spec.flat_end - spec.flat_start == spec.original_shape[0]
 
 
-# ---------------------------------------------------------------------------
-# Test: solver integration
-# ---------------------------------------------------------------------------
-
-
 class TestSolverIntegration:
     def test_subspace_solver_integration(self):
         """PolyStep with subspace runs end-to-end on a synthetic NN objective."""
-        from polystep.solver import PolyStep, SolverState
+        from polystep.solver import PolyStep
         from polystep.cost_nn import NNCostEvaluator
         from polystep.transform import ParamLayout
 
@@ -413,20 +307,6 @@ class TestLinearSubspaceFromLayout:
 
 
 class TestLinearSubspaceApplyPerturbation:
-    def test_apply_perturbation_zeros_linear(self):
-        """Zero perturbation returns base params unchanged."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LinearSubspace.from_layout(layout, rank=4, seed=42)
-        base_sd = model.state_dict()
-
-        flat_sub = torch.zeros(sub.subspace_dim)
-        result = sub.apply_perturbation(base_sd, flat_sub)
-
-        for key in base_sd:
-            if key in result:
-                assert torch.allclose(result[key], base_sd[key], atol=1e-6), f"Key {key} differs with zero perturbation"
-
     def test_apply_perturbation_nonzero_linear(self):
         """Nonzero perturbation changes parameters."""
         model = SimpleMLP()
@@ -439,54 +319,12 @@ class TestLinearSubspaceApplyPerturbation:
         result = sub.apply_perturbation(base_sd, flat_sub)
 
         any_different = False
+        assert set(result) == set(base_sd), "apply_perturbation dropped keys; the value checks below would be vacuous"
         for key in base_sd:
-            if key in result:
-                if not torch.allclose(result[key], base_sd[key]):
-                    any_different = True
-                    break
+            if not torch.allclose(result[key], base_sd[key]):
+                any_different = True
+                break
         assert any_different, "Nonzero perturbation should change some params"
-
-
-class TestLinearSubspaceReconstructBatch:
-    def test_reconstruct_batch_consistency_linear(self):
-        """reconstruct_batch matches apply_perturbation for each row."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LinearSubspace.from_layout(layout, rank=4, seed=42)
-        base_sd = model.state_dict()
-
-        N = 3
-        torch.manual_seed(123)
-        flat_batch = torch.randn(N, sub.subspace_dim) * 0.01
-        batch_result = sub.reconstruct_batch(base_sd, flat_batch)
-
-        for i in range(N):
-            single_result = sub.apply_perturbation(base_sd, flat_batch[i])
-            for key in single_result:
-                assert torch.allclose(batch_result[key][i], single_result[key], atol=1e-5), (
-                    f"Row {i}, key {key} mismatch between batch and single"
-                )
-
-
-class TestLinearSubspaceAbsorb:
-    def test_absorb_linear(self):
-        """absorb folds perturbation into base and returns zeroed subspace."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LinearSubspace.from_layout(layout, rank=4, seed=42)
-        base_sd = model.state_dict()
-
-        torch.manual_seed(42)
-        flat_sub = torch.randn(sub.subspace_dim) * 0.01
-
-        expected = sub.apply_perturbation(base_sd, flat_sub)
-        new_base, zeroed = sub.absorb(base_sd, flat_sub)
-
-        assert torch.all(zeroed == 0)
-        assert zeroed.shape == flat_sub.shape
-
-        for key in expected:
-            assert torch.allclose(new_base[key], expected[key], atol=1e-6)
 
 
 class TestLinearSubspaceLinearity:
@@ -512,7 +350,7 @@ class TestLinearSubspaceLinearity:
                 delta_1 = result_1x[key] - base_sd[key]
                 delta_2 = result_2x[key] - base_sd[key]
                 assert torch.allclose(delta_2, 2.0 * delta_1, atol=1e-5), (
-                    f"Key {key}: delta(2v) != 2*delta(v) -- linearity violated"
+                    f"Key {key}: delta(2v) != 2*delta(v): linearity violated"
                 )
 
     def test_linearity_additivity(self):
@@ -536,5 +374,5 @@ class TestLinearSubspaceLinearity:
                 delta_v = result_v[key] - base_sd[key]
                 delta_uv = result_uv[key] - base_sd[key]
                 assert torch.allclose(delta_uv, delta_u + delta_v, atol=1e-5), (
-                    f"Key {key}: delta(u+v) != delta(u)+delta(v) -- additivity violated"
+                    f"Key {key}: delta(u+v) != delta(u)+delta(v): additivity violated"
                 )

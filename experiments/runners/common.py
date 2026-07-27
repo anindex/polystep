@@ -50,29 +50,18 @@ from polystep.benchmarks.utils import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Tonic availability check (for neuromorphic datasets)
-# ---------------------------------------------------------------------------
-
 _HAS_TONIC = False
 try:
     import tonic
     import tonic.transforms as tonic_transforms
+
     _HAS_TONIC = True
 except ImportError:
     pass
 
 
-# ---------------------------------------------------------------------------
-# Seeds for publication rigor (5 seeds, extending the 3-seed benchmarks list)
-# ---------------------------------------------------------------------------
-
 SEEDS: List[int] = [42, 123, 456, 789, 1337]
 
-
-# ---------------------------------------------------------------------------
-# Default results directory (relative to repo root)
-# ---------------------------------------------------------------------------
 
 _DEFAULT_RESULTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -81,10 +70,6 @@ _DEFAULT_RESULTS_DIR = os.path.join(
     "main",
 )
 
-
-# ---------------------------------------------------------------------------
-# Environment info (extends benchmarks/utils.py version)
-# ---------------------------------------------------------------------------
 
 def get_environment_info() -> Dict[str, Any]:
     """Collect environment info for reproducibility.
@@ -107,10 +92,6 @@ def get_environment_info() -> Dict[str, Any]:
 
     return info
 
-
-# ---------------------------------------------------------------------------
-# GPU memory tracking
-# ---------------------------------------------------------------------------
 
 @contextmanager
 def track_gpu_memory():
@@ -141,10 +122,6 @@ def track_gpu_memory():
             peak_bytes = torch.cuda.max_memory_allocated()
             result["peak_gpu_memory_mb"] = round(peak_bytes / (1024 * 1024), 2)
 
-
-# ---------------------------------------------------------------------------
-# Result saving
-# ---------------------------------------------------------------------------
 
 def save_result(
     benchmark: str,
@@ -239,10 +216,6 @@ def save_result(
     return filepath
 
 
-# ---------------------------------------------------------------------------
-# Accuracy evaluation
-# ---------------------------------------------------------------------------
-
 @torch.no_grad()
 def evaluate_accuracy(
     model: nn.Module,
@@ -306,10 +279,6 @@ def evaluate_accuracy(
     return correct / total if total > 0 else 0.0
 
 
-# ---------------------------------------------------------------------------
-# Parameter flattening (for gradient-free baselines: OpenAI ES, SPSA)
-# ---------------------------------------------------------------------------
-
 def load_flat_params(model: nn.Module) -> torch.Tensor:
     """Flatten all model parameters into a single 1D tensor.
 
@@ -335,10 +304,7 @@ def set_flat_params(model: nn.Module, flat_params: torch.Tensor) -> None:
     """
     total_params = sum(p.numel() for p in model.parameters())
     if flat_params.numel() != total_params:
-        raise ValueError(
-            f"flat_params has {flat_params.numel()} elements, "
-            f"but model has {total_params} parameters"
-        )
+        raise ValueError(f"flat_params has {flat_params.numel()} elements, but model has {total_params} parameters")
 
     offset = 0
     for p in model.parameters():
@@ -346,10 +312,6 @@ def set_flat_params(model: nn.Module, flat_params: torch.Tensor) -> None:
         p.data.copy_(flat_params[offset : offset + numel].reshape(p.shape))
         offset += numel
 
-
-# ---------------------------------------------------------------------------
-# Convenience: create standard loss function
-# ---------------------------------------------------------------------------
 
 def get_loss_fn(benchmark: str) -> nn.Module:
     """Get the standard loss function for a benchmark.
@@ -362,10 +324,6 @@ def get_loss_fn(benchmark: str) -> nn.Module:
     """
     return nn.CrossEntropyLoss()
 
-
-# ---------------------------------------------------------------------------
-# Seed management
-# ---------------------------------------------------------------------------
 
 def set_seed(seed: int) -> None:
     """Set random seeds for reproducibility.
@@ -386,11 +344,6 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
-
-# ---------------------------------------------------------------------------
-# Validation-split helper for leakage-free model selection
-# ---------------------------------------------------------------------------
 
 
 def make_train_val_split(
@@ -427,7 +380,9 @@ def make_train_val_split(
 
     g = torch.Generator().manual_seed(seed)
     train_subset, val_subset = torch.utils.data.random_split(
-        dataset, [n_train, n_val], generator=g,
+        dataset,
+        [n_train, n_val],
+        generator=g,
     )
 
     batch_size = getattr(train_loader, "batch_size", 64) or 64
@@ -450,10 +405,6 @@ def make_train_val_split(
     )
     return new_train_loader, val_loader
 
-
-# ---------------------------------------------------------------------------
-# Data loading: MNIST (via benchmarks/utils.py)
-# ---------------------------------------------------------------------------
 
 def load_mnist(
     data_dir: str = "data/",
@@ -488,10 +439,6 @@ def load_mnist(
     )
 
 
-# ---------------------------------------------------------------------------
-# Data loading: Fashion-MNIST
-# ---------------------------------------------------------------------------
-
 def load_fashion_mnist(
     data_dir: str = "data/",
     batch_size: int = 512,
@@ -512,20 +459,18 @@ def load_fashion_mnist(
     from torchvision import datasets, transforms
 
     fmnist_dir = os.path.join(data_dir, "fashion_mnist")
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.2860,), (0.3530,)),
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.2860,), (0.3530,)),
+        ]
+    )
     train_ds = datasets.FashionMNIST(fmnist_dir, train=True, download=True, transform=transform)
     test_ds = datasets.FashionMNIST(fmnist_dir, train=False, download=True, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     return train_loader, test_loader
 
-
-# ---------------------------------------------------------------------------
-# Data loading: CIFAR-10 (via benchmarks/utils.py)
-# ---------------------------------------------------------------------------
 
 def load_cifar10(
     data_dir: str = "data/",
@@ -552,10 +497,6 @@ def load_cifar10(
     )
 
 
-# ---------------------------------------------------------------------------
-# Data loading: DVS-Gesture (Tonic, no synthetic fallback)
-# ---------------------------------------------------------------------------
-
 def load_dvs_gesture(
     data_dir: str = "data/",
     num_steps: int = 25,
@@ -564,7 +505,7 @@ def load_dvs_gesture(
     """Load DVS-Gesture dataset via Tonic.
 
     Uses ``tonic.datasets.DVSGesture`` with Denoise + ToFrame transforms.
-    There is **no synthetic fallback** -- if Tonic is not installed or the
+    There is **no synthetic fallback**: if Tonic is not installed or the
     dataset cannot be downloaded, a ``RuntimeError`` is raised with
     instructions for manual resolution.
 
@@ -592,20 +533,26 @@ def load_dvs_gesture(
     dvs_dir = os.path.join(data_dir, "dvs_gesture")
     sensor_size = tonic.datasets.DVSGesture.sensor_size
 
-    transform = tonic.transforms.Compose([
-        tonic.transforms.Denoise(filter_time=10000),
-        tonic.transforms.ToFrame(
-            sensor_size=sensor_size,
-            n_time_bins=num_steps,
-        ),
-    ])
+    transform = tonic.transforms.Compose(
+        [
+            tonic.transforms.Denoise(filter_time=10000),
+            tonic.transforms.ToFrame(
+                sensor_size=sensor_size,
+                n_time_bins=num_steps,
+            ),
+        ]
+    )
 
     try:
         train_ds = tonic.datasets.DVSGesture(
-            save_to=dvs_dir, train=True, transform=transform,
+            save_to=dvs_dir,
+            train=True,
+            transform=transform,
         )
         test_ds = tonic.datasets.DVSGesture(
-            save_to=dvs_dir, train=False, transform=transform,
+            save_to=dvs_dir,
+            train=False,
+            transform=transform,
         )
     except Exception as e:
         raise RuntimeError(
@@ -618,19 +565,21 @@ def load_dvs_gesture(
     collate_fn = tonic.collation.PadTensors()
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=0, collate_fn=collate_fn,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_fn,
     )
     test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=0, collate_fn=collate_fn,
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn,
     )
     return train_loader, test_loader
 
-
-# ---------------------------------------------------------------------------
-# Data loading: N-MNIST (Tonic, no synthetic fallback)
-# ---------------------------------------------------------------------------
 
 def load_nmnist(
     data_dir: str = "data/",
@@ -640,7 +589,7 @@ def load_nmnist(
     """Load N-MNIST dataset via Tonic.
 
     Uses ``tonic.datasets.NMNIST`` with Denoise + ToFrame transforms.
-    There is **no synthetic fallback** -- raises ``RuntimeError`` if
+    There is **no synthetic fallback**: raises ``RuntimeError`` if
     Tonic is not installed or the dataset cannot be loaded.
 
     Args:
@@ -666,20 +615,26 @@ def load_nmnist(
     nmnist_dir = os.path.join(data_dir, "nmnist")
     sensor_size = tonic.datasets.NMNIST.sensor_size
 
-    transform = tonic.transforms.Compose([
-        tonic.transforms.Denoise(filter_time=10000),
-        tonic.transforms.ToFrame(
-            sensor_size=sensor_size,
-            n_time_bins=num_steps,
-        ),
-    ])
+    transform = tonic.transforms.Compose(
+        [
+            tonic.transforms.Denoise(filter_time=10000),
+            tonic.transforms.ToFrame(
+                sensor_size=sensor_size,
+                n_time_bins=num_steps,
+            ),
+        ]
+    )
 
     try:
         train_ds = tonic.datasets.NMNIST(
-            save_to=nmnist_dir, train=True, transform=transform,
+            save_to=nmnist_dir,
+            train=True,
+            transform=transform,
         )
         test_ds = tonic.datasets.NMNIST(
-            save_to=nmnist_dir, train=False, transform=transform,
+            save_to=nmnist_dir,
+            train=False,
+            transform=transform,
         )
     except Exception as e:
         raise RuntimeError(
@@ -691,19 +646,21 @@ def load_nmnist(
     collate_fn = tonic.collation.PadTensors()
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=0, collate_fn=collate_fn,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_fn,
     )
     test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=0, collate_fn=collate_fn,
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn,
     )
     return train_loader, test_loader
 
-
-# ---------------------------------------------------------------------------
-# Data loading: SHD (Tonic, no synthetic fallback)
-# ---------------------------------------------------------------------------
 
 class _ClampedToFrame:
     """Wrapper around tonic.transforms.ToFrame that clamps event indices.
@@ -719,11 +676,12 @@ class _ClampedToFrame:
 
     def __call__(self, events):
         import numpy as np
-        if isinstance(events, np.ndarray) and 'x' in events.dtype.names:
+
+        if isinstance(events, np.ndarray) and "x" in events.dtype.names:
             events = events.copy()
-            events['x'] = np.clip(events['x'], 0, self.sensor_size[0] - 1)
-            if 'y' in events.dtype.names and len(self.sensor_size) > 1:
-                events['y'] = np.clip(events['y'], 0, self.sensor_size[1] - 1)
+            events["x"] = np.clip(events["x"], 0, self.sensor_size[0] - 1)
+            if "y" in events.dtype.names and len(self.sensor_size) > 1:
+                events["y"] = np.clip(events["y"], 0, self.sensor_size[1] - 1)
         return self.to_frame(events)
 
 
@@ -732,7 +690,7 @@ def _shd_collate_fn(batch):
     data_list, label_list = [], []
     for frames, label in batch:
         t = torch.tensor(frames, dtype=torch.float32)
-        # SHD ToFrame produces (time, 1, 700) -- squeeze channel dim
+        # SHD ToFrame produces (time, 1, 700): squeeze channel dim
         if t.dim() == 3:
             t = t.squeeze(1)
         data_list.append(t)
@@ -750,7 +708,7 @@ def load_shd(
     """Load SHD (Spiking Heidelberg Digits) dataset via Tonic.
 
     Uses ``tonic.datasets.SHD`` with ToFrame transform. There is **no
-    synthetic fallback** -- raises ``RuntimeError`` if Tonic/h5py is
+    synthetic fallback**: raises ``RuntimeError`` if Tonic/h5py is
     not installed or the dataset cannot be loaded.
 
     Args:
@@ -768,16 +726,14 @@ def load_shd(
             loading fails.
     """
     if not _HAS_TONIC:
-        raise RuntimeError(
-            "SHD dataset not available. Install tonic and h5py "
-            "(pip install tonic h5py)."
-        )
+        raise RuntimeError("SHD dataset not available. Install tonic and h5py (pip install tonic h5py).")
 
     shd_dir = os.path.join(data_dir, "shd")
     sensor_size = tonic.datasets.SHD.sensor_size
 
     base_transform = tonic.transforms.ToFrame(
-        sensor_size=sensor_size, n_time_bins=num_steps,
+        sensor_size=sensor_size,
+        n_time_bins=num_steps,
     )
     # Clamp event indices to sensor_size bounds (SHD has occasional
     # out-of-bounds events that cause IndexError in ToFrame)
@@ -785,31 +741,34 @@ def load_shd(
 
     try:
         train_ds = tonic.datasets.SHD(
-            save_to=shd_dir, train=True, transform=transform,
+            save_to=shd_dir,
+            train=True,
+            transform=transform,
         )
         test_ds = tonic.datasets.SHD(
-            save_to=shd_dir, train=False, transform=transform,
+            save_to=shd_dir,
+            train=False,
+            transform=transform,
         )
     except Exception as e:
-        raise RuntimeError(
-            f"SHD dataset loading failed: {e}. "
-            "Install tonic and h5py (pip install tonic h5py)."
-        ) from e
+        raise RuntimeError(f"SHD dataset loading failed: {e}. Install tonic and h5py (pip install tonic h5py).") from e
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=0, collate_fn=_shd_collate_fn,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=_shd_collate_fn,
     )
     test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=0, collate_fn=_shd_collate_fn,
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_shd_collate_fn,
     )
     return train_loader, test_loader
 
-
-# ---------------------------------------------------------------------------
-# Function evaluation counter
-# ---------------------------------------------------------------------------
 
 class FunctionEvalCounter:
     """Wraps a loss function to count forward pass evaluations.
@@ -838,23 +797,19 @@ class FunctionEvalCounter:
         self.count = 0
 
     def to(self, device):
-        if hasattr(self.loss_fn, 'to'):
+        if hasattr(self.loss_fn, "to"):
             self.loss_fn = self.loss_fn.to(device)
         return self
 
-
-# ---------------------------------------------------------------------------
-# Unified experiment runner
-# ---------------------------------------------------------------------------
 
 def run_experiment(
     model_fn,
     train_loader,
     test_loader,
-    method='polystep',
-    benchmark='nondiff',
+    method="polystep",
+    benchmark="nondiff",
     seeds=None,
-    device='cuda',
+    device="cuda",
     epochs=20,
     method_config=None,
     results_dir=None,
@@ -904,30 +859,57 @@ def run_experiment(
         start_time = time.time()
 
         with track_gpu_memory() as mem:
-            if method == 'adam':
+            if method == "adam":
                 result = _run_adam(
-                    model, train_loader, test_loader, current_loss_fn,
-                    epochs, device, seed, method_config,
+                    model,
+                    train_loader,
+                    test_loader,
+                    current_loss_fn,
+                    epochs,
+                    device,
+                    seed,
+                    method_config,
                 )
-            elif method == 'openai_es':
+            elif method == "openai_es":
                 result = _run_openai_es(
-                    model, train_loader, test_loader, current_loss_fn,
-                    device, seed, method_config,
+                    model,
+                    train_loader,
+                    test_loader,
+                    current_loss_fn,
+                    device,
+                    seed,
+                    method_config,
                 )
-            elif method == 'spsa':
+            elif method == "spsa":
                 result = _run_spsa(
-                    model, train_loader, test_loader, current_loss_fn,
-                    device, seed, method_config,
+                    model,
+                    train_loader,
+                    test_loader,
+                    current_loss_fn,
+                    device,
+                    seed,
+                    method_config,
                 )
-            elif method == 'cmaes':
+            elif method == "cmaes":
                 result = _run_cmaes(
-                    model, train_loader, test_loader, current_loss_fn,
-                    device, seed, method_config,
+                    model,
+                    train_loader,
+                    test_loader,
+                    current_loss_fn,
+                    device,
+                    seed,
+                    method_config,
                 )
-            elif method == 'polystep':
+            elif method == "polystep":
                 result = _run_polystep(
-                    model, train_loader, test_loader, current_loss_fn,
-                    epochs, device, seed, method_config,
+                    model,
+                    train_loader,
+                    test_loader,
+                    current_loss_fn,
+                    epochs,
+                    device,
+                    seed,
+                    method_config,
                 )
             else:
                 raise ValueError(f"Unknown method: {method}")
@@ -964,9 +946,9 @@ def _run_adam(model, train_loader, test_loader, loss_fn, epochs, device, seed, c
         train_loader=train_loader,
         test_loader=test_loader,
         loss_fn=loss_fn,
-        optimizer_name='adam',
-        lr=config.get('lr', 0.001),
-        weight_decay=config.get('weight_decay', 0.0),
+        optimizer_name="adam",
+        lr=config.get("lr", 0.001),
+        weight_decay=config.get("weight_decay", 0.0),
         epochs=epochs,
         device=device,
         seed=seed,
@@ -983,13 +965,13 @@ def _run_openai_es(model, train_loader, test_loader, loss_fn, device, seed, conf
         train_loader=train_loader,
         test_loader=test_loader,
         loss_fn=loss_fn,
-        sigma=config.get('sigma', 0.02),
-        lr=config.get('lr', 0.01),
-        population_size=config.get('population_size', 50),
-        generations=config.get('generations', 200),
-        lr_decay=config.get('lr_decay', False),
-        weight_decay=config.get('weight_decay', 0.0),
-        fitness_shaping=config.get('fitness_shaping', 'zscore'),
+        sigma=config.get("sigma", 0.02),
+        lr=config.get("lr", 0.01),
+        population_size=config.get("population_size", 50),
+        generations=config.get("generations", 200),
+        lr_decay=config.get("lr_decay", False),
+        weight_decay=config.get("weight_decay", 0.0),
+        fitness_shaping=config.get("fitness_shaping", "zscore"),
         device=device,
         seed=seed,
     )
@@ -1005,12 +987,12 @@ def _run_spsa(model, train_loader, test_loader, loss_fn, device, seed, config):
         train_loader=train_loader,
         test_loader=test_loader,
         loss_fn=loss_fn,
-        a=config.get('a', 0.1),
-        c=config.get('c', 0.1),
-        A=config.get('A', None),
-        alpha=config.get('alpha', 0.602),
-        gamma=config.get('gamma', 0.101),
-        max_iters=config.get('max_iters', 5000),
+        a=config.get("a", 0.1),
+        c=config.get("c", 0.1),
+        A=config.get("A", None),
+        alpha=config.get("alpha", 0.602),
+        gamma=config.get("gamma", 0.101),
+        max_iters=config.get("max_iters", 5000),
         device=device,
         seed=seed,
     )
@@ -1022,15 +1004,10 @@ def _run_cmaes(model, train_loader, test_loader, loss_fn, device, seed, config):
     try:
         from polystep.benchmarks.baselines import train_cmaes, has_evotorch
     except ImportError:
-        raise RuntimeError(
-            "CMA-ES requires polystep.benchmarks.baselines. "
-            "Install evotorch or pycma."
-        )
+        raise RuntimeError("CMA-ES requires polystep.benchmarks.baselines. Install evotorch or pycma.")
 
     if not has_evotorch():
-        raise RuntimeError(
-            "CMA-ES requires EvoTorch. Install with: pip install evotorch"
-        )
+        raise RuntimeError("CMA-ES requires EvoTorch. Install with: pip install evotorch")
 
     # Extract full dataset tensors from loaders
     train_data_list, train_labels_list = [], []
@@ -1053,9 +1030,9 @@ def _run_cmaes(model, train_loader, test_loader, loss_fn, device, seed, config):
         train_labels=train_labels,
         test_data=test_data,
         test_labels=test_labels,
-        generations=config.get('generations', 200),
-        popsize=config.get('popsize', 16),
-        stdev_init=config.get('stdev_init', 0.5),
+        generations=config.get("generations", 200),
+        popsize=config.get("popsize", 16),
+        stdev_init=config.get("stdev_init", 0.5),
         device=device,
         verbose=False,
     )
@@ -1081,26 +1058,26 @@ def _run_polystep(model, train_loader, test_loader, loss_fn, epochs, device, see
 
     optimizer = PolyStepOptimizer(
         model,
-        compile=config.get('compile', False),
+        compile=config.get("compile", False),
         seed=seed,
-        epsilon=config.get('epsilon', 0.5),
-        step_radius=config.get('step_radius', 2.0),
-        probe_radius=config.get('probe_radius', 1.0),
-        num_probe=config.get('num_probe', 3),
-        sinkhorn_max_iters=config.get('sinkhorn_max_iters', 50),
-        amortize_steps=config.get('amortize_steps', 2),
-        amortize_ema=config.get('amortize_ema', 0.7),
-        biased_rotation=config.get('biased_rotation', True),
-        anderson_depth=config.get('anderson_depth', 5),
-        adaptive_omega=config.get('adaptive_omega', True),
-        solver=config.get('solver'),
+        epsilon=config.get("epsilon", 0.5),
+        step_radius=config.get("step_radius", 2.0),
+        probe_radius=config.get("probe_radius", 1.0),
+        num_probe=config.get("num_probe", 3),
+        sinkhorn_max_iters=config.get("sinkhorn_max_iters", 50),
+        amortize_steps=config.get("amortize_steps", 2),
+        amortize_ema=config.get("amortize_ema", 0.7),
+        biased_rotation=config.get("biased_rotation", True),
+        anderson_depth=config.get("anderson_depth", 5),
+        adaptive_omega=config.get("adaptive_omega", True),
+        solver=config.get("solver"),
     )
 
     evaluator = NNCostEvaluator(
         model,
         loss_fn=loss_fn,
-        compile_vmap=config.get('compile_evaluator', False),
-        compile_forward=config.get('compile_forward', False),
+        compile_vmap=config.get("compile_evaluator", False),
+        compile_forward=config.get("compile_forward", False),
     )
     epoch_logs = []
     best_accuracy = 0.0
@@ -1124,7 +1101,7 @@ def _run_polystep(model, train_loader, test_loader, loss_fn, epochs, device, see
             with torch.no_grad():
                 output = model(data)
                 loss = loss_fn(output, targets)
-                if hasattr(loss, 'item'):
+                if hasattr(loss, "item"):
                     epoch_loss += loss.item()
                 else:
                     epoch_loss += float(loss)
@@ -1135,12 +1112,14 @@ def _run_polystep(model, train_loader, test_loader, loss_fn, epochs, device, see
         epoch_time = time.time() - epoch_start
         avg_loss = epoch_loss / max(len(train_loader), 1)
 
-        epoch_logs.append({
-            "epoch": epoch + 1,
-            "accuracy": test_acc,
-            "loss": avg_loss,
-            "time": epoch_time,
-        })
+        epoch_logs.append(
+            {
+                "epoch": epoch + 1,
+                "accuracy": test_acc,
+                "loss": avg_loss,
+                "time": epoch_time,
+            }
+        )
 
     final_acc = evaluate_accuracy(model, test_loader, device=device)
     best_accuracy = max(best_accuracy, final_acc)

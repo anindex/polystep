@@ -10,8 +10,8 @@ Smoke-scale benchmark snapshot. Produced by benchmark scripts.
 
 These are smoke-scale benchmarks - their purpose is to confirm that
 changes do not regress core optimizer behavior, NOT to reproduce
-the headline numbers in [`EXPERIMENT_INDEX.md`](EXPERIMENT_INDEX.md).
-Full headline reproduction (5 seeds, full MNIST 3 epochs etc.) lives
+the reported numbers in [`EXPERIMENT_INDEX.md`](EXPERIMENT_INDEX.md).
+Full reproduction (5 seeds, full MNIST 3 epochs etc.) lives
 under `experiments/runners/run_*.py` and is left as future GPU work.
 
 ## Results
@@ -49,4 +49,4 @@ under `experiments/runners/run_*.py` and is left as future GPU work.
 - The MNIST-MLP smoke uses random Gaussian inputs (no torchvision dependency); it measures step latency, not accuracy.
 - MAX-SAT 1K satisfied fraction should exceed ~0.9 within 200 steps when python-sat is available.
 
-For full headline reproduction, see [`EXPERIMENT_INDEX.md`](EXPERIMENT_INDEX.md) and `experiments/runners/run_all_paper.sh`.
+For full reproduction, see [`EXPERIMENT_INDEX.md`](EXPERIMENT_INDEX.md) and `experiments/runners/run_all_paper.sh`.

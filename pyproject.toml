@@ -11,22 +11,29 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["torch>=2.4", "numpy>=1.24"]
+# numpy is required at import time by the shipped polystep.benchmarks subpackage
+# (utils, baselines, rl.gym_evaluator), not by the optimizer itself.
+dependencies = ["torch>=2.8", "numpy>=2.0"]
 keywords = ["pytorch", "optimal-transport", "gradient-free", "sinkhorn", "polystep", "optimization", "neural-network"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
 
 [project.urls]
 Homepage = "https://github.com/anindex/polystep"
 Repository = "https://github.com/anindex/polystep"
+Documentation = "https://github.com/anindex/polystep/blob/main/docs/api_overview.md"
+Changelog = "https://github.com/anindex/polystep/blob/main/CHANGELOG.md"
 Issues = "https://github.com/anindex/polystep/issues"
 
 [project.optional-dependencies]
@@ -36,6 +43,7 @@ examples = [
     "matplotlib>=3.8",
     "Pillow>=10.0",
     "gymnasium[classic-control]>=0.29",
+    "python-sat",  # example 04 generates its 3-SAT instance through pysat
 ]
 # Core dev: lint + test the library itself (no experiment deps)
 dev = [
@@ -43,12 +51,11 @@ dev = [
     "pytest-timeout>=2.2",
     "pytest-rerunfailures>=14.0",
     "pytest-cov>=5.0",
+    "pytest-xdist>=3.5",  # -n auto; the suite has no shared mutable state between tests
     "ruff==0.15.12",  # pinned to match CI so `ruff format` never disagrees local vs CI
 ]
 # Full experiment reproduction (paper results, ablations, baselines)
 experiments = [
-    "scipy>=1.11",
-    "statsmodels>=0.14",
     "pandas>=2.0",
     "python-sat",  # unusual pre-release versioning, left unpinned to stay installable
     "torchvision>=0.25",
@@ -98,6 +105,7 @@ testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "gpu: marks tests requiring CUDA GPU",
+    "flaky: retried by pytest-rerunfailures; registered so a missing plugin only skips the retry",
 ]
 addopts = "-m 'not slow' --timeout=60"
 filterwarnings = [

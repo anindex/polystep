@@ -24,10 +24,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# Load a single result file
-# ---------------------------------------------------------------------------
-
 def load_single_result(path: str) -> Dict[str, Any]:
     """Load a single JSON result file and extract key fields into a flat dict.
 
@@ -71,10 +67,6 @@ def load_single_result(path: str) -> Dict[str, Any]:
 
     return result
 
-
-# ---------------------------------------------------------------------------
-# Aggregate results into summary DataFrame
-# ---------------------------------------------------------------------------
 
 def aggregate_results(
     results_dir: str,
@@ -169,17 +161,13 @@ def aggregate_results(
                 "benchmark": bm,
                 "method": method,
                 "mean_accuracy": group["best_accuracy"].mean(),
-                "std_accuracy": group["best_accuracy"].std(ddof=1)
-                if len(group) > 1
-                else 0.0,
+                "std_accuracy": group["best_accuracy"].std(ddof=1) if len(group) > 1 else 0.0,
                 "mean_mse": mse_vals.mean() if has_mse else float("nan"),
                 "std_mse": mse_vals.std(ddof=1)
                 if has_mse and len(mse_vals) > 1
                 else (0.0 if has_mse else float("nan")),
                 "mean_time": group["wall_time_seconds"].mean(),
-                "std_time": group["wall_time_seconds"].std(ddof=1)
-                if len(group) > 1
-                else 0.0,
+                "std_time": group["wall_time_seconds"].std(ddof=1) if len(group) > 1 else 0.0,
                 "mean_memory": group["peak_gpu_memory_mb"].mean(),
                 "mean_func_evals": group["function_evals"].mean(),
                 "n_runs": len(group),
@@ -188,10 +176,6 @@ def aggregate_results(
 
     return pd.DataFrame(summary_rows, columns=summary_columns)
 
-
-# ---------------------------------------------------------------------------
-# Convergence curves
-# ---------------------------------------------------------------------------
 
 def get_epoch_curves(
     results_dir: str,
@@ -243,17 +227,10 @@ def get_epoch_curves(
     return curves
 
 
-# ---------------------------------------------------------------------------
-# CLI interface
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     """CLI entry point: aggregate results and print summary."""
     if len(sys.argv) < 2:
-        print(
-            "Usage: python experiments/scripts/aggregate_results.py <results_dir> "
-            "[--benchmark <name>]"
-        )
+        print("Usage: python experiments/scripts/aggregate_results.py <results_dir> [--benchmark <name>]")
         sys.exit(1)
 
     results_dir = sys.argv[1]

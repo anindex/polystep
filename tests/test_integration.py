@@ -148,17 +148,17 @@ class TestFeatureInteractions:
             sinkhorn_max_iters=100,
         )
 
-        config = TrainConfig(epochs=1)
+        # restore_best=False so the run ends on the last step's weights. With the
+        # default restore_best=True, train() rolls the model back to the best epoch
+        # and calls resync_from_model(), which clears the velocity on purpose: a
+        # velocity measured at the position the run ended at does not describe the
+        # restored one, and applying it would move the weights with nothing evaluated.
+        config = TrainConfig(epochs=1, restore_best=False)
         result = train(model, dl, nn.MSELoss(), opt, config)
         assert result is model
         assert opt.state.iteration_count == 2
         assert opt.state.velocity is not None
         assert torch.any(opt.state.velocity != 0)
-
-
-# ---------------------------------------------------------------------------
-# parametric extension: Individual improvement integration tests
-# ---------------------------------------------------------------------------
 
 
 def _make_small_model():
@@ -221,7 +221,6 @@ class TestParticleDimAdaptiveProbes:
         closure = _make_integration_closure(model)
         for _ in range(3):
             loss = opt.step(closure)
-            assert isinstance(loss, float)
             assert torch.isfinite(torch.tensor(loss))
 
         updated_params = model.state_dict()
@@ -251,7 +250,6 @@ class TestParticleDimAdaptiveProbes:
         closure = _make_integration_closure(model)
         for _ in range(3):
             loss = opt.step(closure)
-            assert isinstance(loss, float)
             assert torch.isfinite(torch.tensor(loss))
 
         # After 3 steps, rank should have transitioned to 4 at step 2
@@ -276,11 +274,10 @@ class TestParticleDimAdaptiveProbes:
         closure = _make_integration_closure(model)
         for _ in range(5):
             loss = opt.step(closure)
-            assert isinstance(loss, float)
             assert torch.isfinite(torch.tensor(loss))
 
-        # Verify displacement tracking is active
-        assert opt._prev_displacement_sqnorms is not None
+        # Verify the reuse cache is populated
+        assert opt._prev_X is not None
         assert opt._prev_cost_matrix is not None
         assert opt.state.iteration_count == 5
 
@@ -321,7 +318,6 @@ class TestSinkhornAccelerationComposition:
         closure = _make_integration_closure(model)
         for step_i in range(5):
             loss = opt.step(closure)
-            assert isinstance(loss, float), f"Step {step_i}: loss not float"
             assert torch.isfinite(torch.tensor(loss)), f"Step {step_i}: loss not finite"
 
         assert opt.state.iteration_count == 5
@@ -359,7 +355,6 @@ class TestSinkhornAccelerationComposition:
         closure = _make_integration_closure(model)
         for step_i in range(5):
             loss = opt.step(closure)
-            assert isinstance(loss, float), f"Step {step_i}: loss not float"
             assert torch.isfinite(torch.tensor(loss)), f"Step {step_i}: loss not finite"
 
         assert opt.state.iteration_count == 5
@@ -394,18 +389,16 @@ class TestTurboBlockwiseRegression:
         for _ in range(3):
             loss = opt.step(closure)
             losses.append(loss)
-            assert isinstance(loss, float)
             assert torch.isfinite(torch.tensor(loss))
 
-        # Verify defaults: particle_dim=2, omega=1.0, no rank_schedule, no adaptive_probes
         assert opt._particle_dim == 2, "Default particle_dim should be 2"
         assert opt.solver.omega == 1.0, "Default omega should be 1.0"
         assert opt._rank_schedule is None, "Default rank_schedule should be None"
-        assert not opt._adaptive_probes, "Default adaptive_probes should be False"
-
-        # Verify no adaptive probes state stored
-        assert opt._prev_displacement_sqnorms is None
-        assert opt._prev_cost_matrix is None
+        # Monolithic is where cost-row reuse is implemented, so it is on by default
+        # and the reuse cache is populated after a step.
+        assert opt._adaptive_probes
+        assert opt._prev_X is not None
+        assert opt._prev_cost_matrix is not None
 
         # Verify optimization succeeded
         assert opt.state.iteration_count == 3

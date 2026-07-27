@@ -1,7 +1,7 @@
 """Vmap-compatible LSTM bypassing CuDNN.
 
 Standard ``nn.LSTM`` (via ``aten::lstm.input``) has no batching rule under
-``torch.vmap`` and fails on both CPU and CUDA -- still the case on PyTorch
+``torch.vmap`` and fails on both CPU and CUDA: still the case on PyTorch
 2.12 (verified). This implementation uses explicit per-step gate
 computations, which are vmap-safe but ~2-5x slower than CuDNN.
 

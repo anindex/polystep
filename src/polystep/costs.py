@@ -52,28 +52,35 @@ def compute_cost_matrix(
     return cost_matrix
 
 
-def scale_cost_matrix(
+def resolve_cost_scale(
     cost_matrix: torch.Tensor,
     scale_cost: Optional[Union[str, float]] = None,
 ) -> torch.Tensor:
-    """Apply cost scaling to a cost matrix.
+    """Resolve the divisor ``scale_cost`` selects for this cost matrix.
+
+    Returned as a 0-d tensor on the cost matrix's device so callers can divide
+    and later multiply back without a host sync. ``None`` resolves to 1.
+
+    The data-dependent modes ('mean', 'max_cost') are *not* shift-invariant, so
+    callers must recenter with :func:`~polystep.solvers._prelude.recenter_cost`
+    first. Otherwise adding a constant to every cost changes the divisor, hence
+    the effective temperature, and the entropic plan moves: even though the
+    plan is mathematically invariant to that shift.
 
     Args:
-        cost_matrix: Raw cost matrix.
-        scale_cost: Scaling strategy ('mean', 'max_cost', or float).
+        cost_matrix: Cost matrix, already recentered by the caller.
+        scale_cost: Scaling strategy ('mean', 'max_cost', a float, or None).
 
     Returns:
-        Scaled cost matrix.
+        0-d tensor holding the divisor.
     """
     if scale_cost is None:
-        return cost_matrix
+        return cost_matrix.new_ones(())
 
     if scale_cost == "mean":
-        s = torch.clamp(cost_matrix.abs().mean(), min=1e-10)
-        return cost_matrix / s
+        return torch.clamp(cost_matrix.abs().mean(), min=1e-10)
     elif scale_cost == "max_cost":
-        s = torch.clamp(cost_matrix.abs().max(), min=1e-10)
-        return cost_matrix / s
+        return torch.clamp(cost_matrix.abs().max(), min=1e-10)
     elif isinstance(scale_cost, (int, float)):
         s = float(scale_cost)
         if not math.isfinite(s) or s <= 0.0:
@@ -81,6 +88,27 @@ def scale_cost_matrix(
                 f"Numeric scale_cost must be finite and positive, got {scale_cost!r}. "
                 "A negative divisor flips the cost sign and reverses the objective."
             )
-        return cost_matrix / s
+        return cost_matrix.new_full((), s)
     else:
         raise ValueError(f"Unknown scale_cost: {scale_cost!r}. Expected 'mean', 'max_cost', or a float.")
+
+
+def scale_cost_matrix(
+    cost_matrix: torch.Tensor,
+    scale_cost: Optional[Union[str, float]] = None,
+) -> torch.Tensor:
+    """Apply cost scaling to a cost matrix.
+
+    Thin wrapper over :func:`resolve_cost_scale`. Recenter before calling this
+    with a data-dependent mode; see that function for why.
+
+    Args:
+        cost_matrix: Cost matrix.
+        scale_cost: Scaling strategy ('mean', 'max_cost', or float).
+
+    Returns:
+        Scaled cost matrix.
+    """
+    if scale_cost is None:
+        return cost_matrix
+    return cost_matrix / resolve_cost_scale(cost_matrix, scale_cost)

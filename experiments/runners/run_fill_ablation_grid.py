@@ -37,13 +37,6 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "results"
 ABLATION_DIR = os.path.join(RESULTS_DIR, "softmax", "ablations")
 
 
-
-
-
-# ---------------------------------------------------------------------------
-# Training loop (matches original ablation)
-# ---------------------------------------------------------------------------
-
 BASE_CONFIG = {
     "rank": 4,
     "epsilon_init": 1.0,
@@ -57,8 +50,7 @@ BASE_CONFIG = {
 }
 
 
-def run_one(pr: float, sr: float, seed: int, device: str,
-            benchmark: str, out_dir: str) -> float:
+def run_one(pr: float, sr: float, seed: int, device: str, benchmark: str, out_dir: str) -> float:
     """Run a single ablation cell and save result."""
     from polystep.optimizer import PolyStepOptimizer
     from polystep.epsilon import CosineEpsilon
@@ -86,18 +78,26 @@ def run_one(pr: float, sr: float, seed: int, device: str,
 
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
-        layout, rank=BASE_CONFIG["rank"],
-        rotation_mode="random", rotation_interval=0,
-        absorb_mode="periodic", absorb_interval=BASE_CONFIG["absorb_interval"],
+        layout,
+        rank=BASE_CONFIG["rank"],
+        rotation_mode="random",
+        rotation_interval=0,
+        absorb_mode="periodic",
+        absorb_interval=BASE_CONFIG["absorb_interval"],
     )
 
     optimizer = PolyStepOptimizer(
-        model, compile=False, seed=seed,
+        model,
+        compile=False,
+        seed=seed,
         epsilon=CosineEpsilon(init=eps_init, target=eps_target, decay=eps_decay),
-        step_radius=sr, probe_radius=pr,
+        step_radius=sr,
+        probe_radius=pr,
         num_probe=BASE_CONFIG["num_probe"],
         sinkhorn_max_iters=BASE_CONFIG["sinkhorn_max_iters"],
-        subspace=subspace, chunk_size=1024, amortize_steps=3,
+        subspace=subspace,
+        chunk_size=1024,
+        amortize_steps=3,
     )
     evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
 
@@ -111,22 +111,26 @@ def run_one(pr: float, sr: float, seed: int, device: str,
         for epoch in range(epochs):
             for data, targets in train_loader:
                 data, targets = data.to(device), targets.to(device)
+
                 def closure(bp, _d=data, _t=targets):
                     nonlocal fwd_count
                     fwd_count += next(iter(bp.values())).shape[0]
                     return evaluator.evaluate(bp, _d, _t)
+
                 optimizer.step(closure)
                 step_count += 1
 
             test_acc = evaluate_accuracy(model, test_loader, device=device)
             best_acc = max(best_acc, test_acc)
-            epoch_logs.append({
-                "epoch": epoch + 1,
-                "accuracy": test_acc,
-                "cumulative_function_evals": fwd_count,
-                "wall_time": time.time() - t0,
-            })
-            print(f"    [{method_name} s{seed}] ep{epoch+1}/{epochs} acc={test_acc*100:.1f}%")
+            epoch_logs.append(
+                {
+                    "epoch": epoch + 1,
+                    "accuracy": test_acc,
+                    "cumulative_function_evals": fwd_count,
+                    "wall_time": time.time() - t0,
+                }
+            )
+            print(f"    [{method_name} s{seed}] ep{epoch + 1}/{epochs} acc={test_acc * 100:.1f}%")
 
     wall = time.time() - t0
 
@@ -148,13 +152,11 @@ def run_one(pr: float, sr: float, seed: int, device: str,
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     with open(out_file, "w") as f:
         json.dump(result, f, indent=2)
-    print(f"  SAVED: {out_file} best={best_acc*100:.1f}%")
+    print(f"  SAVED: {out_file} best={best_acc * 100:.1f}%")
     return best_acc
 
 
-
-def run_epsilon_one(ei: float, et: float, seed: int, device: str,
-                    out_dir: str) -> float:
+def run_epsilon_one(ei: float, et: float, seed: int, device: str, out_dir: str) -> float:
     """Run a single epsilon ablation cell."""
     from polystep.optimizer import PolyStepOptimizer
     from polystep.epsilon import CosineEpsilon
@@ -181,18 +183,26 @@ def run_epsilon_one(ei: float, et: float, seed: int, device: str,
 
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
-        layout, rank=BASE_CONFIG["rank"],
-        rotation_mode="random", rotation_interval=0,
-        absorb_mode="periodic", absorb_interval=BASE_CONFIG["absorb_interval"],
+        layout,
+        rank=BASE_CONFIG["rank"],
+        rotation_mode="random",
+        rotation_interval=0,
+        absorb_mode="periodic",
+        absorb_interval=BASE_CONFIG["absorb_interval"],
     )
 
     optimizer = PolyStepOptimizer(
-        model, compile=False, seed=seed,
+        model,
+        compile=False,
+        seed=seed,
         epsilon=CosineEpsilon(init=ei, target=et, decay=eps_decay),
-        step_radius=4.5, probe_radius=1.0,
+        step_radius=4.5,
+        probe_radius=1.0,
         num_probe=BASE_CONFIG["num_probe"],
         sinkhorn_max_iters=BASE_CONFIG["sinkhorn_max_iters"],
-        subspace=subspace, chunk_size=1024, amortize_steps=3,
+        subspace=subspace,
+        chunk_size=1024,
+        amortize_steps=3,
     )
     evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
 
@@ -206,22 +216,26 @@ def run_epsilon_one(ei: float, et: float, seed: int, device: str,
         for epoch in range(epochs):
             for data, targets in train_loader:
                 data, targets = data.to(device), targets.to(device)
+
                 def closure(bp, _d=data, _t=targets):
                     nonlocal fwd_count
                     fwd_count += next(iter(bp.values())).shape[0]
                     return evaluator.evaluate(bp, _d, _t)
+
                 optimizer.step(closure)
                 step_count += 1
 
             test_acc = evaluate_accuracy(model, test_loader, device=device)
             best_acc = max(best_acc, test_acc)
-            epoch_logs.append({
-                "epoch": epoch + 1,
-                "accuracy": test_acc,
-                "cumulative_function_evals": fwd_count,
-                "wall_time": time.time() - t0,
-            })
-            print(f"    [{method_name} s{seed}] ep{epoch+1}/{epochs} acc={test_acc*100:.1f}%")
+            epoch_logs.append(
+                {
+                    "epoch": epoch + 1,
+                    "accuracy": test_acc,
+                    "cumulative_function_evals": fwd_count,
+                    "wall_time": time.time() - t0,
+                }
+            )
+            print(f"    [{method_name} s{seed}] ep{epoch + 1}/{epochs} acc={test_acc * 100:.1f}%")
 
     wall = time.time() - t0
 
@@ -243,13 +257,9 @@ def run_epsilon_one(ei: float, et: float, seed: int, device: str,
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     with open(out_file, "w") as f:
         json.dump(result, f, indent=2)
-    print(f"  SAVED: {out_file} best={best_acc*100:.1f}%")
+    print(f"  SAVED: {out_file} best={best_acc * 100:.1f}%")
     return best_acc
 
-
-# ---------------------------------------------------------------------------
-# Grid scan: find and fill missing cells
-# ---------------------------------------------------------------------------
 
 def scan_existing(out_dir: str, benchmark: str, pr_vals, sr_vals):
     """Scan existing results and return {(pr,sr): [seed, ...]}."""
@@ -275,8 +285,9 @@ def scan_existing(out_dir: str, benchmark: str, pr_vals, sr_vals):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--target-seeds", type=int, default=1,
-                        help="Min seeds per cell (1 is fine for heatmaps; 5 for line plots)")
+    parser.add_argument(
+        "--target-seeds", type=int, default=1, help="Min seeds per cell (1 is fine for heatmaps; 5 for line plots)"
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -294,7 +305,7 @@ def main():
     for pr in pr_vals:
         for sr in sr_vals:
             have = existing.get((pr, sr), [])
-            needed = [s for s in all_seeds[:args.target_seeds] if s not in have]
+            needed = [s for s in all_seeds[: args.target_seeds] if s not in have]
             status = f"have={len(have)}" + (f" NEED={len(needed)}" if needed else " ✓")
             print(f"  pr={pr} sr={sr}: {status}")
             for s in needed:
@@ -329,7 +340,7 @@ def main():
     for ei in ei_vals:
         for et in et_vals:
             have = eps_existing.get((ei, et), [])
-            needed = [s for s in all_seeds[:args.target_seeds] if s not in have]
+            needed = [s for s in all_seeds[: args.target_seeds] if s not in have]
             status = f"have={len(have)}" + (f" NEED={len(needed)}" if needed else " ✓")
             print(f"  ei={ei} et={et}: {status}")
             for s in needed:
@@ -345,20 +356,20 @@ def main():
 
     # === RUN RADIUS FILLS ===
     if radius_todo:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Running {len(radius_todo)} radius fills...")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         for i, (pr, sr, seed) in enumerate(radius_todo):
-            print(f"\n[{i+1}/{len(radius_todo)}] pr={pr} sr={sr} seed={seed}")
+            print(f"\n[{i + 1}/{len(radius_todo)}] pr={pr} sr={sr} seed={seed}")
             run_one(pr, sr, seed, args.device, "ablation_radius", radius_dir)
 
     # === RUN EPSILON FILLS ===
     if eps_todo:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Running {len(eps_todo)} epsilon fills...")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         for i, (ei, et, seed) in enumerate(eps_todo):
-            print(f"\n[{i+1}/{len(eps_todo)}] ei={ei} et={et} seed={seed}")
+            print(f"\n[{i + 1}/{len(eps_todo)}] ei={ei} et={et} seed={seed}")
             run_epsilon_one(ei, et, seed, args.device, epsilon_dir)
 
     print("\n=== ALL FILLS COMPLETE ===")

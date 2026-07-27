@@ -134,42 +134,12 @@ def test_newton_momentum_fallback_without_qm():
     assert opt._newton_direction is None
 
 
-def test_sobol_rotations_low_discrepancy():
-    """Sobol 2D rotations should have more uniform angle coverage than random."""
-    from polystep.geometry import get_sobol_rotation_matrices
-
-    rots = get_sobol_rotation_matrices(16, 2, device=torch.device("cpu"))
-    assert rots.shape == (16, 2, 2)
-    for i in range(16):
-        R = rots[i]
-        assert torch.allclose(R @ R.T, torch.eye(2), atol=1e-5)
-        assert torch.allclose(torch.det(R), torch.tensor(1.0), atol=1e-5)
-    # Check low discrepancy: angle gaps should have low coefficient of variation
-    angles = torch.atan2(rots[:, 1, 0], rots[:, 0, 0])
-    angles_sorted = torch.sort(angles)[0]
-    gaps = torch.diff(angles_sorted)
-    cv = gaps.std() / gaps.mean()
-    assert cv < 0.5
-
-
-def test_sobol_rotations_higher_dim():
-    """Sobol higher-dim rotations should produce valid SO(d) matrices."""
-    from polystep.geometry import get_sobol_rotation_matrices
-
-    rots = get_sobol_rotation_matrices(8, 4, device=torch.device("cpu"))
-    assert rots.shape == (8, 4, 4)
-    for i in range(8):
-        R = rots[i]
-        assert torch.allclose(R @ R.T, torch.eye(4), atol=1e-4)
-        assert torch.allclose(torch.det(R).abs(), torch.tensor(1.0), atol=1e-4)
-
-
 def test_trust_region_expands_on_accurate_prediction():
     """A correct improvement prediction must not shrink the trust region.
 
     The ratio uses negative = improvement; feeding the wrong sign made an
     accurate improving step read as a failure and collapse the radius to the
-    floor. A genuine expansion (multiplier > 1.0) is only reachable when the
+    floor. An expansion (multiplier > 1.0) is only reachable when the
     signs agree.
     """
     model, make_closure = _make_model_and_closure()
@@ -273,7 +243,9 @@ def test_multifidelity_screening_keeps_descending():
     closure = make_closure(opt)
     losses = [opt.step(closure) for _ in range(20)]
     assert all(torch.isfinite(torch.tensor(loss)) for loss in losses)
-    assert min(losses) < losses[0]
+    # Measured 0.64 at this seed. The ratchet this guards would leave the loss flat,
+    # which a bare `< losses[0]` would not catch.
+    assert min(losses) < losses[0] * 0.80, f"loss barely moved: {losses[0]:.4f} -> {min(losses):.4f}"
 
 
 def test_multifidelity_off_by_default():
@@ -305,11 +277,14 @@ def test_multifidelity_screening_skipped_for_non_orthoplex():
         seed=42,
     )
     closure = make_closure(opt)
-    loss1 = opt.step(closure)
-    assert torch.isfinite(torch.tensor(loss1))
-    # Second step would trigger screening on orthoplex - should be skipped for simplex
-    loss2 = opt.step(closure)
-    assert torch.isfinite(torch.tensor(loss2))
+    opt.step(closure)
+    # The second step is where screening would fire on an orthoplex.
+    opt.step(closure)
+
+    assert opt._last_screen_savings == 0.0, (
+        f"screening ran on a simplex polytope and reported {opt._last_screen_savings} savings; "
+        "the orthoplex-specific +/- pair indexing does not apply there"
+    )
 
 
 def test_all_dfo_features_compose():

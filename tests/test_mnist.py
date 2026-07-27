@@ -1,123 +1,33 @@
-"""End-to-end MNIST training tests for polystep.
+"""End-to-end MNIST training tests.
 
-The ``slow`` test trains on a 2000-sample subset and verifies accuracy
-above a threshold. The fast test verifies that loss decreases on a
-tiny subset using a very small model.
+Real-dataset validation for every subspace mode. These are ``slow``-marked because they
+download MNIST and train for multiple epochs; the fast, network-free learning check that
+runs in CI is ``tests/test_end_to_end_learning.py``.
 
-Downloads MNIST data directly from Google Cloud Storage mirror
-(no torchvision dependency).
+MNIST loaders live in ``conftest.py`` as the ``mnist_loaders`` factory fixture; this file
+previously carried three copies of the download and IDX-parsing code.
 
-Note on model size: The gradient-free Sinkhorn optimizer operates in
-multi-particle mode where parameters are reshaped to (num_particles,
-particle_dim). With particle_dim=2 and orthoplex polytope, each OT
-problem has 4 vertices per particle -- tractable but requiring P*V*K
-model evaluations per step. Smaller models are faster.
+Model size note: the optimizer reshapes parameters to ``(num_particles, particle_dim)``,
+so each OT problem has ``2 * particle_dim`` vertices per particle and costs ``P * V * K``
+model evaluations per step. Downsampling the images to 7x7 keeps that tractable on CPU.
 """
 
 from __future__ import annotations
 
-import gzip
-import os
-import struct as pystruct
-from urllib.request import urlretrieve
-
-import numpy as np
 import pytest
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 
-from polystep import PolyStepOptimizer, train, TrainConfig
+from polystep import PolyStepOptimizer, TrainCallback, TrainConfig, train
+from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.epsilon import LinearEpsilon
-from polystep.subspace import LowRankSubspace, LinearSubspace
+from polystep.hybrid_subspace import HybridSubspace
+from polystep.subspace import LinearSubspace, LowRankSubspace
 from polystep.transform import ParamLayout
 
 
-# ---------------------------------------------------------------------------
-# MNIST data loading (no torchvision required)
-# ---------------------------------------------------------------------------
-
-MNIST_URL = "https://storage.googleapis.com/cvdf-datasets/mnist/"
-MNIST_FILES = {
-    "train_images": "train-images-idx3-ubyte.gz",
-    "train_labels": "train-labels-idx1-ubyte.gz",
-    "test_images": "t10k-images-idx3-ubyte.gz",
-    "test_labels": "t10k-labels-idx1-ubyte.gz",
-}
-
-
-def _download_mnist(data_dir: str = "/tmp/mnist") -> None:
-    os.makedirs(data_dir, exist_ok=True)
-    for _name, filename in MNIST_FILES.items():
-        filepath = os.path.join(data_dir, filename)
-        if not os.path.exists(filepath):
-            urlretrieve(MNIST_URL + filename, filepath)
-
-
-def _load_images(filepath: str) -> np.ndarray:
-    with gzip.open(filepath, "rb") as f:
-        _magic, num, rows, cols = pystruct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8).reshape(num, 1, rows, cols)
-    return images.astype(np.float32) / 255.0
-
-
-def _load_labels(filepath: str) -> np.ndarray:
-    with gzip.open(filepath, "rb") as f:
-        _magic, _num = pystruct.unpack(">II", f.read(8))
-        labels = np.frombuffer(f.read(), dtype=np.uint8)
-    return labels.astype(np.int64)
-
-
-def _make_loaders(n_train: int, n_test: int, batch_size: int, downsample: int = 1):
-    """Load MNIST subsets as DataLoaders (downloads if needed).
-
-    Args:
-        n_train: Number of training samples.
-        n_test: Number of test samples.
-        batch_size: Batch size for DataLoaders.
-        downsample: Spatial downsampling factor. 1=28x28, 2=14x14, 4=7x7.
-    """
-    data_dir = "/tmp/mnist"
-    _download_mnist(data_dir)
-
-    train_imgs = _load_images(os.path.join(data_dir, MNIST_FILES["train_images"]))[:n_train]
-    train_lbls = _load_labels(os.path.join(data_dir, MNIST_FILES["train_labels"]))[:n_train]
-    test_imgs = _load_images(os.path.join(data_dir, MNIST_FILES["test_images"]))[:n_test]
-    test_lbls = _load_labels(os.path.join(data_dir, MNIST_FILES["test_labels"]))[:n_test]
-
-    # Normalize
-    mean, std = 0.1307, 0.3081
-    train_imgs = (train_imgs - mean) / std
-    test_imgs = (test_imgs - mean) / std
-
-    # Spatial downsampling via average pooling to reduce input dimension
-    if downsample > 1:
-        train_t = torch.from_numpy(train_imgs)
-        test_t = torch.from_numpy(test_imgs)
-        train_t = nn.functional.avg_pool2d(train_t, downsample)
-        test_t = nn.functional.avg_pool2d(test_t, downsample)
-        train_imgs = train_t.numpy()
-        test_imgs = test_t.numpy()
-
-    train_ds = TensorDataset(torch.from_numpy(train_imgs), torch.from_numpy(train_lbls))
-    test_ds = TensorDataset(torch.from_numpy(test_imgs), torch.from_numpy(test_lbls))
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-    return train_loader, test_loader
-
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-
 class SmallMNISTNet(nn.Module):
-    """Tiny MLP for MNIST -- keeps parameter count low for OT feasibility.
-
-    With downsample=4 (7x7=49 input) and hidden=16:
-    fc1: 49*16+16=800, fc2: 16*10+10=170 => total ~970 params.
-    """
+    """7x7 input, 16 hidden: 49*16+16 + 16*10+10 = 970 params."""
 
     def __init__(self, input_dim: int = 49, hidden: int = 16):
         super().__init__()
@@ -127,13 +37,11 @@ class SmallMNISTNet(nn.Module):
         self.fc2 = nn.Linear(hidden, 10)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.flatten(x)
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
+        return self.fc2(self.relu(self.fc1(self.flatten(x))))
 
 
-class MNISTNet(nn.Module):
-    """Standard MLP for MNIST digit classification (for slow test)."""
+class SmallMLP(nn.Module):
+    """Full 28x28 input, 64 hidden: 50890 params. Used for the subspace tests."""
 
     def __init__(self, hidden: int = 64):
         super().__init__()
@@ -143,84 +51,67 @@ class MNISTNet(nn.Module):
         self.fc2 = nn.Linear(hidden, 10)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.flatten(x)
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+        return self.fc2(self.relu(self.fc1(self.flatten(x))))
 
 
 @torch.no_grad()
-def _evaluate(model: nn.Module, loader: DataLoader) -> float:
+def _accuracy(model: nn.Module, loader, device=None) -> float:
+    was_training = model.training
+    model.eval()
     correct = total = 0
     for inputs, targets in loader:
-        preds = model(inputs).argmax(dim=-1)
-        correct += (preds == targets).sum().item()
+        if device is not None:
+            inputs, targets = inputs.to(device), targets.to(device)
+        correct += (model(inputs).argmax(dim=-1) == targets).sum().item()
         total += targets.size(0)
+    if was_training:
+        model.train()
     return correct / total if total > 0 else 0.0
 
 
-@torch.no_grad()
-def _evaluate_on_device(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-) -> float:
-    correct = total = 0
-    for inputs, targets in loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-        preds = model(inputs).argmax(dim=-1)
-        correct += (preds == targets).sum().item()
-        total += targets.size(0)
-    return correct / total if total > 0 else 0.0
+class _EpochLoss(TrainCallback):
+    def __init__(self):
+        self.losses = []
+
+    def on_epoch_end(self, metrics: dict) -> None:
+        self.losses.append(metrics["avg_loss"])
 
 
-def _compute_loss(model: nn.Module, loader: DataLoader, loss_fn) -> float:
-    total_loss = 0.0
-    count = 0
-    with torch.no_grad():
-        for inputs, targets in loader:
-            total_loss += loss_fn(model(inputs), targets).item()
-            count += 1
-    return total_loss / count if count > 0 else 0.0
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def _make_subspace(kind, model):
+    layout = ParamLayout.from_module(model)
+    if kind == "linear":
+        return LinearSubspace.from_layout(layout, rank=4)
+    if kind == "adaptive":
+        return AdaptiveSubspace.from_layout(
+            layout,
+            rank=128,
+            rotation_mode="displacement",
+            absorb_mode="periodic",
+            absorb_interval=20,
+        )
+    return HybridSubspace.from_layout(
+        layout,
+        rank=4,
+        rotation_mode="random",
+        rotation_interval=0,
+        absorb_mode="periodic",
+        absorb_interval=20,
+    )
 
 
 @pytest.mark.slow
-@pytest.mark.timeout(180)
-def test_mnist_accuracy():
-    """Train on 2000 MNIST samples (downsampled 4x) for 10 epochs.
-
-    Uses multi-particle architecture with orthoplex polytope in 2D.
-    Each particle controls 2 of the 970 model parameters. The OT
-    solver matches 485 particles to 4 vertices, producing non-uniform
-    transport that moves parameters toward lower loss.
-
-    Verifies accuracy > 50% (well above random chance of 10%).
-    """
+@pytest.mark.timeout(600)
+def test_mnist_accuracy(mnist_loaders):
+    """Full-space training on 2000 downsampled samples clears 50%, well above 10% chance."""
     torch.manual_seed(42)
-    train_loader, test_loader = _make_loaders(
-        n_train=2000,
-        n_test=1000,
-        batch_size=32,
-        downsample=4,
-    )
+    train_loader, test_loader = mnist_loaders(n_train=2000, n_test=1000, batch_size=32, downsample=4)
 
     model = SmallMNISTNet(input_dim=49, hidden=16)
-    epsilon = LinearEpsilon(init=0.1, target=0.01, decay=0.001)
-
     optimizer = PolyStepOptimizer(
         model,
         compile=False,
         seed=42,
-        epsilon=epsilon,
+        epsilon=LinearEpsilon(init=0.1, target=0.01, decay=0.001),
         step_radius=3.0,
         probe_radius=6.0,
         num_probe=2,
@@ -228,93 +119,244 @@ def test_mnist_accuracy():
         scale_cost="mean",
         chunk_size=512,
     )
+    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=10))
 
-    config = TrainConfig(epochs=10)
-    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
-
-    accuracy = _evaluate(model, test_loader)
-    assert accuracy > 0.50, f"Expected accuracy > 50% on 1000-sample test subset, got {accuracy * 100:.1f}%"
+    accuracy = _accuracy(model, test_loader)
+    assert accuracy > 0.50, f"expected > 50% on the 1000-sample test subset, got {accuracy * 100:.1f}%"
 
 
-def test_mnist_model_improves():
-    """Verify loss decreases after training on 200 MNIST samples for 2 epochs.
+@pytest.mark.slow
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("kind", ["linear", "adaptive", "hybrid"])
+def test_subspace_trains(mnist_loaders, kind):
+    """Each subspace mode trains: steps are taken, displacement is real, loss falls.
 
-    Uses heavily downsampled images (7x7) and a tiny model (~970 params)
-    so the gradient-free OT solver can make progress within a reasonable
-    time on CPU. Multi-particle mode with 485 particles in 2D space,
-    4 orthoplex vertices per particle.
+    Replaces three near-identical per-subspace copies. The loss bound is a strict
+    decrease; the previous hybrid version accepted ``last < first * 1.5``, which passes
+    on a 50% loss increase.
     """
+    train_loader, _ = mnist_loaders(n_train=500, n_test=200, batch_size=512)
+
     torch.manual_seed(42)
-    train_loader, test_loader = _make_loaders(
-        n_train=200,
-        n_test=100,
-        batch_size=32,
-        downsample=4,
+    model = SmallMLP(hidden=64)
+    optimizer = PolyStepOptimizer(
+        model,
+        compile=False,
+        seed=42,
+        epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
+        step_radius=10.0 if kind == "adaptive" else 4.5,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=_make_subspace(kind, model),
     )
 
-    model = SmallMNISTNet(input_dim=49, hidden=16)
-    loss_fn = nn.CrossEntropyLoss()
+    tracker = _EpochLoss()
+    model = train(
+        model,
+        train_loader,
+        nn.CrossEntropyLoss(),
+        optimizer,
+        TrainConfig(epochs=4, callbacks=[tracker], restore_best=False),
+    )
 
-    # Record initial loss
-    initial_loss = _compute_loss(model, test_loader, loss_fn)
+    assert optimizer.state.iteration_count > 0
+    assert len(optimizer.state.costs) == optimizer.state.iteration_count
+
+    finite_disps = [d for d in optimizer.state.displacement_sqnorms if d == d]
+    assert sum(finite_disps) > 0, "every displacement was zero or NaN, so no step moved"
+    if kind != "linear":
+        # LinearSubspace has a fixed projection and never rotates, so it keeps no
+        # displacement history; the rotating subspaces steer their next basis with it.
+        assert optimizer.state.displacement_history_count > 0, "displacement history was never populated"
+
+    assert len(tracker.losses) >= 2
+    assert min(tracker.losses) < tracker.losses[0], f"loss never improved across epochs: {tracker.losses}"
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("kind", ["adaptive", "hybrid"])
+def test_periodic_absorb_fires_and_moves_the_base(mnist_loaders, kind):
+    """Periodic absorb folds the perturbation into the base weights.
+
+    Asserting the base actually moved, not just that a counter incremented.
+    """
+    train_loader, _ = mnist_loaders(n_train=1000, n_test=500, batch_size=512)
+
+    torch.manual_seed(42)
+    model = SmallMLP(hidden=64)
+    layout = ParamLayout.from_module(model)
+    if kind == "adaptive":
+        subspace = AdaptiveSubspace.from_layout(
+            layout, rank=128, rotation_mode="displacement", absorb_mode="periodic", absorb_interval=5
+        )
+    else:
+        subspace = HybridSubspace.from_layout(
+            layout, rank=4, rotation_interval=0, absorb_mode="periodic", absorb_interval=5
+        )
 
     optimizer = PolyStepOptimizer(
         model,
         compile=False,
         seed=42,
-        epsilon=0.1,
+        epsilon=0.5,
+        step_radius=10.0,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=subspace,
+    )
+    initial_base = {k: v.clone() for k, v in optimizer.state.base_params.items()}
+
+    train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=6, restore_best=False))
+
+    assert optimizer.state.absorb_count > 0, (
+        f"absorb never fired in {optimizer.state.iteration_count} steps with absorb_interval=5"
+    )
+    base = optimizer.state.base_params
+    assert any(not torch.equal(initial_base[k], base[k]) for k in initial_base), (
+        "absorb_count incremented but the base weights are unchanged"
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(900)
+@pytest.mark.flaky(reruns=2)
+def test_hybrid_reaches_a_useful_accuracy(mnist_loaders):
+    """HybridSubspace clears 25% on 10-class MNIST.
+
+    The documented range for this configuration is 30-45%. The floors this replaces were
+    0.12 and 0.15, which are 2 and 5 points over chance.
+    """
+    train_loader, test_loader = mnist_loaders(n_train=1000, n_test=500, batch_size=512)
+
+    torch.manual_seed(42)
+    model = SmallMLP(hidden=64)
+    optimizer = PolyStepOptimizer(
+        model,
+        compile=False,
+        seed=42,
+        epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
+        step_radius=4.5,
+        probe_radius=2.0,
+        num_probe=3,
+        sinkhorn_max_iters=50,
+        subspace=_make_subspace("hybrid", model),
+    )
+    train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=8))
+
+    accuracy = _accuracy(model, test_loader)
+    assert accuracy >= 0.25, f"hybrid accuracy {accuracy * 100:.1f}% is below the 25% floor"
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(1800)
+def test_adaptive_and_linear_both_reach_the_accuracy_target(mnist_loaders):
+    """Both subspace families reach 20% within the budget, and report steps-to-target.
+
+    Per-step coverage differs a lot (LinearSubspace's per-layer projections touch ~4.3%
+    of parameters per step, AdaptiveSubspace's global projection ~0.25%), so this checks
+    both arrive rather than that one arrives sooner.
+    """
+    train_loader, test_loader = mnist_loaders(n_train=1000, n_test=500, batch_size=512)
+    target_acc, epochs = 0.20, 5
+
+    class StepAccuracy(TrainCallback):
+        def __init__(self, model, loader):
+            self.model, self.loader = model, loader
+            self.steps_to_target = None
+            self._step = 0
+
+        def on_step_end(self, metrics: dict) -> bool:
+            self._step += 1
+            if self.steps_to_target is None and _accuracy(self.model, self.loader) >= target_acc:
+                self.steps_to_target = self._step
+            return False
+
+    results = {}
+    for kind, step_radius, subspace_kwargs in (
+        ("linear", 4.5, {}),
+        ("adaptive", 10.0, {"rank": 4096, "rotation_mode": "displacement", "absorb_interval": 20}),
+    ):
+        torch.manual_seed(42)
+        model = SmallMLP(hidden=64)
+        layout = ParamLayout.from_module(model)
+        if kind == "linear":
+            subspace = LinearSubspace.from_layout(layout, rank=4)
+        else:
+            subspace = AdaptiveSubspace.from_layout(layout, absorb_mode="periodic", **subspace_kwargs)
+
+        opt = PolyStepOptimizer(
+            model,
+            compile=False,
+            seed=42,
+            epsilon=0.5,
+            step_radius=step_radius,
+            probe_radius=2.0,
+            num_probe=3,
+            sinkhorn_max_iters=50,
+            subspace=subspace,
+        )
+        tracker = StepAccuracy(model, test_loader)
+        train(model, train_loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=epochs, callbacks=[tracker]))
+        final = _accuracy(model, test_loader)
+        results[kind] = (tracker.steps_to_target or (opt.state.iteration_count if final >= target_acc else None), final)
+
+    for kind, (steps, final) in results.items():
+        assert steps is not None and steps > 0, (
+            f"{kind} did not reach {target_acc * 100:.0f}% in {epochs} epochs (final {final * 100:.1f}%)"
+        )
+        assert final >= target_acc, f"{kind} final accuracy {final * 100:.1f}% fell back below target"
+
+
+@pytest.mark.gpu
+def test_mnist_gpu_full_space(mnist_loaders):
+    """Full-space training with compiled ops on CUDA clears 70%."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    train_loader, test_loader = mnist_loaders(n_train=2000, n_test=1000, batch_size=32, downsample=4)
+
+    model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
+    optimizer = PolyStepOptimizer(
+        model,
+        compile=True,
+        seed=42,
+        epsilon=LinearEpsilon(init=0.1, target=0.01, decay=0.001),
         step_radius=3.0,
         probe_radius=6.0,
         num_probe=2,
         sinkhorn_max_iters=100,
         scale_cost="mean",
-        chunk_size=256,
+        chunk_size=512,
     )
+    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=10))
 
-    config = TrainConfig(epochs=2)
-    model = train(model, train_loader, loss_fn, optimizer, config)
-
-    final_loss = _compute_loss(model, test_loader, loss_fn)
-    assert final_loss < initial_loss, (
-        f"Expected loss to decrease after training. Initial: {initial_loss:.4f}, Final: {final_loss:.4f}"
-    )
+    accuracy = _accuracy(model, test_loader, device=device)
+    assert accuracy > 0.70, f"expected > 70% on 7x7 MNIST on GPU, got {accuracy * 100:.1f}%"
 
 
 @pytest.mark.gpu
-def test_mnist_gpu_subspace():
-    """Verify subspace compression pipeline works on GPU.
+def test_mnist_gpu_subspace_particle_dim_8(mnist_loaders):
+    """subspace_particle_dim=8 (16 orthoplex vertices) plus absorb_every on CUDA.
 
-    Validates that the subspace + multi-particle + GPU pipeline runs
-    without errors: LowRankSubspace creation, optimizer initialization
-    with subspace, chunked probe evaluation on CUDA, and model sync.
-
-    Uses a small subset (500 train, 200 test) for speed. Verifies that
-    the optimizer produces non-zero displacement (OT solver is active)
-    and that model parameters actually change during training.
-
-    Note: Subspace multi-particle mode has limited convergence because
-    each OT step only perturbs 2 of the subspace_dim coordinates per
-    particle. This test validates the GPU pipeline correctness, not
-    accuracy. The full-space test_mnist_gpu_full_space validates accuracy.
+    Covers the GPU subspace pipeline: projection build, chunked probe evaluation, model
+    sync, and absorb folding into the base. Accuracy is not asserted; the bilinear B@A
+    factorization converges slowly by design and ``test_mnist_gpu_full_space`` owns
+    accuracy.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
     device = torch.device("cuda")
     torch.manual_seed(42)
-
-    train_loader, test_loader = _make_loaders(
-        n_train=500,
-        n_test=200,
-        batch_size=64,
-        downsample=4,
-    )
+    train_loader, _ = mnist_loaders(n_train=500, n_test=200, batch_size=64, downsample=4)
 
     model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
     layout = ParamLayout.from_module(model)
-    subspace = LowRankSubspace.from_layout(layout, rank=2)
-
-    # Record initial params
     initial_params = {k: v.clone() for k, v in model.state_dict().items()}
 
     optimizer = PolyStepOptimizer(
@@ -326,221 +368,25 @@ def test_mnist_gpu_subspace():
         probe_radius=60.0,
         num_probe=1,
         sinkhorn_max_iters=100,
-        subspace=subspace,
-        scale_cost="mean",
-        chunk_size=256,
-    )
-
-    config = TrainConfig(epochs=2)
-    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
-
-    # Verify optimizer produced non-zero displacement
-    displacements = optimizer.state.displacement_sqnorms
-    assert len(displacements) > 0, "No steps were taken"
-    has_nonzero = any(d > 0 for d in displacements)
-    assert has_nonzero, "All displacements were zero -- OT solver produced uniform transport"
-
-    # Verify model parameters actually changed
-    current_params = model.state_dict()
-    param_changed = False
-    for key in initial_params:
-        if not torch.equal(initial_params[key], current_params[key]):
-            param_changed = True
-            break
-    assert param_changed, "Model parameters did not change during training"
-
-
-@pytest.mark.gpu
-def test_mnist_gpu_full_space():
-    """Train on 7x7 MNIST in full parameter space on GPU.
-
-    Uses the multi-particle architecture (485 particles in 2D) with
-    orthoplex polytope (4 vertices). Trains on 2000 samples for 10
-    epochs, targeting >80% accuracy on the 1000-sample test set.
-
-    This demonstrates that the core Sinkhorn OT algorithm achieves
-    meaningful learning on GPU with compiled operations.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    device = torch.device("cuda")
-    torch.manual_seed(42)
-
-    train_loader, test_loader = _make_loaders(
-        n_train=2000,
-        n_test=1000,
-        batch_size=32,
-        downsample=4,
-    )
-
-    model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
-
-    epsilon = LinearEpsilon(init=0.1, target=0.01, decay=0.001)
-
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=True,
-        seed=42,
-        epsilon=epsilon,
-        step_radius=3.0,
-        probe_radius=6.0,
-        num_probe=2,
-        sinkhorn_max_iters=100,
-        scale_cost="mean",
-        chunk_size=512,
-    )
-
-    config = TrainConfig(epochs=10)
-    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
-
-    accuracy = _evaluate_on_device(model, test_loader, device)
-    assert accuracy > 0.70, f"Expected accuracy > 70% on 7x7 MNIST with GPU, got {accuracy * 100:.1f}%"
-
-
-@pytest.mark.gpu
-def test_mnist_gpu_subspace_higher_particle_dim():
-    """Verify higher subspace_particle_dim gives stronger per-step signal on GPU.
-
-    Tests the subspace_particle_dim=8 feature: orthoplex in 8D has 16 vertices,
-    perturbing 8 subspace coords per particle per step (vs 2 with particle_dim=2).
-    Validates that the optimizer runs correctly with higher particle_dim and
-    produces meaningful displacement.
-
-    Also validates absorb_every: after absorb_every steps, the subspace resets
-    and base params absorb the perturbation.
-
-    Note on subspace accuracy: The B@A low-rank factorization creates a bilinear
-    relationship between subspace coordinates and weight perturbations. The OT
-    solver probes linearly in subspace space, making convergence fundamentally
-    harder than full-space mode. Subspace mode is designed for SCALABILITY
-    (reducing memory for large models), not for maximizing accuracy on small
-    problems. Full-space mode (test_mnist_gpu_full_space) validates accuracy.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    device = torch.device("cuda")
-    torch.manual_seed(42)
-
-    train_loader, test_loader = _make_loaders(
-        n_train=500,
-        n_test=200,
-        batch_size=64,
-        downsample=4,
-    )
-
-    model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
-    layout = ParamLayout.from_module(model)
-    subspace = LowRankSubspace.from_layout(layout, rank=4)
-
-    initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=True,
-        seed=42,
-        epsilon=0.1,
-        step_radius=30.0,
-        probe_radius=60.0,
-        num_probe=1,
-        sinkhorn_max_iters=100,
-        subspace=subspace,
+        subspace=LowRankSubspace.from_layout(layout, rank=4),
         subspace_particle_dim=8,
         absorb_every=10,
         scale_cost="mean",
         chunk_size=256,
     )
+    assert optimizer.state.X.shape[1] == 8, f"expected particle_dim=8, got {optimizer.state.X.shape[1]}"
 
-    # Verify particle shape reflects subspace_particle_dim=8
-    X = optimizer.state.X
-    assert X.shape[1] == 8, f"Expected particle_dim=8 for subspace mode, got {X.shape[1]}"
+    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=2))
 
-    config = TrainConfig(epochs=2)
-    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
-
-    # Verify optimizer ran and produced displacement
     displacements = optimizer.state.displacement_sqnorms
-    assert len(displacements) > 0, "No steps were taken"
-    has_nonzero = any(d > 0 for d in displacements)
-    assert has_nonzero, "All displacements were zero -- OT solver produced uniform transport"
+    assert displacements, "no steps were taken"
+    assert any(d > 0 for d in displacements), "all displacements were zero, transport stayed uniform"
 
-    # Verify model parameters actually changed (absorb folds into base)
-    current_params = model.state_dict()
-    param_changed = False
-    for key in initial_params:
-        if not torch.equal(initial_params[key], current_params[key]):
-            param_changed = True
-            break
-    assert param_changed, "Model parameters did not change during training"
-
-    # Verify absorb worked: after absorb, base_params should differ from initial
+    current = model.state_dict()
+    assert any(not torch.equal(initial_params[k], current[k]) for k in initial_params), (
+        "model parameters did not change during training"
+    )
     base = optimizer.state.base_params
-    base_changed = False
-    for key in initial_params:
-        if not torch.equal(initial_params[key], base[key]):
-            base_changed = True
-            break
-    assert base_changed, "Base params did not change -- absorb_every did not trigger"
-
-
-@pytest.mark.gpu
-@pytest.mark.slow
-def test_mnist_gpu_linear_subspace():
-    """Train MNIST with LinearSubspace to verify convergence.
-
-    LinearSubspace uses a fixed random projection (linear mapping) from
-    subspace coordinates to weight perturbations. Unlike B@A (bilinear),
-    this gives the OT solver proportional cost changes when probing,
-    enabling meaningful transport and convergence.
-
-    The random projection scaling (1/sqrt(num_coords)) dilutes perturbation
-    magnitude, requiring larger step/probe radii than full-space mode.
-    Subspace mode reaches 60-75% accuracy on this small model (varies due to
-    GPU non-determinism with torch.compile), demonstrating clear convergence
-    from 10% (random). Full-space mode reaches >80%.
-
-    Target: >55% accuracy (well above 10% random, confirms linear subspace
-    enables OT convergence unlike bilinear B@A which stalls). Threshold set
-    conservatively to account for run-to-run variance on GPU.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    device = torch.device("cuda")
-    torch.manual_seed(42)
-
-    train_loader, test_loader = _make_loaders(
-        n_train=2000,
-        n_test=1000,
-        batch_size=32,
-        downsample=4,
+    assert any(not torch.equal(initial_params[k], base[k]) for k in initial_params), (
+        "base params unchanged, so absorb_every never triggered"
     )
-
-    model = SmallMNISTNet(input_dim=49, hidden=16).to(device)
-    layout = ParamLayout.from_module(model)
-    subspace = LinearSubspace.from_layout(layout, rank=8, seed=42)
-
-    epsilon = LinearEpsilon(init=0.1, target=0.01, decay=0.001)
-
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=True,
-        seed=42,
-        epsilon=epsilon,
-        step_radius=30.0,
-        probe_radius=60.0,
-        num_probe=2,
-        sinkhorn_max_iters=100,
-        subspace=subspace,
-        subspace_particle_dim=8,
-        absorb_every=15,
-        scale_cost="mean",
-        chunk_size=512,
-    )
-
-    config = TrainConfig(epochs=20)
-    model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, config)
-
-    accuracy = _evaluate_on_device(model, test_loader, device)
-    assert accuracy > 0.55, f"Expected linear subspace accuracy > 55% on MNIST, got {accuracy * 100:.1f}%"

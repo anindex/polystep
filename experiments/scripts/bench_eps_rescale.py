@@ -17,6 +17,7 @@ Metric: total inner Sinkhorn iterations to reach threshold, fraction of solves
 that hit max_iterations (non-convergence), mean final marginal error. Run:
     python experiments/scripts/bench_eps_rescale.py
 """
+
 import math
 import sys
 from pathlib import Path

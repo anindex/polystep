@@ -104,10 +104,6 @@ class ParamLayout:
     shared_groups: Tuple[Tuple[str, ...], ...] = ()
     _all_keys: Tuple[str, ...] = ()
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
-
     @classmethod
     def from_module(
         cls,
@@ -161,14 +157,10 @@ class ParamLayout:
         all_keys: list[str] = []
 
         for key, tensor in sd.items():
-            # Skip non-trainable tensors (buffers). Only trainable
-            # parameters (requires_grad=True) belong in the OT particle
-            # array. Non-trainable float buffers (e.g., BatchNorm
-            # running_mean/running_var) would otherwise drift randomly
-            # since the evaluator overrides them with frozen values -
-            # the optimizer gets no gradient signal for them.
-            # Exception: shared/tied params may appear under a name not
-            # in named_parameters() - detect them via data_ptr.
+            # Only trainable parameters belong in the particle array: the evaluator
+            # holds buffers frozen, so a BatchNorm running stat placed here would drift
+            # with no signal behind it. Tied params can appear under a name absent from
+            # named_parameters(), so fall back to data_ptr for those.
             requires_grad = param_grad.get(key, False)
             is_trainable_alias = tensor.data_ptr() in trainable_ptrs
             if not requires_grad and not is_trainable_alias:
@@ -256,15 +248,14 @@ class ParamLayout:
             _all_keys=tuple(all_keys),
         )
 
-    # ------------------------------------------------------------------
-    # Flatten / Unflatten
-    # ------------------------------------------------------------------
-
     def batch_unflatten(self, particles_batch: torch.Tensor) -> dict[str, torch.Tensor]:
         """Convert N particle vectors to stacked param dicts for vmap.
 
-        Each key maps to a tensor with an extra leading batch dimension.
-        Shared parameters produce aliased entries (same tensor object).
+        Each key maps to a tensor with an extra leading batch dimension. Tied weights
+        appear once, under the canonical key: ``functional_call`` propagates a canonical
+        value to every name tied to it and rejects a dict that names both, and the
+        in-place path writes the one shared ``Parameter`` that both modules hold.
+        Use :meth:`unflatten` when the alias keys are needed, as ``load_state_dict`` does.
 
         Args:
             particles_batch: Tensor of shape ``(N, rows, particle_dim)`` or
@@ -289,14 +280,8 @@ class ParamLayout:
             if entry.dtype != self.dominant_dtype:
                 param = param.to(entry.dtype)
             stacked[entry.key] = param
-            for alias in entry.shared_with:
-                stacked[alias] = param
 
         return stacked
-
-    # ------------------------------------------------------------------
-    # Flatten / Unflatten
-    # ------------------------------------------------------------------
 
     def flatten(self, model: nn.Module) -> torch.Tensor:
         """Flatten model state_dict to a 2D particle tensor.

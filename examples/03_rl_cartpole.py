@@ -1,7 +1,7 @@
 """03 - RL starter: gradient-free policy training on CartPole.
 
 PolyStep optimizes the policy directly against the (non-differentiable)
-total episode return -- no policy gradient theorem, no value baselines,
+total episode return: no policy gradient theorem, no value baselines,
 no Gym dependency at training time. The reward signal is the
 optimization target.
 
@@ -13,7 +13,7 @@ search against a black-box objective.
 What you should see:
   Mean episode return rises from ~10-40 (random policy) toward 200+ over
   ~80 PolyStep steps. CartPole-v1's max return is 500; we use a reduced
-  horizon of 200 to keep the demo under one minute on CPU.
+  horizon of 200 to keep the demo at a few seconds on CPU.
 
   After training, the script launches a Gymnasium render window to visually
   verify the trained policy (pass ``--no-render`` to skip).
@@ -25,15 +25,22 @@ Run:
   python examples/03_rl_cartpole.py
   python examples/03_rl_cartpole.py --no-render   # headless
 """
+
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 import time
 from pathlib import Path
 
 import torch
+
+# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
+# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
+# Set POLYSTEP_THREADS to override. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
 
 # Allow running directly from a source checkout without `pip install -e .`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -63,8 +70,7 @@ def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
 
     # Override the default 500-step truncation so we can demonstrate
     # long-term stability of the trained policy.
-    env = gym.make("CartPole-v1", render_mode="rgb_array",
-                   max_episode_steps=horizon)
+    env = gym.make("CartPole-v1", render_mode="rgb_array", max_episode_steps=horizon)
     frames: list = []
 
     for ep in range(num_episodes):
@@ -89,15 +95,13 @@ def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
     os.makedirs(out.parent, exist_ok=True)
     step = max(1, len(frames) // 200)  # cap at ~200 frames
     imgs = [Image.fromarray(f) for f in frames[::step]]
-    imgs[0].save(out, save_all=True, append_images=imgs[1:],
-                 duration=33, loop=0)
+    imgs[0].save(out, save_all=True, append_images=imgs[1:], duration=33, loop=0)
     print(f"  saved visualization: {out}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="CartPole policy search with PolyStep")
-    parser.add_argument("--no-render", action="store_true",
-                        help="skip Gymnasium visualization after training")
+    parser.add_argument("--no-render", action="store_true", help="skip Gymnasium visualization after training")
     args = parser.parse_args()
 
     seed = 42
@@ -148,11 +152,17 @@ def main():
     )
 
     rand_summary = random_policy_baseline(
-        seed=seed, episodes=eval_episodes, horizon=horizon, device=device,
+        seed=seed,
+        episodes=eval_episodes,
+        horizon=horizon,
+        device=device,
     )
     init_summary = evaluate_policy_module(
-        policy, seed=seed + 10_000, episodes=eval_episodes,
-        horizon=horizon, device=device,
+        policy,
+        seed=seed + 10_000,
+        episodes=eval_episodes,
+        horizon=horizon,
+        device=device,
     )
     print(f"  random policy mean return:  {rand_summary['mean_return']:.1f}")
     print(f"  initial policy mean return: {init_summary['mean_return']:.1f}")
@@ -169,7 +179,9 @@ def main():
     def closure(stacked_params):
         step = optimizer.state.iteration_count if optimizer.state is not None else 0
         return evaluator.loss_for_stacked_params(
-            stacked_params, seed=seed, step=step,
+            stacked_params,
+            seed=seed,
+            step=step,
         )
 
     for step in range(target_steps):
@@ -177,8 +189,11 @@ def main():
 
         if step % 4 == 0 or step == target_steps - 1:
             summary = evaluate_policy_module(
-                policy, seed=seed + 10_000, episodes=eval_episodes,
-                horizon=horizon, device=device,
+                policy,
+                seed=seed + 10_000,
+                episodes=eval_episodes,
+                horizon=horizon,
+                device=device,
             )
             return_log.append(summary["mean_return"])
             step_log.append(step)
@@ -191,49 +206,64 @@ def main():
 
     elapsed = time.time() - start
     final_summary = evaluate_policy_module(
-        policy, seed=seed + 10_000, episodes=eval_episodes,
-        horizon=horizon, device=device,
+        policy,
+        seed=seed + 10_000,
+        episodes=eval_episodes,
+        horizon=horizon,
+        device=device,
     )
 
     print()
     print("=" * 60)
     print(f"  initial mean return: {init_summary['mean_return']:.1f}")
-    print(f"  final   mean return: {final_summary['mean_return']:.1f} "
-          f"(success {100 * final_summary['success_rate']:.0f}%)")
+    print(
+        f"  final   mean return: {final_summary['mean_return']:.1f} "
+        f"(success {100 * final_summary['success_rate']:.0f}%)"
+    )
     print(f"  random baseline:     {rand_summary['mean_return']:.1f}")
     print(f"  wallclock: {elapsed:.1f}s ({target_steps} steps)")
     print("=" * 60)
 
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    if importlib.util.find_spec("matplotlib") is None:
+        print("matplotlib not installed; skipping the figure (pip install matplotlib).")
+    else:
+        import matplotlib
 
-    fig, ax = plt.subplots(1, 1, figsize=(5.0, 2.8), constrained_layout=True)
-    ax.plot(step_log, return_log, color="#0072B2", lw=1.5, marker="o",
-            markersize=3, label="PolyStep policy")
-    ax.axhline(rand_summary["mean_return"], color="#999999", ls="--", lw=1.0,
-               label=f"random ({rand_summary['mean_return']:.0f})")
-    ax.axhline(horizon, color="#009E73", ls=":", lw=1.0,
-               label=f"horizon cap ({horizon})")
-    ax.set_xlabel("PolyStep step")
-    ax.set_ylabel(f"Mean return over {eval_episodes} episodes")
-    ax.set_title("CartPole-v1: gradient-free direct policy search", fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right", fontsize=7)
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
-    out = Path(__file__).parent / "figures" / "rl_cartpole.png"
-    os.makedirs(out.parent, exist_ok=True)
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
-    print(f"saved figure: {out}")
+        fig, ax = plt.subplots(1, 1, figsize=(5.0, 2.8), constrained_layout=True)
+        ax.plot(step_log, return_log, color="#0072B2", lw=1.5, marker="o", markersize=3, label="PolyStep policy")
+        ax.axhline(
+            rand_summary["mean_return"],
+            color="#999999",
+            ls="--",
+            lw=1.0,
+            label=f"random ({rand_summary['mean_return']:.0f})",
+        )
+        ax.axhline(horizon, color="#009E73", ls=":", lw=1.0, label=f"horizon cap ({horizon})")
+        ax.set_xlabel("PolyStep step")
+        ax.set_ylabel(f"Mean return over {eval_episodes} episodes")
+        ax.set_title("CartPole-v1: gradient-free direct policy search", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="lower right", fontsize=7)
 
-    # Visualization with Gymnasium rendering
-    if not args.no_render:
+        out = Path(__file__).parent / "figures" / "rl_cartpole.png"
+        os.makedirs(out.parent, exist_ok=True)
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        print(f"saved figure: {out}")
+
+    # Visualization with Gymnasium rendering. Training uses the internal dynamics, so
+    # gymnasium is only needed here.
+    if args.no_render:
+        print("(skipping Gymnasium render; pass without --no-render to visualize)")
+    elif importlib.util.find_spec("gymnasium") is None:
+        print("gymnasium not installed; skipping the render (pip install gymnasium).")
+    else:
         print()
         print("launching Gymnasium CartPole-v1 visualization...")
         visualize_policy(policy, num_episodes=1, horizon=2000)
-    else:
-        print("(skipping Gymnasium render; pass without --no-render to visualize)")
 
 
 if __name__ == "__main__":

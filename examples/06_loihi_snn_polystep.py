@@ -5,18 +5,18 @@ adapt the deployed model on device under input distribution shift, using
 only the writable subset a real Loihi 2 chip exposes at runtime, without
 backpropagation, surrogate gradients, or BPTT.
 
-Stage 1 -- Off-chip pretrain on clean MNIST. Full-model PolyStep with
+Stage 1, Off-chip pretrain on clean MNIST. Full-model PolyStep with
     the paper's SNN configuration from
     ``experiments/runners/run_elevation.py`` ``PSTORCH_CONFIGS["snn"]``
     (flat schedules; ``CosineEpsilon`` on eps / sr / pr collapses SNN
     accuracy in the paper sweeps). Stands in for a SLAYER + ``netx``
     deploy.
 
-Stage 2 -- On-chip readout adaptation under input shift. Hidden layer is
-    frozen; only the writable subset is adapted -- ``fc2`` weights and
+Stage 2, On-chip readout adaptation under input shift. Hidden layer is
+    frozen; only the writable subset is adapted, ``fc2`` weights and
     the per-population learnable LIF ``vth`` / ``beta`` (the chip's
     runtime-mutable microcode neuron ``Var``s). Three TENT-style
-    safeguards (Wang et al., ICLR 2021) make Stage 2 robust:
+    safeguards (Wang et al., ICLR 2021) keep Stage 2 from drifting:
 
       1. Mixed-batch shift (``--mixed-shift``, default on): each adapt
          batch is ``[clean ; shifted]`` so the writable subset is
@@ -25,7 +25,7 @@ Stage 2 -- On-chip readout adaptation under input shift. Hidden layer is
       3. Two probes per step (``--adapt-num-probe 2``) for variance
          reduction on the noisier shifted landscape.
 
-Both stages use best-test early stopping (patience 4 -- higher than
+Both stages use best-test early stopping (patience 4: higher than
 typical SGD because zeroth-order test curves are noisier per epoch).
 The weights at the end of each stage are the checkpoint with the
 highest test accuracy on that stage's target distribution (clean for
@@ -35,8 +35,14 @@ seeded noise mask across pre / post / baseline evaluations, so the
 reported recovery is a paired comparison free of sampling jitter.
 
 Backends. ``--backend cpu_sim`` (default) uses PyTorch as the forward
-evaluator. The host loop is identical to the on-chip loop -- only
+evaluator. The host loop is identical to the on-chip loop: only
 ``LoihiSpikeEvaluator.evaluate`` would change for ``--backend loihi2``.
+
+What you should see. On an RTX 5090 at the defaults, about 13 minutes:
+Stage 1 reaches ~64% clean test accuracy, which drops to ~44% under the
+shift; Stage 2 recovers it to ~55% while holding clean accuracy, a paired
+shift-recovery of about +10 pp over the frozen readout. CUDA reductions
+are non-deterministic, so expect a couple of points of run-to-run spread.
 
 Run::
 
@@ -45,14 +51,26 @@ Run::
     python examples/06_loihi_snn_polystep.py --no-mixed-shift    # ablate safeguard
     python examples/06_loihi_snn_polystep.py --backend loihi2    # if lava installed
 """
+
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
 import torch
+
+# On CPU, PolyStep issues many small tensor ops per step, where torch's intra-op pool
+# costs more than the arithmetic. On CUDA the forward runs on the device and pinning
+# only slows the host side, so leave torch's default there (measured 845s pinned
+# against 794s free on this example, identical accuracy). See docs/performance.md.
+_threads = os.environ.get("POLYSTEP_THREADS")
+if _threads:
+    torch.set_num_threads(int(_threads))
+elif not torch.cuda.is_available():
+    torch.set_num_threads(1)
 import torch.nn as nn
 
 # Allow running directly from a source checkout without `pip install -e .`.
@@ -65,11 +83,9 @@ from polystep.hybrid_subspace import HybridSubspace  # noqa: E402
 from polystep.transform import ParamLayout  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Backend detection
-# ---------------------------------------------------------------------------
 try:
     import lava  # noqa: F401  (presence check only)
+
     _HAS_LAVA = True
 except ImportError:
     _HAS_LAVA = False
@@ -88,9 +104,6 @@ def select_backend(requested: str) -> str:
     return "cpu_sim"
 
 
-# ---------------------------------------------------------------------------
-# Spiking layers (vmap-safe; learnable vth/beta mirror Loihi 2 µcode Vars)
-# ---------------------------------------------------------------------------
 class LearnableLIF(nn.Module):
     """Leaky integrate-and-fire with learnable threshold and decay.
 
@@ -102,7 +115,7 @@ class LearnableLIF(nn.Module):
 
     ``beta`` is parameterized through a sigmoid so it stays in (0, 1)
     under unconstrained PolyStep updates. ``vth`` is parameterized
-    directly. Both are scalars -- vmap stacks them along dim 0 with no
+    directly. Both are scalars: vmap stacks them along dim 0 with no
     special handling.
 
     On a real Loihi 2 these would be the per-population ``vth`` and
@@ -155,12 +168,9 @@ class MnistSpikingNet(nn.Module):
             spk1, mem1 = self.lif1(self.fc1(x), mem1)
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
-        return total  # (batch, 10) -- raw spike counts (rate code)
+        return total  # (batch, 10): raw spike counts (rate code)
 
 
-# ---------------------------------------------------------------------------
-# Forward-evaluation backends
-# ---------------------------------------------------------------------------
 class CpuSimEvaluator:
     """CPU forward evaluator. Identical interface to the on-chip path."""
 
@@ -173,7 +183,7 @@ class CpuSimEvaluator:
 
 
 class LoihiSpikeEvaluator:
-    """Loihi 2 forward evaluator (Lava ``netx`` deployment) -- Stage 2.
+    """Loihi 2 forward evaluator (Lava ``netx`` deployment), Stage 2.
 
     Implementation sketch (real version requires ``lava`` + a SLAYER-
     trained HDF5 net description; not run by default in this example)::
@@ -209,9 +219,6 @@ class LoihiSpikeEvaluator:
         )
 
 
-# ---------------------------------------------------------------------------
-# Adaptation subset = readout + per-population LIF parameters (vth, beta)
-# ---------------------------------------------------------------------------
 def freeze_to_writable_subset(model: MnistSpikingNet) -> int:
     """Freeze ``fc1``; keep the *writable* subset (readout + LIF Vars).
 
@@ -233,24 +240,27 @@ def freeze_to_writable_subset(model: MnistSpikingNet) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-# ---------------------------------------------------------------------------
-# Optimizer factories (paper-tuned configs)
-# ---------------------------------------------------------------------------
 def make_pretrain_optimizer(
-    model: nn.Module, *, seed: int, device: torch.device,
+    model: nn.Module,
+    *,
+    seed: int,
+    device: torch.device,
 ) -> PolyStepOptimizer:
     """Stage 1 optimizer (off-chip pretrain): paper SNN config from ``run_elevation.py``.
 
     Mirrors ``PSTORCH_CONFIGS["snn"]`` exactly. Key insight from the
     paper sweeps (see ``experiments/runners/run_elevation.py:84``):
-    *flat* epsilon / step_radius / probe_radius -- ``CosineEpsilon``
+    *flat* epsilon / step_radius / probe_radius, ``CosineEpsilon``
     scheduling on any of them collapses SNN accuracy to 10-47%.
     """
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
-        layout, rank=4,
-        rotation_mode="random", rotation_interval=0,
-        absorb_mode="periodic", absorb_interval=20,
+        layout,
+        rank=4,
+        rotation_mode="random",
+        rotation_interval=0,
+        absorb_mode="periodic",
+        absorb_interval=20,
     )
     return PolyStepOptimizer(
         model,
@@ -271,9 +281,14 @@ def make_pretrain_optimizer(
 
 
 def make_adapt_optimizer(
-    model: nn.Module, *, seed: int, device: torch.device,
-    rank: int = 8, num_probe: int = 2,
-    step_radius: float = 1.5, probe_radius: float = 0.75,
+    model: nn.Module,
+    *,
+    seed: int,
+    device: torch.device,
+    rank: int = 8,
+    num_probe: int = 2,
+    step_radius: float = 1.5,
+    probe_radius: float = 0.75,
 ) -> PolyStepOptimizer:
     """Stage 2 optimizer (on-chip readout adaptation): small writable subset, low-rank, all flat.
 
@@ -286,14 +301,17 @@ def make_adapt_optimizer(
       paper SNN defaults; the writable subset is well-conditioned and
       benefits from larger moves under shift).
 
-    All scheduling stays *flat* -- the paper-sweep finding that
+    All scheduling stays *flat*: the paper-sweep finding that
     ``CosineEpsilon`` collapses SNN training applies here too.
     """
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
-        layout, rank=rank,
-        rotation_mode="random", rotation_interval=0,
-        absorb_mode="periodic", absorb_interval=20,
+        layout,
+        rank=rank,
+        rotation_mode="random",
+        rotation_interval=0,
+        absorb_mode="periodic",
+        absorb_interval=20,
     )
     return PolyStepOptimizer(
         model,
@@ -313,16 +331,12 @@ def make_adapt_optimizer(
     )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 @torch.no_grad()
-def evaluate(model: nn.Module, loader, device: torch.device,
-             *, shift_sigma: float = 0.0, noise_seed: int = 0) -> float:
+def evaluate(model: nn.Module, loader, device: torch.device, *, shift_sigma: float = 0.0, noise_seed: int = 0) -> float:
     """Test-set accuracy.
 
     When ``shift_sigma > 0`` the same per-batch noise mask is used
-    across calls with the same ``noise_seed`` -- so pre/post/baseline
+    across calls with the same ``noise_seed``: so pre/post/baseline
     shifted-accuracy comparisons are paired, not contaminated by
     independent ~N(0,sigma^2) draws.
     """
@@ -332,8 +346,7 @@ def evaluate(model: nn.Module, loader, device: torch.device,
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         if shift_sigma > 0.0:
-            x = x + shift_sigma * torch.randn(
-                x.shape, generator=gen, device=device, dtype=x.dtype)
+            x = x + shift_sigma * torch.randn(x.shape, generator=gen, device=device, dtype=x.dtype)
         logits = model(x)
         correct += (logits.argmax(-1) == y).sum().item()
         total += y.numel()
@@ -341,10 +354,20 @@ def evaluate(model: nn.Module, loader, device: torch.device,
 
 
 def train_loop(
-    model: nn.Module, optimizer: PolyStepOptimizer, evaluator: CpuSimEvaluator,
-    loader, loss_fn: nn.Module, *, epochs: int, device: torch.device,
-    shift_sigma: float, label: str, mixed_shift: bool = False,
-    test_loader=None, eval_shift_sigma: float = 0.0, patience: int = 2,
+    model: nn.Module,
+    optimizer: PolyStepOptimizer,
+    evaluator: CpuSimEvaluator,
+    loader,
+    loss_fn: nn.Module,
+    *,
+    epochs: int,
+    device: torch.device,
+    shift_sigma: float,
+    label: str,
+    mixed_shift: bool = False,
+    test_loader=None,
+    eval_shift_sigma: float = 0.0,
+    patience: int = 2,
     noise_seed: int = 0,
 ) -> tuple[float, dict]:
     """Per-batch PolyStep updates with best-test early stopping.
@@ -388,43 +411,45 @@ def train_loop(
             train_acc = (logits.argmax(-1) == last_y).float().mean().item()
         if test_loader is not None:
             test_acc = evaluate(
-                model, test_loader, device,
-                shift_sigma=eval_shift_sigma, noise_seed=noise_seed,
+                model,
+                test_loader,
+                device,
+                shift_sigma=eval_shift_sigma,
+                noise_seed=noise_seed,
             )
             improved = test_acc > best_acc
             tag = "*" if improved else " "
             if improved:
                 best_acc = test_acc
-                best_state = {k: v.detach().clone()
-                              for k, v in model.state_dict().items()}
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 bad_epochs = 0
             else:
                 bad_epochs += 1
             elapsed = time.time() - t0
-            print(f"  [{label}] epoch {epoch + 1}/{epochs} | "
-                  f"step {step:3d} | batch_acc={100 * train_acc:5.1f}% | "
-                  f"test{'(σ=' + str(eval_shift_sigma) + ')' if eval_shift_sigma > 0 else '(clean)'}"
-                  f"={100 * test_acc:5.1f}%{tag} | {elapsed:5.1f}s")
+            print(
+                f"  [{label}] epoch {epoch + 1}/{epochs} | "
+                f"step {step:3d} | batch_acc={100 * train_acc:5.1f}% | "
+                f"test{'(σ=' + str(eval_shift_sigma) + ')' if eval_shift_sigma > 0 else '(clean)'}"
+                f"={100 * test_acc:5.1f}%{tag} | {elapsed:5.1f}s"
+            )
             if bad_epochs >= patience:
-                print(f"  [{label}] early stop at epoch {epoch + 1} "
-                      f"(patience {patience}); best={100 * best_acc:.1f}%")
+                print(f"  [{label}] early stop at epoch {epoch + 1} (patience {patience}); best={100 * best_acc:.1f}%")
                 break
         else:
             elapsed = time.time() - t0
-            print(f"  [{label}] epoch {epoch + 1}/{epochs} | "
-                  f"step {step:3d} | batch_acc={100 * train_acc:5.1f}% | "
-                  f"{elapsed:5.1f}s")
+            print(
+                f"  [{label}] epoch {epoch + 1}/{epochs} | "
+                f"step {step:3d} | batch_acc={100 * train_acc:5.1f}% | "
+                f"{elapsed:5.1f}s"
+            )
     model.load_state_dict(best_state)
     return best_acc, best_state
 
 
-# ---------------------------------------------------------------------------
-# Visualization
-# ---------------------------------------------------------------------------
 # Color palette: colorblind-safe (Wong 2011)
-_COLOR_CLEAN = "#0072B2"      # blue   -- in-distribution
-_COLOR_BASELINE = "#D55E00"   # orange -- shifted, no adaptation (failure)
-_COLOR_RECOVERED = "#009E73"  # green  -- shifted, after adaptation (success)
+_COLOR_CLEAN = "#0072B2"  # blue  : in-distribution
+_COLOR_BASELINE = "#D55E00"  # orange: shifted, no adaptation (failure)
+_COLOR_RECOVERED = "#009E73"  # green : shifted, after adaptation (success)
 _COLOR_SHIFT_ACCENT = "#D55E00"
 
 
@@ -451,6 +476,7 @@ def _save_visualization(
     """
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.gridspec as gridspec
         import matplotlib.patches as mpatches
@@ -459,23 +485,32 @@ def _save_visualization(
         print("  [viz] matplotlib not available; skipping (pip install matplotlib).")
         return
 
-    plt.rcParams.update({
-        "font.family": "DejaVu Sans",
-        "font.size": 10,
-        "axes.titleweight": "semibold",
-        "axes.labelcolor": "#222",
-        "axes.edgecolor": "#888",
-        "xtick.color": "#222",
-        "ytick.color": "#222",
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-    })
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 10,
+            "axes.titleweight": "semibold",
+            "axes.labelcolor": "#222",
+            "axes.edgecolor": "#888",
+            "xtick.color": "#222",
+            "ytick.color": "#222",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+        }
+    )
 
     n = vis_x.shape[0]
     fig = plt.figure(figsize=(13.5, 5.4), facecolor="white")
     gs_outer = gridspec.GridSpec(
-        1, 2, figure=fig, width_ratios=[1.0, 1.20],
-        left=0.085, right=0.985, top=0.86, bottom=0.20, wspace=0.16,
+        1,
+        2,
+        figure=fig,
+        width_ratios=[1.0, 1.20],
+        left=0.085,
+        right=0.985,
+        top=0.86,
+        bottom=0.20,
+        wspace=0.16,
     )
 
     # ============================================================
@@ -485,14 +520,19 @@ def _save_visualization(
     ax_left.axis("off")
     ax_left.set_title(
         "(a)  Input shift at deployment",
-        loc="left", fontsize=12, pad=14,
+        loc="left",
+        fontsize=12,
+        pad=14,
     )
 
     # 2-row x n-col image grid (no extra label column).
     gs_imgs = gridspec.GridSpecFromSubplotSpec(
-        2, n, subplot_spec=gs_outer[0],
+        2,
+        n,
+        subplot_spec=gs_outer[0],
         height_ratios=[1.0, 1.0],
-        hspace=0.18, wspace=0.06,
+        hspace=0.18,
+        wspace=0.06,
     )
 
     row_meta = [
@@ -504,8 +544,7 @@ def _save_visualization(
         for c in range(n):
             ax = fig.add_subplot(gs_imgs[r, c])
             img = row_x[c, 0].cpu().clamp(0.0, 1.0).numpy()
-            ax.imshow(img, cmap="gray", vmin=0, vmax=1,
-                      interpolation="nearest")
+            ax.imshow(img, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
             ax.set_xticks([])
             ax.set_yticks([])
             for spine in ax.spines.values():
@@ -515,15 +554,21 @@ def _save_visualization(
             if r == 0:
                 ax.set_title(
                     f"\u2018{int(vis_y[c])}\u2019",
-                    fontsize=10, color="#333", pad=4,
+                    fontsize=10,
+                    color="#333",
+                    pad=4,
                 )
             # Row label as a horizontal ylabel on the leftmost image only
             if c == 0:
                 ax.set_ylabel(
                     label,
-                    rotation=0, ha="right", va="center",
-                    labelpad=10, fontsize=11,
-                    fontweight="semibold", color=color,
+                    rotation=0,
+                    ha="right",
+                    va="center",
+                    labelpad=10,
+                    fontsize=11,
+                    fontweight="semibold",
+                    color=color,
                 )
 
     # ============================================================
@@ -532,7 +577,9 @@ def _save_visualization(
     ax_bar = fig.add_subplot(gs_outer[1])
     ax_bar.set_title(
         "(b)  Accuracy recovery via on-chip PolyStep adaptation",
-        loc="left", fontsize=12, pad=14,
+        loc="left",
+        fontsize=12,
+        pad=14,
     )
 
     group_centers = [0.0, 1.4]  # Stage 1, Stage 2
@@ -544,25 +591,35 @@ def _save_visualization(
 
     # Clean bars (both stages, same blue)
     bars_clean = ax_bar.bar(
-        [c - bar_offset for c in group_centers], clean_vals,
-        width=bar_width, color=_COLOR_CLEAN, edgecolor="white", linewidth=1.0,
+        [c - bar_offset for c in group_centers],
+        clean_vals,
+        width=bar_width,
+        color=_COLOR_CLEAN,
+        edgecolor="white",
+        linewidth=1.0,
         label="Clean test set",
     )
     # Shifted bars: orange for failed baseline, green for recovered
     shift_colors = [_COLOR_BASELINE, _COLOR_RECOVERED]
     bars_shift = ax_bar.bar(
-        [c + bar_offset for c in group_centers], shift_vals,
-        width=bar_width, color=shift_colors,
-        edgecolor="white", linewidth=1.0,
+        [c + bar_offset for c in group_centers],
+        shift_vals,
+        width=bar_width,
+        color=shift_colors,
+        edgecolor="white",
+        linewidth=1.0,
     )
 
     # Bar value labels
-    for b, v in zip(list(bars_clean) + list(bars_shift),
-                    clean_vals + shift_vals):
+    for b, v in zip(list(bars_clean) + list(bars_shift), clean_vals + shift_vals):
         ax_bar.text(
-            b.get_x() + b.get_width() / 2, v + 1.0,
-            f"{v:.1f}%", ha="center", va="bottom",
-            fontsize=9.5, color="#222",
+            b.get_x() + b.get_width() / 2,
+            v + 1.0,
+            f"{v:.1f}%",
+            ha="center",
+            va="bottom",
+            fontsize=9.5,
+            color="#222",
         )
 
     # X axis: group labels
@@ -591,48 +648,65 @@ def _save_visualization(
         xy=(x_to, y_to + 5.0),
         xytext=(x_from, y_from + 5.0),
         arrowprops=dict(
-            arrowstyle="-|>", color=_COLOR_RECOVERED, lw=2.2,
-            shrinkA=2, shrinkB=2,
+            arrowstyle="-|>",
+            color=_COLOR_RECOVERED,
+            lw=2.2,
+            shrinkA=2,
+            shrinkB=2,
             connectionstyle="arc3,rad=-0.45",
         ),
     )
     ax_bar.text(
-        (x_from + x_to) / 2, label_y,
+        (x_from + x_to) / 2,
+        label_y,
         f"+{recovery:.1f} pp shift-recovery",
-        ha="center", va="bottom", fontsize=11.5,
-        color=_COLOR_RECOVERED, fontweight="bold",
+        ha="center",
+        va="bottom",
+        fontsize=11.5,
+        color=_COLOR_RECOVERED,
+        fontweight="bold",
     )
 
     # Custom legend (clean / shifted-failed / shifted-recovered) - placed
     # horizontally above the bar axis so it never overlaps the data.
     legend_handles = [
         mpatches.Patch(color=_COLOR_CLEAN, label="Clean test"),
-        mpatches.Patch(color=_COLOR_BASELINE,
-                       label=f"Shifted (σ={shift_sigma}), no adaptation"),
-        mpatches.Patch(color=_COLOR_RECOVERED,
-                       label=f"Shifted (σ={shift_sigma}), PolyStep on-chip adapt"),
+        mpatches.Patch(color=_COLOR_BASELINE, label=f"Shifted (σ={shift_sigma}), no adaptation"),
+        mpatches.Patch(color=_COLOR_RECOVERED, label=f"Shifted (σ={shift_sigma}), PolyStep on-chip adapt"),
     ]
     ax_bar.legend(
         handles=legend_handles,
-        loc="upper center", bbox_to_anchor=(0.5, -0.16),
-        ncol=3, frameon=False, fontsize=9,
-        handlelength=1.4, handleheight=0.9, columnspacing=1.6,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.16),
+        ncol=3,
+        frameon=False,
+        fontsize=9,
+        handlelength=1.4,
+        handleheight=0.9,
+        columnspacing=1.6,
     )
 
     # Footer note: writable-subset fraction
     pct_writable = 100 * n_writable / n_total
     fig.text(
-        0.985, 0.005,
+        0.985,
+        0.005,
         f"Stage 2 adapts only {n_writable:,} / {n_total:,} params "
         f"({pct_writable:.1f} %) - the Loihi 2 runtime-writable subset "
         "(fc2 + per-population vth, β).",
-        ha="right", va="bottom", fontsize=8.0, color="#555", style="italic",
+        ha="right",
+        va="bottom",
+        fontsize=8.0,
+        color="#555",
+        style="italic",
     )
 
     # Suptitle
     fig.suptitle(
         "PolyStep -> Loihi 2 (skeleton):  spiking MNIST + on-chip readout adaptation",
-        fontsize=13, fontweight="bold", y=0.965,
+        fontsize=13,
+        fontweight="bold",
+        y=0.965,
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -641,43 +715,46 @@ def _save_visualization(
     print(f"  [viz] saved -> {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--backend", choices=["cpu_sim", "loihi2"],
-                        default="cpu_sim")
+    parser.add_argument("--backend", choices=["cpu_sim", "loihi2"], default="cpu_sim")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str,
-                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--num-steps", type=int, default=15,
-                        help="SNN simulation timesteps (paper SNN: 15).")
+    parser.add_argument("--num-steps", type=int, default=15, help="SNN simulation timesteps (paper SNN: 15).")
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--max-train", type=int, default=16000,
-                        help="MNIST train subset (0 = full 60k).")
+    parser.add_argument("--max-train", type=int, default=16000, help="MNIST train subset (0 = full 60k).")
     parser.add_argument("--max-test", type=int, default=2000)
     parser.add_argument("--pretrain-epochs", type=int, default=16)
     parser.add_argument("--adapt-epochs", type=int, default=6)
-    parser.add_argument("--shift-sigma", type=float, default=1.0,
-                        help="Gaussian noise stddev applied at adaptation "
-                             "time (input shift). 0 = no shift.")
-    parser.add_argument("--mixed-shift", action="store_true", default=True,
-                        help="Adapt on a half-clean/half-shifted batch "
-                             "(prevents catastrophic forgetting; default ON).")
-    parser.add_argument("--no-mixed-shift", dest="mixed_shift",
-                        action="store_false")
+    parser.add_argument(
+        "--shift-sigma",
+        type=float,
+        default=1.0,
+        help="Gaussian noise stddev applied at adaptation time (input shift). 0 = no shift.",
+    )
+    parser.add_argument(
+        "--mixed-shift",
+        action="store_true",
+        default=True,
+        help="Adapt on a half-clean/half-shifted batch (prevents catastrophic forgetting; default ON).",
+    )
+    parser.add_argument("--no-mixed-shift", dest="mixed_shift", action="store_false")
     parser.add_argument("--adapt-rank", type=int, default=8)
     parser.add_argument("--adapt-num-probe", type=int, default=2)
-    parser.add_argument("--patience", type=int, default=4,
-                        help="Early-stop patience on test accuracy "
-                             "(epochs without improvement before halt). "
-                             "Higher than typical SGD because zeroth-"
-                             "order test curves are noisier per epoch.")
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=4,
+        help="Early-stop patience on test accuracy "
+        "(epochs without improvement before halt). "
+        "Higher than typical SGD because zeroth-"
+        "order test curves are noisier per epoch.",
+    )
     parser.add_argument("--data-dir", type=str, default="data/mnist")
     parser.add_argument(
-        "--no-plot", action="store_true",
+        "--no-plot",
+        action="store_true",
         help="Skip saving the visualization figure to examples/figures/.",
     )
     args = parser.parse_args()
@@ -689,19 +766,21 @@ def main():
     print("=" * 70)
     print("  PolyStep -> Loihi 2 (skeleton): MNIST SNN + on-chip readout adapt")
     print(f"  backend={backend}  device={device}  seed={args.seed}")
-    print(f"  hidden={args.hidden}  num_steps={args.num_steps}  "
-          f"batch={args.batch_size}")
+    print(f"  hidden={args.hidden}  num_steps={args.num_steps}  batch={args.batch_size}")
     print(f"  data: MNIST subset train={args.max_train} test={args.max_test}")
     print(f"  shift: input += N(0, {args.shift_sigma}^2) at adapt time")
     print("=" * 70)
 
     train_loader, test_loader = get_mnist_loaders(
-        data_dir=args.data_dir, batch_size=args.batch_size,
-        max_train=args.max_train, max_test=args.max_test,
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        max_train=args.max_train,
+        max_test=args.max_test,
     )
 
     model = MnistSpikingNet(
-        hidden=args.hidden, num_steps=args.num_steps,
+        hidden=args.hidden,
+        num_steps=args.num_steps,
     ).to(device)
     n_total = sum(p.numel() for p in model.parameters())
     print(f"  total params: {n_total:,}")
@@ -716,7 +795,9 @@ def main():
     _vis_y = _vis_batch[1][:5].to(device)
     _vis_gen = torch.Generator(device=device).manual_seed(args.seed)
     _vis_x_shift = _vis_x_clean + args.shift_sigma * torch.randn(
-        _vis_x_clean.shape, generator=_vis_gen, device=device,
+        _vis_x_clean.shape,
+        generator=_vis_gen,
+        device=device,
         dtype=_vis_x_clean.dtype,
     )
 
@@ -731,33 +812,44 @@ def main():
     pre_opt = make_pretrain_optimizer(model, seed=args.seed, device=device)
     pre_eval = CpuSimEvaluator(model, loss_fn=loss_fn)
     pre_clean, _ = train_loop(
-        model, pre_opt, pre_eval, train_loader, loss_fn,
-        epochs=args.pretrain_epochs, device=device,
-        shift_sigma=0.0, label="pre",
-        test_loader=test_loader, eval_shift_sigma=0.0,
-        patience=args.patience, noise_seed=args.seed,
+        model,
+        pre_opt,
+        pre_eval,
+        train_loader,
+        loss_fn,
+        epochs=args.pretrain_epochs,
+        device=device,
+        shift_sigma=0.0,
+        label="pre",
+        test_loader=test_loader,
+        eval_shift_sigma=0.0,
+        patience=args.patience,
+        noise_seed=args.seed,
     )
     # Best Stage 1 weights are now loaded; sample their shifted accuracy
     # for context (and for the paired baseline comparison below).
     pre_shift = evaluate(
-        model, test_loader, device,
-        shift_sigma=args.shift_sigma, noise_seed=args.seed,
+        model,
+        test_loader,
+        device,
+        shift_sigma=args.shift_sigma,
+        noise_seed=args.seed,
     )
-    print(f"  -> best Stage 1 | clean: {100 * pre_clean:.1f}%  "
-          f"shifted: {100 * pre_shift:.1f}%")
+    print(f"  -> best Stage 1 | clean: {100 * pre_clean:.1f}%  shifted: {100 * pre_shift:.1f}%")
 
     # Snapshot the Stage 1 best for the frozen-readout baseline.
     pretrained_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
     # ----- Stage 2: 'on-chip' readout + LIF Var adaptation -----
     print()
-    print(f"Stage 2: 'on-chip' readout + LIF Var adaptation "
-          f"(shift sigma={args.shift_sigma})")
+    print(f"Stage 2: 'on-chip' readout + LIF Var adaptation (shift sigma={args.shift_sigma})")
     print("-" * 70)
     n_writable = freeze_to_writable_subset(model)
-    print(f"  writable subset: {n_writable:,} params "
-          f"({100 * n_writable / n_total:.1f}% of model) "
-          "= fc2 + lif1.vth + lif1.beta + lif2.vth + lif2.beta")
+    print(
+        f"  writable subset: {n_writable:,} params "
+        f"({100 * n_writable / n_total:.1f}% of model) "
+        "= fc2 + lif1.vth + lif1.beta + lif2.vth + lif2.beta"
+    )
 
     if backend == "cpu_sim":
         adapt_eval = CpuSimEvaluator(model, loss_fn=loss_fn)
@@ -765,29 +857,46 @@ def main():
         adapt_eval = LoihiSpikeEvaluator(hdf5_path="snn_mnist.net", loss_fn=loss_fn)
 
     ad_opt = make_adapt_optimizer(
-        model, seed=args.seed, device=device,
-        rank=args.adapt_rank, num_probe=args.adapt_num_probe,
+        model,
+        seed=args.seed,
+        device=device,
+        rank=args.adapt_rank,
+        num_probe=args.adapt_num_probe,
     )
     post_shift, _ = train_loop(
-        model, ad_opt, adapt_eval, train_loader, loss_fn,
-        epochs=args.adapt_epochs, device=device,
-        shift_sigma=args.shift_sigma, label="adapt",
+        model,
+        ad_opt,
+        adapt_eval,
+        train_loader,
+        loss_fn,
+        epochs=args.adapt_epochs,
+        device=device,
+        shift_sigma=args.shift_sigma,
+        label="adapt",
         mixed_shift=args.mixed_shift,
-        test_loader=test_loader, eval_shift_sigma=args.shift_sigma,
-        patience=args.patience, noise_seed=args.seed,
+        test_loader=test_loader,
+        eval_shift_sigma=args.shift_sigma,
+        patience=args.patience,
+        noise_seed=args.seed,
     )
     # Best Stage 2 weights are now loaded; sample clean accuracy on it.
     post_clean = evaluate(
-        model, test_loader, device,
-        shift_sigma=0.0, noise_seed=args.seed,
+        model,
+        test_loader,
+        device,
+        shift_sigma=0.0,
+        noise_seed=args.seed,
     )
 
     # Reload Stage 1 best to evaluate the frozen-readout baseline
-    # against the SAME shift noise mask as post_shift -- paired.
+    # against the SAME shift noise mask as post_shift: paired.
     model.load_state_dict(pretrained_state)
     base_shift = evaluate(
-        model, test_loader, device,
-        shift_sigma=args.shift_sigma, noise_seed=args.seed,
+        model,
+        test_loader,
+        device,
+        shift_sigma=args.shift_sigma,
+        noise_seed=args.seed,
     )
 
     # ----- Report -----
@@ -795,20 +904,19 @@ def main():
     print("=" * 70)
     print("  Results")
     print("=" * 70)
-    print(f"  initial (random):                          "
-          f"clean {100 * init_clean:5.1f}%")
-    print(f"  best Stage 1 (off-chip pretrain):          "
-          f"clean {100 * pre_clean:5.1f}%   "
-          f"shifted {100 * pre_shift:5.1f}%")
-    print(f"  best Stage 2 (PolyStep on-chip adapt):     "
-          f"clean {100 * post_clean:5.1f}%   "
-          f"shifted {100 * post_shift:5.1f}%")
-    print(f"  baseline (no adaptation, frozen readout):  "
-          f"shifted {100 * base_shift:5.1f}%")
+    print(f"  initial (random):                          clean {100 * init_clean:5.1f}%")
+    print(
+        f"  best Stage 1 (off-chip pretrain):          clean {100 * pre_clean:5.1f}%   shifted {100 * pre_shift:5.1f}%"
+    )
+    print(
+        f"  best Stage 2 (PolyStep on-chip adapt):     "
+        f"clean {100 * post_clean:5.1f}%   "
+        f"shifted {100 * post_shift:5.1f}%"
+    )
+    print(f"  baseline (no adaptation, frozen readout):  shifted {100 * base_shift:5.1f}%")
     print()
     recovery = 100 * (post_shift - base_shift)
-    print(f"  shift-recovery from PolyStep adapt: {recovery:+.1f} pp "
-          f"(higher is better; paired-noise comparison)")
+    print(f"  shift-recovery from PolyStep adapt: {recovery:+.1f} pp (higher is better; paired-noise comparison)")
     print(f"  backend: {backend}")
     print("=" * 70)
     print()

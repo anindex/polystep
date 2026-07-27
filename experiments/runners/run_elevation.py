@@ -32,9 +32,7 @@ import traceback
 from typing import Any, Dict, List, Optional
 
 # Ensure repo root is on path
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
 import torch
@@ -67,10 +65,6 @@ from experiments.baselines.openai_es import train_openai_es
 from experiments.baselines.spsa import train_spsa
 
 
-# ---------------------------------------------------------------------------
-# Showcase configurations
-# ---------------------------------------------------------------------------
-
 SHOWCASE_CONFIGS = {
     "snn": {
         "model_fn": lambda: SpikingMNISTNet(num_steps=15),
@@ -99,18 +93,19 @@ SHOWCASE_CONFIGS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Hyperparameter constants
-# ---------------------------------------------------------------------------
-
-EPOCHS_PSTORCH = 30    # SNN needs more epochs; softmax solver is fast enough
+EPOCHS_PSTORCH = 30  # SNN needs more epochs; softmax solver is fast enough
 EPOCHS_PSTORCH_NONSNN = 30  # Int8/Argmax/Staircase
 EPOCHS_ADAM = 30
 ADAM_LR = 0.001
 
 OPENAI_ES_CONFIG = {
-    "sigma": 0.02, "lr": 0.01, "population_size": 50, "generations": 10000,
-    "lr_decay": True, "weight_decay": 0.01, "fitness_shaping": "rank",
+    "sigma": 0.02,
+    "lr": 0.01,
+    "population_size": 50,
+    "generations": 10000,
+    "lr_decay": True,
+    "weight_decay": 0.01,
+    "fitness_shaping": "rank",
 }
 CMAES_CONFIG = {"generations": 10000, "popsize": 16, "stdev_init": 0.5}
 SPSA_CONFIG = {"a": 0.1, "c": 0.1, "alpha": 0.602, "gamma": 0.101, "max_iters": 50000}
@@ -123,54 +118,73 @@ PSTORCH_CONFIGS = {
         "epsilon": 0.5,
         "step_radius": 2.0,
         "probe_radius": 1.0,
-        "num_probe": 1, "rank": 4,
-        "chunk_size": 1024, "amortize_steps": 1,
-        "rotation_interval": 0, "absorb_interval": 20,
+        "num_probe": 1,
+        "rank": 4,
+        "chunk_size": 1024,
+        "amortize_steps": 1,
+        "rotation_interval": 0,
+        "absorb_interval": 20,
         "biased_rotation": True,
-        "anderson_depth": 5, "adaptive_omega": True,
+        "anderson_depth": 5,
+        "adaptive_omega": True,
     },
     # INT8: Best sweep config = rank8 (97.18% at 20ep, beats 40ep production)
     # CosineEpsilon scheduling works well on quantization plateaus
     # rank=8 is the dominant lever (+1.08% over rank=4)
     "int8": {
-        "epsilon_init": 5.0, "epsilon_target": 0.3,
-        "step_radius_init": 32.0, "step_radius_target": 8.0,
-        "probe_radius_init": 2.0, "probe_radius_target": 0.5,
-        "num_probe": 1, "rank": 8,
-        "chunk_size": 1024, "amortize_steps": 1,
-        "rotation_interval": 0, "absorb_interval": 0,
-        "use_momentum": True, "momentum_init": 0.3, "momentum_final": 0.5,
+        "epsilon_init": 5.0,
+        "epsilon_target": 0.3,
+        "step_radius_init": 32.0,
+        "step_radius_target": 8.0,
+        "probe_radius_init": 2.0,
+        "probe_radius_target": 0.5,
+        "num_probe": 1,
+        "rank": 8,
+        "chunk_size": 1024,
+        "amortize_steps": 1,
+        "rotation_interval": 0,
+        "absorb_interval": 0,
+        "use_momentum": True,
+        "momentum_init": 0.3,
+        "momentum_final": 0.5,
     },
     # Argmax: Best sweep config = rank8 (87.08% at 20ep, beats 40ep production)
     # Same CosineEpsilon strategy as INT8 but NO momentum (sweep: no_mom=84.71% < rank8=87.08%)
     "argmax": {
-        "epsilon_init": 5.0, "epsilon_target": 0.3,
-        "step_radius_init": 32.0, "step_radius_target": 8.0,
-        "probe_radius_init": 2.0, "probe_radius_target": 0.5,
-        "num_probe": 1, "rank": 8,
-        "chunk_size": 1024, "amortize_steps": 1,
-        "rotation_interval": 0, "absorb_interval": 0,
+        "epsilon_init": 5.0,
+        "epsilon_target": 0.3,
+        "step_radius_init": 32.0,
+        "step_radius_target": 8.0,
+        "probe_radius_init": 2.0,
+        "probe_radius_target": 0.5,
+        "num_probe": 1,
+        "rank": 8,
+        "chunk_size": 1024,
+        "amortize_steps": 1,
+        "rotation_interval": 0,
+        "absorb_interval": 0,
     },
     # Staircase: Retuned from sr64->16 which degraded after epoch 11
     # Gentler cosine targets (64->32, eps 5->1) eliminate late-epoch degradation
     # 15ep tune: cosine_64_32=91.96%/91.10% vs cosine_64_16=91.80%/89.15%
     "staircase": {
-        "epsilon_init": 5.0, "epsilon_target": 1.0,
-        "step_radius_init": 64.0, "step_radius_target": 32.0,
-        "probe_radius_init": 2.0, "probe_radius_target": 1.0,
-        "num_probe": 1, "rank": 4,
-        "chunk_size": 1024, "amortize_steps": 1,
-        "rotation_interval": 0, "absorb_interval": 0,
+        "epsilon_init": 5.0,
+        "epsilon_target": 1.0,
+        "step_radius_init": 64.0,
+        "step_radius_target": 32.0,
+        "probe_radius_init": 2.0,
+        "probe_radius_target": 1.0,
+        "num_probe": 1,
+        "rank": 4,
+        "chunk_size": 1024,
+        "amortize_steps": 1,
+        "rotation_interval": 0,
+        "absorb_interval": 0,
     },
 }
 
 
-# ---------------------------------------------------------------------------
-# Method: polystep
-# ---------------------------------------------------------------------------
-
-def run_polystep(showcase_name, seed, device, results_dir, dry_run=False,
-                audit_no_leakage: bool = True):
+def run_polystep(showcase_name, seed, device, results_dir, dry_run=False, audit_no_leakage: bool = True):
     """Train non-diff model with polystep PolyStepOptimizer + HybridSubspace.
 
     By default, best-checkpoint selection uses a held-out validation
@@ -205,7 +219,9 @@ def run_polystep(showcase_name, seed, device, results_dir, dry_run=False,
     val_loader = None
     if audit_no_leakage:
         train_loader, val_loader = make_train_val_split(
-            train_loader, val_frac=0.1, seed=seed,
+            train_loader,
+            val_frac=0.1,
+            seed=seed,
         )
     selection_loader = val_loader if (audit_no_leakage and val_loader is not None) else test_loader
 
@@ -222,13 +238,17 @@ def run_polystep(showcase_name, seed, device, results_dir, dry_run=False,
 
     if "step_radius_init" in polystep_cfg:
         sr_decay = (polystep_cfg["step_radius_init"] - polystep_cfg["step_radius_target"]) / max(1, total_steps)
-        step_radius_value = CosineEpsilon(init=polystep_cfg["step_radius_init"], target=polystep_cfg["step_radius_target"], decay=sr_decay)
+        step_radius_value = CosineEpsilon(
+            init=polystep_cfg["step_radius_init"], target=polystep_cfg["step_radius_target"], decay=sr_decay
+        )
     else:
         step_radius_value = polystep_cfg.get("step_radius", 1.0)
 
     if "probe_radius_init" in polystep_cfg:
         pr_decay = (polystep_cfg["probe_radius_init"] - polystep_cfg["probe_radius_target"]) / max(1, total_steps)
-        probe_radius_value = CosineEpsilon(init=polystep_cfg["probe_radius_init"], target=polystep_cfg["probe_radius_target"], decay=pr_decay)
+        probe_radius_value = CosineEpsilon(
+            init=polystep_cfg["probe_radius_init"], target=polystep_cfg["probe_radius_target"], decay=pr_decay
+        )
     else:
         probe_radius_value = polystep_cfg.get("probe_radius", 1.0)
 
@@ -307,13 +327,15 @@ def run_polystep(showcase_name, seed, device, results_dir, dry_run=False,
                 # Per-20-step fine-grained tracking
                 if step_count % 20 == 0:
                     step_test_acc = evaluate_accuracy(model, test_loader, device=device)
-                    step_logs.append({
-                        "step": step_count,
-                        "epoch": epoch + 1,
-                        "test_accuracy": step_test_acc,
-                        "loss": loss,
-                        "wall_time": time.time() - start_time,
-                    })
+                    step_logs.append(
+                        {
+                            "step": step_count,
+                            "epoch": epoch + 1,
+                            "test_accuracy": step_test_acc,
+                            "loss": loss,
+                            "wall_time": time.time() - start_time,
+                        }
+                    )
 
             train_acc = epoch_correct / max(epoch_total, 1)
             test_acc = evaluate_accuracy(model, test_loader, device=device)
@@ -328,16 +350,20 @@ def run_polystep(showcase_name, seed, device, results_dir, dry_run=False,
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / max(len(train_loader), 1)
 
-            epoch_logs.append({
-                "epoch": epoch + 1,
-                "accuracy": test_acc,
-                "train_accuracy": train_acc,
-                "test_accuracy": test_acc,
-                "loss": avg_loss,
-                "time": epoch_time,
-                "wall_time": time.time() - start_time,
-            })
-            print(f"    Epoch {epoch+1}/{epochs} | train={train_acc*100:.1f}% | test={test_acc*100:.1f}% | loss={avg_loss:.4f}")
+            epoch_logs.append(
+                {
+                    "epoch": epoch + 1,
+                    "accuracy": test_acc,
+                    "train_accuracy": train_acc,
+                    "test_accuracy": test_acc,
+                    "loss": avg_loss,
+                    "time": epoch_time,
+                    "wall_time": time.time() - start_time,
+                }
+            )
+            print(
+                f"    Epoch {epoch + 1}/{epochs} | train={train_acc * 100:.1f}% | test={test_acc * 100:.1f}% | loss={avg_loss:.4f}"
+            )
 
     wall_time = time.time() - start_time
     last_epoch_acc = evaluate_accuracy(model, test_loader, device=device)
@@ -372,10 +398,6 @@ def run_polystep(showcase_name, seed, device, results_dir, dry_run=False,
     print(f"    Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method: Adam (smooth model variant -- accuracy ceiling)
-# ---------------------------------------------------------------------------
-
 def run_adam(showcase_name, seed, device, results_dir, dry_run=False):
     """Train smooth model variant with Adam (accuracy ceiling baseline)."""
     config = SHOWCASE_CONFIGS[showcase_name]
@@ -409,10 +431,6 @@ def run_adam(showcase_name, seed, device, results_dir, dry_run=False):
     )
     print(f"    Saved: {filepath}")
 
-
-# ---------------------------------------------------------------------------
-# Method: CMA-ES (pycma)
-# ---------------------------------------------------------------------------
 
 def run_cmaes(showcase_name, seed, device, results_dir, dry_run=False):
     """Train non-diff model with CMA-ES (pycma)."""
@@ -491,13 +509,15 @@ def run_cmaes(showcase_name, seed, device, results_dir, dry_run=False):
                 test_acc = evaluate_accuracy(model, test_loader, device=device)
                 best_accuracy = max(best_accuracy, test_acc)
                 elapsed = time.time() - start_time
-                epoch_logs.append({
-                    "epoch": gen,
-                    "accuracy": test_acc,
-                    "loss": es.result.fbest,
-                    "time": elapsed,
-                })
-                print(f"    Gen {gen}/{generations} | acc={test_acc*100:.1f}% | loss={es.result.fbest:.4f}")
+                epoch_logs.append(
+                    {
+                        "epoch": gen,
+                        "accuracy": test_acc,
+                        "loss": es.result.fbest,
+                        "time": elapsed,
+                    }
+                )
+                print(f"    Gen {gen}/{generations} | acc={test_acc * 100:.1f}% | loss={es.result.fbest:.4f}")
 
     wall_time = time.time() - start_time
 
@@ -528,10 +548,6 @@ def run_cmaes(showcase_name, seed, device, results_dir, dry_run=False):
     )
     print(f"    Saved: {filepath}")
 
-
-# ---------------------------------------------------------------------------
-# Method: OpenAI-ES
-# ---------------------------------------------------------------------------
 
 def run_openai_es(showcase_name, seed, device, results_dir, dry_run=False):
     """Train non-diff model with OpenAI Evolution Strategy."""
@@ -571,10 +587,6 @@ def run_openai_es(showcase_name, seed, device, results_dir, dry_run=False):
     print(f"    Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method: SPSA
-# ---------------------------------------------------------------------------
-
 def run_spsa(showcase_name, seed, device, results_dir, dry_run=False):
     """Train non-diff model with SPSA."""
     config = SHOWCASE_CONFIGS[showcase_name]
@@ -611,10 +623,6 @@ def run_spsa(showcase_name, seed, device, results_dir, dry_run=False):
     print(f"    Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method dispatch
-# ---------------------------------------------------------------------------
-
 METHOD_RUNNERS = {
     "polystep": run_polystep,
     "adam": run_adam,
@@ -624,44 +632,52 @@ METHOD_RUNNERS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(
         description="Run non-differentiable showcase elevation experiments: showcases x methods x seeds"
     )
     parser.add_argument(
-        "--showcases", nargs="+",
+        "--showcases",
+        nargs="+",
         default=["snn", "int8", "argmax", "staircase"],
         help="Showcases to run (default: all 4)",
     )
     parser.add_argument(
-        "--methods", nargs="+",
+        "--methods",
+        nargs="+",
         default=["polystep", "adam", "cmaes", "openai_es", "spsa"],
         help="Methods to run (default: all 5)",
     )
     parser.add_argument(
-        "--seeds", nargs="+", type=int, default=SEEDS,
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=SEEDS,
         help="Seeds to run (default: 42 123 456 789 1337)",
     )
     parser.add_argument(
-        "--device", default="cuda", help="Device (default: cuda)",
+        "--device",
+        default="cuda",
+        help="Device (default: cuda)",
     )
     parser.add_argument(
-        "--results-dir", default="experiments/results/softmax/main", help="Results directory",
+        "--results-dir",
+        default="experiments/results/softmax/main",
+        help="Results directory",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Run 1 epoch / 10 generations / 100 SPSA iters for testing",
     )
     parser.add_argument(
-        "--force", action="store_true",
+        "--force",
+        action="store_true",
         help="Override skip-if-exists and rerun all experiments",
     )
     parser.add_argument(
-        "--allow-test-leakage", action="store_true",
+        "--allow-test-leakage",
+        action="store_true",
         help=(
             "Legacy mode: select best_state_dict on the test set instead "
             "of a held-out validation slice. Default is honest protocol "
@@ -670,11 +686,15 @@ def main():
         ),
     )
     parser.add_argument(
-        "--step-radius", type=float, default=None,
+        "--step-radius",
+        type=float,
+        default=None,
         help="Override step_radius for polystep (for hyperparameter sweeps)",
     )
     parser.add_argument(
-        "--epochs-polystep", type=int, default=None,
+        "--epochs-polystep",
+        type=int,
+        default=None,
         help="Override number of polystep epochs (for quick sweeps)",
     )
     args = parser.parse_args()
@@ -720,18 +740,21 @@ def main():
                 continue
 
             for seed in args.seeds:
-                output_file = os.path.join(
-                    args.results_dir, f"{showcase_name}_{method}_{seed}.json"
-                )
+                output_file = os.path.join(args.results_dir, f"{showcase_name}_{method}_{seed}.json")
                 if os.path.exists(output_file) and not args.force:
                     print(f"  Skipping {method} seed={seed} (result exists)")
                     continue
 
                 print(f"  Running {method} seed={seed}...")
                 try:
-                    runner(showcase_name, seed, args.device, args.results_dir,
-                           dry_run=args.dry_run,
-                           **(dict(audit_no_leakage=not args.allow_test_leakage) if method == 'polystep' else {}))
+                    runner(
+                        showcase_name,
+                        seed,
+                        args.device,
+                        args.results_dir,
+                        dry_run=args.dry_run,
+                        **(dict(audit_no_leakage=not args.allow_test_leakage) if method == "polystep" else {}),
+                    )
                 except Exception as e:
                     print(f"    ERROR: {method} seed={seed} failed: {e}")
                     traceback.print_exc()

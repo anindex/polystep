@@ -16,7 +16,7 @@ from typing import Optional, Union
 import torch
 
 from ..costs import scale_cost_matrix
-from ._prelude import sanitize_cost
+from ._prelude import align_marginal, sanitize_cost
 from .base import SolverResult
 
 
@@ -62,19 +62,23 @@ class MinCostGreedySolver:
         device = cost_matrix.device
         dtype = cost_matrix.dtype
 
-        if a is None:
-            a = torch.ones(P, device=device, dtype=dtype) / P
+        # Shared marginal handling: validates a user-supplied `a` (finite, nonneg,
+        # positive mass) instead of scattering a bad marginal straight into the plan.
+        a = align_marginal(a, P, device, dtype, "a")
 
         # Replace non-finite costs with a finite penalty first: argmin over a
         # NaN is undefined and would happily assign all mass to a masked vertex.
-        C = scale_cost_matrix(sanitize_cost(cost_matrix), scale_cost)
+        C_raw = sanitize_cost(cost_matrix)
+        C = scale_cost_matrix(C_raw, scale_cost)
 
         # Greedy: each particle picks the single lowest-cost vertex
         min_indices = C.argmin(dim=-1)  # (P,)
         transport = torch.zeros(P, V, device=device, dtype=dtype)
         transport.scatter_(1, min_indices.unsqueeze(1), a.unsqueeze(1))
 
-        ent_cost = (C * transport).sum().item()
+        # Report in the caller's frame, like the entropic solvers do. The argmin is
+        # invariant to the positive divisor, so only the reported number changes.
+        ent_cost = (C_raw * transport).sum().item()
 
         return SolverResult(
             matrix=transport,
@@ -142,10 +146,12 @@ class TopKMeanSolver:
         device = cost_matrix.device
         dtype = cost_matrix.dtype
 
-        if a is None:
-            a = torch.ones(P, device=device, dtype=dtype) / P
+        # Shared marginal handling: validates a user-supplied `a` (finite, nonneg,
+        # positive mass) instead of scattering a bad marginal straight into the plan.
+        a = align_marginal(a, P, device, dtype, "a")
 
-        C = scale_cost_matrix(sanitize_cost(cost_matrix), scale_cost)
+        C_raw = sanitize_cost(cost_matrix)
+        C = scale_cost_matrix(C_raw, scale_cost)
 
         # Graceful fallback when fewer vertices than k
         k_eff = min(self.k, V)
@@ -158,7 +164,9 @@ class TopKMeanSolver:
         mass_per_vertex = a.unsqueeze(1) / k_eff  # (P, 1)
         transport.scatter_(1, topk_indices, mass_per_vertex.expand_as(topk_indices))
 
-        ent_cost = (C * transport).sum().item()
+        # Report in the caller's frame, like the entropic solvers do. topk is
+        # invariant to the positive divisor, so only the reported number changes.
+        ent_cost = (C_raw * transport).sum().item()
 
         return SolverResult(
             matrix=transport,

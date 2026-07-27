@@ -12,7 +12,7 @@ Paper reproduction harness for PolyStep. All results use 5 seeds `{42, 123, 456,
 
 ```bash
 pip install -e ".[experiments]"
-bash experiments/runners/run_all_paper.sh             # ~8–10 GPU hours (RTX 5090)
+bash experiments/runners/run_all_paper.sh             # ~8-10 GPU hours (RTX 5090)
 python experiments/scripts/aggregate_results.py experiments/results/softmax/main/ --benchmark snn
 ```
 
@@ -25,7 +25,7 @@ python experiments/scripts/aggregate_results.py experiments/results/softmax/main
 | Argmax attention | `runners/run_elevation.py` | argmax() |
 | Staircase | `runners/run_elevation.py` | floor() |
 | Hard MoE | `runners/run_moe.py` | argmax() |
-| MAX-SAT (100K–1M) | `runners/run_maxsat.py` | round() |
+| MAX-SAT (100K-1M) | `runners/run_maxsat.py` | round() |
 | MNIST | `runners/run_mnist.py` | - |
 | ETTh1 timeseries | `runners/run_timeseries.py` | - |
 | RL policy search | `runners/run_rl.py` | - |

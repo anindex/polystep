@@ -17,7 +17,13 @@ Run:
 
 from __future__ import annotations
 
+import os
 import torch
+
+# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
+# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
+# Set POLYSTEP_THREADS to override. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
 
 from polystep import PolyStepES
 

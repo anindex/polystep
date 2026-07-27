@@ -17,11 +17,6 @@ from polystep.geometry import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Polytope tests
-# ---------------------------------------------------------------------------
-
-
 class TestPolytopes:
     """Tests for polytope vertex generators."""
 
@@ -75,11 +70,6 @@ class TestPolytopes:
         assert POLYTOPE_NUM_VERTICES_MAP["orthoplex"](dim) == 2 * dim
         assert POLYTOPE_NUM_VERTICES_MAP["simplex"](dim) == dim + 1
         assert POLYTOPE_NUM_VERTICES_MAP["cube"](dim) == 2**dim
-
-
-# ---------------------------------------------------------------------------
-# Rotation tests
-# ---------------------------------------------------------------------------
 
 
 class TestRotations:
@@ -143,11 +133,6 @@ class TestRotations:
         gen2 = torch.Generator().manual_seed(123)
         R2 = get_random_rotation_matrices(batch=5, dim=4, generator=gen2)
         assert torch.equal(R1, R2), "Same seed should produce identical rotations"
-
-
-# ---------------------------------------------------------------------------
-# Probe tests
-# ---------------------------------------------------------------------------
 
 
 class TestProbes:

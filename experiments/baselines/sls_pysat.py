@@ -14,7 +14,7 @@ comparison against polystep:
 This module exposes a ``run_sls_pysat`` function that wraps
 PySAT's ``Glucose4`` solver under a fair wall-clock budget that
 matches what polystep consumed. PySAT solvers are CDCL, not pure SLS, and target 100% SAT. For
-genuine SLS we recommend installing ProbSAT separately and calling
+true SLS we recommend installing ProbSAT separately and calling
 its binary, but Glucose4 is a strong upper bound that is already
 in the ``[paper]`` extras.
 
@@ -24,10 +24,11 @@ Usage:
     print(result["sat_ratio"])
 
 This is *not* wired into ``run_maxsat.py`` by default. We prefer
-explicit opt-in over silent baseline mutation -- the existing
+explicit opt-in over silent baseline mutation: the existing
 ``run_sls`` continues to drive ``run_all_paper.sh`` until a fair
 re-quantification is requested.
 """
+
 from __future__ import annotations
 
 import time

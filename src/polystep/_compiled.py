@@ -48,7 +48,12 @@ def try_compile(
     mode: str = DEFAULT_MODE,
     name: Optional[str] = None,
 ) -> Callable:
-    """Attempt to compile a function with torch.compile, falling back to eager.
+    """Wrap a function with torch.compile, falling back to eager on failure.
+
+    Compilation is lazy: ``torch.compile`` returns immediately and Inductor only
+    runs on the first call. Both points are covered here, so a backend failure at
+    either one warns once and permanently reverts that function to eager instead of
+    raising mid-step.
 
     Args:
         fn: Pure tensor function to compile.
@@ -57,11 +62,11 @@ def try_compile(
         name: Label for warning messages. Defaults to fn.__name__.
 
     Returns:
-        Compiled function, or the original fn if compilation fails.
+        Wrapped function that runs compiled when possible and eager otherwise.
     """
     label = name if name is not None else getattr(fn, "__name__", repr(fn))
     try:
-        return torch.compile(fn, fullgraph=fullgraph, mode=mode)
+        compiled = torch.compile(fn, fullgraph=fullgraph, mode=mode)
     except Exception as e:
         warnings.warn(
             f"torch.compile failed for '{label}': {e}. Falling back to eager mode.",
@@ -69,10 +74,28 @@ def try_compile(
         )
         return fn
 
+    state = {"compiled": compiled}
 
-# ---------------------------------------------------------------------------
-# Pure compiled functions (no .item(), no list ops, no shape-dependent branches)
-# ---------------------------------------------------------------------------
+    def guarded(*args, **kwargs):
+        target = state["compiled"]
+        if target is None:
+            return fn(*args, **kwargs)
+        try:
+            return target(*args, **kwargs)
+        except Exception as e:
+            # Do not swallow resource exhaustion: an OOM is a real failure whose
+            # eager retry would just OOM again, and hiding it makes the next
+            # traceback point at the wrong place.
+            if isinstance(e, torch.cuda.OutOfMemoryError):
+                raise
+            state["compiled"] = None
+            warnings.warn(
+                f"torch.compile backend failed on first call to '{label}': {e}. Falling back to eager mode.",
+                stacklevel=2,
+            )
+            return fn(*args, **kwargs)
+
+    return guarded
 
 
 def _sinkhorn_iteration(
@@ -205,7 +228,7 @@ def _fused_softmax_project(
         cost_matrix: Cost matrix C of shape (P, V).
         epsilon: Temperature parameter (entropic regularization strength).
         a: Source marginal of shape (P,).
-        polytope_verts: Template polytope vertices of shape (V, dim) -- NOT rotated.
+        polytope_verts: Template polytope vertices of shape (V, dim), NOT rotated.
         rot_mats: Per-particle rotation matrices of shape (P, dim, dim).
         step_radius: Step distance multiplier.
         X: Current particle positions of shape (P, dim).
@@ -216,15 +239,22 @@ def _fused_softmax_project(
             - X_new: Updated particle positions of shape (P, dim).
             - transport: Transport matrix of shape (P, V) with row sums equal to a.
     """
+    # Recenter to min(C)=0 first. softmax is shift-invariant, so this changes no
+    # weight, but it (a) makes the 'mean' scaling below shift-invariant too and
+    # (b) bounds -C/epsilon, which otherwise overflows to NaN for large-magnitude
+    # costs at tiny epsilon: the eager SoftmaxSolver recenters for the same reason.
+    C = cost_matrix - cost_matrix.amin()
+
     # Cost scaling (inline for compile safety, avoids cross-module string dispatch)
     if scale_cost_mean:
-        s = torch.clamp(cost_matrix.abs().mean(), min=1e-10)
-        C = cost_matrix / s
-    else:
-        C = cost_matrix
+        s = torch.clamp(C.abs().mean(), min=1e-10)
+        C = C / s
 
-    # Softmax weights: PyTorch's softmax subtracts row-max internally for stability
-    W = torch.softmax(-C / epsilon, dim=-1)  # (P, V)
+    # Shift per row before dividing. torch.softmax subtracts the row max only after
+    # the division, so at tiny epsilon a row sitting entirely above the global minimum
+    # sends every logit to -inf and comes back NaN. Softmax is row-wise
+    # shift-invariant, so only the values reaching the exponent change.
+    W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / epsilon, dim=-1)  # (P, V)
 
     # Transport matrix: row sums equal source marginal a
     transport = W * a.unsqueeze(-1)  # (P, V)
@@ -234,15 +264,32 @@ def _fused_softmax_project(
     w_centroid = W.to(polytope_verts.dtype) @ polytope_verts  # (P, dim)
     rot_centroid = torch.einsum("bij,bj->bi", rot_mats, w_centroid)  # (P, dim)
 
-    # Barycentric projection
     X_new = X + step_radius * rot_centroid  # (P, dim)
 
     return X_new, transport
 
 
-# ---------------------------------------------------------------------------
-# Registry: holds compiled or eager versions of each function
-# ---------------------------------------------------------------------------
+def _tensorize_scalars(fn: Callable, eager: Callable, positions: Tuple[int, ...], ref_arg: int) -> Callable:
+    """Wrap ``fn`` so the float arguments at ``positions`` arrive as 0-d tensors.
+
+    ``ref_arg`` indexes a tensor argument that supplies the device and dtype. Callers
+    that already pass a tensor are left alone, so this is idempotent.
+
+    Returns ``fn`` untouched when compilation fell back to ``eager``: there is no
+    Dynamo guard to defeat then, so the conversion would be pure overhead.
+    """
+    if fn is eager:
+        return fn
+
+    def wrapper(*args, **kwargs):
+        args = list(args)
+        ref = args[ref_arg]
+        for i in positions:
+            if i < len(args) and not isinstance(args[i], torch.Tensor):
+                args[i] = torch.as_tensor(args[i], dtype=ref.dtype, device=ref.device)
+        return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class CompiledFunctions:
@@ -264,11 +311,22 @@ class CompiledFunctions:
     def __init__(self, compile: bool = True) -> None:
         self.compile = compile and torch.cuda.is_available()
         if self.compile:
-            self.sinkhorn_iter = try_compile(_sinkhorn_iteration, name="sinkhorn_iteration")
-            self.rotate_and_translate = try_compile(_rotate_and_translate, name="rotate_and_translate")
+            # Dynamo specializes on Python float values, so a scheduled radius or
+            # progressive epsilon recompiles every step. 0-d tensors keep them dynamic.
+            # Compiled path only: the conversion is pure overhead in eager mode.
+            self.sinkhorn_iter = _tensorize_scalars(
+                try_compile(_sinkhorn_iteration, name="sinkhorn_iteration"), _sinkhorn_iteration, (5, 6), 2
+            )
+            self.rotate_and_translate = _tensorize_scalars(
+                try_compile(_rotate_and_translate, name="rotate_and_translate"), _rotate_and_translate, (3,), 0
+            )
             self.barycentric_projection = try_compile(_barycentric_projection, name="barycentric_projection")
-            self.compute_probe_points = try_compile(_compute_probe_points, name="compute_probe_points")
-            self.fused_softmax_project = try_compile(_fused_softmax_project, name="fused_softmax_project")
+            self.compute_probe_points = _tensorize_scalars(
+                try_compile(_compute_probe_points, name="compute_probe_points"), _compute_probe_points, (3,), 0
+            )
+            self.fused_softmax_project = _tensorize_scalars(
+                try_compile(_fused_softmax_project, name="fused_softmax_project"), _fused_softmax_project, (1, 5), 0
+            )
         else:
             self.sinkhorn_iter = _sinkhorn_iteration
             self.rotate_and_translate = _rotate_and_translate

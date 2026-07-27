@@ -42,17 +42,17 @@ pip install -e ".[experiments]"
 |---|-------|--------|
 | 13 | OT vs Softmax solver | `ablation_ot_vs_softmax.py` |
 | 14 | Epsilon / radius / particles / subspace grid | `run_fill_ablation_grid.py` |
-| 15 | MAX-SAT scaling (100–1M vars) | `run_maxsat_softmax_scaling.py` |
+| 15 | MAX-SAT scaling (100-1M vars) | `run_maxsat_softmax_scaling.py` |
 
 ## Reproduce all
 
 ```bash
 cd experiments/runners
-bash run_all_paper.sh              # ~8–10 GPU hours (RTX 5090)
+bash run_all_paper.sh              # ~8-10 GPU hours (RTX 5090)
 ```
 
 Results are saved to `experiments/results/`. Figures referenced in the
-paper are not bundled with this repository -- see the arXiv preprint
+paper are not bundled with this repository: see the arXiv preprint
 (arXiv:2605.01928) for the rendered versions.
 
 ## Result layout

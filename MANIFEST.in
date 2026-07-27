@@ -1,0 +1,15 @@
+# setuptools' default sdist selection picks up tests/test*.py but not conftest.py or
+# tests/__init__.py, which ships a test suite that cannot run. Include them, plus the
+# docs the README links to.
+include CHANGELOG.md
+include LIMITATIONS.md
+include CITATION.cff
+include CONTRIBUTING.md
+include tests/__init__.py
+include tests/conftest.py
+recursive-include docs *.md
+prune experiments
+prune examples
+prune data
+prune dist
+global-exclude *.py[cod] __pycache__ .DS_Store

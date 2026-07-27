@@ -1,6 +1,6 @@
 """Regression tests for the Softmax solver.
 
-The Softmax solver is on the critical path for every headline number
+The Softmax solver is on the critical path for every reported number
 in the paper. This file checks:
 
 - numerical safety of ``softmax(-C/eps)`` under FP32 / BF16
@@ -9,7 +9,7 @@ in the paper. This file checks:
 - a non-uniform target marginal ``b`` triggers a warning
 - a tiny epsilon (relative to ``max|C|``) triggers a warning
 - ``scale_cost`` does not mutate the caller's tensor in place
-- every headline runner explicitly pins ``solver=softmax``
+- the result-reporting runners explicitly pin ``solver=softmax``
 """
 
 from __future__ import annotations
@@ -24,11 +24,6 @@ import torch
 from polystep import SoftmaxSolver
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-# ---------------------------------------------------------------------------
-# Numerical safety of softmax(-C/eps) - overflow grid
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -58,11 +53,6 @@ def test_softmax_overflow_grid(cost_grid, dtype):
     assert not failures, "softmax produced non-finite entries:\n" + "\n".join(failures)
 
 
-# ---------------------------------------------------------------------------
-# Identical rows -> uniform output, no NaN
-# ---------------------------------------------------------------------------
-
-
 def test_softmax_identical_row_returns_uniform():
     """When every cost in a row equals 5.0, softmax must return 1/V uniformly.
 
@@ -85,11 +75,6 @@ def test_softmax_identical_row_returns_uniform():
     )
 
 
-# ---------------------------------------------------------------------------
-# Source-marginal preservation under FP32 and BF16
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-6), (torch.bfloat16, 5e-3)])
 def test_softmax_source_marginal_preserved(dtype, tol):
     """transport.sum(-1) must equal source marginal `a` exactly within dtype tol.
@@ -109,11 +94,6 @@ def test_softmax_source_marginal_preserved(dtype, tol):
     assert max_err < tol, (
         f"row sums deviate from a by {max_err} (tol={tol}, dtype={dtype}). a={a.tolist()}, row_sums={row_sums.tolist()}"
     )
-
-
-# ---------------------------------------------------------------------------
-# Target marginal `b` silently ignored - should warn (P3 fix)
-# ---------------------------------------------------------------------------
 
 
 def test_softmax_warns_on_nonuniform_b():
@@ -138,11 +118,6 @@ def test_softmax_warns_on_nonuniform_b():
     )
 
 
-# ---------------------------------------------------------------------------
-# Tiny epsilon underflow - should warn (P2 fix)
-# ---------------------------------------------------------------------------
-
-
 def test_softmax_warns_on_tiny_epsilon():
     """epsilon = 1e-30 is technically positive (passes existing
     `epsilon <= 0` validation) but produces -C/eps overflow in any
@@ -164,11 +139,6 @@ def test_softmax_warns_on_tiny_epsilon():
     )
 
 
-# ---------------------------------------------------------------------------
-# Cost-matrix scaling must clone - no in-place mutation
-# ---------------------------------------------------------------------------
-
-
 def test_softmax_does_not_mutate_caller_cost_matrix():
     """If the caller reuses a cost matrix across multiple solve() calls
     (for example, A/B testing a few epsilons on the same probe data), the
@@ -187,21 +157,16 @@ def test_softmax_does_not_mutate_caller_cost_matrix():
     )
 
 
-# ---------------------------------------------------------------------------
-# Static check: every headline runner forces softmax
-# ---------------------------------------------------------------------------
-
-
-HEADLINE_RUNNERS = (
+SOLVER_PINNED_RUNNERS = (
     ("experiments/runners/run_moe.py", '"softmax"'),
     ("experiments/runners/run_elevation.py", '"softmax"'),
     ("experiments/runners/run_maxsat_softmax_scaling.py", "'softmax'"),
 )
 
 
-@pytest.mark.parametrize("relpath,literal", HEADLINE_RUNNERS)
-def test_headline_runner_uses_softmax(relpath, literal):
-    """Verify that headline runners hard-code solver=softmax.
+@pytest.mark.parametrize("relpath,literal", SOLVER_PINNED_RUNNERS)
+def test_runner_pins_softmax_solver(relpath, literal, require_experiments):
+    """Verify that the result-reporting runners hard-code solver=softmax.
 
     Sets a regression guard if a refactor accidentally removes the explicit pin
     and lets the auto-selection rule (subspace -> softmax, else sinkhorn)
@@ -212,13 +177,8 @@ def test_headline_runner_uses_softmax(relpath, literal):
     pattern = re.compile(rf"solver\s*=\s*{re.escape(literal)}")
     assert pattern.search(src), (
         f"{relpath} does not pin solver={literal}; "
-        f"headline runners must hard-code softmax to avoid solver auto-selection drift."
+        f"these runners must hard-code softmax to avoid solver auto-selection drift."
     )
-
-
-# ---------------------------------------------------------------------------
-# API contract: epsilon validation, result-object invariants, init_f/g ignored
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("eps", [0.0, -0.1])

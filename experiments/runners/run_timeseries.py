@@ -41,10 +41,6 @@ from experiments.runners.common import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Data pipeline
-# ---------------------------------------------------------------------------
-
 ETTH1_URL = "https://raw.githubusercontent.com/zhouhaoyi/ETDataset/main/ETT-small/ETTh1.csv"
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
@@ -73,9 +69,9 @@ def load_etth1():
 
     Returns:
         Tuple of (train, val, test, scaler_dict) where:
-        - train: np.ndarray of shape (8640,) -- z-score normalized
-        - val: np.ndarray of shape (2880,) -- z-score normalized
-        - test: np.ndarray of shape (2880,) -- z-score normalized
+        - train: np.ndarray of shape (8640,): z-score normalized
+        - val: np.ndarray of shape (2880,): z-score normalized
+        - test: np.ndarray of shape (2880,): z-score normalized
         - scaler_dict: dict with 'mean' and 'std' keys (train statistics)
     """
     filepath = download_etth1()
@@ -91,8 +87,8 @@ def load_etth1():
 
     # Informer-standard split: 8640/2880/2880
     train_raw = data[:8640]
-    val_raw = data[8640:8640 + 2880]
-    test_raw = data[8640 + 2880:8640 + 2880 + 2880]
+    val_raw = data[8640 : 8640 + 2880]
+    test_raw = data[8640 + 2880 : 8640 + 2880 + 2880]
 
     # Z-score normalization using train statistics ONLY (no data leakage)
     train_mean = float(train_raw.mean())
@@ -132,14 +128,10 @@ class TimeSeriesDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.seq_len].reshape(-1, 1)  # (seq_len, 1)
-        y = self.data[idx + self.seq_len:idx + self.seq_len + self.pred_len]  # (pred_len,)
+        x = self.data[idx : idx + self.seq_len].reshape(-1, 1)  # (seq_len, 1)
+        y = self.data[idx + self.seq_len : idx + self.seq_len + self.pred_len]  # (pred_len,)
         return torch.from_numpy(x), torch.from_numpy(y)
 
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
 
 class TimeSeriesLSTM(nn.Module):
     """LSTM for univariate time-series forecasting.
@@ -162,6 +154,7 @@ class TimeSeriesLSTM(nn.Module):
     def __init__(self, input_size: int = 1, hidden_size: int = 64, pred_len: int = 96):
         super().__init__()
         from polystep.layers import VmapSafeLSTM
+
         self.lstm = VmapSafeLSTM(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -171,14 +164,10 @@ class TimeSeriesLSTM(nn.Module):
 
     def forward(self, x):
         # x: (batch, seq_len, 1)
-        out, _ = self.lstm(x)          # (batch, seq_len, hidden_size)
-        last_hidden = out[:, -1, :]    # (batch, hidden_size)
-        return self.fc(last_hidden)    # (batch, pred_len)
+        out, _ = self.lstm(x)  # (batch, seq_len, hidden_size)
+        last_hidden = out[:, -1, :]  # (batch, hidden_size)
+        return self.fc(last_hidden)  # (batch, pred_len)
 
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def evaluate_regression(
@@ -264,9 +253,9 @@ def compute_persistence_baseline(
 
     for i in range(n_samples):
         last_value = data_array[i + seq_len - 1]
-        target = data_array[i + seq_len:i + seq_len + pred_len]
+        target = data_array[i + seq_len : i + seq_len + pred_len]
         diff = target - last_value
-        total_mse += float((diff ** 2).sum())
+        total_mse += float((diff**2).sum())
         total_mae += float(np.abs(diff).sum())
         total_elements += pred_len
 
@@ -276,14 +265,10 @@ def compute_persistence_baseline(
     }
 
 
-# ---------------------------------------------------------------------------
-# Benchmark constants
-# ---------------------------------------------------------------------------
-
 BENCHMARK = "timeseries"
 BATCH_SIZE = 64
-EPOCHS = 30        # polystep epochs (30 for production)
-ADAM_EPOCHS = 50   # Adam epochs (gradient-based ceiling)
+EPOCHS = 30  # polystep epochs (30 for production)
+ADAM_EPOCHS = 50  # Adam epochs (gradient-based ceiling)
 SEQ_LEN = 96
 PRED_LEN = 96
 
@@ -345,10 +330,6 @@ ADAM_CONFIG = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Helper: build train/test tensors for baselines that need raw tensor input
-# ---------------------------------------------------------------------------
-
 def _build_window_tensors(data_array, seq_len=SEQ_LEN, pred_len=PRED_LEN, device="cuda"):
     """Build sliding window input/target tensors for baselines.
 
@@ -363,12 +344,17 @@ def _build_window_tensors(data_array, seq_len=SEQ_LEN, pred_len=PRED_LEN, device
     return inputs.to(device), targets.to(device)
 
 
-# ---------------------------------------------------------------------------
-# Method runners
-# ---------------------------------------------------------------------------
-
-def run_polystep(seed, device, train_data, val_data, test_data, results_dir,
-                epochs_override=None, solver=None, audit_no_leakage: bool = True):
+def run_polystep(
+    seed,
+    device,
+    train_data,
+    val_data,
+    test_data,
+    results_dir,
+    epochs_override=None,
+    solver=None,
+    audit_no_leakage: bool = True,
+):
     """Train time-series LSTM with polystep PolyStepOptimizer + HybridSubspace.
 
     By default, best-checkpoint selection uses validation MSE (from
@@ -390,10 +376,7 @@ def run_polystep(seed, device, train_data, val_data, test_data, results_dir,
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     total_steps = epochs * len(train_loader)
-    epsilon_decay = (
-        (PSTORCH_CONFIG["epsilon_init"] - PSTORCH_CONFIG["epsilon_target"])
-        / max(1, total_steps)
-    )
+    epsilon_decay = (PSTORCH_CONFIG["epsilon_init"] - PSTORCH_CONFIG["epsilon_target"]) / max(1, total_steps)
     sr_decay = (PSTORCH_CONFIG["step_radius_init"] - PSTORCH_CONFIG["step_radius_target"]) / max(1, total_steps)
     pr_decay = (PSTORCH_CONFIG["probe_radius_init"] - PSTORCH_CONFIG["probe_radius_target"]) / max(1, total_steps)
 
@@ -473,14 +456,16 @@ def run_polystep(seed, device, train_data, val_data, test_data, results_dir,
                 # Per-20-step fine-grained tracking
                 if step_count % 20 == 0:
                     step_metrics = evaluate_regression(model, test_data, device=device)
-                    step_logs.append({
-                        "step": step_count,
-                        "epoch": epoch + 1,
-                        "test_mse": step_metrics["mse"],
-                        "test_mae": step_metrics["mae"],
-                        "loss": loss,
-                        "wall_time": time.time() - start_time,
-                    })
+                    step_logs.append(
+                        {
+                            "step": step_count,
+                            "epoch": epoch + 1,
+                            "test_mse": step_metrics["mse"],
+                            "test_mae": step_metrics["mae"],
+                            "loss": loss,
+                            "wall_time": time.time() - start_time,
+                        }
+                    )
 
             # Evaluate on val and test sets
             val_metrics = evaluate_regression(model, val_data, device=device)
@@ -494,18 +479,22 @@ def run_polystep(seed, device, train_data, val_data, test_data, results_dir,
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / len(train_loader)
 
-            epoch_logs.append({
-                "epoch": epoch + 1,
-                "train_mse": avg_loss,
-                "val_mse": val_metrics["mse"],
-                "val_mae": val_metrics["mae"],
-                "test_mse": test_metrics["mse"],
-                "test_mae": test_metrics["mae"],
-                "loss": avg_loss,
-                "time": epoch_time,
-                "wall_time": time.time() - start_time,
-            })
-            print(f"    Epoch {epoch+1}/{epochs} | train={avg_loss:.4f} | val={val_metrics['mse']:.4f} | test={test_metrics['mse']:.4f}")
+            epoch_logs.append(
+                {
+                    "epoch": epoch + 1,
+                    "train_mse": avg_loss,
+                    "val_mse": val_metrics["mse"],
+                    "val_mae": val_metrics["mae"],
+                    "test_mse": test_metrics["mse"],
+                    "test_mae": test_metrics["mae"],
+                    "loss": avg_loss,
+                    "time": epoch_time,
+                    "wall_time": time.time() - start_time,
+                }
+            )
+            print(
+                f"    Epoch {epoch + 1}/{epochs} | train={avg_loss:.4f} | val={val_metrics['mse']:.4f} | test={test_metrics['mse']:.4f}"
+            )
 
     wall_time = time.time() - start_time
     last_metrics = evaluate_regression(model, test_data, device=device)
@@ -549,8 +538,7 @@ def run_polystep(seed, device, train_data, val_data, test_data, results_dir,
     print(f"    Saved: {filepath}")
 
 
-def run_adam(seed, device, train_data, val_data, test_data, results_dir,
-             epochs_override=None):
+def run_adam(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
     """Train time-series LSTM with Adam optimizer (gradient-based ceiling)."""
     set_seed(seed)
     model = TimeSeriesLSTM().to(device)
@@ -593,18 +581,22 @@ def run_adam(seed, device, train_data, val_data, test_data, results_dir,
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / len(train_loader)
 
-            epoch_logs.append({
-                "epoch": epoch + 1,
-                "train_mse": avg_loss,
-                "val_mse": val_metrics["mse"],
-                "val_mae": val_metrics["mae"],
-                "test_mse": test_metrics["mse"],
-                "test_mae": test_metrics["mae"],
-                "loss": avg_loss,
-                "time": epoch_time,
-                "wall_time": time.time() - start_time,
-            })
-            print(f"    Epoch {epoch+1}/{epochs} | train={avg_loss:.4f} | val={val_metrics['mse']:.4f} | test={test_metrics['mse']:.4f}")
+            epoch_logs.append(
+                {
+                    "epoch": epoch + 1,
+                    "train_mse": avg_loss,
+                    "val_mse": val_metrics["mse"],
+                    "val_mae": val_metrics["mae"],
+                    "test_mse": test_metrics["mse"],
+                    "test_mae": test_metrics["mae"],
+                    "loss": avg_loss,
+                    "time": epoch_time,
+                    "wall_time": time.time() - start_time,
+                }
+            )
+            print(
+                f"    Epoch {epoch + 1}/{epochs} | train={avg_loss:.4f} | val={val_metrics['mse']:.4f} | test={test_metrics['mse']:.4f}"
+            )
 
     wall_time = time.time() - start_time
     final_metrics = evaluate_regression(model, test_data, device=device)
@@ -640,11 +632,11 @@ def run_adam(seed, device, train_data, val_data, test_data, results_dir,
     print(f"    Saved: {filepath}")
 
 
-def run_cmaes(seed, device, train_data, val_data, test_data, results_dir,
-              epochs_override=None):
+def run_cmaes(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
     """Train time-series LSTM with CMA-ES (EvoTorch) using negative MSE fitness."""
     try:
         from polystep.benchmarks.baselines import has_evotorch
+
         if not has_evotorch():
             print("    Skipping cmaes (EvoTorch not installed)")
             return
@@ -684,7 +676,7 @@ def run_cmaes(seed, device, train_data, val_data, test_data, results_dir,
             with torch.no_grad():
                 for p in eval_model.parameters():
                     numel = p.numel()
-                    p.data.copy_(values[offset:offset + numel].view(p.shape))
+                    p.data.copy_(values[offset : offset + numel].view(p.shape))
                     offset += numel
             # Evaluate on a random batch
             batch_size = min(512, len(train_inputs))
@@ -724,28 +716,32 @@ def run_cmaes(seed, device, train_data, val_data, test_data, results_dir,
                 # Load best solution into model for evaluation
                 pop_best_sol = status.get("pop_best", None)
                 if pop_best_sol is not None:
-                    values = pop_best_sol.values if hasattr(pop_best_sol, 'values') else pop_best_sol
+                    values = pop_best_sol.values if hasattr(pop_best_sol, "values") else pop_best_sol
                     offset = 0
                     with torch.no_grad():
                         for p in model.parameters():
                             numel = p.numel()
-                            p.data.copy_(values[offset:offset + numel].view(p.shape))
+                            p.data.copy_(values[offset : offset + numel].view(p.shape))
                             offset += numel
 
                 metrics = evaluate_regression(model, test_data, device=device)
                 if metrics["mse"] < best_mse:
                     best_mse = metrics["mse"]
 
-                epoch_logs.append({
-                    "epoch": gen + 1,
-                    "generation": gen + 1,
-                    "pop_best_fitness": pop_best_fitness,
-                    "test_mse": metrics["mse"],
-                    "test_mae": metrics["mae"],
-                    "loss": metrics["mse"],
-                    "time": time.time() - start_time,
-                })
-                print(f"    Gen {gen+1}/{generations} | MSE={metrics['mse']:.4f} | MAE={metrics['mae']:.4f} | fitness={pop_best_fitness:.6f}")
+                epoch_logs.append(
+                    {
+                        "epoch": gen + 1,
+                        "generation": gen + 1,
+                        "pop_best_fitness": pop_best_fitness,
+                        "test_mse": metrics["mse"],
+                        "test_mae": metrics["mae"],
+                        "loss": metrics["mse"],
+                        "time": time.time() - start_time,
+                    }
+                )
+                print(
+                    f"    Gen {gen + 1}/{generations} | MSE={metrics['mse']:.4f} | MAE={metrics['mae']:.4f} | fitness={pop_best_fitness:.6f}"
+                )
 
     wall_time = time.time() - start_time
 
@@ -775,8 +771,7 @@ def run_cmaes(seed, device, train_data, val_data, test_data, results_dir,
     print(f"    Saved: {filepath}")
 
 
-def run_openai_es(seed, device, train_data, val_data, test_data, results_dir,
-                  epochs_override=None):
+def run_openai_es(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
     """Train time-series LSTM with OpenAI Evolution Strategy."""
     from experiments.baselines.openai_es import train_openai_es
 
@@ -847,8 +842,7 @@ def run_openai_es(seed, device, train_data, val_data, test_data, results_dir,
     print(f"    Saved: {filepath}")
 
 
-def run_spsa(seed, device, train_data, val_data, test_data, results_dir,
-             epochs_override=None):
+def run_spsa(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
     """Train time-series LSTM with SPSA."""
     from experiments.baselines.spsa import train_spsa
 
@@ -917,8 +911,7 @@ def run_spsa(seed, device, train_data, val_data, test_data, results_dir,
     print(f"    Saved: {filepath}")
 
 
-def run_persistence(seed, device, train_data, val_data, test_data, results_dir,
-                    epochs_override=None):
+def run_persistence(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
     """Compute persistence (naive) baseline for time-series forecasting.
 
     Persistence forecast: predict the last observed value for all H=96
@@ -952,10 +945,6 @@ def run_persistence(seed, device, train_data, val_data, test_data, results_dir,
     print(f"    Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method dispatch
-# ---------------------------------------------------------------------------
-
 METHOD_RUNNERS = {
     "polystep": run_polystep,
     "adam": run_adam,
@@ -966,8 +955,7 @@ METHOD_RUNNERS = {
 }
 
 
-def run_method(method, seed, device, results_dir, epochs_override=None, solver=None,
-               audit_no_leakage: bool = True):
+def run_method(method, seed, device, results_dir, epochs_override=None, solver=None, audit_no_leakage: bool = True):
     """Run a single method+seed combination.
 
     Loads ETTh1 data, then delegates to the method-specific runner.
@@ -977,44 +965,54 @@ def run_method(method, seed, device, results_dir, epochs_override=None, solver=N
     if runner is None:
         print(f"    Unknown method: {method}")
         return
-    if method == 'polystep':
-        runner(seed, device, train_data, val_data, test_data, results_dir,
-               epochs_override=epochs_override, solver=solver,
-               audit_no_leakage=audit_no_leakage)
+    if method == "polystep":
+        runner(
+            seed,
+            device,
+            train_data,
+            val_data,
+            test_data,
+            results_dir,
+            epochs_override=epochs_override,
+            solver=solver,
+            audit_no_leakage=audit_no_leakage,
+        )
     else:
-        runner(seed, device, train_data, val_data, test_data, results_dir,
-               epochs_override=epochs_override)
+        runner(seed, device, train_data, val_data, test_data, results_dir, epochs_override=epochs_override)
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run ETTh1 time-series benchmark: all methods x all seeds"
-    )
+    parser = argparse.ArgumentParser(description="Run ETTh1 time-series benchmark: all methods x all seeds")
     parser.add_argument(
-        "--methods", nargs="+",
+        "--methods",
+        nargs="+",
         default=["polystep", "adam", "cmaes", "openai_es", "spsa", "persistence"],
         help="Methods to run (default: all 6)",
     )
     parser.add_argument(
-        "--seeds", nargs="+", type=int, default=SEEDS,
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=SEEDS,
         help="Seeds to run (default: 42 123 456 789 1337)",
     )
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
     parser.add_argument("--results-dir", default="experiments/results/softmax/main", help="Results directory")
     parser.add_argument(
-        "--epochs-override", type=int, default=None,
+        "--epochs-override",
+        type=int,
+        default=None,
         help="Override epoch count for polystep and Adam (for smoke testing)",
     )
     parser.add_argument(
-        "--solver", choices=["softmax", "sinkhorn"], default="softmax",
+        "--solver",
+        choices=["softmax", "sinkhorn"],
+        default="softmax",
         help="Solver backend: softmax (default, used with subspace) or sinkhorn (full-space).",
     )
     parser.add_argument(
-        "--allow-test-leakage", action="store_true",
+        "--allow-test-leakage",
+        action="store_true",
         help=(
             "Legacy mode: select best_state_dict on test MSE instead of "
             "validation MSE. Default is honest protocol (val-selected). "
@@ -1037,20 +1035,25 @@ def main():
 
     for method in args.methods:
         for seed in args.seeds:
-            output_file = os.path.join(
-                args.results_dir, f"{BENCHMARK}_{method}_{seed}.json"
-            )
+            output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{method}_{seed}.json")
             if os.path.exists(output_file):
                 print(f"Skipping {method} seed={seed} (result exists)")
                 continue
             print(f"Running {method} seed={seed}...")
             try:
-                run_method(method, seed, args.device, args.results_dir,
-                           epochs_override=args.epochs_override, solver=args.solver,
-                           audit_no_leakage=not args.allow_test_leakage)
+                run_method(
+                    method,
+                    seed,
+                    args.device,
+                    args.results_dir,
+                    epochs_override=args.epochs_override,
+                    solver=args.solver,
+                    audit_no_leakage=not args.allow_test_leakage,
+                )
             except Exception as e:
                 print(f"  ERROR: {method} seed={seed} failed: {e}")
                 import traceback
+
                 traceback.print_exc()
             finally:
                 gc.collect()

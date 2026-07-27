@@ -148,14 +148,10 @@ def train_openai_es(
         loss_fn = nn.CrossEntropyLoss()
 
     if antithetic and population_size % 2 != 0:
-        raise ValueError(
-            f"population_size must be even when antithetic=True, got {population_size}"
-        )
+        raise ValueError(f"population_size must be even when antithetic=True, got {population_size}")
 
     if fitness_shaping not in ("zscore", "rank"):
-        raise ValueError(
-            f"fitness_shaping must be 'zscore' or 'rank', got '{fitness_shaping}'"
-        )
+        raise ValueError(f"fitness_shaping must be 'zscore' or 'rank', got '{fitness_shaping}'")
 
     set_seed(seed)
     model = model.to(device)
@@ -224,9 +220,7 @@ def train_openai_es(
             # --- 4. Gradient estimate ---
             # g = (1 / (pop * sigma)) * epsilon^T @ shaped_rewards
             # epsilon: (pop, n_params), shaped_rewards: (pop,)
-            grad = (1.0 / (population_size * sigma)) * (
-                epsilon.t() @ shaped_rewards
-            ).to(device)
+            grad = (1.0 / (population_size * sigma)) * (epsilon.t() @ shaped_rewards).to(device)
 
             # --- 5. Update params (gradient ascent on reward = descent on loss) ---
             current_lr = lr * (1.0 - gen / generations) if lr_decay else lr

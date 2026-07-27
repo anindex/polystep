@@ -11,7 +11,7 @@ from typing import Optional, Union
 
 import torch
 
-from ..costs import scale_cost_matrix
+from ..costs import resolve_cost_scale
 from ._prelude import align_marginal, recenter_cost, sanitize_cost, validate_positive
 from .base import SolverResult
 
@@ -72,10 +72,12 @@ class TemperedSoftmaxSolver:
         device, dtype = cost_matrix.device, cost_matrix.dtype
         a = align_marginal(a, P, device, dtype)
 
-        C = scale_cost_matrix(cost_matrix, scale_cost)
-        # softmax is shift-invariant; recentering keeps min(C)=0 so -C/tau cannot
-        # form a +inf logit at tiny tau.
-        C, cost_shift = recenter_cost(C)
+        # Recenter BEFORE scaling: softmax is shift-invariant but 'mean'/'max_cost'
+        # are not. Recentering also keeps min(C)=0 so -C/tau cannot form a +inf
+        # logit at tiny tau.
+        C, cost_shift = recenter_cost(cost_matrix)
+        cost_scale = resolve_cost_scale(C, scale_cost)
+        C = C / cost_scale
 
         # Use fixed tau (NOT self.epsilon) for the softmax. Pin inside an
         # autocast-disabled FP32 region so an outer mixed-precision context
@@ -83,8 +85,8 @@ class TemperedSoftmaxSolver:
         with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
             W = torch.softmax(-C / self.tau, dim=-1)
             transport = W * a.unsqueeze(-1)
-            # Undo the recenter shift so the reported cost is <C_scaled, transport>.
-            ent_cost = ((C * transport).sum() + cost_shift * a.sum()).item()
+            # Undo both frame changes so the reported cost is <C_raw, transport>.
+            ent_cost = ((C * transport).sum() * cost_scale + cost_shift * a.sum()).item()
 
         return SolverResult(
             matrix=transport,

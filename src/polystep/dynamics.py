@@ -75,6 +75,76 @@ def apply_momentum(
 
 
 @torch.inference_mode()
+def update_stagnation(
+    current_loss: float,
+    prev_loss: float,
+    stagnation_count: int,
+    stagnation_threshold: float = 1e-4,
+) -> Tuple[int, float]:
+    """Count consecutive near-flat steps.
+
+    Separate from radius adaptation because the subspace absorb trigger
+    (``absorb_mode="stagnation"``) also reads ``state.stagnation_count``, and that
+    counter must advance even when ``use_adaptive_radius`` is False.
+
+    Args:
+        current_loss: Loss at current iteration.
+        prev_loss: Loss at previous iteration.
+        stagnation_count: Current consecutive stagnation count.
+        stagnation_threshold: Relative change below which an iteration is stagnating.
+
+    Returns:
+        (stagnation_count, current_loss). The loss is returned so the caller can store
+        it as prev_loss.
+    """
+    # No progress signal from a non-finite loss, so leave the counter alone.
+    if not math.isfinite(current_loss) or not math.isfinite(prev_loss):
+        return (stagnation_count, current_loss)
+
+    rel_change = abs(current_loss - prev_loss) / (abs(prev_loss) + 1e-10)
+    return ((stagnation_count + 1) if rel_change < stagnation_threshold else 0, current_loss)
+
+
+@torch.inference_mode()
+def update_radius_multiplier(
+    current_loss: float,
+    prev_loss: float,
+    stagnation_count: int,
+    radius_multiplier: float,
+    stagnation_patience: int = 10,
+    radius_increase: float = 1.5,
+    radius_decrease: float = 0.9,
+    radius_min: float = 0.5,
+    radius_max: float = 3.0,
+) -> Tuple[float, int]:
+    """Adjust the radius multiplier from an already-updated stagnation count.
+
+    Boosts the radius after ``stagnation_patience`` flat steps, decays it on
+    improvement. A boost resets ``stagnation_count``, so with
+    ``stagnation_patience <= absorb_patience`` it fires before a stagnation absorb can.
+    ``PolyStepOptimizer`` warns on that combination.
+
+    Note the direction is deliberately the opposite of a trust region, which grows the
+    step on a successful iteration. Here every improving step multiplies the radius by
+    ``radius_decrease``, so a healthy run contracts toward ``radius_min`` and only
+    stagnation restores reach. The intent is to settle into the current basin and to keep
+    exploration for when progress stops, not to accelerate down a slope.
+
+    Returns:
+        (radius_multiplier, stagnation_count).
+    """
+    if not math.isfinite(current_loss) or not math.isfinite(prev_loss):
+        return (radius_multiplier, stagnation_count)
+
+    if stagnation_count >= stagnation_patience:
+        radius_multiplier = min(radius_multiplier * radius_increase, radius_max)
+        stagnation_count = 0
+    elif current_loss < prev_loss:
+        radius_multiplier = max(radius_multiplier * radius_decrease, radius_min)
+
+    return (radius_multiplier, stagnation_count)
+
+
 def update_adaptive_radius(
     current_loss: float,
     prev_loss: float,
@@ -109,30 +179,19 @@ def update_adaptive_radius(
         Tuple of (radius_multiplier, stagnation_count, current_loss) where
         current_loss is returned so the caller can store it as prev_loss.
     """
-    # Guard against NaN/inf: if the loss is not finite, skip all radius
-    # adaptation and return the current state unchanged. This prevents a
-    # NaN loss from resetting the stagnation counter or corrupting the
-    # radius multiplier.
-    if not math.isfinite(current_loss):
-        return (radius_multiplier, stagnation_count, current_loss)
-
-    # Skip adaptation on the first step (prev_loss=inf) - no history to compare
-    if not math.isfinite(prev_loss):
-        return (radius_multiplier, stagnation_count, current_loss)
-
-    rel_change = abs(current_loss - prev_loss) / (abs(prev_loss) + 1e-10)
-
-    if rel_change < stagnation_threshold:
-        stagnation_count += 1
-    else:
-        stagnation_count = 0
-
-    if stagnation_count >= stagnation_patience:
-        radius_multiplier *= radius_increase
-        radius_multiplier = min(radius_multiplier, radius_max)
-        stagnation_count = 0
-    elif current_loss < prev_loss:
-        radius_multiplier *= radius_decrease
-        radius_multiplier = max(radius_multiplier, radius_min)
-
-    return (radius_multiplier, stagnation_count, current_loss)
+    # Composition of the two halves above, kept for backward compatibility. Both no-op
+    # on non-finite losses, so NaN cannot reset the counter or corrupt the multiplier,
+    # and the first step (prev_loss=inf) is skipped.
+    stagnation_count, prev = update_stagnation(current_loss, prev_loss, stagnation_count, stagnation_threshold)
+    radius_multiplier, stagnation_count = update_radius_multiplier(
+        current_loss,
+        prev_loss,
+        stagnation_count,
+        radius_multiplier,
+        stagnation_patience=stagnation_patience,
+        radius_increase=radius_increase,
+        radius_decrease=radius_decrease,
+        radius_min=radius_min,
+        radius_max=radius_max,
+    )
+    return (radius_multiplier, stagnation_count, prev)

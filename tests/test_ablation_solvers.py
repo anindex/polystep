@@ -13,11 +13,6 @@ from polystep.solvers.greedy import MinCostGreedySolver, TopKMeanSolver
 from polystep.solvers.tempered_softmax import TemperedSoftmaxSolver
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def cost_matrix():
     """Small (4, 6) cost matrix with known structure."""
@@ -29,11 +24,6 @@ def cost_matrix():
 def source_marginal():
     """Uniform source marginal for P=4."""
     return torch.ones(4) / 4
-
-
-# ---------------------------------------------------------------------------
-# MinCostGreedySolver
-# ---------------------------------------------------------------------------
 
 
 class TestMinCostGreedySolver:
@@ -75,11 +65,6 @@ class TestMinCostGreedySolver:
         row_sums = result.matrix.sum(dim=1)
         expected = torch.ones(4) / 4
         assert torch.allclose(row_sums, expected, atol=1e-7)
-
-
-# ---------------------------------------------------------------------------
-# TopKMeanSolver
-# ---------------------------------------------------------------------------
 
 
 class TestTopKMeanSolver:
@@ -138,11 +123,6 @@ class TestTopKMeanSolver:
         assert torch.allclose(r_greedy.matrix, r_topk1.matrix, atol=1e-7)
 
 
-# ---------------------------------------------------------------------------
-# TemperedSoftmaxSolver
-# ---------------------------------------------------------------------------
-
-
 class TestTemperedSoftmaxSolver:
     def test_basic(self, cost_matrix, source_marginal):
         solver = TemperedSoftmaxSolver(tau=1.0)
@@ -198,11 +178,6 @@ class TestTemperedSoftmaxSolver:
         assert torch.allclose(T, r_greedy.matrix, atol=1e-5)
 
 
-# ---------------------------------------------------------------------------
-# Shape Consistency: all solvers return (P, V) matrix
-# ---------------------------------------------------------------------------
-
-
 class TestShapeConsistency:
     @pytest.mark.parametrize("P,V", [(1, 4), (10, 2), (50, 16), (100, 8)])
     def test_various_sizes(self, P, V):
@@ -212,11 +187,6 @@ class TestShapeConsistency:
             result = solver.solve(C, a=a)
             assert result.matrix.shape == (P, V)
             assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# PolyStepOptimizer solver selection integration
-# ---------------------------------------------------------------------------
 
 
 class TestSolverSelection:

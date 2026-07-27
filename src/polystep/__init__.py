@@ -1,6 +1,6 @@
 """polystep: PyTorch PolyStep Optimizer."""
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     # Core solver
@@ -12,6 +12,8 @@ __all__ = [
     "SoftmaxResult",
     "KLSoftmaxSolver",
     "TemperedSoftmaxSolver",
+    "MinCostGreedySolver",
+    "TopKMeanSolver",
     # Geometry
     "get_orthoplex_vertices",
     "get_simplex_vertices",
@@ -58,6 +60,8 @@ __all__ = [
     # Dynamics
     "apply_momentum",
     "update_adaptive_radius",
+    "update_radius_multiplier",
+    "update_stagnation",
     "compute_momentum_coefficient",
     # Optimizer
     "PolyStepOptimizer",
@@ -90,6 +94,7 @@ __all__ = [
     # Projection
     "SparseRandomProjection",
     # Hybrid subspace
+    "FactoredSubspace",
     "HybridSubspace",
     "LayerProjectionSpec",
 ]
@@ -103,6 +108,8 @@ from .solvers import (
     SoftmaxResult,
     KLSoftmaxSolver,
     TemperedSoftmaxSolver,
+    MinCostGreedySolver,
+    TopKMeanSolver,
 )
 
 from .geometry import (
@@ -138,7 +145,13 @@ from .cma import (
 
 from .blockwise import BlockConfig, create_per_layer_blocks, create_grouped_blocks
 
-from .dynamics import apply_momentum, update_adaptive_radius, compute_momentum_coefficient
+from .dynamics import (
+    apply_momentum,
+    update_adaptive_radius,
+    update_radius_multiplier,
+    update_stagnation,
+    compute_momentum_coefficient,
+)
 
 from .optimizer import PolyStepOptimizer, RankSchedule
 from .ask_tell import PolyStepES, minimize
@@ -173,4 +186,5 @@ from .layers import VmapSafeMultiHeadAttention, VmapSafeLSTMCell, VmapSafeLSTM
 from .projection import SparseRandomProjection
 
 # Hybrid subspace
+from .factored_subspace import FactoredSubspace
 from .hybrid_subspace import HybridSubspace, LayerProjectionSpec

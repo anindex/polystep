@@ -14,11 +14,6 @@ import torch.nn as nn
 from polystep.transform import ParamEntry, ParamLayout, get_device, create_generator
 
 
-# ---------------------------------------------------------------------------
-# Helper models
-# ---------------------------------------------------------------------------
-
-
 class SimpleMLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -54,11 +49,6 @@ class SharedWeightsModel(nn.Module):
 
     def forward(self, x):
         return self.fc2(torch.relu(self.fc1(x)))
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 class TestRoundtripMLP:
@@ -191,10 +181,6 @@ class TestParamEntriesMetadata:
             )
 
 
-# ---------------------------------------------------------------------------
-# Device and determinism tests
-# ---------------------------------------------------------------------------
-
 HAS_CUDA = torch.cuda.is_available()
 
 
@@ -208,6 +194,7 @@ class TestFlattenDeviceCPU:
         assert particles.device == torch.device("cpu")
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not HAS_CUDA, reason="CUDA not available")
 class TestFlattenDeviceCUDA:
     """``flatten`` produces particles on CUDA when the model is on CUDA."""

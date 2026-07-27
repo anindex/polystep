@@ -20,10 +20,6 @@ Rotation modes:
 - ``'displacement'`` - SVD of recent displacements keeps productive
   directions; the SVD share grows linearly from ``svd_ratio_init`` to
   ``svd_ratio_final`` over the schedule.
-- ``'ot_bias'`` - biases a fraction of columns toward high-transport
-  directions extracted from the OT plan (falls back to random when the
-  full-dim layout doesn't match the particle layout).
-
 ``absorb()`` folds the current subspace perturbation into the base
 weights and zeros the subspace vector. Combined with rotation each
 iteration explores a fresh subspace centered on the current best.
@@ -35,6 +31,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
+
+from .solvers._prelude import thin_qr
+from .subspace import absorb_due
 import torch.nn as nn
 
 if TYPE_CHECKING:
@@ -56,6 +55,20 @@ def _spawn_cpu_generator(generator: Optional[torch.Generator]) -> Optional[torch
     cpu_gen = torch.Generator(device="cpu")
     cpu_gen.manual_seed(seed)
     return cpu_gen
+
+
+def _draw_basis_gaussian(rows, cols, device, dtype, generator):
+    """Draw a (rows, cols) Gaussian for basis construction.
+
+    Seeded callers go through CPU so the random stream is identical whatever the
+    target device. Unseeded there is no such contract, so draw on the target and skip
+    a host allocation plus transfer that reaches gigabytes per step at large full_dim.
+    """
+    target = torch.device(device)
+    if generator is None:
+        return torch.randn(rows, cols, device=target, dtype=dtype)
+    Z = torch.randn(rows, cols, generator=_spawn_cpu_generator(generator), device="cpu", dtype=dtype)
+    return Z.to(device=target) if target.type != "cpu" else Z
 
 
 @dataclass(frozen=True)
@@ -88,16 +101,12 @@ class AdaptiveSubspace:
     Two rotation modes are supported:
 
     - ``'random'``: Draws entirely new QR-orthogonalized basis each call
-      to ``rotate()``. Simple but effective -- equivalent to random search
+      to ``rotate()``. Simple but effective: equivalent to random search
       in a new subspace each iteration.
 
     - ``'displacement'``: Uses SVD of recent displacement history to retain
       productive directions. The fraction of SVD-derived directions increases
       linearly from ``svd_ratio_init`` to ``svd_ratio_final`` over optimization.
-
-    - ``'ot_bias'``: Biases projection toward high-transport directions from
-      the OT plan. The fraction of OT-derived directions is controlled by
-      ``ot_bias_ratio``. Falls back to random when OT info is not available.
 
     Example::
 
@@ -118,11 +127,9 @@ class AdaptiveSubspace:
         full_dim: Total flattened parameter count.
         subspace_dim: Number of subspace coordinates (rank).
         compression_ratio: subspace_dim / full_dim.
-        rotation_mode: 'random', 'displacement', or 'ot_bias' (default 'displacement').
+        rotation_mode: 'random' or 'displacement' (default 'displacement').
         svd_ratio_init: Starting SVD ratio for displacement mode (default 0.0).
         svd_ratio_final: Ending SVD ratio for displacement mode (default 0.5).
-        ot_bias_ratio: Fraction of subspace from OT directions in 'ot_bias' mode
-            (default 0.3).
         displacement_history_size: Rolling window size for displacement
             history (default 5).
         absorb_mode: 'stagnation' or 'periodic' (default 'stagnation').
@@ -136,7 +143,6 @@ class AdaptiveSubspace:
     rotation_mode: str = "displacement"
     svd_ratio_init: float = 0.0
     svd_ratio_final: float = 0.5
-    ot_bias_ratio: float = 0.3
     displacement_history_size: int = 5
     absorb_mode: str = "stagnation"
     absorb_patience: int = 20
@@ -146,10 +152,6 @@ class AdaptiveSubspace:
     def __post_init__(self) -> None:
         if self.compression_ratio == 0.0 and self.full_dim > 0:
             object.__setattr__(self, "compression_ratio", self.subspace_dim / self.full_dim)
-
-    # ------------------------------------------------------------------
-    # Projection initialization
-    # ------------------------------------------------------------------
 
     def init_projection(
         self,
@@ -204,19 +206,13 @@ class AdaptiveSubspace:
         Returns:
             Orthogonal matrix of shape (rows, cols).
         """
-        # Generate Z on CPU in fp32 for reproducibility: a CUDA generator cannot
-        # drive a CPU tensor, so spawn a CPU generator seeded from it. The random
-        # stream is therefore identical on CPU and CUDA targets.
-        generator = _spawn_cpu_generator(generator)
-        Z = torch.randn(rows, cols, generator=generator, device="cpu", dtype=torch.float32)
-        # QR of the tall (rows, cols) matrix dominates the per-step cost. Run it
-        # on the GPU when the target is CUDA (measured several times faster than
-        # CPU QR for large full_dim); bf16 QR is unsupported, so decompose in
-        # fp32 and cast below.
+        # QR of the tall (rows, cols) matrix dominates the per-step cost. Run it on the
+        # GPU when the target is CUDA (measured several times faster than CPU QR at
+        # large full_dim); bf16 QR is unsupported, so decompose in fp32 and cast below.
         target_device = torch.device(device)
-        if target_device.type == "cuda":
-            Z = Z.to(target_device)
-        P, R = torch.linalg.qr(Z)
+        qr_device = target_device if target_device.type == "cuda" else torch.device("cpu")
+        Z = _draw_basis_gaussian(rows, cols, qr_device, torch.float32, generator)
+        P, R = thin_qr(Z)
         # Fix sign ambiguity: positive diagonal in R (replace zeros with 1).
         d = torch.sign(torch.diagonal(R))
         d[d == 0] = 1.0
@@ -227,10 +223,6 @@ class AdaptiveSubspace:
             P = P.to(device=target_device)
         return P
 
-    # ------------------------------------------------------------------
-    # Rotation
-    # ------------------------------------------------------------------
-
     @torch.inference_mode()
     def rotate(
         self,
@@ -239,18 +231,12 @@ class AdaptiveSubspace:
         total_steps: int,
         displacement_history: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
-        # OT-bias mode inputs
-        transport_matrix: Optional[torch.Tensor] = None,
-        X_vertices: Optional[torch.Tensor] = None,
-        X_current: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Rotate the projection basis according to the configured mode.
 
         For ``'random'`` mode, draws an entirely new QR-orthogonalized basis.
         For ``'displacement'`` mode, uses SVD of the displacement history to
         keep productive directions and fills the remainder with random.
-        For ``'ot_bias'`` mode, uses high-transport directions from the OT
-        plan to bias a fraction of the projection basis.
 
         Args:
             projection: Current projection matrix P of shape
@@ -262,13 +248,6 @@ class AdaptiveSubspace:
                 vectors in subspace coordinates. Required for displacement
                 mode; if None, falls back to random rotation.
             generator: Optional torch.Generator for reproducibility.
-            transport_matrix: OT transport plan, shape (num_particles, num_vertices).
-                Required for ot_bias mode; if None, falls back to random.
-            X_vertices: Polytope vertex positions for each particle,
-                shape (num_particles, num_vertices, particle_dim).
-                Required for ot_bias mode.
-            X_current: Current particle positions, shape (num_particles, particle_dim).
-                Required for ot_bias mode.
 
         Returns:
             New projection matrix P_new of shape ``(full_dim, subspace_dim)``
@@ -276,22 +255,6 @@ class AdaptiveSubspace:
         """
         device = projection.device
         dtype = projection.dtype
-
-        # Handle ot_bias mode
-        if self.rotation_mode == "ot_bias":
-            has_ot_info = transport_matrix is not None and X_vertices is not None and X_current is not None
-            if has_ot_info:
-                return self._rotate_ot_bias(
-                    transport_matrix,
-                    X_vertices,
-                    X_current,
-                    device,
-                    dtype,
-                    generator,
-                )
-            else:
-                # Fallback to random when OT info not available
-                return self._rotate_random(device, dtype, generator)
 
         # Fall back to random if displacement mode lacks history
         use_random = (
@@ -376,11 +339,13 @@ class AdaptiveSubspace:
         k_svd = max(1, int(svd_ratio * self.subspace_dim))
         k_random = self.subspace_dim - k_svd
 
-        # Project displacement history to full parameter space
-        # displacement_history: (history_len, subspace_dim)
-        # projection: (full_dim, subspace_dim)
-        # D_full: (full_dim, history_len)
-        D_full = projection @ displacement_history.T
+        # D_full: (full_dim, history_len). A history already in full parameter space
+        # is used as-is; each row then carries the basis it was measured in, instead of
+        # being re-projected through whichever basis happens to be current.
+        if displacement_history.shape[1] == projection.shape[0]:
+            D_full = displacement_history.T
+        else:
+            D_full = projection @ displacement_history.T
 
         # Guard against non-finite values from numerical issues
         if not torch.isfinite(D_full).all():
@@ -390,8 +355,12 @@ class AdaptiveSubspace:
         compute_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
         D_full = D_full.to(compute_dtype)
 
-        # SVD of the full-space displacement matrix
-        if k_svd < min(D_full.shape) // 2 and min(D_full.shape) > 6:
+        # SVD of the full-space displacement matrix.
+        # pca_lowrank draws its test matrix from the global RNG and takes no
+        # generator, so a seeded run would still depend on torch.manual_seed. Use
+        # the deterministic full SVD whenever the caller asked for reproducibility;
+        # the history is short, so the two cost about the same.
+        if generator is None and k_svd < min(D_full.shape) // 2 and min(D_full.shape) > 6:
             # Randomized SVD: faster when k_svd << rank
             U_top, S_top, V_top = torch.pca_lowrank(D_full, q=k_svd, niter=2)
         else:
@@ -400,122 +369,14 @@ class AdaptiveSubspace:
             U_top = U[:, :k_svd]
         k_random = self.subspace_dim - k_svd
 
-        # Generate random directions for the remainder
-        gen_device = "cpu"
-        # Handle generator device mismatch: create CPU generator for reproducibility
-        gen_to_use = _spawn_cpu_generator(generator)
-        Z_random = torch.randn(
-            self.full_dim,
-            k_random,
-            generator=gen_to_use,
-            device=gen_device,
-            dtype=compute_dtype,
-        )
-        if str(device) != gen_device:
-            Z_random = Z_random.to(device=device)
+        # Random directions for the remainder
+        Z_random = _draw_basis_gaussian(self.full_dim, k_random, device, compute_dtype, generator)
         if U_top.device != Z_random.device:
             U_top = U_top.to(device=Z_random.device)
 
         # Concatenate SVD directions + random, then QR-orthogonalize
         combined = torch.cat([U_top, Z_random], dim=1)
-        P_new, R = torch.linalg.qr(combined)
-        # Fix sign ambiguity
-        d = torch.sign(torch.diagonal(R))
-        d[d == 0] = 1.0
-        P_new = P_new * d
-        P_new = P_new[:, : self.subspace_dim]
-        if P_new.dtype != dtype:
-            P_new = P_new.to(dtype)
-
-        if P_new.device != device:
-            P_new = P_new.to(device=device)
-
-        return P_new
-
-    @torch.inference_mode()
-    def _rotate_ot_bias(
-        self,
-        transport_matrix: torch.Tensor,
-        X_vertices: torch.Tensor,
-        X_current: torch.Tensor,
-        device: str | torch.device,
-        dtype: torch.dtype,
-        generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
-        """Rotate basis using OT-informed high-transport directions.
-
-        Extracts directions where particles moved the most mass according to
-        the transport plan, projects these particle-space directions to full
-        parameter space (by tiling to match full_dim), then combines with
-        random directions via QR orthogonalization.
-
-        The fraction of directions from OT bias is controlled by ot_bias_ratio.
-
-        Args:
-            transport_matrix: OT transport plan, shape (num_particles, num_vertices).
-            X_vertices: Polytope vertices, shape (num_particles, num_vertices, particle_dim).
-            X_current: Current particles, shape (num_particles, particle_dim).
-            device: Target device.
-            dtype: Target dtype.
-            generator: Optional PRNG generator.
-
-        Returns:
-            New orthogonal projection of shape (full_dim, subspace_dim).
-        """
-        from .cma import compute_ot_bias_directions
-
-        # Number of directions to allocate to OT bias vs random.
-        k_ot = max(1, int(self.ot_bias_ratio * self.subspace_dim))
-
-        # Get high-transport directions in particle space.
-        ot_dirs = compute_ot_bias_directions(
-            transport_matrix,
-            X_vertices,
-            X_current,
-            top_k=k_ot,
-        )
-        # ot_dirs: (k_ot_actual, particle_dim)
-        k_ot_actual = ot_dirs.shape[0]
-
-        # Lifting particle-space directions to ``full_dim`` only makes sense
-        # when the full vector is a concatenation of equal-size particle
-        # slots (full_dim == num_particles * particle_dim). For real
-        # parameter layouts ``full_dim`` is the total number of trainable
-        # parameters; tiling would map an OT direction to arbitrary layer
-        # weights and lose its meaning. Fall back to pure random in that
-        # case.
-        num_particles = X_current.shape[0]
-        particle_dim = ot_dirs.shape[1]
-        if num_particles * particle_dim == self.full_dim:
-            ot_dirs_full = ot_dirs.unsqueeze(1).expand(-1, num_particles, -1)
-            ot_dirs_full = ot_dirs_full.reshape(k_ot_actual, -1)
-            ot_cols = ot_dirs_full.T  # (full_dim, k_ot_actual)
-        else:
-            ot_cols = None
-            k_ot_actual = 0
-        k_random = self.subspace_dim - k_ot_actual
-
-        # Generate random directions for the remainder
-        gen_device = "cpu"
-        # Handle generator device mismatch: create CPU generator for reproducibility
-        gen_to_use = _spawn_cpu_generator(generator)
-        # QR rejects bf16 on CPU; build in fp32 and cast the result back.
-        compute_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
-        Z_random = torch.randn(
-            self.full_dim,
-            k_random,
-            generator=gen_to_use,
-            device=gen_device,
-            dtype=compute_dtype,
-        )
-        if str(device) != gen_device:
-            Z_random = Z_random.to(device=device)
-        if ot_cols is not None:
-            ot_cols = ot_cols.to(device=Z_random.device, dtype=compute_dtype)
-            combined = torch.cat([ot_cols, Z_random], dim=1)
-        else:
-            combined = Z_random
-        P_new, R = torch.linalg.qr(combined)
+        P_new, R = thin_qr(combined)
         # Fix sign ambiguity
         d = torch.sign(torch.diagonal(R))
         d[d == 0] = 1.0
@@ -544,10 +405,6 @@ class AdaptiveSubspace:
         """
         progress = min(1.0, step / max(1, total_steps or 1))
         return self.svd_ratio_init + progress * (self.svd_ratio_final - self.svd_ratio_init)
-
-    # ------------------------------------------------------------------
-    # Core interface methods (match LinearSubspace contract)
-    # ------------------------------------------------------------------
 
     def apply_perturbation(
         self,
@@ -645,24 +502,14 @@ class AdaptiveSubspace:
         return new_sd, torch.zeros_like(flat_subspace)
 
     def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
-        """Check whether an absorb-and-rotate should be triggered.
-
-        Args:
-            stagnation_count: Number of consecutive steps without improvement.
-            iteration: Current iteration number (0-indexed).
-
-        Returns:
-            True if absorb should be triggered based on the configured mode.
-        """
-        if self.absorb_mode == "stagnation":
-            return stagnation_count >= self.absorb_patience
-        elif self.absorb_mode == "periodic" and self.absorb_interval > 0:
-            return iteration > 0 and iteration % self.absorb_interval == 0
-        return False
-
-    # ------------------------------------------------------------------
-    # Factory methods
-    # ------------------------------------------------------------------
+        """Whether to fold the perturbation into the base weights this step."""
+        return absorb_due(
+            self.absorb_mode,
+            self.absorb_patience,
+            self.absorb_interval,
+            stagnation_count,
+            iteration,
+        )
 
     @classmethod
     def auto_from_params(

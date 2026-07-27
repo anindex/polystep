@@ -8,11 +8,6 @@ from polystep.adaptive_subspace import AdaptiveSubspace, EntrySpec
 from polystep.transform import ParamLayout
 
 
-# ---------------------------------------------------------------------------
-# Helper model fixture
-# ---------------------------------------------------------------------------
-
-
 class SimpleMLP(nn.Module):
     def __init__(self):
         super().__init__()
@@ -38,11 +33,6 @@ def layout(model):
 @pytest.fixture
 def adaptive_sub(model):
     return AdaptiveSubspace.auto_from_params(model)
-
-
-# ---------------------------------------------------------------------------
-# init_projection shape and orthogonality
-# ---------------------------------------------------------------------------
 
 
 class TestInitProjection:
@@ -86,11 +76,6 @@ class TestInitProjection:
         P1 = adaptive_sub.init_projection(generator=gen, device=dev)
         P2 = adaptive_sub.init_projection(generator=gen, device=dev)
         assert not torch.allclose(P1, P2), "seeded CUDA basis is frozen"
-
-
-# ---------------------------------------------------------------------------
-# Rotation
-# ---------------------------------------------------------------------------
 
 
 class TestRotateRandom:
@@ -180,6 +165,14 @@ class TestRotateDisplacement:
         eye = torch.eye(adaptive_sub.subspace_dim)
         assert torch.allclose(PtP, eye, atol=atol)
 
+        # Orthogonality alone does not prove a fallback happened: returning the input
+        # basis unchanged satisfies it. The result has to be the freshly drawn basis.
+        assert not torch.allclose(P_new, P, atol=1e-6), "rotate returned the input basis"
+        expected = adaptive_sub._rotate_random(
+            device=P.device, dtype=P.dtype, generator=torch.Generator().manual_seed(seed)
+        )
+        torch.testing.assert_close(P_new, expected, rtol=1e-5, atol=1e-6)
+
     def test_rotate_displacement_incorporates_svd(self):
         """Displacement rotation incorporates SVD directions when history has clear dominant direction."""
         full_dim = 100
@@ -226,11 +219,6 @@ class TestRotateDisplacement:
         )
 
 
-# ---------------------------------------------------------------------------
-# SVD ratio schedule
-# ---------------------------------------------------------------------------
-
-
 class TestSvdRatioSchedule:
     @pytest.mark.parametrize(
         "step, total, expected",
@@ -245,11 +233,6 @@ class TestSvdRatioSchedule:
         """SVD ratio interpolates from init to final and clamps beyond total_steps."""
         sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
         assert sub.get_svd_ratio(step, total) == pytest.approx(expected)
-
-
-# ---------------------------------------------------------------------------
-# apply_perturbation matches manual
-# ---------------------------------------------------------------------------
 
 
 class TestApplyPerturbation:
@@ -276,103 +259,49 @@ class TestApplyPerturbation:
                 f"Key {key}: manual vs method mismatch"
             )
 
-    def test_apply_perturbation_zero_is_identity(self, model, adaptive_sub):
-        """Zero perturbation returns base params unchanged."""
-        P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
-        base_sd = model.state_dict()
-        flat_sub = torch.zeros(adaptive_sub.subspace_dim)
 
-        result = adaptive_sub.apply_perturbation(P, base_sd, flat_sub)
+def _absorb_schedules(**kwargs):
+    """One subspace per class, all sharing the absorb schedule under test.
 
-        for key in base_sd:
-            if key in result:
-                assert torch.allclose(result[key], base_sd[key], atol=1e-6)
+    All four delegate to ``subspace.absorb_due``; before that they carried four copies of
+    the same logic, and only two of them were tested.
+    """
+    from polystep.cma_subspace import CMAAdaptiveSubspace
+    from polystep.factored_subspace import FactoredSubspace
+    from polystep.hybrid_subspace import HybridSubspace
 
-
-# ---------------------------------------------------------------------------
-# reconstruct_batch matches loop
-# ---------------------------------------------------------------------------
-
-
-class TestReconstructBatch:
-    def test_reconstruct_batch_matches_loop(self, model, adaptive_sub):
-        """reconstruct_batch gives same result as looping apply_perturbation."""
-        P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
-        base_sd = model.state_dict()
-
-        N = 4
-        torch.manual_seed(42)
-        batch = torch.randn(N, adaptive_sub.subspace_dim) * 0.01
-
-        batch_result = adaptive_sub.reconstruct_batch(P, base_sd, batch)
-
-        for i in range(N):
-            single_result = adaptive_sub.apply_perturbation(P, base_sd, batch[i])
-            for key in single_result:
-                assert torch.allclose(batch_result[key][i], single_result[key], atol=1e-5), (
-                    f"Row {i}, key {key}: batch vs single mismatch"
-                )
-
-
-# ---------------------------------------------------------------------------
-# absorb zeros subspace
-# ---------------------------------------------------------------------------
-
-
-class TestAbsorb:
-    def test_absorb_zeros_subspace(self, model, adaptive_sub):
-        """After absorb, flat_subspace is all zeros and base_sd is updated."""
-        P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
-        base_sd = model.state_dict()
-
-        torch.manual_seed(42)
-        flat_sub = torch.randn(adaptive_sub.subspace_dim) * 0.01
-
-        # Expected base after absorb = apply_perturbation result
-        expected_sd = adaptive_sub.apply_perturbation(P, base_sd, flat_sub)
-
-        new_base, zeroed = adaptive_sub.absorb(P, base_sd, flat_sub)
-
-        # Zeroed subspace
-        assert torch.all(zeroed == 0)
-        assert zeroed.shape == flat_sub.shape
-
-        # New base matches expected
-        for key in expected_sd:
-            assert torch.allclose(new_base[key], expected_sd[key], atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# should_absorb
-# ---------------------------------------------------------------------------
+    base = AdaptiveSubspace(full_dim=100, subspace_dim=10, **kwargs)
+    return {
+        "adaptive": base,
+        "hybrid": HybridSubspace(specs=(), subspace_dim=10, compression_ratio=0.1, **kwargs),
+        "factored": FactoredSubspace(specs=(), subspace_dim=10, compression_ratio=0.1, **kwargs),
+        "cma": CMAAdaptiveSubspace.from_adaptive_subspace(base),
+    }
 
 
 class TestShouldAbsorb:
-    def test_should_absorb_stagnation(self):
-        """stagnation_count >= absorb_patience returns True."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, absorb_mode="stagnation", absorb_patience=20)
+    """The absorb schedule, checked on every subspace class that exposes it."""
+
+    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored", "cma"])
+    def test_stagnation_fires_at_the_patience_boundary(self, kind):
+        sub = _absorb_schedules(absorb_mode="stagnation", absorb_patience=20)[kind]
         assert not sub.should_absorb(stagnation_count=19, iteration=50)
         assert sub.should_absorb(stagnation_count=20, iteration=50)
         assert sub.should_absorb(stagnation_count=25, iteration=50)
 
-    def test_should_absorb_periodic(self):
-        """iteration % absorb_interval == 0 returns True (for iteration > 0)."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, absorb_mode="periodic", absorb_interval=10)
+    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored", "cma"])
+    def test_periodic_fires_on_multiples_and_skips_iteration_zero(self, kind):
+        sub = _absorb_schedules(absorb_mode="periodic", absorb_interval=10)[kind]
         assert not sub.should_absorb(stagnation_count=0, iteration=0)
         assert not sub.should_absorb(stagnation_count=0, iteration=5)
+        assert not sub.should_absorb(stagnation_count=0, iteration=13)
         assert sub.should_absorb(stagnation_count=0, iteration=10)
         assert sub.should_absorb(stagnation_count=0, iteration=20)
-        assert not sub.should_absorb(stagnation_count=0, iteration=13)
 
-    def test_should_absorb_periodic_disabled(self):
-        """absorb_interval=0 with periodic mode never triggers."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, absorb_mode="periodic", absorb_interval=0)
+    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored", "cma"])
+    def test_periodic_with_zero_interval_never_fires(self, kind):
+        sub = _absorb_schedules(absorb_mode="periodic", absorb_interval=0)[kind]
         assert not sub.should_absorb(stagnation_count=100, iteration=100)
-
-
-# ---------------------------------------------------------------------------
-# Factory methods
-# ---------------------------------------------------------------------------
 
 
 class TestFactoryMethods:
@@ -412,11 +341,6 @@ class TestFactoryMethods:
             )
             assert spec.flat_end > spec.flat_start
             prev_end = spec.flat_end
-
-
-# ---------------------------------------------------------------------------
-# Displacement mode productivity validation
-# ---------------------------------------------------------------------------
 
 
 class TestDisplacementProductivity:
@@ -513,12 +437,8 @@ class TestDisplacementProductivity:
         )
 
 
-# ---------------------------------------------------------------------------
-# CUDA generator warning
-# ---------------------------------------------------------------------------
-
-
 class TestCudaGeneratorFallback:
+    @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_cuda_generator_creates_cpu_fallback(self):
         """CUDA generator should silently create a CPU generator for reproducibility."""

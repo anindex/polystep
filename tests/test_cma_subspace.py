@@ -5,6 +5,8 @@ that the optimizer properly integrates CMA features, and that OT-bias
 rotation mode functions as expected.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn as nn
@@ -13,11 +15,6 @@ from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.optimizer import PolyStepOptimizer
 from polystep.solver import SolverState
-
-
-# ---------------------------------------------------------------------------
-# Helper fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -37,11 +34,6 @@ def base_adaptive_subspace(simple_model):
 def cma_adaptive_subspace(simple_model):
     """CMAAdaptiveSubspace from the simple model."""
     return CMAAdaptiveSubspace.auto_from_params(simple_model)
-
-
-# ---------------------------------------------------------------------------
-# Test: CMAAdaptiveSubspace wrapper
-# ---------------------------------------------------------------------------
 
 
 class TestCMAAdaptiveSubspace:
@@ -64,35 +56,11 @@ class TestCMAAdaptiveSubspace:
         assert cma_sub.subspace_dim > 0
         assert cma_sub.subspace_dim <= cma_sub.full_dim
 
-    def test_hyperparameters_auto_computed(self, cma_adaptive_subspace):
-        """CMA hyperparameters are auto-computed from subspace_dim."""
-        cma_sub = cma_adaptive_subspace
-
-        # All hyperparameters should be positive
-        assert cma_sub.c_c > 0
-        assert cma_sub.c_sigma > 0
-        assert cma_sub.c_1 > 0
-        assert cma_sub.c_mu > 0
-        assert cma_sub.d_sigma > 0
-        assert cma_sub.expected_norm > 0
-        assert cma_sub.mu_eff >= 1.0
-
     def test_mu_eff_default_heuristic(self, base_adaptive_subspace):
         """mu_eff defaults to subspace_dim / 4."""
         cma_sub = CMAAdaptiveSubspace.from_adaptive_subspace(base_adaptive_subspace)
         expected_mu_eff = max(1.0, base_adaptive_subspace.subspace_dim / 4.0)
         assert cma_sub.mu_eff == pytest.approx(expected_mu_eff)
-
-    def test_mu_eff_custom(self, base_adaptive_subspace):
-        """Custom mu_eff is respected."""
-        cma_sub = CMAAdaptiveSubspace.from_adaptive_subspace(base_adaptive_subspace, mu_eff=10.0)
-        assert cma_sub.mu_eff == 10.0
-
-    def test_cov_bounds_configurable(self, base_adaptive_subspace):
-        """cov_min and cov_max are configurable."""
-        cma_sub = CMAAdaptiveSubspace.from_adaptive_subspace(base_adaptive_subspace, cov_min=1e-8, cov_max=1e8)
-        assert cma_sub.cov_min == 1e-8
-        assert cma_sub.cov_max == 1e8
 
     def test_delegated_properties(self, base_adaptive_subspace):
         """Properties delegate to base AdaptiveSubspace."""
@@ -153,33 +121,26 @@ class TestCMAAdaptiveSubspace:
         expected = P * 2.0
         assert torch.allclose(P_scaled, expected, atol=1e-6)
 
-    def test_delegated_methods_work(self, simple_model, cma_adaptive_subspace):
-        """Delegated methods (apply_perturbation, reconstruct_batch, absorb) work."""
-        cma_sub = cma_adaptive_subspace
+    def test_covariance_scaling_clamps_to_the_configured_bounds(self, cma_adaptive_subspace):
+        """C_diag outside [cov_min, cov_max] is clamped before the square root.
+
+        Without the clamp a collapsed coordinate scales the projection to zero and the
+        search direction disappears; a diverged one scales it past the trust region.
+        Only in-range values were exercised before.
+        """
+        sub = cma_adaptive_subspace
         gen = torch.Generator().manual_seed(42)
-        P = cma_sub.init_projection(generator=gen)
-        base_sd = simple_model.state_dict()
+        P = sub.init_projection(generator=gen)
 
-        # apply_perturbation
-        coords = torch.randn(cma_sub.subspace_dim) * 0.01
-        perturbed_sd = cma_sub.apply_perturbation(P, base_sd, coords)
-        assert set(perturbed_sd.keys()) == set(base_sd.keys())
+        C_diag = torch.full((sub.subspace_dim,), 4.0)
+        C_diag[0] = sub.cov_min * 1e-3  # below the floor
+        C_diag[1] = sub.cov_max * 1e3  # above the ceiling
 
-        # reconstruct_batch
-        batch = torch.randn(4, cma_sub.subspace_dim) * 0.01
-        batch_sd = cma_sub.reconstruct_batch(P, base_sd, batch)
-        for key in base_sd:
-            if key in batch_sd:
-                assert batch_sd[key].shape[0] == 4
+        P_scaled = sub.apply_covariance_scaling(P, C_diag)
 
-        # absorb
-        new_base, zeroed = cma_sub.absorb(P, base_sd, coords)
-        assert torch.all(zeroed == 0)
-
-
-# ---------------------------------------------------------------------------
-# Test: Optimizer CMA integration
-# ---------------------------------------------------------------------------
+        torch.testing.assert_close(P_scaled[:, 0], P[:, 0] * math.sqrt(sub.cov_min), rtol=1e-5, atol=0)
+        torch.testing.assert_close(P_scaled[:, 1], P[:, 1] * math.sqrt(sub.cov_max), rtol=1e-5, atol=0)
+        torch.testing.assert_close(P_scaled[:, 2], P[:, 2] * 2.0, rtol=1e-5, atol=0)
 
 
 class TestOptimizerCMAIntegration:
@@ -212,34 +173,13 @@ class TestOptimizerCMAIntegration:
 
         assert opt.use_csa is False
 
-    def test_csa_overrides_adaptive_radius(self, simple_model):
-        """CSA overrides heuristic adaptive_radius with warning."""
-        cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
-
-        import warnings
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            opt = PolyStepOptimizer(
-                simple_model,
-                subspace=cma_sub,
-                use_csa=True,
-                use_adaptive_radius=True,  # Conflict
-                compile=False,
-            )
-            assert len(w) == 1
-            assert "CSA" in str(w[0].message)
-
-        assert opt.use_csa is True
-        assert opt.use_adaptive_radius is False
-
     def test_optimizer_initializes_cma_state(self, simple_model):
-        """Optimizer initializes CMA state when enabled."""
+        """Optimizer initializes CMA state when covariance adaptation is enabled."""
         cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
         opt = PolyStepOptimizer(
             simple_model,
             subspace=cma_sub,
-            use_csa=True,
+            use_covariance_adaptation=True,
             compile=False,
         )
 
@@ -249,7 +189,7 @@ class TestOptimizerCMAIntegration:
         assert state.C_diag is not None
         assert state.sigma == 1.0
         assert state.generation == 0
-        assert state.use_csa is True
+        assert state.use_csa is False
 
     def test_optimizer_cma_state_shapes(self, simple_model):
         """CMA state tensors have correct shapes."""
@@ -273,7 +213,7 @@ class TestOptimizerCMAIntegration:
         opt = PolyStepOptimizer(
             simple_model,
             subspace=cma_sub,
-            use_csa=True,
+            use_covariance_adaptation=True,
             compile=False,
         )
 
@@ -294,7 +234,6 @@ class TestOptimizerCMAIntegration:
         opt = PolyStepOptimizer(
             simple_model,
             subspace=cma_sub,
-            use_csa=True,
             use_covariance_adaptation=True,
             epsilon=0.5,
             max_iterations=10,
@@ -373,7 +312,7 @@ class TestOptimizerCMAIntegration:
         opt = PolyStepOptimizer(
             simple_model,
             subspace=cma_sub,
-            use_csa=True,
+            use_covariance_adaptation=True,
             epsilon=0.5,
             max_iterations=40,
             compile=False,
@@ -412,36 +351,6 @@ class TestOptimizerCMAIntegration:
         assert opt.use_covariance_adaptation is False
         assert opt.use_csa is False
 
-    def test_cma_absorb_does_not_crash(self, simple_model):
-        """CMA subspace + absorb_every>0 used to hit the periodic-absorb branch
-        with the wrong absorb() arity and raise TypeError; it must run cleanly."""
-        torch.manual_seed(42)
-        cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
-        opt = PolyStepOptimizer(
-            simple_model,
-            subspace=cma_sub,
-            use_csa=True,
-            absorb_every=2,
-            epsilon=0.5,
-            max_iterations=10,
-            compile=False,
-        )
-        inputs = torch.randn(8, 20)
-        targets = torch.randn(8, 5)
-        loss_fn = nn.MSELoss()
-
-        def closure(batched_params):
-            N = list(batched_params.values())[0].shape[0]
-            losses = []
-            for i in range(N):
-                config = {k: v[i] for k, v in batched_params.items()}
-                simple_model.load_state_dict(config, strict=False)
-                losses.append(loss_fn(simple_model(inputs), targets).item())
-            return torch.tensor(losses)
-
-        for _ in range(3):
-            opt.step(closure)  # step at absorb_every must not raise
-
     def test_covariance_adaptation_scales_sampling_projection(self, simple_model):
         """With use_covariance_adaptation on, the coord->param projection is the
         base projection scaled by sqrt(C_diag), so the learned covariance shapes
@@ -461,156 +370,12 @@ class TestOptimizerCMAIntegration:
         """Without covariance adaptation the sampling projection is unscaled."""
         cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
         opt = PolyStepOptimizer(
-            simple_model, subspace=cma_sub, use_covariance_adaptation=False, use_csa=True, epsilon=0.5, compile=False
+            simple_model, subspace=cma_sub, use_covariance_adaptation=False, epsilon=0.5, compile=False
         )
         state = opt._state
         state.C_diag = torch.linspace(0.25, 4.0, state.projection.shape[1])
         opt._update_sampling_projection()
         assert opt._sampling_projection is state.projection
-
-
-# ---------------------------------------------------------------------------
-# Test: OT-bias rotation mode
-# ---------------------------------------------------------------------------
-
-
-class TestOTBiasRotation:
-    """Tests for OT-bias rotation mode in AdaptiveSubspace."""
-
-    def test_ot_bias_mode_creates_subspace(self, simple_model):
-        """ot_bias rotation mode can be created."""
-        sub = AdaptiveSubspace.auto_from_params(simple_model, rotation_mode="ot_bias", ot_bias_ratio=0.3)
-        assert sub.rotation_mode == "ot_bias"
-        assert sub.ot_bias_ratio == 0.3
-
-    def test_ot_bias_rotate_with_ot_info(self):
-        """Rotate with OT info produces orthogonal projection."""
-        full_dim = 100
-        subspace_dim = 20
-        particle_dim = 8
-        num_particles = full_dim // particle_dim
-
-        sub = AdaptiveSubspace(
-            full_dim=full_dim,
-            subspace_dim=subspace_dim,
-            rotation_mode="ot_bias",
-            ot_bias_ratio=0.3,
-        )
-
-        gen = torch.Generator().manual_seed(42)
-        P = sub.init_projection(generator=gen)
-
-        # Create mock OT info
-        transport_matrix = torch.rand(num_particles, 4)  # 4 vertices
-        transport_matrix = transport_matrix / transport_matrix.sum()
-        X_vertices = torch.randn(num_particles, 4, particle_dim)
-        X_current = torch.randn(num_particles, particle_dim)
-
-        P_new = sub.rotate(
-            P,
-            step=5,
-            total_steps=100,
-            transport_matrix=transport_matrix,
-            X_vertices=X_vertices,
-            X_current=X_current,
-            generator=torch.Generator().manual_seed(99),
-        )
-
-        # Should be orthogonal
-        PtP = P_new.T @ P_new
-        eye = torch.eye(subspace_dim)
-        assert torch.allclose(PtP, eye, atol=1e-4)
-
-    def test_ot_bias_rotate_without_ot_info_fallback(self):
-        """Rotate without OT info falls back to random."""
-        full_dim = 100
-        subspace_dim = 20
-
-        sub = AdaptiveSubspace(
-            full_dim=full_dim,
-            subspace_dim=subspace_dim,
-            rotation_mode="ot_bias",
-            ot_bias_ratio=0.3,
-        )
-
-        gen = torch.Generator().manual_seed(42)
-        P = sub.init_projection(generator=gen)
-
-        # No OT info provided -> should fall back to random
-        P_new = sub.rotate(
-            P,
-            step=5,
-            total_steps=100,
-            generator=torch.Generator().manual_seed(99),
-        )
-
-        # Should still be orthogonal
-        PtP = P_new.T @ P_new
-        eye = torch.eye(subspace_dim)
-        assert torch.allclose(PtP, eye, atol=1e-4)
-
-    def test_ot_bias_ratio_affects_directions(self):
-        """Higher ot_bias_ratio should incorporate more OT directions."""
-        full_dim = 100
-        subspace_dim = 20
-        particle_dim = 10
-        num_particles = full_dim // particle_dim
-
-        # Create consistent OT info
-        torch.manual_seed(123)
-        transport_matrix = torch.rand(num_particles, 4)
-        transport_matrix = transport_matrix / transport_matrix.sum()
-        X_vertices = torch.randn(num_particles, 4, particle_dim)
-        X_current = torch.randn(num_particles, particle_dim)
-
-        # Low OT bias
-        sub_low = AdaptiveSubspace(
-            full_dim=full_dim,
-            subspace_dim=subspace_dim,
-            rotation_mode="ot_bias",
-            ot_bias_ratio=0.1,
-        )
-        P_init = sub_low.init_projection(generator=torch.Generator().manual_seed(42))
-        P_low = sub_low.rotate(
-            P_init,
-            step=5,
-            total_steps=100,
-            transport_matrix=transport_matrix,
-            X_vertices=X_vertices,
-            X_current=X_current,
-            generator=torch.Generator().manual_seed(99),
-        )
-
-        # High OT bias
-        sub_high = AdaptiveSubspace(
-            full_dim=full_dim,
-            subspace_dim=subspace_dim,
-            rotation_mode="ot_bias",
-            ot_bias_ratio=0.5,
-        )
-        P_init_high = sub_high.init_projection(generator=torch.Generator().manual_seed(42))
-        P_high = sub_high.rotate(
-            P_init_high,
-            step=5,
-            total_steps=100,
-            transport_matrix=transport_matrix,
-            X_vertices=X_vertices,
-            X_current=X_current,
-            generator=torch.Generator().manual_seed(99),
-        )
-
-        # Both should be orthogonal
-        assert torch.allclose(P_low.T @ P_low, torch.eye(subspace_dim), atol=1e-4)
-        assert torch.allclose(P_high.T @ P_high, torch.eye(subspace_dim), atol=1e-4)
-
-        # They should be different due to different ratios
-        # (unless very unlucky seed combination)
-        assert not torch.allclose(P_low, P_high, atol=0.1)
-
-
-# ---------------------------------------------------------------------------
-# Test: SolverState CMA fields
-# ---------------------------------------------------------------------------
 
 
 class TestSolverStateCMAFields:

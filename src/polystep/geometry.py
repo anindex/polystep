@@ -11,11 +11,6 @@ from typing import Callable, Dict, Optional, Tuple
 import torch
 
 
-# ---------------------------------------------------------------------------
-# Section 1: Polytope vertex templates
-# ---------------------------------------------------------------------------
-
-
 def get_orthoplex_vertices(
     dim: int,
     *,
@@ -124,11 +119,6 @@ POLYTOPE_NUM_VERTICES_MAP: Dict[str, Callable[[int], int]] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Section 2: Rotation matrices
-# ---------------------------------------------------------------------------
-
-
 def get_rotation_matrix_2d(theta: torch.Tensor) -> torch.Tensor:
     """Create 2x2 rotation matrices from angles using analytical formula.
 
@@ -222,103 +212,65 @@ def get_random_rotation_matrices(
     return Q
 
 
-def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir_norm: torch.Tensor) -> torch.Tensor:
-    """Bias the first rotation axis toward ``bias_dir_norm`` and re-orthonormalize.
+def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir: torch.Tensor) -> torch.Tensor:
+    """Bias the first rotation axis toward ``bias_dir`` and re-orthonormalize.
 
-    Replaces column 0 with the unit bias direction, re-orthonormalizes via QR,
-    and flips the last column where needed so det = +1 (a proper rotation).
-    Batch elements where QR is non-finite fall back to the input rotation.
+    Replaces column 0 with the normalized bias direction, re-orthonormalizes the
+    remaining columns against it, and flips the last column where needed so det = +1.
+    Particles whose direction is too short to carry a heading keep their unbiased
+    rotation.
+
+    Uses modified Gram-Schmidt, not ``torch.linalg.qr``. Both give the same basis, but
+    cuSOLVER's batched QR is 10x slower at (64, 2, 2) and 29x slower at (4096, 16, 16).
+    ``dim`` is at most a few tens here, where Gram-Schmidt is accurate enough.
 
     Args:
         rot_mats: Rotation matrices of shape (batch, dim, dim).
-        bias_dir_norm: Unit bias directions of shape (batch, dim).
+        bias_dir: Bias directions of shape (batch, dim), any magnitude.
 
     Returns:
         Biased rotation matrices of shape (batch, dim, dim), det = +1.
     """
-    if rot_mats.shape[-1] == 1:
-        # SO(1) = {[[1]]}: the only proper 1D rotation is the identity, so
-        # aligning axis 0 with the bias is not representable (a sign flip is a
-        # reflection). Return identity instead of flipping the aligned axis back.
+    dim = rot_mats.shape[-1]
+    if dim == 1:
+        # SO(1) = {[[1]]}: a sign flip is a reflection, so the bias is not
+        # representable. Return identity.
         return torch.ones_like(rot_mats)
-    biased = rot_mats.clone()
-    biased[:, :, 0] = bias_dir_norm
-    # geqrf has no bf16/fp16 CPU kernel; run QR in fp32, cast back.
-    qr_in = biased.float() if biased.dtype in (torch.bfloat16, torch.float16) else biased
-    Q, _ = torch.linalg.qr(qr_in)
-    Q = Q.to(biased.dtype)
-    valid = torch.isfinite(Q).all(dim=-1).all(dim=-1)  # (batch,)
-    out = torch.where(valid[:, None, None], Q, rot_mats)
-    # QR fixes column 0 only up to sign; realign it with the bias so the search
-    # points toward descent, not ascent (sign 0 -> +1).
-    dot0 = (out[:, :, 0] * bias_dir_norm).sum(dim=1)  # (batch,)
-    sign0 = torch.where(dot0 < 0, -1.0, 1.0).to(out.dtype)
-    out[:, :, 0] = out[:, :, 0] * sign0.unsqueeze(-1)
-    # Flip the last column to keep det = +1 (det has no bf16 CPU kernel, use fp32).
-    flip = (torch.det(out.float()) < 0).unsqueeze(-1)
+
+    # Normalize here rather than at each call site: column 0 must be unit or the
+    # Gram-Schmidt below orthogonalizes the rest against a scaled axis and returns a
+    # non-orthonormal frame. Clamping the divisor instead of zeroing would do exactly
+    # that, turning a 1e-12 direction into a column of norm 1e-2. Zeroing routes those
+    # particles to the ``bias_ok`` fallback below.
+    norms = torch.linalg.vector_norm(bias_dir, dim=-1, keepdim=True)
+    bias_dir_norm = torch.where(norms > 1e-8, bias_dir / norms.clamp(min=1e-10), torch.zeros_like(bias_dir))
+
+    out = rot_mats.clone()
+    out[:, :, 0] = bias_dir_norm
+    for col in range(1, dim):
+        v = out[:, :, col].clone()
+        # Two sweeps: one pass loses orthogonality when a column is nearly in the span
+        # of the earlier ones (Q^T Q off by >1e-4 at dim=8). Twice is enough.
+        for _ in range(2):
+            for prev in range(col):
+                proj = (v * out[:, :, prev]).sum(dim=-1, keepdim=True)
+                v = v - proj * out[:, :, prev]
+        raw_norm = torch.norm(v, dim=-1, keepdim=True)
+        # A collapsed column carries no direction; keep the original instead of a zero.
+        keep = raw_norm > 1e-6
+        out[:, :, col] = torch.where(keep, v / raw_norm.clamp(min=1e-10), rot_mats[:, :, col])
+
+    # A zero or non-finite bias leaves column 0 degenerate, so +e0 and -e0 would
+    # coincide. Fall back to the unbiased rotation.
+    bias_ok = torch.isfinite(bias_dir_norm).all(dim=-1) & (bias_dir_norm.abs().amax(dim=-1) > 0)
+    valid = torch.isfinite(out).all(dim=-1).all(dim=-1) & bias_ok  # (batch,)
+    out = torch.where(valid[:, None, None], out, rot_mats)
+
+    # Flip the last column for det = +1. det has no bf16/fp16 CPU kernel, use fp32.
+    det_in = out.float() if out.dtype in (torch.bfloat16, torch.float16) else out
+    flip = (torch.det(det_in) < 0).unsqueeze(-1)
     out[:, :, -1] = torch.where(flip, -out[:, :, -1], out[:, :, -1])
     return out
-
-
-def get_sobol_rotation_matrices(
-    batch: int,
-    dim: int,
-    device: torch.device = torch.device("cpu"),
-    dtype: torch.dtype = torch.float32,
-    engine: Optional[torch.quasirandom.SobolEngine] = None,
-) -> torch.Tensor:
-    """Generate rotation matrices from Sobol quasi-random sequences.
-
-    Low-discrepancy sequences ensure better coverage of SO(d) over
-    multiple calls than purely random rotations.
-
-    Args:
-        batch: Number of rotation matrices.
-        dim: Dimension of the rotation.
-        device: Target device.
-        dtype: Target dtype.
-        engine: Optional pre-initialized SobolEngine (for stateful sequencing).
-
-    Returns:
-        Rotation matrices of shape (batch, dim, dim) in SO(dim).
-    """
-    if dim == 2:
-        # 2D: Sobol angle in [0, 2pi)
-        if engine is None:
-            engine = torch.quasirandom.SobolEngine(dimension=1, scramble=True)
-        uniform = engine.draw(batch).to(device=device, dtype=dtype)  # (batch, 1)
-        angles = uniform[:, 0] * 2 * math.pi
-        return get_rotation_matrix_2d(angles)
-
-    # Higher dimensions: Sobol-driven QR (Mezzadri method with quasi-random input)
-    sobol_dim = dim * dim
-    if engine is None:
-        engine = torch.quasirandom.SobolEngine(dimension=sobol_dim, scramble=True)
-    uniform = engine.draw(batch)  # (batch, dim*dim) in [0, 1]
-
-    # Transform uniform to normal via inverse CDF (erfinv)
-    uniform = uniform.clamp(1e-6, 1 - 1e-6)
-    normal = torch.erfinv(2 * uniform - 1) * math.sqrt(2)
-    normal = normal.to(device=device, dtype=dtype)
-
-    Z = normal.reshape(batch, dim, dim)
-    Q, R = torch.linalg.qr(Z)
-
-    # Mezzadri sign correction (sign(0) := +1 to keep columns nonzero)
-    d = torch.diagonal(R, dim1=-2, dim2=-1)
-    phases = torch.where(d == 0, torch.ones_like(d), torch.sign(d))
-    Q = Q * phases.unsqueeze(-2)
-
-    # Ensure det = +1 (Q is a fresh tensor, so the in-place flip is safe)
-    flip = torch.where(torch.det(Q) < 0, -1.0, 1.0).to(Q.dtype)
-    Q[:, :, 0] = Q[:, :, 0] * flip.unsqueeze(-1)
-
-    return Q
-
-
-# ---------------------------------------------------------------------------
-# Section 3: Probe point generation
-# ---------------------------------------------------------------------------
 
 
 def get_probe_points(
@@ -346,11 +298,6 @@ def get_probe_points(
     scales_exp = scales[None, None, :, None]
 
     return origin_exp + (directions_exp * probe_radius) * scales_exp
-
-
-# ---------------------------------------------------------------------------
-# Section 4: Main sampling pipeline
-# ---------------------------------------------------------------------------
 
 
 def get_sampled_polytope_vertices(
@@ -386,7 +333,7 @@ def get_sampled_polytope_vertices(
         origin = origin.unsqueeze(0)
     batch, dim = origin.shape
 
-    # 1. Generate rotation matrices (batch, dim, dim)
+    # Generate rotation matrices (batch, dim, dim)
     rot_mats = get_random_rotation_matrices(
         batch,
         dim,
@@ -395,15 +342,15 @@ def get_sampled_polytope_vertices(
         generator=generator,
     )
 
-    # 2. Apply rotation: R @ v for each vertex
+    # Apply rotation: R @ v for each vertex
     # rot_mats: (batch, dim, dim), polytope_vertices: (num_verts, dim)
     # Result: (batch, num_verts, dim)
     rotated_vertices = torch.einsum("bji, ni -> bnj", rot_mats, polytope_vertices)
 
-    # 3. Translate step points
+    # Translate step points
     step_points = rotated_vertices * step_radius + origin.unsqueeze(1)
 
-    # 4. Generate probes (deterministic scaling)
+    # Generate probes (deterministic scaling)
     probe_points = get_probe_points(origin, rotated_vertices, probes, probe_radius)
 
     return step_points, probe_points, rotated_vertices

@@ -22,11 +22,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-# ---------------------------------------------------------------------------
-# Turbo-feature contamination check
-# ---------------------------------------------------------------------------
-
-
 _TURBO_TOKENS = (
     "apply_momentum",
     "update_adaptive_radius",
@@ -57,14 +52,16 @@ def _baseline_python_files():
     return files
 
 
-def test_no_baseline_imports_polystep_turbo_features():
+def test_no_baseline_imports_polystep_turbo_features(require_experiments):
     """Baselines must not import polystep turbo helpers; otherwise the
     "fair" comparison is silently using PolyStep acceleration on the
     other side of the table."""
     failures = []
+    checked = []
     for path in _baseline_python_files():
         if not path.is_file():
             continue
+        checked.append(path)
         src = path.read_text()
         # Look for `from polystep... import ... TOKEN` or `polystep.TOKEN`.
         # Ignore textual mentions inside docstrings - look for either
@@ -74,15 +71,13 @@ def test_no_baseline_imports_polystep_turbo_features():
             if re.search(pattern, src):
                 failures.append(f"{path.relative_to(REPO_ROOT)} imports/uses {token}")
 
+    # Without this the scan passes vacuously when the baselines tree is missing or
+    # renamed: an empty file list makes `not failures` trivially true.
+    assert len(checked) >= 4, f"expected at least 4 baseline files to scan, found {len(checked)}"
     assert not failures, "Baseline contamination detected:\n" + "\n".join(failures)
 
 
-# ---------------------------------------------------------------------------
-# PySAT baseline smoke
-# ---------------------------------------------------------------------------
-
-
-def test_sls_pysat_baseline_runs_on_small_instance():
+def test_sls_pysat_baseline_runs_on_small_instance(require_experiments):
     """The PySAT replacement baseline must execute on a tiny 50-var
     instance and return a sat_ratio in [0, 1]."""
     pytest.importorskip("pysat", reason="python-sat not installed")

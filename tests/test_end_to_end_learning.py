@@ -1,0 +1,125 @@
+"""The optimizer actually learns.
+
+Everything else in the suite checks a piece: a solver returns a valid plan, a subspace
+round-trips, a step does not NaN. Nothing checked that the pieces together reduce a real
+loss and raise a real accuracy, because the only tests that did were the MNIST ones,
+which are ``slow``-marked and never run in CI.
+
+Synthetic separable data, fixed seed, no network, no download, under a second per case.
+If the optimizer stops optimizing, this is the test that fails.
+"""
+
+import pytest
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from polystep import PolyStepOptimizer, TrainCallback, TrainConfig, train
+from polystep.adaptive_subspace import AdaptiveSubspace
+from polystep.factored_subspace import FactoredSubspace
+from polystep.hybrid_subspace import HybridSubspace
+from polystep.transform import ParamLayout
+
+IN_DIM, N_CLASSES, N_SAMPLES = 12, 3, 192
+
+
+def _blobs():
+    """Well-separated Gaussian blobs, one per class. Linearly separable by design."""
+    gen = torch.Generator().manual_seed(0)
+    centers = torch.eye(N_CLASSES, IN_DIM) * 6.0
+    y = torch.arange(N_SAMPLES) % N_CLASSES
+    X = centers[y] + torch.randn(N_SAMPLES, IN_DIM, generator=gen) * 0.5
+    return X, y
+
+
+def _model():
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(IN_DIM, 16), nn.ReLU(), nn.Linear(16, N_CLASSES))
+
+
+def _accuracy(model, X, y):
+    with torch.no_grad():
+        return (model(X).argmax(dim=1) == y).float().mean().item()
+
+
+def _subspace(kind, model):
+    if kind is None:
+        return None
+    layout = ParamLayout.from_module(model)
+    if kind == "adaptive":
+        return AdaptiveSubspace.auto_from_params(model, compression_target=0.5)
+    if kind == "hybrid":
+        return HybridSubspace.from_layout(layout, rank=4)
+    return FactoredSubspace.from_layout(layout, rank=4)
+
+
+@pytest.mark.parametrize("kind", [None, "adaptive", "hybrid", "factored"])
+def test_optimizer_learns_a_separable_classification_task(kind):
+    """Loss falls and accuracy beats chance, through every subspace path."""
+    X, y = _blobs()
+    model = _model()
+    loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=False)
+
+    start_acc = _accuracy(model, X, y)
+    opt = PolyStepOptimizer(
+        model,
+        subspace=_subspace(kind, model),
+        epsilon=0.5,
+        step_radius=0.5,
+        num_probe=2,
+        compile=False,
+        seed=0,
+    )
+    losses = []
+    train(
+        model,
+        loader,
+        nn.CrossEntropyLoss(),
+        opt,
+        TrainConfig(epochs=12, callbacks=[_Recorder(losses)]),
+    )
+
+    assert losses, "training produced no loss records"
+    assert min(losses) < losses[0] * 0.75, f"loss barely moved: {losses[0]:.4f} -> {min(losses):.4f}"
+
+    final_acc = _accuracy(model, X, y)
+    chance = 1.0 / N_CLASSES
+    assert final_acc > chance + 0.2, f"accuracy {final_acc:.3f} is not meaningfully above chance {chance:.3f}"
+    assert final_acc > start_acc, f"accuracy did not improve: {start_acc:.3f} -> {final_acc:.3f}"
+
+
+def test_a_zero_step_radius_does_not_learn():
+    """Guards the test above: with no movement allowed, its thresholds must not be met.
+
+    Without this, a bug that turned ``train`` into a no-op would still leave the learning
+    test passing on a lucky initialization.
+
+    The weights do drift by ~1e-7 even at ``step_radius=0``: reconstructing
+    ``base + P @ coords`` and pushing it back through ``load_state_dict`` is a
+    round-trip through fp32, so the bound is round-off scale, not exact equality.
+    """
+    X, y = _blobs()
+    model = _model()
+    loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=False)
+
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    losses = []
+    opt = PolyStepOptimizer(model, epsilon=0.5, step_radius=0.0, num_probe=2, compile=False, seed=0)
+    train(model, loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=12, callbacks=[_Recorder(losses)]))
+
+    after = model.state_dict()
+    drift = max((after[k] - before[k]).abs().max().item() for k in before)
+    assert drift < 1e-5, f"step_radius=0 moved the weights by {drift:.3e}, beyond fp32 round-off"
+    assert min(losses) >= losses[0] * 0.75, f"loss fell without any step being taken: {losses[0]} -> {min(losses)}"
+
+
+class _Recorder(TrainCallback):
+    """Records the exact per-step loss. Also makes ``train`` compute it, rather than
+    tracking the cheaper OT-cost proxy, which is what ``restore_best`` then uses."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def on_step_end(self, metrics: dict) -> bool:
+        self.sink.append(float(metrics["loss"]))
+        return False

@@ -45,8 +45,10 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
 
+from .solvers._prelude import thin_qr
+
 from .projection.sparse import SparseRandomProjection
-from .subspace import _stable_entry_seed
+from .subspace import _stable_entry_seed, absorb_due
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -120,7 +122,9 @@ def _scale_specs_to_budget(
                     num_coords=new_coords,
                     flat_start=new_offset,
                     flat_end=new_offset + new_coords,
-                    is_projected=True,
+                    # At full width the projection is the identity, so perturb the
+                    # parameter directly rather than allocating an eye(num_params).
+                    is_projected=new_coords < spec.num_params,
                 )
             )
         else:
@@ -271,9 +275,13 @@ class HybridSubspace:
                 d_out = shape[0]
                 d_in = math.prod(shape[1:])
                 effective_rank = min(rank, d_in, d_out)
-                # Same formula as LinearSubspace for drop-in compatibility
-                num_coords = d_out * effective_rank + effective_rank * d_in
                 num_params = math.prod(shape)
+                # Same formula as LinearSubspace for drop-in compatibility, capped at
+                # num_params. A wide (num_params, num_coords) matrix has rank at most
+                # num_params, so the extra coordinates are redundant, and QR cannot
+                # orthonormalize it: the fallback would be a scaled Gaussian of gain
+                # sqrt(num_params / num_coords) where the step radii assume 1.
+                num_coords = min(d_out * effective_rank + effective_rank * d_in, num_params)
                 specs.append(
                     LayerProjectionSpec(
                         entry_key=entry.key,
@@ -282,7 +290,9 @@ class HybridSubspace:
                         num_coords=num_coords,
                         flat_start=offset,
                         flat_end=offset + num_coords,
-                        is_projected=True,
+                        # At full width the projection is the identity, so carry the
+                        # parameter directly rather than allocating an eye(num_params).
+                        is_projected=num_coords < num_params,
                     )
                 )
                 offset += num_coords
@@ -362,8 +372,9 @@ class HybridSubspace:
                 min_dim = min(d_in, d_out)
                 auto_rank = max(min_rank, min(max_rank, min_dim // compression_ratio))
                 effective_rank = min(auto_rank, d_in, d_out)
-                num_coords = d_out * effective_rank + effective_rank * d_in
                 num_params = math.prod(shape)
+                # Capped at num_params for the same reason as from_layout above.
+                num_coords = min(d_out * effective_rank + effective_rank * d_in, num_params)
                 specs.append(
                     LayerProjectionSpec(
                         entry_key=entry.key,
@@ -372,7 +383,9 @@ class HybridSubspace:
                         num_coords=num_coords,
                         flat_start=offset,
                         flat_end=offset + num_coords,
-                        is_projected=True,
+                        # At full width the projection is the identity, so carry the
+                        # parameter directly rather than allocating an eye(num_params).
+                        is_projected=num_coords < num_params,
                     )
                 )
                 offset += num_coords
@@ -519,7 +532,7 @@ class HybridSubspace:
         if spec.num_params >= spec.num_coords:
             # geqrf has no bf16/fp16 CPU kernel; orthogonalize in fp32, cast back.
             qr_in = P_raw.float() if P_raw.dtype in (torch.bfloat16, torch.float16) else P_raw
-            P, _ = torch.linalg.qr(qr_in, mode="reduced")  # (num_params, num_coords)
+            P, _ = thin_qr(qr_in)  # (num_params, num_coords)
             P = P.to(dtype=P_raw.dtype)
         else:
             P = P_raw * (1.0 / math.sqrt(spec.num_coords))
@@ -826,14 +839,12 @@ class HybridSubspace:
         if D_full.dtype in (torch.bfloat16, torch.float16):
             D_full = D_full.float()
 
-        # SVD of the full-space displacement matrix
-        if k_svd < min(D_full.shape) // 2 and min(D_full.shape) > 6:
-            # Randomized SVD: faster when k_svd << rank
-            U_top, S_top, V_top = torch.pca_lowrank(D_full, q=k_svd, niter=2)
-        else:
-            U, S, Vh = torch.linalg.svd(D_full, full_matrices=False)
-            k_svd = min(k_svd, U.shape[1])
-            U_top = U[:, :k_svd]
+        # SVD of the full-space displacement matrix. The history is short, so the
+        # full decomposition costs about the same as a randomized one and stays
+        # deterministic under a caller-supplied generator.
+        U, S, Vh = torch.linalg.svd(D_full, full_matrices=False)
+        k_svd = min(k_svd, U.shape[1])
+        U_top = U[:, :k_svd]
         k_random = spec.num_coords - k_svd
         if U_top.dtype != svd_dtype:
             U_top = U_top.to(svd_dtype)
@@ -863,7 +874,7 @@ class HybridSubspace:
             orig_dtype = combined.dtype
             if combined.dtype == torch.bfloat16 and combined.device.type == "cpu":
                 combined = combined.float()
-            Q, _ = torch.linalg.qr(combined)
+            Q, _ = thin_qr(combined)
             combined = Q.to(orig_dtype) if Q.dtype != orig_dtype else Q
         else:
             combined = combined * (1.0 / math.sqrt(spec.num_coords))
@@ -891,30 +902,14 @@ class HybridSubspace:
     # ------------------------------------------------------------------
 
     def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
-        """Check whether an absorb-and-rotate should be triggered.
-
-        Matches AdaptiveSubspace's absorb logic: triggers on stagnation
-        (stagnation_count >= absorb_patience) or periodically
-        (iteration % absorb_interval == 0).
-
-        Args:
-            stagnation_count: Number of consecutive steps without improvement.
-            iteration: Current iteration number (0-indexed).
-
-        Returns:
-            True if absorb should be triggered based on the configured mode.
-
-        Example::
-
-            if hybrid.should_absorb(stagnation_count=25, iteration=100):
-                # Trigger absorb and rotate
-                pass
-        """
-        if self.absorb_mode == "stagnation":
-            return stagnation_count >= self.absorb_patience
-        elif self.absorb_mode == "periodic" and self.absorb_interval > 0:
-            return iteration > 0 and iteration % self.absorb_interval == 0
-        return False
+        """Whether to fold the perturbation into the base weights this step."""
+        return absorb_due(
+            self.absorb_mode,
+            self.absorb_patience,
+            self.absorb_interval,
+            stagnation_count,
+            iteration,
+        )
 
     # ------------------------------------------------------------------
     # Core reconstruction methods (matching LinearSubspace contract)
@@ -975,6 +970,48 @@ class HybridSubspace:
 
         return result
 
+    def _gather_fused_coords(self, flat_subspace: torch.Tensor) -> torch.Tensor:
+        """Slice out the coordinates the fused dense blocks consume, in block order.
+
+        Works for a single candidate ``(subspace_dim,)`` and for a batch
+        ``(N, subspace_dim)``; the dense specs are contiguous in the common case,
+        so this is one view rather than a per-layer gather.
+        """
+        first_start = self._fused_dense_specs[0][0].flat_start
+        last_end = self._fused_dense_specs[-1][0].flat_end
+        total = sum(s.num_coords for s, _ in self._fused_dense_specs)
+        if last_end - first_start == total:
+            return flat_subspace[..., first_start:last_end]
+        return torch.cat(
+            [flat_subspace[..., s.flat_start : s.flat_end] for s, _ in self._fused_dense_specs],
+            dim=-1,
+        )
+
+    def prepare_inplace(self, base_sd: Dict[str, torch.Tensor]) -> None:
+        """Cache the concatenated dense base row for a run of in-place candidates.
+
+        The base is constant across the candidates in a chunk, so building it once
+        here keeps :meth:`apply_perturbation_inplace` down to two kernel launches
+        per candidate. Call :meth:`release_inplace` when the chunk is done: a
+        stale row would perturb around the wrong point.
+        """
+        if getattr(self, "_fused_P", None) is None or not self._fused_dense_specs:
+            return
+        self._fused_base_row_cache = torch.cat(
+            [base_sd[spec.entry_key].reshape(-1) for spec, _ in self._fused_dense_specs]
+        ).unsqueeze(0)
+
+    def release_inplace(self) -> None:
+        """Drop the cached base row and scratch buffer from :meth:`prepare_inplace`."""
+        self._fused_base_row_cache = None
+        self._inplace_delta_buffer = None
+
+    def _fused_base_row(self, base_sd: Dict[str, torch.Tensor]) -> torch.Tensor:
+        cached = getattr(self, "_fused_base_row_cache", None)
+        if cached is not None:
+            return cached
+        return torch.cat([base_sd[spec.entry_key].reshape(-1) for spec, _ in self._fused_dense_specs]).unsqueeze(0)
+
     def build_fused_projection(
         self,
         projections: Dict[str, Union[torch.Tensor, "SparseRandomProjection"]],
@@ -1021,10 +1058,12 @@ class HybridSubspace:
         else:
             self._fused_P = None
             self._fused_total_dense_params = 0
+        # The cached base row describes the old block layout.
+        self.release_inplace()
 
     def apply_perturbation_inplace(
         self,
-        projections: Dict[str, Union[torch.Tensor, "SparseRandomProjection"]],
+        projections: Dict[str, Union[torch.Tensor, SparseRandomProjection]],
         model: "nn.Module",
         base_sd: Dict[str, torch.Tensor],
         flat_subspace: torch.Tensor,
@@ -1047,7 +1086,32 @@ class HybridSubspace:
         """
         if param_dict is None:
             param_dict = dict(model.named_parameters())
-        for spec in self.specs:
+
+        # Fused path: one addmm covers every dense layer, then a single grouped
+        # copy scatters the result into the parameter tensors. Two kernel
+        # launches per candidate regardless of layer count.
+        fused_P = getattr(self, "_fused_P", None)
+        if fused_P is not None and self._fused_dense_specs:
+            coords = self._gather_fused_coords(flat_subspace)
+            buf = self._inplace_delta_buffer
+            if buf is None or buf.shape[1] != fused_P.shape[0] or buf.dtype != fused_P.dtype:
+                buf = fused_P.new_empty((1, fused_P.shape[0]))
+                self._inplace_delta_buffer = buf
+            torch.addmm(self._fused_base_row(base_sd), coords.unsqueeze(0), fused_P.t(), out=buf)
+            dsts, srcs = [], []
+            for spec, offset in self._fused_dense_specs:
+                param = param_dict.get(spec.entry_key)
+                if param is None:
+                    continue
+                dsts.append(param.data)
+                srcs.append(buf[0, offset : offset + spec.num_params].view(spec.original_shape))
+            if dsts:
+                torch._foreach_copy_(dsts, srcs)
+            remaining = [s for s, _ in self._fused_sparse_specs] + list(self._fused_bias_specs)
+        else:
+            remaining = self.specs
+
+        for spec in remaining:
             key = spec.entry_key
             if key not in param_dict:
                 continue
@@ -1060,20 +1124,17 @@ class HybridSubspace:
                 if isinstance(P, SparseRandomProjection):
                     delta = P.project(chunk)
                     param.data.copy_((base.reshape(-1) + delta).reshape(spec.original_shape))
+                elif param.data.is_contiguous():
+                    # addmm writes straight into the parameter storage.
+                    torch.addmm(
+                        base.reshape(1, -1),
+                        chunk.unsqueeze(0),
+                        P.t(),
+                        out=param.data.reshape(1, -1),
+                    )
                 else:
-                    # Fused: base + coords @ P^T. reshape(1, -1) is a view only
-                    # when param.data is contiguous; otherwise it is a copy and an
-                    # out= write would be silently discarded, so copy_ instead.
-                    if param.data.is_contiguous():
-                        torch.addmm(
-                            base.reshape(1, -1),
-                            chunk.unsqueeze(0),
-                            P.t(),
-                            out=param.data.reshape(1, -1),
-                        )
-                    else:
-                        res = torch.addmm(base.reshape(1, -1), chunk.unsqueeze(0), P.t())
-                        param.data.copy_(res.reshape(spec.original_shape))
+                    res = torch.addmm(base.reshape(1, -1), chunk.unsqueeze(0), P.t())
+                    param.data.copy_(res.reshape(spec.original_shape))
             else:
                 param.data.copy_(base + chunk.reshape(spec.original_shape))
 
@@ -1104,36 +1165,17 @@ class HybridSubspace:
         N = flat_subspace_batch.shape[0]
         result = {}
 
-        # Fast path: fused block-diagonal matmul for all dense layers
         if getattr(self, "_fused_P", None) is not None and self._fused_dense_specs:
-            # Gather subspace coords for all dense layers.
-            # If dense specs are laid out contiguously (common case), use a
-            # single slice instead of a 72-iteration Python loop + torch.cat.
-            first_start = self._fused_dense_specs[0][0].flat_start
-            last_spec = self._fused_dense_specs[-1][0]
-            last_end = last_spec.flat_end
-            total_dense_coords = sum(s.num_coords for s, _ in self._fused_dense_specs)
-            if last_end - first_start == total_dense_coords:
-                # Contiguous layout - single slice
-                fused_coords = flat_subspace_batch[:, first_start:last_end]
-            else:
-                # Non-contiguous - fallback to cat
-                coord_slices = []
-                for spec, _ in self._fused_dense_specs:
-                    coord_slices.append(flat_subspace_batch[:, spec.flat_start : spec.flat_end])
-                fused_coords = torch.cat(coord_slices, dim=1)  # (N, total_dense_coords)
+            fused_coords = self._gather_fused_coords(flat_subspace_batch)
+            # One matmul covers every dense layer at once.
+            fused_delta = fused_coords @ self._fused_P.t()
 
-            # Single matmul: (N, total_dense_coords) @ (total_dense_coords, total_dense_params)
-            fused_delta = fused_coords @ self._fused_P.t()  # (N, total_dense_params)
-
-            # Split into per-layer deltas and add to base
             for spec, param_offset in self._fused_dense_specs:
                 base = base_sd[spec.entry_key]
                 delta = fused_delta[:, param_offset : param_offset + spec.num_params]
                 result_flat = base.reshape(1, -1) + delta
                 result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
 
-            # Sparse layers: per-layer fallback
             for spec, P in self._fused_sparse_specs:
                 chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
                 base = base_sd[spec.entry_key]
@@ -1141,113 +1183,30 @@ class HybridSubspace:
                 result_flat = base.reshape(1, -1) + delta
                 result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
 
-            # 1D biases: direct add
             for spec in self._fused_bias_specs:
                 chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
                 base = base_sd[spec.entry_key]
                 delta = chunk.reshape(N, *spec.original_shape)
                 result[spec.entry_key] = base.unsqueeze(0) + delta
-        else:
-            # Fallback: per-layer loop (no fused projection built yet)
-            for spec in self.specs:
-                chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
-                base = base_sd[spec.entry_key]
 
-                if spec.is_projected:
-                    P = projections[spec.entry_key]
-                    if isinstance(P, SparseRandomProjection):
-                        delta = P.project(chunk)
-                        result_flat = base.reshape(1, -1) + delta
-                        result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
-                    else:
-                        result_flat = base.reshape(1, -1) + chunk @ P.t()
-                        result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
-                else:
-                    delta = chunk.reshape(N, *spec.original_shape)
-                    result[spec.entry_key] = base.unsqueeze(0) + delta
+            return result
 
-        return result
-
-    def reconstruct_base(
-        self,
-        projections: Dict[str, Union[torch.Tensor, "SparseRandomProjection"]],
-        base_sd: Dict[str, torch.Tensor],
-        flat_subspace: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Reconstruct full params from subspace coords (single config, no batch dim).
-
-        Returns unbatched tensors suitable as a base for delta reconstruction.
-        """
-        result = {}
         for spec in self.specs:
-            chunk = flat_subspace[spec.flat_start : spec.flat_end]
+            chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
+
             if spec.is_projected:
                 P = projections[spec.entry_key]
                 if isinstance(P, SparseRandomProjection):
-                    delta = P.project(chunk.unsqueeze(0)).squeeze(0)
-                    result[spec.entry_key] = (base.reshape(-1) + delta).reshape(spec.original_shape)
-                else:
-                    result[spec.entry_key] = (base.reshape(-1) + chunk @ P.t()).reshape(spec.original_shape)
-            else:
-                result[spec.entry_key] = base + chunk.reshape(spec.original_shape)
-        return result
-
-    def reconstruct_batch_delta(
-        self,
-        projections: Dict[str, Union[torch.Tensor, "SparseRandomProjection"]],
-        base_reconstructed: Dict[str, torch.Tensor],
-        flat_subspace_base: torch.Tensor,
-        flat_subspace_batch: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Delta-based batched reconstruction: only recompute layers affected by changes.
-
-        Instead of reconstructing all layers from scratch for each probe,
-        computes delta = (probe_coords - base_coords) and applies only to
-        layers whose coord ranges overlap with the changed positions.
-
-        This is much faster when probe configs differ from base in only a few
-        contiguous coords (e.g., one particle's pdim-dimensional coordinates).
-
-        Args:
-            projections: Per-layer projection matrices.
-            base_reconstructed: Pre-computed full reconstruction from reconstruct_base().
-            flat_subspace_base: 1D tensor (subspace_dim,) - the base subspace coords.
-            flat_subspace_batch: 2D tensor (N, subspace_dim) - the probed configs.
-
-        Returns:
-            Dict {key: (N, *shape)} with batched perturbed params.
-        """
-        N = flat_subspace_batch.shape[0]
-        # Compute delta coords: where batch differs from base
-        delta_coords = flat_subspace_batch - flat_subspace_base.unsqueeze(0)  # (N, sub_dim)
-
-        result = {}
-        for spec in self.specs:
-            delta_chunk = delta_coords[:, spec.flat_start : spec.flat_end]  # (N, num_coords)
-
-            # Check if any probe actually modifies this layer's coords
-            # Use a fast check: if all deltas are zero, just broadcast base
-            has_delta = delta_chunk.any()
-
-            base_val = base_reconstructed[spec.entry_key]  # (*shape)
-
-            if not has_delta:
-                # No change in this layer - broadcast base
-                result[spec.entry_key] = base_val.unsqueeze(0).expand(N, *spec.original_shape)
-            elif spec.is_projected:
-                P = projections[spec.entry_key]
-                if isinstance(P, SparseRandomProjection):
-                    delta_params = P.project(delta_chunk)  # (N, num_params)
-                    result_flat = base_val.reshape(1, -1) + delta_params
+                    delta = P.project(chunk)
+                    result_flat = base.reshape(1, -1) + delta
                     result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
                 else:
-                    delta_params = delta_chunk @ P.t()  # (N, num_params)
-                    result_flat = base_val.reshape(1, -1) + delta_params
+                    result_flat = base.reshape(1, -1) + chunk @ P.t()
                     result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
             else:
-                delta = delta_chunk.reshape(N, *spec.original_shape)
-                result[spec.entry_key] = base_val.unsqueeze(0) + delta
+                delta = chunk.reshape(N, *spec.original_shape)
+                result[spec.entry_key] = base.unsqueeze(0) + delta
 
         return result
 
@@ -1299,7 +1258,7 @@ def create_hybrid_blocks(
     the shared projection matrices.
 
     Unlike create_subspace_blocks (which evenly divides a global subspace),
-    this function respects layer boundaries -- each block corresponds exactly
+    this function respects layer boundaries: each block corresponds exactly
     to one layer's subspace coordinates.
 
     Note: Block flat ranges are computed with contiguous offsets (accounting for

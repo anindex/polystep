@@ -41,6 +41,10 @@ class SolverState:
         prev_loss: Previous iteration loss for stagnation detection.
         projection: Orthonormal projection matrix for adaptive subspace mode.
             Shape (full_dim, subspace_dim). None when not using AdaptiveSubspace.
+        displacement_history_full: Same displacements mapped to full parameter space
+            with the basis that was current when each was recorded. The basis rotates
+            between steps, so re-projecting stored subspace coordinates through the
+            latest basis would mix frames.
         displacement_history: Rolling buffer of recent subspace displacement vectors.
             Shape (history_size, subspace_dim). None when not using AdaptiveSubspace.
         displacement_history_idx: Current write position in the rolling buffer.
@@ -87,6 +91,7 @@ class SolverState:
     # Adaptive subspace state
     projection: Optional[torch.Tensor] = None
     displacement_history: Optional[torch.Tensor] = None
+    displacement_history_full: Optional[torch.Tensor] = None
     displacement_history_idx: int = 0
     displacement_history_count: int = 0
     absorb_count: int = 0
@@ -97,9 +102,6 @@ class SolverState:
     sigma: float = 1.0
     generation: int = 0
     use_csa: bool = False
-    # Running mean of ||p_sigma|| that calibrates CSA to the OT step scale,
-    # which is far below the sqrt(n) a Gaussian mutation would give.
-    csa_norm_ema: Optional[float] = None
     # Dual potential momentum
     prev_prev_f: Optional[torch.Tensor] = None
     prev_prev_g: Optional[torch.Tensor] = None
@@ -194,6 +196,13 @@ class PolyStep:
             raise NotImplementedError(
                 "Combined subspace + block-wise mode is not yet supported. "
                 "Use subspace or block_strategy independently."
+            )
+
+        if self.num_probe < 1:
+            raise ValueError(
+                f"num_probe must be >= 1, got {self.num_probe}. num_probe=0 yields an "
+                "empty probe tensor, so the cost matrix is a mean over nothing (NaN) "
+                "and every step becomes a no-op with a fabricated finite cost."
             )
 
         self.polytope_vertices = POLYTOPE_MAP[self.polytope_type](self.dim, radius=1.0)
@@ -339,7 +348,7 @@ class PolyStep:
         X = state.X
         device = X.device
 
-        # 1. Resolve epsilon and radii
+        # Resolve epsilon and radii
         current_eps = self._get_epsilon(iteration)
         step_radius = self.step_radius * current_eps
         probe_radius = self.probe_radius * current_eps
@@ -354,7 +363,7 @@ class PolyStep:
         polytope_verts = self.polytope_vertices.to(device=device, dtype=X.dtype)
         probes = self.probes.to(device=device, dtype=X.dtype)
 
-        # 2. Sample polytope and probes
+        # Sample polytope and probes
         # Pre-normalize for compiled path (avoid shape branch inside compiled fn)
         if X.dim() == 1:
             X = X.unsqueeze(0)
@@ -385,7 +394,6 @@ class PolyStep:
             probe_radius,
         )
 
-        # 3. Compute cost matrix
         if state.subspace is not None and self.nn_evaluator is not None:
             # Subspace mode: reconstruct full params from subspace probes
             P, V, K, D = X_probe.shape
@@ -412,14 +420,12 @@ class PolyStep:
         # inline copy that .item()-synced and could overflow the penalty to inf.
         cost_matrix = sanitize_cost(cost_matrix)
 
-        # 4. Resolve OT epsilon
         ent_eps = self._get_ent_epsilon(iteration)
         ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
-        # 5. Solve entropic OT. Forward the previous solve's epsilon so the
+        # Solve entropic OT. Forward the previous solve's epsilon so the
         # solver can rescale the warm-started duals when the schedule moved
-        # epsilon -- consistent with PolyStepOptimizer's monolithic step,
-        # which previously was the only path that passed init_eps.
+        # epsilon: consistent with PolyStepOptimizer's monolithic step,
         self.sinkhorn_solver.epsilon = ot_epsilon
         solve_kwargs = dict(
             cost_matrix=cost_matrix,
@@ -433,7 +439,6 @@ class PolyStep:
         ot_result = self.sinkhorn_solver.solve(**solve_kwargs)
         state.last_solve_eps = ot_epsilon
 
-        # 6. Barycentric projection (compiled)
         transport_matrix = ot_result.matrix  # (batch, num_vertices)
         X_new = self._compiled.barycentric_projection(
             transport_matrix,
@@ -446,7 +451,6 @@ class PolyStep:
         if _nan_reverted:
             X_new = X.clone()
 
-        # 7. Update state
         disp_sqnorm = torch.mean(torch.sum((X_new - X) ** 2, dim=-1)).item()
 
         state.X = X_new
@@ -510,13 +514,13 @@ class PolyStep:
         block_X_2d = block_flat.reshape(-1, X.shape[-1]) if X.dim() > 1 else block_flat
         all_block_particles = split_particles(block_X_2d, blocks)
 
-        # Resolve OT epsilon
         ent_eps = self._get_ent_epsilon(state.iteration_count)
         ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
         updated_block_particles = []
         new_block_duals = []
         total_ent_cost = 0.0
+        block_cost_means: List[torch.Tensor] = []
         all_converged = True
         total_disp = 0.0
         total_particles = 0
@@ -576,16 +580,21 @@ class PolyStep:
                 targets=self.train_targets,
             )
 
-            # Per-block OT solve with warm-started duals
+            # Per-block OT solve with warm-started duals. Forward the previous
+            # epsilon so the solver can rescale the warm start when the schedule
+            # moved it, matching the monolithic path.
             self.sinkhorn_solver.epsilon = ot_epsilon
             init_f, init_g = state.block_duals[block_idx]
-            ot_result = self.sinkhorn_solver.solve(
+            solve_kwargs = dict(
                 cost_matrix=cost_matrix,
                 a=torch.ones(P_block, device=device, dtype=X.dtype) / P_block,
                 init_f=init_f,
                 init_g=init_g,
                 scale_cost=self.scale_cost,
             )
+            if state.last_solve_eps is not None:
+                solve_kwargs["init_eps"] = state.last_solve_eps
+            ot_result = self.sinkhorn_solver.solve(**solve_kwargs)
 
             # Barycentric projection for this block
             transport_matrix = ot_result.matrix
@@ -604,6 +613,7 @@ class PolyStep:
             updated_block_particles.append(X_new_block)
             new_block_duals.append((ot_result.f.detach(), ot_result.g.detach()))
             total_ent_cost += ot_result.ent_reg_cost
+            block_cost_means.append(cost_matrix.mean())
             all_converged = all_converged and ot_result.converged
 
         # Reassemble and convert back to layout-indexed format
@@ -611,15 +621,25 @@ class PolyStep:
         layout_flat_new = blocks_to_layout_flat(full_flat, blocks, self.layout)
         X_new = layout_flat_new.reshape(X.shape)
 
-        # Update state
+        # Revert on a non-finite update, matching the monolithic path. One bad block
+        # evaluation would otherwise poison every particle and the dual warm-start chain.
+        if not torch.isfinite(X_new).all():
+            X_new = X.clone()
+            new_block_duals = [(None, None) for _ in blocks]
+            total_disp = 0.0
+
         disp_sqnorm = total_disp / total_particles if total_particles > 0 else 0.0
 
         state.X = X_new
-        state.costs.append(total_ent_cost)
+        # Raw objective mean, matching the monolithic path, so min(state.costs) means
+        # the same thing in both modes. The summed entropic dual scales with the block
+        # count and drifts with the epsilon schedule at a fixed objective.
+        state.costs.append(torch.stack(block_cost_means).mean().item() if block_cost_means else 0.0)
         state.linear_convergence.append(all_converged)
         state.displacement_sqnorms.append(disp_sqnorm)
         state.iteration_count += 1
         state.block_duals = new_block_duals
+        state.last_solve_eps = ot_epsilon
         state.epsilon = current_eps
 
         return state
@@ -653,7 +673,18 @@ class PolyStep:
 
         Returns:
             Final SolverState with converged particles.
+
+        Raises:
+            ValueError: If a subspace is configured. Subspace mode needs the base
+                state_dict, which only ``init_state(X_init, base_params=...)``
+                accepts; running here would silently optimize the plain objective.
         """
+        if self.subspace is not None:
+            raise ValueError(
+                "PolyStep.run() cannot drive subspace mode: the subspace needs "
+                "base_params, which only init_state() accepts. Call "
+                "init_state(X_init, base_params=...) and step() in your own loop."
+            )
         state = self.init_state(X_init)
 
         for i in range(self.max_iterations):

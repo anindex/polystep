@@ -1,49 +1,20 @@
-"""CMAAdaptiveSubspace: CMA-ES covariance adaptation on top of AdaptiveSubspace.
+"""CMAAdaptiveSubspace: sep-CMA-ES covariance adaptation on top of AdaptiveSubspace.
 
-Wraps an ``AdaptiveSubspace`` with the separable CMA-ES (sep-CMA-ES) variant
-of the Covariance Matrix Adaptation Evolution Strategy. sep-CMA-ES uses a
-diagonal covariance instead of a full one, reducing memory from O(n^2) to O(n)
-and compute from O(n^3) to O(n) per update -- which is what makes it usable
-in the high-dimensional subspaces that show up in neural network training.
+The separable variant keeps a diagonal covariance instead of a full one, which drops
+memory from O(n^2) to O(n) and the update from O(n^3) to O(n). That is what makes it
+usable at the subspace dimensions neural network training produces.
 
-Key CMA-ES concepts integrated:
-
-1. **Evolution Paths (p_c, p_sigma)**: Cumulative sums of displacement directions
-   over generations. These track the "momentum" of the search and are used to
-   update covariance and step-size.
-
-2. **Diagonal Covariance (C_diag)**: Per-dimension scaling of the search distribution.
-   Dimensions that consistently show movement get higher variance, allowing the
-   optimizer to stretch the search ellipsoid along productive directions.
-
-3. **Cumulative Step-size Adaptation (CSA)**: Uses p_sigma to detect if steps are
-   too short (should increase sigma) or too long (should decrease sigma) relative
-   to what would be expected under random selection.
-
-4. **Covariance Scaling**: The projection matrix P can be scaled by sqrt(C_diag)
-   to modify the effective search distribution in parameter space.
-
-Design Decision:
-    CMA state (p_c, p_sigma, C_diag, sigma, generation) lives in ``SolverState``,
-    not in this class. This maintains JIT compatibility and enables checkpointing
-    of the full optimizer state. CMAAdaptiveSubspace only stores static config
-    (hyperparameters) and provides methods that operate on the state.
+State (``p_c``, ``p_sigma``, ``C_diag``, ``sigma``, ``generation``) lives in
+``SolverState``, not on this class, so it checkpoints with the rest of the optimizer
+and stays JIT-compatible. This class holds the static hyperparameters and the methods
+that operate on that state.
 
 Example::
 
-    from polystep import AdaptiveSubspace, CMAAdaptiveSubspace, SolverState
-    import torch.nn as nn
-
-    model = nn.Linear(100, 10)
     base = AdaptiveSubspace.auto_from_params(model)
     cma_sub = CMAAdaptiveSubspace.from_adaptive_subspace(base)
-
-    # Initialize CMA state (store in SolverState)
-    cma_state = cma_sub.init_cma_state(device='cuda')
-    # cma_state = {'p_c': ..., 'p_sigma': ..., 'C_diag': ...}
-
-    # Apply covariance scaling to projection
-    P_scaled = cma_sub.apply_covariance_scaling(P, cma_state['C_diag'])
+    cma_state = cma_sub.init_cma_state(device="cuda")
+    P_scaled = cma_sub.apply_covariance_scaling(P, cma_state["C_diag"])
 """
 
 from __future__ import annotations
@@ -60,6 +31,23 @@ from .cma import compute_cma_hyperparameters
 
 if TYPE_CHECKING:
     pass
+
+
+def default_mu_eff(subspace_dim: int) -> float:
+    """Fallback effective population size when the polytope size is unknown.
+
+    ``mu_eff`` is ``1 / sum(w^2)`` over the recombination weights, which are the OT
+    transport row, so its ceiling is the vertex count rather than the subspace
+    dimension. ``PolyStepOptimizer`` knows the vertex count and overrides this; the
+    dimension-derived value here only applies to a standalone subspace object.
+
+    Args:
+        subspace_dim: Subspace dimension ``n``.
+
+    Returns:
+        ``mu_eff`` capped per the Hansen tutorial's ``mu ~ lambda/2 ~ O(sqrt(n))``.
+    """
+    return max(1.0, min(subspace_dim / 4.0, 5.0 * math.sqrt(subspace_dim)))
 
 
 @dataclass
@@ -94,19 +82,60 @@ class CMAAdaptiveSubspace:
     c_mu: float = 0.0
     d_sigma: float = 0.0
     expected_norm: float = 0.0
-    mu_eff: float = 1.0
+    # 0.0 is a "derive me" sentinel, like the learning rates above. A literal 1.0
+    # would be a legal-looking value that silently zeroes c_mu.
+    mu_eff: float = 0.0
     # Numerical stability bounds
     cov_min: float = 1e-6
     cov_max: float = 1e6
 
-    # ------------------------------------------------------------------
-    # Delegated properties
-    # ------------------------------------------------------------------
+    def __post_init__(self) -> None:
+        """Fill unset CMA hyperparameters from the Hansen formulas.
+
+        Direct construction leaves them at their ``0.0`` sentinel, which makes CMA
+        inert (``c_1 = c_mu = c_c = 0`` never updates the covariance) and divides by
+        zero in the CSA update. Filling them here makes every construction path
+        behave like :meth:`from_adaptive_subspace`.
+        """
+        # Recorded so PolyStepOptimizer knows whether to override mu_eff with the
+        # polytope vertex count or respect a value the caller chose.
+        self._mu_eff_explicit = self.mu_eff > 0.0
+        if self.d_sigma == 0.0:
+            n = self.base.subspace_dim
+            mu_eff = self.mu_eff if self.mu_eff > 0.0 else default_mu_eff(n)
+            hyperparams = compute_cma_hyperparameters(n, mu_eff)
+            self.c_c = self.c_c or hyperparams["c_c"]
+            self.c_sigma = self.c_sigma or hyperparams["c_sigma"]
+            self.c_1 = self.c_1 or hyperparams["c_1"]
+            self.c_mu = self.c_mu or hyperparams["c_mu"]
+            self.d_sigma = hyperparams["d_sigma"]
+            self.expected_norm = self.expected_norm or hyperparams["expected_norm"]
+            self.mu_eff = mu_eff
 
     @property
     def full_dim(self) -> int:
         """Total flattened parameter count (delegated to base)."""
         return self.base.full_dim
+
+    @property
+    def displacement_history_size(self) -> int:
+        """Rolling displacement-history length (delegated to base)."""
+        return self.base.displacement_history_size
+
+    @property
+    def absorb_mode(self) -> str:
+        """Absorb trigger mode (delegated to base)."""
+        return self.base.absorb_mode
+
+    @property
+    def absorb_patience(self) -> int:
+        """Stagnation steps before a stagnation absorb (delegated to base)."""
+        return self.base.absorb_patience
+
+    @property
+    def absorb_interval(self) -> int:
+        """Steps between periodic absorbs (delegated to base)."""
+        return self.base.absorb_interval
 
     @property
     def subspace_dim(self) -> int:
@@ -122,10 +151,6 @@ class CMAAdaptiveSubspace:
     def rotation_mode(self) -> str:
         """Rotation mode: 'random' or 'displacement' (delegated to base)."""
         return self.base.rotation_mode
-
-    # ------------------------------------------------------------------
-    # Delegated methods
-    # ------------------------------------------------------------------
 
     def init_projection(
         self,
@@ -153,10 +178,6 @@ class CMAAdaptiveSubspace:
         total_steps: int,
         displacement_history: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
-        # OT-bias mode inputs (forwarded to base.rotate; ignored otherwise)
-        transport_matrix: Optional[torch.Tensor] = None,
-        X_vertices: Optional[torch.Tensor] = None,
-        X_current: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Rotate projection basis (delegated to base).
 
@@ -166,24 +187,11 @@ class CMAAdaptiveSubspace:
             total_steps: Total number of optimization steps.
             displacement_history: Optional displacement history tensor.
             generator: Optional torch.Generator for reproducibility.
-            transport_matrix: OT transport plan (only used when the wrapped
-                AdaptiveSubspace is in ``'ot_bias'`` rotation mode).
-            X_vertices: Polytope vertex positions (ot_bias mode only).
-            X_current: Current particle positions (ot_bias mode only).
 
         Returns:
             New projection matrix P_new.
         """
-        return self.base.rotate(
-            projection,
-            step,
-            total_steps,
-            displacement_history,
-            generator,
-            transport_matrix=transport_matrix,
-            X_vertices=X_vertices,
-            X_current=X_current,
-        )
+        return self.base.rotate(projection, step, total_steps, displacement_history, generator)
 
     def apply_perturbation(
         self,
@@ -251,10 +259,6 @@ class CMAAdaptiveSubspace:
         """
         return self.base.should_absorb(stagnation_count, iteration)
 
-    # ------------------------------------------------------------------
-    # CMA-specific methods
-    # ------------------------------------------------------------------
-
     def apply_covariance_scaling(
         self,
         projection: torch.Tensor,
@@ -277,11 +281,20 @@ class CMAAdaptiveSubspace:
         Returns:
             Scaled projection P_scaled = P @ diag(sqrt(C_diag)).
         """
-        # Clamp C_diag for numerical stability
         C_diag_clamped = torch.clamp(C_diag, min=self.cov_min, max=self.cov_max)
-        # Scale columns: P_scaled[:, i] = P[:, i] * sqrt(C_diag[i])
         sqrt_C = torch.sqrt(C_diag_clamped)
-        return projection * sqrt_C.unsqueeze(0)
+        # Write into a cached buffer: this runs once per step and the result is a full
+        # (full_dim, subspace_dim) tensor, 1 GB in fp32 at full_dim=500K, subspace_dim=512.
+        out = getattr(self, "_scaled_projection_buf", None)
+        if (
+            out is None
+            or out.shape != projection.shape
+            or out.dtype != projection.dtype
+            or out.device != projection.device
+        ):
+            out = torch.empty_like(projection)
+            self._scaled_projection_buf = out
+        return torch.mul(projection, sqrt_C.unsqueeze(0), out=out)
 
     def init_cma_state(
         self,
@@ -312,10 +325,6 @@ class CMAAdaptiveSubspace:
             "C_diag": torch.ones(subspace_dim, device=device, dtype=dtype),
         }
 
-    # ------------------------------------------------------------------
-    # Factory methods
-    # ------------------------------------------------------------------
-
     @classmethod
     def from_adaptive_subspace(
         cls,
@@ -332,37 +341,18 @@ class CMAAdaptiveSubspace:
 
         Args:
             base: The AdaptiveSubspace to wrap.
-            mu_eff: Effective population size. If None, defaults to
-                subspace_dim / 4 (heuristic for OT-based selection).
+            mu_eff: Effective population size. If None, falls back to
+                :func:`default_mu_eff`; ``PolyStepOptimizer`` overrides that with the
+                polytope vertex count, which is the real ceiling on ``1/sum(w^2)``.
             cov_min: Minimum allowed C_diag entry (numerical stability).
             cov_max: Maximum allowed C_diag entry (numerical stability).
 
         Returns:
             CMAAdaptiveSubspace wrapping the base instance.
         """
-        n = base.subspace_dim
-
-        # Default mu_eff: fraction of subspace dim, capped per Hansen CMA tutorial.
-        # Hansen recommends mu_eff ~ mu ~ lambda/2, which scales as O(sqrt(n)).
-        # Cap at 5*sqrt(n) to avoid over-aggressive step-size adaptation.
-        if mu_eff is None:
-            mu_eff = max(1.0, min(n / 4.0, 5.0 * math.sqrt(n)))
-
-        # Compute CMA hyperparameters from dimension and mu_eff
-        hyperparams = compute_cma_hyperparameters(n, mu_eff)
-
-        return cls(
-            base=base,
-            c_c=hyperparams["c_c"],
-            c_sigma=hyperparams["c_sigma"],
-            c_1=hyperparams["c_1"],
-            c_mu=hyperparams["c_mu"],
-            d_sigma=hyperparams["d_sigma"],
-            expected_norm=hyperparams["expected_norm"],
-            mu_eff=mu_eff,
-            cov_min=cov_min,
-            cov_max=cov_max,
-        )
+        # 0.0 lets __post_init__ resolve mu_eff and record it as not caller-chosen, so
+        # PolyStepOptimizer is free to substitute the polytope vertex count.
+        return cls(base=base, mu_eff=0.0 if mu_eff is None else mu_eff, cov_min=cov_min, cov_max=cov_max)
 
     @classmethod
     def auto_from_params(

@@ -42,10 +42,6 @@ from experiments.baselines.spsa import train_spsa
 from experiments.baselines.sgd_baseline import train_sgd
 
 
-# ---------------------------------------------------------------------------
-# Benchmark constants
-# ---------------------------------------------------------------------------
-
 BENCHMARK = "mnist"
 BATCH_SIZE = 512
 EPOCHS = 30
@@ -114,12 +110,9 @@ CMAES_CONFIG = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Method runners
-# ---------------------------------------------------------------------------
-
-def run_polystep(seed, device, train_loader, test_loader, results_dir, solver=None,
-                audit_no_leakage: bool = True, val_loader=None):
+def run_polystep(
+    seed, device, train_loader, test_loader, results_dir, solver=None, audit_no_leakage: bool = True, val_loader=None
+):
     """Train MNIST with polystep PolyStepOptimizer + HybridSubspace.
 
     By default, best-checkpoint selection uses a held-out validation
@@ -140,10 +133,7 @@ def run_polystep(seed, device, train_loader, test_loader, results_dir, solver=No
     selection_label = "val" if (audit_no_leakage and val_loader is not None) else "test"
 
     total_steps = EPOCHS * len(train_loader)
-    epsilon_decay = (
-        (PSTORCH_CONFIG["epsilon_init"] - PSTORCH_CONFIG["epsilon_target"])
-        / max(1, total_steps)
-    )
+    epsilon_decay = (PSTORCH_CONFIG["epsilon_init"] - PSTORCH_CONFIG["epsilon_target"]) / max(1, total_steps)
     sr_decay = (PSTORCH_CONFIG["step_radius_init"] - PSTORCH_CONFIG["step_radius_target"]) / max(1, total_steps)
     pr_decay = (PSTORCH_CONFIG["probe_radius_init"] - PSTORCH_CONFIG["probe_radius_target"]) / max(1, total_steps)
 
@@ -226,13 +216,15 @@ def run_polystep(seed, device, train_loader, test_loader, results_dir, solver=No
                 # Per-20-step fine-grained tracking
                 if step_count % 20 == 0:
                     step_test_acc = evaluate_accuracy(model, test_loader, device=device)
-                    step_logs.append({
-                        "step": step_count,
-                        "epoch": epoch + 1,
-                        "test_accuracy": step_test_acc,
-                        "loss": loss,
-                        "wall_time": time.time() - start_time,
-                    })
+                    step_logs.append(
+                        {
+                            "step": step_count,
+                            "epoch": epoch + 1,
+                            "test_accuracy": step_test_acc,
+                            "loss": loss,
+                            "wall_time": time.time() - start_time,
+                        }
+                    )
 
             train_acc = epoch_correct / max(epoch_total, 1)
             test_acc = evaluate_accuracy(model, test_loader, device=device)
@@ -252,19 +244,21 @@ def run_polystep(seed, device, train_loader, test_loader, results_dir, solver=No
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / max(len(train_loader), 1)
 
-            epoch_logs.append({
-                "epoch": epoch + 1,
-                "accuracy": test_acc,
-                "train_accuracy": train_acc,
-                "test_accuracy": test_acc,
-                f"{selection_label}_accuracy": selection_acc,
-                "loss": avg_loss,
-                "time": epoch_time,
-                "wall_time": time.time() - start_time,
-            })
+            epoch_logs.append(
+                {
+                    "epoch": epoch + 1,
+                    "accuracy": test_acc,
+                    "train_accuracy": train_acc,
+                    "test_accuracy": test_acc,
+                    f"{selection_label}_accuracy": selection_acc,
+                    "loss": avg_loss,
+                    "time": epoch_time,
+                    "wall_time": time.time() - start_time,
+                }
+            )
             print(
-                f"    Epoch {epoch+1}/{EPOCHS} | train={train_acc*100:.1f}% | "
-                f"test={test_acc*100:.1f}% | {selection_label}-best={best_accuracy*100:.1f}% | "
+                f"    Epoch {epoch + 1}/{EPOCHS} | train={train_acc * 100:.1f}% | "
+                f"test={test_acc * 100:.1f}% | {selection_label}-best={best_accuracy * 100:.1f}% | "
                 f"loss={avg_loss:.4f}"
             )
 
@@ -460,10 +454,6 @@ def run_adam(seed, device, train_loader, test_loader, results_dir):
     print(f"    Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method dispatch
-# ---------------------------------------------------------------------------
-
 METHOD_RUNNERS = {
     "polystep": run_polystep,
     "cmaes": run_cmaes,
@@ -473,57 +463,67 @@ METHOD_RUNNERS = {
 }
 
 
-def run_method(method, seed, device, results_dir, data_dir, solver=None,
-               audit_no_leakage: bool = True):
+def run_method(method, seed, device, results_dir, data_dir, solver=None, audit_no_leakage: bool = True):
     """Run a single method+seed combination."""
     from experiments.runners.common import make_train_val_split
 
     train_loader, test_loader = load_mnist(
-        data_dir=data_dir, batch_size=BATCH_SIZE,
+        data_dir=data_dir,
+        batch_size=BATCH_SIZE,
     )
     val_loader = None
     if audit_no_leakage:
         train_loader, val_loader = make_train_val_split(
-            train_loader, val_frac=0.1, seed=seed,
+            train_loader,
+            val_frac=0.1,
+            seed=seed,
         )
     runner = METHOD_RUNNERS.get(method)
     if runner is None:
         print(f"    Unknown method: {method}")
         return
-    if method == 'polystep':
-        runner(seed, device, train_loader, test_loader, results_dir,
-               solver=solver, audit_no_leakage=audit_no_leakage,
-               val_loader=val_loader)
+    if method == "polystep":
+        runner(
+            seed,
+            device,
+            train_loader,
+            test_loader,
+            results_dir,
+            solver=solver,
+            audit_no_leakage=audit_no_leakage,
+            val_loader=val_loader,
+        )
     else:
         runner(seed, device, train_loader, test_loader, results_dir)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run MNIST benchmark: all methods x all seeds"
-    )
+    parser = argparse.ArgumentParser(description="Run MNIST benchmark: all methods x all seeds")
     parser.add_argument(
-        "--methods", nargs="+",
+        "--methods",
+        nargs="+",
         default=["polystep", "cmaes", "openai_es", "spsa", "adam"],
         help="Methods to run (default: all)",
     )
     parser.add_argument(
-        "--seeds", nargs="+", type=int, default=SEEDS,
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=SEEDS,
         help="Seeds to run (default: 42 123 456 789 1337)",
     )
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
     parser.add_argument("--results-dir", default="experiments/results/softmax/main", help="Results directory")
     parser.add_argument("--data-dir", default="data", help="Data directory")
     parser.add_argument(
-        "--solver", choices=["softmax", "sinkhorn"], default="softmax",
+        "--solver",
+        choices=["softmax", "sinkhorn"],
+        default="softmax",
         help="Solver backend: softmax (default, used with subspace) or sinkhorn (full-space).",
     )
     parser.add_argument(
-        "--allow-test-leakage", action="store_true",
+        "--allow-test-leakage",
+        action="store_true",
         help=(
             "Legacy mode: select best_state_dict on the test set instead "
             "of a held-out validation slice. Default is honest protocol "
@@ -545,21 +545,25 @@ def main():
 
     for method in args.methods:
         for seed in args.seeds:
-            output_file = os.path.join(
-                args.results_dir, f"{BENCHMARK}_{method}_{seed}.json"
-            )
+            output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{method}_{seed}.json")
             if os.path.exists(output_file):
                 print(f"Skipping {method} seed={seed} (result exists)")
                 continue
             print(f"Running {method} seed={seed}...")
             try:
                 run_method(
-                    method, seed, args.device, args.results_dir, args.data_dir,
-                    solver=args.solver, audit_no_leakage=not args.allow_test_leakage,
+                    method,
+                    seed,
+                    args.device,
+                    args.results_dir,
+                    args.data_dir,
+                    solver=args.solver,
+                    audit_no_leakage=not args.allow_test_leakage,
                 )
             except Exception as e:
                 print(f"  ERROR: {method} seed={seed} failed: {e}")
                 import traceback
+
                 traceback.print_exc()
             finally:
                 gc.collect()

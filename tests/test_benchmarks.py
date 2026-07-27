@@ -10,32 +10,7 @@ import pytest
 import torch
 
 from polystep import PolyStep, LinearEpsilon
-from polystep.objectives import Ackley, Rosenbrock, Rastrigin, ObjectiveFn
-
-
-class Sphere(ObjectiveFn):
-    """Sphere function: f(x) = sum(x_i^2). Global minimum at origin."""
-
-    def __init__(self, dim: int = 2):
-        bounds = torch.tensor([[-5.0, 5.0]] * dim)
-        optimizers = torch.zeros(1, dim)
-        super().__init__(
-            dim=dim,
-            bounds=bounds,
-            optimizers=optimizers,
-            optimal_value=0.0,
-        )
-
-    def evaluate(self, X: torch.Tensor) -> torch.Tensor:
-        return torch.sum(X**2, dim=-1)
-
-
-ALL_OBJECTIVES = [
-    ("ackley", Ackley(dim=2)),
-    ("rosenbrock", Rosenbrock(dim=2)),
-    ("rastrigin", Rastrigin(dim=2)),
-    ("sphere", Sphere(dim=2)),
-]
+from polystep.objectives import Ackley, Rosenbrock, Rastrigin, Sphere
 
 
 def _run_benchmark(
@@ -92,40 +67,24 @@ class TestSyntheticBenchmarks:
         ids=["ackley-2d", "rastrigin-2d", "sphere-2d", "rosenbrock-2d", "ackley-10d"],
     )
     def test_convergence(self, objective, dim, run_kwargs, optimum, dist_factor):
-        """Cost decreases and particles move toward the optimum across objectives."""
+        """Cost decreases, particles move toward the optimum, and no state goes non-finite."""
         state, X_init = _run_benchmark(objective, dim=dim, **run_kwargs)
 
         assert state.costs[-1] < state.costs[0], f"cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
 
         assert torch.isfinite(state.X).all(), "NaN/Inf in final particles"
+        assert all(math.isfinite(c) for c in state.costs), f"non-finite cost in {state.costs}"
+        assert all(math.isfinite(d) for d in state.displacement_sqnorms), "non-finite displacement"
+        if state.f is not None:
+            assert torch.isfinite(state.f).all(), "NaN/Inf in dual potential f"
+        if state.g is not None:
+            assert torch.isfinite(state.g).all(), "NaN/Inf in dual potential g"
 
         init_dist = torch.norm(X_init - optimum, dim=-1).mean().item()
         final_dist = torch.norm(state.X - optimum, dim=-1).mean().item()
         assert final_dist < init_dist * dist_factor, (
             f"particles did not converge: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
-
-    @pytest.mark.parametrize("name,objective", ALL_OBJECTIVES, ids=[n for n, _ in ALL_OBJECTIVES])
-    def test_all_objectives_no_nan(self, name, objective):
-        """No NaN or Inf in solver state across all benchmark runs."""
-        state, _ = _run_benchmark(objective, dim=2, max_iters=30)
-
-        # Check particles
-        assert torch.isfinite(state.X).all(), f"{name}: NaN/Inf in final particles"
-
-        # Check costs
-        for i, c in enumerate(state.costs):
-            assert math.isfinite(c), f"{name}: non-finite cost at iteration {i}: {c}"
-
-        # Check displacement norms
-        for i, d in enumerate(state.displacement_sqnorms):
-            assert math.isfinite(d), f"{name}: non-finite displacement at iteration {i}: {d}"
-
-        # Check dual potentials if present
-        if state.f is not None:
-            assert torch.isfinite(state.f).all(), f"{name}: NaN/Inf in dual potential f"
-        if state.g is not None:
-            assert torch.isfinite(state.g).all(), f"{name}: NaN/Inf in dual potential g"
 
     def test_epsilon_schedule_synthetic(self):
         """LinearEpsilon schedule with Sphere: solver completes and converges."""

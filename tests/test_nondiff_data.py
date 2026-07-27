@@ -19,7 +19,7 @@ class TestGenerateMaxsatInstance:
         "key, expected_dtype",
         [("clause_vars", torch.long), ("clause_signs", torch.float)],
     )
-    def test_clause_vars_shape_and_dtype(self, key, expected_dtype):
+    def test_clause_vars_shape_and_dtype(self, key, expected_dtype, require_experiments):
         pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
@@ -27,7 +27,7 @@ class TestGenerateMaxsatInstance:
         assert result[key].shape == (86, 3)
         assert result[key].dtype == expected_dtype
 
-    def test_clause_vars_in_valid_range(self):
+    def test_clause_vars_in_valid_range(self, require_experiments):
         pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
@@ -35,7 +35,7 @@ class TestGenerateMaxsatInstance:
         assert result["clause_vars"].min().item() >= 0
         assert result["clause_vars"].max().item() <= 19  # 0-indexed
 
-    def test_clause_signs_binary_values(self):
+    def test_clause_signs_binary_values(self, require_experiments):
         pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
@@ -44,7 +44,7 @@ class TestGenerateMaxsatInstance:
         for v in unique_vals:
             assert v in [0.0, 1.0]
 
-    def test_reproducible_with_same_seed(self):
+    def test_reproducible_with_same_seed(self, require_experiments):
         pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
@@ -53,7 +53,7 @@ class TestGenerateMaxsatInstance:
         assert torch.equal(r1["clause_vars"], r2["clause_vars"])
         assert torch.equal(r1["clause_signs"], r2["clause_signs"])
 
-    def test_critical_ratio_default(self):
+    def test_critical_ratio_default(self, require_experiments):
         """generate_maxsat_instance with default ratio (alpha~4.27) generates valid instance."""
         pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
@@ -64,7 +64,7 @@ class TestGenerateMaxsatInstance:
         assert result["num_clauses"] == expected_clauses
         assert result["clause_vars"].shape == (expected_clauses, 3)
 
-    def test_returns_cnf_object(self):
+    def test_returns_cnf_object(self, require_experiments):
         pytest.importorskip("pysat", reason="python-sat not installed")
         from experiments.runners.nondiff_data import generate_maxsat_instance
 
@@ -77,14 +77,14 @@ class TestGenerateMaxsatInstance:
 class TestGenerateSortingData:
     """Tests for generate_sorting_data."""
 
-    def test_returns_correct_shapes(self):
+    def test_returns_correct_shapes(self, require_experiments):
         from experiments.runners.nondiff_data import generate_sorting_data
 
         sequences, permutations = generate_sorting_data(N=10, num_samples=50)
         assert sequences.shape == (50, 10)
         assert permutations.shape == (50, 10)
 
-    def test_permutations_are_valid(self):
+    def test_permutations_are_valid(self, require_experiments):
         """Each row should be a permutation of 0..N-1."""
         from experiments.runners.nondiff_data import generate_sorting_data
 
@@ -93,7 +93,7 @@ class TestGenerateSortingData:
             perm = permutations[i]
             assert set(perm.tolist()) == set(range(10))
 
-    def test_permutations_correctly_sort(self):
+    def test_permutations_correctly_sort(self, require_experiments):
         """Gathering sequences with permutations should yield sorted sequences."""
         from experiments.runners.nondiff_data import generate_sorting_data
 
@@ -103,7 +103,7 @@ class TestGenerateSortingData:
             row = sorted_seqs[i]
             assert torch.all(row[:-1] <= row[1:]).item(), f"Row {i} not sorted"
 
-    def test_reproducible_with_same_seed(self):
+    def test_reproducible_with_same_seed(self, require_experiments):
         from experiments.runners.nondiff_data import generate_sorting_data
 
         s1, p1 = generate_sorting_data(N=10, num_samples=50, seed=42)
@@ -115,7 +115,7 @@ class TestGenerateSortingData:
 class TestGenerateMultidomainData:
     """Tests for generate_multidomain_data."""
 
-    def test_returns_dict_with_required_keys(self):
+    def test_returns_dict_with_required_keys(self, require_experiments):
         pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data
 
@@ -125,7 +125,7 @@ class TestGenerateMultidomainData:
         assert "test_loader" in result
         assert "num_classes" in result
 
-    def test_labels_range_0_to_19(self):
+    def test_labels_range_0_to_19(self, require_experiments):
         """Labels should span MNIST 0-9 and Fashion-MNIST 10-19."""
         pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data
@@ -144,7 +144,7 @@ class TestGenerateMultidomainData:
         assert max_label >= 10, "Expected Fashion-MNIST labels (10-19)"
         assert min_label <= 9, "Expected MNIST labels (0-9)"
 
-    def test_image_shape(self):
+    def test_image_shape(self, require_experiments):
         """Each batch should have shape (batch, 1, 28, 28)."""
         pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data

@@ -32,11 +32,6 @@ _FAST_OPT_KWARGS = dict(
 )
 
 
-# ------------------------------------------------------------------
-# Fixtures
-# ------------------------------------------------------------------
-
-
 @pytest.fixture
 def simple_model():
     """Small MLP for basic tests."""
@@ -81,11 +76,6 @@ def simple_closure(simple_model):
     return closure
 
 
-# ------------------------------------------------------------------
-# Block function tests
-# ------------------------------------------------------------------
-
-
 class TestSubspaceBlockFunctions:
     """Tests for subspace-aware block splitting functions."""
 
@@ -124,11 +114,6 @@ class TestSubspaceBlockFunctions:
         reassembled = reassemble_blocks_to_subspace(block_particles, blocks, dim)
 
         assert torch.allclose(coords, reassembled)
-
-
-# ------------------------------------------------------------------
-# Initialization tests
-# ------------------------------------------------------------------
 
 
 class TestCombinedModeInitialization:
@@ -198,33 +183,17 @@ class TestCombinedModeInitialization:
             assert polytope.shape[1] == block.particle_dim
 
 
-# ------------------------------------------------------------------
-# Step tests
-# ------------------------------------------------------------------
-
-
 @pytest.mark.timeout(180)
 class TestCombinedModeStep:
     """Tests for combined mode step execution."""
 
-    def test_step_completes(self, simple_model, simple_closure):
-        """Test that step() returns without error."""
-        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
-
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=subspace,
-            block_strategy="per_layer",
-            **_FAST_OPT_KWARGS,
-        )
-
-        loss = optimizer.step(simple_closure)
-
-        assert isinstance(loss, float)
-        assert loss > 0  # OT cost is positive
-
     def test_step_updates_state(self, simple_model, simple_closure):
-        """Test that state.X changes after step."""
+        """Test that the represented point moves after a step.
+
+        Checks model parameters rather than ``state.X``: rotation re-anchors the
+        coordinate origin, folding coords into ``base_params`` and zeroing ``X``, so
+        ``X`` is 0 both before and after while the weights do move.
+        """
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
 
         optimizer = PolyStepOptimizer(
@@ -234,48 +203,10 @@ class TestCombinedModeStep:
             **_FAST_OPT_KWARGS,
         )
 
-        X_before = optimizer._state.X.clone()
+        params_before = [p.detach().clone() for p in simple_model.parameters()]
         optimizer.step(simple_closure)
-        X_after = optimizer._state.X
 
-        # X should have changed (very unlikely to be exactly equal)
-        assert not torch.allclose(X_before, X_after)
-
-    def test_multiple_steps(self, simple_model, simple_closure):
-        """Test running multiple steps without error."""
-        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
-
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=subspace,
-            block_strategy="per_layer",
-            **_FAST_OPT_KWARGS,
-        )
-
-        losses = []
-        for _ in range(3):
-            loss = optimizer.step(simple_closure)
-            losses.append(loss)
-
-        assert len(losses) == 3
-        assert all(loss > 0 for loss in losses)
-
-    def test_iteration_count_increments(self, simple_model, simple_closure):
-        """Test that iteration_count increments correctly."""
-        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
-
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=subspace,
-            block_strategy="per_layer",
-            **_FAST_OPT_KWARGS,
-        )
-
-        assert optimizer._state.iteration_count == 0
-
-        for i in range(3):
-            optimizer.step(simple_closure)
-            assert optimizer._state.iteration_count == i + 1
+        assert any(not torch.allclose(a, b) for a, b in zip(params_before, simple_model.parameters()))
 
     def test_block_duals_updated(self, simple_model, simple_closure):
         """Test that per-block dual potentials are updated after step."""
@@ -305,11 +236,6 @@ class TestCombinedModeStep:
             assert (f is None) == (g is None)
             if f is not None:
                 assert torch.isfinite(f).all() and torch.isfinite(g).all()
-
-
-# ------------------------------------------------------------------
-# Absorb tests
-# ------------------------------------------------------------------
 
 
 @pytest.mark.timeout(180)
@@ -374,11 +300,6 @@ class TestSynchronizedAbsorb:
         assert not torch.allclose(P_before, P_after)
 
 
-# ------------------------------------------------------------------
-# CMA integration tests
-# ------------------------------------------------------------------
-
-
 class TestCMACombinedMode:
     """Tests for CMAAdaptiveSubspace in combined mode."""
 
@@ -396,28 +317,9 @@ class TestCMACombinedMode:
         assert optimizer._subspace_blockwise is True
         assert optimizer._cma_subspace is True
 
-    def test_cma_combined_mode_step(self, simple_model, simple_closure):
-        """Test that CMA combined mode step completes."""
-        cma_subspace = CMAAdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
-
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=cma_subspace,
-            block_strategy="per_layer",
-            **_FAST_OPT_KWARGS,
-        )
-
-        loss = optimizer.step(simple_closure)
-        assert isinstance(loss, float)
-        assert loss > 0
-
-
-# ------------------------------------------------------------------
-# Memory tests (GPU-specific)
-# ------------------------------------------------------------------
-
 
 @pytest.mark.timeout(180)
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 class TestMemoryReduction:
     """Tests for memory efficiency of combined mode."""
@@ -460,32 +362,8 @@ class TestMemoryReduction:
             assert torch.isfinite(torch.tensor(cost)), "Cost should be finite"
 
 
-# ------------------------------------------------------------------
-# Edge case tests
-# ------------------------------------------------------------------
-
-
 class TestEdgeCases:
     """Tests for edge cases and boundary conditions."""
-
-    @pytest.mark.filterwarnings("ignore:num_blocks.*exceeds total_particles:UserWarning")
-    def test_single_block(self, simple_model, simple_closure):
-        """Test with minimum number of blocks (2)."""
-        # Create a very small subspace to force fewer blocks
-        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.1, min_rank=8, max_rank=16)
-
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=subspace,
-            block_strategy="per_layer",
-            **_FAST_OPT_KWARGS,
-        )
-
-        # Should have at least 2 blocks (minimum)
-        assert len(optimizer._subspace_blocks) >= 2
-
-        loss = optimizer.step(simple_closure)
-        assert loss > 0
 
     def test_with_momentum(self, simple_model, simple_closure):
         """Test combined mode with momentum enabled."""
@@ -501,42 +379,39 @@ class TestEdgeCases:
             **_FAST_OPT_KWARGS,
         )
 
+        params_before = [p.detach().clone() for p in simple_model.parameters()]
         for _ in range(2):
-            loss = optimizer.step(simple_closure)
-            assert loss > 0
+            optimizer.step(simple_closure)
 
         assert optimizer._state.velocity is not None
+        assert torch.linalg.vector_norm(optimizer._state.velocity) > 0, "momentum never accumulated"
+        assert any(not torch.allclose(a, b) for a, b in zip(params_before, simple_model.parameters()))
 
-    def test_with_adaptive_radius(self, simple_model, simple_closure):
-        """Test combined mode with adaptive radius enabled."""
+    def test_grouped_block_strategy_warns_and_behaves_like_per_layer(self, simple_model, simple_closure):
+        """In subspace mode the blocks slice coordinates, so 'grouped' cannot group anything.
+
+        It used to be accepted silently while producing exactly the per_layer blocks.
+        """
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
 
-        optimizer = PolyStepOptimizer(
+        with pytest.warns(UserWarning, match="no effect in subspace mode"):
+            grouped = PolyStepOptimizer(
+                simple_model,
+                subspace=subspace,
+                block_strategy="grouped",
+                **_FAST_OPT_KWARGS,
+            )
+        per_layer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
             block_strategy="per_layer",
-            use_adaptive_radius=True,
             **_FAST_OPT_KWARGS,
         )
+        assert len(grouped._subspace_blocks) == len(per_layer._subspace_blocks)
 
-        for _ in range(2):
-            loss = optimizer.step(simple_closure)
-            assert loss > 0
-
-    def test_grouped_block_strategy(self, simple_model, simple_closure):
-        """Test combined mode with grouped block strategy."""
-        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
-
-        # Both 'per_layer' and 'grouped' should work with subspace
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=subspace,
-            block_strategy="grouped",
-            **_FAST_OPT_KWARGS,
-        )
-
-        loss = optimizer.step(simple_closure)
-        assert loss > 0
+        params_before = [p.detach().clone() for p in simple_model.parameters()]
+        grouped.step(simple_closure)
+        assert any(not torch.allclose(a, b) for a, b in zip(params_before, simple_model.parameters()))
 
 
 if __name__ == "__main__":

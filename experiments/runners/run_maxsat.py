@@ -36,9 +36,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 # Ensure repo root is on path
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
 import torch
@@ -52,10 +50,6 @@ from experiments.runners.common import (
 from experiments.runners.nondiff_data import generate_maxsat_instance
 from experiments.runners.nondiff_models import MaxSATModel
 
-
-# ---------------------------------------------------------------------------
-# Benchmark constants
-# ---------------------------------------------------------------------------
 
 BENCHMARK = "maxsat"
 VARIABLE_SIZES = [100, 500, 1000, 5000, 20000, 100000, 1000000]
@@ -83,6 +77,7 @@ PSTORCH_CONFIG = {
 def get_polystep_config(num_vars: int) -> dict:
     """Return size-dependent polystep config using sqrt-scaling from 100K reference."""
     import math
+
     ref = PSTORCH_CONFIG
     scale = math.sqrt(num_vars / 100_000)
     return {
@@ -100,6 +95,7 @@ def get_polystep_config(num_vars: int) -> dict:
         "momentum_init": ref["momentum_init"],
         "momentum_final": ref["momentum_final"],
     }
+
 
 # 1M+ extension: delta evaluation with inverted index.
 # At 1M vars, full closure eval is too expensive (4.5 min/step). Delta evaluation
@@ -152,11 +148,6 @@ SLS_MAX_FLIPS = 100000
 SLS_MAX_FLIPS_1M = 50000  # Reduced from 500K so SLS at 1M completes in reasonable time
 
 
-# ---------------------------------------------------------------------------
-# Counting closure wrapper
-# ---------------------------------------------------------------------------
-
-
 class CountingClosure:
     """Wraps a closure and counts total evaluations (sum of batch dim N)."""
 
@@ -173,13 +164,9 @@ class CountingClosure:
         self.count = 0
 
 
-# ---------------------------------------------------------------------------
-# Helper: make_sat_closure for polystep
-# ---------------------------------------------------------------------------
-
-
-def make_sat_closure(clause_vars, clause_signs, cra_lambda=0.0, cra_alpha=2,
-                     clause_sample_size=0, model=None, particle_dim=2):
+def make_sat_closure(
+    clause_vars, clause_signs, cra_lambda=0.0, cra_alpha=2, clause_sample_size=0, model=None, particle_dim=2
+):
     """Create polystep-compatible closure for MAX-SAT optimization.
 
     Args:
@@ -225,16 +212,14 @@ def make_sat_closure(clause_vars, clause_signs, cra_lambda=0.0, cra_alpha=2,
     # Mutable state
     state = {}
     if use_sampling and not use_delta:
-        idx = torch.randint(total_clauses, (clause_sample_size,),
-                            device=clause_vars.device)
+        idx = torch.randint(total_clauses, (clause_sample_size,), device=clause_vars.device)
         state["cv"] = clause_vars[idx]
         state["cs"] = clause_signs[idx]
 
     def resample():
         """Refresh clause sample and/or cache base for delta evaluation."""
         if use_sampling and not use_delta:
-            idx = torch.randint(total_clauses, (clause_sample_size,),
-                                device=clause_vars.device)
+            idx = torch.randint(total_clauses, (clause_sample_size,), device=clause_vars.device)
             state["cv"] = clause_vars[idx]
             state["cs"] = clause_signs[idx]
 
@@ -250,9 +235,7 @@ def make_sat_closure(clause_vars, clause_signs, cra_lambda=0.0, cra_alpha=2,
                 state["base_clause_sat"] = (lits > 0.5).any(dim=-1)  # (C,) bool
                 state["base_sat_count"] = state["base_clause_sat"].float().sum().item()
                 if cra_lambda > 0:
-                    state["base_cra"] = (
-                        1.0 - (2.0 * base_soft - 1.0) ** cra_alpha
-                    ).sum().item()
+                    state["base_cra"] = (1.0 - (2.0 * base_soft - 1.0) ** cra_alpha).sum().item()
 
     def _full_evaluate(assignments):
         """Full evaluation - used when delta is not available."""
@@ -350,11 +333,6 @@ def make_sat_closure(clause_vars, clause_signs, cra_lambda=0.0, cra_alpha=2,
     return closure
 
 
-# ---------------------------------------------------------------------------
-# Helper: evaluate_sat_result
-# ---------------------------------------------------------------------------
-
-
 def evaluate_sat_result(model, clause_vars, clause_signs):
     """Evaluate hard satisfaction ratio for MaxSATModel.
 
@@ -380,11 +358,6 @@ def evaluate_sat_result(model, clause_vars, clause_signs):
         "num_satisfied": num_satisfied,
         "num_clauses": num_clauses,
     }
-
-
-# ---------------------------------------------------------------------------
-# Method: polystep
-# ---------------------------------------------------------------------------
 
 
 def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=None):
@@ -419,9 +392,19 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # Build CosineEpsilon schedules for epsilon, step_radius, probe_radius
-    eps = CosineEpsilon(cfg["epsilon_init"], cfg["epsilon_target"]) if "epsilon_init" in cfg else cfg.get("epsilon", 3.0)
-    sr = CosineEpsilon(cfg["step_radius_init"], cfg["step_radius_target"]) if "step_radius_init" in cfg else cfg.get("step_radius", 500.0)
-    pr = CosineEpsilon(cfg["probe_radius_init"], cfg["probe_radius_target"]) if "probe_radius_init" in cfg else cfg.get("probe_radius", 50.0)
+    eps = (
+        CosineEpsilon(cfg["epsilon_init"], cfg["epsilon_target"]) if "epsilon_init" in cfg else cfg.get("epsilon", 3.0)
+    )
+    sr = (
+        CosineEpsilon(cfg["step_radius_init"], cfg["step_radius_target"])
+        if "step_radius_init" in cfg
+        else cfg.get("step_radius", 500.0)
+    )
+    pr = (
+        CosineEpsilon(cfg["probe_radius_init"], cfg["probe_radius_target"])
+        if "probe_radius_init" in cfg
+        else cfg.get("probe_radius", 50.0)
+    )
     pdim = cfg.get("particle_dim", 2)
 
     optimizer = PolyStepOptimizer(
@@ -446,7 +429,10 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
     # Clause sampling for 1M+: evaluate random clause subset -> 43x compute reduction
     clause_sample = cfg.get("clause_sample_size", 0) if turbo else 0
     base_closure = make_sat_closure(
-        clause_vars, clause_signs, cra_lambda=cra_lambda, cra_alpha=CRA_ALPHA,
+        clause_vars,
+        clause_signs,
+        cra_lambda=cra_lambda,
+        cra_alpha=CRA_ALPHA,
         clause_sample_size=clause_sample,
         model=model if turbo else None,
         particle_dim=pdim,
@@ -459,7 +445,7 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
     start_time = time.time()
 
     # Resample clause subset each step for noise-free relative comparisons
-    has_resample = hasattr(base_closure, 'resample')
+    has_resample = hasattr(base_closure, "resample")
 
     with track_gpu_memory() as mem:
         for step in range(steps):
@@ -471,15 +457,17 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
             if (step + 1) % 20 == 0:
                 result_20 = evaluate_sat_result(model, clause_vars, clause_signs)
                 best_sat_ratio = max(best_sat_ratio, result_20["sat_ratio"])
-                fine_step_logs.append({
-                    "step": step + 1,
-                    "sat_ratio": result_20["sat_ratio"],
-                    "num_satisfied": result_20["num_satisfied"],
-                    "num_unsatisfied": result_20["num_clauses"] - result_20["num_satisfied"],
-                    "num_clauses": result_20["num_clauses"],
-                    "loss": 1.0 - result_20["sat_ratio"],
-                    "wall_time": time.time() - start_time,
-                })
+                fine_step_logs.append(
+                    {
+                        "step": step + 1,
+                        "sat_ratio": result_20["sat_ratio"],
+                        "num_satisfied": result_20["num_satisfied"],
+                        "num_unsatisfied": result_20["num_clauses"] - result_20["num_satisfied"],
+                        "num_clauses": result_20["num_clauses"],
+                        "loss": 1.0 - result_20["sat_ratio"],
+                        "wall_time": time.time() - start_time,
+                    }
+                )
 
             # Evaluate periodically (coarse epoch-level logging)
             if (step + 1) % max(1, steps // 10) == 0 or step == steps - 1:
@@ -500,8 +488,8 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
                 )
                 if (step + 1) % max(1, steps // 5) == 0:
                     print(
-                        f"      step {step+1}/{steps} | "
-                        f"sat={result['sat_ratio']*100:.1f}% "
+                        f"      step {step + 1}/{steps} | "
+                        f"sat={result['sat_ratio'] * 100:.1f}% "
                         f"({result['num_satisfied']}/{result['num_clauses']}, "
                         f"unsat={unsat}) | "
                         f"evals={counter.count}"
@@ -540,11 +528,6 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
     return counter.count
 
 
-# ---------------------------------------------------------------------------
-# Method: CMA-ES (pycma)
-# ---------------------------------------------------------------------------
-
-
 def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
     """Train MAX-SAT with CMA-ES (pycma) using same sigmoid+CRA encoding.
 
@@ -568,9 +551,7 @@ def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
 
     def eval_batch(solutions_list):
         """Batch-evaluate popsize solutions on GPU (list of np arrays -> list of costs)."""
-        x = torch.from_numpy(np.stack(solutions_list)).to(
-            device=eval_device, dtype=torch.float32
-        )  # (P, N)
+        x = torch.from_numpy(np.stack(solutions_list)).to(device=eval_device, dtype=torch.float32)  # (P, N)
         soft = torch.sigmoid(x)
         hard = torch.round(soft)
         gathered = hard[:, clause_vars]  # (P, C, 3)
@@ -615,12 +596,8 @@ def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
             # Evaluate best so far periodically
             if gen % max(1, max_iter // 10) == 0 or es.stop():
                 model_tmp = MaxSATModel(num_vars)
-                model_tmp.assignments.data = torch.tensor(
-                    es.result.xbest, dtype=torch.float32
-                )
-                result = evaluate_sat_result(
-                    model_tmp, instance["clause_vars"], instance["clause_signs"]
-                )
+                model_tmp.assignments.data = torch.tensor(es.result.xbest, dtype=torch.float32)
+                result = evaluate_sat_result(model_tmp, instance["clause_vars"], instance["clause_signs"])
                 best_sat_ratio = max(best_sat_ratio, result["sat_ratio"])
                 elapsed = time.time() - start_time
                 step_logs.append(
@@ -636,12 +613,8 @@ def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
 
     # Final evaluation
     model_final = MaxSATModel(num_vars)
-    model_final.assignments.data = torch.tensor(
-        es.result.xbest, dtype=torch.float32
-    )
-    final_result = evaluate_sat_result(
-        model_final, instance["clause_vars"], instance["clause_signs"]
-    )
+    model_final.assignments.data = torch.tensor(es.result.xbest, dtype=torch.float32)
+    final_result = evaluate_sat_result(model_final, instance["clause_vars"], instance["clause_signs"])
     best_sat_ratio = max(best_sat_ratio, final_result["sat_ratio"])
 
     filepath = save_result(
@@ -671,11 +644,6 @@ def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
         results_dir=results_dir,
     )
     print(f"      Saved: {filepath}")
-
-
-# ---------------------------------------------------------------------------
-# Method: OpenAI-ES
-# ---------------------------------------------------------------------------
 
 
 def run_openai_es(num_vars, instance, seed, device, max_evals, results_dir):
@@ -724,9 +692,7 @@ def run_openai_es(num_vars, instance, seed, device, max_evals, results_dir):
             # Evaluate clauses for all perturbations
             gathered = hard[:, clause_vars]  # (popsize, C, 3)
             signs_expanded = clause_signs.unsqueeze(0)  # (1, C, 3)
-            literals = gathered * signs_expanded + (1.0 - signs_expanded) * (
-                1.0 - gathered
-            )
+            literals = gathered * signs_expanded + (1.0 - signs_expanded) * (1.0 - gathered)
             satisfied = (literals > 0.5).any(dim=-1).float()  # (popsize, C)
             unsat_ratio = 1.0 - satisfied.mean(dim=-1)  # (popsize,)
             penalty = (1.0 - (2.0 * soft - 1.0) ** CRA_ALPHA).sum(dim=-1)
@@ -809,11 +775,6 @@ def run_openai_es(num_vars, instance, seed, device, max_evals, results_dir):
     print(f"      Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method: RC2 (exact MAX-SAT solver)
-# ---------------------------------------------------------------------------
-
-
 class _RC2Timeout(Exception):
     """Raised when RC2 exceeds timeout."""
 
@@ -887,7 +848,7 @@ def run_rc2(num_vars, instance, results_dir, timeout=None):
             proc.join(timeout=5)
         timed_out = True
     else:
-        # Process finished -- get result
+        # Process finished: get result
         try:
             result = result_queue.get_nowait()
             timed_out = result.get("timed_out", False)
@@ -924,11 +885,6 @@ def run_rc2(num_vars, instance, results_dir, timeout=None):
         results_dir=results_dir,
     )
     print(f"      Saved: {filepath} (timed_out={timed_out})")
-
-
-# ---------------------------------------------------------------------------
-# Method: SLS (WalkSAT-style stochastic local search)
-# ---------------------------------------------------------------------------
 
 
 def run_sls(num_vars, instance, results_dir, max_flips=None):
@@ -1041,13 +997,10 @@ def run_sls(num_vars, instance, results_dir, max_flips=None):
     print(f"      Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method: probSAT (production SLS - SAT competition solver)
-# ---------------------------------------------------------------------------
-
 PROBSAT_BINARY = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "scripts", "probsat",
+    "scripts",
+    "probsat",
 )
 
 # Default max flips for probSAT (much more generous than WalkSAT)
@@ -1085,11 +1038,10 @@ def run_probsat(num_vars, instance, results_dir, max_flips=None, timeout=None):
 
     if timeout is None:
         # Default timeout: read PolyStep's wall time for this size if available
-        polystep_ref = os.path.join(
-            results_dir, f"{BENCHMARK}_{num_vars}v_polystep_42.json"
-        )
+        polystep_ref = os.path.join(results_dir, f"{BENCHMARK}_{num_vars}v_polystep_42.json")
         if os.path.exists(polystep_ref):
             import json as _json
+
             try:
                 with open(polystep_ref) as _f:
                     _r = _json.load(_f)
@@ -1147,7 +1099,7 @@ def run_probsat(num_vars, instance, results_dir, max_flips=None, timeout=None):
                     if p == "0":
                         break
                     lit = int(p)
-                    assignment[abs(lit)] = (lit > 0)
+                    assignment[abs(lit)] = lit > 0
                 break
 
         if assignment:
@@ -1168,7 +1120,7 @@ def run_probsat(num_vars, instance, results_dir, max_flips=None, timeout=None):
             # Parse "best(N)" from comment lines - N is minimum unsat clauses
             best_unsat = num_clauses  # worst case
             for line in stdout.split("\n"):
-                m = re.search(r'best\(\s*(\d+)\)', line)
+                m = re.search(r"best\(\s*(\d+)\)", line)
                 if m:
                     unsat_val = int(m.group(1))
                     best_unsat = min(best_unsat, unsat_val)
@@ -1177,11 +1129,14 @@ def run_probsat(num_vars, instance, results_dir, max_flips=None, timeout=None):
     except subprocess.TimeoutExpired as e:
         timed_out = True
         # Still try to parse partial output
-        stdout = (e.stdout or b"").decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        stdout = (
+            (e.stdout or b"").decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        )
         import re
+
         best_unsat = num_clauses
         for line in stdout.split("\n"):
-            m = re.search(r'best\(\s*(\d+)\)', line)
+            m = re.search(r"best\(\s*(\d+)\)", line)
             if m:
                 unsat_val = int(m.group(1))
                 best_unsat = min(best_unsat, unsat_val)
@@ -1222,18 +1177,11 @@ def run_probsat(num_vars, instance, results_dir, max_flips=None, timeout=None):
         },
         results_dir=results_dir,
     )
-    print(f"      Saved: {filepath} (sat={sat_ratio*100:.1f}%, timed_out={timed_out})")
-
-
-# ---------------------------------------------------------------------------
-# Main execution
-# ---------------------------------------------------------------------------
+    print(f"      Saved: {filepath} (sat={sat_ratio * 100:.1f}%, timed_out={timed_out})")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run MAX-SAT benchmark: scaling variable counts x methods x seeds"
-    )
+    parser = argparse.ArgumentParser(description="Run MAX-SAT benchmark: scaling variable counts x methods x seeds")
     parser.add_argument(
         "--sizes",
         nargs="+",
@@ -1254,19 +1202,17 @@ def main():
         default=SEEDS,
         help="Seeds for optimizer methods (default: 42 123 456 789 1337)",
     )
-    parser.add_argument(
-        "--device", default="cuda", help="Device (default: cuda)"
-    )
-    parser.add_argument(
-        "--results-dir", default="experiments/results/softmax/main", help="Results directory"
-    )
+    parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
+    parser.add_argument("--results-dir", default="experiments/results/softmax/main", help="Results directory")
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run only 10 steps (polystep) / 100 evals (ES) for testing",
     )
     parser.add_argument(
-        "--solver", choices=["softmax", "sinkhorn"], default="softmax",
+        "--solver",
+        choices=["softmax", "sinkhorn"],
+        default="softmax",
         help="Solver backend (default: softmax, matching sweep config).",
     )
     args = parser.parse_args()
@@ -1286,13 +1232,8 @@ def main():
 
     for num_vars in args.sizes:
         print(f"=== {num_vars} variables ===")
-        instance = generate_maxsat_instance(
-            num_vars=num_vars, seed=INSTANCE_SEED
-        )
-        print(
-            f"  Instance: {instance['num_clauses']} clauses "
-            f"(ratio={instance['num_clauses']/num_vars:.2f})"
-        )
+        instance = generate_maxsat_instance(num_vars=num_vars, seed=INSTANCE_SEED)
+        print(f"  Instance: {instance['num_clauses']} clauses (ratio={instance['num_clauses'] / num_vars:.2f})")
 
         # Determine step/eval budgets
         steps = 10 if args.dry_run else STEP_BUDGETS.get(num_vars, 1000)
@@ -1311,14 +1252,20 @@ def main():
                 print(f"  Running polystep seed={seed} ({steps} steps)...")
                 try:
                     evals = run_polystep(
-                        num_vars, instance, seed, args.device, steps,
-                        args.results_dir, solver=args.solver,
+                        num_vars,
+                        instance,
+                        seed,
+                        args.device,
+                        steps,
+                        args.results_dir,
+                        solver=args.solver,
                     )
                     if polystep_evals is None:
                         polystep_evals = evals
                 except Exception as e:
                     print(f"    ERROR: polystep seed={seed} failed: {e}")
                     import traceback
+
                     traceback.print_exc()
                 finally:
                     gc.collect()
@@ -1333,11 +1280,11 @@ def main():
         # vertices * probes) via GPU parallelism, but step-matching is the
         # fairest comparison since each step represents one optimization update.
         es_popsize = CMAES_CONFIG["popsize"]
-        es_budget = (100 if args.dry_run
-                     else steps * es_popsize)
+        es_budget = 100 if args.dry_run else steps * es_popsize
         # Also track polystep eval count for reporting
         if polystep_evals is None:
             import json as _json
+
             polystep_ref = os.path.join(
                 args.results_dir,
                 f"{BENCHMARK}_{num_vars}v_polystep_42.json",
@@ -1351,7 +1298,7 @@ def main():
                     pass
             if polystep_evals is None:
                 polystep_evals = steps * 12
-        print(f"  ES eval budget: {es_budget:,} ({es_budget//es_popsize} gens x pop{es_popsize})")
+        print(f"  ES eval budget: {es_budget:,} ({es_budget // es_popsize} gens x pop{es_popsize})")
 
         # Run CMA-ES with step-matched budget
         # Skip CMA-ES at >= 1M vars: impractical even with GPU batch eval
@@ -1368,18 +1315,20 @@ def main():
                 if os.path.exists(output_file):
                     print(f"  Skipping cmaes seed={seed} (result exists)")
                     continue
-                print(
-                    f"  Running cmaes seed={seed} "
-                    f"(budget={max_evals} evals)..."
-                )
+                print(f"  Running cmaes seed={seed} (budget={max_evals} evals)...")
                 try:
                     run_cmaes(
-                        num_vars, instance, seed, args.device, max_evals,
+                        num_vars,
+                        instance,
+                        seed,
+                        args.device,
+                        max_evals,
                         args.results_dir,
                     )
                 except Exception as e:
                     print(f"    ERROR: cmaes seed={seed} failed: {e}")
                     import traceback
+
                     traceback.print_exc()
                 finally:
                     gc.collect()
@@ -1397,18 +1346,20 @@ def main():
                 if os.path.exists(output_file):
                     print(f"  Skipping openai_es seed={seed} (result exists)")
                     continue
-                print(
-                    f"  Running openai_es seed={seed} "
-                    f"(budget={max_evals} evals)..."
-                )
+                print(f"  Running openai_es seed={seed} (budget={max_evals} evals)...")
                 try:
                     run_openai_es(
-                        num_vars, instance, seed, args.device, max_evals,
+                        num_vars,
+                        instance,
+                        seed,
+                        args.device,
+                        max_evals,
                         args.results_dir,
                     )
                 except Exception as e:
                     print(f"    ERROR: openai_es seed={seed} failed: {e}")
                     import traceback
+
                     traceback.print_exc()
                 finally:
                     gc.collect()
@@ -1421,9 +1372,7 @@ def main():
             if num_vars >= 1000000:
                 print("  Skipping rc2 at 1M+ vars (guaranteed timeout)")
             else:
-                output_file = os.path.join(
-                    args.results_dir, f"{BENCHMARK}_{num_vars}v_rc2_0.json"
-                )
+                output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{num_vars}v_rc2_0.json")
                 if os.path.exists(output_file):
                     print("  Skipping rc2 (result exists)")
                 else:
@@ -1436,15 +1385,11 @@ def main():
 
         # Run SLS reference (deterministic)
         if "sls" in args.methods:
-            output_file = os.path.join(
-                args.results_dir, f"{BENCHMARK}_{num_vars}v_sls_0.json"
-            )
+            output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{num_vars}v_sls_0.json")
             if os.path.exists(output_file):
                 print("  Skipping sls (result exists)")
             else:
-                flips = (1000 if args.dry_run
-                         else SLS_MAX_FLIPS_1M if num_vars >= 1000000
-                         else SLS_MAX_FLIPS)
+                flips = 1000 if args.dry_run else SLS_MAX_FLIPS_1M if num_vars >= 1000000 else SLS_MAX_FLIPS
                 print(f"  Running sls (max_flips={flips})...")
                 try:
                     run_sls(num_vars, instance, args.results_dir, max_flips=flips)
@@ -1453,15 +1398,11 @@ def main():
 
         # Run probSAT reference (production SLS)
         if "probsat" in args.methods:
-            output_file = os.path.join(
-                args.results_dir, f"{BENCHMARK}_{num_vars}v_probsat_0.json"
-            )
+            output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{num_vars}v_probsat_0.json")
             if os.path.exists(output_file):
                 print("  Skipping probsat (result exists)")
             else:
-                flips = (10000 if args.dry_run
-                         else PROBSAT_MAX_FLIPS_1M if num_vars >= 1000000
-                         else PROBSAT_MAX_FLIPS)
+                flips = 10000 if args.dry_run else PROBSAT_MAX_FLIPS_1M if num_vars >= 1000000 else PROBSAT_MAX_FLIPS
                 print(f"  Running probsat (max_flips={flips}, runs={PROBSAT_RUNS})...")
                 try:
                     run_probsat(num_vars, instance, args.results_dir, max_flips=flips)

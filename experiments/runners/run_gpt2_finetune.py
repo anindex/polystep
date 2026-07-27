@@ -52,21 +52,17 @@ from experiments.runners.common import (
 from polystep.layers import VmapSafeMultiHeadAttention
 
 
-# ---------------------------------------------------------------------------
-# GPT-2 Fine-Tuning Configuration
-# ---------------------------------------------------------------------------
-
 BENCHMARK = "gpt2_finetune"
 
 GPT2_FINETUNE_CONFIG = {
-    "vocab_size": 50257,      # BPE vocabulary
-    "max_seq_len": 128,       # Reduced from 1024 for memory efficiency
-    "embed_dim": 768,         # d_model
-    "num_heads": 12,          # 64 per head
-    "num_layers": 12,         # Transformer blocks
-    "ff_dim": 3072,           # 4x expansion
-    "dropout": 0.0,           # Disable for vmap compatibility
-    "num_classes": 2,         # SST-2 binary sentiment classification
+    "vocab_size": 50257,  # BPE vocabulary
+    "max_seq_len": 128,  # Reduced from 1024 for memory efficiency
+    "embed_dim": 768,  # d_model
+    "num_heads": 12,  # 64 per head
+    "num_layers": 12,  # Transformer blocks
+    "ff_dim": 3072,  # 4x expansion
+    "dropout": 0.0,  # Disable for vmap compatibility
+    "num_classes": 2,  # SST-2 binary sentiment classification
 }
 
 PSTORCH_CONFIG = {
@@ -86,7 +82,7 @@ ADAM_CONFIG = {
 
 NUM_STEPS = 100
 BATCH_SIZE = 8
-MAX_TRAIN = 5000       # Limit training samples for feasibility
+MAX_TRAIN = 5000  # Limit training samples for feasibility
 MAX_SEQ_LEN = 128
 
 # Head-only fine-tuning configs (train classifier head only, freeze backbone)
@@ -111,13 +107,9 @@ HEADONLY_ADAM_CONFIG = {
     "lr": 1e-3,
     "epochs": 3,
 }
-HEADONLY_EPOCHS = 50  # polystep epochs (not steps -- small param count allows epoch-based training)
+HEADONLY_EPOCHS = 50  # polystep epochs (not steps: small param count allows epoch-based training)
 HEADONLY_BENCHMARK = "gpt2_headonly"
 
-
-# ---------------------------------------------------------------------------
-# GPT-2 Small Model (modified from run_gpt2_feasibility.py for SST-2)
-# ---------------------------------------------------------------------------
 
 class GPT2TransformerBlock(nn.Module):
     """Single Transformer block with vmap-safe attention (GPT-2 style).
@@ -137,7 +129,7 @@ class GPT2TransformerBlock(nn.Module):
         self.attention = VmapSafeMultiHeadAttention(embed_dim, num_heads, dropout)
         self.ff = nn.Sequential(
             nn.Linear(embed_dim, ff_dim),
-            nn.GELU(approximate='tanh'),  # GPT-2 uses gelu_new (tanh approximation)
+            nn.GELU(approximate="tanh"),  # GPT-2 uses gelu_new (tanh approximation)
             nn.Linear(ff_dim, embed_dim),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
         )
@@ -155,7 +147,7 @@ class GPT2TransformerBlock(nn.Module):
         # Causal attention mask (GPT-2 is a causal language model)
         # Upper triangular of -inf prevents attending to future tokens
         causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=x.device, dtype=x.dtype),
+            torch.full((seq_len, seq_len), float("-inf"), device=x.device, dtype=x.dtype),
             diagonal=1,
         )
 
@@ -198,10 +190,9 @@ class GPT2Small(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.position_embedding = nn.Embedding(max_seq_len, embed_dim)
 
-        self.layers = nn.ModuleList([
-            GPT2TransformerBlock(embed_dim, num_heads, ff_dim, dropout)
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [GPT2TransformerBlock(embed_dim, num_heads, ff_dim, dropout) for _ in range(num_layers)]
+        )
 
         self.layer_norm = nn.LayerNorm(embed_dim)
         self.classifier = nn.Linear(embed_dim, num_classes)
@@ -215,10 +206,10 @@ class GPT2Small(nn.Module):
         device = input_ids.device
 
         if seq_len > self.max_seq_len:
-            input_ids = input_ids[:, :self.max_seq_len]
+            input_ids = input_ids[:, : self.max_seq_len]
             seq_len = self.max_seq_len
             if attention_mask is not None:
-                attention_mask = attention_mask[:, :self.max_seq_len]
+                attention_mask = attention_mask[:, : self.max_seq_len]
 
         positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
@@ -238,10 +229,6 @@ class GPT2Small(nn.Module):
         logits = self.classifier(x)
         return logits
 
-
-# ---------------------------------------------------------------------------
-# Weight Loading: HuggingFace GPT-2 -> Custom GPT2Small
-# ---------------------------------------------------------------------------
 
 def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
     """Load pretrained GPT-2 weights into custom GPT2Small model.
@@ -267,7 +254,7 @@ def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
 
     # Embeddings
     mapping["token_embedding.weight"] = hf_sd["wte.weight"]  # [50257, 768]
-    mapping["position_embedding.weight"] = hf_sd["wpe.weight"][:model.max_seq_len]  # truncate
+    mapping["position_embedding.weight"] = hf_sd["wpe.weight"][: model.max_seq_len]  # truncate
 
     # Final LayerNorm
     mapping["layer_norm.weight"] = hf_sd["ln_f.weight"]
@@ -279,9 +266,9 @@ def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
 
         # Fused QKV -> separate Q, K, V (split BEFORE transposing)
         c_attn_w = hf_sd[f"{pfx}.attn.c_attn.weight"]  # [768, 2304]
-        c_attn_b = hf_sd[f"{pfx}.attn.c_attn.bias"]    # [2304]
-        q_w, k_w, v_w = c_attn_w.split(768, dim=1)     # each [768, 768]
-        q_b, k_b, v_b = c_attn_b.split(768, dim=0)     # each [768]
+        c_attn_b = hf_sd[f"{pfx}.attn.c_attn.bias"]  # [2304]
+        q_w, k_w, v_w = c_attn_w.split(768, dim=1)  # each [768, 768]
+        q_b, k_b, v_b = c_attn_b.split(768, dim=0)  # each [768]
 
         mapping[f"{lpfx}.attention.W_q.weight"] = q_w.T
         mapping[f"{lpfx}.attention.W_q.bias"] = q_b
@@ -308,9 +295,7 @@ def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
 
     # Load with strict=False (classifier.weight/bias are randomly initialized for new task)
     missing, unexpected = model.load_state_dict(mapping, strict=False)
-    assert set(missing) == {"classifier.weight", "classifier.bias"}, (
-        f"Unexpected missing keys: {missing}"
-    )
+    assert set(missing) == {"classifier.weight", "classifier.bias"}, f"Unexpected missing keys: {missing}"
     assert len(unexpected) == 0, f"Unexpected keys: {unexpected}"
 
     # Free HF model memory
@@ -319,10 +304,6 @@ def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
 
     return mapping
 
-
-# ---------------------------------------------------------------------------
-# Forward Pass Verification
-# ---------------------------------------------------------------------------
 
 def verify_forward_pass(custom_model: GPT2Small, hf_model_name: str = "gpt2") -> float:
     """Verify weight loading by comparing hidden states with HuggingFace model.
@@ -371,10 +352,6 @@ def verify_forward_pass(custom_model: GPT2Small, hf_model_name: str = "gpt2") ->
     return max_diff
 
 
-# ---------------------------------------------------------------------------
-# SST-2 Data Loading with GPT-2 BPE Tokenizer
-# ---------------------------------------------------------------------------
-
 def get_sst2_gpt2_loaders(
     max_seq_len: int = 128,
     batch_size: int = 8,
@@ -397,7 +374,7 @@ def get_sst2_gpt2_loaders(
     from transformers import GPT2Tokenizer
     from datasets import load_dataset
 
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no pad token by default
 
     ds = load_dataset("glue", "sst2")
@@ -414,25 +391,25 @@ def get_sst2_gpt2_loaders(
         train_texts,
         max_length=max_seq_len,
         truncation=True,
-        padding='max_length',
-        return_tensors='pt',
+        padding="max_length",
+        return_tensors="pt",
     )
     val_enc = tokenizer(
         val_texts,
         max_length=max_seq_len,
         truncation=True,
-        padding='max_length',
-        return_tensors='pt',
+        padding="max_length",
+        return_tensors="pt",
     )
 
     train_ds = TensorDataset(
-        train_enc['input_ids'],
-        train_enc['attention_mask'],
+        train_enc["input_ids"],
+        train_enc["attention_mask"],
         torch.tensor(train_labels),
     )
     val_ds = TensorDataset(
-        val_enc['input_ids'],
-        val_enc['attention_mask'],
+        val_enc["input_ids"],
+        val_enc["attention_mask"],
         torch.tensor(val_labels),
     )
 
@@ -441,10 +418,6 @@ def get_sst2_gpt2_loaders(
 
     return train_loader, val_loader
 
-
-# ---------------------------------------------------------------------------
-# polystep Fine-Tuning Runner
-# ---------------------------------------------------------------------------
 
 def run_polystep(
     seed: int,
@@ -485,15 +458,17 @@ def run_polystep(
 
     # Create AdaptiveSubspace with sparse projection
     subspace = AdaptiveSubspace.auto_from_params(
-        model, compression_target=0.001, max_rank=subspace_dim,
+        model,
+        compression_target=0.001,
+        max_rank=subspace_dim,
     )
-    object.__setattr__(subspace, 'rotation_mode', 'random')
+    object.__setattr__(subspace, "rotation_mode", "random")
 
     optimizer = PolyStepOptimizer(
         model,
         seed=seed,
         subspace=subspace,
-        projection_type='sparse',
+        projection_type="sparse",
         step_radius=PSTORCH_CONFIG["step_radius"],
         probe_radius=PSTORCH_CONFIG["probe_radius"],
         epsilon=PSTORCH_CONFIG["epsilon"],
@@ -538,6 +513,7 @@ def run_polystep(
                     was_training = model.training
                     model.eval()
                     try:
+
                         def single_forward(params):
                             full_dict = {**params, **buffers}
                             logits = functional_call(model, full_dict, (_ids, _mask))
@@ -548,6 +524,7 @@ def run_polystep(
                         if was_training:
                             model.train()
                     return losses
+
                 return closure
 
             optimizer.step(make_closure(input_ids, attention_mask, labels))
@@ -564,25 +541,31 @@ def run_polystep(
             if step % 20 == 0:
                 step_test_acc = evaluate_accuracy(model, test_loader, device=device)
                 best_accuracy = max(best_accuracy, step_test_acc)
-                step_logs.append({
-                    "step": step,
-                    "test_accuracy": step_test_acc,
-                    "loss": loss,
-                    "wall_time": time.time() - start_time,
-                })
+                step_logs.append(
+                    {
+                        "step": step,
+                        "test_accuracy": step_test_acc,
+                        "loss": loss,
+                        "wall_time": time.time() - start_time,
+                    }
+                )
 
             # Periodic evaluation
             if step % 10 == 0 or step == num_steps:
                 test_acc = evaluate_accuracy(model, test_loader, device=device)
                 best_accuracy = max(best_accuracy, test_acc)
 
-                epoch_logs.append({
-                    "epoch": step,
-                    "accuracy": test_acc,
-                    "loss": loss,
-                    "time": step_time,
-                })
-                print(f"    Step {step}/{num_steps} | acc={test_acc*100:.1f}% | loss={loss:.4f} | time={step_time:.1f}s")
+                epoch_logs.append(
+                    {
+                        "epoch": step,
+                        "accuracy": test_acc,
+                        "loss": loss,
+                        "time": step_time,
+                    }
+                )
+                print(
+                    f"    Step {step}/{num_steps} | acc={test_acc * 100:.1f}% | loss={loss:.4f} | time={step_time:.1f}s"
+                )
 
     wall_time = time.time() - start_time
     final_acc = evaluate_accuracy(model, test_loader, device=device)
@@ -614,7 +597,7 @@ def run_polystep(
         results_dir=results_dir,
     )
     print(f"  Saved: {result_path}")
-    print(f"  Final accuracy: {final_acc*100:.1f}%, Best: {best_accuracy*100:.1f}%")
+    print(f"  Final accuracy: {final_acc * 100:.1f}%, Best: {best_accuracy * 100:.1f}%")
     print(f"  Wall time: {wall_time:.1f}s, Peak GPU: {mem['peak_gpu_memory_mb']:.0f} MB")
 
     return {
@@ -624,10 +607,6 @@ def run_polystep(
         "peak_memory_mb": mem["peak_gpu_memory_mb"],
     }
 
-
-# ---------------------------------------------------------------------------
-# Adam Baseline Runner
-# ---------------------------------------------------------------------------
 
 def run_adam(
     seed: int,
@@ -693,13 +672,17 @@ def run_adam(
             best_accuracy = max(best_accuracy, test_acc)
             epoch_time = time.time() - epoch_start
 
-            epoch_logs.append({
-                "epoch": epoch,
-                "accuracy": test_acc,
-                "loss": avg_loss,
-                "time": epoch_time,
-            })
-            print(f"    Epoch {epoch}/{num_epochs} | acc={test_acc*100:.1f}% | loss={avg_loss:.4f} | time={epoch_time:.1f}s")
+            epoch_logs.append(
+                {
+                    "epoch": epoch,
+                    "accuracy": test_acc,
+                    "loss": avg_loss,
+                    "time": epoch_time,
+                }
+            )
+            print(
+                f"    Epoch {epoch}/{num_epochs} | acc={test_acc * 100:.1f}% | loss={avg_loss:.4f} | time={epoch_time:.1f}s"
+            )
 
     wall_time = time.time() - start_time
     final_acc = evaluate_accuracy(model, test_loader, device=device)
@@ -728,7 +711,7 @@ def run_adam(
         results_dir=results_dir,
     )
     print(f"  Saved: {result_path}")
-    print(f"  Final accuracy: {final_acc*100:.1f}%, Best: {best_accuracy*100:.1f}%")
+    print(f"  Final accuracy: {final_acc * 100:.1f}%, Best: {best_accuracy * 100:.1f}%")
     print(f"  Wall time: {wall_time:.1f}s, Peak GPU: {mem['peak_gpu_memory_mb']:.0f} MB")
 
     return {
@@ -738,10 +721,6 @@ def run_adam(
         "peak_memory_mb": mem["peak_gpu_memory_mb"],
     }
 
-
-# ---------------------------------------------------------------------------
-# Head-Only Fine-Tuning (Classifier Head Only, Frozen Backbone)
-# ---------------------------------------------------------------------------
 
 def get_backbone_features(
     model: GPT2Small,
@@ -767,10 +746,10 @@ def get_backbone_features(
     batch_size, seq_len = input_ids.shape
 
     if seq_len > model.max_seq_len:
-        input_ids = input_ids[:, :model.max_seq_len]
+        input_ids = input_ids[:, : model.max_seq_len]
         seq_len = model.max_seq_len
         if attention_mask is not None:
-            attention_mask = attention_mask[:, :model.max_seq_len]
+            attention_mask = attention_mask[:, : model.max_seq_len]
 
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
     x = model.token_embedding(input_ids) + model.position_embedding(positions)
@@ -802,7 +781,7 @@ def run_headonly_polystep(
 
     Freezes the entire pretrained backbone and optimizes only the classifier
     head (nn.Linear(768, 2) = 1538 params) using polystep in full-space mode.
-    Features are pre-extracted from the frozen backbone for efficiency -- avoids
+    Features are pre-extracted from the frozen backbone for efficiency: avoids
     vmapping over the full 124M parameter model.
 
     Args:
@@ -842,9 +821,19 @@ def run_headonly_polystep(
 
     # Build CosineEpsilon schedules
     cfg = HEADONLY_PSTORCH_CONFIG
-    eps = CosineEpsilon(cfg["epsilon_init"], cfg["epsilon_target"]) if "epsilon_init" in cfg else cfg.get("epsilon", 2.0)
-    sr = CosineEpsilon(cfg["step_radius_init"], cfg["step_radius_target"]) if "step_radius_init" in cfg else cfg.get("step_radius", 1.0)
-    pr = CosineEpsilon(cfg["probe_radius_init"], cfg["probe_radius_target"]) if "probe_radius_init" in cfg else cfg.get("probe_radius", 1.0)
+    eps = (
+        CosineEpsilon(cfg["epsilon_init"], cfg["epsilon_target"]) if "epsilon_init" in cfg else cfg.get("epsilon", 2.0)
+    )
+    sr = (
+        CosineEpsilon(cfg["step_radius_init"], cfg["step_radius_target"])
+        if "step_radius_init" in cfg
+        else cfg.get("step_radius", 1.0)
+    )
+    pr = (
+        CosineEpsilon(cfg["probe_radius_init"], cfg["probe_radius_target"])
+        if "probe_radius_init" in cfg
+        else cfg.get("probe_radius", 1.0)
+    )
 
     optimizer = PolyStepOptimizer(
         classifier_module,
@@ -892,8 +881,10 @@ def run_headonly_polystep(
                             full_dict = {**params, **buffers}
                             logits = functional_call(classifier_module, full_dict, (_features,))
                             return criterion(logits, _labels)
+
                         losses = vmap(single_forward, in_dims=(0,))(batched_params)
                         return losses
+
                     return closure
 
                 optimizer.step(make_closure(features, labels))
@@ -911,13 +902,15 @@ def run_headonly_polystep(
                     model.classifier.weight.data.copy_(classifier_module[0].weight.data)
                     model.classifier.bias.data.copy_(classifier_module[0].bias.data)
                     step_test_acc = evaluate_accuracy(model, test_loader, device=device)
-                    step_logs.append({
-                        "step": total_steps,
-                        "epoch": epoch,
-                        "test_accuracy": step_test_acc,
-                        "loss": batch_loss,
-                        "wall_time": time.time() - start_time,
-                    })
+                    step_logs.append(
+                        {
+                            "step": total_steps,
+                            "epoch": epoch,
+                            "test_accuracy": step_test_acc,
+                            "loss": batch_loss,
+                            "wall_time": time.time() - start_time,
+                        }
+                    )
 
             avg_loss = epoch_loss / max(epoch_batches, 1)
 
@@ -929,15 +922,19 @@ def run_headonly_polystep(
             best_accuracy = max(best_accuracy, test_acc)
             epoch_time = time.time() - epoch_start
 
-            epoch_logs.append({
-                "epoch": epoch,
-                "accuracy": test_acc,
-                "loss": avg_loss,
-                "time": epoch_time,
-            })
+            epoch_logs.append(
+                {
+                    "epoch": epoch,
+                    "accuracy": test_acc,
+                    "loss": avg_loss,
+                    "time": epoch_time,
+                }
+            )
 
             if epoch % 5 == 0 or epoch == num_epochs:
-                print(f"    Epoch {epoch}/{num_epochs} | acc={test_acc*100:.1f}% | loss={avg_loss:.4f} | time={epoch_time:.1f}s")
+                print(
+                    f"    Epoch {epoch}/{num_epochs} | acc={test_acc * 100:.1f}% | loss={avg_loss:.4f} | time={epoch_time:.1f}s"
+                )
 
     wall_time = time.time() - start_time
 
@@ -974,7 +971,7 @@ def run_headonly_polystep(
         results_dir=results_dir,
     )
     print(f"  Saved: {result_path}")
-    print(f"  Final accuracy: {final_acc*100:.1f}%, Best: {best_accuracy*100:.1f}%")
+    print(f"  Final accuracy: {final_acc * 100:.1f}%, Best: {best_accuracy * 100:.1f}%")
     print(f"  Wall time: {wall_time:.1f}s, Peak GPU: {mem['peak_gpu_memory_mb']:.0f} MB")
 
     return {
@@ -1066,13 +1063,17 @@ def run_headonly_adam(
             best_accuracy = max(best_accuracy, test_acc)
             epoch_time = time.time() - epoch_start
 
-            epoch_logs.append({
-                "epoch": epoch,
-                "accuracy": test_acc,
-                "loss": avg_loss,
-                "time": epoch_time,
-            })
-            print(f"    Epoch {epoch}/{num_epochs} | acc={test_acc*100:.1f}% | loss={avg_loss:.4f} | time={epoch_time:.1f}s")
+            epoch_logs.append(
+                {
+                    "epoch": epoch,
+                    "accuracy": test_acc,
+                    "loss": avg_loss,
+                    "time": epoch_time,
+                }
+            )
+            print(
+                f"    Epoch {epoch}/{num_epochs} | acc={test_acc * 100:.1f}% | loss={avg_loss:.4f} | time={epoch_time:.1f}s"
+            )
 
     wall_time = time.time() - start_time
     final_acc = evaluate_accuracy(model, test_loader, device=device)
@@ -1104,7 +1105,7 @@ def run_headonly_adam(
         results_dir=results_dir,
     )
     print(f"  Saved: {result_path}")
-    print(f"  Final accuracy: {final_acc*100:.1f}%, Best: {best_accuracy*100:.1f}%")
+    print(f"  Final accuracy: {final_acc * 100:.1f}%, Best: {best_accuracy * 100:.1f}%")
     print(f"  Wall time: {wall_time:.1f}s, Peak GPU: {mem['peak_gpu_memory_mb']:.0f} MB")
 
     return {
@@ -1114,10 +1115,6 @@ def run_headonly_adam(
         "peak_memory_mb": mem["peak_gpu_memory_mb"],
     }
 
-
-# ---------------------------------------------------------------------------
-# Memory Profiling
-# ---------------------------------------------------------------------------
 
 def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int = 128):
     """Measure peak VRAM for both polystep and Adam on GPT-2 124M.
@@ -1140,7 +1137,7 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
 
     results = {}
 
-    # -- polystep memory --
+    #: polystep memory --
     print("Measuring polystep memory...")
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -1151,15 +1148,17 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
     total_params = sum(p.numel() for p in model.parameters())
 
     subspace = AdaptiveSubspace.auto_from_params(
-        model, compression_target=0.001, max_rank=PSTORCH_CONFIG["subspace_dim"],
+        model,
+        compression_target=0.001,
+        max_rank=PSTORCH_CONFIG["subspace_dim"],
     )
-    object.__setattr__(subspace, 'rotation_mode', 'random')
+    object.__setattr__(subspace, "rotation_mode", "random")
 
     optimizer = PolyStepOptimizer(
         model,
         seed=42,
         subspace=subspace,
-        projection_type='sparse',
+        projection_type="sparse",
         step_radius=PSTORCH_CONFIG["step_radius"],
         probe_radius=PSTORCH_CONFIG["probe_radius"],
         epsilon=PSTORCH_CONFIG["epsilon"],
@@ -1181,20 +1180,23 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
             was_training = _model.training
             _model.eval()
             try:
+
                 def single_forward(params):
                     full_dict = {**params, **_buffers}
                     logits = functional_call(_model, full_dict, (_ids, _mask))
                     return criterion(logits, _labels)
+
                 losses = vmap(single_forward, in_dims=(0,))(batched_params)
             finally:
                 if was_training:
                     _model.train()
             return losses
+
         return closure
 
     optimizer.step(make_closure(input_ids, attention_mask, labels))
     torch.cuda.synchronize()
-    polystep_peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    polystep_peak = torch.cuda.max_memory_allocated() / (1024**2)
     results["polystep_peak_mb"] = polystep_peak
     print(f"  polystep peak: {polystep_peak:.0f} MB")
 
@@ -1202,7 +1204,7 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
     gc.collect()
     torch.cuda.empty_cache()
 
-    # -- Adam memory --
+    # , Adam memory --
     print("Measuring Adam memory...")
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -1225,7 +1227,7 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
     adam_opt.step()
     torch.cuda.synchronize()
 
-    adam_peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    adam_peak = torch.cuda.max_memory_allocated() / (1024**2)
     results["adam_peak_mb"] = adam_peak
     print(f"  Adam peak: {adam_peak:.0f} MB")
 
@@ -1235,7 +1237,7 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
 
     # Theoretical breakdown
     param_bytes = total_params * 4  # FP32
-    param_mb = param_bytes / (1024 ** 2)
+    param_mb = param_bytes / (1024**2)
 
     results["theoretical"] = {
         "model_weights_mb": param_mb,
@@ -1257,10 +1259,6 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
     return results
 
 
-# ---------------------------------------------------------------------------
-# Method Dispatch
-# ---------------------------------------------------------------------------
-
 METHOD_RUNNERS = {
     "polystep": run_polystep,
     "adam": run_adam,
@@ -1272,41 +1270,47 @@ HEADONLY_METHOD_RUNNERS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="GPT-2 124M Fine-Tuning on SST-2: polystep vs Adam"
-    )
+    parser = argparse.ArgumentParser(description="GPT-2 124M Fine-Tuning on SST-2: polystep vs Adam")
     parser.add_argument(
-        "--methods", nargs="+", default=["polystep", "adam"],
+        "--methods",
+        nargs="+",
+        default=["polystep", "adam"],
         help="Methods to run (default: polystep adam)",
     )
     parser.add_argument(
-        "--seeds", nargs="+", type=int, default=[42, 123, 456],
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=[42, 123, 456],
         help="Seeds to run (default: 42 123 456)",
     )
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
     parser.add_argument(
-        "--steps", type=int, default=NUM_STEPS,
+        "--steps",
+        type=int,
+        default=NUM_STEPS,
         help=f"Number of polystep optimizer steps (default: {NUM_STEPS})",
     )
     parser.add_argument(
-        "--subspace-dim", type=int, default=PSTORCH_CONFIG["subspace_dim"],
+        "--subspace-dim",
+        type=int,
+        default=PSTORCH_CONFIG["subspace_dim"],
         help=f"Subspace dimensionality (default: {PSTORCH_CONFIG['subspace_dim']})",
     )
     parser.add_argument(
-        "--results-dir", default="experiments/results",
+        "--results-dir",
+        default="experiments/results",
         help="Results directory (default: experiments/results)",
     )
     parser.add_argument(
-        "--measure-memory", action="store_true",
+        "--measure-memory",
+        action="store_true",
         help="Run memory profiling only (no training)",
     )
     parser.add_argument(
-        "--head-only", action="store_true",
+        "--head-only",
+        action="store_true",
         help="Train only classifier head (1,538 params) with frozen backbone",
     )
     args = parser.parse_args()
@@ -1349,9 +1353,7 @@ def main():
 
     for method in args.methods:
         for seed in args.seeds:
-            output_file = os.path.join(
-                args.results_dir, f"{benchmark}_{method}_{seed}.json"
-            )
+            output_file = os.path.join(args.results_dir, f"{benchmark}_{method}_{seed}.json")
             if os.path.exists(output_file):
                 print(f"Skipping {method} seed={seed} (result exists: {output_file})")
                 continue
@@ -1412,6 +1414,7 @@ def main():
             except Exception as e:
                 print(f"  ERROR: {method} seed={seed} failed: {e}")
                 import traceback
+
                 traceback.print_exc()
 
     print(f"\nDone. Results in experiments/results/{benchmark}_*.json")

@@ -13,12 +13,7 @@ from polystep.blockwise import (
 )
 from polystep.transform import ParamLayout
 from polystep.cost_nn import NNCostEvaluator
-from polystep.solver import PolyStep, SolverState
-
-
-# ---------------------------------------------------------------------------
-# Helper models
-# ---------------------------------------------------------------------------
+from polystep.solver import PolyStep
 
 
 class SimpleMLP(nn.Module):
@@ -29,11 +24,6 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.fc2(torch.relu(self.fc1(x)))
-
-
-# ---------------------------------------------------------------------------
-# create_per_layer_blocks tests
-# ---------------------------------------------------------------------------
 
 
 class TestPerLayerBlocks:
@@ -62,11 +52,6 @@ class TestPerLayerBlocks:
             assert blocks[i].flat_start == blocks[i - 1].flat_end
 
 
-# ---------------------------------------------------------------------------
-# create_grouped_blocks tests
-# ---------------------------------------------------------------------------
-
-
 class TestGroupedBlocks:
     def test_grouped_pairs(self):
         model = SimpleMLP()
@@ -93,11 +78,6 @@ class TestGroupedBlocks:
         assert blocks[0].flat_end - blocks[0].flat_start == padded0
 
 
-# ---------------------------------------------------------------------------
-# split_particles / reassemble_blocks tests
-# ---------------------------------------------------------------------------
-
-
 class TestSplitReassemble:
     def test_split_correct_shapes(self):
         model = SimpleMLP()
@@ -119,11 +99,6 @@ class TestSplitReassemble:
         block_parts = split_particles(original, blocks)
         reconstructed = reassemble_blocks(block_parts, blocks, total_flat)
         torch.testing.assert_close(original, reconstructed)
-
-
-# ---------------------------------------------------------------------------
-# compute_block_cost_matrix test
-# ---------------------------------------------------------------------------
 
 
 class TestBlockCost:
@@ -157,11 +132,6 @@ class TestBlockCost:
         )
         assert cost.shape == (P, V)
         assert torch.isfinite(cost).all()
-
-
-# ---------------------------------------------------------------------------
-# PolyStep block-wise integration test
-# ---------------------------------------------------------------------------
 
 
 class TestBlockwiseSolverIntegration:
@@ -272,11 +242,6 @@ class TestBlockwiseSolverIntegration:
                 layout=layout,
                 compile=False,
             )
-
-
-# ---------------------------------------------------------------------------
-# Layout ↔ block conversion tests
-# ---------------------------------------------------------------------------
 
 
 class TestBlockLayoutConversion:

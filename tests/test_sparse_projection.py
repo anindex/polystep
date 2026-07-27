@@ -34,21 +34,6 @@ class TestCoreProjection:
         assert full.shape == expected_shape
         assert full.dtype == coords.dtype
 
-    @pytest.mark.parametrize(
-        "input_shape, expected_shape",
-        [
-            ((10000,), (64,)),
-            ((16, 10000), (16, 64)),
-        ],
-    )
-    def test_project_transpose_shape_1d(self, input_shape, expected_shape):
-        """Transpose projection (full -> subspace) produces correct shape."""
-        proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
-        full = torch.randn(*input_shape)
-        coords = proj.project_transpose(full)
-        assert coords.shape == expected_shape
-        assert coords.dtype == full.dtype
-
     def test_deterministic_with_seed(self):
         """Same seed produces identical projections."""
         proj1 = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=123)
@@ -185,17 +170,24 @@ class TestJLTProperty:
         assert torch.allclose(result, torch.zeros(10000))
 
     def test_linearity(self):
-        """Projection is linear: P(a*x) = a*P(x)."""
+        """Projection is linear: ``P(a x) == a P(x)``.
+
+        Compared in the norm, not per element. The two expressions reassociate the fp32
+        sparse matmul differently, so an entry that lands near cancellation has a large
+        relative error (worst 1.5e-3 over 200 draws) while the vectors agree to 7e-8.
+        A per-element ``rtol=1e-5`` therefore passed or failed on the luck of the draw,
+        which is how it survived until the suite ran under xdist.
+        """
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
 
-        x = torch.randn(64)
+        x = torch.randn(64, generator=torch.Generator().manual_seed(0))
         scale = 3.14
 
-        # P(scale * x) should equal scale * P(x)
-        result1 = proj.project(scale * x)
-        result2 = scale * proj.project(x)
+        scaled_then_projected = proj.project(scale * x)
+        projected_then_scaled = scale * proj.project(x)
 
-        assert torch.allclose(result1, result2, rtol=1e-5)
+        error = torch.linalg.vector_norm(scaled_then_projected - projected_then_scaled)
+        assert error <= 1e-6 * torch.linalg.vector_norm(projected_then_scaled), f"linearity broken: {error}"
 
 
 class TestDtypeHandling:
@@ -213,6 +205,7 @@ class TestDtypeHandling:
 class TestCUDA:
     """Tests for CUDA compatibility."""
 
+    @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
         "input_shape, expected_shape",
@@ -231,17 +224,7 @@ class TestCUDA:
         assert full.device.type == "cuda"
         assert full.shape == expected_shape
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_transpose(self):
-        """Transpose projection works on GPU."""
-        proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
-
-        full = torch.randn(10000, device="cuda")
-        coords = proj.project_transpose(full)
-
-        assert coords.device.type == "cuda"
-        assert coords.shape == (64,)
-
+    @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_determinism(self):
         """Same seed produces same results on GPU."""
@@ -289,28 +272,6 @@ class TestEdgeCases:
 
 class TestStatisticalProperties:
     """Variance and warning behavior for the sparse JL projection."""
-
-    @pytest.mark.filterwarnings("ignore:Sparse invariant checks:UserWarning")
-    def test_project_transpose_has_unit_variance(self):
-        """``project_transpose`` computes ``P^T @ full`` with ``P`` having
-        ``nnz_per_col`` Rademacher entries scaled by
-        ``1/sqrt(nnz_per_col)``. For ``full ~ N(0, I)`` the projected
-        coordinate variance is ~1.
-        """
-        full_dim = 10000
-        subspace_dim = 256
-        proj = SparseRandomProjection(
-            full_dim=full_dim,
-            subspace_dim=subspace_dim,
-            seed=0,
-        )
-
-        gen = torch.Generator(device="cpu").manual_seed(1)
-        x = torch.randn(full_dim, generator=gen)
-        y = proj.project_transpose(x)
-        assert y.shape == (subspace_dim,)
-        sample_var = y.var().item()
-        assert 0.5 < sample_var < 2.0, f"projected coordinate variance off: got {sample_var:.3f}, expected ~1.0"
 
     def test_warns_at_extreme_compression(self):
         """Subspace ratio below 1e-5 triggers a UserWarning."""

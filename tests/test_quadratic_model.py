@@ -161,11 +161,6 @@ def test_trust_region_shrinks_on_bad_step():
     assert new_radius < 1.0
 
 
-# ---------------------------------------------------------------------------
-# Tests for apply_newton_refinement (Newton refinement)
-# ---------------------------------------------------------------------------
-
-
 def _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P, c=10.0):
     """Helper: generate losses_3d for a known quadratic f(x) = c + g*x + 0.5*H*x^2."""
     K = len(scales)

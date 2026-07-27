@@ -72,7 +72,7 @@ class SparseRandomProjection:
         self.density = density if density is not None else 1.0 / math.sqrt(full_dim)
         self.seed = seed
 
-        # Warn loudly at extreme compression ratios -- see
+        # Warn loudly at extreme compression ratios: see
         # ``_EXTREME_COMPRESSION_RATIO`` above.
         if full_dim > 0:
             ratio = subspace_dim / full_dim
@@ -125,7 +125,7 @@ class SparseRandomProjection:
         # Scale factor for unit variance
         scale = 1.0 / math.sqrt(self._nnz_per_col)
 
-        # Vectorized row index sampling (with replacement -- negligible collisions)
+        # Vectorized row index sampling (with replacement: negligible collisions)
         row_indices = torch.randint(
             0,
             self.full_dim,
@@ -211,34 +211,6 @@ class SparseRandomProjection:
         # coords is (batch, subspace_dim), need (subspace_dim, batch)
         result = torch.sparse.mm(P, coords.T)  # (full_dim, batch)
         result = result.T  # (batch, full_dim)
-
-        if is_1d:
-            result = result.squeeze(0)
-
-        return result
-
-    def project_transpose(self, full: torch.Tensor) -> torch.Tensor:
-        """Project full parameters back to subspace (transpose).
-
-        Computes: coords = P^T @ full where P is (full_dim x subspace_dim).
-
-        Args:
-            full: Full parameter space vector of shape (full_dim,) or (batch, full_dim).
-
-        Returns:
-            Subspace coordinates of shape (subspace_dim,) or (batch, subspace_dim).
-        """
-        is_1d = full.dim() == 1
-        if is_1d:
-            full = full.unsqueeze(0)  # (1, full_dim)
-
-        # Get sparse matrix and transpose
-        P = self._get_sparse_matrix(full.device, full.dtype)
-        P_T = P.t()  # (subspace_dim, full_dim)
-
-        # Sparse-dense matmul: P^T @ full.T -> (subspace_dim, batch)
-        result = torch.sparse.mm(P_T, full.T)  # (subspace_dim, batch)
-        result = result.T  # (batch, subspace_dim)
 
         if is_1d:
             result = result.squeeze(0)

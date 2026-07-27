@@ -6,8 +6,8 @@ This document describes how to reproduce all experiments and results in the Poly
 
 ### Requirements
 - Python >= 3.11
-- PyTorch >= 2.8
-- NVIDIA GPU with CUDA support (tested on RTX 5090, 32GB VRAM, CUDA 13.0, PyTorch 2.12)
+- PyTorch >= 2.8 (the package floor; results below were produced on a newer build)
+- NVIDIA GPU with CUDA support (tested on RTX 5090, 32GB VRAM, CUDA 13.0, PyTorch 2.13)
 - ~10GB disk space for results
 
 ### Installation
@@ -18,11 +18,14 @@ cd polystep
 pip install -e ".[experiments]"
 ```
 
-The `[experiments]` extra installs scipy, statsmodels, pandas, python-sat, torchvision, cma, and gymnasium.
+The `[experiments]` extra installs pandas, python-sat, torchvision, cma, evotorch,
+nevergrad, snntorch, tabulate, datasets, and gymnasium.
 
 ### Datasets
 
-MNIST is downloaded automatically via `torchvision.datasets`.
+MNIST is downloaded automatically from the Google Cloud Storage mirror as raw IDX
+archives. The loaders in `polystep.benchmarks.utils` deliberately avoid torchvision so
+the core reproduction path needs no extra vision dependency.
 SST-2 is downloaded via HuggingFace `datasets`. No manual data setup is required.
 
 ## Running All Experiments

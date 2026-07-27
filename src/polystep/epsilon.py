@@ -134,7 +134,7 @@ class ProgressiveEpsilon:
         elif ratio < self.fast_threshold:
             # Solver converging fast: decrease epsilon
             self._current = max(self._current * self.decrease_factor, self.target)
-        # else: ratio in [fast_threshold, slow_threshold] -- keep current
+        # else: ratio in [fast_threshold, slow_threshold]: keep current
 
         # EMA smooth
         self._smoothed = self.ema_alpha * self._smoothed + (1.0 - self.ema_alpha) * self._current

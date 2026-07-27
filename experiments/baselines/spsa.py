@@ -136,7 +136,7 @@ def train_spsa(
         for k in range(1, max_iters + 1):
             # --- 1. Gain sequences ---
             a_k = a / ((A + k) ** alpha)
-            c_k = c / (k ** gamma)
+            c_k = c / (k**gamma)
 
             # --- 2. Bernoulli perturbation: each element +1 or -1 ---
             delta.bernoulli_(0.5).mul_(2.0).sub_(1.0)

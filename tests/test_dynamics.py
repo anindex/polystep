@@ -12,11 +12,6 @@ from polystep.dynamics import (
 )
 
 
-# ---------------------------------------------------------------------------
-# TestMomentumCoefficient
-# ---------------------------------------------------------------------------
-
-
 class TestMomentumCoefficient:
     """Tests for compute_momentum_coefficient linear warmup."""
 
@@ -46,11 +41,6 @@ class TestMomentumCoefficient:
         beta = compute_momentum_coefficient(mid, max_iterations=100)
         expected = 0.5 + (mid / 99) * (0.95 - 0.5)
         assert beta == pytest.approx(expected)
-
-
-# ---------------------------------------------------------------------------
-# TestApplyMomentum
-# ---------------------------------------------------------------------------
 
 
 class TestApplyMomentum:
@@ -110,11 +100,6 @@ class TestApplyMomentum:
         X_new, v_new = apply_momentum(X_old, X_bary, velocity, beta=0.9)
         assert X_new.shape == (N, D)
         assert v_new.shape == (N, D)
-
-
-# ---------------------------------------------------------------------------
-# TestAdaptiveRadius
-# ---------------------------------------------------------------------------
 
 
 class TestAdaptiveRadius:

@@ -45,7 +45,6 @@ __all__ = [
     "update_step_size_csa",
     "update_covariance_diagonal",
     "compute_heaviside_sigma",
-    "compute_ot_bias_directions",
 ]
 
 
@@ -73,19 +72,24 @@ def compute_cma_hyperparameters(n: int, mu_eff: float = 2.0) -> Dict[str, float]
     References:
         Hansen CMA-ES Tutorial (arXiv:1604.00772), Section 3 Table 1.
     """
-    # Cumulation factor for step-size path (Eq. 3)
-    # c_sigma = (mu_eff + 2) / (n + mu_eff + 5)
-    # Note: Tutorial uses +5, some variants use +3; we use +3 for faster adaptation
+    # Cumulation factor for the step-size path (Eq. 3). Hansen's tutorial
+    # (arXiv:1604.00772, Table 1) writes (mu_eff + 2) / (n + mu_eff + 5); the +3 here
+    # is a tuning choice for faster adaptation, not a published variant. At mu_eff = 1
+    # it gives 3/(n+3) against the tutorial's 3/(n+6).
     c_sigma = (mu_eff + 2) / (n + mu_eff + 3)
 
-    # Cumulation factor for covariance path (Eq. 4)
-    c_c = 4.0 / (n + 4)
+    # Cumulation factor for covariance path (Eq. 4). The mu_eff-aware form from the
+    # current tutorial; the older 4/(n+4) also feeds the c_c*(2-c_c) make-up term.
+    c_c = (4.0 + mu_eff / n) / (n + 4.0 + 2.0 * mu_eff / n)
 
     # Rank-one learning rate (Eq. 5)
     c_1 = 2.0 / ((n + 1.3) ** 2 + mu_eff)
 
     # Rank-mu learning rate (Eq. 6)
     # Ensure c_1 + c_mu <= 1
+    # Exactly 0 at mu_eff = 1: one recombination point carries no second-moment
+    # information. The integrated optimizer runs at mu_eff = 1 by default, so
+    # covariance adaptation there is rank-one only (see LIMITATIONS.md).
     c_mu = min(1 - c_1, 2 * (mu_eff - 2 + 1 / mu_eff) / ((n + 2) ** 2 + mu_eff))
 
     # Damping factor for step-size (Eq. 7)
@@ -112,6 +116,7 @@ def update_evolution_path_sigma(
     C_diag: torch.Tensor,
     c_sigma: float,
     mu_eff: float,
+    cov_min: float = 1e-6,
 ) -> torch.Tensor:
     """Update step-size evolution path using CMA-ES Tutorial Eq. 3.
 
@@ -129,7 +134,10 @@ def update_evolution_path_sigma(
         displacement: Weighted mean displacement from current step, shape (subspace_dim,).
         C_diag: Diagonal covariance values, shape (subspace_dim,).
         c_sigma: Cumulation factor (typically from compute_cma_hyperparameters).
-        mu_eff: Variance-effectiveness of weights.
+        mu_eff: Variance-effectiveness of weights. Pass 1.0 when ``displacement`` is
+            already standardized to unit expected squared norm.
+        cov_min: Floor applied to C_diag inside the whitening. Must match the ``cov_min``
+            used when clamping C_diag, or the whitening is wrong at the floor.
 
     Returns:
         Updated evolution path p_sigma, shape (subspace_dim,).
@@ -139,8 +147,7 @@ def update_evolution_path_sigma(
     """
     sqrt_factor = math.sqrt(c_sigma * (2 - c_sigma) * mu_eff)
     # For diagonal C: C^(-1/2) = 1/sqrt(C_diag) element-wise
-    # Add small constant for numerical stability
-    C_inv_sqrt = 1.0 / torch.sqrt(torch.clamp(C_diag, min=1e-8))
+    C_inv_sqrt = 1.0 / torch.sqrt(torch.clamp(C_diag, min=cov_min))
     return (1 - c_sigma) * p_sigma + sqrt_factor * C_inv_sqrt * displacement
 
 
@@ -206,7 +213,11 @@ def compute_heaviside_sigma(
 
     Args:
         p_sigma_norm: Current norm of p_sigma.
-        expected_norm: Expected norm of N(0,I) in n dimensions.
+        expected_norm: Stationary norm of p_sigma under no selection. This is
+            ``E||N(0,I)|| ~ sqrt(n)`` for Gaussian mutations, but 1.0 for a
+            standardized OT step (see :func:`update_step_size_csa`). Passing a running
+            mean of ``p_sigma_norm`` itself makes the test almost always true, which
+            disables stall detection.
         n: Subspace dimension.
         c_sigma: Cumulation factor for step-size path.
         generation: Count of completed generations (0-based); the formula uses
@@ -251,10 +262,14 @@ def update_step_size_csa(
     Formula (CMA-ES Tutorial Eq. 7):
         sigma^(g+1) = sigma^(g) * exp((c_sigma / d_sigma) * (||p_sigma|| / E - 1))
 
-    Canonical CMA-ES uses ``E = E[||N(0,I)||] = sqrt(n)``, valid for Gaussian
-    mutations. OT barycentric steps are far smaller, so passing ``expected_norm``
-    (a running mean of ||p_sigma||) calibrates CSA to the OT scale and prevents
-    sigma from collapsing every generation. Falls back to the Gaussian value.
+    Canonical CMA-ES uses ``E = E[||N(0,I)||] = sqrt(n)`` because a Gaussian mutation has
+    norm ~sqrt(n). An OT step over an orthoplex has no such fixed norm (antithetic vertex
+    pairs cancel toward zero), so pass 1.0 and feed ``p_sigma`` unit-norm innovations:
+    their stationary path norm is exactly 1 in any dimension.
+
+    Do not pass a running mean of ``||p_sigma||``. The ratio is then pinned near 1, and
+    while the norm trends it exceeds its own trailing mean by construction, so sigma grows
+    until it clamps.
 
     Args:
         sigma: Current step-size.
@@ -298,6 +313,9 @@ def update_covariance_diagonal(
     c_mu: float,
     h_sigma: bool,
     c_c: float,
+    trace_scale: float = 1.0,
+    cov_min: float = 1e-6,
+    cov_max: float = 1e6,
 ) -> torch.Tensor:
     """Update diagonal covariance with rank-one and rank-mu terms.
 
@@ -320,6 +338,10 @@ def update_covariance_diagonal(
         c_mu: Learning rate for rank-mu update.
         h_sigma: Heaviside flag (``True`` if ``p_sigma`` healthy).
         c_c: Cumulation factor for covariance path (used in ``h_factor``).
+        trace_scale: Multiplier on the rank-one term. ``p_c`` built from unit-norm
+            directions has total squared norm 1, while ``C_diag`` sums to the dimension,
+            so the rank-one term needs the same trace convention as ``rank_mu`` or it
+            contributes nothing and ``C_diag`` decays every generation.
 
     Returns:
         Updated diagonal covariance, clamped to ``[1e-6, 1e6]``,
@@ -331,7 +353,7 @@ def update_covariance_diagonal(
         Time and Space Complexity", PPSN 2008.
     """
     # Rank-one update from the covariance evolution path.
-    rank_one = p_c**2
+    rank_one = trace_scale * p_c**2
 
     # sep-CMA-ES old-covariance coefficient. When the Heaviside h_sigma is 0
     # (step-size path stalled), the missing rank-one mass c_1*c_c*(2-c_c) is
@@ -341,60 +363,4 @@ def update_covariance_diagonal(
 
     C_new = old_coeff * C_diag + c_1 * rank_one + c_mu * rank_mu
 
-    cov_min = 1e-6
-    cov_max = 1e6
     return torch.clamp(C_new, min=cov_min, max=cov_max)
-
-
-@torch.inference_mode()
-def compute_ot_bias_directions(
-    transport_matrix: torch.Tensor,
-    X_vertices: torch.Tensor,
-    X_current: torch.Tensor,
-    top_k: int,
-) -> torch.Tensor:
-    """Extract high-transport directions from the OT plan for subspace bias.
-
-    For each particle, compute the displacement from the current position
-    to the transport-weighted vertex centroid, then rank particles by
-    *transport entropy*: particles whose transport is concentrated on a
-    single vertex have low entropy and provide the most confident descent
-    direction. Row-sum mass does not work as a weight here: for a valid OT
-    plan rows sum to the source marginal, so entropy is used instead of mass
-    moved.
-
-    Args:
-        transport_matrix: OT transport plan of shape
-            ``(num_particles, num_vertices)``. Entry ``T[i, v]`` is the
-            mass transported from particle ``i`` to vertex ``v``.
-        X_vertices: Polytope vertex positions for each particle,
-            shape ``(num_particles, num_vertices, particle_dim)``.
-        X_current: Current particle positions of shape
-            ``(num_particles, particle_dim)``.
-        top_k: Number of top directions to return.
-
-    Returns:
-        Tensor of shape ``(min(top_k, num_particles), particle_dim)``
-        containing normalized high-confidence transport directions.
-    """
-    P, _ = transport_matrix.shape
-
-    # Per-particle transport probability distribution.
-    row_sums = transport_matrix.sum(dim=1, keepdim=True).clamp(min=1e-10)
-    T_norm = transport_matrix / row_sums  # (P, V)
-
-    # Centroid_i = sum_v T_norm[i, v] * X_vertices[i, v]
-    centroids = (T_norm.unsqueeze(-1) * X_vertices).sum(dim=1)  # (P, pdim)
-    displacements = centroids - X_current  # (P, pdim)
-
-    # Rank by inverse transport entropy so concentrated transport scores high.
-    log_T = torch.log(T_norm.clamp(min=1e-30))
-    entropy = -(T_norm * log_T).sum(dim=1)  # (P,)
-    confidence = 1.0 / (entropy + 1e-6)
-
-    k_actual = min(top_k, P)
-    topk_indices = torch.topk(confidence, k_actual).indices
-    top_displacements = displacements[topk_indices]
-
-    norms = torch.norm(top_displacements, dim=1, keepdim=True).clamp(min=1e-10)
-    return top_displacements / norms

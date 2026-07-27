@@ -9,12 +9,19 @@ Tests verify:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn as nn
 from torch.func import functional_call, vmap
 
-from experiments.runners.nondiff_models import (
+# experiments/ is the paper reproduction harness and is not part of the distributed
+# package, so this module is unimportable when the tests run from an sdist.
+if not (Path(__file__).resolve().parent.parent / "experiments" / "runners").is_dir():
+    pytest.skip("experiments/runners not present (running outside the repo)", allow_module_level=True)
+
+from experiments.runners.nondiff_models import (  # noqa: E402
     LIFNeuron,
     SpikingMNISTNet,
     QuantizedLinear,
@@ -51,20 +58,7 @@ from experiments.runners.nondiff_models import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Building block tests
-# ---------------------------------------------------------------------------
-
-
 class TestLIFNeuron:
-    def test_forward_shape(self):
-        lif = LIFNeuron(beta=0.95, threshold=1.0)
-        x = torch.randn(2, 16)
-        mem = torch.zeros(2, 16)
-        spike, new_mem = lif(x, mem)
-        assert spike.shape == (2, 16)
-        assert new_mem.shape == (2, 16)
-
     def test_spike_values_binary(self):
         """Spike output must be in {0.0, 1.0}."""
         lif = LIFNeuron(beta=0.95, threshold=1.0)
@@ -77,12 +71,6 @@ class TestLIFNeuron:
 
 
 class TestQuantizedLinear:
-    def test_forward_shape(self):
-        ql = QuantizedLinear(16, 32)
-        x = torch.randn(2, 16)
-        out = ql(x)
-        assert out.shape == (2, 32)
-
     def test_weights_are_int8_rounded(self):
         """forward() must apply int8 round-quantization to the weights it uses."""
         ql = QuantizedLinear(2, 1, scale=0.5)
@@ -96,12 +84,6 @@ class TestQuantizedLinear:
 
 
 class TestBinaryLinear:
-    def test_forward_shape(self):
-        bl = BinaryLinear(16, 32)
-        x = torch.randn(2, 16)
-        out = bl(x)
-        assert out.shape == (2, 32)
-
     def test_effective_weights_binary(self):
         """forward() must binarize weights to {-1, +1} via sign()."""
         bl = BinaryLinear(2, 1)
@@ -115,12 +97,6 @@ class TestBinaryLinear:
 
 
 class TestTernaryLinear:
-    def test_forward_shape(self):
-        tl = TernaryLinear(16, 32)
-        x = torch.randn(2, 16)
-        out = tl(x)
-        assert out.shape == (2, 32)
-
     def test_effective_weights_ternary(self):
         """forward() must ternarize weights to {-1, 0, +1} using the threshold."""
         tl = TernaryLinear(3, 1, threshold=0.5)
@@ -131,11 +107,6 @@ class TestTernaryLinear:
         out = tl(x)
         assert torch.allclose(out, torch.tensor([[2.0]]))  # +1 + 0 + +1
         assert not torch.allclose(out, x @ tl.weight.t())  # not the raw linear (1.4)
-
-
-# ---------------------------------------------------------------------------
-# STE autograd function tests
-# ---------------------------------------------------------------------------
 
 
 class TestSTESign:
@@ -173,18 +144,7 @@ class TestSTETernary:
         assert input.grad is not None
 
 
-# ---------------------------------------------------------------------------
-# STE-enabled layer tests
-# ---------------------------------------------------------------------------
-
-
 class TestBinaryLinearSTE:
-    def test_forward_shape(self):
-        layer = BinaryLinearSTE(16, 8)
-        x = torch.randn(2, 16)
-        out = layer(x)
-        assert out.shape == (2, 8)
-
     def test_gradient_flows(self):
         layer = BinaryLinearSTE(16, 8)
         x = torch.randn(2, 16)
@@ -205,12 +165,6 @@ class TestTernaryLinearSTE:
 
 
 class TestBinaryConv2d:
-    def test_forward_shape(self):
-        layer = BinaryConv2d(3, 16, 3, padding=1)
-        x = torch.randn(2, 3, 8, 8)
-        out = layer(x)
-        assert out.shape == (2, 16, 8, 8)
-
     def test_weights_are_binary(self):
         """forward() must convolve with sign-binarized weights, not the raw ones."""
         layer = BinaryConv2d(1, 1, 1, padding=0)  # 1x1 conv -> per-pixel scale by the (binarized) weight
@@ -227,12 +181,6 @@ class TestBinaryConv2d:
 
 
 class TestBinaryConv2dSTE:
-    def test_forward_shape(self):
-        layer = BinaryConv2dSTE(3, 16, 3, padding=1)
-        x = torch.randn(2, 3, 8, 8)
-        out = layer(x)
-        assert out.shape == (2, 16, 8, 8)
-
     def test_gradient_flows(self):
         layer = BinaryConv2dSTE(3, 16, 3, padding=1)
         x = torch.randn(2, 3, 8, 8)
@@ -241,18 +189,7 @@ class TestBinaryConv2dSTE:
         assert layer.weight.grad is not None
 
 
-# ---------------------------------------------------------------------------
-# STE full model tests
-# ---------------------------------------------------------------------------
-
-
 class TestBinaryMNISTNetSTE:
-    def test_forward_shape(self):
-        model = BinaryMNISTNetSTE()
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 10)
-
     @pytest.mark.parametrize(
         "model_fn, input_shape",
         [
@@ -270,45 +207,24 @@ class TestBinaryMNISTNetSTE:
             assert p.grad is not None, f"No gradient for {name}"
 
 
-class TestTernaryMNISTNetSTE:
-    def test_forward_shape(self):
-        model = TernaryMNISTNetSTE()
-        x = torch.randn(2, 1, 28, 28)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestBinaryCIFAR10Net:
-    def test_forward_shape(self):
-        model = BinaryCIFAR10Net()
-        x = torch.randn(2, 3, 32, 32)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestBinaryCIFAR10NetSTE:
-    def test_forward_shape(self):
-        model = BinaryCIFAR10NetSTE()
-        x = torch.randn(2, 3, 32, 32)
-        out = model(x)
-        assert out.shape == (2, 10)
-
-
-class TestDiscreteAttention:
-    def test_forward_shape(self):
-        da = DiscreteAttention(dim=32, num_slots=8)
-        x = torch.randn(2, 32)
-        out = da(x)
-        assert out.shape == (2, 32)
+@pytest.mark.parametrize(
+    "build, input_shape, output_shape",
+    [
+        (TernaryMNISTNetSTE, (2, 1, 28, 28), (2, 10)),
+        (BinaryCIFAR10Net, (2, 3, 32, 32), (2, 10)),
+        (BinaryCIFAR10NetSTE, (2, 3, 32, 32), (2, 10)),
+        (lambda: DiscreteAttention(dim=32, num_slots=8), (2, 32), (2, 32)),
+    ],
+    ids=["ternary_mnist_ste", "binary_cifar10", "binary_cifar10_ste", "discrete_attention"],
+)
+def test_forward_shape(build, input_shape, output_shape):
+    torch.manual_seed(0)
+    out = build()(torch.randn(*input_shape))
+    assert out.shape == output_shape
+    assert torch.isfinite(out).all()
 
 
 class TestStaircaseActivation:
-    def test_forward_shape(self):
-        sa = StaircaseActivation(levels=5)
-        x = torch.randn(2, 16)
-        out = sa(x)
-        assert out.shape == (2, 16)
-
     def test_output_values_quantized(self):
         """Output values must be in {0/5, 1/5, 2/5, 3/5, 4/5}."""
         sa = StaircaseActivation(levels=5)
@@ -321,12 +237,6 @@ class TestStaircaseActivation:
 
 
 class TestHardMoELayer:
-    def test_forward_shape(self):
-        moe = HardMoELayer(input_dim=32, hidden_dim=64, num_experts=4)
-        x = torch.randn(2, 32)
-        out = moe(x)
-        assert out.shape == (2, 64)
-
     def test_hard_routing_selects_argmax_expert(self):
         """forward() must return the argmax-gated expert's output (hard top-1),
         not a soft average of the experts."""
@@ -339,26 +249,10 @@ class TestHardMoELayer:
             selected = moe.experts[int(gate_idx[i])](x[i : i + 1])[0]
             assert torch.allclose(out[i], selected, atol=1e-5)
         avg = torch.stack([e(x) for e in moe.experts], dim=1).mean(dim=1)
-        assert not torch.allclose(out, avg, atol=1e-4)  # genuinely hard, not averaging
-
-
-# Full-model forward-shape smoke tests live in TestVmapCompatibility below,
-# which exercises the same forward under vmap + functional_call (the path the
-# optimizer actually uses) and asserts output shape.
-
-
-# ---------------------------------------------------------------------------
-# Soft MoE tests (differentiable baseline)
-# ---------------------------------------------------------------------------
+        assert not torch.allclose(out, avg, atol=1e-4)  # hard threshold, not averaging
 
 
 class TestSoftMoELayer:
-    def test_forward_shape(self):
-        moe = SoftMoELayer(input_dim=32, hidden_dim=64, num_experts=4)
-        x = torch.randn(2, 32)
-        out = moe(x)
-        assert out.shape == (2, 64)
-
     def test_gradient_flows(self):
         moe = SoftMoELayer(input_dim=32, hidden_dim=64, num_experts=4)
         x = torch.randn(2, 32)
@@ -424,11 +318,6 @@ class TestExpertUtilization:
         assert result["max_expert_share"] > 0.90
 
 
-# ---------------------------------------------------------------------------
-# MAX-SAT utility tests
-# ---------------------------------------------------------------------------
-
-
 class TestMaxSATModel:
     def test_forward_returns_scalar(self):
         model = MaxSATModel(num_vars=20)
@@ -465,11 +354,6 @@ class TestEvaluateSatLoss:
         clause_signs = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
         loss = evaluate_sat_loss(soft, clause_vars, clause_signs)
         assert loss.dim() == 0 or loss.numel() == 1
-
-
-# ---------------------------------------------------------------------------
-# Vmap compatibility tests
-# ---------------------------------------------------------------------------
 
 
 class TestVmapCompatibility:
@@ -521,11 +405,6 @@ class TestVmapCompatibility:
         x = torch.randn(*input_shape)
         outputs = self._vmap_test(model, x)
         assert outputs.shape == expected_shape
-
-
-# ---------------------------------------------------------------------------
-# Permutation model tests
-# ---------------------------------------------------------------------------
 
 
 class TestHardPermutationNet:

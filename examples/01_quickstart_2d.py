@@ -18,13 +18,20 @@ Output:
 Run:
   python examples/01_quickstart_2d.py
 """
+
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from pathlib import Path
 
 import torch
+
+# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
+# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
+# Set POLYSTEP_THREADS to override. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
 
 # Allow running directly from a source checkout without `pip install -e .`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -35,6 +42,7 @@ from polystep.solver import PolyStep  # noqa: E402
 # A 2D non-smooth objective: staircase in radius. Minimum at the origin,
 # piecewise-constant in concentric annuli, gradient zero almost everywhere.
 
+
 def staircase_radial(X: torch.Tensor) -> torch.Tensor:
     """Piecewise-constant radial staircase. ``X`` shape: ``(..., 2)``."""
     r = torch.linalg.vector_norm(X, dim=-1)
@@ -43,6 +51,7 @@ def staircase_radial(X: torch.Tensor) -> torch.Tensor:
 
 class StaircaseObjective:
     """Wraps the staircase as a polystep-compatible callable."""
+
     dim = 2
 
     def __call__(self, X: torch.Tensor) -> torch.Tensor:
@@ -88,11 +97,17 @@ def main():
         best_traj.append(c[staircase_radial(c).argmin()])
     best_traj = torch.stack(best_traj)
 
+    if importlib.util.find_spec("matplotlib") is None:
+        print("matplotlib not installed; skipping the figure (pip install matplotlib).")
+        return
+
     import matplotlib.pyplot as plt
     import numpy as np
 
     fig, (ax_left, ax_right) = plt.subplots(
-        1, 2, figsize=(7.0, 2.8),
+        1,
+        2,
+        figsize=(7.0, 2.8),
         gridspec_kw={"width_ratios": [1.0, 1.05]},
         constrained_layout=True,
     )
@@ -107,24 +122,22 @@ def main():
     ax_left.set_xlabel(r"$x_1$")
     ax_left.set_ylabel(r"$x_2$")
     ax_left.set_title("Particles on a piecewise-constant 2D landscape", fontsize=9)
-    plt.colorbar(cf, ax=ax_left, fraction=0.046, pad=0.03,
-                 label=r"$\lfloor 2\,\|x\| \rfloor$")
+    plt.colorbar(cf, ax=ax_left, fraction=0.046, pad=0.03, label=r"$\lfloor 2\,\|x\| \rfloor$")
 
     init_cloud = cloud_history[0].numpy()
     final_cloud = cloud_history[-1].numpy()
-    ax_left.scatter(init_cloud[:, 0], init_cloud[:, 1],
-                    c="white", edgecolors="black", s=18, alpha=0.55, label="init")
-    ax_left.scatter(final_cloud[:, 0], final_cloud[:, 1],
-                    c="#ffce4d", edgecolors="black", s=26, alpha=0.95,
-                    label="final", zorder=5)
+    ax_left.scatter(init_cloud[:, 0], init_cloud[:, 1], c="white", edgecolors="black", s=18, alpha=0.55, label="init")
+    ax_left.scatter(
+        final_cloud[:, 0], final_cloud[:, 1], c="#ffce4d", edgecolors="black", s=26, alpha=0.95, label="final", zorder=5
+    )
     bt = best_traj.numpy()
     ax_left.plot(bt[:, 0], bt[:, 1], color="#ffce4d", lw=1.0, alpha=0.6, zorder=4)
-    ax_left.scatter([0.0], [0.0], marker="*", c="#e84040", s=110,
-                    edgecolors="black", linewidths=0.5, label="optimum", zorder=6)
+    ax_left.scatter(
+        [0.0], [0.0], marker="*", c="#e84040", s=110, edgecolors="black", linewidths=0.5, label="optimum", zorder=6
+    )
     ax_left.legend(loc="upper right", fontsize=7, frameon=True, framealpha=0.9)
 
-    ax_right.plot(range(1, len(cost_history) + 1), cost_history,
-                  color="#0072B2", lw=1.4)
+    ax_right.plot(range(1, len(cost_history) + 1), cost_history, color="#0072B2", lw=1.4)
     ax_right.set_xlabel("PolyStep iteration")
     ax_right.set_ylabel("Entropic OT cost")
     ax_right.set_title("Solver cost decreases monotonically", fontsize=9)

@@ -15,6 +15,7 @@ Covers:
 - Anderson regression-check guard rejects bad combined iterates
 - Anderson history is per-call (implicit restart on epsilon change)
 - Anderson depth clamp: lstsq is well-defined for ``k in {1..5}``
+- an outer BF16 autocast does not bleed into the solver internals
 """
 
 from __future__ import annotations
@@ -24,17 +25,12 @@ import warnings
 import pytest
 import torch
 
-from polystep import SinkhornSolver
+from polystep import SinkhornSolver, SoftmaxSolver
 
 
 def _gaussian_cost(P, V, dtype=torch.float32, seed=0, scale=1.0):
     g = torch.Generator().manual_seed(seed)
     return torch.randn(P, V, generator=g, dtype=dtype) * scale
-
-
-# ---------------------------------------------------------------------------
-# Log-sum-exp safety
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -62,11 +58,6 @@ def test_sinkhorn_lse_safety(dtype, scale):
     assert torch.isfinite(result.g).all(), "g has non-finite entries"
 
 
-# ---------------------------------------------------------------------------
-# epsilon-scheduled warm start - rescaling preserves convergence
-# ---------------------------------------------------------------------------
-
-
 def test_warmstart_rescale_stays_finite_on_large_eps_ratio():
     """Warm-start duals are clamped after the eps/init_eps rescale, so a large
     ratio cannot blow the plan to Inf/NaN when max_iterations < check_every."""
@@ -86,11 +77,6 @@ def test_warmstart_rescale_stays_finite_on_large_eps_ratio():
             init_eps=init_eps,
         )
         assert torch.isfinite(res.matrix).all()
-
-
-# ---------------------------------------------------------------------------
-# marginal-constraint enforcement
-# ---------------------------------------------------------------------------
 
 
 def test_sinkhorn_marginals_satisfied_at_convergence():
@@ -132,11 +118,6 @@ def test_sinkhorn_marginals_satisfied_at_convergence():
     )
 
 
-# ---------------------------------------------------------------------------
-# ties symmetry
-# ---------------------------------------------------------------------------
-
-
 def test_sinkhorn_ties_yield_symmetric_transport():
     """Equal cost rows must produce equal transport rows (broken by
     symmetry, not numerical noise)."""
@@ -155,11 +136,6 @@ def test_sinkhorn_ties_yield_symmetric_transport():
     T = result.matrix
     assert torch.allclose(T[0], T[1], atol=1e-5), f"rows 0 and 1 should be equal; got diff {(T[0] - T[1]).abs().max()}"
     assert torch.allclose(T[2], T[3], atol=1e-5), f"rows 2 and 3 should be equal; got diff {(T[2] - T[3]).abs().max()}"
-
-
-# ---------------------------------------------------------------------------
-# divergence detector
-# ---------------------------------------------------------------------------
 
 
 def test_sinkhorn_omega_default_is_safe():
@@ -200,16 +176,12 @@ def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
     assert diverg, f"expected divergence-detector warning on ill-conditioned cost with omega=1.95; got warnings: {msgs}"
 
 
-# ---------------------------------------------------------------------------
-# omega sweep
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("omega", [0.5, 0.7, 1.0, 1.3, 1.5, 1.7, 1.9, 1.95])
 def test_sinkhorn_omega_sweep(omega):
-    """Record iteration counts across omega values on an ill-conditioned
-    cost. This test asserts the solver does not produce non-finite duals at
-    any value in [0.5, 1.95]; omega=1.98 is rejected by validation."""
+    """Duals stay finite across the whole valid omega range on an ill-conditioned cost.
+
+    omega=1.98 is rejected by validation, so 1.95 is the top of the range.
+    """
     P, V = 32, 64
     C = _gaussian_cost(P, V, scale=100.0)
     solver = SinkhornSolver(
@@ -223,16 +195,6 @@ def test_sinkhorn_omega_sweep(omega):
         warnings.simplefilter("ignore")
         result = solver.solve(C)
     assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all(), f"omega={omega} produced non-finite duals"
-
-
-# ---------------------------------------------------------------------------
-# dual re-centering on cost shift
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Anderson regression-check guard
-# ---------------------------------------------------------------------------
 
 
 def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
@@ -306,11 +268,6 @@ def test_sinkhorn_anderson_overrelaxed_stays_valid():
     assert torch.allclose(res.matrix.sum(dim=1), a, atol=1e-3)
 
 
-# ---------------------------------------------------------------------------
-# Anderson restart on epsilon change (per-call history)
-# ---------------------------------------------------------------------------
-
-
 def test_sinkhorn_anderson_history_resets_per_call():
     """Anderson history is local to each `solve()` call (created inside
     the convergence-checking branch). Verify by running two solves with
@@ -333,11 +290,6 @@ def test_sinkhorn_anderson_history_resets_per_call():
     assert r1.converged and r2.converged
 
 
-# ---------------------------------------------------------------------------
-# Anderson depth clamp
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("depth", [1, 2, 3, 5])
 def test_sinkhorn_anderson_depth_well_defined(depth):
     """Anderson works for depth=1 (k=0) up to depth=5 (k=4)."""
@@ -355,3 +307,30 @@ def test_sinkhorn_anderson_depth_well_defined(depth):
         result = solver.solve(C)
     assert result.converged, f"depth={depth} failed to converge"
     assert torch.isfinite(result.f).all(), f"depth={depth} produced NaN/Inf"
+
+
+@pytest.mark.parametrize("solver_cls", [SoftmaxSolver, SinkhornSolver])
+def test_solver_disables_outer_bf16_autocast(solver_cls):
+    """An outer ``autocast(bfloat16)`` must not reach the solver internals.
+
+    Without the autocast-disable wrapper inside the solver, the outer autocast
+    downcasts intermediates and the transport matrix comes back BF16, whose 7
+    mantissa bits collapse the row-max trick once the cost spread passes ~15 nats.
+    """
+    P, V = 8, 16
+    torch.manual_seed(0)
+    C = torch.randn(P, V) * 5.0
+    solver = (
+        solver_cls(epsilon=0.5)
+        if solver_cls is SoftmaxSolver
+        else solver_cls(epsilon=0.5, max_iterations=200, threshold=1e-4)
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+            result = solver.solve(C)
+
+    assert result.matrix.dtype == torch.float32, (
+        f"outer autocast leaked into solver: result dtype = {result.matrix.dtype}"
+    )

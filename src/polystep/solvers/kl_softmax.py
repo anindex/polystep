@@ -39,8 +39,8 @@ from typing import Optional, Union
 
 import torch
 
-from ..costs import scale_cost_matrix
-from ._prelude import align_marginal, recenter_cost, sanitize_cost
+from ..costs import resolve_cost_scale
+from ._prelude import align_dual, align_marginal, recenter_cost, sanitize_cost, validate_positive
 from .base import SolverResult
 
 
@@ -97,20 +97,29 @@ class KLSoftmaxSolver:
         init_g: Optional[torch.Tensor] = None,
         scale_cost: Optional[Union[str, float]] = None,
     ) -> SolverResult:
-        # Shared prelude: FP32 promotion for LSE stability plus device-side
-        # non-finite handling, then device/dtype-aligned marginals. Sanitizing
-        # before scaling keeps a +Inf penalty out of the 'mean'/'max_cost' scale.
+        # Re-validate: epsilon is a mutable field that schedulers rewrite between
+        # solves, so __post_init__ is not enough (the sibling solvers do the same).
+        validate_positive(self.epsilon, "epsilon", "the entropic temperature")
+        if not math.isfinite(self.lam) and self.lam != float("inf"):
+            raise ValueError(f"lam must be a non-negative number or +inf, got {self.lam!r}.")
+        # Shared prelude: FP32 promotion for LSE stability plus device-side non-finite
+        # handling, then device/dtype-aligned marginals. Sanitizing before scaling keeps
+        # +Inf out of the 'mean'/'max_cost' reduction; the substituted penalty is relative
+        # to the finite scale so it does not distort that reduction either.
         cost_matrix = sanitize_cost(cost_matrix)
         n, m = cost_matrix.shape
         device, dtype = cost_matrix.device, cost_matrix.dtype
         a = align_marginal(a, n, device, dtype, "a")
         b = align_marginal(b, m, device, dtype, "b")
 
-        # Optional cost rescaling (on the already-sanitized, finite cost).
-        C = scale_cost_matrix(cost_matrix, scale_cost)
-        # Recenter to min(C)=0 so the log-sum-exp updates and the exp((f+g-C)/eps)
-        # plan keep FP32 precision when |C| is much larger than eps.
-        C, cost_shift = recenter_cost(C)
+        # Recenter to min(C)=0 BEFORE the optional rescale: the plan is invariant to
+        # a constant cost shift but 'mean'/'max_cost' are not, so scaling first ties
+        # the effective temperature to the arbitrary absolute loss level. Recentering
+        # also keeps the log-sum-exp updates and the exp((f+g-C)/eps) plan in FP32
+        # range when |C| is much larger than eps.
+        C, cost_shift = recenter_cost(cost_matrix)
+        cost_scale = resolve_cost_scale(C, scale_cost)
+        C = C / cost_scale
 
         eps = float(self.epsilon)
         alpha = self.alpha
@@ -121,16 +130,19 @@ class KLSoftmaxSolver:
         # Disable any outer mixed-precision autocast inside the iteration -
         # downcast LSE to BF16 collapses the dual potentials.
         with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
-            f = (
-                init_f.to(dtype=dtype, device=device).clone()
-                if init_f is not None
-                else torch.zeros(n, device=device, dtype=dtype)
-            )
-            g = (
-                init_g.to(dtype=dtype, device=device).clone()
-                if init_g is not None
-                else torch.zeros(m, device=device, dtype=dtype)
-            )
+            # align_dual moves the warm start onto (device, dtype) and rejects a
+            # shape mismatch. A raw .to().clone() let a (1, m) init_g broadcast
+            # through the updates and produced a 3-D "transport matrix".
+            f = align_dual(init_f, n, device, dtype, "init_f")
+            g = align_dual(init_g, m, device, dtype, "init_g")
+            if f is None:
+                f = torch.zeros(n, device=device, dtype=dtype)
+            if g is None:
+                g = torch.zeros(m, device=device, dtype=dtype)
+            # Drop a non-finite warm start rather than propagate it into the LSE.
+            if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
+                f = torch.zeros(n, device=device, dtype=dtype)
+                g = torch.zeros(m, device=device, dtype=dtype)
 
             # Special-case alpha == 0 (softmax limit): single closed-form.
             if alpha == 0.0:
@@ -157,7 +169,9 @@ class KLSoftmaxSolver:
                             (f_new - f).abs().amax(),
                             (g_new - g).abs().amax(),
                         )
-                        if delta.item() < threshold:
+                        # ``<=`` so threshold=0 means "converge on an exact fixed
+                        # point" rather than "never converge".
+                        if delta.item() <= threshold:
                             f, g = f_new, g_new
                             converged = True
                             n_iters = it + 1
@@ -175,19 +189,18 @@ class KLSoftmaxSolver:
                 )
                 P = torch.where(torch.isfinite(P), P, torch.zeros_like(P))
 
-            # Undo the recenter shift so cost is <C_scaled, P> (sum(P) == a.sum()).
-            cost = ((C * P).sum() + cost_shift * a.sum()).item()
+            # Undo both frame changes so cost is <C_raw, P> (sum(P) == a.sum()).
+            cost = ((C * P).sum() * cost_scale + cost_shift * a.sum()).item()
 
-            # Theorem 4.1 instrumentation: KL(P^T 1 || b).
-            # P^T 1 is the realized column marginal; b is the target.
-            # KL = sum_j q_j * log(q_j / b_j) with q = P^T 1.
-            try:
-                col_marginal = P.sum(dim=0).clamp(min=1e-30)
-                b_safe = b.clamp(min=1e-30)
-                kl = (col_marginal * (col_marginal.log() - b_safe.log())).sum().item()
-                self.last_marginal_violation = float(kl)
-            except Exception:  # noqa: BLE001
-                self.last_marginal_violation = float("nan")
+            # Theorem 4.1 instrumentation: generalized KL(P^T 1 || b), which is the
+            # divergence this solver actually penalizes. q = P^T 1 is the realized
+            # column marginal; b is the target. The -q+b mass terms are what keep it
+            # non-negative when sum(q) != sum(b); without them an unbalanced problem
+            # reports a spuriously large (or negative) violation.
+            col_marginal = P.sum(dim=0).clamp(min=1e-30)
+            b_safe = b.clamp(min=1e-30)
+            kl = (col_marginal * (col_marginal.log() - b_safe.log()) - col_marginal + b_safe).sum().item()
+            self.last_marginal_violation = float(kl)
 
         return SolverResult(
             matrix=P,

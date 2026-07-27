@@ -17,7 +17,7 @@ from typing import Optional, Union
 
 import torch
 
-from ..costs import scale_cost_matrix
+from ..costs import resolve_cost_scale
 from ._prelude import align_marginal, recenter_cost, sanitize_cost, validate_positive
 from .base import SolverResult
 
@@ -88,7 +88,7 @@ class SoftmaxSolver:
         # SinkhornSolver; warn loudly so the constraint isn't silently dropped.
         if b is not None:
             uniform = torch.full_like(b, 1.0 / V)
-            if not torch.allclose(b.to(uniform.dtype), uniform, atol=1e-6):
+            if not torch.allclose(b.to(device=uniform.device, dtype=uniform.dtype), uniform, atol=1e-6):
                 warnings.warn(
                     "SoftmaxSolver ignores the target marginal `b`: it only "
                     "enforces row sums equal to the source marginal `a`. "
@@ -103,10 +103,13 @@ class SoftmaxSolver:
         device, dtype = cost_matrix.device, cost_matrix.dtype
         a = align_marginal(a, P, device, dtype)
 
-        C = scale_cost_matrix(cost_matrix, scale_cost)
-        # softmax is shift-invariant, so recentering leaves the weights unchanged
-        # while min(C)=0 avoids a +inf logit that would NaN the softmax at tiny eps.
-        C, cost_shift = recenter_cost(C)
+        # Recenter BEFORE scaling. softmax is shift-invariant but 'mean'/'max_cost'
+        # are not, so scaling first would let the arbitrary absolute loss level set
+        # the effective temperature. min(C)=0 also avoids a +inf logit that would
+        # NaN the softmax at tiny eps.
+        C, cost_shift = recenter_cost(cost_matrix)
+        cost_scale = resolve_cost_scale(C, scale_cost)
+        C = C / cost_scale
 
         # ``epsilon > 0`` is enough to avoid division-by-zero, but
         # eps=1e-30 with cost_max~10 still overflows -C/epsilon before
@@ -132,13 +135,18 @@ class SoftmaxSolver:
         # Pin the whole block inside an autocast-disabled context so an outer
         # mixed-precision region can't downcast intermediates back to BF16.
         with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
-            W = torch.softmax(-C / self.epsilon, dim=-1)
+            # Shift per row, not just globally, before dividing. torch.softmax
+            # subtracts the row max only *after* the division, so at tiny epsilon a
+            # row whose entries all sit above the global minimum sends every logit to
+            # -inf and the row comes back NaN. Softmax is row-wise shift-invariant,
+            # so this changes nothing except which values reach the exponent.
+            W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / self.epsilon, dim=-1)
 
             # Row sums equal source marginal a
             transport = W * a.to(W.dtype).unsqueeze(-1)
 
-            # Undo the recenter shift so the reported cost is <C_scaled, transport>.
-            ent_cost = ((C * transport).sum() + cost_shift * a.to(W.dtype).sum()).item()
+            # Undo both frame changes so the reported cost is <C_raw, transport>.
+            ent_cost = ((C * transport).sum() * cost_scale + cost_shift * a.to(W.dtype).sum()).item()
 
         return SolverResult(
             matrix=transport,

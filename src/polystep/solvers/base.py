@@ -21,7 +21,9 @@ class SolverResult:
         cost: Regularized cost scalar.
         f: First dual potential (Sinkhorn) or None (softmax).
         g: Second dual potential (Sinkhorn) or None (softmax).
-        converged: Whether the solver converged within tolerance.
+        converged: Whether the solver converged within tolerance. In a
+            fixed-iteration mode (``threshold <= 0``) no marginal residual is
+            measured, so this reports only that the duals came back finite.
         n_iters: Number of iterations actually run.
         ent_reg_cost: Entropic regularized cost of the transport plan. For the
             Sinkhorn dual this is <f, a> + <g, b> - eps * sum_ij P_ij (true plan

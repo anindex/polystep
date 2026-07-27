@@ -6,13 +6,13 @@ assignment vector. The integer rounding step is treated as a black box
 and the piecewise-constant SAT objective is optimized without
 surrogate gradients.
 
-This is the headline scaling result from the paper, reduced to a single
+The main scaling result from the paper, reduced to a single
 runnable script. The hyperparameters mirror the 10K row of
 ``experiments/runners/run_maxsat.py`` (sqrt-scaled from a 100K reference).
 
 Hardware:
   Default: 10,000 variables, ~42,700 clauses. Best on a CUDA GPU with
-  >=4 GB free; runs on CPU in a few minutes.
+  >=4 GB free; runs on one CPU core in about 50 s.
   ``--small``: 2,000 variables, ~8,500 clauses. Completes on CPU in <60s.
 
 What you should see:
@@ -29,16 +29,23 @@ Run:
   python examples/04_maxsat_10k.py             # 10K vars, GPU recommended
   python examples/04_maxsat_10k.py --small     # 2K vars, CPU-friendly
 """
+
 from __future__ import annotations
 
 import argparse
 import math
+import importlib.util
 import os
 import sys
 import time
 from pathlib import Path
 
 import torch
+
+# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
+# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
+# Set POLYSTEP_THREADS to override. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
 
 # Allow running directly from a source checkout without `pip install -e .`.
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,14 +69,15 @@ REFERENCE_PROBE_RADIUS_TARGET = 20.0
 def scaled_radii(num_vars: int):
     s = math.sqrt(num_vars / REFERENCE_NUM_VARS)
     return (
-        REFERENCE_STEP_RADIUS_INIT * s, REFERENCE_STEP_RADIUS_TARGET * s,
-        REFERENCE_PROBE_RADIUS_INIT * s, REFERENCE_PROBE_RADIUS_TARGET * s,
+        REFERENCE_STEP_RADIUS_INIT * s,
+        REFERENCE_STEP_RADIUS_TARGET * s,
+        REFERENCE_PROBE_RADIUS_INIT * s,
+        REFERENCE_PROBE_RADIUS_TARGET * s,
     )
 
 
 @torch.no_grad()
-def sat_ratio(model: MaxSATModel, clause_vars: torch.Tensor,
-              clause_signs: torch.Tensor) -> float:
+def sat_ratio(model: MaxSATModel, clause_vars: torch.Tensor, clause_signs: torch.Tensor) -> float:
     hard = torch.round(torch.sigmoid(model.assignments))
     gathered = hard[clause_vars]
     literals = gathered * clause_signs + (1.0 - clause_signs) * (1.0 - gathered)
@@ -79,11 +87,13 @@ def sat_ratio(model: MaxSATModel, clause_vars: torch.Tensor,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--small", action="store_true",
-                        help="Use 2,000 variables for a CPU-friendly run.")
-    parser.add_argument("--steps", type=int, default=1500,
-                        help="Number of PolyStep iterations. 1500 gives "
-                             "comfortable margin above 98%% SAT.")
+    parser.add_argument("--small", action="store_true", help="Use 2,000 variables for a CPU-friendly run.")
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=1500,
+        help="Number of PolyStep iterations. 1500 gives comfortable margin above 98%% SAT.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -96,6 +106,9 @@ def main():
     print("=" * 60)
     print(f"MAX-SAT (3-SAT): {num_vars} vars at phase-transition density")
     print("=" * 60)
+
+    if importlib.util.find_spec("pysat") is None:
+        raise SystemExit("this example generates its instance through pysat: pip install python-sat")
 
     instance = generate_maxsat_instance(num_vars=num_vars, ratio=4.27, seed=seed)
     print(f"  variables: {instance['num_vars']:,}")
@@ -164,17 +177,19 @@ def main():
     print(f"  wallclock: {elapsed:.1f}s ({args.steps} steps)")
     print("=" * 60)
 
+    if importlib.util.find_spec("matplotlib") is None:
+        print("matplotlib not installed; skipping the figure (pip install matplotlib).")
+        return
+
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(1, 1, figsize=(5.0, 2.8), constrained_layout=True)
-    ax.plot(step_log, sat_log, color="#0072B2", lw=1.5, marker="o",
-            markersize=3, label="PolyStep")
+    ax.plot(step_log, sat_log, color="#0072B2", lw=1.5, marker="o", markersize=3, label="PolyStep")
     ax.axhline(1.0, color="#009E73", ls=":", lw=1.0, label="all clauses sat")
     ax.set_xlabel("PolyStep step")
     ax.set_ylabel("Fraction of clauses satisfied")
     ax.set_title(
-        f"3-SAT phase transition ({num_vars:,} vars, "
-        f"{instance['num_clauses']:,} clauses)",
+        f"3-SAT phase transition ({num_vars:,} vars, {instance['num_clauses']:,} clauses)",
         fontsize=9,
     )
     ax.set_ylim(min(0.85, sat_log[0] - 0.02), 1.005)

@@ -38,10 +38,6 @@ from torch import Tensor
 from .utils import BenchmarkResult
 
 
-# ---------------------------------------------------------------------------
-# Check for optional dependencies
-# ---------------------------------------------------------------------------
-
 _HAS_EVOTORCH = False
 _EVOTORCH_ERROR = None
 try:
@@ -72,10 +68,6 @@ def has_nevergrad() -> bool:
     """Check if Nevergrad is available."""
     return _HAS_NEVERGRAD
 
-
-# ---------------------------------------------------------------------------
-# EvoTorch CMA-ES Implementation
-# ---------------------------------------------------------------------------
 
 if _HAS_EVOTORCH:
 
@@ -378,11 +370,6 @@ def train_cmaes(
     )
 
 
-# ---------------------------------------------------------------------------
-# Nevergrad ES Implementation
-# ---------------------------------------------------------------------------
-
-
 def train_nevergrad(
     model: nn.Module,
     train_data: Tensor,
@@ -561,11 +548,6 @@ def train_nevergrad(
         convergence_epoch=None,
         epoch_logs=epoch_logs,
     )
-
-
-# ---------------------------------------------------------------------------
-# Utility functions for benchmark scripts
-# ---------------------------------------------------------------------------
 
 
 def check_gradient_free_deps() -> Tuple[bool, bool, str]:

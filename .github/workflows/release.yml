@@ -8,8 +8,45 @@ on:
   release:
     types: [published]
 
+env:
+  # Same reason as ci.yml: the default PyPI torch drags in ~2.7 GB of nvidia-* CUDA
+  # wheels on a runner with no GPU, which is slow and crowds the disk.
+  UV_TORCH_BACKEND: cpu
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
 jobs:
+  # The matrix in ci.yml runs on push and pull_request, which does not guarantee it
+  # ever ran on the tagged commit. Re-run the gate here so a release cannot publish
+  # code that has not passed tests and lint at that exact revision. Keep the lint and
+  # test commands identical to ci.yml, or the release gate is the weaker of the two.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the tag matches the packaged version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(python -c "import re,pathlib;print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/polystep/__init__.py').read_text()).group(1))")
+          CITATION=$(python -c "import re,pathlib;print(re.search(r'^version: (.+)$', pathlib.Path('CITATION.cff').read_text(), re.M).group(1).strip())")
+          echo "tag=$TAG packaged=$VERSION citation=$CITATION"
+          test "$TAG" = "$VERSION"
+          test "$TAG" = "$CITATION"
+      - name: Check the changelog has a section for this version
+        run: grep -q "^## ${GITHUB_REF_NAME#v} " CHANGELOG.md
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: |
+          ruff check src/polystep/ tests/ examples/ experiments/scripts/
+          ruff format --check src/polystep/ tests/ examples/ experiments/scripts/
+      - name: Test
+        run: pytest tests/ -q -m "not slow and not gpu" --timeout=120 -n auto
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -26,5 +63,7 @@ jobs:
           uv venv
           uv pip install dist/*.whl
           .venv/bin/python -c "import polystep; from polystep import *"
+      - name: Verify py.typed ships in the wheel
+        run: .venv/bin/python -c "import importlib.resources, polystep; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

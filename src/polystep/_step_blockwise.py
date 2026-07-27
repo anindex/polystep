@@ -1,7 +1,4 @@
-"""Block-wise step methods: per-block and subspace+block OT solves.
-
-Extracted from optimizer.py for maintainability.
-"""
+"""Block-wise step methods: per-block and subspace+block OT solves."""
 
 from __future__ import annotations
 
@@ -20,12 +17,16 @@ from .blockwise import (
     blocks_to_layout_flat_batch,
 )
 from .costs import scale_cost_matrix
-from .solvers._prelude import sanitize_cost
-from .dynamics import apply_momentum, compute_momentum_coefficient, update_adaptive_radius
-from .geometry import get_random_rotation_matrices
+from .solvers._prelude import loss_buffer_dtype, recenter_cost, sanitize_cost
+from .dynamics import (
+    apply_momentum,
+    compute_momentum_coefficient,
+    update_radius_multiplier,
+    update_stagnation,
+)
+from .geometry import apply_biased_rotation, get_random_rotation_matrices
 from .solvers import SinkhornSolver
 from .solvers.base import SolverResult
-from .adaptive_subspace import AdaptiveSubspace
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,6 @@ def step_blockwise(opt, closure: Callable) -> float:
     block_X_2d = block_flat.reshape(-1, opt._particle_dim)
     all_block_particles = split_particles(block_X_2d, blocks)
 
-    # Resolve OT epsilon
     ent_eps = opt._get_ent_epsilon(iteration)
     ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
@@ -88,7 +88,10 @@ def step_blockwise(opt, closure: Callable) -> float:
     # Per-block descent directions for biased rotation (populated from previous step)
     _block_descent_dirs = getattr(opt, "_prev_block_descent_directions", None)
 
-    probes = opt._probes.to(device=device, dtype=X.dtype)
+    # Cache the transfer instead of calling .to() every step, matching the monolithic path.
+    if opt._probes.device != device or opt._probes.dtype != X.dtype:
+        opt._probes = opt._probes.to(device=device, dtype=X.dtype)
+    probes = opt._probes
     chunk = opt.chunk_size or 1024  # default chunk for block-wise
 
     # base_flat holds every block at its current value and is invariant across
@@ -113,12 +116,11 @@ def step_blockwise(opt, closure: Callable) -> float:
         P_block = block_X.shape[0]
 
         # Per-block polytope
-        block_polytope_verts = opt._block_polytopes[block_idx].to(
-            device=device,
-            dtype=X.dtype,
-        )
+        block_polytope_verts = opt._block_polytopes[block_idx]
+        if block_polytope_verts.device != device or block_polytope_verts.dtype != X.dtype:
+            block_polytope_verts = block_polytope_verts.to(device=device, dtype=X.dtype)
+            opt._block_polytopes[block_idx] = block_polytope_verts
 
-        # Rotation matrices
         rot_mats = get_random_rotation_matrices(
             P_block,
             block_dim,
@@ -127,11 +129,6 @@ def step_blockwise(opt, closure: Callable) -> float:
             generator=opt._generator,
         )
 
-        # Apply biased rotation per block. We keep the elementwise
-        # Gram-Schmidt loop here on purpose: per-layer block_dim is
-        # typically <=128 and small batched QR via cuSOLVER measured
-        # slower than this loop on RTX 5090. The monolithic step uses
-        # one big QR for the opposite reason.
         if (
             opt.biased_rotation
             and _block_descent_dirs is not None
@@ -139,25 +136,8 @@ def step_blockwise(opt, closure: Callable) -> float:
             and _block_descent_dirs[block_idx] is not None
             and _block_descent_dirs[block_idx].shape == (P_block, block_dim)
         ):
-            bias_dir = _block_descent_dirs[block_idx]
-            bias_norms = torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
-            bias_dir_norm = bias_dir / bias_norms
-            rot_mats_orig = rot_mats.clone()
-            rot_mats[:, :, 0] = bias_dir_norm
-            for col in range(1, block_dim):
-                v = rot_mats[:, :, col].clone()
-                for prev_col in range(col):
-                    proj = (v * rot_mats[:, :, prev_col]).sum(dim=-1, keepdim=True)
-                    v = v - proj * rot_mats[:, :, prev_col]
-                raw_norm = torch.norm(v, dim=-1, keepdim=True)
-                norms_v = raw_norm.clamp(min=1e-10)
-                mask = (raw_norm > 1e-6).float()
-                rot_mats[:, :, col] = mask * (v / norms_v) + (1 - mask) * rot_mats_orig[:, :, col]
-            dets = torch.det(rot_mats)
-            flip = (dets < 0).unsqueeze(-1)
-            rot_mats[:, :, -1] = torch.where(flip, -rot_mats[:, :, -1], rot_mats[:, :, -1])
+            rot_mats = apply_biased_rotation(rot_mats, _block_descent_dirs[block_idx])
 
-        # Rotate + translate
         X_vertices, rotated = opt._compiled.rotate_and_translate(
             rot_mats,
             block_polytope_verts,
@@ -179,8 +159,9 @@ def step_blockwise(opt, closure: Callable) -> float:
         P, V, K, D = X_probe.shape
         total_evals = P * V * K
 
-        losses_list = []
+        losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
         _all_indices = torch.arange(total_evals, device=device)
+        _d_offsets = torch.arange(D, device=device)
         for chunk_start in range(0, total_evals, chunk):
             chunk_end = min(chunk_start + chunk, total_evals)
             chunk_size_actual = chunk_end - chunk_start
@@ -188,7 +169,7 @@ def step_blockwise(opt, closure: Callable) -> float:
             # Refill the reuse buffer with base_flat instead of allocating a
             # fresh (chunk x total_flat_size) tensor each chunk.
             base_batch = base_batch_buf[:chunk_size_actual]
-            base_batch.copy_(base_flat.unsqueeze(0).expand(chunk_size_actual, -1))
+            base_batch.copy_(base_flat)
 
             global_indices = _all_indices[chunk_start:chunk_end]  # view, no alloc
             i_idx = global_indices // (V * K)
@@ -196,11 +177,11 @@ def step_blockwise(opt, closure: Callable) -> float:
             v_idx = vk // K
             k_idx = vk % K
 
-            # Vectorized scatter: replace probed particle rows in each config
-            local_range = torch.arange(chunk_size_actual, device=device)
+            # Replace probed particle rows in each config, all D coordinates in one
+            # scatter instead of one indexed assignment per coordinate.
             row_starts = block.flat_start + i_idx * D
-            for d in range(D):
-                base_batch[local_range, row_starts + d] = X_probe[i_idx, v_idx, k_idx, d]
+            col_idx = row_starts.unsqueeze(1) + _d_offsets  # (chunk, D)
+            base_batch.scatter_(1, col_idx, X_probe[i_idx, v_idx, k_idx])
 
             # Map block-indexed flat vector to layout-indexed flat vector.
             # Per-layer blocks pad each entry independently, creating
@@ -215,10 +196,8 @@ def step_blockwise(opt, closure: Callable) -> float:
             batched_params = opt.layout.batch_unflatten(batch_for_layout)
             chunk_losses = closure(batched_params)
             # Ensure FP32 for Sinkhorn solver numerical stability
-            chunk_losses = chunk_losses.float()
-            losses_list.append(chunk_losses)
+            losses[chunk_start:chunk_end] = chunk_losses.to(losses.dtype)
 
-        losses = torch.cat(losses_list, dim=0)
         if K == 1:
             # K=1 fast path: no averaging needed
             cost_matrix = losses.reshape(P, V)
@@ -233,7 +212,7 @@ def step_blockwise(opt, closure: Callable) -> float:
         block_a = torch.ones(P_block, device=device, dtype=X.dtype) / P_block
         if opt._use_fused_softmax:
             # Fused path: softmax + vertex-free projection in one compiled call.
-            scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
+            scaled_cost = scale_cost_matrix(recenter_cost(cost_matrix)[0], opt.scale_cost)
             X_new_block, transport_matrix = opt._compiled.fused_softmax_project(
                 scaled_cost,
                 ot_epsilon,
@@ -289,7 +268,6 @@ def step_blockwise(opt, closure: Callable) -> float:
                     solve_bw_kwargs["init_eps"] = last_eps
             ot_result = opt.solver.solve(**solve_bw_kwargs)
 
-            # Barycentric projection
             X_new_block = opt._compiled.barycentric_projection(
                 ot_result.matrix,
                 block_a,
@@ -362,13 +340,16 @@ def step_blockwise(opt, closure: Callable) -> float:
             opt._prev_block_descent_directions = None
         _blockwise_nan_reverted = True
 
-    # Capture transport direction for amortized OT (matching monolithic L1660-1678)
+    # Capture transport direction for amortized OT.
     if opt.amortize_steps > 1:
         if _blockwise_nan_reverted:
             opt._transport_direction = None
             opt._transport_direction_ema = None
         else:
-            raw_direction = (state.X - X).detach()
+            # Pure OT step, taken before momentum. Reading state.X here would fold in
+            # beta * velocity, which the next cheap step re-applies on top of its own
+            # momentum. The monolithic step captures X_bary - X for the same reason.
+            raw_direction = (X_new_full - X).detach()
             opt._transport_direction = raw_direction
             alpha = opt.amortize_ema
             if opt._transport_direction_ema is None:
@@ -378,26 +359,35 @@ def step_blockwise(opt, closure: Callable) -> float:
 
     # Reduce per-block accumulators with one host transfer each.
     total_model_loss = torch.stack(block_model_loss_terms).sum().item() if block_model_loss_terms else 0.0
-    total_disp = torch.stack(block_disp_terms).sum().item() if block_disp_terms else 0.0
+    # On a revert state.X is back at X, so the per-block accumulator describes a move
+    # that did not happen; reporting it puts an inf in the displacement history.
+    total_disp = (
+        0.0 if _blockwise_nan_reverted else (torch.stack(block_disp_terms).sum().item() if block_disp_terms else 0.0)
+    )
 
     # Adaptive radius (use model loss, not OT regularized cost)
     avg_model_loss = total_model_loss / num_blocks_counted if num_blocks_counted > 0 else total_ent_cost
+    # Tracked unconditionally: absorb_mode="stagnation" reads this counter, which
+    # use_adaptive_radius (default False) does not gate.
+    _prev_loss_for_radius = state.prev_loss
+    state.stagnation_count, state.prev_loss = update_stagnation(
+        avg_model_loss,
+        state.prev_loss,
+        state.stagnation_count,
+        stagnation_threshold=opt.stagnation_threshold,
+    )
     if opt.use_adaptive_radius:
-        rm, sc, pl = update_adaptive_radius(
+        state.radius_multiplier, state.stagnation_count = update_radius_multiplier(
             avg_model_loss,
-            state.prev_loss,
+            _prev_loss_for_radius,
             state.stagnation_count,
             state.radius_multiplier,
-            stagnation_threshold=opt.stagnation_threshold,
             stagnation_patience=opt.stagnation_patience,
             radius_increase=opt.radius_increase,
             radius_decrease=opt.radius_decrease,
             radius_min=opt.radius_min,
             radius_max=opt.radius_max,
         )
-        state.radius_multiplier = rm
-        state.stagnation_count = sc
-        state.prev_loss = pl
 
     # Update diagnostics
     disp_sqnorm = total_disp / total_particles if total_particles > 0 else 0.0
@@ -435,8 +425,9 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     1. Global subspace projection: Compresses full params (e.g., 100M) to
        subspace coords (e.g., 256), reducing memory and enabling cross-layer
        information sharing via the global projection matrix P.
-    2. Per-block OT decomposition: Splits subspace coords into blocks for
-       independent OT solves, reducing OT cost from O(N^2) to O(N^2/L).
+    2. Per-block OT decomposition: L independent Sinkhorn solves over P/L rows
+       each instead of one solve over P. The forward count is unchanged: an
+       orthoplex spends 2*subspace_dim*K evaluations either way.
 
     Algorithm:
     a) Get current subspace coords from state.X (flattened)
@@ -487,16 +478,20 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     # Get subspace dimension
     sub_dim = opt.subspace.subspace_dim
 
+    # Cache the coord-to-param projection for this step, before any rotation below,
+    # so probes and the end-of-step _sync_model share one basis.
+    opt._update_sampling_projection()
+    proj_used = opt._sampling_projection if opt._sampling_projection is not None else state.projection
+
     # Save pre-step subspace coords for displacement tracking
     _pre_step_sub_coords = None
-    if opt._adaptive or (opt._cma_subspace and (opt.use_covariance_adaptation or opt.use_csa)):
+    if opt._adaptive or opt._cma_subspace:
         _pre_step_sub_coords = state.X.reshape(-1)[:sub_dim].clone()
 
     # Split subspace coords into per-block particles
     subspace_coords_flat = X.reshape(-1)[:sub_dim]
     all_block_particles = split_subspace_to_blocks(subspace_coords_flat, blocks)
 
-    # Resolve OT epsilon
     ent_eps = opt._get_ent_epsilon(iteration)
     ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
@@ -512,14 +507,19 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     total_particles = 0
     num_blocks_counted = 0
 
-    probes = opt._probes.to(device=device, dtype=X.dtype)
+    # Cache the transfer instead of calling .to() every step, matching the monolithic path.
+    if opt._probes.device != device or opt._probes.dtype != X.dtype:
+        opt._probes = opt._probes.to(device=device, dtype=X.dtype)
+    probes = opt._probes
     chunk = opt.chunk_size or 512  # default chunk for combined mode
 
     # base_subspace holds every block's coords and is invariant across the block
     # loop (updates are applied after it). Build it once and reuse one scatter
     # buffer for every block and chunk.
     base_subspace = reassemble_blocks_to_subspace(all_block_particles, blocks, sub_dim)
-    base_batch_buf = base_subspace.new_empty((chunk, sub_dim))
+    # One trailing scratch column absorbs writes for the padded tail of the last block,
+    # so the perturbation scatter needs no validity mask and no host sync.
+    base_batch_buf = base_subspace.new_empty((chunk, sub_dim + 1))
 
     # Per-block descent directions for biased rotation (populated from previous step)
     _block_descent_dirs = getattr(opt, "_prev_block_descent_directions", None)
@@ -540,10 +540,10 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         P_block = block_X.shape[0]
 
         # Per-block polytope (in subspace_particle_dim space)
-        block_polytope_verts = opt._subspace_block_polytopes[block_idx].to(
-            device=device,
-            dtype=X.dtype,
-        )
+        block_polytope_verts = opt._subspace_block_polytopes[block_idx]
+        if block_polytope_verts.device != device or block_polytope_verts.dtype != X.dtype:
+            block_polytope_verts = block_polytope_verts.to(device=device, dtype=X.dtype)
+            opt._subspace_block_polytopes[block_idx] = block_polytope_verts
 
         # Rotation matrices for this block
         rot_mats = get_random_rotation_matrices(
@@ -554,7 +554,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             generator=opt._generator,
         )
 
-        # Same Gram-Schmidt-vs-QR trade-off as in step_blockwise() above.
+        # Same QR-based biased rotation as step_blockwise() above.
         if (
             opt.biased_rotation
             and _block_descent_dirs is not None
@@ -562,25 +562,8 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             and _block_descent_dirs[block_idx] is not None
             and _block_descent_dirs[block_idx].shape == (P_block, block_dim)
         ):
-            bias_dir = _block_descent_dirs[block_idx]
-            bias_norms = torch.norm(bias_dir, dim=-1, keepdim=True).clamp(min=1e-10)
-            bias_dir_norm = bias_dir / bias_norms
-            rot_mats_orig = rot_mats.clone()
-            rot_mats[:, :, 0] = bias_dir_norm
-            for col in range(1, block_dim):
-                v = rot_mats[:, :, col].clone()
-                for prev_col in range(col):
-                    proj = (v * rot_mats[:, :, prev_col]).sum(dim=-1, keepdim=True)
-                    v = v - proj * rot_mats[:, :, prev_col]
-                raw_norm = torch.norm(v, dim=-1, keepdim=True)
-                norms_v = raw_norm.clamp(min=1e-10)
-                mask = (raw_norm > 1e-6).float()
-                rot_mats[:, :, col] = mask * (v / norms_v) + (1 - mask) * rot_mats_orig[:, :, col]
-            dets = torch.det(rot_mats)
-            flip = (dets < 0).unsqueeze(-1)
-            rot_mats[:, :, -1] = torch.where(flip, -rot_mats[:, :, -1], rot_mats[:, :, -1])
+            rot_mats = apply_biased_rotation(rot_mats, _block_descent_dirs[block_idx])
 
-        # Rotate + translate
         X_vertices, rotated = opt._compiled.rotate_and_translate(
             rot_mats,
             block_polytope_verts,
@@ -598,23 +581,24 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
         # Build full params with only this block varying.
         # For each probe (i, v, k):
-        # 1. Create full subspace coords by assembling all blocks
-        # 2. Replace particle i in this block with probe position
-        # 3. Apply global projection P to get full params
-        # 4. Evaluate closure on full params
+        # Create full subspace coords by assembling all blocks
+        # Replace particle i in this block with probe position
+        # Apply global projection P to get full params
+        # Evaluate closure on full params
         P, V, K, D = X_probe.shape
         total_evals = P * V * K
 
-        losses_list = []
+        losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
         _all_indices = torch.arange(total_evals, device=device)
+        _d_offsets = torch.arange(D, device=device)
         for chunk_start in range(0, total_evals, chunk):
             chunk_end = min(chunk_start + chunk, total_evals)
             chunk_size_actual = chunk_end - chunk_start
 
             # Refill the reuse buffer with base_subspace instead of allocating a
             # fresh (chunk x sub_dim) tensor each chunk, then perturb this block.
-            base_batch = base_batch_buf[:chunk_size_actual]
-            base_batch.copy_(base_subspace.unsqueeze(0).expand(chunk_size_actual, -1))
+            padded_batch = base_batch_buf[:chunk_size_actual]
+            padded_batch[:, :sub_dim].copy_(base_subspace)
 
             global_indices = _all_indices[chunk_start:chunk_end]  # view, no alloc
             i_idx = global_indices // (V * K)
@@ -622,34 +606,32 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             v_idx = vk // K
             k_idx = vk % K
 
-            # Replace particle i in this block (vectorized)
+            # Replace particle i in this block, all D coordinates in one scatter.
             # Block flat range: [block.flat_start, block.flat_end)
             # Particle i occupies: [block.flat_start + i*D, block.flat_start + (i+1)*D)
+            # Columns past sub_dim are the last block's padded tail and go to the scratch
+            # column, sliced off below. A per-d loop with a boolean mask instead costs one
+            # host sync per coordinate per chunk per block.
             row_starts = block.flat_start + i_idx * D
-            local_range = torch.arange(chunk_size_actual, device=device)
-            # Handle case where row_end exceeds sub_dim (padding region)
-            for d in range(D):
-                col_idx = row_starts + d
-                valid = col_idx < sub_dim
-                if valid.any():
-                    base_batch[local_range[valid], col_idx[valid]] = X_probe[
-                        i_idx[valid], v_idx[valid], k_idx[valid], d
-                    ]
+            col_idx = row_starts.unsqueeze(1) + _d_offsets  # (chunk, D)
+            col_idx = torch.where(col_idx < sub_dim, col_idx, sub_dim)
+            padded_batch.scatter_(1, col_idx, X_probe[i_idx, v_idx, k_idx])
+            base_batch = padded_batch[:, :sub_dim]
 
             # Apply global projection to get full params
             # base_batch: (chunk_size, sub_dim)
             # projection: (full_dim, sub_dim)
             # reconstruct_batch needs projection argument for AdaptiveSubspace
             # Match dtype with projection for mixed precision compatibility
-            if opt._mixed_precision and state.projection is not None and state.projection.dtype is not None:
-                base_batch = base_batch.to(dtype=state.projection.dtype)
+            if opt._mixed_precision and proj_used is not None and proj_used.dtype is not None:
+                base_batch = base_batch.to(dtype=proj_used.dtype)
             if opt._adaptive or opt._cma_subspace:
                 chunk_params = state.subspace.reconstruct_batch(
-                    state.projection,
+                    proj_used,
                     state.base_params,
                     base_batch,
                 )
-            elif opt._hybrid:
+            elif opt._per_layer_projections:
                 chunk_params = state.subspace.reconstruct_batch(
                     state.hybrid_projections,
                     state.base_params,
@@ -664,10 +646,8 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             # Evaluate full model via closure
             chunk_losses = closure(chunk_params)
             # Ensure FP32 for Sinkhorn solver numerical stability
-            chunk_losses = chunk_losses.float()
-            losses_list.append(chunk_losses)
+            losses[chunk_start:chunk_end] = chunk_losses.to(losses.dtype)
 
-        losses = torch.cat(losses_list, dim=0)
         if K == 1:
             # K=1 fast path: no averaging needed
             cost_matrix = losses.reshape(P, V)
@@ -681,7 +661,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         opt.solver.epsilon = ot_epsilon
         block_a = torch.ones(P_block, device=device, dtype=X.dtype) / P_block
         if opt._use_fused_softmax:
-            scaled_cost = scale_cost_matrix(cost_matrix, opt.scale_cost)
+            scaled_cost = scale_cost_matrix(recenter_cost(cost_matrix)[0], opt.scale_cost)
             X_new_block, transport_matrix = opt._compiled.fused_softmax_project(
                 scaled_cost,
                 ot_epsilon,
@@ -814,13 +794,16 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             opt._prev_block_descent_directions = None
         _blockwise_nan_reverted = True
 
-    # Capture transport direction for amortized OT (matching monolithic L1660-1678)
+    # Capture transport direction for amortized OT.
     if opt.amortize_steps > 1:
         if _blockwise_nan_reverted:
             opt._transport_direction = None
             opt._transport_direction_ema = None
         else:
-            raw_direction = (state.X - X).detach()
+            # Pure OT step, taken before momentum. Reading state.X here would fold in
+            # beta * velocity, which the next cheap step re-applies on top of its own
+            # momentum. The monolithic step captures X_bary - X for the same reason.
+            raw_direction = (X_new_full - X).detach()
             opt._transport_direction = raw_direction
             alpha = opt.amortize_ema
             if opt._transport_direction_ema is None:
@@ -830,26 +813,35 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
     # Reduce per-block accumulators with one host transfer each.
     total_model_loss = torch.stack(block_model_loss_terms).sum().item() if block_model_loss_terms else 0.0
-    total_disp = torch.stack(block_disp_terms).sum().item() if block_disp_terms else 0.0
+    # On a revert state.X is back at X, so the per-block accumulator describes a move
+    # that did not happen; reporting it puts an inf in the displacement history.
+    total_disp = (
+        0.0 if _blockwise_nan_reverted else (torch.stack(block_disp_terms).sum().item() if block_disp_terms else 0.0)
+    )
 
     # Adaptive radius (use model loss, not OT regularized cost)
     avg_model_loss = total_model_loss / num_blocks_counted if num_blocks_counted > 0 else total_ent_cost
+    # Tracked unconditionally: absorb_mode="stagnation" reads this counter, which
+    # use_adaptive_radius (default False) does not gate.
+    _prev_loss_for_radius = state.prev_loss
+    state.stagnation_count, state.prev_loss = update_stagnation(
+        avg_model_loss,
+        state.prev_loss,
+        state.stagnation_count,
+        stagnation_threshold=opt.stagnation_threshold,
+    )
     if opt.use_adaptive_radius:
-        rm, sc, pl = update_adaptive_radius(
+        state.radius_multiplier, state.stagnation_count = update_radius_multiplier(
             avg_model_loss,
-            state.prev_loss,
+            _prev_loss_for_radius,
             state.stagnation_count,
             state.radius_multiplier,
-            stagnation_threshold=opt.stagnation_threshold,
             stagnation_patience=opt.stagnation_patience,
             radius_increase=opt.radius_increase,
             radius_decrease=opt.radius_decrease,
             radius_min=opt.radius_min,
             radius_max=opt.radius_max,
         )
-        state.radius_multiplier = rm
-        state.stagnation_count = sc
-        state.prev_loss = pl
 
     # Update diagnostics
     disp_sqnorm = total_disp / total_particles if total_particles > 0 else 0.0
@@ -874,16 +866,17 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     state.epsilon = current_eps
     state.last_solve_eps = ot_epsilon
 
-    # Adaptive subspace: displacement tracking, absorb, and rotation
-    # For combined mode with AdaptiveSubspace, handle synchronized absorb
-    if opt._adaptive and isinstance(opt.subspace, AdaptiveSubspace):
+    # Adaptive subspace: displacement tracking, absorb, and rotation.
+    # CMAAdaptiveSubspace wraps AdaptiveSubspace by composition, not inheritance, so
+    # it must be tested separately or CMA runs never rotate or absorb.
+    if opt._adaptive or opt._cma_subspace:
         adaptive_sub = opt.subspace
 
-        # 1. Compute displacement in subspace coords
+        # Compute displacement in subspace coords
         post_step_sub_coords = state.X.reshape(-1)[: adaptive_sub.subspace_dim]
         displacement = post_step_sub_coords - _pre_step_sub_coords
 
-        # 2. Update displacement history (rolling buffer)
+        # Update displacement history (rolling buffer)
         idx = state.displacement_history_idx
         state.displacement_history[idx] = displacement
         state.displacement_history_idx = (idx + 1) % adaptive_sub.displacement_history_size
@@ -892,7 +885,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             adaptive_sub.displacement_history_size,
         )
 
-        # 3. Check for synchronized absorb trigger
+        # Check for synchronized absorb trigger
         # In combined mode, absorb resets ALL blocks to zero and rotates global P
         should_absorb = adaptive_sub.should_absorb(
             state.stagnation_count,
@@ -903,7 +896,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             # SYNCHRONIZED ABSORB: fold perturbation into base, zero ALL block coords
             full_flat_sub = state.X.reshape(-1)[: adaptive_sub.subspace_dim]
             new_base, _zeroed = adaptive_sub.absorb(
-                state.projection,
+                proj_used,
                 state.base_params,
                 full_flat_sub,
             )
@@ -927,20 +920,19 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                     device=state.X.device,
                     dtype=state.X.dtype,
                 )
-            # Reset displacement history
             state.displacement_history.zero_()
             state.displacement_history_idx = 0
             state.displacement_history_count = 0
             # Reset ALL block duals (cost landscape changed)
             state.block_duals = [(None, None) for _ in blocks]
-            # Increment absorb count
             state.absorb_count += 1
-            # Invalidate cached cost/probe state (cost landscape changed after absorb)
-            opt._prev_cost_matrix = None
-            opt._prev_losses_3d = None
-            opt._prev_displacement_sqnorms = None
-            opt._prev_k_eff = None
-            opt._prev_step_r = None
+            # Clear the stagnation counter, else absorb_mode='stagnation' stays
+            # triggered on a plateau and redraws the basis every step. The absorb
+            # re-anchors the origin, so the old loss history no longer applies.
+            state.stagnation_count = 0
+            state.prev_loss = avg_model_loss
+            # Invalidate cached cost/probe state (cost landscape changed after absorb).
+            opt._invalidate_reuse_cache()
             opt._newton_direction = None
             opt._prev_descent_direction = None
             opt._prev_descent_direction_finite = False
@@ -956,7 +948,17 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 state.C_diag = torch.ones_like(state.C_diag)
                 state.sigma = 1.0
         else:
-            # Rotate projection basis for next step
+            # Re-anchor the coordinate origin, then rotate the basis for next step.
+            # The represented point is base + P @ coords, so replacing P while coords
+            # are non-zero moves the weights with no evaluation behind it. Folding
+            # coords into base first makes rotation point-preserving.
+            state.base_params, _ = adaptive_sub.absorb(
+                proj_used,
+                state.base_params,
+                state.X.reshape(-1)[: adaptive_sub.subspace_dim],
+            )
+            state.X = torch.zeros_like(state.X)
+
             # Sparse projection: use seed increment instead of QR rotation
             from .projection import SparseRandomProjection
 
@@ -983,6 +985,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
                 )
             # Reset ALL block duals after rotation (cost geometry changed)
             state.block_duals = [(None, None) for _ in blocks]
+            opt._invalidate_reuse_cache()
 
     # Write back to model
     opt._sync_model()

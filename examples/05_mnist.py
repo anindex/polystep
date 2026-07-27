@@ -6,8 +6,8 @@ explicit per-epoch training loop with best-state tracking. Downloads
 MNIST data directly (no torchvision dependency).
 
 What you should see:
-  ~95% test accuracy after 15 epochs on GPU (~3 min).
-  ~96% with 30 epochs (matches paper headline).
+  ~95% test accuracy after 15 epochs (~3 min on one CPU core).
+  ~96% with 30 epochs (matches the paper).
   Best-state tracking restores the peak accuracy across epochs.
 
 Output:
@@ -17,6 +17,7 @@ Run:
   python examples/05_mnist.py
   python examples/05_mnist.py --device cuda --epochs 10
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,6 +29,16 @@ from urllib.request import urlretrieve
 
 import numpy as np
 import torch
+
+# On CPU, PolyStep issues many small tensor ops per step, where torch's intra-op pool
+# costs more than the arithmetic. On CUDA the forward runs on the device and pinning
+# only slows the host side, so leave torch's default there (measured 845s pinned
+# against 794s free on this example, identical accuracy). See docs/performance.md.
+_threads = os.environ.get("POLYSTEP_THREADS")
+if _threads:
+    torch.set_num_threads(int(_threads))
+elif not torch.cuda.is_available():
+    torch.set_num_threads(1)
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -36,10 +47,6 @@ from polystep.epsilon import CosineEpsilon
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
-
-# ---------------------------------------------------------------------------
-# MNIST data loading (raw IDX files - no torchvision required)
-# ---------------------------------------------------------------------------
 
 MNIST_URL = "https://storage.googleapis.com/cvdf-datasets/mnist/"
 MNIST_FILES = {
@@ -94,10 +101,6 @@ def get_mnist_loaders(data_dir: str = "/tmp/mnist", batch_size: int = 512):
     )
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
 class MNISTNet(nn.Module):
     """Two-layer MLP (101K parameters)."""
 
@@ -123,18 +126,12 @@ def evaluate(model: nn.Module, loader: DataLoader) -> float:
     return correct / total
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(description="MNIST with PolyStep")
-    parser.add_argument("--epochs", type=int, default=15,
-                        help="Training epochs (paper uses 30 for 96%%).")
+    parser.add_argument("--epochs", type=int, default=15, help="Training epochs (paper uses 30 for 96%%).")
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str,
-                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -153,9 +150,7 @@ def main():
     # Cosine schedules: broad exploration early -> fine exploitation late.
     total_steps = args.epochs * len(train_loader)
     layout = ParamLayout.from_module(model)
-    subspace = HybridSubspace.from_layout(layout, rank=8,
-                                          rotation_interval=0,
-                                          absorb_interval=0)
+    subspace = HybridSubspace.from_layout(layout, rank=8, rotation_interval=0, absorb_interval=0)
 
     eps_init, eps_target = 10.0, 0.1
     sr_init, sr_target = 5.0, 1.0
@@ -167,13 +162,9 @@ def main():
         subspace=subspace,
         solver="softmax",
         num_probe=1,
-        chunk_size=1024,
-        epsilon=CosineEpsilon(init=eps_init, target=eps_target,
-                              decay=(eps_init - eps_target) / total_steps),
-        step_radius=CosineEpsilon(init=sr_init, target=sr_target,
-                                  decay=(sr_init - sr_target) / total_steps),
-        probe_radius=CosineEpsilon(init=pr_init, target=pr_target,
-                                   decay=(pr_init - pr_target) / total_steps),
+        epsilon=CosineEpsilon(init=eps_init, target=eps_target, decay=(eps_init - eps_target) / total_steps),
+        step_radius=CosineEpsilon(init=sr_init, target=sr_target, decay=(sr_init - sr_target) / total_steps),
+        probe_radius=CosineEpsilon(init=pr_init, target=pr_target, decay=(pr_init - pr_target) / total_steps),
         amortize_steps=3,
         amortize_ema=0.7,
         compile=(device.type == "cuda"),
@@ -209,6 +200,10 @@ def main():
             def closure(stacked_params, _in=inputs, _tgt=targets):
                 return evaluator.evaluate(stacked_params, _in, _tgt)
 
+            # Hand-rolled loops must register the evaluator themselves. Without it the
+            # step can only reach the objective through closure(), so the fused in-place
+            # and sparse-delta evaluators never run. api.train() does this for you.
+            optimizer.register_evaluator(evaluator, inputs, targets)
             optimizer.step(closure)
 
             with torch.no_grad():
@@ -223,8 +218,7 @@ def main():
             best_acc = test_acc
             best_state = copy.deepcopy(model.state_dict())
 
-        print(f"  epoch {epoch:2d} | loss={avg_loss:.4f} | "
-              f"test={100 * test_acc:.1f}% | best={100 * best_acc:.1f}%")
+        print(f"  epoch {epoch:2d} | loss={avg_loss:.4f} | test={100 * test_acc:.1f}% | best={100 * best_acc:.1f}%")
 
     # Restore best checkpoint
     if best_state is not None:
@@ -239,4 +233,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

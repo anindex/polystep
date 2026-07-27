@@ -18,12 +18,7 @@ from polystep.costs import scale_cost_matrix
 from polystep._compiled import _fused_softmax_project
 from polystep.geometry import get_orthoplex_vertices, get_random_rotation_matrices
 from polystep.solvers import SinkhornSolver, SoftmaxSolver, TemperedSoftmaxSolver
-from polystep.solvers._prelude import align_dual, align_marginal, sanitize_cost
-
-
-# --------------------------------------------------------------------------
-# Fused vs non-fused softmax: scale_cost must be honored identically
-# --------------------------------------------------------------------------
+from polystep.solvers._prelude import align_dual, align_marginal, recenter_cost, sanitize_cost
 
 
 @pytest.mark.parametrize("scale_cost", ["mean", "max_cost", 2.0, None])
@@ -52,8 +47,9 @@ def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
     # Non-fused reference (sanitizes internally)
     ref = SoftmaxSolver(epsilon=eps).solve(cost, a=a, scale_cost=scale_cost).matrix
 
-    # Fused path as wired in the optimizer: step sanitizes, branch scales.
-    scaled = scale_cost_matrix(sanitize_cost(cost), scale_cost)
+    # Fused path as wired in the optimizer: step sanitizes, branch recenters then
+    # scales (recenter first, or the data-dependent divisor is not shift-invariant).
+    scaled = scale_cost_matrix(recenter_cost(sanitize_cost(cost))[0], scale_cost)
     _, fused_T = _fused_softmax_project(
         scaled,
         eps,
@@ -66,11 +62,6 @@ def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
     )
     assert torch.isfinite(fused_T).all()
     assert torch.allclose(ref, fused_T, atol=1e-5)
-
-
-# --------------------------------------------------------------------------
-# Input validation guards
-# --------------------------------------------------------------------------
 
 
 def test_num_probe_zero_raises():
@@ -99,11 +90,6 @@ def test_sinkhorn_epsilon_revalidated_per_solve():
 def test_check_every_must_be_positive():
     with pytest.raises(ValueError, match="check_every"):
         SinkhornSolver(check_every=0)
-
-
-# --------------------------------------------------------------------------
-# Shared prelude behavior
-# --------------------------------------------------------------------------
 
 
 def test_sanitize_cost_promotes_and_replaces_nonfinite():

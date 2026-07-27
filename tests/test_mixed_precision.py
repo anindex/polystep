@@ -89,20 +89,18 @@ class TestMixedPrecisionStep:
             compile=False,
         )
 
-        captured_dtype = [None]
-
-        # Monkey-patch to capture dtype
+        # Observe what the solver returns, not a value the test computes itself. The
+        # previous version called sanitize_cost inside the patch and asserted on that,
+        # so it passed even if the solver iterated entirely in BF16.
+        captured = {}
         original_solve = opt.solver.solve
 
         def patched_solve(cost_matrix, **kwargs):
-            # Under mixed_precision the BF16 forward yields a BF16 cost matrix;
-            # the guarantee is that the solver promotes it to FP32 (sanitize_cost)
-            # so the log-domain Sinkhorn stays numerically stable. Assert the
-            # promotion, not the pre-promotion entry dtype.
-            from polystep.solvers._prelude import sanitize_cost
-
-            captured_dtype[0] = sanitize_cost(cost_matrix).dtype
-            return original_solve(cost_matrix, **kwargs)
+            result = original_solve(cost_matrix, **kwargs)
+            captured["entry"] = cost_matrix.dtype
+            captured["plan"] = result.matrix.dtype
+            captured["duals"] = None if result.f is None else result.f.dtype
+            return result
 
         opt.solver.solve = patched_solve
 
@@ -121,7 +119,13 @@ class TestMixedPrecisionStep:
             return losses
 
         opt.step(closure)
-        assert captured_dtype[0] == torch.float32, "Sinkhorn must run the cost matrix in FP32"
+        assert captured, "solver was never called"
+        assert captured["plan"] == torch.float32, (
+            f"Sinkhorn returned a {captured['plan']} plan; BF16's 7 mantissa bits collapse "
+            f"the log-domain row-max trick (entry dtype was {captured['entry']})"
+        )
+        if captured["duals"] is not None:
+            assert captured["duals"] == torch.float32, f"duals came back {captured['duals']}"
 
 
 class TestMixedPrecisionSubspace:
@@ -174,6 +178,7 @@ class TestProjectionDtype:
 class TestBF16SupportDetection:
     """Test BF16 support detection logic."""
 
+    @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_bf16_support(self):
         """GPU BF16 support based on compute capability."""

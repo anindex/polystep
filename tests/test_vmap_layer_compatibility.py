@@ -33,11 +33,6 @@ from polystep.layers import VmapSafeMultiHeadAttention, VmapSafeLSTM
 from polystep.transform import ParamLayout
 
 
-# ---------------------------------------------------------------------------
-# ParamLayout dedup of tied weights
-# ---------------------------------------------------------------------------
-
-
 class _TiedHead(nn.Module):
     """embedding.weight = lm_head.weight: classic transformer tie."""
 
@@ -88,11 +83,6 @@ def test_tied_weights_unflatten_aliased():
     assert sd["embedding.weight"].data_ptr() == sd["lm_head.weight"].data_ptr()
 
 
-# ---------------------------------------------------------------------------
-# dp divisibility padding round-trip
-# ---------------------------------------------------------------------------
-
-
 def test_dp_padding_round_trip_does_not_mutate_state_dict():
     """flatten -> unflatten must produce a state_dict identical to the
     original (within dtype rounding) and must not expose padding bytes
@@ -121,17 +111,12 @@ def test_dp_padding_round_trip_does_not_mutate_state_dict():
         assert torch.allclose(sd[k], orig[k]), f"value mismatch on {k}"
 
 
-# ---------------------------------------------------------------------------
-# nn.LSTM under vmap (issue #105982) and nn.MultiheadAttention float
-# mask (issue #107084) - record the upstream pitfalls so a future PyTorch
-# release that fixes them will fail this test and prompt removal of the
-# VmapSafe layers.
-# ---------------------------------------------------------------------------
-
-
 def test_upstream_nn_lstm_fails_under_vmap():
-    """Documented PyTorch issue #105982. If this ever passes, the
-    workaround in VmapSafeLSTM can be removed."""
+    """Documented PyTorch issue #105982, the reason VmapSafeLSTM exists.
+
+    Matching the specific error keeps this honest. A bare ``except Exception: pass``
+    passes on any failure, including a typo in the test itself, so it could never fail.
+    """
     lstm = nn.LSTM(4, 8, num_layers=1, batch_first=True)
     params = {k: v.detach() for k, v in lstm.named_parameters()}
     buffers = {k: v.detach() for k, v in lstm.named_buffers()}
@@ -140,13 +125,9 @@ def test_upstream_nn_lstm_fails_under_vmap():
     def call(p):
         return functional_call(lstm, {**p, **buffers}, (x,))[0]
 
-    # Stack 3 candidate parameter sets.
     stacked = {k: torch.stack([v, v, v], dim=0) for k, v in params.items()}
-    try:
+    with pytest.raises(RuntimeError, match="Batching rule not implemented|does not support|Cannot access data pointer"):
         vmap(call, in_dims=(0,))(stacked)
-        pytest.skip("nn.LSTM now works under vmap (PyTorch fixed #105982); consider removing VmapSafeLSTM.")
-    except Exception:
-        pass  # expected: upstream vmap does not support nn.LSTM
 
 
 def test_vmap_safe_lstm_works_under_vmap():
@@ -164,22 +145,12 @@ def test_vmap_safe_lstm_works_under_vmap():
     assert out.shape == (3, 2, 5, 8)
 
 
-# ---------------------------------------------------------------------------
-# sqrt(head_dim) scale
-# ---------------------------------------------------------------------------
-
-
 def test_vmap_safe_attention_scales_by_sqrt_head_dim():
     embed_dim, num_heads = 64, 8
     head_dim = embed_dim // num_heads  # 8
     attn = VmapSafeMultiHeadAttention(embed_dim, num_heads)
     assert math.isclose(attn.scale, 1.0 / math.sqrt(head_dim))
     assert not math.isclose(attn.scale, 1.0 / math.sqrt(embed_dim))
-
-
-# ---------------------------------------------------------------------------
-# bool attn_mask must mask-fill (-inf), not add
-# ---------------------------------------------------------------------------
 
 
 def test_vmap_safe_attention_bool_mask_zeros_attention():
@@ -220,11 +191,6 @@ def test_vmap_safe_attention_bool_mask_zeros_attention():
     )
 
 
-# ---------------------------------------------------------------------------
-# NotImplementedError for unsupported configs
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -257,11 +223,6 @@ def test_vmap_safe_attention_raises_on_unsupported_forward_kwargs(forward_kwargs
         attn(x, x, x, **forward_kwargs)
 
 
-# ---------------------------------------------------------------------------
-# VmapSafeLSTM raises on unsupported configs / PackedSequence
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -282,11 +243,6 @@ def test_vmap_safe_lstm_raises_on_packed_sequence():
     packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
     with pytest.raises(NotImplementedError, match="PackedSequence"):
         lstm(packed)
-
-
-# ---------------------------------------------------------------------------
-# state_dict round-trip BF16 + tied weights
-# ---------------------------------------------------------------------------
 
 
 def test_state_dict_roundtrip_bf16_with_tied_weights():

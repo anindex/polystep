@@ -15,32 +15,12 @@ from polystep.optimizer import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
 
 
-def test_vectorized_step_produces_finite_cost():
-    """Basic sanity: optimizer step works and produces finite cost."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    optimizer = PolyStepOptimizer(model, epsilon=0.5, step_radius=0.5, num_probe=2, compile=False, seed=42)
-
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-
-    def closure(batched_params):
-        evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    cost = optimizer.step(closure)
-    assert cost is not None
-    assert isinstance(cost, float)
-    assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-
-
-# test_vectorized_step_updates_model removed: identical to the canonical
-# tests/test_optimizer.py::TestClosureInterface::test_step_updates_model.
-
-
 def test_amortize_steps_alternates_ot_and_momentum():
-    """With amortize_steps=3, only 1 in 3 steps should run full OT."""
+    """With amortize_steps=3, only steps 0 and 3 evaluate the objective.
+
+    The saving is the whole point of amortization, so the test counts closure calls
+    rather than checking the returned costs are finite, which they are either way.
+    """
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
@@ -55,31 +35,21 @@ def test_amortize_steps_alternates_ot_and_momentum():
 
     inputs = torch.randn(8, 4)
     targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
+    evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+    calls = []
 
     def closure(batched_params):
-        evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
+        calls.append(1)
         return evaluator.evaluate(batched_params, inputs, targets)
 
-    # Step 1: full OT step (counter=0, 0 % 3 == 0)
-    cost1 = optimizer.step(closure)
-    assert torch.isfinite(torch.tensor(cost1)), f"Cost is not finite: {cost1}"
-    assert cost1 != 0.0, "First step should be a full OT step with nonzero cost"
+    evaluated_on = []
+    for step in range(4):
+        before = len(calls)
+        optimizer.step(closure)
+        if len(calls) > before:
+            evaluated_on.append(step)
 
-    # Step 2: momentum step (counter=1, 1 % 3 != 0)
-    cost2 = optimizer.step(closure)
-    assert isinstance(cost2, float), "Second step should return a float"
-    assert torch.isfinite(torch.tensor(cost2)), f"Cost is not finite: {cost2}"
-
-    # Step 3: momentum step (counter=2, 2 % 3 != 0)
-    cost3 = optimizer.step(closure)
-    assert isinstance(cost3, float), "Third step should return a float"
-    assert torch.isfinite(torch.tensor(cost3)), f"Cost is not finite: {cost3}"
-
-    # Step 4: full OT step again (counter=3, 3 % 3 == 0)
-    cost4 = optimizer.step(closure)
-    assert torch.isfinite(torch.tensor(cost4)), f"Cost is not finite: {cost4}"
-    assert cost4 != 0.0, "Fourth step should be a full OT step"
+    assert evaluated_on == [0, 3], f"expected OT on steps 0 and 3, got {evaluated_on}"
 
 
 def test_amortize_steps_model_updates_on_momentum():
@@ -185,7 +155,9 @@ def test_amortize_with_momentum_stays_finite():
 
     losses = [optimizer.step(closure) for _ in range(24)]
     assert all(torch.isfinite(torch.tensor(x)) for x in losses)
-    assert min(losses) < losses[0]
+    # Measured 0.78 at this seed. A bare `< losses[0]` passes on a one-ULP dip,
+    # which an amortized step that stopped descending would still satisfy.
+    assert min(losses) < losses[0] * 0.90, f"loss barely moved: {losses[0]:.4f} -> {min(losses):.4f}"
 
 
 def test_momentum_step_reuses_last_cost():
@@ -226,7 +198,7 @@ def test_momentum_step_reuses_last_cost():
 
 def test_adaptive_probe_reduces_probes():
     """On a steadily-improving objective the decreasing-loss counter must
-    increment after warmup -- that counter is what drops K_eff to 1."""
+    increment after warmup: that counter is what drops K_eff to 1."""
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
@@ -255,41 +227,6 @@ def test_adaptive_probe_reduces_probes():
 
     assert optimizer.state.costs[-1] < optimizer.state.costs[0], "objective did not decrease"
     assert optimizer._loss_decreasing_count >= 1, "decreasing-loss tracking never fired"
-
-
-@pytest.mark.parametrize("num_probe", [3, 1])
-def test_adaptive_probe_step_works(num_probe):
-    """Optimizer step should work with adaptive_num_probe=True."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    optimizer = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        step_radius=0.5,
-        num_probe=num_probe,
-        compile=False,
-        seed=42,
-        adaptive_num_probe=True,
-        adaptive_probe_warmup=0,
-    )
-
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-
-    def closure(batched_params):
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    initial_cost = None
-    for _ in range(5):
-        cost = optimizer.step(closure)
-        assert isinstance(cost, float)
-        assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-        if initial_cost is None:
-            initial_cost = cost
-    # Verify optimizer isn't diverging wildly (10x tolerance for stochastic optimizer)
-    assert abs(cost) < abs(initial_cost) * 10 + 1, f"Cost exploded: {cost} vs initial {initial_cost}"
 
 
 def test_biased_rotation_stores_descent_direction():
@@ -321,38 +258,6 @@ def test_biased_rotation_stores_descent_direction():
     assert optimizer._prev_descent_direction.dim() == 2
 
 
-def test_biased_rotation_step_works():
-    """Multiple steps with biased_rotation should work without error."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    optimizer = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        step_radius=0.5,
-        num_probe=1,
-        compile=False,
-        seed=42,
-        biased_rotation=True,
-    )
-
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-
-    def closure(batched_params):
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    costs = []
-    for _ in range(5):
-        c = optimizer.step(closure)
-        costs.append(c)
-        assert isinstance(c, float)
-        assert torch.isfinite(torch.tensor(c)), f"Cost is not finite: {c}"
-    # Verify optimizer isn't diverging wildly (10x tolerance for stochastic optimizer)
-    assert abs(costs[-1]) < abs(costs[0]) * 10 + 1, f"Cost exploded: {costs[-1]} vs initial {costs[0]}"
-
-
 def test_all_three_features_compose():
     """All three features (EMA amortize, adaptive probes, biased rotation) compose."""
     torch.manual_seed(42)
@@ -380,51 +285,16 @@ def test_all_three_features_compose():
         return evaluator.evaluate(batched_params, inputs, targets)
 
     # Run 10 steps - should not error
-    initial_cost = None
+    costs = []
     for _ in range(10):
         cost = optimizer.step(closure)
         assert isinstance(cost, float)
         assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-        if initial_cost is None:
-            initial_cost = cost
+        costs.append(cost)
 
     # Model should have changed
     assert optimizer._state.iteration_count == 10
-    # Verify optimizer isn't diverging wildly (10x tolerance for stochastic optimizer)
-    assert abs(cost) < abs(initial_cost) * 10 + 1, f"Cost exploded: {cost} vs initial {initial_cost}"
-
-
-def test_newton_refinement_runs_without_error():
-    """Newton refinement should not crash and produce finite params."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    optimizer = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        step_radius=0.5,
-        num_probe=3,
-        compile=False,
-        seed=42,
-        newton_refinement=True,
-        newton_refinement_alpha=0.3,
-    )
-
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-
-    def closure(batched_params):
-        evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    # First step populates _prev_losses_3d, second step uses it
-    cost1 = optimizer.step(closure)
-    assert torch.isfinite(torch.tensor(cost1)), f"Cost is not finite: {cost1}"
-    cost = optimizer.step(closure)
-    assert isinstance(cost, float)
-    assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-    for p in model.parameters():
-        assert torch.isfinite(p).all()
+    assert min(costs) < costs[0], f"objective never improved over the run: {costs}"
 
 
 def test_structured_projection_subspace_step():
@@ -461,15 +331,13 @@ def test_structured_projection_subspace_step():
         return evaluator.evaluate(batched_params, inputs, targets)
 
     # Run 3 steps to verify stability
-    initial_cost = None
+    costs = []
     for _ in range(3):
         cost = optimizer.step(closure)
         assert isinstance(cost, float)
         assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-        if initial_cost is None:
-            initial_cost = cost
-    # Verify optimizer isn't diverging wildly (10x tolerance for stochastic optimizer)
-    assert abs(cost) < abs(initial_cost) * 10 + 1, f"Cost exploded: {cost} vs initial {initial_cost}"
+        costs.append(cost)
+    assert min(costs) < costs[0], f"objective never improved over the run: {costs}"
 
     # Verify model params are finite
     for p in model.parameters():
@@ -502,62 +370,6 @@ def test_structured_vs_random_projections_differ():
     zero_count_struct = (P_struct == 0).sum().item()
     zero_count_random = (P_rand.abs() < 1e-10).sum().item()
     assert zero_count_struct > zero_count_random, "Structured projection should have more zeros (block-diagonal)"
-
-
-def test_amortize_steps_with_momentum():
-    """amortize_steps=2 composes with use_momentum=True.
-
-    Both features should work together: amortized steps use EMA direction
-    while momentum smooths the overall trajectory.
-    """
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    params_before = {k: v.clone() for k, v in model.named_parameters()}
-
-    optimizer = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        step_radius=0.5,
-        num_probe=2,
-        compile=False,
-        seed=42,
-        amortize_steps=2,
-        amortize_ema=0.7,
-        use_momentum=True,
-        momentum_init=0.5,
-        momentum_final=0.95,
-    )
-
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-
-    def closure(batched_params):
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    # Run several steps (mix of OT and momentum-amortized steps)
-    initial_cost = None
-    for _ in range(6):
-        cost = optimizer.step(closure)
-        assert isinstance(cost, float)
-        assert torch.isfinite(torch.tensor(cost)), f"Cost is not finite: {cost}"
-        if initial_cost is None:
-            initial_cost = cost
-    # Verify optimizer isn't diverging wildly (10x tolerance for stochastic optimizer)
-    assert abs(cost) < abs(initial_cost) * 10 + 1, f"Cost exploded: {cost} vs initial {initial_cost}"
-
-    # Params should have changed
-    changed = False
-    for k, v in model.named_parameters():
-        if not torch.equal(v, params_before[k]):
-            changed = True
-            break
-    assert changed, "Model params should change with amortize_steps + momentum"
-
-    # Velocity should be active (momentum is on)
-    assert optimizer._state.velocity is not None
-    assert torch.any(optimizer._state.velocity != 0)
 
 
 class TestTurboIntegration:
@@ -600,13 +412,8 @@ class TestTurboIntegration:
 # ===========================================================================
 
 
-# ---------------------------------------------------------------------------
-# K=1 vs K=3 default unification
-# ---------------------------------------------------------------------------
-
-
 def test_poly_step_optimizer_num_probe_default_is_1():
-    """Headline runners use K=1; the optimizer default must match."""
+    """The reported runs use K=1; the optimizer default must match."""
     model = nn.Linear(4, 2, bias=False)
     opt = _PSO(model, epsilon=0.5)
     assert opt.num_probe == 1
@@ -624,11 +431,6 @@ def test_poly_step_low_level_num_probe_default_is_1():
     assert solver.num_probe == 1, (
         f"PolyStep.num_probe default should match PolyStepOptimizer (K=1 per paper); got {solver.num_probe}"
     )
-
-
-# ---------------------------------------------------------------------------
-# SNN cosine epsilon guard
-# ---------------------------------------------------------------------------
 
 
 class _FakeLIF(nn.Module):

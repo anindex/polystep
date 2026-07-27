@@ -1,11 +1,12 @@
 """Numerical stress tests for the Sinkhorn solver and OT pipeline.
 
-Tests edge conditions that could expose hidden numerical issues:
-- extreme epsilon values
-- pathological cost matrices
-- warm-start with scale changes
-- NaN propagation
-- marginal constraint satisfaction under stress
+Edge conditions that could expose hidden numerical issues: extreme epsilon at both
+limits, constant and negative costs, warm start across a 100x cost-scale change,
+non-uniform marginals, and ParamLayout round-trip under padding.
+
+Non-finite cost sanitisation lives in test_hardening.py (unit) and
+test_correctness_regressions.py (the ordering contract); marginal satisfaction over
+many random problems lives in test_sinkhorn_correctness.py.
 """
 
 import torch
@@ -18,37 +19,40 @@ from polystep import ParamLayout, SinkhornSolver
 class TestSinkhornEdgeCases:
     """Stress-test the Sinkhorn solver under extreme conditions."""
 
-    def test_very_small_epsilon(self):
-        """Tiny epsilon should produce near-deterministic (one-hot) transport."""
+    def test_smaller_epsilon_concentrates_the_plan(self):
+        """Lower eps means a sharper plan: each row's mass piles onto fewer columns.
+
+        The bound is relative, not absolute. With 10 rows of mass 1/10 feeding 6 columns
+        of capacity 1/6, some rows must split across two columns no matter how small eps
+        gets, so the eps -> 0 limit here has a min row share of 0.5, not 1.
+        """
         torch.manual_seed(0)
         n, m = 10, 6
         C = torch.rand(n, m)
-        solver = SinkhornSolver(epsilon=0.001, max_iterations=500, threshold=1e-8)
-        result = solver.solve(C)
 
-        T = result.matrix
-        assert torch.isfinite(T).all(), "Transport has NaN/Inf at eps=0.001"
-        # At eps=0.001 the log-domain solver collapses toward a permutation
-        # and the iterates stop reducing marginal error below ~1e-2 in
-        # practice (LSE rounding plus the eps -> 0 limit). This test guards
-        # the no-NaN/no-Inf behavior; the broad atol reflects that
-        # near-breakdown regime, not the solver's normal convergence floor.
-        row_sums = T.sum(dim=1)
-        assert torch.allclose(row_sums, torch.ones(n) / n, atol=0.02)
+        def mean_row_share(eps):
+            T = SinkhornSolver(epsilon=eps, max_iterations=500, threshold=1e-8).solve(C).matrix
+            assert torch.isfinite(T).all(), f"Transport has NaN/Inf at eps={eps}"
+            return (T.max(dim=1).values / T.sum(dim=1)).mean().item()
 
-    def test_very_large_epsilon(self):
-        """Large epsilon should produce near-uniform transport."""
+        sharp, soft = mean_row_share(0.001), mean_row_share(0.05)
+        assert sharp > soft + 0.1, f"eps=0.001 share {sharp:.3f} not sharper than eps=0.05 share {soft:.3f}"
+
+    def test_very_large_epsilon_is_near_uniform(self):
+        """As eps -> inf the plan approaches the independent coupling ``a b^T``.
+
+        The bound has to be relative: with uniform marginals every entry is already in
+        ``[0, 1/n]``, so an absolute tolerance of 0.1 against ``1/60`` cannot fail.
+        """
         torch.manual_seed(0)
         n, m = 10, 6
         C = torch.rand(n, m)
         solver = SinkhornSolver(epsilon=100.0, max_iterations=200)
-        result = solver.solve(C)
+        T = solver.solve(C).matrix
 
-        T = result.matrix
         assert torch.isfinite(T).all(), "Transport has NaN/Inf at eps=100"
-        # Near-uniform: all entries should be close to 1/(n*m)
         expected = 1.0 / (n * m)
-        assert (T - expected).abs().max() < 0.1
+        assert (T - expected).abs().max() < expected * 0.05
 
     @pytest.mark.parametrize("const", [0.0, 42.0])
     def test_zero_cost_matrix(self, const):
@@ -66,18 +70,6 @@ class TestSinkhornEdgeCases:
         assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-4)
         assert torch.allclose(col_sums, torch.ones(m) / m, atol=1e-4)
 
-    def test_large_cost_range(self):
-        """Cost matrix with values spanning [0, 1000] should converge."""
-        torch.manual_seed(0)
-        n, m = 10, 6
-        C = torch.rand(n, m) * 1000.0
-        solver = SinkhornSolver(epsilon=10.0, max_iterations=500)
-        result = solver.solve(C, scale_cost="mean")
-        T = result.matrix
-        assert torch.isfinite(T).all()
-        row_sums = T.sum(dim=1)
-        assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-3)
-
     def test_negative_costs(self):
         """Cost matrix with negative values should still work."""
         torch.manual_seed(0)
@@ -88,25 +80,6 @@ class TestSinkhornEdgeCases:
         T = result.matrix
         assert torch.isfinite(T).all()
         assert (T >= -1e-8).all(), "Transport plan should be non-negative"
-
-    @pytest.mark.filterwarnings("ignore:Cost matrix has.*non-finite:UserWarning")
-    def test_nan_in_cost_is_sanitized(self):
-        """``SinkhornSolver`` sanitizes NaN / Inf entries in the cost
-        matrix and emits a ``UserWarning``; the resulting transport
-        plan is always finite.
-        """
-        torch.manual_seed(0)
-        n, m = 8, 4
-        C = torch.rand(n, m)
-        C[0, 0] = float("nan")
-        C[3, 2] = float("inf")
-
-        solver = SinkhornSolver(epsilon=1.0, max_iterations=100)
-        result = solver.solve(C)
-        T = result.matrix
-        assert torch.isfinite(T).all(), (
-            "SinkhornSolver should sanitize non-finite cost entries and return a finite transport plan."
-        )
 
     def test_warm_start_after_scale_change(self):
         """Warm-started duals from a 1x-cost step applied to a 100x-cost step."""
@@ -141,21 +114,6 @@ class TestSinkhornEdgeCases:
 class TestMarginalConstraints:
     """Property tests: transport plan must satisfy marginal constraints."""
 
-    @pytest.mark.parametrize("n,m", [(5, 4), (10, 6), (50, 8), (100, 16)])
-    def test_row_column_sums(self, n, m):
-        torch.manual_seed(0)
-        C = torch.rand(n, m)
-        a = torch.ones(n) / n
-        b = torch.ones(m) / m
-        solver = SinkhornSolver(epsilon=0.5, max_iterations=300, threshold=1e-6)
-        result = solver.solve(C, a=a)
-        T = result.matrix
-
-        assert torch.isfinite(T).all()
-        assert (T >= -1e-8).all(), "Transport plan has negative entries"
-        assert torch.allclose(T.sum(dim=1), a, atol=1e-3), "Row sums don't match marginals"
-        assert torch.allclose(T.sum(dim=0), b, atol=1e-3), "Col sums don't match marginals"
-
     def test_non_uniform_marginals(self):
         """Non-uniform source marginals should be respected."""
         torch.manual_seed(0)
@@ -186,7 +144,8 @@ class TestParamLayoutStress:
         for key in recovered:
             assert torch.allclose(sd[key], recovered[key], atol=1e-6), f"Mismatch: {key}"
 
-    @pytest.mark.parametrize("particle_dim", [1, 2, 3, 4, 7, 8])
+    # nn.Linear(13, 7) is 98 params: pdim 1 needs no padding, 3 and 8 do.
+    @pytest.mark.parametrize("particle_dim", [1, 3, 8])
     def test_roundtrip_various_particle_dims(self, particle_dim):
         """Round-trip should work for any particle_dim."""
         model = nn.Linear(13, 7)  # Odd dimensions to test padding

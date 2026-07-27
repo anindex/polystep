@@ -37,6 +37,28 @@ def _stable_entry_seed(*parts: object) -> int:
     return int(zlib.adler32(key)) & 0x7FFFFFFF
 
 
+def absorb_due(
+    absorb_mode: str,
+    absorb_patience: int,
+    absorb_interval: int,
+    stagnation_count: int,
+    iteration: int,
+) -> bool:
+    """Whether an absorb-and-rotate is due this step.
+
+    ``"stagnation"`` fires once ``stagnation_count`` reaches ``absorb_patience``; the caller
+    must reset the counter afterwards or the trigger stays true forever. ``"periodic"`` fires
+    on multiples of ``absorb_interval``, skipping iteration 0. Any other mode never fires.
+
+    Shared by every subspace class so the four schedules cannot drift apart.
+    """
+    if absorb_mode == "stagnation":
+        return stagnation_count >= absorb_patience
+    if absorb_mode == "periodic" and absorb_interval > 0:
+        return iteration > 0 and iteration % absorb_interval == 0
+    return False
+
+
 if TYPE_CHECKING:
     from .transform import ParamLayout
 
@@ -82,10 +104,6 @@ class LowRankSubspace:
     rank: int
     subspace_dim: int
     compression_ratio: float
-
-    # ------------------------------------------------------------------
-    # Factory methods
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_layout(cls, layout: ParamLayout, rank: int) -> LowRankSubspace:
@@ -227,10 +245,6 @@ class LowRankSubspace:
             compression_ratio=compression,
         )
 
-    # ------------------------------------------------------------------
-    # Core methods
-    # ------------------------------------------------------------------
-
     def apply_perturbation(
         self,
         base_sd: Dict[str, torch.Tensor],
@@ -355,10 +369,15 @@ class LinearSubspace:
     Unlike LowRankSubspace (B@A, bilinear), this avoids the near-zero gradient
     problem that causes uniform OT transport.
 
-    Note on radius scaling: LinearSubspace requires larger ``step_radius``
-    (typically 30x the default) because the random projection matrix has
-    1/sqrt(N) scaling, which dilutes the perturbation magnitude in full
-    parameter space.
+    Note on radius scaling: LinearSubspace needs a much larger ``step_radius``
+    (typically 30x the default), but not because the projection dilutes the step. The
+    entries are scaled by ``1/sqrt(num_coords)``, so
+    ``E||P c||^2 = (num_params / num_coords) * ||c||^2`` and the map AMPLIFIES by
+    ``sqrt(num_params / num_coords)``. That gain is per layer, so one global
+    ``step_radius`` means a different effective step size in every layer, and the tuned
+    value is compensating for the mixture. ``HybridSubspace`` orthonormalizes instead
+    (unit gain, layer-independent) and is the recommended replacement; the numerics here
+    are left as they are so existing tuned configurations keep working.
 
     Example::
 
@@ -392,10 +411,6 @@ class LinearSubspace:
         self.compression_ratio = compression_ratio
         self.seed = seed
         self._projections: Dict[str, torch.Tensor] = {}
-
-    # ------------------------------------------------------------------
-    # Factory methods
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_layout(
@@ -559,10 +574,6 @@ class LinearSubspace:
         inst._max_subspace_dim = max_subspace_dim
         return inst
 
-    # ------------------------------------------------------------------
-    # Projection matrix generation
-    # ------------------------------------------------------------------
-
     def _get_projection(
         self,
         spec: ProjectionSpec,
@@ -602,16 +613,13 @@ class LinearSubspace:
             dtype=dtype,
             device="cpu",
         )
-        # Scale for unit-variance output
+        # Unit variance per output entry, which makes the whole map amplify by
+        # sqrt(num_params / num_coords). See the class docstring on radius scaling.
         P = P * (1.0 / math.sqrt(spec.num_coords))
         P = P.to(device=device)
 
         self._projections[cache_key] = P
         return P
-
-    # ------------------------------------------------------------------
-    # Core methods
-    # ------------------------------------------------------------------
 
     def apply_perturbation(
         self,
@@ -650,7 +658,7 @@ class LinearSubspace:
         """Vectorized reconstruction for N probe points.
 
         For projected entries: coords @ P.T gives (N, num_params), then reshape.
-        This avoids bmm -- simple matmul.
+        This avoids bmm: simple matmul.
 
         Args:
             base_sd: Base state_dict with original parameter values.

@@ -5,10 +5,12 @@ Single source of truth for the small spiking network used by the
 parameters) so the example finishes in under a couple of minutes on
 CPU and can also drive small 2D loss-landscape visualizations.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -49,7 +51,7 @@ OUTPUT_SCALE = 10.0
 class LIFNeuron(nn.Module):
     """Leaky Integrate-and-Fire neuron with hard threshold spike.
 
-    The spike function ``(mem >= threshold).float()`` is genuinely
+    The spike function ``(mem >= threshold).float()`` is truly
     non-differentiable: ``d(spike)/d(mem) == 0`` almost everywhere, so
     backpropagation through this layer gives zero gradient. PolyStep
     only evaluates the forward pass, so the spike stays as-is.
@@ -106,8 +108,9 @@ class TinySNN(nn.Module):
         return total / self.num_steps
 
 
-def make_dataset(num_samples: int, *, input_dim: int = DEFAULT_INPUT_DIM,
-                 num_classes: int = DEFAULT_NUM_CLASSES, seed: int = 42):
+def make_dataset(
+    num_samples: int, *, input_dim: int = DEFAULT_INPUT_DIM, num_classes: int = DEFAULT_NUM_CLASSES, seed: int = 42
+):
     """Synthetic class-conditional rate-coded dataset.
 
     Each class is a distinct subset of "on" features; samples are noisy
@@ -129,23 +132,38 @@ def make_dataset(num_samples: int, *, input_dim: int = DEFAULT_INPUT_DIM,
     return data, labels
 
 
-def make_loaders(*, num_train: int = DEFAULT_NUM_TRAIN, num_test: int = DEFAULT_NUM_TEST,
-                 batch_size: int = DEFAULT_BATCH_SIZE,
-                 input_dim: int = DEFAULT_INPUT_DIM,
-                 num_classes: int = DEFAULT_NUM_CLASSES, seed: int = 42):
+def make_loaders(
+    *,
+    num_train: int = DEFAULT_NUM_TRAIN,
+    num_test: int = DEFAULT_NUM_TEST,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    input_dim: int = DEFAULT_INPUT_DIM,
+    num_classes: int = DEFAULT_NUM_CLASSES,
+    seed: int = 42,
+):
     train_x, train_y = make_dataset(
-        num_train, input_dim=input_dim, num_classes=num_classes, seed=seed,
+        num_train,
+        input_dim=input_dim,
+        num_classes=num_classes,
+        seed=seed,
     )
     test_x, test_y = make_dataset(
-        num_test, input_dim=input_dim, num_classes=num_classes, seed=seed + 1,
+        num_test,
+        input_dim=input_dim,
+        num_classes=num_classes,
+        seed=seed + 1,
     )
     train_loader = DataLoader(
         TensorDataset(train_x, train_y),
-        batch_size=batch_size, shuffle=True, num_workers=0,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
     )
     test_loader = DataLoader(
         TensorDataset(test_x, test_y),
-        batch_size=batch_size, shuffle=False, num_workers=0,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
     )
     return train_loader, test_loader
 
@@ -153,6 +171,7 @@ def make_loaders(*, num_train: int = DEFAULT_NUM_TRAIN, num_test: int = DEFAULT_
 @dataclass
 class SNNDemoConfig:
     """Hyperparameters for the tiny SNN demo. Tuned for fast CPU runs."""
+
     epsilon: float = 0.5
     step_radius: float = 2.0
     probe_radius: float = 4.0
@@ -160,8 +179,7 @@ class SNNDemoConfig:
     sinkhorn_max_iters: int = 100
 
 
-def make_optimizer(model: nn.Module, *, seed: int = 42,
-                   config: SNNDemoConfig | None = None) -> PolyStepOptimizer:
+def make_optimizer(model: nn.Module, *, seed: int = 42, config: SNNDemoConfig | None = None) -> PolyStepOptimizer:
     """Build the PolyStepOptimizer with SNN-tuned hyperparameters.
 
     Larger radii than typical NN settings (0.15 / 0.3) because the LIF

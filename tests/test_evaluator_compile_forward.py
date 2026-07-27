@@ -5,8 +5,8 @@ graphs) capturing the forward+loss once and replaying it per candidate while the
 swap loop mutates ``param.data`` in place. The one silent-wrongness failure mode
 (flagged by every reviewer): if the graph pools parameters into a static buffer,
 ``.data.copy_`` writes the wrong storage and every candidate replays the SAME
-weights -- distinct configs then yield IDENTICAL losses and OT sees zero contrast,
-with no error. So the load-bearing test is: distinct configs -> distinct losses.
+weights: distinct configs then yield IDENTICAL losses and OT sees zero contrast,
+with no error. So the test is: distinct configs -> distinct losses.
 """
 
 import torch
@@ -76,7 +76,7 @@ def test_compile_forward_matches_eager():
 
 def test_compile_forward_falls_back_on_cpu():
     """On CPU (no CUDA graphs) compile_forward must silently use the eager forward
-    and still return correct distinct losses -- never crash, never go stale."""
+    and still return correct distinct losses: never crash, never go stale."""
     net = _CustomForwardNet()  # CPU
     x = torch.rand(8, 16)
     y = torch.randint(0, 4, (8,))

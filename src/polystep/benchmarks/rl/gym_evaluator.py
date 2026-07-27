@@ -173,9 +173,6 @@ class GymVectorEvaluator:
         except Exception:  # noqa: BLE001
             pass
 
-    # ------------------------------------------------------------------
-    # Core rollout
-    # ------------------------------------------------------------------
     def rollout_stacked_params(
         self,
         stacked_params: Dict[str, torch.Tensor],
@@ -238,9 +235,6 @@ class GymVectorEvaluator:
             successes=successes.to(self.device),
         )
 
-    # ------------------------------------------------------------------
-    # Loss + summary helpers (matches CartPoleEvaluator interface)
-    # ------------------------------------------------------------------
     def loss_for_stacked_params(
         self,
         stacked_params: Dict[str, torch.Tensor],

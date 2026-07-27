@@ -7,6 +7,7 @@
 Consumed by ``run_maxsat.py``, ``run_elevation.py``, ``run_mnist.py``,
 and ``run_moe.py`` under ``experiments/runners/``.
 """
+
 from __future__ import annotations
 
 import random
@@ -163,19 +164,23 @@ def generate_multidomain_data(
 
     # MNIST transform (matching common.py load_mnist normalization)
     mnist_dir = os.path.join(data_dir, "mnist")
-    mnist_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-    ])
+    mnist_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ]
+    )
     mnist_train = datasets.MNIST(mnist_dir, train=True, download=True, transform=mnist_transform)
     mnist_test = datasets.MNIST(mnist_dir, train=False, download=True, transform=mnist_transform)
 
     # Fashion-MNIST transform
     fmnist_dir = os.path.join(data_dir, "fashion_mnist")
-    fmnist_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.2860,), (0.3530,)),
-    ])
+    fmnist_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.2860,), (0.3530,)),
+        ]
+    )
     fmnist_train = datasets.FashionMNIST(fmnist_dir, train=True, download=True, transform=fmnist_transform)
     fmnist_test = datasets.FashionMNIST(fmnist_dir, train=False, download=True, transform=fmnist_transform)
 
@@ -188,10 +193,16 @@ def generate_multidomain_data(
     combined_test = ConcatDataset([mnist_test, fmnist_test_offset])
 
     train_loader = DataLoader(
-        combined_train, batch_size=batch_size, shuffle=True, num_workers=0,
+        combined_train,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
     )
     test_loader = DataLoader(
-        combined_test, batch_size=batch_size, shuffle=False, num_workers=0,
+        combined_test,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
     )
 
     return {

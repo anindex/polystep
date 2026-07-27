@@ -65,18 +65,17 @@ class CountingClosure:
 _FINAL_EVAL_SEED_OFFSETS = (20_000, 30_000, 40_000)
 
 
-def multi_seed_summary(evaluator, stacked_params, *, seed: int, step: int,
-                       offsets: tuple[int, ...] = _FINAL_EVAL_SEED_OFFSETS) -> dict:
+def multi_seed_summary(
+    evaluator, stacked_params, *, seed: int, step: int, offsets: tuple[int, ...] = _FINAL_EVAL_SEED_OFFSETS
+) -> dict:
     """Average evaluator.summarize_stacked_params across several deterministic eval seeds.
 
     Returns a dict with all original summary keys plus *_std variants for
     mean_return / success_rate / episode_length / fall_rate when present.
     """
     import statistics as _st
-    summaries = [
-        evaluator.summarize_stacked_params(stacked_params, seed=seed + off, step=step)
-        for off in offsets
-    ]
+
+    summaries = [evaluator.summarize_stacked_params(stacked_params, seed=seed + off, step=step) for off in offsets]
     out: dict = {}
     keys = set().union(*(s.keys() for s in summaries))
     for k in keys:
@@ -92,9 +91,15 @@ def multi_seed_summary(evaluator, stacked_params, *, seed: int, step: int,
     return out
 
 
-def _sb3_periodic_eval_callback(eval_env_factory, *, n_eval_episodes: int, n_eval_points: int,
-                                 total_timesteps: int, deterministic: bool = True,
-                                 eval_seed_base: int = 0):
+def _sb3_periodic_eval_callback(
+    eval_env_factory,
+    *,
+    n_eval_episodes: int,
+    n_eval_points: int,
+    total_timesteps: int,
+    deterministic: bool = True,
+    eval_seed_base: int = 0,
+):
     """Build an SB3 callback that runs deterministic eval every total/n_eval_points steps.
 
     Records a per-eval curve (env_steps_cumulative, mean_return) so PolyStep and SB3 share
@@ -130,15 +135,17 @@ def _sb3_periodic_eval_callback(eval_env_factory, *, n_eval_episodes: int, n_eva
             env.close()
             mean_ret = float(np.mean(returns_)) if returns_ else 0.0
             mean_len = float(np.mean(lengths_)) if lengths_ else 0.0
-            curve.append({
-                "step": self._eval_idx,  # 0 for the step-0 anchor; 1, 2, ... otherwise
-                "epoch": self._eval_idx,
-                "env_steps_cumulative": int(self.num_timesteps),
-                "mean_return": mean_ret,
-                "episode_length": mean_len,
-                "loss": -mean_ret,
-                "time": float(self.num_timesteps),
-            })
+            curve.append(
+                {
+                    "step": self._eval_idx,  # 0 for the step-0 anchor; 1, 2, ... otherwise
+                    "epoch": self._eval_idx,
+                    "env_steps_cumulative": int(self.num_timesteps),
+                    "mean_return": mean_ret,
+                    "episode_length": mean_len,
+                    "loss": -mean_ret,
+                    "time": float(self.num_timesteps),
+                }
+            )
             self._eval_idx += 1
 
         def _on_step(self) -> bool:
@@ -205,16 +212,22 @@ def run_polystep_cartpole(
 
     set_seed(seed)
     model = DiscreteMLPPolicy(
-        obs_dim=CARTPOLE_OBS_DIM, hidden=hidden, action_dim=CARTPOLE_ACTION_DIM,
+        obs_dim=CARTPOLE_OBS_DIM,
+        hidden=hidden,
+        action_dim=CARTPOLE_ACTION_DIM,
     ).to(device)
     param_count = sum(p.numel() for p in model.parameters())
     evaluator = CartPoleEvaluator(
-        rollouts_per_candidate=rollouts_per_candidate, horizon=horizon, device=device,
+        rollouts_per_candidate=rollouts_per_candidate,
+        horizon=horizon,
+        device=device,
     )
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(layout, rank=subspace_rank, max_subspace_dim=max_subspace_dim)
     total_steps = max(1, int(steps))
-    print(f"  [CartPole] hidden={hidden} params={param_count} subspace_dim={subspace.subspace_dim} rank={subspace_rank}")
+    print(
+        f"  [CartPole] hidden={hidden} params={param_count} subspace_dim={subspace.subspace_dim} rank={subspace_rank}"
+    )
 
     optimizer = PolyStepOptimizer(
         model,
@@ -247,21 +260,25 @@ def run_polystep_cartpole(
 
     # Step-0 anchor.
     init_summary = evaluator.summarize_stacked_params(
-        stack_module_params(model, 1), seed=seed + 10_000, step=0,
+        stack_module_params(model, 1),
+        seed=seed + 10_000,
+        step=0,
     )
-    step_logs.append({
-        "step": 0,
-        "epoch": 0,
-        "accuracy": _cartpole_normalized_score(init_summary["mean_return"]),
-        "mean_return": init_summary["mean_return"],
-        "success_rate": init_summary["success_rate"],
-        "episode_length": init_summary["episode_length"],
-        "loss": -init_summary["mean_return"],
-        "time": 0.0,
-        "step_wall_time": 0.0,
-        "candidates_evaluated": 0,
-        "env_steps_cumulative": 0,
-    })
+    step_logs.append(
+        {
+            "step": 0,
+            "epoch": 0,
+            "accuracy": _cartpole_normalized_score(init_summary["mean_return"]),
+            "mean_return": init_summary["mean_return"],
+            "success_rate": init_summary["success_rate"],
+            "episode_length": init_summary["episode_length"],
+            "loss": -init_summary["mean_return"],
+            "time": 0.0,
+            "step_wall_time": 0.0,
+            "candidates_evaluated": 0,
+            "env_steps_cumulative": 0,
+        }
+    )
 
     with track_gpu_memory() as mem:
         for step in range(1, total_steps + 1):
@@ -271,31 +288,40 @@ def run_polystep_cartpole(
 
             if step == 1 or step == total_steps or step % eval_interval == 0:
                 summary = evaluator.summarize_stacked_params(
-                    stack_module_params(model, 1), seed=seed + 10_000, step=0,
+                    stack_module_params(model, 1),
+                    seed=seed + 10_000,
+                    step=0,
                 )
                 mean_return = summary["mean_return"]
                 if mean_return > best_return:
                     best_return = mean_return
                     best_summary = summary
-                step_logs.append({
-                    "step": step,
-                    "epoch": step,
-                    "accuracy": _cartpole_normalized_score(mean_return),
-                    "mean_return": mean_return,
-                    "success_rate": summary["success_rate"],
-                    "episode_length": summary["episode_length"],
-                    "loss": -mean_return,
-                    "time": time.time() - start,
-                    "step_wall_time": step_wall,
-                    "candidates_evaluated": counted.count,
-                    "env_steps_cumulative": counted.count * rollouts_per_candidate * horizon,
-                })
-                print(f"  [CartPole step {step}/{total_steps}] return={mean_return:.1f} "
-                      f"success={summary['success_rate']:.3f} best={best_return:.1f} "
-                      f"wall={time.time()-start:.0f}s")
+                step_logs.append(
+                    {
+                        "step": step,
+                        "epoch": step,
+                        "accuracy": _cartpole_normalized_score(mean_return),
+                        "mean_return": mean_return,
+                        "success_rate": summary["success_rate"],
+                        "episode_length": summary["episode_length"],
+                        "loss": -mean_return,
+                        "time": time.time() - start,
+                        "step_wall_time": step_wall,
+                        "candidates_evaluated": counted.count,
+                        "env_steps_cumulative": counted.count * rollouts_per_candidate * horizon,
+                    }
+                )
+                print(
+                    f"  [CartPole step {step}/{total_steps}] return={mean_return:.1f} "
+                    f"success={summary['success_rate']:.3f} best={best_return:.1f} "
+                    f"wall={time.time() - start:.0f}s"
+                )
 
     final_summary = multi_seed_summary(
-        evaluator, stack_module_params(model, 1), seed=seed, step=total_steps,
+        evaluator,
+        stack_module_params(model, 1),
+        seed=seed,
+        step=total_steps,
     )
     best_return = max(best_return, final_summary["mean_return"])
     if not best_summary:
@@ -347,7 +373,10 @@ def run_polystep_cartpole(
 
 
 def run_random_cartpole(
-    *, seed: int, eval_episodes: int = 256, horizon: int = CARTPOLE_HORIZON,
+    *,
+    seed: int,
+    eval_episodes: int = 256,
+    horizon: int = CARTPOLE_HORIZON,
     results_dir: str | None = None,
 ) -> None:
     """Uniform-random-action CartPole baseline."""
@@ -367,15 +396,22 @@ def run_random_cartpole(
         episode_length=summary["episode_length"],
     )
     save_result(
-        "cartpole", "random_policy", seed, metrics,
+        "cartpole",
+        "random_policy",
+        seed,
+        metrics,
         {"eval_episodes": eval_episodes, "horizon": horizon, "action_selection": "uniform_random"},
         results_dir=results_dir or DEFAULT_RESULTS_DIR,
     )
 
 
 def run_sb3_cartpole(
-    *, method: str, seed: int, total_timesteps: int = 50_000,
-    eval_episodes: int = 50, results_dir: str | None = None,
+    *,
+    method: str,
+    seed: int,
+    total_timesteps: int = 50_000,
+    eval_episodes: int = 50,
+    results_dir: str | None = None,
     net_arch: tuple[int, ...] = (16,),
 ) -> None:
     """Stable-Baselines3 DQN/PPO baseline on CartPole-v1.
@@ -409,8 +445,11 @@ def run_sb3_cartpole(
         return gym.make("CartPole-v1")
 
     cb, curve = _sb3_periodic_eval_callback(
-        _eval_env_factory, n_eval_episodes=min(20, eval_episodes), n_eval_points=80,
-        total_timesteps=int(total_timesteps), eval_seed_base=int(seed),
+        _eval_env_factory,
+        n_eval_episodes=min(20, eval_episodes),
+        n_eval_points=80,
+        total_timesteps=int(total_timesteps),
+        eval_seed_base=int(seed),
     )
     model.learn(total_timesteps=int(total_timesteps), callback=cb)
 
@@ -448,9 +487,16 @@ def run_sb3_cartpole(
         episode_length=float(np.mean(lengths)) if lengths else 0.0,
     )
     save_result(
-        "cartpole", method, seed, metrics,
-        {"total_timesteps": int(total_timesteps), "eval_episodes": int(eval_episodes),
-         "net_arch": list(net_arch), "param_count": int(param_count)},
+        "cartpole",
+        method,
+        seed,
+        metrics,
+        {
+            "total_timesteps": int(total_timesteps),
+            "eval_episodes": int(eval_episodes),
+            "net_arch": list(net_arch),
+            "param_count": int(param_count),
+        },
         epoch_logs=[{"epoch": c["epoch"], "accuracy": 0.0, "loss": c["loss"], "time": c["time"]} for c in curve],
         step_logs=curve,
         results_dir=results_dir or DEFAULT_RESULTS_DIR,
@@ -554,11 +600,17 @@ for _short, _ovr in _HARDENED_OVERRIDES.items():
 
 def _gym_normalized_score(env_short: str, mean_return: float) -> float:
     cfg = GYM_ENV_REGISTRY[env_short]
-    return max(0.0, min(1.0, normalize_score(
-        mean_return,
-        random_return=cfg["random_return"],
-        reference_return=cfg["reference_return"],
-    )))
+    return max(
+        0.0,
+        min(
+            1.0,
+            normalize_score(
+                mean_return,
+                random_return=cfg["random_return"],
+                reference_return=cfg["reference_return"],
+            ),
+        ),
+    )
 
 
 def run_polystep_gym(
@@ -606,34 +658,43 @@ def run_polystep_gym(
     step_radius = float(step_radius) if step_radius is not None else float(pcfg["step_radius"])
     probe_radius = float(probe_radius) if probe_radius is not None else float(pcfg["probe_radius"])
     amortize_steps = int(amortize_steps) if amortize_steps is not None else int(pcfg["amortize_steps"])
-    max_subspace_dim = (
-        int(max_subspace_dim) if max_subspace_dim is not None else pcfg.get("max_subspace_dim")
-    )
+    max_subspace_dim = int(max_subspace_dim) if max_subspace_dim is not None else pcfg.get("max_subspace_dim")
 
     set_seed(seed)
     if nondiff_mode == "float32":
         model = DiscreteMLPPolicy(
-            obs_dim=int(cfg["obs_dim"]), hidden=hidden, action_dim=int(cfg["action_dim"]),
+            obs_dim=int(cfg["obs_dim"]),
+            hidden=hidden,
+            action_dim=int(cfg["action_dim"]),
         ).to(device)
         eval_activation = "tanh"
     else:
         model = NonDiffMLPPolicy(
-            obs_dim=int(cfg["obs_dim"]), hidden=hidden, action_dim=int(cfg["action_dim"]),
+            obs_dim=int(cfg["obs_dim"]),
+            hidden=hidden,
+            action_dim=int(cfg["action_dim"]),
             mode=nondiff_mode,
         ).to(device)
         eval_activation = nondiff_mode
     param_count = sum(p.numel() for p in model.parameters())
     evaluator = GymVectorEvaluator(
-        env_id, rollouts_per_candidate=rollouts_per_candidate, horizon=horizon, device=device,
+        env_id,
+        rollouts_per_candidate=rollouts_per_candidate,
+        horizon=horizon,
+        device=device,
         activation=eval_activation,
     )
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
-        layout, rank=subspace_rank, max_subspace_dim=max_subspace_dim,
+        layout,
+        rank=subspace_rank,
+        max_subspace_dim=max_subspace_dim,
     )
     total_steps = max(1, int(steps))
-    print(f"  [{env_short}] env={env_id} hidden={hidden} params={param_count} "
-          f"subspace_dim={subspace.subspace_dim} rank={subspace_rank}")
+    print(
+        f"  [{env_short}] env={env_id} hidden={hidden} params={param_count} "
+        f"subspace_dim={subspace.subspace_dim} rank={subspace_rank}"
+    )
 
     optimizer = PolyStepOptimizer(
         model,
@@ -666,21 +727,25 @@ def run_polystep_gym(
 
     # Step-0 anchor.
     init_summary = evaluator.summarize_stacked_params(
-        stack_module_params(model, 1), seed=seed + 10_000, step=0,
+        stack_module_params(model, 1),
+        seed=seed + 10_000,
+        step=0,
     )
-    step_logs.append({
-        "step": 0,
-        "epoch": 0,
-        "accuracy": _gym_normalized_score(env_short, init_summary["mean_return"]),
-        "mean_return": init_summary["mean_return"],
-        "success_rate": init_summary["success_rate"],
-        "episode_length": init_summary["episode_length"],
-        "loss": -init_summary["mean_return"],
-        "time": 0.0,
-        "step_wall_time": 0.0,
-        "candidates_evaluated": 0,
-        "env_steps_cumulative": 0,
-    })
+    step_logs.append(
+        {
+            "step": 0,
+            "epoch": 0,
+            "accuracy": _gym_normalized_score(env_short, init_summary["mean_return"]),
+            "mean_return": init_summary["mean_return"],
+            "success_rate": init_summary["success_rate"],
+            "episode_length": init_summary["episode_length"],
+            "loss": -init_summary["mean_return"],
+            "time": 0.0,
+            "step_wall_time": 0.0,
+            "candidates_evaluated": 0,
+            "env_steps_cumulative": 0,
+        }
+    )
 
     with track_gpu_memory() as mem:
         for step in range(1, total_steps + 1):
@@ -690,31 +755,40 @@ def run_polystep_gym(
 
             if step == 1 or step == total_steps or step % eval_interval == 0:
                 summary = evaluator.summarize_stacked_params(
-                    stack_module_params(model, 1), seed=seed + 10_000, step=0,
+                    stack_module_params(model, 1),
+                    seed=seed + 10_000,
+                    step=0,
                 )
                 mean_return = summary["mean_return"]
                 if mean_return > best_return:
                     best_return = mean_return
                     best_summary = summary
-                step_logs.append({
-                    "step": step,
-                    "epoch": step,
-                    "accuracy": _gym_normalized_score(env_short, mean_return),
-                    "mean_return": mean_return,
-                    "success_rate": summary["success_rate"],
-                    "episode_length": summary["episode_length"],
-                    "loss": -mean_return,
-                    "time": time.time() - start,
-                    "step_wall_time": step_wall,
-                    "candidates_evaluated": counted.count,
-                    "env_steps_cumulative": counted.count * rollouts_per_candidate * horizon,
-                })
-                print(f"  [{env_short} step {step}/{total_steps}] return={mean_return:.1f} "
-                      f"success={summary['success_rate']:.3f} best={best_return:.1f} "
-                      f"wall={time.time()-start:.0f}s")
+                step_logs.append(
+                    {
+                        "step": step,
+                        "epoch": step,
+                        "accuracy": _gym_normalized_score(env_short, mean_return),
+                        "mean_return": mean_return,
+                        "success_rate": summary["success_rate"],
+                        "episode_length": summary["episode_length"],
+                        "loss": -mean_return,
+                        "time": time.time() - start,
+                        "step_wall_time": step_wall,
+                        "candidates_evaluated": counted.count,
+                        "env_steps_cumulative": counted.count * rollouts_per_candidate * horizon,
+                    }
+                )
+                print(
+                    f"  [{env_short} step {step}/{total_steps}] return={mean_return:.1f} "
+                    f"success={summary['success_rate']:.3f} best={best_return:.1f} "
+                    f"wall={time.time() - start:.0f}s"
+                )
 
     final_summary = multi_seed_summary(
-        evaluator, stack_module_params(model, 1), seed=seed, step=total_steps,
+        evaluator,
+        stack_module_params(model, 1),
+        seed=seed,
+        step=total_steps,
     )
     best_return = max(best_return, final_summary["mean_return"])
     if not best_summary:
@@ -769,8 +843,12 @@ def run_polystep_gym(
 
 
 def run_random_gym(
-    *, env_short: str, seed: int, eval_episodes: int = 256,
-    horizon: int | None = None, results_dir: str | None = None,
+    *,
+    env_short: str,
+    seed: int,
+    eval_episodes: int = 256,
+    horizon: int | None = None,
+    results_dir: str | None = None,
 ) -> None:
     """Uniform-random-action baseline for any registered Gym env."""
 
@@ -782,7 +860,10 @@ def run_random_gym(
 
     start = time.time()
     summary = random_policy_baseline(
-        env_id, seed=seed, episodes=int(eval_episodes), horizon=horizon,
+        env_id,
+        seed=seed,
+        episodes=int(eval_episodes),
+        horizon=horizon,
     )
     metrics = build_rl_metrics(
         final_return=summary["mean_return"],
@@ -797,16 +878,28 @@ def run_random_gym(
         episode_length=summary["episode_length"],
     )
     save_result(
-        env_short, "random_policy", seed, metrics,
-        {"env_id": env_id, "eval_episodes": int(eval_episodes), "horizon": horizon,
-         "action_selection": "uniform_random"},
+        env_short,
+        "random_policy",
+        seed,
+        metrics,
+        {
+            "env_id": env_id,
+            "eval_episodes": int(eval_episodes),
+            "horizon": horizon,
+            "action_selection": "uniform_random",
+        },
         results_dir=results_dir or DEFAULT_RESULTS_DIR,
     )
 
 
 def run_sb3_gym(
-    *, env_short: str, method: str, seed: int, total_timesteps: int,
-    eval_episodes: int = 50, results_dir: str | None = None,
+    *,
+    env_short: str,
+    method: str,
+    seed: int,
+    total_timesteps: int,
+    eval_episodes: int = 50,
+    results_dir: str | None = None,
     net_arch: tuple[int, ...] | None = None,
 ) -> None:
     """Stable-Baselines3 DQN/PPO baseline on a generic Gym env."""
@@ -836,7 +929,12 @@ def run_sb3_gym(
     env.reset(seed=seed)
     policy_kwargs = {"net_arch": list(net_arch)}
     model = algo_cls(
-        "MlpPolicy", env, seed=seed, verbose=0, policy_kwargs=policy_kwargs, device="cpu",
+        "MlpPolicy",
+        env,
+        seed=seed,
+        verbose=0,
+        policy_kwargs=policy_kwargs,
+        device="cpu",
     )
     param_count = sum(p.numel() for p in model.policy.parameters())
 
@@ -844,8 +942,11 @@ def run_sb3_gym(
         return gym.make(env_id)
 
     cb, curve = _sb3_periodic_eval_callback(
-        _eval_env_factory, n_eval_episodes=min(20, eval_episodes), n_eval_points=80,
-        total_timesteps=int(total_timesteps), eval_seed_base=int(seed),
+        _eval_env_factory,
+        n_eval_episodes=min(20, eval_episodes),
+        n_eval_points=80,
+        total_timesteps=int(total_timesteps),
+        eval_seed_base=int(seed),
     )
     model.learn(total_timesteps=int(total_timesteps), callback=cb)
 
@@ -883,10 +984,17 @@ def run_sb3_gym(
         episode_length=float(np.mean(lengths)) if lengths else 0.0,
     )
     save_result(
-        env_short, method, seed, metrics,
-        {"env_id": env_id, "total_timesteps": int(total_timesteps),
-         "eval_episodes": int(eval_episodes),
-         "net_arch": list(net_arch), "param_count": int(param_count)},
+        env_short,
+        method,
+        seed,
+        metrics,
+        {
+            "env_id": env_id,
+            "total_timesteps": int(total_timesteps),
+            "eval_episodes": int(eval_episodes),
+            "net_arch": list(net_arch),
+            "param_count": int(param_count),
+        },
         epoch_logs=[{"epoch": c["epoch"], "accuracy": 0.0, "loss": c["loss"], "time": c["time"]} for c in curve],
         step_logs=curve,
         results_dir=results_dir or DEFAULT_RESULTS_DIR,
@@ -913,12 +1021,13 @@ def _wrap_module_output_with_nondiff(module, mode: str):
     Used to clamp the *final* policy / value / Q outputs through a non-diff op
     so that backprop through the action distribution / Bellman target returns
     zero gradient all the way to the upstream linear weights - the only design
-    that genuinely collapses PPO/DQN learning (a single trainable linear head
+    that collapses PPO/DQN learning (a single trainable linear head
     on top of binary features can still solve CartPole).
     """
 
     from torch import nn
     from polystep.benchmarks.rl.policies import NonDiffActivation
+
     if module is None:
         return module
     return nn.Sequential(module, NonDiffActivation(mode))
@@ -945,15 +1054,18 @@ def _apply_nondiff_to_sb3_policy(model, method: str, mode: str) -> None:
         if hasattr(model.q_net, "q_net"):
             model.q_net.q_net = _wrap_module_output_with_nondiff(model.q_net.q_net, mode)
         if hasattr(model, "q_net_target") and hasattr(model.q_net_target, "q_net"):
-            model.q_net_target.q_net = _wrap_module_output_with_nondiff(
-                model.q_net_target.q_net, mode
-            )
+            model.q_net_target.q_net = _wrap_module_output_with_nondiff(model.q_net_target.q_net, mode)
 
 
 def run_sb3_gym_nondiff(
-    *, env_short: str, method: str, seed: int, total_timesteps: int,
+    *,
+    env_short: str,
+    method: str,
+    seed: int,
+    total_timesteps: int,
     nondiff_mode: str = "binary",
-    eval_episodes: int = 50, results_dir: str | None = None,
+    eval_episodes: int = 50,
+    results_dir: str | None = None,
     features_dim: int | None = None,
 ) -> None:
     """SB3 PPO/DQN baseline trained through a fully non-differentiable policy.
@@ -993,7 +1105,12 @@ def run_sb3_gym_nondiff(
         "activation_fn": activation_fn,
     }
     model = algo_cls(
-        "MlpPolicy", env, seed=seed, verbose=0, policy_kwargs=policy_kwargs, device="cpu",
+        "MlpPolicy",
+        env,
+        seed=seed,
+        verbose=0,
+        policy_kwargs=policy_kwargs,
+        device="cpu",
     )
     _apply_nondiff_to_sb3_policy(model, method, nondiff_mode)
     param_count = sum(p.numel() for p in model.policy.parameters())
@@ -1002,8 +1119,11 @@ def run_sb3_gym_nondiff(
         return gym.make(env_id)
 
     cb, curve = _sb3_periodic_eval_callback(
-        _eval_env_factory, n_eval_episodes=min(20, eval_episodes), n_eval_points=80,
-        total_timesteps=int(total_timesteps), eval_seed_base=int(seed),
+        _eval_env_factory,
+        n_eval_episodes=min(20, eval_episodes),
+        n_eval_points=80,
+        total_timesteps=int(total_timesteps),
+        eval_seed_base=int(seed),
     )
     model.learn(total_timesteps=int(total_timesteps), callback=cb)
 
@@ -1027,6 +1147,7 @@ def run_sb3_gym_nondiff(
     env.close()
 
     import numpy as _np
+
     mean_return = float(_np.mean(returns)) if returns else 0.0
     best_return = max([mean_return] + [c["mean_return"] for c in curve], default=mean_return)
     metrics = build_rl_metrics(
@@ -1042,11 +1163,18 @@ def run_sb3_gym_nondiff(
         episode_length=float(_np.mean(lengths)) if lengths else 0.0,
     )
     save_result(
-        env_short, f"{method}_nondiff_{nondiff_mode}", seed, metrics,
-        {"env_id": env_id, "total_timesteps": int(total_timesteps),
-         "eval_episodes": int(eval_episodes),
-         "hidden": hidden, "param_count": int(param_count),
-         "nondiff_mode": nondiff_mode},
+        env_short,
+        f"{method}_nondiff_{nondiff_mode}",
+        seed,
+        metrics,
+        {
+            "env_id": env_id,
+            "total_timesteps": int(total_timesteps),
+            "eval_episodes": int(eval_episodes),
+            "hidden": hidden,
+            "param_count": int(param_count),
+            "nondiff_mode": nondiff_mode,
+        },
         epoch_logs=[{"epoch": c["epoch"], "accuracy": 0.0, "loss": c["loss"], "time": c["time"]} for c in curve],
         step_logs=curve,
         results_dir=results_dir or DEFAULT_RESULTS_DIR,
@@ -1101,27 +1229,34 @@ def run_es_gym(
     set_seed(seed)
     if nondiff_mode == "float32":
         model = DiscreteMLPPolicy(
-            obs_dim=int(cfg["obs_dim"]), hidden=hidden, action_dim=int(cfg["action_dim"]),
+            obs_dim=int(cfg["obs_dim"]),
+            hidden=hidden,
+            action_dim=int(cfg["action_dim"]),
         ).to(device)
         eval_activation = "tanh"
     else:
         model = NonDiffMLPPolicy(
-            obs_dim=int(cfg["obs_dim"]), hidden=hidden, action_dim=int(cfg["action_dim"]),
+            obs_dim=int(cfg["obs_dim"]),
+            hidden=hidden,
+            action_dim=int(cfg["action_dim"]),
             mode=nondiff_mode,
         ).to(device)
         eval_activation = nondiff_mode
     param_count = sum(p.numel() for p in model.parameters())
     evaluator = GymVectorEvaluator(
-        env_id, rollouts_per_candidate=rollouts_per_candidate, horizon=horizon, device=device,
+        env_id,
+        rollouts_per_candidate=rollouts_per_candidate,
+        horizon=horizon,
+        device=device,
         activation=eval_activation,
     )
-    print(f"  [{env_short}/ES] env={env_id} hidden={hidden} params={param_count} "
-          f"popsize={popsize} generations={generations}")
+    print(
+        f"  [{env_short}/ES] env={env_id} hidden={hidden} params={param_count} "
+        f"popsize={popsize} generations={generations}"
+    )
 
     # theta = current mean parameters as a list of named (name, shape).
-    base_params: dict[str, torch.Tensor] = {
-        n: p.detach().clone().to(device) for n, p in model.named_parameters()
-    }
+    base_params: dict[str, torch.Tensor] = {n: p.detach().clone().to(device) for n, p in model.named_parameters()}
     rng = torch.Generator(device="cpu")
     rng.manual_seed(int(seed))
 
@@ -1143,24 +1278,29 @@ def run_es_gym(
     # Step-0 anchor.
     eval_stacked0 = {n: t.unsqueeze(0) for n, t in base_params.items()}
     init_summary = evaluator.summarize_stacked_params(
-        eval_stacked0, seed=seed + 10_000, step=0,
+        eval_stacked0,
+        seed=seed + 10_000,
+        step=0,
     )
-    step_logs.append({
-        "step": 0,
-        "epoch": 0,
-        "accuracy": _gym_normalized_score(env_short, init_summary["mean_return"]),
-        "mean_return": init_summary["mean_return"],
-        "success_rate": init_summary["success_rate"],
-        "episode_length": init_summary["episode_length"],
-        "loss": -init_summary["mean_return"],
-        "time": 0.0,
-        "env_steps_cumulative": 0,
-        "sigma": float(sigma_init),
-    })
+    step_logs.append(
+        {
+            "step": 0,
+            "epoch": 0,
+            "accuracy": _gym_normalized_score(env_short, init_summary["mean_return"]),
+            "mean_return": init_summary["mean_return"],
+            "success_rate": init_summary["success_rate"],
+            "episode_length": init_summary["episode_length"],
+            "loss": -init_summary["mean_return"],
+            "time": 0.0,
+            "env_steps_cumulative": 0,
+            "sigma": float(sigma_init),
+        }
+    )
 
     for gen in range(1, generations + 1):
         # Cosine-annealed sigma.
         import math as _math
+
         progress = (gen - 1) / max(1, generations - 1)
         sigma = sigma_target + 0.5 * (sigma_init - sigma_target) * (1 + _math.cos(_math.pi * progress))
 
@@ -1168,7 +1308,9 @@ def run_es_gym(
         noise: dict[str, torch.Tensor] = {}
         for name, theta in base_params.items():
             eps_half = torch.randn(
-                (half,) + theta.shape, generator=rng, dtype=theta.dtype,
+                (half,) + theta.shape,
+                generator=rng,
+                dtype=theta.dtype,
             ).to(device)
             noise[name] = torch.cat([eps_half, -eps_half], dim=0)  # (popsize, *)
 
@@ -1197,31 +1339,40 @@ def run_es_gym(
                 # Build a 1-candidate stacked dict from the current theta.
                 eval_stacked = {n: t.unsqueeze(0) for n, t in base_params.items()}
             summary = evaluator.summarize_stacked_params(
-                eval_stacked, seed=seed + 10_000, step=0,
+                eval_stacked,
+                seed=seed + 10_000,
+                step=0,
             )
             mean_return = summary["mean_return"]
             if mean_return > best_return:
                 best_return = mean_return
                 best_summary = summary
-            step_logs.append({
-                "step": gen,
-                "epoch": gen,
-                "accuracy": _gym_normalized_score(env_short, mean_return),
-                "mean_return": mean_return,
-                "success_rate": summary["success_rate"],
-                "episode_length": summary["episode_length"],
-                "loss": -mean_return,
-                "time": time.time() - start,
-                "env_steps_cumulative": env_steps_cumulative,
-                "sigma": float(sigma),
-            })
-            print(f"  [{env_short}/ES gen {gen}/{generations}] return={mean_return:.1f} "
-                  f"sigma={sigma:.3f} best={best_return:.1f} wall={time.time()-start:.0f}s")
+            step_logs.append(
+                {
+                    "step": gen,
+                    "epoch": gen,
+                    "accuracy": _gym_normalized_score(env_short, mean_return),
+                    "mean_return": mean_return,
+                    "success_rate": summary["success_rate"],
+                    "episode_length": summary["episode_length"],
+                    "loss": -mean_return,
+                    "time": time.time() - start,
+                    "env_steps_cumulative": env_steps_cumulative,
+                    "sigma": float(sigma),
+                }
+            )
+            print(
+                f"  [{env_short}/ES gen {gen}/{generations}] return={mean_return:.1f} "
+                f"sigma={sigma:.3f} best={best_return:.1f} wall={time.time() - start:.0f}s"
+            )
 
     # Final multi-seed eval at the mean params.
     eval_stacked = {n: t.unsqueeze(0) for n, t in base_params.items()}
     final_summary = multi_seed_summary(
-        evaluator, eval_stacked, seed=seed, step=generations,
+        evaluator,
+        eval_stacked,
+        seed=seed,
+        step=generations,
     )
     best_return = max(best_return, final_summary["mean_return"])
     if not best_summary:
@@ -1243,17 +1394,25 @@ def run_es_gym(
     metrics["final_eval_seeds"] = final_summary.get("_n_eval_seeds", 1)
     method_name = "es" if nondiff_mode == "float32" else f"es_nondiff_{nondiff_mode}"
     save_result(
-        env_short, method_name, seed, metrics,
+        env_short,
+        method_name,
+        seed,
+        metrics,
         {
-            "env_id": env_id, "hidden": hidden, "param_count": int(param_count),
-            "popsize": popsize, "generations": int(generations),
-            "sigma_init": sigma_init, "sigma_target": sigma_target, "lr": lr,
-            "rollouts_per_candidate": rollouts_per_candidate, "horizon": horizon,
+            "env_id": env_id,
+            "hidden": hidden,
+            "param_count": int(param_count),
+            "popsize": popsize,
+            "generations": int(generations),
+            "sigma_init": sigma_init,
+            "sigma_target": sigma_target,
+            "lr": lr,
+            "rollouts_per_candidate": rollouts_per_candidate,
+            "horizon": horizon,
             "nondiff_mode": nondiff_mode,
         },
         epoch_logs=[
-            {"epoch": r["step"], "accuracy": r["accuracy"], "loss": r["loss"], "time": r["time"]}
-            for r in step_logs
+            {"epoch": r["step"], "accuracy": r["accuracy"], "loss": r["loss"], "time": r["time"]} for r in step_logs
         ],
         step_logs=step_logs,
         results_dir=results_dir or DEFAULT_RESULTS_DIR,
@@ -1282,9 +1441,16 @@ _CARTPOLE_METHODS = {
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["sweep", "full"], default="full")
-    parser.add_argument("--env", choices=[
-        "cartpole", "acrobot", "cartpole_hard", "acrobot_hard",
-    ], default="cartpole")
+    parser.add_argument(
+        "--env",
+        choices=[
+            "cartpole",
+            "acrobot",
+            "cartpole_hard",
+            "acrobot_hard",
+        ],
+        default="cartpole",
+    )
     parser.add_argument("--methods", nargs="+", default=["polystep"])
     parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1294,19 +1460,24 @@ def main() -> None:
     parser.add_argument("--rollouts-per-candidate", type=int, default=None)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--max-subspace-dim", type=int, default=None)
-    parser.add_argument("--probe-radius", type=float, default=None,
-                        help="Override probe_radius in FINAL_CONFIG for PolyStep runs.")
-    parser.add_argument("--nondiff-mode", choices=["float32", "int8", "binary"], default="float32",
-                        help="Non-differentiable activation for the policy. PolyStep + ES "
-                             "handle int8/binary natively; PPO/DQN under int8/binary collapse "
-                             "(no STE) - used to motivate gradient-free training.")
+    parser.add_argument(
+        "--probe-radius", type=float, default=None, help="Override probe_radius in FINAL_CONFIG for PolyStep runs."
+    )
+    parser.add_argument(
+        "--nondiff-mode",
+        choices=["float32", "int8", "binary"],
+        default="float32",
+        help="Non-differentiable activation for the policy. PolyStep + ES "
+        "handle int8/binary natively; PPO/DQN under int8/binary collapse "
+        "(no STE) - used to motivate gradient-free training.",
+    )
     args = parser.parse_args()
 
     for seed in args.seeds:
         for method in args.methods:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"[{args.mode}] env={args.env}  method={method}  seed={seed}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             if args.env == "cartpole":
                 if method not in _CARTPOLE_METHODS:
@@ -1316,14 +1487,18 @@ def main() -> None:
                 if args.nondiff_mode != "float32":
                     if method == "polystep":
                         run_polystep_gym(
-                            env_short="cartpole", seed=seed, device=args.device,
+                            env_short="cartpole",
+                            seed=seed,
+                            device=args.device,
                             results_dir=args.results_dir,
                             nondiff_mode=args.nondiff_mode,
                             method=f"polystep_nondiff_{args.nondiff_mode}",
                         )
                     elif method == "es":
                         run_es_gym(
-                            env_short="cartpole", seed=seed, device=args.device,
+                            env_short="cartpole",
+                            seed=seed,
+                            device=args.device,
                             results_dir=args.results_dir,
                             nondiff_mode=args.nondiff_mode,
                         )
@@ -1333,7 +1508,9 @@ def main() -> None:
                         cfg = GYM_ENV_REGISTRY["cartpole"]
                         total_timesteps = cfg["sb3_total_timesteps"][args.mode]
                         run_sb3_gym_nondiff(
-                            env_short="cartpole", method=method, seed=seed,
+                            env_short="cartpole",
+                            method=method,
+                            seed=seed,
                             total_timesteps=int(total_timesteps),
                             nondiff_mode=args.nondiff_mode,
                             results_dir=args.results_dir,
@@ -1341,18 +1518,24 @@ def main() -> None:
                     continue
                 if method == "polystep":
                     _run_cartpole_polystep_full(
-                        seed=seed, device=args.device, results_dir=args.results_dir, args=args,
+                        seed=seed,
+                        device=args.device,
+                        results_dir=args.results_dir,
+                        args=args,
                     )
                 elif method == "random_policy":
                     run_random_cartpole(seed=seed, results_dir=args.results_dir)
                 elif method == "es":
                     run_es_gym(
-                        env_short="cartpole", seed=seed, device=args.device,
+                        env_short="cartpole",
+                        seed=seed,
+                        device=args.device,
                         results_dir=args.results_dir,
                     )
                 elif method in {"dqn", "ppo"}:
                     run_sb3_cartpole(
-                        method=method, seed=seed,
+                        method=method,
+                        seed=seed,
                         total_timesteps=10_000 if args.mode == "sweep" else 1_000_000,
                         results_dir=args.results_dir,
                     )
@@ -1361,9 +1544,7 @@ def main() -> None:
                 env_short = args.env
                 allowed = _HARDENED_METHODS.get(env_short, _ACROBOT_METHODS)
                 if method not in allowed:
-                    raise ValueError(
-                        f"Unknown {env_short} method: {method!r}. Valid: {sorted(allowed)}"
-                    )
+                    raise ValueError(f"Unknown {env_short} method: {method!r}. Valid: {sorted(allowed)}")
                 cfg = GYM_ENV_REGISTRY[env_short]
                 if method == "polystep":
                     run_polystep_gym(
@@ -1378,14 +1559,17 @@ def main() -> None:
                         max_subspace_dim=args.max_subspace_dim,
                         results_dir=args.results_dir,
                         nondiff_mode=args.nondiff_mode,
-                        method=("polystep" if args.nondiff_mode == "float32"
-                                else f"polystep_nondiff_{args.nondiff_mode}"),
+                        method=(
+                            "polystep" if args.nondiff_mode == "float32" else f"polystep_nondiff_{args.nondiff_mode}"
+                        ),
                     )
                 elif method == "random_policy":
                     run_random_gym(env_short=env_short, seed=seed, results_dir=args.results_dir)
                 elif method == "es":
                     run_es_gym(
-                        env_short=env_short, seed=seed, device=args.device,
+                        env_short=env_short,
+                        seed=seed,
+                        device=args.device,
                         results_dir=args.results_dir,
                         nondiff_mode=args.nondiff_mode,
                     )
@@ -1393,13 +1577,17 @@ def main() -> None:
                     total_timesteps = cfg["sb3_total_timesteps"][args.mode]
                     if args.nondiff_mode == "float32":
                         run_sb3_gym(
-                            env_short=env_short, method=method, seed=seed,
+                            env_short=env_short,
+                            method=method,
+                            seed=seed,
                             total_timesteps=int(total_timesteps),
                             results_dir=args.results_dir,
                         )
                     else:
                         run_sb3_gym_nondiff(
-                            env_short=env_short, method=method, seed=seed,
+                            env_short=env_short,
+                            method=method,
+                            seed=seed,
                             total_timesteps=int(total_timesteps),
                             nondiff_mode=args.nondiff_mode,
                             results_dir=args.results_dir,

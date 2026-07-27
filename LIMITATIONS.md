@@ -21,7 +21,7 @@ What does not work in `polystep`, with source-file references for each entry.
   `model.eval()` before vmap evaluation.
 
 Note: PyTorch 2.12 fixes native `vmap(nn.MultiheadAttention)` (issue
-#151558). The wrapper is retained for the `torch>=2.4` floor; users on
+#151558). The wrapper is retained for the `torch>=2.8` floor; users on
 2.12+ may use `nn.MultiheadAttention` directly when none of the above
 restrictions apply.
 
@@ -88,6 +88,40 @@ restrictions apply.
 - `AdaptiveSubspace` step-0 (no displacement history) falls back to a
   random rotation: deterministic-reproducible with a seeded
   `torch.Generator`.
+- `HybridSubspace` with `rotation_interval > 0` re-projects stored per-layer
+  displacement coordinates through the current basis, so entries recorded under
+  an earlier basis are attributed to directions they were never measured along.
+  `AdaptiveSubspace` keeps its history in full parameter space and is unaffected.
+  `rotation_interval` defaults to `0` (no rotation), which is also the accuracy
+  recommendation. A rotation does now fold the coordinates into the base weights
+  before swapping the basis, so the represented point no longer jumps.
+- `FactoredSubspace` confines every perturbation to the `rank` input directions spanned
+  by its fixed `B` factor, so at matched subspace dimension it makes less progress per
+  step than `HybridSubspace`'s dense projection. It is 3-11x cheaper per step; on the
+  MNIST example at matched dimension it reached 81.4% against 90.9%, or 88.8% with
+  `rotation_interval=1`. It is a speed/memory trade, not a drop-in improvement, and is
+  not the default. See `docs/performance.md`.
+- `use_covariance_adaptation` / `use_csa` hold the subspace basis fixed between
+  absorbs. sep-CMA learns a per-axis variance for one basis, and a diagonal
+  covariance does not stay diagonal under rotation, so the two cannot both run.
+- `use_covariance_adaptation` is **rank-one only** by default. The optimizer derives
+  the CMA rates at `mu_eff = 1`, where Hansen's
+  `c_mu = 2(mu_eff - 2 + 1/mu_eff)/((n+2)^2 + mu_eff)` is exactly zero, so only the
+  `p_c` rank-one term shapes the covariance. That is the right `mu_eff` for the
+  evolution paths, which consume a single unit-normalised displacement, but not for
+  the rank-mu term, whose offspring are the `2*pdim` transport-weighted vertex steps.
+  Set `mu_eff` explicitly on `CMAAdaptiveSubspace` to make `c_mu` positive and turn
+  rank-mu on.
+- The covariance is renormalised to `trace(C) = n` every step, so `C` carries only
+  shape and never scale. Combined with `use_csa` being refused (below), neither `C`
+  nor `sigma` sets the step magnitude; `step_radius` does. This departs from
+  Ros & Hansen sep-CMA-ES, where the trace is free.
+- `use_csa` is refused at construction. CSA reads step size from the length of the
+  evolution path against the length expected under a *Gaussian random walk*, and an
+  OT barycentre is a deterministic descent direction, so that reference does not
+  apply and `sigma` grows without bound. Two-Point step-size Adaptation
+  (arXiv:0805.0231) is the model-free alternative that would fit here, and is nearly
+  free given the orthoplex already evaluates antithetic pairs; it is not implemented.
 
 ## Optimizer
 
@@ -111,6 +145,35 @@ restrictions apply.
 - `step_radius=CosineEpsilon(...)` paired with an SNN model (LIF /
   Leaky / Spik / ALIF in module class names) emits a `UserWarning`
   because the combination collapses SNN accuracy from ~93% to 10-47%.
+- The fast candidate evaluators only run when the optimizer holds the
+  evaluator and its data. `train()` calls `register_evaluator` on every
+  batch; a hand-rolled loop calling `step(closure)` must do the same, or
+  the fused in-place, factored and sparse-delta paths stay unused.
+- `adaptive_probes` reuse is all or nothing on the configuration. A
+  candidate is the whole parameter vector with one particle row
+  replaced, so every row of the cost matrix depends on every particle's
+  position and one moving particle invalidates all of them. Reuse
+  therefore saves forwards only once the whole configuration has
+  settled, which in practice means near convergence. `train()` passes a
+  per-batch `objective_token`, so on a minibatch objective it saves
+  nothing at all and only the bookkeeping remains.
+- `multifidelity_screen` needs a cheap `screen_closure` from the caller,
+  `polytope_type='orthoplex'`, and
+  `screen_fidelity/num_probe + screen_keep_ratio < 1`. Outside that it
+  warns and does not run. It also only pays off in wall-clock when the
+  per-sample cost dominates: measured 0.66x at batch 64 and 1.12x at
+  batch 8192 on CPU.
+- The CMA scalings read like errors and are not. `trace_scale=n`, the
+  `pdim` factor on rank-mu and `expected_norm=1.0` all compensate for
+  the fact that the evolution paths are fed unit-normalized
+  innovations, so `E||p_c||^2` is about 1 rather than `n`.
+- `SinkhornSolver`'s column marginal couples particles through the
+  vertex index. Each particle carries its own rotation, so "vertex v"
+  is a different direction per row, and the shared `b = 1/V` marginal
+  spreads mass across an index that has no common meaning. This is a
+  spreading regularizer rather than a wrong answer, and it applies to
+  the full-space default; subspace mode defaults to the independent-row
+  softmax.
 
 ## Architectures and benchmarks
 

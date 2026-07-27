@@ -195,18 +195,35 @@ def train(
             def closure(batched_params, _in=cost_inputs, _tgt=cost_targets):
                 return evaluator.evaluate(batched_params, _in, _tgt)
 
-            optimizer.step(closure)
+            # Without this the step reaches the objective only through closure(), so the
+            # fused in-place, factored and sparse-delta evaluators never run.
+            optimizer.register_evaluator(evaluator, cost_inputs, cost_targets)
+
+            # multifidelity_screen ranks directions on a slice of the same batch
+            # before spending full-fidelity forwards; returns None when off.
+            # objective_token: every batch is a different objective, so cached cost
+            # rows from the previous step do not describe this one.
+            optimizer.step(
+                closure,
+                screen_closure=optimizer.screen_closure_from(closure, cost_inputs, cost_targets),
+                objective_token=global_step,
+            )
 
             state = optimizer.state
             ot_cost = state.costs[-1] if state.costs else 0.0
 
-            if callbacks:
-                # A callback consumes per-step metrics: compute the exact
-                # full-batch training loss (separate from the OT cost) and build
-                # the full metrics dict (velocity_mag included).
+            # ot_cost averages probe points around the pre-step weights, so it does not
+            # measure the weights the model now holds. restore_best keyed on it would
+            # snapshot the cheapest probe cloud. Costs one forward per 2*d*K probes.
+            if callbacks or config.restore_best:
                 with torch.no_grad():
                     output = model(inputs)
                     train_loss = loss_fn(output, targets).item()
+            else:
+                # Nothing reads a per-step loss: skip the forward and its host sync.
+                train_loss = ot_cost
+
+            if callbacks:
                 metrics = {
                     "step": global_step,
                     "epoch": epoch,
@@ -217,23 +234,26 @@ def train(
                     "converged": (state.linear_convergence[-1] if state.linear_convergence else False),
                     "absorb_count": getattr(state, "absorb_count", 0),
                 }
-                for cb in callbacks:
-                    if cb.on_step_end(metrics):
-                        stop = True
-                        break
             else:
-                # No callback consumes per-step metrics: skip the extra
-                # full-batch forward + its host syncs (.item()/velocity norm)
-                # and track the OT cost as the loss signal for logging / best.
-                train_loss = ot_cost
+                metrics = None
 
             epoch_loss_sum += train_loss
             epoch_loss_count += 1
 
-            # Snapshot the weights at the lowest tracked loss.
+            # Snapshot at the lowest tracked loss, before any callback runs. Callbacks
+            # receive the live model and may write to it, so snapshotting afterwards can
+            # store weights that do not correspond to the loss they are keyed on.
             if config.restore_best and train_loss < best_loss:
                 best_loss = train_loss
-                best_state = copy.deepcopy(model.state_dict())
+                # Keep the snapshot on CPU. A CUDA copy is a second full parameter set
+                # resident on the device for the whole run.
+                best_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+
+            if metrics is not None:
+                for cb in callbacks:
+                    if cb.on_step_end(metrics):
+                        stop = True
+                        break
 
             if stop:
                 break
@@ -253,15 +273,17 @@ def train(
             cb.on_epoch_end(epoch_metrics)
 
     # Restore the best-seen weights (load_state_dict copies in place, keeping dtype/device).
+    # The optimizer still holds the particle state of the LAST step, so re-anchor it on
+    # the restored weights; otherwise the next step() ends in _sync_model and writes the
+    # last-step weights straight back over the restored ones.
     if config.restore_best and best_state is not None:
         model.load_state_dict(best_state)
+        optimizer.resync_from_model()
+
+    # Registration holds the last batch alive on the optimizer past the loop.
+    optimizer.release_evaluator()
 
     return model
-
-
-# ---------------------------------------------------------------------------
-# Built-in callbacks
-# ---------------------------------------------------------------------------
 
 
 class LoggingCallback(TrainCallback):
@@ -314,11 +336,6 @@ class EarlyStoppingCallback(TrainCallback):
             print(f"Early stopping at step {metrics['step']}")
             return True
         return False
-
-
-# ---------------------------------------------------------------------------
-# Diagnostics helper
-# ---------------------------------------------------------------------------
 
 
 def get_diagnostics(optimizer: PolyStepOptimizer) -> dict:

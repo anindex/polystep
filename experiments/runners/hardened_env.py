@@ -35,9 +35,6 @@ from typing import Optional, Sequence
 import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# Observation quantization
-# ---------------------------------------------------------------------------
 def _make_obs_quantizer(low: np.ndarray, high: np.ndarray, bins: int):
     lo = np.asarray(low, dtype=np.float32)
     hi = np.asarray(high, dtype=np.float32)
@@ -57,9 +54,9 @@ def _make_obs_quantizer(low: np.ndarray, high: np.ndarray, bins: int):
     return quantize
 
 
-def QuantizedObsWrapper(env, *, bins: int = 4,
-                        low: Optional[Sequence[float]] = None,
-                        high: Optional[Sequence[float]] = None):
+def QuantizedObsWrapper(
+    env, *, bins: int = 4, low: Optional[Sequence[float]] = None, high: Optional[Sequence[float]] = None
+):
     """Return a Gymnasium ``ObservationWrapper`` that channel-wise bins obs.
 
     If ``low``/``high`` are ``None`` the wrapper uses ``env.observation_space``
@@ -89,7 +86,10 @@ def QuantizedObsWrapper(env, *, bins: int = 4,
             # Observation space stays the same shape & dtype - quantized values
             # still lie inside the original bounds.
             self.observation_space = gym.spaces.Box(
-                low=finite_low, high=finite_high, shape=space.shape, dtype=np.float32,
+                low=finite_low,
+                high=finite_high,
+                shape=space.shape,
+                dtype=np.float32,
             )
 
         def observation(self, obs):
@@ -98,9 +98,6 @@ def QuantizedObsWrapper(env, *, bins: int = 4,
     return _QuantizedObs(env)
 
 
-# ---------------------------------------------------------------------------
-# Sparse / bucketed reward
-# ---------------------------------------------------------------------------
 def SparseRewardWrapper(env, *, bucket: float = 1.0, deadband: float = 0.0):
     """Return a Gymnasium ``RewardWrapper`` that buckets and dead-bands rewards.
 
@@ -126,19 +123,24 @@ def SparseRewardWrapper(env, *, bucket: float = 1.0, deadband: float = 0.0):
     return _SparseReward(env)
 
 
-# ---------------------------------------------------------------------------
-# Hardened-env factory + Gymnasium registration
-# ---------------------------------------------------------------------------
 HARDENED_DEFAULTS = {
     # Each entry: base_env_id, obs_bins, reward_bucket, reward_deadband,
     # optional explicit (low, high) obs bounds for the quantizer.
     "cartpole_hard": dict(
-        base="CartPole-v1", bins=4, bucket=1.0, deadband=0.0,
-        low=[-2.4, -3.0, -0.21, -3.5], high=[2.4, 3.0, 0.21, 3.5],
+        base="CartPole-v1",
+        bins=4,
+        bucket=1.0,
+        deadband=0.0,
+        low=[-2.4, -3.0, -0.21, -3.5],
+        high=[2.4, 3.0, 0.21, 3.5],
     ),
     "acrobot_hard": dict(
-        base="Acrobot-v1", bins=4, bucket=1.0, deadband=0.0,
-        low=None, high=None,  # Acrobot bounds are finite already.
+        base="Acrobot-v1",
+        bins=4,
+        bucket=1.0,
+        deadband=0.0,
+        low=None,
+        high=None,  # Acrobot bounds are finite already.
     ),
 }
 
@@ -149,8 +151,7 @@ def make_hardened_env(env_short: str):
     import gymnasium as gym
 
     if env_short not in HARDENED_DEFAULTS:
-        raise KeyError(f"unknown hardened env {env_short!r}; "
-                       f"choices: {sorted(HARDENED_DEFAULTS)}")
+        raise KeyError(f"unknown hardened env {env_short!r}; choices: {sorted(HARDENED_DEFAULTS)}")
     spec = HARDENED_DEFAULTS[env_short]
     env = gym.make(spec["base"])
     env = QuantizedObsWrapper(env, bins=spec["bins"], low=spec["low"], high=spec["high"])
@@ -184,9 +185,12 @@ def register_hardened_envs() -> None:
                 entry_point=lambda spec=spec: SparseRewardWrapper(
                     QuantizedObsWrapper(
                         gym.make(spec["base"]),
-                        bins=spec["bins"], low=spec["low"], high=spec["high"],
+                        bins=spec["bins"],
+                        low=spec["low"],
+                        high=spec["high"],
                     ),
-                    bucket=spec["bucket"], deadband=spec["deadband"],
+                    bucket=spec["bucket"],
+                    deadband=spec["deadband"],
                 ),
             )
         except gym.error.Error:

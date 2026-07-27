@@ -53,8 +53,8 @@ BATCH = 128
 N_CAND = 128  # representative candidate chunk (P*V*K)
 WARMUP = 50
 # Sub-millisecond sweeps are noisy: use a per-call time budget so cheap backends
-# get many more reps (Codex/Gemini review). GPU clocks should be pinned high
-# (nvidia-smi -lgc) for a headline; these medians are illustrative, not paper-grade.
+# get many more reps. Pin GPU clocks (nvidia-smi -lgc) for stable numbers; these
+# medians are illustrative, not paper-grade.
 MIN_REPS = 60
 TIME_BUDGET_S = 1.5
 
@@ -62,7 +62,7 @@ TIME_BUDGET_S = 1.5
 def _stacked(model, n, noise=0.02, gen=None):
     """N candidate param dicts = current params broadcast + small noise.
 
-    Keyed by param name -- exactly what NNCostEvaluator.evaluate expects.
+    Keyed by param name: exactly what NNCostEvaluator.evaluate expects.
     """
     out = {}
     for name, p in model.named_parameters():
@@ -110,10 +110,10 @@ def _backend_used(ev, kind):
 
 
 def _build_vmap_ro(model, loss_fn):
-    """The 'missing cell' (Kimi): torch.compile(reduce-overhead) on the VMAPPED fn.
+    """torch.compile(reduce-overhead) on the vmapped fn.
 
     With chunk_size=None (no chunking) there is no chunk-concat, so CUDA graphs
-    on the whole N-candidate sweep may capture -- one graph, N candidates. This
+    on the whole N-candidate sweep may capture: one graph, N candidates. This
     is what the evaluator's compile_vmap deliberately does NOT do (it ships
     mode="default"). Tested raw here to see if it beats fusion on launch-bound nets.
     """
@@ -182,7 +182,7 @@ def run_model(name, build, in_shape, n_classes, seeds=(0, 1, 2)):
             ev = _make_ev(model, loss_fn, kind)
             # Guard: these models must NOT hit the pure-MLP bmm fast path, else the
             # benchmark would silently bypass compile and lie.
-            assert ev._batched_linear is None, f"{name} hit BatchedLinearEvaluator -- bmm bypass"
+            assert ev._batched_linear is None, f"{name} hit BatchedLinearEvaluator: bmm bypass"
             with torch.inference_mode():
                 med, iqr = _time(lambda: ev.evaluate(stacked, x, y))
             per_backend[kind].append(med)
@@ -208,11 +208,10 @@ def main():
     if not torch.cuda.is_available():
         print("SKIP: needs CUDA.")
         return
-    print(f"Backend x architecture matrix  device={torch.cuda.get_device_name(0)}  "
-          f"torch={torch.__version__}")
+    print(f"Backend x architecture matrix  device={torch.cuda.get_device_name(0)}  torch={torch.__version__}")
     print("Currency = wall-clock (median over timed reps). Never forward count.")
     verdicts = [run_model(*m) for m in MODELS]
-    print("\n=== VERDICT (measured, illustrative -- pin GPU clocks for headline-grade) ===")
+    print("\n=== VERDICT (measured, illustrative: pin GPU clocks for stable numbers) ===")
     for name, speedup, best, _ in verdicts:
         print(f"  {name:36s} best={best:24s} {speedup:5.2f}x vs eager_vmap")
     print("  - vmap already amortizes launches: ~30-40x vs the sequential in-place loop.")
@@ -222,7 +221,7 @@ def main():
     print("    benefit once the sweep is vmap-amortized).")
     print("  - CUDA graphs help only the sequential in-place path (inplace_graph), proportional")
     print("    to launch-boundness (SNN ~6x, CNN ~1.1x); that path is used only when vmap OOMs.")
-    print("  - eager_vmap can LOSE to inplace on activation-heavy nets (CNN 25 vs 19 ms) -- vmap")
+    print("  - eager_vmap can LOSE to inplace on activation-heavy nets (CNN 25 vs 19 ms): vmap")
     print("    of conv lowers to grouped conv. Never compare by forward count.")
 
 

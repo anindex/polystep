@@ -32,6 +32,7 @@ Full models (sized for CIFAR-10 32x32):
 MAX-SAT utilities (direct parameter optimization, no hidden layers):
   - MaxSATModel, cra_penalty, evaluate_sat_loss
 """
+
 from __future__ import annotations
 
 import torch
@@ -79,11 +80,6 @@ __all__ = [
     "SoftPermutationNet",
     "PermutationLoss",
 ]
-
-
-# ---------------------------------------------------------------------------
-# Building blocks (non-differentiable operations)
-# ---------------------------------------------------------------------------
 
 
 class LIFNeuron(nn.Module):
@@ -157,11 +153,6 @@ class TernaryLinear(nn.Module):
         return x @ w_t.t() + self.bias
 
 
-# ---------------------------------------------------------------------------
-# STE autograd functions (for gradient-based baselines)
-# ---------------------------------------------------------------------------
-
-
 class STESign(torch.autograd.Function):
     """Straight-Through Estimator for sign() binarization.
 
@@ -204,11 +195,6 @@ class STETernary(torch.autograd.Function):
         return grad_input, None  # None for threshold (not trainable)
 
 
-# ---------------------------------------------------------------------------
-# STE-enabled layers (for gradient-based baselines)
-# ---------------------------------------------------------------------------
-
-
 class BinaryLinearSTE(nn.Module):
     """Binary linear layer with STE for gradient-based training."""
 
@@ -241,9 +227,7 @@ class BinaryConv2dSTE(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, padding: int = 0):
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.1
-        )
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.1)
         self.bias = nn.Parameter(torch.zeros(out_channels))
         self.padding = padding
 
@@ -252,19 +236,12 @@ class BinaryConv2dSTE(nn.Module):
         return F.conv2d(x, w_b, self.bias, padding=self.padding)
 
 
-# ---------------------------------------------------------------------------
-# Non-STE conv layer (for polystep / ES methods)
-# ---------------------------------------------------------------------------
-
-
 class BinaryConv2d(nn.Module):
     """Conv2d with binary weights via sign(). NON-DIFFERENTIABLE."""
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, padding: int = 0):
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.1
-        )
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.1)
         self.bias = nn.Parameter(torch.zeros(out_channels))
         self.padding = padding
 
@@ -289,7 +266,7 @@ class DiscreteAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, dim)
         sim = x @ self.keys.t()  # (batch, num_slots)
-        # Hard routing via argmax -- NON-DIFFERENTIABLE
+        # Hard routing via argmax, NON-DIFFERENTIABLE
         slot_idx = sim.argmax(dim=-1)  # (batch,)
         # Gather the selected key for each sample
         selected_keys = self.keys[slot_idx]  # (batch, dim)
@@ -322,14 +299,16 @@ class HardMoELayer(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, num_experts: int = 4):
         super().__init__()
         self.gate = nn.Linear(input_dim, num_experts)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
-            for _ in range(num_experts)
-        ])
+        self.experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                for _ in range(num_experts)
+            ]
+        )
         self.num_experts = num_experts
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -344,16 +323,11 @@ class HardMoELayer(nn.Module):
         return (all_outputs * one_hot.unsqueeze(-1)).sum(dim=1)  # (batch, hidden_dim)
 
 
-# ---------------------------------------------------------------------------
-# Full models (sized for real datasets -- MNIST 28x28)
-# ---------------------------------------------------------------------------
-
-
 class SpikingMNISTNet(nn.Module):
     """SNN with hard-threshold LIF neurons for MNIST.
 
     Accumulates spikes over num_steps timesteps. Returns total spike counts
-    (NOT divided by num_steps -- scale in loss if needed).
+    (NOT divided by num_steps: scale in loss if needed).
     """
 
     def __init__(self, num_steps: int = 15):
@@ -377,7 +351,7 @@ class SpikingMNISTNet(nn.Module):
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
 
-        return total  # (batch, 10) -- raw spike counts
+        return total  # (batch, 10): raw spike counts
 
 
 class QuantizedMLP(nn.Module):
@@ -523,7 +497,11 @@ class DiscreteAttentionNet(nn.Module):
     """MLP with discrete argmax attention routing."""
 
     def __init__(
-        self, input_dim: int = 784, hidden: int = 128, output: int = 10, num_slots: int = 8,
+        self,
+        input_dim: int = 784,
+        hidden: int = 128,
+        output: int = 10,
+        num_slots: int = 8,
     ):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden)
@@ -541,7 +519,11 @@ class StaircaseNet(nn.Module):
     """MLP with piecewise-constant staircase activation."""
 
     def __init__(
-        self, input_dim: int = 784, hidden: int = 128, output: int = 10, levels: int = 5,
+        self,
+        input_dim: int = 784,
+        hidden: int = 128,
+        output: int = 10,
+        levels: int = 5,
     ):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden)
@@ -552,8 +534,8 @@ class StaircaseNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.reshape(x.shape[0], -1)
-        x = self.staircase(self.fc1(x))    # NON-DIFFERENTIABLE
-        x = self.staircase2(self.fc2(x))   # NON-DIFFERENTIABLE
+        x = self.staircase(self.fc1(x))  # NON-DIFFERENTIABLE
+        x = self.staircase2(self.fc2(x))  # NON-DIFFERENTIABLE
         return self.fc3(x)
 
 
@@ -578,11 +560,6 @@ class HardMoENet(nn.Module):
         x = self.relu(self.fc1(x))
         x = self.moe(x)  # NON-DIFFERENTIABLE argmax gating
         return self.fc_out(x)
-
-
-# ---------------------------------------------------------------------------
-# Smooth variants (for Adam baseline -- differentiable analogs)
-# ---------------------------------------------------------------------------
 
 
 class SmoothLIFNeuron(nn.Module):
@@ -636,7 +613,7 @@ class SmoothSpikingMNISTNet(nn.Module):
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
 
-        return total  # (batch, 10) -- raw spike counts
+        return total  # (batch, 10): raw spike counts
 
 
 class SmoothQuantizedMLP(nn.Module):
@@ -691,7 +668,11 @@ class SmoothDiscreteAttentionNet(nn.Module):
     """
 
     def __init__(
-        self, input_dim: int = 784, hidden: int = 128, output: int = 10, num_slots: int = 8,
+        self,
+        input_dim: int = 784,
+        hidden: int = 128,
+        output: int = 10,
+        num_slots: int = 8,
     ):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden)
@@ -714,7 +695,11 @@ class SmoothStaircaseNet(nn.Module):
     """
 
     def __init__(
-        self, input_dim: int = 784, hidden: int = 128, output: int = 10, levels: int = 5,
+        self,
+        input_dim: int = 784,
+        hidden: int = 128,
+        output: int = 10,
+        levels: int = 5,
     ):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden)
@@ -723,8 +708,8 @@ class SmoothStaircaseNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.reshape(x.shape[0], -1)
-        x = torch.sigmoid(self.fc1(x))   # DIFFERENTIABLE (no staircase)
-        x = torch.sigmoid(self.fc2(x))   # DIFFERENTIABLE (no staircase)
+        x = torch.sigmoid(self.fc1(x))  # DIFFERENTIABLE (no staircase)
+        x = torch.sigmoid(self.fc2(x))  # DIFFERENTIABLE (no staircase)
         return self.fc3(x)
 
 
@@ -739,14 +724,16 @@ class SoftMoELayer(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, num_experts: int = 4):
         super().__init__()
         self.gate = nn.Linear(input_dim, num_experts)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
-            for _ in range(num_experts)
-        ])
+        self.experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                for _ in range(num_experts)
+            ]
+        )
         self.num_experts = num_experts
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -840,11 +827,6 @@ def compute_expert_utilization(model, test_loader, device):
     }
 
 
-# ---------------------------------------------------------------------------
-# Permutation learning models
-# ---------------------------------------------------------------------------
-
-
 class HardPermutationNet(nn.Module):
     """Maps input sequence to sorting permutation via shared MLP + argmax.
 
@@ -869,15 +851,15 @@ class HardPermutationNet(nn.Module):
     def forward(self, x):
         # x: (batch, N) sequences of numbers
         batch = x.shape[0]
-        x_flat = x.reshape(-1, 1)              # (batch*N, 1)
-        scores = self.mlp(x_flat)               # (batch*N, N)
+        x_flat = x.reshape(-1, 1)  # (batch*N, 1)
+        scores = self.mlp(x_flat)  # (batch*N, N)
         score_matrix = scores.reshape(batch, self.N, self.N)  # (batch, N, N)
         # Transpose: MLP produces scores[input_pos][output_pos], but we need
         # score_matrix[output_pos][input_pos] so argmax gives "which input goes
         # to this output position" (matching argsort target convention).
         score_matrix = score_matrix.transpose(-1, -2)
-        perm = score_matrix.argmax(dim=-1)      # NON-DIFFERENTIABLE
-        return perm                              # (batch, N) long
+        perm = score_matrix.argmax(dim=-1)  # NON-DIFFERENTIABLE
+        return perm  # (batch, N) long
 
 
 class SoftPermutationNet(nn.Module):
@@ -939,15 +921,10 @@ class PermutationLoss(nn.Module):
         return (pred_perm != target_perm).float().mean()
 
 
-# ---------------------------------------------------------------------------
-# MAX-SAT utilities (direct parameter optimization, no hidden layers)
-# ---------------------------------------------------------------------------
-
-
 class MaxSATModel(nn.Module):
     """MAX-SAT solver via continuous relaxation.
 
-    No hidden layers -- only self.assignments parameter. Uses sigmoid for [0,1]
+    No hidden layers: only self.assignments parameter. Uses sigmoid for [0,1]
     relaxation, round() for {0,1} hard evaluation.
     """
 
@@ -986,11 +963,6 @@ class MaxSATModel(nn.Module):
 
         unsat_ratio = 1.0 - satisfied.mean()
         return unsat_ratio
-
-
-# ---------------------------------------------------------------------------
-# Program Synthesizer (Section 7 killer-app)
-# ---------------------------------------------------------------------------
 
 
 def cra_penalty(

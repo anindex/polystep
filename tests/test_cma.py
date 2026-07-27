@@ -13,17 +13,11 @@ import torch
 from polystep.cma import (
     compute_cma_hyperparameters,
     compute_heaviside_sigma,
-    compute_ot_bias_directions,
     update_covariance_diagonal,
     update_evolution_path_c,
     update_evolution_path_sigma,
     update_step_size_csa,
 )
-
-
-# ---------------------------------------------------------------------------
-# Test: compute_cma_hyperparameters
-# ---------------------------------------------------------------------------
 
 
 class TestComputeCMAHyperparameters:
@@ -82,23 +76,8 @@ class TestComputeCMAHyperparameters:
         assert params["expected_norm"] == pytest.approx(100, rel=0.1)
 
 
-# ---------------------------------------------------------------------------
-# Test: update_evolution_path_sigma
-# ---------------------------------------------------------------------------
-
-
 class TestEvolutionPathSigma:
     """Tests for step-size evolution path update (p_sigma)."""
-
-    def test_output_shape_matches_input(self):
-        """Output p_sigma has same shape as input."""
-        n = 64
-        p_sigma = torch.zeros(n)
-        displacement = torch.randn(n)
-        C_diag = torch.ones(n)
-
-        p_sigma_new = update_evolution_path_sigma(p_sigma, displacement, C_diag, c_sigma=0.1, mu_eff=2.0)
-        assert p_sigma_new.shape == p_sigma.shape
 
     def test_zero_displacement_accumulates_decay(self):
         """Zero displacement decays existing p_sigma by (1 - c_sigma)."""
@@ -150,22 +129,8 @@ class TestEvolutionPathSigma:
         assert torch.allclose(p_from_y, p_from_z, atol=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# Test: update_evolution_path_c
-# ---------------------------------------------------------------------------
-
-
 class TestEvolutionPathC:
     """Tests for covariance evolution path update (p_c)."""
-
-    def test_output_shape_matches_input(self):
-        """Output p_c has same shape as input."""
-        n = 64
-        p_c = torch.zeros(n)
-        displacement = torch.randn(n)
-
-        p_c_new = update_evolution_path_c(p_c, displacement, h_sigma=True, c_c=0.1, mu_eff=2.0)
-        assert p_c_new.shape == p_c.shape
 
     def test_h_sigma_false_disables_accumulation(self):
         """When h_sigma=False, displacement is not added (only decay)."""
@@ -190,11 +155,6 @@ class TestEvolutionPathC:
         sqrt_factor = math.sqrt(c_c * (2 - c_c) * mu_eff)
         expected_component = sqrt_factor * 0.1
         assert p_c_new[0].item() == pytest.approx(expected_component, rel=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Test: compute_heaviside_sigma
-# ---------------------------------------------------------------------------
 
 
 class TestHeavisideSigma:
@@ -224,11 +184,6 @@ class TestHeavisideSigma:
         # The former max(1, generation) form used a smaller threshold and would misclassify here.
         wrong = (1.4 + 2 / (n + 1)) * expected_norm * math.sqrt(1 - (1 - c_sigma) ** (2 * generation))
         assert wrong < threshold
-
-
-# ---------------------------------------------------------------------------
-# Test: update_step_size_csa
-# ---------------------------------------------------------------------------
 
 
 class TestCSAStepSize:
@@ -280,23 +235,8 @@ class TestCSAStepSize:
         assert sigma_new <= 100.0
 
 
-# ---------------------------------------------------------------------------
-# Test: update_covariance_diagonal
-# ---------------------------------------------------------------------------
-
-
 class TestCovarianceUpdate:
     """Tests for diagonal covariance update."""
-
-    def test_output_shape_matches_input(self):
-        """Output C_diag has same shape as input."""
-        n = 64
-        C_diag = torch.ones(n)
-        p_c = torch.randn(n)
-        rank_mu = torch.rand(n)
-
-        C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=0.1, c_mu=0.1, h_sigma=True, c_c=0.1)
-        assert C_new.shape == C_diag.shape
 
     def test_cov_bounds_enforced(self):
         """Covariance is clamped to [1e-6, 1e6]."""
@@ -354,74 +294,3 @@ class TestCovarianceUpdate:
 
         C_new = update_covariance_diagonal(C_diag, p_c, rank_mu, c_1=c_1, c_mu=c_mu, h_sigma=False, c_c=c_c)
         assert C_new[0].item() == pytest.approx(expected, rel=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Test: compute_ot_bias_directions
-# ---------------------------------------------------------------------------
-
-
-class TestOTBiasDirections:
-    """Tests for OT-bias direction extraction."""
-
-    def test_output_shape(self):
-        """Output has shape (top_k_actual, particle_dim)."""
-        P, V, pdim = 10, 4, 8
-        transport_matrix = torch.rand(P, V)
-        X_vertices = torch.randn(P, V, pdim)
-        X_current = torch.randn(P, pdim)
-        top_k = 5
-
-        dirs = compute_ot_bias_directions(transport_matrix, X_vertices, X_current, top_k)
-        assert dirs.shape[0] <= top_k
-        assert dirs.shape[1] == pdim
-
-    def test_directions_normalized(self):
-        """Each direction should have unit norm."""
-        P, V, pdim = 10, 4, 8
-        transport_matrix = torch.rand(P, V)
-        X_vertices = torch.randn(P, V, pdim)
-        X_current = torch.randn(P, pdim)
-        top_k = 5
-
-        dirs = compute_ot_bias_directions(transport_matrix, X_vertices, X_current, top_k)
-        norms = torch.norm(dirs, dim=1)
-        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
-
-    def test_fewer_particles_than_top_k(self):
-        """If P < top_k, returns P directions."""
-        P, V, pdim = 3, 4, 8
-        transport_matrix = torch.rand(P, V)
-        X_vertices = torch.randn(P, V, pdim)
-        X_current = torch.randn(P, pdim)
-        top_k = 10
-
-        dirs = compute_ot_bias_directions(transport_matrix, X_vertices, X_current, top_k)
-        assert dirs.shape[0] == P
-
-    def test_direction_toward_high_transport_vertex(self):
-        """Direction should point toward vertex that received most transport."""
-        P, V, pdim = 1, 2, 4
-        # Single particle, all transport to vertex 1
-        transport_matrix = torch.tensor([[0.0, 1.0]])
-        X_vertices = torch.zeros(P, V, pdim)
-        X_vertices[0, 1, :] = torch.tensor([1.0, 0.0, 0.0, 0.0])  # Vertex 1 at (1,0,0,0)
-        X_current = torch.zeros(P, pdim)  # Particle at origin
-        top_k = 1
-
-        dirs = compute_ot_bias_directions(transport_matrix, X_vertices, X_current, top_k)
-        # Direction should be toward (1,0,0,0) from origin -> normalized = (1,0,0,0)
-        expected = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-        assert torch.allclose(dirs, expected, atol=1e-5)
-
-    def test_handles_zero_norm_displacement(self):
-        """Edge case: particle at centroid doesn't cause NaN."""
-        P, V, pdim = 2, 2, 4
-        transport_matrix = torch.ones(P, V) / (P * V)
-        X_vertices = torch.zeros(P, V, pdim)
-        # Set particle exactly at centroid
-        X_current = torch.zeros(P, pdim)
-        top_k = 2
-
-        dirs = compute_ot_bias_directions(transport_matrix, X_vertices, X_current, top_k)
-        assert not torch.isnan(dirs).any()

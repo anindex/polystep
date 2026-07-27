@@ -41,11 +41,6 @@ def test_compile_vmap_tracks_changing_batch():
     torch.testing.assert_close(lb, ref.evaluate(stacked, xb, tb), rtol=1e-4, atol=1e-4)
 
 
-# ---------------------------------------------------------------------------
-# Helper models
-# ---------------------------------------------------------------------------
-
-
 class SimpleMLP(nn.Module):
     def __init__(self, in_dim=10, hidden=5, out_dim=2):
         super().__init__()
@@ -82,7 +77,7 @@ class MLPWithBatchNorm(nn.Module):
 
 
 class VmapIncompatibleModel(nn.Module):
-    """Model that calls .item() in forward -- incompatible with vmap."""
+    """Model that calls .item() in forward: incompatible with vmap."""
 
     def __init__(self):
         super().__init__()
@@ -93,11 +88,6 @@ class VmapIncompatibleModel(nn.Module):
         # .item() is not traceable by vmap
         s = self._scale.item()
         return self.fc(x) * s
-
-
-# ---------------------------------------------------------------------------
-# batch_unflatten tests
-# ---------------------------------------------------------------------------
 
 
 class TestBatchUnflattenShape:
@@ -153,16 +143,37 @@ class TestBatchUnflattenSharedParams:
         batch = particle.unsqueeze(0).expand(N, -1, -1).clone()
         stacked = layout.batch_unflatten(batch)
 
-        # Both canonical and alias key must be present
+        # The tied weight appears once, under the canonical key. functional_call
+        # rejects a dict naming both, and the in-place swap writes the single
+        # Parameter that fc1 and fc2 share.
         assert "fc1.weight" in stacked
-        assert "fc2.weight" in stacked
-        # They must be the same tensor object (identity)
-        assert stacked["fc2.weight"] is stacked["fc1.weight"]
+        assert "fc2.weight" not in stacked
+        # unflatten still carries the alias: it feeds load_state_dict.
+        assert "fc2.weight" in layout.unflatten(particle)
 
+    def test_a_tied_weight_evaluates_on_both_paths(self):
+        from polystep.cost_nn import NNCostEvaluator
 
-# ---------------------------------------------------------------------------
-# NNCostEvaluator tests
-# ---------------------------------------------------------------------------
+        torch.manual_seed(0)
+        model = SharedWeightsModel()
+        layout = ParamLayout.from_module(model)
+        inputs, targets = torch.randn(6, 10), torch.randn(6, 10)
+
+        evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
+        batch = layout.flatten(model).unsqueeze(0).expand(3, -1, -1).clone()
+        batch[1] += 0.05
+        batch[2] -= 0.05
+        stacked = layout.batch_unflatten(batch)
+
+        evaluator._use_inplace = True
+        inplace = evaluator.evaluate(stacked, inputs, targets)
+        evaluator._use_inplace = False
+        vmapped = evaluator.evaluate(stacked, inputs, targets)
+
+        torch.testing.assert_close(inplace, vmapped)
+        # The tie must survive: an in-place swap that wrote one alias and not the
+        # other would leave the two layers holding different weights.
+        assert model.fc2.weight is model.fc1.weight
 
 
 class TestEvaluatorUnsupervised:
@@ -303,6 +314,40 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
         assert evaluator._batched_linear is not None
 
+    @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
+    def test_regression_losses_use_fast_path_and_match_vmap(self, loss_fn):
+        """The bmm forward is loss-independent; only the reduction differs.
+
+        Gating the fast path on CrossEntropyLoss sent every regression MLP through
+        vmap for no reason.
+        """
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+        layout = ParamLayout.from_module(model)
+
+        N = 6
+        batch = layout.flatten(model).unsqueeze(0).expand(N, -1, -1).clone()
+        batch += torch.randn_like(batch) * 0.05
+        stacked = layout.batch_unflatten(batch)
+        inputs = torch.randn(16, 4)
+        targets = torch.randn(16, 3)
+
+        evaluator = NNCostEvaluator(model, loss_fn)
+        assert evaluator._batched_linear is not None
+        fast = evaluator.evaluate(stacked, inputs, targets)
+
+        expected = torch.stack(
+            [
+                loss_fn(torch.func.functional_call(model, {k: v[i] for k, v in stacked.items()}, (inputs,)), targets)
+                for i in range(N)
+            ]
+        )
+        assert torch.allclose(fast, expected, atol=1e-6)
+
+    def test_non_mean_reduction_falls_back(self):
+        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+        assert NNCostEvaluator(model, nn.MSELoss(reduction="sum"))._batched_linear is None
+
     def test_label_smoothing_falls_back_and_matches(self):
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
@@ -336,7 +381,6 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         torch.testing.assert_close(losses, expected, atol=1e-5, rtol=1e-5)
 
 
-# ---------------------------------------------------------------------------
 # Chunked evaluation tests# ---------------------------------------------------------------------------
 
 
@@ -429,7 +473,6 @@ class TestAutoChunkSizeCached:
         assert evaluator._chunk_size_cached is not _UNSET
 
 
-# ---------------------------------------------------------------------------
 # compute_nn_cost_matrix tests# ---------------------------------------------------------------------------
 
 

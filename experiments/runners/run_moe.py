@@ -28,9 +28,7 @@ import traceback
 from typing import Any, Dict, List, Optional
 
 # Ensure repo root is on path
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
 import torch
@@ -52,45 +50,44 @@ from experiments.baselines.openai_es import train_openai_es
 from experiments.baselines.spsa import train_spsa
 
 
-# ---------------------------------------------------------------------------
-# Benchmark constants
-# ---------------------------------------------------------------------------
-
 BENCHMARK = "moe"
 BATCH_SIZE = 512
 EPOCHS = 30
 
 OPENAI_ES_CONFIG = {
-    "sigma": 0.02, "lr": 0.01, "population_size": 50, "generations": 2000,
-    "lr_decay": True, "weight_decay": 0.01, "fitness_shaping": "rank",
+    "sigma": 0.02,
+    "lr": 0.01,
+    "population_size": 50,
+    "generations": 2000,
+    "lr_decay": True,
+    "weight_decay": 0.01,
+    "fitness_shaping": "rank",
 }
 CMAES_CONFIG = {"generations": 2000, "popsize": 16, "stdev_init": 0.5}
 SPSA_CONFIG = {"a": 0.1, "c": 0.1, "alpha": 0.602, "gamma": 0.101, "max_iters": 10000}
 
 # polystep config - r4_sr12t4 config (90.92% at 20ep, seed 42)
 # HYBRID: flat eps + flat pr, but SCHEDULED sr only
-# eps ≤ 0.5 mandatory - eps scheduling causes MoE collapse (2.66% at eps=1.5)
+# eps <= 0.5 mandatory - eps scheduling causes MoE collapse (2.66% at eps=1.5)
 # sr scheduling (12->4) with rank=4 beats flat rank=8 while being 2x faster
 PSTORCH_CONFIG = {
-    "epsilon": 0.5,                     # FLAT - eps scheduling -> collapse
-    "step_radius_init": 12.0,          # sr scheduling: 12->4
+    "epsilon": 0.5,  # FLAT - eps scheduling -> collapse
+    "step_radius_init": 12.0,  # sr scheduling: 12->4
     "step_radius_target": 4.0,
-    "probe_radius": 1.0,               # FLAT
-    "num_probe": 1, "rank": 4,
-    "chunk_size": 1024, "amortize_steps": 1,
-    "rotation_interval": 0, "absorb_interval": 20,
+    "probe_radius": 1.0,  # FLAT
+    "num_probe": 1,
+    "rank": 4,
+    "chunk_size": 1024,
+    "amortize_steps": 1,
+    "rotation_interval": 0,
+    "absorb_interval": 20,
     "biased_rotation": True,
-    "anderson_depth": 0,               # Option 3: ablation showed zero effect on MoE (identical 3-epoch numerics vs depth=5)
+    "anderson_depth": 0,  # Option 3: ablation showed zero effect on MoE (identical 3-epoch numerics vs depth=5)
     "adaptive_omega": True,
 }
 
 
-# ---------------------------------------------------------------------------
-# Method: polystep
-# ---------------------------------------------------------------------------
-
-def run_polystep(seed, device, results_dir, epochs=EPOCHS, dry_run=False,
-                audit_no_leakage: bool = True):
+def run_polystep(seed, device, results_dir, epochs=EPOCHS, dry_run=False, audit_no_leakage: bool = True):
     """Train Hard MoE with polystep PolyStepOptimizer + HybridSubspace.
 
     By default, best-checkpoint selection uses a held-out validation
@@ -117,7 +114,9 @@ def run_polystep(seed, device, results_dir, epochs=EPOCHS, dry_run=False,
     val_loader = None
     if audit_no_leakage:
         train_loader, val_loader = make_train_val_split(
-            train_loader, val_frac=0.1, seed=seed,
+            train_loader,
+            val_frac=0.1,
+            seed=seed,
         )
     selection_loader = val_loader if (audit_no_leakage and val_loader is not None) else test_loader
 
@@ -207,13 +206,15 @@ def run_polystep(seed, device, results_dir, epochs=EPOCHS, dry_run=False,
                 # Per-20-step fine-grained tracking
                 if step_count % 20 == 0:
                     step_test_acc = evaluate_accuracy(model, test_loader, device=device)
-                    step_logs.append({
-                        "step": step_count,
-                        "epoch": epoch + 1,
-                        "test_accuracy": step_test_acc,
-                        "loss": loss,
-                        "wall_time": time.time() - start_time,
-                    })
+                    step_logs.append(
+                        {
+                            "step": step_count,
+                            "epoch": epoch + 1,
+                            "test_accuracy": step_test_acc,
+                            "loss": loss,
+                            "wall_time": time.time() - start_time,
+                        }
+                    )
 
             train_acc = epoch_correct / max(epoch_total, 1)
             test_acc = evaluate_accuracy(model, test_loader, device=device)
@@ -228,16 +229,20 @@ def run_polystep(seed, device, results_dir, epochs=EPOCHS, dry_run=False,
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / max(len(train_loader), 1)
 
-            epoch_logs.append({
-                "epoch": epoch + 1,
-                "accuracy": test_acc,
-                "train_accuracy": train_acc,
-                "test_accuracy": test_acc,
-                "loss": avg_loss,
-                "time": epoch_time,
-                "wall_time": time.time() - start_time,
-            })
-            print(f"    Epoch {epoch+1}/{epochs} | train={train_acc*100:.1f}% | test={test_acc*100:.1f}% | loss={avg_loss:.4f}")
+            epoch_logs.append(
+                {
+                    "epoch": epoch + 1,
+                    "accuracy": test_acc,
+                    "train_accuracy": train_acc,
+                    "test_accuracy": test_acc,
+                    "loss": avg_loss,
+                    "time": epoch_time,
+                    "wall_time": time.time() - start_time,
+                }
+            )
+            print(
+                f"    Epoch {epoch + 1}/{epochs} | train={train_acc * 100:.1f}% | test={test_acc * 100:.1f}% | loss={avg_loss:.4f}"
+            )
 
     wall_time = time.time() - start_time
     last_epoch_acc = test_acc
@@ -270,10 +275,6 @@ def run_polystep(seed, device, results_dir, epochs=EPOCHS, dry_run=False,
     )
     print(f"    Saved: {filepath}")
 
-
-# ---------------------------------------------------------------------------
-# Method: CMA-ES (pycma)
-# ---------------------------------------------------------------------------
 
 def run_cmaes(seed, device, results_dir, dry_run=False):
     """Train Hard MoE with CMA-ES (pycma)."""
@@ -345,13 +346,15 @@ def run_cmaes(seed, device, results_dir, dry_run=False):
                 test_acc = evaluate_accuracy(model, test_loader, device=device)
                 best_accuracy = max(best_accuracy, test_acc)
                 elapsed = time.time() - start_time
-                epoch_logs.append({
-                    "epoch": gen,
-                    "accuracy": test_acc,
-                    "loss": es.result.fbest,
-                    "time": elapsed,
-                })
-                print(f"    Gen {gen}/{generations} | acc={test_acc*100:.1f}% | loss={es.result.fbest:.4f}")
+                epoch_logs.append(
+                    {
+                        "epoch": gen,
+                        "accuracy": test_acc,
+                        "loss": es.result.fbest,
+                        "time": elapsed,
+                    }
+                )
+                print(f"    Gen {gen}/{generations} | acc={test_acc * 100:.1f}% | loss={es.result.fbest:.4f}")
 
     wall_time = time.time() - start_time
 
@@ -381,10 +384,6 @@ def run_cmaes(seed, device, results_dir, dry_run=False):
     )
     print(f"    Saved: {filepath}")
 
-
-# ---------------------------------------------------------------------------
-# Method: OpenAI-ES
-# ---------------------------------------------------------------------------
 
 def run_openai_es(seed, device, results_dir, dry_run=False):
     """Train Hard MoE with OpenAI Evolution Strategy."""
@@ -423,10 +422,6 @@ def run_openai_es(seed, device, results_dir, dry_run=False):
     print(f"    Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method: SPSA
-# ---------------------------------------------------------------------------
-
 def run_spsa(seed, device, results_dir, dry_run=False):
     """Train Hard MoE with SPSA."""
     max_iters = 100 if dry_run else SPSA_CONFIG["max_iters"]
@@ -462,10 +457,6 @@ def run_spsa(seed, device, results_dir, dry_run=False):
     print(f"    Saved: {filepath}")
 
 
-# ---------------------------------------------------------------------------
-# Method dispatch
-# ---------------------------------------------------------------------------
-
 METHOD_RUNNERS = {
     "polystep": lambda seed, device, results_dir, dry_run: run_polystep(seed, device, results_dir, dry_run=dry_run),
     "cmaes": run_cmaes,
@@ -474,21 +465,19 @@ METHOD_RUNNERS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run Hard MoE (Mixture-of-Experts) benchmark: methods x seeds"
-    )
+    parser = argparse.ArgumentParser(description="Run Hard MoE (Mixture-of-Experts) benchmark: methods x seeds")
     parser.add_argument(
-        "--methods", nargs="+",
+        "--methods",
+        nargs="+",
         default=["polystep", "cmaes", "openai_es", "spsa"],
         help="Methods to run (default: all 4)",
     )
     parser.add_argument(
-        "--seeds", nargs="+", type=int, default=SEEDS,
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=SEEDS,
         help=f"Seeds (default: {SEEDS})",
     )
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
@@ -498,15 +487,19 @@ def main():
         help="Output directory for JSON results",
     )
     parser.add_argument(
-        "--epochs", type=int, default=EPOCHS,
+        "--epochs",
+        type=int,
+        default=EPOCHS,
         help=f"Number of polystep epochs (default: {EPOCHS})",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Run only 1 epoch (polystep) / 10 generations (ES) for testing",
     )
     parser.add_argument(
-        "--allow-test-leakage", action="store_true",
+        "--allow-test-leakage",
+        action="store_true",
         help=(
             "Legacy mode: select best_state_dict on the test set instead "
             "of a held-out validation slice. Default is honest protocol "
@@ -540,8 +533,14 @@ def main():
             print(f"  Running {method} seed={seed}...")
             try:
                 if method == "polystep":
-                    run_polystep(seed, args.device, args.results_dir, epochs=args.epochs,
-                                dry_run=args.dry_run, audit_no_leakage=not args.allow_test_leakage)
+                    run_polystep(
+                        seed,
+                        args.device,
+                        args.results_dir,
+                        epochs=args.epochs,
+                        dry_run=args.dry_run,
+                        audit_no_leakage=not args.allow_test_leakage,
+                    )
                 elif method in METHOD_RUNNERS:
                     METHOD_RUNNERS[method](seed, args.device, args.results_dir, args.dry_run)
                 else:

@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.9.0 - 2026-07-27
+
+### Added
+
+- `SparseDeltaEvaluator`: a full-space candidate replaces `particle_dim` scalars, so its
+  output differs from the base in at most that many columns. Propagates the delta through
+  elementwise layers and goes dense one `Linear` past the perturbed one, instead of a
+  dense `bmm` over `N` weight sets. Automatic for `nn.Sequential` of `Linear` and
+  elementwise layers, with a per-chunk fallback.
+- `FactoredSubspace`: perturbs each 2D parameter by `dW = A @ B` with `B` fixed, so
+  `x (W + A B)^T = x W^T + (x B^T) A^T` and no candidate weight is built. Not the
+  default: the fixed `B` confines perturbations to `rank` input directions.
+- `step(..., objective_token=...)` marks which objective a step measures, so cost rows
+  cannot be reused across minibatches. `release_evaluator()`, `resync_from_model()`,
+  `MinCostGreedySolver` and `TopKMeanSolver` are public.
+- `MANIFEST.in`, so the sdist ships a runnable test suite. CI runs it from the tarball.
+
+### Fixed
+
+- `api.train()` never called `register_evaluator`, the only assignment of
+  `_cost_evaluator`, `_fused_inputs`, `_factored_evaluator` and `_sparse_delta_evaluator`,
+  so every fast evaluation path was unreachable through the training API.
+- Cost-row reuse under `adaptive_probes` was per particle, but a candidate is the whole
+  configuration with one row replaced, so a stagnant particle's row was still measured
+  against every other particle's position. Reuse is now all or nothing.
+- `multifidelity_screen` averaged direction contrast across particles, which carry
+  independent rotations, so the kept set was chosen at random. Ranked per particle now.
+- Tied weights raised on both evaluation paths. `batch_unflatten` emits the canonical key
+  only; `unflatten` still carries aliases for `load_state_dict`.
+- `restore_best` keyed on the OT cost when no callback was registered, restoring the step
+  with the cheapest probe cloud rather than the best weights. It also snapshots to CPU.
+- Chunk size ignored the weight set a non-fused subspace builds per candidate and the vmap
+  activations. A 120K-param step peaked at 1661 MB in full space and 10565 MB in subspace
+  mode; now 946 MB and 1461 MB.
+- `AdaptiveSubspace` and per-layer rotation replaced the projection while the coordinates
+  were non-zero, moving the weights with nothing evaluated behind them.
+- `CMAAdaptiveSubspace` never rotated or absorbed, left its hyperparameters at `0.0` so
+  the covariance update was inert, normalized the evolution paths by `sigma` instead of
+  `step_radius` so `C_diag` decayed to its floor, carried state through basis rotations
+  untransformed, and accumulated at bf16 where `1 + c_1*x` rounds back to `1`.
+- Anderson acceleration subtracted `dX` instead of `dX + dR`, so `anderson_depth > 0`
+  converged slower than no acceleration.
+- `num_particles = 1` froze the optimizer: balanced OT with one row forces a uniform plan.
+  The default now selects `SoftmaxSolver` and warns.
+- `scale_cost` divided before recentering, so adding a constant to every cost changed the
+  plan. `SinkhornSolver` also reported `ent_reg_cost` in the wrong frame; the plan and
+  duals were unaffected. The greedy and top-k solvers had the same reporting bug.
+- Softmax paths recentred by the global minimum, so a row above it underflowed to `-inf`
+  and returned NaN; the fused kernel did not recenter at all.
+- `sanitize_cost` mapped `-inf` to the worst finite value instead of the best, and used an
+  absolute penalty that entered the `scale_cost='mean'` reduction.
+- `state_dict` captured only `SolverState`, so resume was not exact for `amortize_steps`,
+  `adaptive_probes`, `trust_region` or `HybridSubspace`. Format is 3; format 2 loads with
+  a warning.
+- A stagnation absorb never cleared `stagnation_count`, redrawing the basis every step on
+  a plateau. `resync_from_model()` left momentum and rotation state on the old anchor.
+- Probe losses accumulated in FP32 unconditionally, so a float64 objective whose costs
+  differ below FP32 resolution produced a constant cost matrix.
+- Block-wise biased rotation raised on bf16 under `mixed_precision=True`. A zero descent
+  direction produced a singular rotation collapsing `+e0` and `-e0`.
+- Smaller: the in-place evaluator dropped unknown parameter keys silently; the
+  trust-region ratio scored a Newton step that was never applied; displacement history
+  mixed bases; randomized PCA drew from the global RNG; rank transitions dropped
+  `HybridSubspace` settings; `data_dependent_init` had the wrong sign; a float64 model
+  with a subspace raised; a frozen model gave an opaque error; `pyproject.toml` declared
+  `torch>=2.4` where 0.2.0 announced `torch>=2.8`.
+
+### Changed
+
+- `adaptive_probes` and `adaptive_num_probe` default on under `block_strategy='monolithic'`.
+- `use_csa` is refused with a warning: the OT step is a deterministic descent direction, so
+  CSA reads agreement as the normal state and `sigma` grows without bound.
+- `multifidelity_screen` cuts the forward budget instead of only reweighting, and runs only
+  when `screen_fidelity/num_probe + screen_keep_ratio < 1`. Needs a cheap closure from
+  `screen_closure_from()`; `api.train` supplies one.
+- Block-wise warns for options it ignores; `grouped` warns when combined with a subspace.
+  `LinearSubspace` amplifies rather than dilutes the perturbation, as its docstring said.
+- `_step_blockwise` claimed blockwise cuts OT cost from `O(N^2)` to `O(N^2/L)`. The forward
+  count is identical; `L` solves over `P/L` rows replace one over `P`.
+- Removed `get_sobol_rotation_matrices`, `HybridSubspace.reconstruct_base` and
+  `reconstruct_batch_delta`: no callers, no coverage.
+
+### Performance
+
+- `thin_qr` pins basis construction to one thread: `HybridSubspace` setup for the MNIST
+  example drops from 27.0 s to 97.8 ms. `apply_biased_rotation` uses modified Gram-Schmidt
+  instead of `torch.linalg.qr`, 7-33x faster at these sizes. Compiled kernels take radius
+  and epsilon as 0-d tensors, so a scheduled radius no longer recompiles every step.
+- Example 06 on an RTX 5090: 1024 s to 845 s, shift-recovery +9.3 pp to +10.7 pp.
+
+### Tests, examples and docs
+
+- 967 tests in 262 s with an intermittent timeout failure, now 941 in 8 s with none.
+  `tests/test_subspace_contract.py` replaces per-class copies of the properties every
+  subspace shares. Removed tests that could not fail. Suite verified by mutation: eight
+  semantic changes to the source are all caught.
+- `tests/test_nondiff_data.py` guarded nine tests on the `pysat` import but not on the
+  `experiments/` tree they import from, so they failed rather than skipped in the sdist
+  when pysat happened to be installed.
+- Examples pin CPU threads, check optional imports before use instead of failing after the
+  run, and register the evaluator in hand-rolled loops. `python-sat` moved into the
+  `examples` extra, which example 04 needs.
+- `release.yml` lint and test commands had drifted from `ci.yml` and it lacked the CPU
+  torch index; both now match. README and the docs corrected where they had drifted.
+
 ## 0.8.0 - 2026-07-24
 
 ### Added
@@ -385,7 +490,7 @@ Networks via Optimal Transport*.
 
 - 5 runnable demos under `examples/` (quickstart, SNN, RL, MAX-SAT, MNIST)
 - Paper-reproduction harness under `experiments/runners/` covering SNN,
-  INT8, argmax, staircase, hard MoE, MAX-SAT (100K–1M vars), MNIST,
+  INT8, argmax, staircase, hard MoE, MAX-SAT (100K-1M vars), MNIST,
   ETTh1 timeseries, RL, and GPT-2 head-only fine-tuning
 - Ablations: OT vs softmax solver, epsilon / radius / particles / subspace
   grid, MAX-SAT scaling

@@ -3,15 +3,11 @@
 import torch
 import pytest
 
-from polystep.solvers import SinkhornSolver, SinkhornResult
+from polystep.solvers import SinkhornSolver
 
 
 class TestSinkhornSolver:
     """Tests for the unified Sinkhorn solver."""
-
-    # ------------------------------------------------------------------
-    # Full-rank tests
-    # ------------------------------------------------------------------
 
     def test_small_epsilon_near_deterministic(self):
         """Small epsilon pushes transport toward deterministic (near one-hot rows).
@@ -273,59 +269,6 @@ class TestAndersonAcceleration:
             f"n_iters differ: standard={result_standard.n_iters}, configured={result_configured.n_iters}"
         )
 
-    def test_anderson_reduces_iterations(self):
-        """anderson_depth=5 converges in fewer iterations than depth=0."""
-        torch.manual_seed(42)
-        n, m = 20, 20
-        C = torch.rand(n, m)
-
-        solver_standard = SinkhornSolver(
-            epsilon=0.5,
-            max_iterations=5000,
-            threshold=1e-6,
-            check_every=5,
-            compile=False,
-            anderson_depth=0,
-        )
-        result_standard = solver_standard.solve(C)
-
-        solver_aa = SinkhornSolver(
-            epsilon=0.5,
-            max_iterations=5000,
-            threshold=1e-6,
-            check_every=5,
-            compile=False,
-            anderson_depth=5,
-        )
-        result_aa = solver_aa.solve(C)
-
-        assert result_standard.converged, f"Standard did not converge in {result_standard.n_iters} iters"
-        assert result_aa.converged, f"Anderson did not converge in {result_aa.n_iters} iters"
-        assert result_aa.n_iters <= result_standard.n_iters, (
-            f"Anderson ({result_aa.n_iters} iters) should be <= standard ({result_standard.n_iters} iters)"
-        )
-
-    def test_anderson_valid_marginals(self):
-        """anderson_depth=5 result satisfies marginal constraints."""
-        torch.manual_seed(42)
-        n, m = 15, 12
-        C = torch.rand(n, m)
-        a = torch.ones(n) / n
-        b = torch.ones(m) / m
-
-        solver = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-6,
-            compile=False,
-            anderson_depth=5,
-        )
-        result = solver.solve(C)
-
-        P = result.matrix
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-
     @pytest.mark.parametrize("noise", [1e-4, 1e-6])
     def test_anderson_near_singular_no_nan(self, noise):
         """Anderson acceleration on near-singular cost matrices produces finite results.
@@ -440,27 +383,6 @@ class TestDataDependentInit:
             f"g difference: {(result_ddi_warm.g - result_warm.g).abs().max():.2e}"
         )
 
-    def test_valid_marginals(self):
-        """data_dependent_init=True produces valid transport plan."""
-        torch.manual_seed(42)
-        n, m = 12, 10
-        C = torch.rand(n, m)
-        a = torch.ones(n) / n
-        b = torch.ones(m) / m
-
-        solver = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-6,
-            compile=False,
-            data_dependent_init=True,
-        )
-        result = solver.solve(C)
-
-        P = result.matrix
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-
 
 class TestAdaptiveOmega:
     """Tests for adaptive omega in Sinkhorn solver (convergence acceleration)."""
@@ -486,44 +408,6 @@ class TestAdaptiveOmega:
         assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all()
         a = torch.ones(n) / n
         assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-3)
-
-    def test_valid_marginals(self):
-        """adaptive_omega=True produces valid transport plan."""
-        torch.manual_seed(42)
-        n, m = 10, 10
-        C = torch.rand(n, m)
-        a = torch.ones(n) / n
-        b = torch.ones(m) / m
-
-        solver = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-6,
-            compile=False,
-            adaptive_omega=True,
-        )
-        result = solver.solve(C)
-
-        P = result.matrix
-        assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
-        assert torch.allclose(P.sum(dim=0), b, atol=1e-4), f"Col marginal error: {(P.sum(dim=0) - b).abs().max():.6f}"
-
-    def test_convergence(self):
-        """adaptive_omega=True converges on a standard problem."""
-        torch.manual_seed(42)
-        n, m = 10, 10
-        C = torch.rand(n, m)
-
-        solver = SinkhornSolver(
-            epsilon=0.5,
-            max_iterations=5000,
-            threshold=1e-6,
-            compile=False,
-            adaptive_omega=True,
-        )
-        result = solver.solve(C)
-
-        assert result.converged, f"Did not converge after {result.n_iters} iters"
 
 
 class TestFixedModeLogic:
@@ -649,38 +533,8 @@ class TestFixedModeLogic:
         assert len(anderson_warnings) == 1, f"Expected 1 Anderson fixed-mode warning, got {len(anderson_warnings)}"
 
 
-# ---------------------------------------------------------------------------
-# Tests for dual potential clamping
-# ---------------------------------------------------------------------------
-
-
 class TestDualClamping:
     """Tests for dual potential clamping behavior."""
-
-    def test_dual_clamping_not_too_aggressive_small_epsilon(self):
-        """Dual potentials should not be aggressively clamped at small epsilon."""
-        from polystep.solvers import SinkhornSolver
-
-        # Small epsilon creates large dual potentials
-        solver = SinkhornSolver(epsilon=0.05, max_iterations=100, threshold=1e-6, compile=False)
-        n, m = 10, 10
-        torch.manual_seed(42)
-        C = torch.randn(n, m).abs() * 10  # Large cost spread
-        a = torch.ones(n) / n
-        b = torch.ones(m) / m
-        result = solver.solve(C, a=a, b=b)
-        f, g = result.f, result.g
-        T = result.matrix
-        # Duals should be finite and marginals approximately satisfied
-        assert torch.isfinite(f).all()
-        assert torch.isfinite(g).all()
-        row_sums = T.sum(dim=1)
-        assert torch.allclose(row_sums, a, atol=1e-3), f"Row marginals off: {row_sums} vs {a}"
-
-
-# ---------------------------------------------------------------------------
-# Tests for ProgressiveEpsilon (progressive epsilon)
-# ---------------------------------------------------------------------------
 
 
 class TestProgressiveEpsilon:

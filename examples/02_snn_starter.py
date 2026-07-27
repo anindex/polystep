@@ -1,7 +1,7 @@
 """02 - SNN starter: train a tiny spiking network without gradients.
 
-A small spiking neural network with hard-threshold LIF spikes (genuinely
-non-differentiable) trained via PolyStep in under a minute on CPU.
+A small spiking neural network with hard-threshold LIF spikes (truly
+non-differentiable) trained via PolyStep in about 5 s on one CPU core.
 
 Why gradient-free for SNNs?
   Hard LIF spikes have ``d(spike) / d(mem) == 0`` almost everywhere, so
@@ -19,14 +19,21 @@ Output:
 Run:
   python examples/02_snn_starter.py
 """
+
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 import time
 from pathlib import Path
 
 import torch
+
+# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
+# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
+# Set POLYSTEP_THREADS to override. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
 import torch.nn as nn
 
 # Allow running directly from a source checkout without `pip install -e .`.
@@ -82,6 +89,9 @@ def main():
             def closure(stacked_params, _in=inputs, _tgt=targets):
                 return evaluator.evaluate(stacked_params, _in, _tgt)
 
+            # A hand-rolled loop has to register the evaluator itself for the optimizer
+            # to use anything but closure(). api.train() does this for you.
+            optimizer.register_evaluator(evaluator, inputs, targets)
             optimizer.step(closure)
 
             with torch.no_grad():
@@ -94,10 +104,7 @@ def main():
             step_log.append(global_step)
 
             if global_step % 10 == 0:
-                print(
-                    f"  step {global_step:3d} | "
-                    f"loss={step_loss:.3f} batch_acc={100 * step_acc:5.1f}%"
-                )
+                print(f"  step {global_step:3d} | loss={step_loss:.3f} batch_acc={100 * step_acc:5.1f}%")
             global_step += 1
 
     elapsed = time.time() - start
@@ -110,10 +117,17 @@ def main():
     print(f"  wallclock: {elapsed:.1f}s ({target_steps} steps)")
     print("=" * 60)
 
+    if importlib.util.find_spec("matplotlib") is None:
+        print("matplotlib not installed; skipping the figure (pip install matplotlib).")
+        return
+
     import matplotlib.pyplot as plt
 
     fig, (ax_loss, ax_acc) = plt.subplots(
-        1, 2, figsize=(7.0, 2.6), constrained_layout=True,
+        1,
+        2,
+        figsize=(7.0, 2.6),
+        constrained_layout=True,
     )
     ax_loss.plot(step_log, loss_log, color="#0072B2", lw=1.4)
     ax_loss.set_xlabel("PolyStep step")
@@ -121,12 +135,9 @@ def main():
     ax_loss.set_title("Training loss", fontsize=9)
     ax_loss.grid(True, alpha=0.3)
 
-    ax_acc.plot(step_log, [100 * a for a in acc_log], color="#0072B2", lw=1.4,
-                label="train batch")
-    ax_acc.axhline(100 * init_acc, color="#999999", ls="--", lw=1.0,
-                   label=f"initial test {100 * init_acc:.1f}%")
-    ax_acc.axhline(100 * final_acc, color="#e84040", ls="--", lw=1.0,
-                   label=f"final test {100 * final_acc:.1f}%")
+    ax_acc.plot(step_log, [100 * a for a in acc_log], color="#0072B2", lw=1.4, label="train batch")
+    ax_acc.axhline(100 * init_acc, color="#999999", ls="--", lw=1.0, label=f"initial test {100 * init_acc:.1f}%")
+    ax_acc.axhline(100 * final_acc, color="#e84040", ls="--", lw=1.0, label=f"final test {100 * final_acc:.1f}%")
     ax_acc.set_xlabel("PolyStep step")
     ax_acc.set_ylabel("Accuracy (%)")
     ax_acc.set_title("Classification accuracy", fontsize=9)

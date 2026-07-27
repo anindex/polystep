@@ -61,11 +61,6 @@ DEFAULT_RESULTS_DIR = os.path.join(
 )
 
 
-# ---------------------------------------------------------------------------
-# Environments
-# ---------------------------------------------------------------------------
-
-
 class VectorParam(nn.Module):
     """Holds a single optimizable vector as the model parameter."""
 
@@ -339,11 +334,6 @@ def build_envs(names, scale):
     return [reg[n] for n in names if n in reg]
 
 
-# ---------------------------------------------------------------------------
-# Variant configs
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class Config:
     axis: str
@@ -553,11 +543,6 @@ def configs_for(env: Env, stage: str):
     return uniq
 
 
-# ---------------------------------------------------------------------------
-# Baseline kwargs and optimizer construction
-# ---------------------------------------------------------------------------
-
-
 def baseline_kwargs(env: Env, seed: int):
     # Horizon for the cosine anneal, in optimizer steps. Approximate (evals per
     # step vary a little by config); the schedule just needs to reach target.
@@ -594,11 +579,6 @@ def build_optimizer(env: Env, cfg: Config, model, seed):
     return opt
 
 
-# ---------------------------------------------------------------------------
-# Solver instrumentation (n_iters + column-marginal violation)
-# ---------------------------------------------------------------------------
-
-
 def instrument_solver(opt, log):
     """Wrap the solver so each solve records n_iters and column-marginal error."""
     solver = getattr(opt, "solver", None)
@@ -617,11 +597,6 @@ def instrument_solver(opt, log):
         return r
 
     solver.solve = wrapped
-
-
-# ---------------------------------------------------------------------------
-# One run
-# ---------------------------------------------------------------------------
 
 
 def _clamp_to_budget(curve, budget):
@@ -747,11 +722,6 @@ def run_one(env: Env, cfg: Config, seed: int, device: str):
         },
         "curve": curve,
     }
-
-
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
 
 
 def main():

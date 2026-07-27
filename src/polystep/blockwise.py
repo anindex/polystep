@@ -308,11 +308,6 @@ def blocks_to_layout_flat_batch(
     return layout_batch
 
 
-# ------------------------------------------------------------------
-# Subspace-aware block functions
-# ------------------------------------------------------------------
-
-
 def create_subspace_blocks(
     subspace_dim: int,
     num_blocks: int,

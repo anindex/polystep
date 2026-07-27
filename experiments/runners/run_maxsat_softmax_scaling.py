@@ -33,9 +33,7 @@ import time
 from typing import Any, Dict, Optional
 
 # Ensure repo root is on path
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 
@@ -50,11 +48,6 @@ from experiments.runners.run_maxsat import (
     evaluate_sat_result,
     make_sat_closure,
 )
-
-
-# ---------------------------------------------------------------------------
-# Core runner: run softmax MAX-SAT at a given scale
-# ---------------------------------------------------------------------------
 
 
 def run_softmax_maxsat(
@@ -108,19 +101,21 @@ def run_softmax_maxsat(
         amortize_ema=config.get("amortize_ema", 0.7),
         mixed_precision=config.get("mixed_precision", False),
         particle_dim=pdim,
-        solver='softmax',
+        solver="softmax",
     )
 
     # Build closure
     clause_sample = config.get("clause_sample_size", 0) if turbo else 0
     closure = make_sat_closure(
-        clause_vars, clause_signs,
-        cra_lambda=CRA_LAMBDA, cra_alpha=CRA_ALPHA,
+        clause_vars,
+        clause_signs,
+        cra_lambda=CRA_LAMBDA,
+        cra_alpha=CRA_ALPHA,
         clause_sample_size=clause_sample,
         model=model if turbo else None,
         particle_dim=pdim,
     )
-    has_resample = hasattr(closure, 'resample')
+    has_resample = hasattr(closure, "resample")
 
     start_time = time.time()
 
@@ -153,11 +148,6 @@ def run_softmax_maxsat(
         "steps": steps,
         "wall_time_seconds": round(wall_time, 2),
     }
-
-
-# ---------------------------------------------------------------------------
-# Binary search for maximum feasible scale
-# ---------------------------------------------------------------------------
 
 
 def binary_search_max_feasible(
@@ -231,15 +221,15 @@ def binary_search_max_feasible(
         gc.collect()
 
         try:
-            final_result = run_softmax_maxsat(
-                best_feasible, seed=seed, device=device, steps=steps_full
+            final_result = run_softmax_maxsat(best_feasible, seed=seed, device=device, steps=steps_full)
+            print(
+                f"  Final: sat_ratio={final_result['sat_ratio']:.4f}, "
+                f"peak={final_result['peak_memory_mb']:.1f} MB, "
+                f"time={final_result['wall_time_seconds']:.1f}s"
             )
-            print(f"  Final: sat_ratio={final_result['sat_ratio']:.4f}, "
-                  f"peak={final_result['peak_memory_mb']:.1f} MB, "
-                  f"time={final_result['wall_time_seconds']:.1f}s")
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
-                print("  OOM on full run -- reducing to last known good")
+                print("  OOM on full run: reducing to last known good")
                 final_result = {"error": "OOM on full run", "num_vars": best_feasible}
             else:
                 raise
@@ -256,11 +246,6 @@ def binary_search_max_feasible(
             "device": device,
         },
     }
-
-
-# ---------------------------------------------------------------------------
-# Print summary table
-# ---------------------------------------------------------------------------
 
 
 def print_summary(result: Dict[str, Any]) -> None:
@@ -289,26 +274,23 @@ def print_summary(result: Dict[str, Any]) -> None:
         print(f"Final wall time: {fr['wall_time_seconds']:.1f}s")
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-
 def main():
     """CLI entry point for MAX-SAT softmax scaling binary search."""
     parser = argparse.ArgumentParser(
         description="Binary search for largest feasible MAX-SAT variable count with softmax solver"
     )
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device to run on (default: cuda)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed (default: 42)")
-    parser.add_argument("--results-dir", type=str, default="experiments/results/softmax",
-                        help="Directory for JSON results (default: experiments/results/softmax)")
-    parser.add_argument("--steps-short", type=int, default=10,
-                        help="Steps for binary search probes (default: 10)")
-    parser.add_argument("--steps-full", type=int, default=100,
-                        help="Steps for final evaluation at best scale (default: 100)")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to run on (default: cuda)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default="experiments/results/softmax",
+        help="Directory for JSON results (default: experiments/results/softmax)",
+    )
+    parser.add_argument("--steps-short", type=int, default=10, help="Steps for binary search probes (default: 10)")
+    parser.add_argument(
+        "--steps-full", type=int, default=100, help="Steps for final evaluation at best scale (default: 100)"
+    )
     args = parser.parse_args()
 
     # Validate device

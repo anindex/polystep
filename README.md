@@ -3,8 +3,8 @@
 [![PyPI](https://img.shields.io/pypi/v/polystep.svg)](https://pypi.org/project/polystep/)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.01928-b31b1b.svg)](https://arxiv.org/abs/2605.01928)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.4+](https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c.svg)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+[![PyTorch 2.8+](https://img.shields.io/badge/PyTorch-2.8%2B-ee4c2c.svg)](https://pytorch.org/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](https://github.com/anindex/polystep/blob/main/LICENSE)
 
 **Gradient-free neural network training via optimal transport.**
 
@@ -24,7 +24,7 @@ Based on the Sinkhorn Step algorithm ([Le et al., NeurIPS 2023](https://arxiv.or
        alt="One PolyStep: subspace projection, polytope probes, cost matrix, soft entropic-OT assignment, and barycentric projection, plus the softmax-to-full-OT solver continuum.">
 </p>
 
-> Want to play around with parameters? [**Viet T. Nguyen**](https://vietngth.github.io/) built a gorgeous interactive walkthrough that animates every step of the method -> **[explore the PolyStep visualization](https://vietngth.github.io/polystep-visualization/)**.
+> Want to play with the parameters? [**Viet T. Nguyen**](https://vietngth.github.io/) built an interactive walkthrough that animates every step of the method: **[the PolyStep visualization](https://vietngth.github.io/polystep-visualization/)**.
 
 ## Installation
 
@@ -37,9 +37,9 @@ From source:
 
 ```bash
 pip install -e .                      # core library (torch + numpy)
-pip install -e ".[examples]"          # + torchvision, matplotlib
+pip install -e ".[examples]"          # + torchvision, matplotlib, gymnasium, python-sat
 pip install -e ".[dev]"               # + pytest, ruff (development)
-pip install -e ".[experiments]"       # + scipy, pandas, python-sat (paper reproduction)
+pip install -e ".[experiments]"       # + scipy, pandas (paper reproduction)
 ```
 
 GPU: `pip install torch --index-url https://download.pytorch.org/whl/cu130` (or pick the CUDA build that matches your driver from the [PyTorch install page](https://pytorch.org/get-started/locally/)).
@@ -77,9 +77,13 @@ train_loader = DataLoader(
     batch_size=64,
 )
 
-# HybridSubspace compresses the parameter space per-layer.
+# HybridSubspace compresses the parameter space per-layer. Cost per step scales with
+# subspace_dim: each step evaluates about 2 * subspace_dim candidate forward passes.
+# rank alone does not bound it (rank=4 on this 101k-parameter model still gives
+# subspace_dim=4338, about 16 s/step on one CPU core), so cap it directly.
+# max_subspace_dim=256 reduces to about 0.3 s/step.
 layout = ParamLayout.from_module(model)
-subspace = HybridSubspace.from_layout(layout, rank=8)
+subspace = HybridSubspace.from_layout(layout, rank=4, max_subspace_dim=256)
 
 # Cosine schedules: broad exploration -> fine exploitation.
 optimizer = PolyStepOptimizer(
@@ -91,6 +95,21 @@ optimizer = PolyStepOptimizer(
 
 train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 ```
+
+Gradient-free training is forward-pass bound: expect this to be much slower per step
+than backprop, and prefer a GPU build of PyTorch for anything beyond a smoke test.
+
+Two things dominate wall-clock in practice:
+
+- **Pin the CPU threads.** PolyStep issues many small ops per step, where torch's
+  intra-op pool costs more than the arithmetic. `torch.set_num_threads(1)` is worth a
+  lot below GPU-saturating sizes, and it also stops the timings swinging with machine
+  load. See [`docs/performance.md`](https://github.com/anindex/polystep/blob/main/docs/performance.md).
+- **Register the evaluator if you write your own loop.** `train()` does this for you.
+  Calling `optimizer.step(closure)` directly leaves the optimizer with no route to the
+  objective but `closure()`, so the fused in-place, factored and sparse-delta
+  evaluators never run: call `optimizer.register_evaluator(evaluator, inputs, targets)`
+  before each step.
 
 ### Drop-in gradient-free optimizer (ask/tell)
 
@@ -107,9 +126,11 @@ for _ in range(300):
 print(es.best_fitness, es.mean)
 ```
 
-[`experiments/bench_ask_tell.py`](experiments/bench_ask_tell.py) compares it head-to-head with a Gaussian ES on the standard synthetic suite under a matched evaluation budget.
+[`experiments/bench_ask_tell.py`](https://github.com/anindex/polystep/blob/main/experiments/bench_ask_tell.py) compares it head-to-head with a Gaussian ES on the standard synthetic suite under a matched evaluation budget.
 
-See [`examples/`](examples/) for runnable demos covering SNN, RL, MAX-SAT, MNIST, a Loihi 2 on-chip adaptation skeleton, STE-free binary-net training vs OpenAI-ES, direct F1 minimization where PolyStep beats both a biased gradient (Adam+STE) and OpenAI-ES, and a hard oblique decision tree with strict argmax routing that PolyStep trains directly while OpenAI-ES and SPSA stall.
+See [`examples/`](https://github.com/anindex/polystep/tree/main/examples/) for nine
+runnable demos: SNN, RL, MAX-SAT, MNIST, a Loihi 2 on-chip adaptation skeleton,
+STE-free binary-net training, direct F1 maximization, and a hard oblique decision tree.
 
 <table>
   <tr>
@@ -181,7 +202,7 @@ Among gradient-free optimizers PolyStep is the strongest on every task here, at 
 - **Block-wise OT** for per-layer decomposition.
 - **`torch.compile`** opt-in on the OT hot paths (`compile=True`) and on the
   candidate forward (`compile_evaluator` = fusion; `compile_forward` = CUDA
-  graphs on the in-place path). See [`docs/performance.md`](docs/performance.md).
+  graphs on the in-place path). See [`docs/performance.md`](https://github.com/anindex/polystep/blob/main/docs/performance.md).
 - **Vmap-safe layers**: drop-in attention and LSTM that play nicely with `torch.vmap`.
 - **Sub-linear memory**: forward-only evaluation, no BPTT activation tape (~30x savings at long SNN horizons).
 - **CMA-ES inspired adaptation** of subspace covariance (experimental, monolithic step only; `use_adaptive_radius` is the stable default).
@@ -194,14 +215,14 @@ Among gradient-free optimizers PolyStep is the strongest on every task here, at 
 - **High-dimensional NLP.** Near-random accuracy on SST-2 (4.2M parameters trained from scratch). Gradient-free methods do not scale to this regime in our experiments.
 - **Adam baseline.** On a smoothed surrogate, Adam beats PolyStep on int8 (98.1 vs 97.1), argmax (89.1 vs 86.8), and staircase (97.6 vs 93.2), and only loses where the non-differentiability is hard (SNN hard LIF 93.4 vs 80.5; hard MoE routing). The stronger surrogate-gradient / BPTT baseline for SNNs (paper §5.3) is not bundled with this release; see the arXiv preprint.
 
-See [`LIMITATIONS.md`](LIMITATIONS.md) for the full discussion.
+See [`LIMITATIONS.md`](https://github.com/anindex/polystep/blob/main/LIMITATIONS.md) for the full discussion.
 
 ## Project structure
 
 ```
 src/polystep/          Core library (optimizer, solvers, subspaces, geometry)
 tests/                 Unit, integration, and regression tests
-examples/              8 runnable demos (quickstart, SNN, RL, MAX-SAT, MNIST, Loihi 2, STE-free binary net, direct loss minimization)
+examples/              9 runnable demos (quickstart, SNN, RL, MAX-SAT, MNIST, Loihi 2, STE-free binary net, direct loss minimization, hard oblique decision tree)
 experiments/           Paper reproduction: runners, results, baselines
 docs/                  API overview, reproducibility guide
 ```
@@ -210,13 +231,13 @@ docs/                  API overview, reproducibility guide
 
 | Resource | Description |
 |----------|-------------|
-| [`examples/`](examples/) | 8 runnable demos with output figures |
-| [`experiments/`](experiments/) | Full paper reproduction harness |
-| [`docs/api_overview.md`](docs/api_overview.md) | API reference |
-| [`docs/performance.md`](docs/performance.md) | Per-step cost & the compile flags (`compile_evaluator`, `compile_forward`) |
-| [`LIMITATIONS.md`](LIMITATIONS.md) | Known limitations |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
-| [`CHANGELOG.md`](CHANGELOG.md) | Release history |
+| [`examples/`](https://github.com/anindex/polystep/tree/main/examples/) | 9 runnable demos with output figures |
+| [`experiments/`](https://github.com/anindex/polystep/tree/main/experiments/) | Full paper reproduction harness |
+| [`docs/api_overview.md`](https://github.com/anindex/polystep/blob/main/docs/api_overview.md) | API reference |
+| [`docs/performance.md`](https://github.com/anindex/polystep/blob/main/docs/performance.md) | Per-step cost & the compile flags (`compile_evaluator`, `compile_forward`) |
+| [`LIMITATIONS.md`](https://github.com/anindex/polystep/blob/main/LIMITATIONS.md) | Known limitations |
+| [`CONTRIBUTING.md`](https://github.com/anindex/polystep/blob/main/CONTRIBUTING.md) | Contribution guidelines |
+| [`CHANGELOG.md`](https://github.com/anindex/polystep/blob/main/CHANGELOG.md) | Release history |
 
 ## Citation
 
@@ -233,8 +254,8 @@ If you find this work useful, please consider citing:
 
 ## Acknowledgments
 
-A huge thank you to [**Viet**](https://vietngth.github.io/) for building a beautiful interactive [PolyStep visualization](https://vietngth.github.io/polystep-visualization/), it brings the method to life and makes every step click!
+Thanks to [**Viet**](https://vietngth.github.io/) for building the interactive [PolyStep visualization](https://vietngth.github.io/polystep-visualization/), which animates what each step of the method does.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/anindex/polystep/blob/main/LICENSE).

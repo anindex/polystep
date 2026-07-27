@@ -131,7 +131,7 @@ class PolyStepES:
         )
         self.solver.epsilon = self.epsilon
         # Source marginal defaults to uniform 1/P inside the solver, which is
-        # exactly ``self.a`` -- pass None so the solver skips the (host-syncing)
+        # exactly ``self.a``: pass None so the solver skips the (host-syncing)
         # user-marginal validation on this per-step path.
         transport = self.solver.solve(cost, scale_cost=self.scale_cost).matrix
         X_new = _barycentric_projection(transport, self.a, self._pending)
