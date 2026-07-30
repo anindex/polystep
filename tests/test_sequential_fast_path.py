@@ -224,7 +224,16 @@ def _hand_two_layer(layer_cls):
 
 
 def _converted_models():
-    from experiments.runners import nondiff_models as models
+    """The model pairs, or one skipped param when the harness is absent.
+
+    ``experiments/`` is the paper reproduction harness and ships in the repo, not in the
+    distribution, so this runs at collection time in a checkout and skips from an sdist.
+    Returning an empty list instead would delete the tests with no signal.
+    """
+    try:
+        from experiments.runners import nondiff_models as models
+    except ImportError:
+        return [pytest.param(None, None, None, None, marks=pytest.mark.skip(reason="experiments/ not present (sdist)"))]
 
     return [
         ("StaircaseNet", models.StaircaseNet, _HandStaircase, True),
@@ -236,8 +245,11 @@ def _converted_models():
     ]
 
 
+_CONVERTED_MODELS = _converted_models()
+
+
 @pytest.mark.parametrize(
-    "name,new_cls,old_cls,on_fast_path", _converted_models(), ids=lambda v: getattr(v, "__name__", v)
+    "name,new_cls,old_cls,on_fast_path", _CONVERTED_MODELS, ids=lambda v: getattr(v, "__name__", v)
 )
 def test_converted_models_are_bit_identical_to_their_handwritten_form(name, new_cls, old_cls, on_fast_path):
     """Same seed, same weights, same keys, same output. Only the dispatch changed.
@@ -256,7 +268,7 @@ def test_converted_models_are_bit_identical_to_their_handwritten_form(name, new_
 
 
 @pytest.mark.parametrize(
-    "name,new_cls,old_cls,on_fast_path", _converted_models(), ids=lambda v: getattr(v, "__name__", v)
+    "name,new_cls,old_cls,on_fast_path", _CONVERTED_MODELS, ids=lambda v: getattr(v, "__name__", v)
 )
 def test_converted_models_forward_bit_identically(name, new_cls, old_cls, on_fast_path):
     """Forward equality at shared weights, which is what a dropped activation breaks."""
@@ -269,7 +281,7 @@ def test_converted_models_forward_bit_identically(name, new_cls, old_cls, on_fas
         assert torch.equal(new(inputs), old(inputs)), name
 
 
-def test_a_weight_transforming_layer_reaches_the_bmm_path_but_not_the_subspace_one():
+def test_a_weight_transforming_layer_reaches_the_bmm_path_but_not_the_subspace_one(require_experiments):
     """The subspace and factored paths keep a correction that is linear in the delta.
 
     A piecewise-constant weight transform breaks that linearity, and rebuilding the
@@ -286,7 +298,7 @@ def test_a_weight_transforming_layer_reaches_the_bmm_path_but_not_the_subspace_o
     assert FactoredEvaluator.try_build(model, nn.CrossEntropyLoss()) is None
 
 
-def test_ternary_threshold_leaves_the_layer_alive():
+def test_ternary_threshold_leaves_the_layer_alive(require_experiments):
     """A threshold several sigma past the initialization zeroes every effective weight.
 
     The layer then returns its bias for any input and the benchmark measures nothing.
@@ -301,34 +313,50 @@ def test_ternary_threshold_leaves_the_layer_alive():
         TernaryLinear(64, 32, threshold=5.0)
 
 
-def test_spiking_net_applies_fc1_per_timestep_on_temporal_input():
-    """One (T*B, F) GEMM is not bitwise the T (B, F) GEMMs it replaces.
+def _record_fc1_shapes(net):
+    """Swap fc1 for a module recording the shape of every input it is called with."""
+    shapes = []
+    real_fc1 = net.fc1
 
-    The LIF threshold turns that ULP into a whole spike, so only the static branch,
-    where every call saw the same tensor, may hoist fc1 out of the loop.
+    class _Recorder(nn.Module):
+        def forward(self, inp):
+            shapes.append(tuple(inp.shape))
+            return real_fc1(inp)
+
+    net.fc1 = _Recorder()
+    return shapes
+
+
+def test_spiking_net_applies_fc1_per_timestep_on_temporal_input():
+    """Temporal input keeps fc1 inside the timestep loop.
+
+    One (T*B, F) GEMM blocks differently from the T (B, F) GEMMs it would replace, and
+    the LIF threshold turns that difference into a whole spike. Only the static branch,
+    where every call sees the same tensor, may hoist fc1 out.
+
+    Asserted on the call shapes, not on the outputs: whether the two GEMM shapes differ
+    bitwise is a property of the BLAS blocking, so an output comparison passes or fails
+    by machine.
     """
     from polystep.benchmarks.utils import SpikingNet
 
     torch.manual_seed(0)
     steps, batch, features = 6, 8, 64
     net = SpikingNet(input_dim=features, hidden=32, output=10, num_steps=steps)
-    x = torch.rand(steps, batch, features)
-    per_slice = torch.stack([net.fc1(x[t]) for t in range(steps)])
-    assert not torch.equal(net.fc1(x), per_slice), "the two GEMM shapes agree here, so this proves nothing"
 
-    # Record what actually reaches the neuron. Comparing outputs would only catch this
-    # when the difference happens to cross the threshold, which is rare enough that a
-    # 200-seed search found no case; the injected current is the deterministic contract.
-    seen = []
-    real_lif1 = net.lif1
+    shapes = _record_fc1_shapes(net)
+    net(torch.rand(steps, batch, features))
+    assert shapes == [(batch, features)] * steps
 
-    class _Recorder(nn.Module):
-        def forward(self, current, mem):
-            seen.append(current.clone())
-            return real_lif1(current, mem)
 
-    net.lif1 = _Recorder()
-    net(x)
-    assert len(seen) == steps
-    for t, current in enumerate(seen):
-        assert torch.equal(current, per_slice[t]), f"timestep {t} was fed a batched fc1 result"
+def test_spiking_net_hoists_fc1_on_static_input():
+    """Static input is constant in time, so fc1 runs once and broadcasts."""
+    from polystep.benchmarks.utils import SpikingNet
+
+    torch.manual_seed(0)
+    steps, batch, features = 6, 8, 64
+    net = SpikingNet(input_dim=features, hidden=32, output=10, num_steps=steps)
+
+    shapes = _record_fc1_shapes(net)
+    net(torch.rand(batch, features))
+    assert shapes == [(batch, features)]

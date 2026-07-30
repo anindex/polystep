@@ -123,9 +123,6 @@ jobs:
         run: .venv/bin/python -c "import importlib.resources, polystep; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
 
   sdist:
-    # The sdist ships the test suite, so it has to run from the tarball. setuptools'
-    # default selection takes tests/test*.py but not conftest.py, which once shipped a
-    # suite that errored on every fixture lookup.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -146,7 +143,4 @@ jobs:
           mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
           cd /tmp/sdist
           uv pip install --system ".[dev]"
-          # Collection is the check: it fails if conftest.py did not ship. The test job
-          # already runs the suite itself.
-          pytest tests/ -q --collect-only -m "not slow and not gpu" > /dev/null
-          pytest tests/test_api.py -q -m "not slow and not gpu" --timeout=120
+          pytest tests/ -q -rs -m "not slow and not gpu" --timeout=120 -n auto
