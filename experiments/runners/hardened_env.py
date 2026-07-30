@@ -11,7 +11,7 @@ without changing the underlying control problem:
 
 * :class:`SparseRewardWrapper` - replace dense reward ``r`` with
   ``sign(r) * floor(|r| / bucket)`` and zero whenever ``|r| < deadband``.
-  Inflates policy-gradient advantage variance dramatically; PolyStep's
+  Inflates policy-gradient advantage variance; PolyStep's
   *episodic-return* objective is unchanged.
 
 Both wrappers are composable. The hardened registry below combines them with

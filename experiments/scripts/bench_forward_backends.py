@@ -211,7 +211,7 @@ def main():
     print(f"Backend x architecture matrix  device={torch.cuda.get_device_name(0)}  torch={torch.__version__}")
     print("Currency = wall-clock (median over timed reps). Never forward count.")
     verdicts = [run_model(*m) for m in MODELS]
-    print("\n=== VERDICT (measured, illustrative: pin GPU clocks for stable numbers) ===")
+    print("\n=== VERDICT (illustrative: pin GPU clocks for stable numbers) ===")
     for name, speedup, best, _ in verdicts:
         print(f"  {name:36s} best={best:24s} {speedup:5.2f}x vs eager_vmap")
     print("  - vmap already amortizes launches: ~30-40x vs the sequential in-place loop.")

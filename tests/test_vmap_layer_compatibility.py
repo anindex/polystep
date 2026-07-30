@@ -1,4 +1,4 @@
-"""Regression tests for vmap-safe layers and parameter layout.
+"""Contracts of the vmap-safe layers and the parameter layout.
 
 Covers:
 
@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import math
-import warnings
 
 import pytest
 import torch
@@ -130,21 +129,6 @@ def test_upstream_nn_lstm_fails_under_vmap():
         vmap(call, in_dims=(0,))(stacked)
 
 
-def test_vmap_safe_lstm_works_under_vmap():
-    """The drop-in VmapSafeLSTM must succeed where nn.LSTM fails."""
-    lstm = VmapSafeLSTM(input_size=4, hidden_size=8, num_layers=1)
-    params = {k: v.detach() for k, v in lstm.named_parameters()}
-    buffers = {k: v.detach() for k, v in lstm.named_buffers()}
-    x = torch.randn(2, 5, 4)
-
-    def call(p):
-        return functional_call(lstm, {**p, **buffers}, (x,))[0]
-
-    stacked = {k: torch.stack([v, v, v], dim=0) for k, v in params.items()}
-    out = vmap(call, in_dims=(0,))(stacked)
-    assert out.shape == (3, 2, 5, 8)
-
-
 def test_vmap_safe_attention_scales_by_sqrt_head_dim():
     embed_dim, num_heads = 64, 8
     head_dim = embed_dim // num_heads  # 8
@@ -153,42 +137,28 @@ def test_vmap_safe_attention_scales_by_sqrt_head_dim():
     assert not math.isclose(attn.scale, 1.0 / math.sqrt(embed_dim))
 
 
-def test_vmap_safe_attention_bool_mask_zeros_attention():
-    """Bool attn_mask=True means 'do not attend' (mask-fill -inf),
-    matching upstream nn.MultiheadAttention semantics.
+def test_vmap_safe_attention_bool_mask_matches_upstream():
+    """A True entry in a bool attn_mask means "do not attend", as in nn.MultiheadAttention.
+
+    Compared against the upstream module rather than a replay of this one's own
+    forward: a replay reuses ``attn.scale`` and would cancel an error in it, leaving
+    only the mask semantics actually tested.
     """
     torch.manual_seed(0)
     embed_dim, num_heads, B, T = 8, 2, 1, 4
+    reference = nn.MultiheadAttention(embed_dim, num_heads, bias=False, batch_first=True)
     attn = VmapSafeMultiHeadAttention(embed_dim, num_heads, bias=False)
+    with torch.no_grad():
+        for layer, w in zip((attn.W_q, attn.W_k, attn.W_v), reference.in_proj_weight.chunk(3, dim=0)):
+            layer.weight.copy_(w)
+        attn.W_o.weight.copy_(reference.out_proj.weight)
 
     x = torch.randn(B, T, embed_dim)
-    # Mask the second key position for every query: shape (T, T)
     bool_mask = torch.zeros(T, T, dtype=torch.bool)
-    bool_mask[:, 1] = True  # mask out key index 1
+    bool_mask[:, 1] = True  # key index 1 is unreachable from every query
 
-    # Compute attention weights manually and check key-1 weight is zero.
-    Q = attn.W_q(x).view(B, T, num_heads, embed_dim // num_heads).transpose(1, 2)
-    K = attn.W_k(x).view(B, T, num_heads, embed_dim // num_heads).transpose(1, 2)
-    scores = torch.matmul(Q, K.transpose(-2, -1)) * attn.scale
-    # Replicate the expected mask logic:
-    expected_scores = scores.clone()
-    expected_scores = expected_scores.masked_fill(bool_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-    expected_weights = torch.softmax(expected_scores, dim=-1)
-
-    # Now run the actual layer with the bool mask and inspect attention weights.
-    # Easiest: run forward and check the output respects the mask via a probe.
-    out = attn(x, x, x, attn_mask=bool_mask)
-
-    # Replay attention manually and compare.
-    V = attn.W_v(x).view(B, T, num_heads, embed_dim // num_heads).transpose(1, 2)
-    expected_context = torch.matmul(expected_weights, V)
-    expected_context = expected_context.transpose(1, 2).reshape(B, T, embed_dim)
-    expected_out = attn.W_o(expected_context)
-
-    assert torch.allclose(out, expected_out, atol=1e-5), (
-        "VmapSafeMultiHeadAttention does not treat bool attn_mask as "
-        "mask-fill(-inf): expected zero-weight at masked key positions."
-    )
+    expected, _ = reference(x, x, x, attn_mask=bool_mask, need_weights=False)
+    torch.testing.assert_close(attn(x, x, x, attn_mask=bool_mask), expected, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize(

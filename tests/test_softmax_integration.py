@@ -1,7 +1,7 @@
 """Integration tests for softmax solver wired into PolyStepOptimizer.
 
 Verifies the solver strategy pattern works end-to-end: solver selection,
-ProgressiveEpsilon blocking, functional step(), turbo features, subspace
+ProgressiveEpsilon blocking, functional step(), amortization, subspace
 modes, and epsilon sharing.
 """
 
@@ -16,10 +16,8 @@ from polystep import (
     LinearSubspace,
     HybridSubspace,
     ParamLayout,
-    RankSchedule,
 )
 from polystep.cost_nn import NNCostEvaluator
-from polystep.epsilon import LinearEpsilon
 from polystep.solvers import SoftmaxSolver, SinkhornSolver
 
 
@@ -27,6 +25,10 @@ def _make_model():
     """Small MLP for fast testing."""
     torch.manual_seed(42)
     return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
+
+
+def _flat_params(model):
+    return torch.cat([p.detach().reshape(-1) for p in model.parameters()]).clone()
 
 
 def _make_closure(model):
@@ -78,22 +80,6 @@ class TestSolverSelection:
         sub = make_subspace(layout)
         opt = PolyStepOptimizer(model, subspace=sub)
         assert isinstance(opt.solver, SoftmaxSolver)
-
-    def test_explicit_sinkhorn_with_subspace(self, model, layout):
-        """solver='sinkhorn' override with subspace uses SinkhornSolver."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
-        opt = PolyStepOptimizer(model, subspace=sub, solver="sinkhorn")
-        assert isinstance(opt.solver, SinkhornSolver)
-
-    def test_explicit_softmax_without_subspace(self, model):
-        """solver='softmax' override without subspace uses SoftmaxSolver."""
-        opt = PolyStepOptimizer(model, solver="softmax")
-        assert isinstance(opt.solver, SoftmaxSolver)
-
-    def test_invalid_solver_raises_value_error(self, model):
-        """solver='invalid' raises ValueError."""
-        with pytest.raises(ValueError, match="Unknown solver"):
-            PolyStepOptimizer(model, solver="invalid")
 
 
 class TestProgressiveEpsilonBlocking:
@@ -155,29 +141,26 @@ class TestSoftmaxFunctionalStep:
         assert isinstance(state.g, torch.Tensor), "state.g should be Tensor after sinkhorn"
 
 
-class TestTurboFeaturesWithSoftmax:
-    """Verify all turbo features work with softmax solver."""
-
-    @pytest.mark.parametrize(
-        "feature_kwargs",
-        [
-            {"amortize_steps": 2, "amortize_ema": 0.7},
-            {"biased_rotation": True},
-            {"adaptive_probes": True},
-            {"use_momentum": True},
-        ],
+@pytest.mark.parametrize(
+    "feature_kwargs",
+    [
+        {"amortize_steps": 2, "amortize_ema": 0.7},
+        {"biased_rotation": True},
+        {"adaptive_probes": True},
+        {"use_momentum": True},
+    ],
+)
+def test_amortize_steps_with_softmax(model, closure, feature_kwargs):
+    """amortize_steps + adaptive_probes + biased_rotation, all on softmax."""
+    opt = PolyStepOptimizer(
+        model,
+        solver="softmax",
+        epsilon=0.5,
+        **feature_kwargs,
     )
-    def test_amortize_steps_with_softmax(self, model, closure, feature_kwargs):
-        """Turbo features work with softmax solver."""
-        opt = PolyStepOptimizer(
-            model,
-            solver="softmax",
-            epsilon=0.5,
-            **feature_kwargs,
-        )
-        for _ in range(4):
-            loss = opt.step(closure)
-            assert math.isfinite(loss)
+    for _ in range(4):
+        loss = opt.step(closure)
+        assert math.isfinite(loss)
 
 
 class TestSubspaceModes:
@@ -202,33 +185,27 @@ class TestSubspaceModes:
         assert math.isfinite(loss)
 
 
-class TestEpsilonSharing:
-    """Verify epsilon schedule is shared with softmax solver."""
-
-    def test_fixed_epsilon_with_softmax(self, model):
-        """Fixed float epsilon works with softmax solver."""
-        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
-        closure = _make_closure(model)
-        loss = opt.step(closure)
-        assert math.isfinite(loss)
-        # Solver epsilon should be set from the optimizer
-        assert opt.solver.epsilon == pytest.approx(0.5, abs=0.01)
+def test_fixed_epsilon_with_softmax(model):
+    """Fixed float epsilon works with softmax solver."""
+    opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
+    closure = _make_closure(model)
+    loss = opt.step(closure)
+    assert math.isfinite(loss)
+    # Solver epsilon should be set from the optimizer
+    assert opt.solver.epsilon == pytest.approx(0.5, abs=0.01)
 
 
-class TestDualMomentumGuard:
-    """Verify dual momentum doesn't crash when f/g are None from softmax."""
-
-    def test_dual_momentum_with_softmax_no_crash(self, model, closure):
-        """dual_momentum_beta > 0 with softmax doesn't crash (None.clone guard)."""
-        opt = PolyStepOptimizer(
-            model,
-            solver="softmax",
-            epsilon=0.5,
-            dual_momentum_beta=0.5,
-        )
-        for _ in range(3):
-            loss = opt.step(closure)
-            assert math.isfinite(loss)
+def test_dual_momentum_with_softmax_keeps_stepping(model, closure):
+    """softmax has no duals to extrapolate, so dual_momentum_beta must be inert."""
+    opt = PolyStepOptimizer(
+        model,
+        solver="softmax",
+        epsilon=0.5,
+        dual_momentum_beta=0.5,
+    )
+    losses = [opt.step(closure) for _ in range(3)]
+    assert all(math.isfinite(v) for v in losses)
+    assert opt.state.f is None, "softmax produced duals for the momentum to extrapolate"
 
 
 class TestFusedSoftmaxDispatch:
@@ -239,14 +216,13 @@ class TestFusedSoftmaxDispatch:
         sub = LinearSubspace.from_layout(layout, rank=4)
         opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.5)
         assert opt._use_fused_softmax is True, "_use_fused_softmax should be True for softmax solver"
-        # Run 2 steps to verify it works end-to-end
         closure = _make_closure(model)
-        losses = []
-        for _ in range(2):
-            loss = opt.step(closure)
-            losses.append(loss)
-        assert all(isinstance(loss_v, float) for loss_v in losses)
-        assert all(loss_v == loss_v for loss_v in losses), "Loss should not be NaN"
+        before = _flat_params(model)
+        losses = [opt.step(closure) for _ in range(2)]
+        # A bound and a moved model, not `loss == loss`: that rules out NaN and nothing
+        # else, so an inf or a frozen optimizer passes it.
+        assert all(0.0 < loss_v < 10.0 for loss_v in losses), losses
+        assert not torch.equal(before, _flat_params(model))
 
     def test_fused_softmax_path_inactive_with_sinkhorn(self, model):
         """Fused path is NOT active when solver='sinkhorn'."""
@@ -266,55 +242,51 @@ class TestFusedSoftmaxDispatch:
         )
         assert opt._use_fused_softmax is True
         closure = _make_closure(model)
-        for _ in range(5):
-            loss = opt.step(closure)
-            assert math.isfinite(loss)
-            assert loss == loss, "Loss should not be NaN"
+        before = _flat_params(model)
+        losses = [opt.step(closure) for _ in range(5)]
+        assert all(0.0 < loss_v < 10.0 for loss_v in losses), losses
+        assert not torch.equal(before, _flat_params(model))
 
     def test_fused_path_monolithic_no_subspace(self, model):
         """Fused path works in monolithic mode without subspace."""
         opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         assert opt._use_fused_softmax is True
         closure = _make_closure(model)
-        losses = []
-        for _ in range(3):
-            loss = opt.step(closure)
-            losses.append(loss)
-        assert all(isinstance(loss_v, float) for loss_v in losses)
+        before = _flat_params(model)
+        losses = [opt.step(closure) for _ in range(3)]
+        assert all(0.0 < loss_v < 10.0 for loss_v in losses), losses
+        assert not torch.equal(before, _flat_params(model))
 
 
-class TestK1ReshapeShortcut:
+@pytest.mark.parametrize("use_subspace,solver", [(True, None), (False, "sinkhorn")])
+def test_k1_shortcut_matches_the_averaging_path(model, layout, use_subspace, solver):
     """The K=1 cost-matrix shortcut must equal the general averaging path.
 
     ``_step_monolithic`` skips ``losses.reshape(P, V, K).mean(-1)`` when ``K_eff == 1``
     and reshapes straight to ``(P, V)``. The two must agree exactly; averaging over a
-    length-1 axis is the identity.
-    """
+    length-1 axis is the identity."""
+    # adaptive_probes is what populates _prev_cost_matrix; use_quadratic_model is
+    # what populates _losses_3d. Both are needed to compare the two paths.
+    kwargs = {
+        "epsilon": 0.5,
+        "num_probe": 1,
+        "seed": 42,
+        "use_quadratic_model": True,
+        "adaptive_probes": True,
+    }
+    if use_subspace:
+        kwargs["subspace"] = LinearSubspace.from_layout(layout, rank=4)
+    if solver is not None:
+        kwargs["solver"] = solver
+    opt = PolyStepOptimizer(model, **kwargs)
+    closure = _make_closure(model)
 
-    @pytest.mark.parametrize("use_subspace,solver", [(True, None), (False, "sinkhorn")])
-    def test_k1_shortcut_matches_the_averaging_path(self, model, layout, use_subspace, solver):
-        # adaptive_probes is what populates _prev_cost_matrix; use_quadratic_model is
-        # what populates _prev_losses_3d. Both are needed to compare the two paths.
-        kwargs = {
-            "epsilon": 0.5,
-            "num_probe": 1,
-            "seed": 42,
-            "use_quadratic_model": True,
-            "adaptive_probes": True,
-        }
-        if use_subspace:
-            kwargs["subspace"] = LinearSubspace.from_layout(layout, rank=4)
-        if solver is not None:
-            kwargs["solver"] = solver
-        opt = PolyStepOptimizer(model, **kwargs)
-        closure = _make_closure(model)
+    for _ in range(3):
+        opt.step(closure)
 
-        for _ in range(3):
-            opt.step(closure)
-
-        losses_3d = opt._prev_losses_3d
-        assert losses_3d is not None and losses_3d.shape[-1] == 1, "expected a K=1 probe buffer"
-        torch.testing.assert_close(opt._prev_cost_matrix, losses_3d.mean(dim=-1), rtol=0, atol=0)
+    losses_3d = opt._losses_3d
+    assert losses_3d is not None and losses_3d.shape[-1] == 1, "expected a K=1 probe buffer"
+    torch.testing.assert_close(opt._prev_cost_matrix, losses_3d.mean(dim=-1), rtol=0, atol=0)
 
 
 class TestSoftmaxEdgeCases:

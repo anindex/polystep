@@ -31,9 +31,16 @@ Full models (sized for CIFAR-10 32x32):
 
 MAX-SAT utilities (direct parameter optimization, no hidden layers):
   - MaxSATModel, cra_penalty, evaluate_sat_loss
+
+The chain models subclass nn.Sequential rather than defining a forward, and their custom
+layers declare polystep_elementwise or polystep_weight_transform, so polystep's batched
+evaluators can score candidates without rebuilding each one. See docs/performance.md.
 """
 
 from __future__ import annotations
+
+import warnings
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -100,57 +107,78 @@ class LIFNeuron(nn.Module):
         return spike, mem
 
 
+INIT_SCALE = 0.1  # every quantizing layer below initializes at randn * INIT_SCALE
+
+
 class QuantizedLinear(nn.Module):
     """Linear layer with int8 weight quantization in the forward pass.
 
-    d(round)/dx = 0 almost everywhere.
+    d(round)/dx = 0 almost everywhere. ``forward`` calls the declared transforms rather
+    than repeating them, so the batched evaluators cannot read a stale rule.
     """
 
     def __init__(self, in_features: int, out_features: int, scale: float = 0.01):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * INIT_SCALE)
         self.bias = nn.Parameter(torch.zeros(out_features))
         self.scale = scale
 
+    def polystep_weight_transform(self, w: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(torch.round(w / self.scale), -128, 127) * self.scale
+
+    polystep_bias_transform = polystep_weight_transform
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_q = torch.clamp(torch.round(self.weight / self.scale), -128, 127) * self.scale
-        b_q = torch.clamp(torch.round(self.bias / self.scale), -128, 127) * self.scale
-        return x @ w_q.t() + b_q
+        return x @ self.polystep_weight_transform(self.weight).t() + self.polystep_bias_transform(self.bias)
 
 
 class BinaryLinear(nn.Module):
     """Linear layer with binary weights via sign().
 
     Effective weights are in {-1, +1}. sign(0) = 0 but randn rarely produces
-    exact zero.
+    exact zero. The bias is not quantized.
     """
+
+    polystep_weight_transform = staticmethod(torch.sign)
+    polystep_bias_transform = None
 
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * INIT_SCALE)
         self.bias = nn.Parameter(torch.zeros(out_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_b = torch.sign(self.weight)  # NON-DIFFERENTIABLE
-        return x @ w_b.t() + self.bias
+        return x @ self.polystep_weight_transform(self.weight).t() + self.bias  # NON-DIFFERENTIABLE
 
 
 class TernaryLinear(nn.Module):
     """Linear layer with ternary weight quantization.
 
-    Weights below threshold become 0, above become +/-1.
-    Effective weights are in {-1, 0, +1}.
+    Weights below threshold become 0, above become +/-1. The threshold defaults to half
+    the initialization scale, leaving ~62% of weights alive; several sigma out zeroes
+    the layer and the net returns a constant, so the two have to move together.
     """
 
-    def __init__(self, in_features: int, out_features: int, threshold: float = 0.5):
+    polystep_bias_transform = None
+
+    def __init__(self, in_features: int, out_features: int, threshold: float = 0.5 * INIT_SCALE):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * INIT_SCALE)
         self.bias = nn.Parameter(torch.zeros(out_features))
         self.threshold = threshold
+        if not bool((self.weight.detach().abs() >= threshold).any()):
+            warnings.warn(
+                f"TernaryLinear({in_features}, {out_features}) with threshold={threshold} zeroes every "
+                f"initial weight, so the layer outputs its bias for any input. Lower the threshold "
+                f"or widen the initialization.",
+                stacklevel=2,
+            )
+
+    def polystep_weight_transform(self, w: torch.Tensor) -> torch.Tensor:
+        return torch.sign(w) * (w.abs() >= self.threshold).to(w.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_t = torch.sign(self.weight) * (self.weight.abs() >= self.threshold).float()  # NON-DIFFERENTIABLE
-        return x @ w_t.t() + self.bias
+        return x @ self.polystep_weight_transform(self.weight).t() + self.bias  # NON-DIFFERENTIABLE
 
 
 class STESign(torch.autograd.Function):
@@ -200,7 +228,7 @@ class BinaryLinearSTE(nn.Module):
 
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * INIT_SCALE)
         self.bias = nn.Parameter(torch.zeros(out_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -211,9 +239,9 @@ class BinaryLinearSTE(nn.Module):
 class TernaryLinearSTE(nn.Module):
     """Ternary linear layer with STE for gradient-based training."""
 
-    def __init__(self, in_features: int, out_features: int, threshold: float = 0.5):
+    def __init__(self, in_features: int, out_features: int, threshold: float = 0.5 * INIT_SCALE):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * INIT_SCALE)
         self.bias = nn.Parameter(torch.zeros(out_features))
         self.threshold = threshold
 
@@ -281,6 +309,8 @@ class StaircaseActivation(nn.Module):
     Gradient is zero everywhere (piecewise constant).
     """
 
+    polystep_elementwise = True  # coordinatewise, no state: the batched paths accept it
+
     def __init__(self, levels: int = 5):
         super().__init__()
         self.levels = levels
@@ -346,89 +376,95 @@ class SpikingMNISTNet(nn.Module):
         mem2 = torch.zeros(batch, 10, device=x.device, dtype=x.dtype)
         total = torch.zeros(batch, 10, device=x.device, dtype=x.dtype)
 
+        cur1 = self.fc1(x)  # static input: same injected current at every timestep
         for _ in range(self.num_steps):
-            spk1, mem1 = self.lif1(self.fc1(x), mem1)
+            spk1, mem1 = self.lif1(cur1, mem1)
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
 
         return total  # (batch, 10): raw spike counts
 
 
-class QuantizedMLP(nn.Module):
+class QuantizedMLP(nn.Sequential):
     """MLP where hidden layer uses int8 quantized weights."""
 
     def __init__(self, input_dim: int = 784, hidden: int = 128, output: int = 10):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden)
-        self.quant = QuantizedLinear(hidden, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden, output)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", nn.Linear(input_dim, hidden)),
+                    ("act1", nn.ReLU()),
+                    ("quant", QuantizedLinear(hidden, hidden)),  # NON-DIFFERENTIABLE
+                    ("relu", nn.ReLU()),
+                    ("fc2", nn.Linear(hidden, output)),
+                ]
+            )
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = torch.relu(self.fc1(x))
-        x = self.relu(self.quant(x))  # NON-DIFFERENTIABLE quantized layer
-        return self.fc2(x)
 
-
-class BinaryMNISTNet(nn.Module):
+class BinaryMNISTNet(nn.Sequential):
     """MNIST classifier with binary weights via sign()."""
 
     def __init__(self, input_dim: int = 784, hidden: int = 128, output: int = 10):
-        super().__init__()
-        self.fc1 = BinaryLinear(input_dim, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = BinaryLinear(hidden, output)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", BinaryLinear(input_dim, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", BinaryLinear(hidden, output)),
+                ]
+            )
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
 
-
-class TernaryMNISTNet(nn.Module):
+class TernaryMNISTNet(nn.Sequential):
     """MNIST classifier with ternary weights via sign() * threshold."""
 
     def __init__(self, input_dim: int = 784, hidden: int = 128, output: int = 10):
-        super().__init__()
-        self.fc1 = TernaryLinear(input_dim, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = TernaryLinear(hidden, output)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", TernaryLinear(input_dim, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", TernaryLinear(hidden, output)),
+                ]
+            )
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
 
-
-class BinaryMNISTNetSTE(nn.Module):
+class BinaryMNISTNetSTE(nn.Sequential):
     """MNIST classifier with binary weights via STE for gradient-based training."""
 
     def __init__(self, input_dim: int = 784, hidden: int = 128, output: int = 10):
-        super().__init__()
-        self.fc1 = BinaryLinearSTE(input_dim, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = BinaryLinearSTE(hidden, output)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", BinaryLinearSTE(input_dim, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", BinaryLinearSTE(hidden, output)),
+                ]
+            )
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
 
-
-class TernaryMNISTNetSTE(nn.Module):
+class TernaryMNISTNetSTE(nn.Sequential):
     """MNIST classifier with ternary weights via STE for gradient-based training."""
 
     def __init__(self, input_dim: int = 784, hidden: int = 128, output: int = 10):
-        super().__init__()
-        self.fc1 = TernaryLinearSTE(input_dim, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = TernaryLinearSTE(hidden, output)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", TernaryLinearSTE(input_dim, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", TernaryLinearSTE(hidden, output)),
+                ]
+            )
+        )
 
 
 class BinaryCIFAR10Net(nn.Module):
@@ -515,7 +551,7 @@ class DiscreteAttentionNet(nn.Module):
         return self.fc2(x)
 
 
-class StaircaseNet(nn.Module):
+class StaircaseNet(nn.Sequential):
     """MLP with piecewise-constant staircase activation."""
 
     def __init__(
@@ -525,18 +561,18 @@ class StaircaseNet(nn.Module):
         output: int = 10,
         levels: int = 5,
     ):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden)
-        self.staircase = StaircaseActivation(levels)
-        self.fc2 = nn.Linear(hidden, hidden)
-        self.staircase2 = StaircaseActivation(levels)
-        self.fc3 = nn.Linear(hidden, output)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = self.staircase(self.fc1(x))  # NON-DIFFERENTIABLE
-        x = self.staircase2(self.fc2(x))  # NON-DIFFERENTIABLE
-        return self.fc3(x)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", nn.Linear(input_dim, hidden)),
+                    ("staircase", StaircaseActivation(levels)),
+                    ("fc2", nn.Linear(hidden, hidden)),
+                    ("staircase2", StaircaseActivation(levels)),
+                    ("fc3", nn.Linear(hidden, output)),
+                ]
+            )
+        )
 
 
 class HardMoENet(nn.Module):
@@ -608,15 +644,16 @@ class SmoothSpikingMNISTNet(nn.Module):
         mem2 = torch.zeros(batch, 10, device=x.device, dtype=x.dtype)
         total = torch.zeros(batch, 10, device=x.device, dtype=x.dtype)
 
+        cur1 = self.fc1(x)  # static input: same injected current at every timestep
         for _ in range(self.num_steps):
-            spk1, mem1 = self.lif1(self.fc1(x), mem1)
+            spk1, mem1 = self.lif1(cur1, mem1)
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
 
         return total  # (batch, 10): raw spike counts
 
 
-class SmoothQuantizedMLP(nn.Module):
+class SmoothQuantizedMLP(nn.Sequential):
     """Smooth (differentiable) analog of QuantizedMLP.
 
     Same architecture as QuantizedMLP but replaces QuantizedLinear with a
@@ -625,17 +662,18 @@ class SmoothQuantizedMLP(nn.Module):
     """
 
     def __init__(self, input_dim: int = 784, hidden: int = 128, output: int = 10):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden)
-        self.fc_hidden = nn.Linear(hidden, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden, output)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = torch.relu(self.fc1(x))
-        x = self.relu(self.fc_hidden(x))  # DIFFERENTIABLE (no quantization)
-        return self.fc2(x)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", nn.Linear(input_dim, hidden)),
+                    ("act1", nn.ReLU()),
+                    ("fc_hidden", nn.Linear(hidden, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", nn.Linear(hidden, output)),
+                ]
+            )
+        )
 
 
 class SmoothAttention(nn.Module):
@@ -686,12 +724,12 @@ class SmoothDiscreteAttentionNet(nn.Module):
         return self.fc2(x)
 
 
-class SmoothStaircaseNet(nn.Module):
+class SmoothStaircaseNet(nn.Sequential):
     """Smooth (differentiable) analog of StaircaseNet.
 
     Same architecture as StaircaseNet but replaces StaircaseActivation with
-    plain torch.sigmoid. Identical parameter count (118,282). Serves as Adam
-    accuracy ceiling showing 'what if smooth activation instead of staircase'.
+    plain sigmoid. Identical parameter count (118,282). Serves as Adam accuracy
+    ceiling showing 'what if smooth activation instead of staircase'.
     """
 
     def __init__(
@@ -701,16 +739,18 @@ class SmoothStaircaseNet(nn.Module):
         output: int = 10,
         levels: int = 5,
     ):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden)
-        self.fc2 = nn.Linear(hidden, hidden)
-        self.fc3 = nn.Linear(hidden, output)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = torch.sigmoid(self.fc1(x))  # DIFFERENTIABLE (no staircase)
-        x = torch.sigmoid(self.fc2(x))  # DIFFERENTIABLE (no staircase)
-        return self.fc3(x)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", nn.Linear(input_dim, hidden)),
+                    ("act1", nn.Sigmoid()),
+                    ("fc2", nn.Linear(hidden, hidden)),
+                    ("act2", nn.Sigmoid()),
+                    ("fc3", nn.Linear(hidden, output)),
+                ]
+            )
+        )
 
 
 class SoftMoELayer(nn.Module):

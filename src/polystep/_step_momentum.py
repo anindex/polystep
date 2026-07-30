@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import math
 from typing import Callable
 
 import torch
 
 
 def step_momentum(opt, closure: Callable) -> float:
-    """Cheap momentum step: apply EMA transport direction with decay.
+    """Cheap step: reapply the last direction with decay, no forward passes.
 
-    Applies the EMA-smoothed transport direction without a validation
-    forward pass.  NaN safety is guaranteed by reverting to the
-    pre-step position if non-finite values appear.
+    Uses the Newton direction when the quadratic model produced one, else the
+    EMA-smoothed transport direction. Reverts to the pre-step position on NaN.
 
     Args:
         closure: ``closure(batched_params) -> losses`` (unused - kept
@@ -27,26 +25,24 @@ def step_momentum(opt, closure: Callable) -> float:
     if opt._transport_direction_ema is None:
         return state.costs[-1] if state.costs else float("inf")
 
-    # Linear decay: first momentum step gets full strength, last gets minimal
+    # Linear decay across the cheap steps. The branch only runs for
+    # counter % amortize_steps != 0, so the first one is already at 1 - 1/amortize_steps.
     phase = (opt._amortize_counter % opt.amortize_steps) / opt.amortize_steps
     decay = 1.0 - phase
 
-    # Store pre-step X for NaN safety
-    X_old = state.X.clone()
+    # No clone: the update below is out-of-place, so this reference stays valid.
+    X_old = state.X
 
-    # Choose momentum direction: Newton (if available) or EMA transport
     if opt.use_quadratic_model and opt._newton_direction is not None:
         direction = opt._newton_direction
     else:
         direction = opt._transport_direction_ema
 
-    # Apply direction with decay.
     state.X = state.X + decay * direction
 
     # NaN check - revert to pre-step state and use previous cost
     if not torch.isfinite(state.X).all():
         state.X = X_old
-        opt._transport_direction = None
         opt._transport_direction_ema = None
         opt._newton_direction = None
         # X_old is where the last OT step left the particles only on the first
@@ -58,6 +54,7 @@ def step_momentum(opt, closure: Callable) -> float:
         state.costs.append(prev_cost)
         state.linear_convergence.append(True)
         state.displacement_sqnorms.append(0.0)
+        state.record_solver_health(evals=0)
         state.iteration_count += 1
         return prev_cost
 
@@ -72,11 +69,12 @@ def step_momentum(opt, closure: Callable) -> float:
     # Reuse last cost (no validation forward pass)
     cost = state.costs[-1] if state.costs else float("inf")
 
-    # Update diagnostics
     disp_sqnorm = torch.mean(torch.sum((state.X - X_old) ** 2, dim=-1)).item()
     state.costs.append(cost)
     state.linear_convergence.append(True)
     state.displacement_sqnorms.append(disp_sqnorm)
+    # No OT solve and no forwards, so ess/rho carry forward.
+    state.record_solver_health(evals=0)
     state.iteration_count += 1
 
     return cost

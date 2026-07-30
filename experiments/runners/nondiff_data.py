@@ -155,7 +155,6 @@ def generate_multidomain_data(
             - 'test_loader': DataLoader for combined test set.
             - 'num_classes': 20 (MNIST 0-9, Fashion-MNIST 10-19).
     """
-    from experiments.runners.common import load_mnist, load_fashion_mnist
 
     # Load both datasets (returns DataLoaders; we need the underlying datasets)
     # Use the underlying torchvision datasets directly for concatenation

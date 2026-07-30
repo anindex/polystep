@@ -4,6 +4,7 @@ Both decide what the caller gets back from a run, and both shipped in 0.8.0 unte
 """
 
 import copy
+import math
 
 import pytest
 import torch
@@ -11,6 +12,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from polystep import PolyStepOptimizer, TrainConfig, train
+from polystep.hybrid_subspace import HybridSubspace
+from polystep.optimizer import RankSchedule
+from polystep.transform import ParamLayout
 from polystep.cost_nn import NNCostEvaluator
 
 
@@ -157,6 +161,20 @@ class TestStateDictRoundTrip:
         with pytest.raises(ValueError, match="Unsupported optimizer state_dict format"):
             opt.load_state_dict(sd)
 
+    def test_accepts_fields_a_newer_schema_dropped(self):
+        """0.10.0 removed ``sigma``/``use_csa``; a 0.9.0 checkpoint must still load."""
+        model, closure = _model_and_closure()
+        opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10)
+        opt.step(closure)
+        sd = copy.deepcopy(opt.state_dict())
+        sd["solver_state"]["sigma"] = 1.0
+        sd["solver_state"]["use_csa"] = False
+
+        opt.load_state_dict(sd)
+
+        assert not hasattr(opt.state, "sigma")
+        assert math.isfinite(opt.step(closure))
+
     def test_generator_state_restores(self):
         model, closure = _model_and_closure()
         opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10, seed=11)
@@ -213,9 +231,6 @@ class TestRestoreBest:
         inputs = torch.randn(samples, in_dim, generator=gen)
         targets = torch.randn(samples, out_dim, generator=gen)
         return DataLoader(TensorDataset(inputs, targets), batch_size=batch_size, shuffle=False)
-
-    def test_default_is_on(self):
-        assert TrainConfig().restore_best is True
 
     def test_returns_weights_no_worse_than_the_final_step(self):
         loader = self._loaders(batch_size=32)
@@ -346,3 +361,60 @@ class TestAbsorbAlignedActive:
             plain.state.hybrid_projections[key],
             aligned.state.hybrid_projections[key],
         )
+
+
+def test_rank_schedule_stage_zero_applies_before_the_first_step():
+    """``RankSchedule.at(0)`` was only checked after the OT solve and after
+    ``iteration_count`` advanced, so the entire first sweep ran at whatever rank the
+    supplied subspace carried, contradicting the documented contract.
+    """
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 12), nn.Tanh(), nn.Linear(12, 3))
+    supplied = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4)
+    dim_at_supplied_rank = supplied.subspace_dim
+
+    opt = PolyStepOptimizer(
+        model,
+        subspace=supplied,
+        rank_schedule=RankSchedule(stages=[(0, 2), (100, 8)]),
+        compile=False,
+        seed=0,
+    )
+
+    assert opt._applied_rank == 2
+    assert opt.subspace.subspace_dim != dim_at_supplied_rank
+
+
+def test_resume_across_a_rank_transition():
+    """``state_dict`` carries no subspace object and used to omit ``_applied_rank``,
+    so loading a post-transition checkpoint into an optimizer built at the starting
+    rank restored wide coordinates into a narrow subspace and the next step raised.
+    """
+    schedule = RankSchedule(stages=[(0, 1), (2, 2)])
+    inputs, targets = torch.randn(16, 8), torch.randn(16, 3)
+    loss_fn = nn.MSELoss()
+
+    def build():
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(8, 12), nn.Tanh(), nn.Linear(12, 3))
+        subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+        opt = PolyStepOptimizer(model, subspace=subspace, rank_schedule=schedule, compile=False, seed=0)
+        return model, opt
+
+    def closure_for(model):
+        from torch.func import functional_call, vmap
+
+        return lambda p: vmap(lambda q: loss_fn(functional_call(model, q, (inputs,)), targets))(p)
+
+    saved_model, saved = build()
+    for _ in range(4):
+        saved.step(closure_for(saved_model))
+    checkpoint = saved.state_dict()
+    assert saved._applied_rank == 2
+    expected = saved.step(closure_for(saved_model))
+
+    resumed_model, resumed = build()
+    resumed.load_state_dict(checkpoint)
+    actual = resumed.step(closure_for(resumed_model))
+
+    assert actual == pytest.approx(expected, abs=1e-9)

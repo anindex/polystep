@@ -28,12 +28,10 @@ from pathlib import Path
 
 import torch
 
-# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
-# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
-# Set POLYSTEP_THREADS to override. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
+# One thread: PolyStep's per-step ops are small enough that torch's default pool of
+# nproc threads costs far more than it returns. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
 
-# Allow running directly from a source checkout without `pip install -e .`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polystep.solver import PolyStep  # noqa: E402
@@ -97,6 +95,10 @@ def main():
         best_traj.append(c[staircase_radial(c).argmin()])
     best_traj = torch.stack(best_traj)
 
+    final_mean = float(staircase_radial(state.X).mean())
+    init_mean = float(staircase_radial(X_init).mean())
+    print(f"final mean cost = {final_mean:.3f} (started ~{init_mean:.3f})")
+
     if importlib.util.find_spec("matplotlib") is None:
         print("matplotlib not installed; skipping the figure (pip install matplotlib).")
         return
@@ -148,9 +150,6 @@ def main():
     fig.savefig(out, dpi=150)
     plt.close(fig)
 
-    final_mean = float(staircase_radial(state.X).mean())
-    init_mean = float(staircase_radial(X_init).mean())
-    print(f"final mean cost = {final_mean:.3f} (started ~{init_mean:.3f})")
     print(f"saved figure: {out}")
 
 

@@ -17,15 +17,15 @@ See Also:
 
 from __future__ import annotations
 
+import functools
 import warnings
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
     from .transform import ParamLayout
-    from .cost_nn import NNCostEvaluator
 
 
 @dataclass(frozen=True)
@@ -135,16 +135,7 @@ def split_particles(
     particles: torch.Tensor,
     blocks: List[BlockConfig],
 ) -> List[torch.Tensor]:
-    """Slice full flat particle vector into per-block particle tensors.
-
-    Args:
-        particles: 2D tensor of shape ``(total_particles, particle_dim)`` or
-            1D flat tensor. Internally flattened and sliced by block offsets.
-        blocks: List of BlockConfig with flat_start/flat_end offsets.
-
-    Returns:
-        List of tensors, each ``(block.num_particles, block.particle_dim)``.
-    """
+    """Flatten ``particles`` and slice it into one tensor per block."""
     flat = particles.reshape(-1)
     result: List[torch.Tensor] = []
 
@@ -161,18 +152,7 @@ def reassemble_blocks(
     blocks: List[BlockConfig],
     total_flat_size: int,
 ) -> torch.Tensor:
-    """Reconstruct full flat vector from per-block particle tensors.
-
-    Args:
-        block_particles: List of tensors, each
-            ``(block.num_particles, block.particle_dim)``.
-        blocks: List of BlockConfig with flat_start/flat_end offsets.
-        total_flat_size: Total size of the reassembled flat vector
-            (sum of all block padded sizes).
-
-    Returns:
-        1D tensor of shape ``(total_flat_size,)``.
-    """
+    """Inverse of :func:`split_particles`, into one ``(total_flat_size,)`` vector."""
     if not block_particles:
         return torch.zeros(total_flat_size)
 
@@ -186,47 +166,41 @@ def reassemble_blocks(
     return full_flat
 
 
+@functools.lru_cache(maxsize=8)
+def _block_layout_spans(
+    blocks: Tuple[BlockConfig, ...],
+    layout: "ParamLayout",
+) -> Tuple[Tuple[int, int, int], ...]:
+    """``(layout_offset, block_offset, numel)`` per parameter entry.
+
+    Blocks pad independently, so their offsets differ from ``ParamLayout``, which
+    concatenates every entry and pads once at the end. Fixed once the blocks exist,
+    so it is cached rather than re-walked per chunk per block.
+
+    Spans, not a gather index: the runs are contiguous, so a slice copy beats the
+    equivalent advanced-index gather.
+    """
+    spans = []
+    for block in blocks:
+        internal_offset = 0
+        for leaf_idx in block.leaf_indices:
+            entry = layout.entries[leaf_idx]
+            spans.append((entry.offset, block.flat_start + internal_offset, entry.numel))
+            internal_offset += entry.numel
+    return tuple(spans)
+
+
 @torch.inference_mode()
 def blocks_to_layout_flat(
     block_flat: torch.Tensor,
     blocks: List[BlockConfig],
     layout: "ParamLayout",
 ) -> torch.Tensor:
-    """Map block-indexed flat vector to layout-indexed flat vector.
-
-    Per-layer (and grouped) blocks pad each block independently, creating a
-    different offset scheme than ``ParamLayout`` (which concatenates all
-    entries contiguously and pads once at the end).  This function copies
-    actual parameter data from block offsets to the correct layout offsets,
-    producing a vector suitable for ``layout.batch_unflatten``.
-
-    Handles both per-layer blocks (one entry per block) and grouped blocks
-    (multiple entries per block) via ``block.leaf_indices``.
-
-    Args:
-        block_flat: 1D tensor in block-indexed layout (from ``reassemble_blocks``).
-        blocks: List of BlockConfig with ``leaf_indices`` into ``layout.entries``.
-        layout: ParamLayout for the model.
-
-    Returns:
-        1D tensor of shape ``(layout.padded_size,)`` in layout-indexed layout.
-    """
-    layout_flat = torch.zeros(
-        layout.padded_size,
-        dtype=block_flat.dtype,
-        device=block_flat.device,
-    )
-
-    for block in blocks:
-        internal_offset = 0
-        for leaf_idx in block.leaf_indices:
-            entry = layout.entries[leaf_idx]
-            numel = entry.numel
-            layout_flat[entry.offset : entry.offset + numel] = block_flat[
-                block.flat_start + internal_offset : block.flat_start + internal_offset + numel
-            ]
-            internal_offset += numel
-
+    """``(total_block_flat_size,)`` to ``(layout.padded_size,)``, ready for
+    ``layout.batch_unflatten``. Handles per-layer and grouped blocks alike."""
+    layout_flat = torch.zeros(layout.padded_size, dtype=block_flat.dtype, device=block_flat.device)
+    for lo, bo, numel in _block_layout_spans(tuple(blocks), layout):
+        layout_flat[lo : lo + numel] = block_flat[bo : bo + numel]
     return layout_flat
 
 
@@ -236,76 +210,44 @@ def layout_flat_to_block_flat(
     blocks: List[BlockConfig],
     layout: "ParamLayout",
 ) -> torch.Tensor:
-    """Map layout-indexed flat vector to block-indexed flat vector.
-
-    Inverse of ``blocks_to_layout_flat``.  Extracts actual parameter data
-    from layout entry offsets and places it at the correct block offsets,
-    with per-block padding zeros.
-
-    Args:
-        layout_flat: 1D tensor of shape ``(layout.padded_size,)`` in
-            layout-indexed format (e.g. from ``layout.flatten(model)``).
-        blocks: List of BlockConfig with ``leaf_indices`` into ``layout.entries``.
-        layout: ParamLayout for the model.
-
-    Returns:
-        1D tensor of shape ``(total_block_flat_size,)`` in block-indexed layout.
-    """
+    """Inverse of :func:`blocks_to_layout_flat`; per-block padding stays zero."""
     total_block_flat_size = blocks[-1].flat_end if blocks else 0
-    block_flat = torch.zeros(
-        total_block_flat_size,
-        dtype=layout_flat.dtype,
-        device=layout_flat.device,
-    )
-
-    for block in blocks:
-        internal_offset = 0
-        for leaf_idx in block.leaf_indices:
-            entry = layout.entries[leaf_idx]
-            numel = entry.numel
-            block_flat[block.flat_start + internal_offset : block.flat_start + internal_offset + numel] = layout_flat[
-                entry.offset : entry.offset + numel
-            ]
-            internal_offset += numel
-
+    block_flat = torch.zeros(total_block_flat_size, dtype=layout_flat.dtype, device=layout_flat.device)
+    for lo, bo, numel in _block_layout_spans(tuple(blocks), layout):
+        block_flat[bo : bo + numel] = layout_flat[lo : lo + numel]
     return block_flat
 
 
-@torch.inference_mode()
-def blocks_to_layout_flat_batch(
-    block_flat_batch: torch.Tensor,
+@functools.lru_cache(maxsize=8)
+def _block_to_layout_columns(
+    blocks: Tuple[BlockConfig, ...],
+    layout: "ParamLayout",
+    device: torch.device,
+) -> torch.Tensor:
+    total = blocks[-1].flat_end if blocks else 0
+    columns = torch.full((total,), layout.padded_size, dtype=torch.long, device=device)
+    for lo, bo, numel in _block_layout_spans(blocks, layout):
+        columns[bo : bo + numel] = torch.arange(lo, lo + numel, device=device)
+    return columns
+
+
+def block_to_layout_columns(
     blocks: List[BlockConfig],
     layout: "ParamLayout",
+    device: torch.device,
 ) -> torch.Tensor:
-    """Batched version of ``blocks_to_layout_flat``.
+    """Layout column for each block-order position, for scattering straight into
+    layout order.
 
-    Args:
-        block_flat_batch: 2D tensor of shape ``(N, total_block_flat_size)``.
-        blocks: List of BlockConfig with ``leaf_indices`` into ``layout.entries``.
-        layout: ParamLayout for the model.
+    Per-block padding has no layout counterpart and maps to ``layout.padded_size``,
+    one past the end, so callers give the destination a trailing scratch column
+    instead of masking. Lets a candidate be written once in layout order rather than
+    built in block order and permuted.
 
-    Returns:
-        2D tensor of shape ``(N, layout.padded_size)``.
+    Cached: the mapping is fixed once the blocks exist, but the step rebuilt it with an
+    arange per span every iteration. Callers must not write to the result.
     """
-    N = block_flat_batch.shape[0]
-    layout_batch = torch.zeros(
-        N,
-        layout.padded_size,
-        dtype=block_flat_batch.dtype,
-        device=block_flat_batch.device,
-    )
-
-    for block in blocks:
-        internal_offset = 0
-        for leaf_idx in block.leaf_indices:
-            entry = layout.entries[leaf_idx]
-            numel = entry.numel
-            layout_batch[:, entry.offset : entry.offset + numel] = block_flat_batch[
-                :, block.flat_start + internal_offset : block.flat_start + internal_offset + numel
-            ]
-            internal_offset += numel
-
-    return layout_batch
+    return _block_to_layout_columns(tuple(blocks), layout, device)
 
 
 def create_subspace_blocks(
@@ -383,29 +325,10 @@ def split_subspace_to_blocks(
     subspace_coords: torch.Tensor,
     blocks: List[BlockConfig],
 ) -> List[torch.Tensor]:
-    """Split 1D subspace coordinate vector into per-block particle tensors.
+    """``split_particles`` over subspace coordinates rather than full flat parameters.
 
-    Takes a flattened subspace coordinate vector and slices it according to
-    the block configuration. Each slice is reshaped to (num_particles, particle_dim).
-
-    This is the subspace-aware equivalent of split_particles(), operating
-    on subspace coordinates rather than full parameter flat vectors.
-
-    Args:
-        subspace_coords: 1D tensor of shape (subspace_dim,) or 2D tensor of
-            shape (num_particles, particle_dim) that will be flattened.
-        blocks: List of BlockConfig from create_subspace_blocks().
-
-    Returns:
-        List of tensors, each of shape (block.num_particles, block.particle_dim).
-
-    Example::
-
-        coords = torch.randn(256)  # subspace coordinates
-        blocks = create_subspace_blocks(256, 4, 8)
-        block_particles = split_subspace_to_blocks(coords, blocks)
-        # block_particles[0].shape == (8, 8)  # 64 coords -> 8 particles x 8 dim
-
+    ``subspace_coords`` is flattened, zero-padded up to the blocks' total size, and
+    sliced into one ``(num_particles, particle_dim)`` tensor per block.
     """
     flat = subspace_coords.reshape(-1)
 
@@ -428,28 +351,7 @@ def reassemble_blocks_to_subspace(
     blocks: List[BlockConfig],
     subspace_dim: int,
 ) -> torch.Tensor:
-    """Reconstruct 1D subspace coordinate vector from per-block particle tensors.
-
-    Inverse of split_subspace_to_blocks(). Takes the list of per-block particle
-    tensors and reassembles them into a contiguous subspace coordinate vector.
-
-    Args:
-        block_particles: List of tensors, each of shape
-            (block.num_particles, block.particle_dim).
-        blocks: List of BlockConfig from create_subspace_blocks().
-        subspace_dim: Original subspace dimension (for trimming padding).
-
-    Returns:
-        1D tensor of shape (subspace_dim,).
-
-    Example::
-
-        # After per-block OT updates
-        updated_coords = reassemble_blocks_to_subspace(
-            block_particles, blocks, subspace_dim=256
-        )
-
-    """
+    """Inverse of :func:`split_subspace_to_blocks`, trimmed back to ``subspace_dim``."""
     if not block_particles:
         return torch.zeros(subspace_dim)
 
@@ -466,79 +368,3 @@ def reassemble_blocks_to_subspace(
 
     # Trim to actual subspace_dim (remove padding)
     return full_flat[:subspace_dim]
-
-
-def compute_block_cost_matrix(
-    block_idx: int,
-    X_probe_block: torch.Tensor,
-    all_block_particles: List[torch.Tensor],
-    blocks: List[BlockConfig],
-    layout: ParamLayout,
-    evaluator: NNCostEvaluator,
-    inputs: torch.Tensor,
-    targets: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Compute cost matrix for one block: full forward, perturb only this block.
-
-    For each probe point (p, v, k), constructs full model parameters by
-    taking the current particles from all blocks and replacing particle row p
-    in block_idx with the probe value. This captures cross-block interactions
-    through the full model forward pass.
-
-    Args:
-        block_idx: Index of the block being evaluated.
-        X_probe_block: Probe points for this block, shape
-            ``(P, V, K, block_particle_dim)``.
-        all_block_particles: Current particles for all blocks (base values).
-        blocks: List of all BlockConfig.
-        layout: ParamLayout for converting flat vectors to param dicts.
-        evaluator: NNCostEvaluator for model evaluation.
-        inputs: Input data batch.
-        targets: Optional target labels.
-
-    Returns:
-        Cost matrix of shape ``(P, V)``.
-    """
-    P, V, K, D = X_probe_block.shape
-    N = P * V * K
-    total_flat_size = sum(b.flat_end - b.flat_start for b in blocks)
-
-    # Build base full flat vector from current block particles
-    base_flat = reassemble_blocks(all_block_particles, blocks, total_flat_size)
-
-    # Expand base flat to batch: (N, total_flat_size)
-    base_batch = base_flat.unsqueeze(0).expand(N, -1).clone()
-
-    # For each probe point (p, v, k), replace particle row p in block_idx
-    block = blocks[block_idx]
-    flat_probes = X_probe_block.reshape(P * V * K, D)  # (N, D)
-
-    # Each probe n corresponds to particle p = n // (V*K)
-    # The flat offset for particle p in the block is:
-    #   block.flat_start + p * D
-    # Vectorized scatter: compute all row offsets at once
-    indices = torch.arange(N, device=flat_probes.device)
-    p_indices = indices // (V * K)
-    row_starts = block.flat_start + p_indices * D
-    # Build column indices for each of the D elements per probe
-    col_offsets = torch.arange(D, device=flat_probes.device)  # (D,)
-    # (N, D) matrix of column indices into base_batch
-    col_indices = row_starts.unsqueeze(1) + col_offsets.unsqueeze(0)
-    # Scatter flat_probes into base_batch using advanced indexing
-    row_idx = indices.unsqueeze(1).expand(-1, D)  # (N, D)
-    base_batch[row_idx, col_indices] = flat_probes
-
-    # Per-layer blocks pad each entry independently, creating different
-    # offsets from ParamLayout (which concatenates entries contiguously).
-    # Map from block offsets to layout offsets for correct batch_unflatten.
-    batch_for_layout = blocks_to_layout_flat_batch(base_batch, blocks, layout)
-
-    # Convert to stacked param dicts
-    stacked_params = layout.batch_unflatten(batch_for_layout)
-
-    # Evaluate all probe points
-    losses = evaluator.evaluate(stacked_params, inputs, targets)  # (N,)
-
-    # Reshape and average over probe dimension K
-    cost_matrix = losses.reshape(P, V, K).mean(dim=-1)  # (P, V)
-    return cost_matrix

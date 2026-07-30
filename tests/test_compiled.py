@@ -1,6 +1,5 @@
 """Tests for compilation infrastructure: fallback, numerical equivalence."""
 
-import inspect
 import warnings
 
 import pytest
@@ -14,177 +13,133 @@ from polystep._compiled import (
     _fused_softmax_project,
     _rotate_and_translate,
     _sinkhorn_iteration,
-    try_compile,
 )
-from polystep import SinkhornSolver, PolyStep
+from polystep import SinkhornSolver
+from polystep.solver import PolyStep
 
 
-class TestTryCompileReturnsCallable:
-    """Test 1: try_compile returns a callable."""
+def test_compile_false_stores_eager_functions():
+    """compile=False stores raw eager functions."""
+    cf = CompiledFunctions(compile=False)
+    assert cf.sinkhorn_iter is _sinkhorn_iteration
+    assert cf.rotate_and_translate is _rotate_and_translate
+    assert cf.barycentric_projection is _barycentric_projection
+    assert cf.compute_probe_points is _compute_probe_points
 
 
-class TestCompiledFunctionsEagerEquivalence:
-    """Test 3: compile=False stores raw eager functions."""
+def test_per_function_fallback_independence(monkeypatch):
+    """One function's compile failure does not block others."""
+    original_compile = torch.compile
 
-    def test_compile_false_stores_eager_functions(self):
-        cf = CompiledFunctions(compile=False)
-        assert cf.sinkhorn_iter is _sinkhorn_iteration
-        assert cf.rotate_and_translate is _rotate_and_translate
-        assert cf.barycentric_projection is _barycentric_projection
-        assert cf.compute_probe_points is _compute_probe_points
+    def selective_compile(fn, *, fullgraph=True, mode="reduce-overhead", **kw):
+        # Fail only for sinkhorn_iteration
+        if getattr(fn, "__name__", "") == "_sinkhorn_iteration":
+            raise RuntimeError("Simulated compile failure for sinkhorn_iteration")
+        return original_compile(fn, fullgraph=fullgraph, mode=mode, **kw)
 
+    monkeypatch.setattr(torch, "compile", selective_compile)
 
-class TestPerFunctionFallbackIndependence:
-    """Test 4: One function's compile failure does not block others."""
+    # Also need CUDA to appear available so CompiledFunctions attempts compilation
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
-    def test_per_function_fallback_independence(self, monkeypatch):
-        original_compile = torch.compile
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cf = CompiledFunctions(compile=True)
 
-        def selective_compile(fn, *, fullgraph=True, mode="reduce-overhead", **kw):
-            # Fail only for sinkhorn_iteration
-            if getattr(fn, "__name__", "") == "_sinkhorn_iteration":
-                raise RuntimeError("Simulated compile failure for sinkhorn_iteration")
-            return original_compile(fn, fullgraph=fullgraph, mode=mode, **kw)
+    # sinkhorn_iter should have fallen back to the original function
+    assert cf.sinkhorn_iter is _sinkhorn_iteration, "sinkhorn_iter should be the original eager function after fallback"
 
-        monkeypatch.setattr(torch, "compile", selective_compile)
+    # Other functions should NOT be the original (they got compiled wrappers)
+    assert cf.rotate_and_translate is not _rotate_and_translate
+    assert cf.barycentric_projection is not _barycentric_projection
 
-        # Also need CUDA to appear available so CompiledFunctions attempts compilation
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            cf = CompiledFunctions(compile=True)
-
-        # sinkhorn_iter should have fallen back to the original function
-        assert cf.sinkhorn_iter is _sinkhorn_iteration, (
-            "sinkhorn_iter should be the original eager function after fallback"
-        )
-
-        # Other functions should NOT be the original (they got compiled wrappers)
-        assert cf.rotate_and_translate is not _rotate_and_translate
-        assert cf.barycentric_projection is not _barycentric_projection
-
-        # Verify warning was emitted for the failed function
-        fail_warnings = [x for x in w if "sinkhorn_iteration" in str(x.message)]
-        assert len(fail_warnings) >= 1, "Expected warning about sinkhorn_iteration failure"
+    # Verify warning was emitted for the failed function
+    fail_warnings = [x for x in w if "sinkhorn_iteration" in str(x.message)]
+    assert len(fail_warnings) >= 1, "Expected warning about sinkhorn_iteration failure"
 
 
-class TestBarycentricProjectionEquivalence:
-    """Test 7: _barycentric_projection equivalence and shape."""
-
-    def test_barycentric_projection_zero_marginal_is_finite(self):
-        B, V, d = 3, 4, 2
-        transport_matrix = torch.zeros(B, V)
-        a = torch.zeros(B)  # degenerate marginal
-        X_vertices = torch.randn(B, V, d)
-        result = _barycentric_projection(transport_matrix, a, X_vertices)
-        assert torch.isfinite(result).all()
+def test_barycentric_projection_zero_marginal_is_finite():
+    """_barycentric_projection equivalence and shape."""
+    B, V, d = 3, 4, 2
+    transport_matrix = torch.zeros(B, V)
+    X_vertices = torch.randn(B, V, d)
+    result = _barycentric_projection(transport_matrix, X_vertices)
+    assert torch.isfinite(result).all()
 
 
-class TestSinkhornSolverCompileFlagEquivalence:
-    """Test 8: SinkhornSolver compile=True vs compile=False on CPU."""
+def test_sinkhorn_solver_compile_flag_equivalence():
+    """SinkhornSolver compile=True vs compile=False on CPU."""
+    torch.manual_seed(42)
+    n, m = 50, 30
+    cost_matrix = torch.rand(n, m) + 0.01
 
-    def test_sinkhorn_solver_compile_flag_equivalence(self):
-        torch.manual_seed(42)
-        n, m = 50, 30
-        cost_matrix = torch.rand(n, m) + 0.01
-
-        solver_compiled = SinkhornSolver(
-            compile=True,
-            max_iterations=100,
-            threshold=-1,
-            epsilon=0.1,
-        )
-        solver_eager = SinkhornSolver(
-            compile=False,
-            max_iterations=100,
-            threshold=-1,
-            epsilon=0.1,
-        )
-
-        result_compiled = solver_compiled.solve(cost_matrix.clone())
-        result_eager = solver_eager.solve(cost_matrix.clone())
-
-        # On CPU both are eager, so results must be identical
-        torch.testing.assert_close(result_compiled.f, result_eager.f, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(result_compiled.g, result_eager.g, atol=1e-5, rtol=1e-5)
-
-
-class TestPolyStepCompileFlagEquivalence:
-    """Test 9: PolyStep compile=True vs compile=False produce same particles."""
-
-    def test_sinkhorn_step_compile_flag_equivalence(self):
-        torch.manual_seed(42)
-        dim = 5
-        num_particles = 20
-
-        def objective_fn(x):
-            return x.pow(2).sum(-1)
-
-        solver_compiled = PolyStep(
-            objective_fn=objective_fn,
-            dim=dim,
-            compile=True,
-            max_iterations=3,
-            sinkhorn_max_iters=50,
-            threshold=-1,
-        )
-        solver_eager = PolyStep(
-            objective_fn=objective_fn,
-            dim=dim,
-            compile=False,
-            max_iterations=3,
-            sinkhorn_max_iters=50,
-            threshold=-1,
-        )
-
-        X_init = torch.randn(num_particles, dim)
-
-        g1 = torch.Generator().manual_seed(123)
-        g2 = torch.Generator().manual_seed(123)
-
-        state_compiled = solver_compiled.run(X_init.clone(), generator=g1)
-        state_eager = solver_eager.run(X_init.clone(), generator=g2)
-
-        torch.testing.assert_close(
-            state_compiled.X,
-            state_eager.X,
-            atol=1e-5,
-            rtol=1e-5,
-        )
-
-
-class TestCompiledFunctionsNoGraphBreaks:
-    """Test 12: Static check that compiled functions avoid graph-break patterns."""
-
-    @pytest.mark.parametrize(
-        "fn",
-        [
-            _sinkhorn_iteration,
-            _rotate_and_translate,
-            _barycentric_projection,
-            _compute_probe_points,
-            _fused_softmax_project,
-        ],
-        ids=[
-            "sinkhorn_iteration",
-            "rotate_and_translate",
-            "barycentric_projection",
-            "compute_probe_points",
-            "fused_softmax_project",
-        ],
+    solver_compiled = SinkhornSolver(
+        compile=True,
+        max_iterations=100,
+        threshold=-1,
+        epsilon=0.1,
     )
-    def test_no_graph_break_patterns(self, fn):
-        source = inspect.getsource(fn)
+    solver_eager = SinkhornSolver(
+        compile=False,
+        max_iterations=100,
+        threshold=-1,
+        epsilon=0.1,
+    )
 
-        assert ".item()" not in source, f"{fn.__name__} contains .item() which causes graph breaks"
-        assert ".append(" not in source, f"{fn.__name__} contains .append() which causes graph breaks"
-        assert ".tolist()" not in source, f"{fn.__name__} contains .tolist() which causes graph breaks"
+    result_compiled = solver_compiled.solve(cost_matrix.clone())
+    result_eager = solver_eager.solve(cost_matrix.clone())
+
+    # On CPU both are eager, so results must be identical
+    torch.testing.assert_close(result_compiled.f, result_eager.f, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(result_compiled.g, result_eager.g, atol=1e-5, rtol=1e-5)
+
+
+def test_sinkhorn_step_compile_flag_equivalence():
+    """PolyStep compile=True vs compile=False produce same particles."""
+    torch.manual_seed(42)
+    dim = 5
+    num_particles = 20
+
+    def objective_fn(x):
+        return x.pow(2).sum(-1)
+
+    solver_compiled = PolyStep(
+        objective_fn=objective_fn,
+        dim=dim,
+        compile=True,
+        max_iterations=3,
+        sinkhorn_max_iters=50,
+        threshold=-1,
+    )
+    solver_eager = PolyStep(
+        objective_fn=objective_fn,
+        dim=dim,
+        compile=False,
+        max_iterations=3,
+        sinkhorn_max_iters=50,
+        threshold=-1,
+    )
+
+    X_init = torch.randn(num_particles, dim)
+
+    g1 = torch.Generator().manual_seed(123)
+    g2 = torch.Generator().manual_seed(123)
+
+    state_compiled = solver_compiled.run(X_init.clone(), generator=g1)
+    state_eager = solver_eager.run(X_init.clone(), generator=g2)
+
+    torch.testing.assert_close(
+        state_compiled.X,
+        state_eager.X,
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def _make_sinkhorn_args(device):
-    """Create input tensors for _sinkhorn_iteration on the given device."""
-    n, m = 200, 150
+    """Inputs for _sinkhorn_iteration. Small: the assertion is about the traced graph,
+    not the arithmetic, and a large kernel only lengthens the trace."""
+    n, m = 40, 30
     f = torch.randn(n, device=device)
     g = torch.randn(m, device=device)
     log_K = torch.randn(n, m, device=device)
@@ -210,9 +165,8 @@ def _make_barycentric_args(device):
     """Create input tensors for _barycentric_projection on the given device."""
     B, V, d = 10, 40, 20
     transport = torch.softmax(torch.randn(B, V, device=device), dim=-1)
-    a = torch.ones(B, device=device) / B
     X_vertices = torch.randn(B, V, d, device=device)
-    return (transport, a, X_vertices)
+    return (transport, X_vertices)
 
 
 def _make_probe_args(device):
@@ -223,19 +177,6 @@ def _make_probe_args(device):
     scales = torch.linspace(0.2, 0.8, 3, device=device)
     probe_radius = 1.0
     return (origin, directions, scales, probe_radius)
-
-
-@pytest.mark.slow
-@pytest.mark.timeout(120)
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestGPUGraphBreakVerification:
-    """Test 13: Runtime verification that compiled functions have zero graph breaks on GPU.
-
-    Uses torch.compile(fullgraph=True) which raises an error if any graph break
-    is detected. If compilation and execution succeed, that IS the proof of zero
-    graph breaks.
-    """
 
 
 def _make_fused_softmax_args(device, P=10, V=8, dim=4, seed=42):
@@ -255,16 +196,66 @@ def _make_fused_softmax_args(device, P=10, V=8, dim=4, seed=42):
 
 
 class TestFusedSoftmaxProjectEquivalence:
-    """Test 17: Fused result matches two-step path (softmax solve + barycentric projection)."""
+    """The fused kernel must equal the two-step softmax solve plus barycentric projection."""
+
+    def test_fused_matches_two_step_path(self):
+        cost, eps, a, verts, rot, step_r, X = _make_fused_softmax_args(torch.device("cpu"))
+        X_fused, transport = _fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=False)
+
+        # Two-step reference: per-row softmax weighting, then project onto the
+        # rotated, translated vertices.
+        W = torch.softmax(-(cost - cost.amin(dim=-1, keepdim=True)) / eps, dim=-1)
+        X_vertices, _ = _rotate_and_translate(rot, verts, X, step_r)
+        X_ref = _barycentric_projection(W * a.unsqueeze(-1), X_vertices)
+
+        torch.testing.assert_close(X_fused, X_ref, atol=1e-5, rtol=1e-5)
+        # The transport rows must carry the source marginal.
+        torch.testing.assert_close(transport.sum(dim=-1), a, atol=1e-6, rtol=1e-6)
+
+    def test_no_scaling_leaves_the_cost_untouched(self):
+        cost, eps, a, verts, rot, step_r, X = _make_fused_softmax_args(torch.device("cpu"))
+        _, t_raw = _fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=False)
+        _, t_scaled = _fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=True)
+        # Dividing the cost by its mean changes the effective temperature, so the two
+        # plans must differ; identical output would mean the flag does nothing.
+        assert not torch.allclose(t_raw, t_scaled, atol=1e-6)
+
+    def test_eager_registry_returns_the_same_result(self):
+        cost, eps, a, verts, rot, step_r, X = _make_fused_softmax_args(torch.device("cpu"))
+        cf = CompiledFunctions(compile=False)
+        got, _ = cf.fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=False)
+        want, _ = _fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=False)
+        torch.testing.assert_close(got, want)
 
 
-class TestFusedSoftmaxProjectTransportRowSums:
-    """Test 18: Transport matrix row sums equal source marginal a."""
+@pytest.mark.parametrize(
+    "fn,make_args",
+    [
+        (_sinkhorn_iteration, _make_sinkhorn_args),
+        (_rotate_and_translate, _make_rotate_args),
+        (_barycentric_projection, _make_barycentric_args),
+        (_compute_probe_points, _make_probe_args),
+        (_fused_softmax_project, _make_fused_softmax_args),
+    ],
+    ids=[
+        "sinkhorn_iteration",
+        "rotate_and_translate",
+        "barycentric_projection",
+        "compute_probe_points",
+        "fused_softmax_project",
+    ],
+)
+def test_compiles_without_graph_breaks(fn, make_args):
+    """Every hot-path kernel must compile as a single graph.
 
-
-class TestFusedSoftmaxProjectNoScaling:
-    """Test 19: With scale_cost_mean=False, cost matrix is used as-is."""
-
-
-class TestFusedSoftmaxProjectCompiledFunctionsEager:
-    """Test 20: CompiledFunctions(compile=False).fused_softmax_project is callable and correct."""
+    ``fullgraph=True`` raises on any graph break, so compiling and running is the
+    check. This runs on CPU, where a break is a break regardless of device."""
+    args = make_args(torch.device("cpu"))
+    compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+    got = compiled(*args)
+    want = fn(*args)
+    if isinstance(want, tuple):
+        for g, w in zip(got, want):
+            torch.testing.assert_close(g, w, atol=1e-5, rtol=1e-5)
+    else:
+        torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)

@@ -123,3 +123,42 @@ class _Recorder(TrainCallback):
     def on_step_end(self, metrics: dict) -> bool:
         self.sink.append(float(metrics["loss"]))
         return False
+
+
+@pytest.mark.slow
+def test_orthoplex_with_the_quadratic_model_beats_the_simplex_per_forward_pass():
+    """Locks the docs/performance.md recommendation to a measurement.
+
+    The orthoplex costs 2k vertices against the simplex's k+1, so it pays off only
+    with the finite-difference machinery its antithetic pairing enables. The budget
+    is candidate evaluations, not steps, or the orthoplex just gets more forwards.
+    """
+    from polystep.cost_nn import NNCostEvaluator
+    from polystep.transform import ParamLayout
+
+    budget = 120_000
+
+    def run(**kwargs):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(20, 32), nn.ReLU(), nn.Linear(32, 3))
+        g = torch.Generator().manual_seed(100)
+        x = torch.randn(256, 20, generator=g)
+        y = (x @ torch.randn(20, 3, generator=g)).argmax(dim=1)
+        loss_fn = nn.CrossEntropyLoss()
+        ev = NNCostEvaluator(model, loss_fn, ParamLayout.from_module(model))
+        opt = PolyStepOptimizer(model, epsilon=0.1, step_radius=0.1, seed=0, compile=False, **kwargs)
+        opt.register_evaluator(ev, x, y)
+
+        with torch.no_grad():
+            start = float(loss_fn(model(x), y))
+        while sum(opt.state.evals) < budget:
+            opt.step(lambda bp: ev.evaluate(bp, x, y))
+        with torch.no_grad():
+            return start - float(loss_fn(model(x), y))
+
+    simplex = run(polytope_type="simplex")
+    orthoplex_quad = run(polytope_type="orthoplex", use_quadratic_model=True, trust_region=True, num_probe=2)
+
+    assert orthoplex_quad > simplex * 1.5, (
+        f"orthoplex+quadratic model does not pay for its extra vertices: {orthoplex_quad:.4f} vs simplex {simplex:.4f}"
+    )

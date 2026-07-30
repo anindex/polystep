@@ -30,14 +30,14 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 # Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 
-from experiments.runners.common import save_result, set_seed, track_gpu_memory
+from experiments.runners.common import set_seed
 from experiments.runners.nondiff_data import generate_maxsat_instance
 from experiments.runners.nondiff_models import MaxSATModel
 from experiments.runners.run_maxsat import (
@@ -130,13 +130,11 @@ def run_softmax_maxsat(
 
     wall_time = time.time() - start_time
 
-    # Record peak memory
     peak_memory_mb = 0.0
     if torch.cuda.is_available():
         peak_bytes = torch.cuda.max_memory_allocated()
         peak_memory_mb = round(peak_bytes / (1024 * 1024), 2)
 
-    # Evaluate final result
     result = evaluate_sat_result(model, clause_vars, clause_signs)
 
     return {
@@ -298,7 +296,6 @@ def main():
         print("CUDA not available, falling back to CPU")
         args.device = "cpu"
 
-    # Run binary search
     result = binary_search_max_feasible(
         device=args.device,
         seed=args.seed,
@@ -306,7 +303,6 @@ def main():
         steps_full=args.steps_full,
     )
 
-    # Print summary
     print_summary(result)
 
     # Save results as JSON

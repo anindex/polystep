@@ -1137,7 +1137,6 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
 
     results = {}
 
-    #: polystep memory --
     print("Measuring polystep memory...")
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -1204,7 +1203,6 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
     gc.collect()
     torch.cuda.empty_cache()
 
-    # , Adam memory --
     print("Measuring Adam memory...")
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()

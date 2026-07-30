@@ -40,14 +40,7 @@ class ObjectiveFn(abc.ABC):
 
     @abc.abstractmethod
     def evaluate(self, X: torch.Tensor) -> torch.Tensor:
-        """Compute the raw objective value.
-
-        Args:
-            X: Input array of shape ``(..., dim)``.
-
-        Returns:
-            Cost array of shape ``(...)``.
-        """
+        """Raw objective value: ``(..., dim)`` in, ``(...)`` out."""
         pass
 
     def __call__(

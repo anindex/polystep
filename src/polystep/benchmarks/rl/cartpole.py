@@ -157,10 +157,8 @@ class CartPoleEvaluator:
         # Send stacked params to device.
         sp = {k: v.to(self.device) for k, v in stacked_params.items()}
 
-        # Check ``active.any()`` only every ``early_stop_check`` steps to
-        # amortize the GPU-CPU sync cost. CartPole rewards stop accumulating
-        # once an env is inactive, so running a few extra "dead" iterations
-        # is cheap and keeps the inner loop fully on-device.
+        # Check ``active.any()`` every ``early_stop_check`` steps to amortize the sync.
+        # Dead envs stop accumulating reward, so the extra iterations are free.
         early_stop_check = max(1, self.horizon // 8)
         for t in range(self.horizon):
             logits = _batched_mlp_logits(states, sp, n_candidates, R)  # (N, R, 2)

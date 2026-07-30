@@ -8,6 +8,12 @@ Vertex ordering convention (orthoplex):
   Vertices 0..d-1: +e_0, +e_1, ..., +e_{d-1}
   Vertices d..2d-1: -e_0, -e_1, ..., -e_{d-1}
   Pair for direction i: vertex i (+) and vertex i+d (-)
+
+The extractors see only the loss tensor, so they can check ``V == 2*pdim`` but not the
+ordering behind it. Callers must pass orthoplex losses built on a unit-radius template,
+which the ``2*s*r`` denominator also assumes. A cube at ``pdim=2`` satisfies the shape
+check while pairing vertex 0 with a non-antipodal partner, so it would return a wrong
+gradient; the optimizer gates every call on ``polytope_type == "orthoplex"``.
 """
 
 import torch
@@ -24,14 +30,8 @@ def extract_fd_gradient(
     Central difference at each probe scale, averaged over scales:
         g_i = mean_k[(L(+s_k*d_i) - L(-s_k*d_i)) / (2 * s_k * r)]
 
-    Args:
-        losses_3d: Loss values of shape (P, V, K) where V = 2*pdim.
-        scales: Probe scale factors of shape (K,).
-        probe_radius: Probe distance multiplier.
-        pdim: Particle dimension (number of orthoplex directions).
-
-    Returns:
-        Gradient in rotated frame of shape (P, pdim).
+    ``losses_3d`` is ``(P, V, K)`` with ``V == 2*pdim``, ``scales`` is ``(K,)``. Returns
+    the gradient in the rotated frame, ``(P, pdim)``.
     """
     if not losses_3d.shape[1] == 2 * pdim:
         raise ValueError(f"FD gradient needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}")
@@ -51,44 +51,87 @@ def extract_fd_hessian_diag(
     probe_radius: float,
     pdim: int,
 ) -> torch.Tensor:
-    """Extract diagonal Hessian from orthoplex cost evaluations.
+    """Regress the symmetric cost sum on s^2 over orthoplex probe scales.
 
-    Uses the symmetry property of the quadratic model:
         L(+s) + L(-s) = 2*L(0) + H_ii * s^2
-    Regresses the symmetric sum on s^2 to estimate H_ii.
 
-    Args:
-        losses_3d: Loss values of shape (P, V, K) where V = 2*pdim.
-        scales: Probe scale factors of shape (K,).
-        probe_radius: Probe distance multiplier.
-        pdim: Particle dimension.
+    What comes back is the least-squares slope of the loss's even part across the probe
+    scales, which equals the diagonal Hessian only where the loss is locally quadratic.
+    On a piecewise-constant objective it is a secant slope and can be negative where the
+    true local curvature is zero; ``compute_newton_step`` floors it, so the step stays
+    non-ascent but its size is set by ``hessian_reg``, not by real curvature.
 
-    Returns:
-        Diagonal Hessian in rotated frame of shape (P, pdim).
+    The regression runs on the unit-radius scales and the slope is divided by
+    ``probe_radius**2`` afterwards. Regressing on the absolute offsets instead puts
+    ``probe_radius**4`` in the denominator, which falls under the guard below once
+    epsilon anneals: at ``probe_radius=2e-3`` the estimate collapsed to 0.9% of the
+    true curvature.
+
+    Non-finite regressions return zero curvature rather than NaN, so an overflowed
+    denominator cannot reach ``state.X``.
+
+    Shapes match :func:`extract_fd_gradient`.
     """
     if not losses_3d.shape[1] == 2 * pdim:
         raise ValueError(f"FD Hessian needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}")
     fwd = losses_3d[:, :pdim, :]  # (P, pdim, K)
     bwd = losses_3d[:, pdim:, :]  # (P, pdim, K)
 
-    # Symmetric sum: L(+s) + L(-s) = 2a + H*s^2
+    # Symmetric sum: L(+s) + L(-s) = 2a + H*(s*r)^2
     sym_sum = fwd + bwd  # (P, pdim, K)
 
-    s_sq = (scales * probe_radius) ** 2  # (K,)
+    s_sq = scales**2  # (K,), O(1) regardless of probe_radius
 
-    # Linear regression of sym_sum on s_sq to get slope = H
-    # Center for numerical stability
-    s_sq_mean = s_sq.mean()
-    sym_mean = sym_sum.mean(dim=-1, keepdim=True)  # (P, pdim, 1)
+    # Least-squares slope of sym_sum on s_sq, centered for stability.
+    s_centered = s_sq - s_sq.mean()  # (K,)
+    y_centered = sym_sum - sym_sum.mean(dim=-1, keepdim=True)  # (P, pdim, K)
 
-    s_centered = s_sq - s_sq_mean  # (K,)
-    y_centered = sym_sum - sym_mean  # (P, pdim, K)
-
-    # slope = sum(s_centered * y_centered) / sum(s_centered^2)
     numerator = (s_centered.unsqueeze(0).unsqueeze(0) * y_centered).sum(dim=-1)  # (P, pdim)
     denominator = (s_centered**2).sum().clamp(min=1e-10)
+    # Slope is in units of s^2; convert to units of (s*r)^2.
+    curvature = numerator / denominator / max(probe_radius**2, 1e-30)  # (P, pdim)
+    return torch.where(torch.isfinite(curvature), curvature, torch.zeros_like(curvature))
 
-    return numerator / denominator  # (P, pdim) = Hessian diagonal
+
+def extract_fd_hessian_diag_centered(
+    losses_3d: torch.Tensor,
+    scales: torch.Tensor,
+    probe_radius: float,
+    pdim: int,
+    center_loss: torch.Tensor,
+) -> torch.Tensor:
+    """Diagonal Hessian from one probe scale plus a shared centre evaluation.
+
+        H_ii = (L(+s) + L(-s) - 2 L(0)) / (s*r)^2
+
+    The regression above needs ``K >= 2`` scales per vertex; this needs one, plus a
+    single ``L(0)`` per particle that every coordinate shares. On the orthoplex that
+    turns ``P*V*K`` candidate evaluations into ``P*V + P``.
+
+    ``center_loss`` is ``(P,)``. Averaged over ``K`` when more than one scale is given.
+    """
+    if not losses_3d.shape[1] == 2 * pdim:
+        raise ValueError(f"FD Hessian needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}")
+    fwd = losses_3d[:, :pdim, :]  # (P, pdim, K)
+    bwd = losses_3d[:, pdim:, :]
+
+    second_diff = fwd + bwd - 2.0 * center_loss.reshape(-1, 1, 1)  # (P, pdim, K)
+    denom = (scales**2).reshape(1, 1, -1) * max(probe_radius**2, 1e-30)
+    curvature = (second_diff / denom.clamp(min=1e-30)).mean(dim=-1)  # (P, pdim)
+    return torch.where(torch.isfinite(curvature), curvature, torch.zeros_like(curvature))
+
+
+def _floor_curvature(hessian_diag: torch.Tensor, hessian_reg: float) -> torch.Tensor:
+    """Raise nonpositive and near-flat curvature to ``hessian_reg``.
+
+    A floor, not ``H + reg`` and not ``|H|``: the step direction stays ``-sign(g)``
+    in every regime, so no coordinate can produce an ascent step.
+    """
+    return torch.where(
+        hessian_diag > hessian_reg,
+        hessian_diag,
+        torch.full_like(hessian_diag, hessian_reg),
+    )
 
 
 def compute_newton_step(
@@ -102,32 +145,15 @@ def compute_newton_step(
     Where curvature is above ``hessian_reg`` returns ``-g_i / H_i``; where it is at or
     below ``hessian_reg`` (small-positive or nonpositive) the step falls back to a
     gradient step whose length is capped per coordinate, never an ascent step. The full
-    step is then clipped to ``max_step_norm``.
-
-    Args:
-        gradient: FD gradient of shape ``(P, pdim)``.
-        hessian_diag: Diagonal Hessian of shape ``(P, pdim)``.
-        max_step_norm: Maximum step norm (trust region bound).
-        hessian_reg: Floor applied to curvature entries at or below it.
-
-    Returns:
-        Newton step in rotated frame of shape ``(P, pdim)``.
+    step is then clipped to ``max_step_norm``. All tensors are ``(P, pdim)``.
     """
-    # Where curvature is positive use H_i directly; otherwise fall back to the
-    # regulariser so the direction stays a descent step.
-    H_safe = torch.where(
-        hessian_diag > hessian_reg,
-        hessian_diag,
-        torch.full_like(hessian_diag, hessian_reg),
-    )
-    delta = -gradient / H_safe  # (P, pdim)
+    delta = -gradient / _floor_curvature(hessian_diag, hessian_reg)  # (P, pdim)
 
     # Cap per coordinate before the global clip. A flat coordinate divides by hessian_reg,
     # giving a 1e4x step that dominates the norm, and the clip is a single rescale, so it
     # would shrink every well-conditioned coordinate by that same factor.
     delta = delta.clamp(-max_step_norm, max_step_norm)
 
-    # Clamp step norm
     norms = torch.norm(delta, dim=-1, keepdim=True).clamp(min=1e-10)
     scale = torch.clamp(max_step_norm / norms, max=1.0)
     return delta * scale
@@ -137,19 +163,19 @@ def compute_predicted_improvement(
     gradient: torch.Tensor,
     hessian_diag: torch.Tensor,
     step: torch.Tensor,
+    hessian_reg: float = 1e-4,
 ) -> torch.Tensor:
-    """Predict improvement from quadratic model: dL = g.delta + 0.5*delta.H.delta.
+    """``dL = g.delta + 0.5 * delta.H.delta`` from ``(P, pdim)`` inputs.
 
-    Args:
-        gradient: FD gradient of shape (P, pdim).
-        hessian_diag: Diagonal Hessian of shape (P, pdim).
-        step: Step vector in rotated frame of shape (P, pdim).
+    Returns ``(P,)``; negative is an improvement.
 
-    Returns:
-        Predicted loss change per particle of shape (P,). Negative = improvement.
+    Curvature is floored the same way :func:`compute_newton_step` floors it, so the
+    trust-region ratio scores the step against the model it was built from. Under raw
+    negative curvature the model rewards displacement without bound and a longer step
+    always predicts a larger gain, which is not a quantity any step minimized.
     """
     linear = (gradient * step).sum(dim=-1)
-    quadratic = 0.5 * (hessian_diag * step**2).sum(dim=-1)
+    quadratic = 0.5 * (_floor_curvature(hessian_diag, hessian_reg) * step**2).sum(dim=-1)
     return linear + quadratic
 
 
@@ -165,42 +191,32 @@ def apply_newton_refinement(
     max_step_norm: float = 1.0,
     hessian_reg: float = 1e-4,
 ) -> torch.Tensor:
-    """Apply post-OT Newton refinement using the quadratic model from probe evaluations.
+    """Blend the OT step with a Newton correction read off the probe evaluations.
 
-    After the OT barycentric projection gives a coarse update direction, this
-    function uses second-order information already available from the probe
-    evaluations to compute a Newton correction step, improving per-step
-    convergence without additional forward passes.
-
-    Steps:
-    1. Extract FD gradient and diagonal Hessian from losses_3d (rotated frame)
-    2. Compute Newton step in rotated frame: delta_rot = -g / (H + reg)
-    3. Transform Newton step to original space: delta_orig = rot_mats @ delta_rot
-    4. Newton-predicted minimum from the probe center: X_newton = X_current + delta_orig
-    5. Blend: X_refined = (1 - alpha) * X_bary + alpha * X_newton
+    The probes already carry second-order information, so the correction costs no
+    extra forward passes. The Newton step is taken in the rotated frame, mapped back,
+    anchored at ``X_current`` (the point the quadratic is built around), and blended
+    ``(1 - alpha) * X_bary + alpha * X_newton``.
 
     Args:
-        X_bary: Post-OT barycentric position, shape (P, pdim).
-        losses_3d: Probe loss values, shape (P, V, K) where V = 2*pdim.
-        scales: Probe scale factors, shape (K,).
+        X_bary: Post-OT barycentric position, ``(P, pdim)``.
+        losses_3d: Probe losses, ``(P, V, K)`` with ``V = 2*pdim``.
+        scales: Probe scale factors, ``(K,)``.
         probe_radius: Probe distance multiplier.
-        pdim: Particle dimension (number of orthoplex directions).
-        rot_mats: Rotation matrices, shape (P, pdim, pdim).
-        X_current: Probe-center position the quadratic model is built around,
-            shape (P, pdim). The Newton step is measured from here, so the
-            predicted minimum is X_current + delta_orig.
-        alpha: Blending weight. 0 = pure OT, 1 = pure Newton correction.
-        max_step_norm: Maximum Newton correction norm (trust region bound).
-        hessian_reg: Regularization for near-zero Hessian entries.
+        pdim: Particle dimension.
+        rot_mats: Rotation matrices, ``(P, pdim, pdim)``.
+        X_current: Probe center, ``(P, pdim)``. ``X_bary`` already carries the transport
+            step, so anchoring the Newton step there would double-count that move.
+        alpha: Blending weight; 0 is pure OT, 1 is pure Newton.
+        max_step_norm: Trust-region bound on the correction.
+        hessian_reg: Curvature floor for flat or nonpositive coordinates.
 
     Returns:
-        Refined position of shape (P, pdim).
+        Refined position, ``(P, pdim)``.
     """
-    # Extract gradient and Hessian in rotated frame
     gradient = extract_fd_gradient(losses_3d, scales, probe_radius, pdim)
     hessian_diag = extract_fd_hessian_diag(losses_3d, scales, probe_radius, pdim)
 
-    # Compute Newton step in rotated frame
     delta_rot = compute_newton_step(
         gradient,
         hessian_diag,
@@ -212,22 +228,15 @@ def apply_newton_refinement(
     # rot_mats: (P, pdim, pdim), delta_rot: (P, pdim)
     delta_orig = torch.einsum("bij,bj->bi", rot_mats, delta_rot)
 
-    # Newton-predicted minimum, anchored at the probe center X_current (the
-    # point the quadratic is built around). X_bary already carries the transport
-    # step, so anchoring the Newton step there would double-count that move.
-    X_newton = X_current + delta_orig
+    X_refined = (1.0 - alpha) * X_bary + alpha * (X_current + delta_orig)
 
-    # Blend the OT result with the Newton prediction
-    X_refined = (1.0 - alpha) * X_bary + alpha * X_newton
-
-    # Descent gate: keep the blend only where the quadratic model predicts it
-    # is no worse than the pure-OT step, else fall back to X_bary. The model is
-    # diagonal in the rotated frame, so measure both steps there from X_current.
+    # Keep the blend only where the model predicts it is no worse than the pure-OT
+    # step. The model is diagonal in the rotated frame, so score both steps there.
     rot_mats_t = rot_mats.transpose(-1, -2)
     ot_rot = torch.einsum("bij,bj->bi", rot_mats_t, X_bary - X_current)
     refined_rot = torch.einsum("bij,bj->bi", rot_mats_t, X_refined - X_current)
-    pred_ot = (gradient * ot_rot + 0.5 * hessian_diag * ot_rot**2).sum(dim=-1)
-    pred_refined = (gradient * refined_rot + 0.5 * hessian_diag * refined_rot**2).sum(dim=-1)
+    pred_ot = compute_predicted_improvement(gradient, hessian_diag, ot_rot, hessian_reg)
+    pred_refined = compute_predicted_improvement(gradient, hessian_diag, refined_rot, hessian_reg)
     accept = (pred_refined <= pred_ot).unsqueeze(-1)
     return torch.where(accept, X_refined, X_bary)
 
@@ -274,9 +283,12 @@ def update_trust_region(
     # Clamp ratio to prevent extreme updates from noisy estimates
     ratio = max(-2.0, min(ratio, 5.0))
 
-    # Negative ratio: actual went opposite direction from prediction - aggressive shrink
+    # Model and reality disagree in sign. Shrink twice as hard only when the model
+    # promised a gain and the loss rose; the reverse case still improved the loss, so
+    # it takes the ordinary shrink.
     if ratio < 0:
-        return max(current_radius * shrink_factor * 0.5, min_radius)
+        factor = shrink_factor * 0.5 if pred < 0 else shrink_factor
+        return max(current_radius * factor, min_radius)
 
     # Only expand when the model predicted an improvement (pred < 0) and reality
     # matched it. An accurate but worsening step (pred > 0, actual > 0) also gives

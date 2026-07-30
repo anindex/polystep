@@ -62,7 +62,7 @@ def resolve_cost_scale(
     and later multiply back without a host sync. ``None`` resolves to 1.
 
     The data-dependent modes ('mean', 'max_cost') are *not* shift-invariant, so
-    callers must recenter with :func:`~polystep.solvers._prelude.recenter_cost`
+    callers must recenter with :func:`~polystep.solvers._shared.recenter_cost`
     first. Otherwise adding a constant to every cost changes the divisor, hence
     the effective temperature, and the entropic plan moves: even though the
     plan is mathematically invariant to that shift.

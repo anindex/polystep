@@ -9,19 +9,30 @@ import torch
 import torch.nn as nn
 
 
-class DiscreteMLPPolicy(nn.Module):
-    """MLP policy for discrete-action direct policy search."""
+class DiscreteMLPPolicy(nn.Sequential):
+    """MLP policy for discrete-action direct policy search.
+
+    An ``nn.Sequential`` subclass rather than a wrapper around one: the batched and
+    delta evaluators require ``type(model).forward is nn.Sequential.forward``, and a
+    one-line ``forward`` that just calls ``self.net`` fails that check and sends every
+    candidate through vmap. The ``OrderedDict`` keeps the ``net.*`` state_dict keys.
+    """
 
     def __init__(self, obs_dim: int, hidden: int, action_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, action_dim),
+        super().__init__(
+            OrderedDict(
+                [
+                    (
+                        "net",
+                        nn.Sequential(
+                            nn.Linear(obs_dim, hidden),
+                            nn.Tanh(),
+                            nn.Linear(hidden, action_dim),
+                        ),
+                    )
+                ]
+            )
         )
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
 
 
 def _quantize_int8_per_tensor(x: torch.Tensor) -> torch.Tensor:
@@ -29,7 +40,7 @@ def _quantize_int8_per_tensor(x: torch.Tensor) -> torch.Tensor:
 
     Forward: ``q = round(x / scale) * scale`` where ``scale = max|x| / 127``.
     The ``round`` op has zero gradient (PyTorch returns 0), so backprop through
-    this layer produces a degenerate signal - exactly what we want to expose as
+    this layer produces a degenerate signal, which is what this exposes as
     a failure mode for PPO/DQN.
     """
 
@@ -64,6 +75,10 @@ class NonDiffActivation(nn.Module):
         if mode not in {"float32", "int8", "binary"}:
             raise ValueError(f"NonDiffActivation mode must be float32/int8/binary; got {mode!r}")
         self.mode = mode
+        # sign() and identity are coordinatewise, so the batched evaluators can carry a
+        # delta through them. int8 scales by the whole tensor's amax, which couples
+        # every output to every input, and must stay on the vmap path.
+        self.polystep_elementwise = mode != "int8"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.mode == "float32":
@@ -74,7 +89,7 @@ class NonDiffActivation(nn.Module):
         return torch.sign(x)
 
 
-class NonDiffMLPPolicy(nn.Module):
+class NonDiffMLPPolicy(nn.Sequential):
     """Discrete-action MLP policy with a non-differentiable activation layer.
 
     Topology: ``Linear(obs_dim, hidden) -> NonDiffActivation(mode) -> Linear(hidden, action_dim)``.
@@ -83,19 +98,29 @@ class NonDiffMLPPolicy(nn.Module):
     being replaced by a non-diff op. PolyStep treats the policy as a black box
     and is unaffected; gradient methods (PPO, DQN) collapse because no useful
     gradient flows through the non-diff op (no STE).
+
+    Subclasses ``nn.Sequential`` for the reason :class:`DiscreteMLPPolicy` does. The
+    ``net`` child stays because the parameters are addressed as ``net.0.weight`` in
+    ``gym_evaluator._batched_mlp_logits``; ``try_build`` walks one level of nesting.
     """
 
     def __init__(self, obs_dim: int, hidden: int, action_dim: int, *, mode: str = "binary"):
-        super().__init__()
-        self.mode = str(mode).lower()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
-            NonDiffActivation(self.mode),
-            nn.Linear(hidden, action_dim),
+        mode = str(mode).lower()
+        super().__init__(
+            OrderedDict(
+                [
+                    (
+                        "net",
+                        nn.Sequential(
+                            nn.Linear(obs_dim, hidden),
+                            NonDiffActivation(mode),
+                            nn.Linear(hidden, action_dim),
+                        ),
+                    )
+                ]
+            )
         )
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
+        self.mode = mode
 
 
 def stack_module_params(

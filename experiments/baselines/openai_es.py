@@ -187,14 +187,14 @@ def train_openai_es(
 
     with track_gpu_memory() as mem:
         for gen in range(1, generations + 1):
-            # --- 1. Sample noise vectors on CPU ---
+            # 1. Sample noise vectors on CPU
             if antithetic:
                 epsilon[:half].normal_()
                 epsilon[half:].copy_(epsilon[:half]).neg_()
             else:
                 epsilon.normal_()
 
-            # --- 2. Evaluate each perturbation on the SAME batch ---
+            # 2. Evaluate each perturbation on the SAME batch
             # Using one batch per generation ensures the gradient estimate
             # reflects perturbation quality, not batch variance
             batch = get_batch()
@@ -211,29 +211,29 @@ def train_openai_es(
                 # Negate loss: lower loss = higher reward for fitness shaping
                 rewards[i] = -loss_val
 
-            # --- 3. Fitness shaping ---
+            # 3. Fitness shaping
             if fitness_shaping == "rank":
                 shaped_rewards = _rank_fitness_shaping(rewards)
             else:
                 shaped_rewards = _fitness_shaping(rewards)
 
-            # --- 4. Gradient estimate ---
+            # 4. Gradient estimate
             # g = (1 / (pop * sigma)) * epsilon^T @ shaped_rewards
             # epsilon: (pop, n_params), shaped_rewards: (pop,)
             grad = (1.0 / (population_size * sigma)) * (epsilon.t() @ shaped_rewards).to(device)
 
-            # --- 5. Update params (gradient ascent on reward = descent on loss) ---
+            # 5. Update params (gradient ascent on reward = descent on loss)
             current_lr = lr * (1.0 - gen / generations) if lr_decay else lr
             params.add_(grad, alpha=current_lr)
 
-            # --- 5b. L2 weight decay (Salimans et al. 2017) ---
+            # 5b. L2 weight decay (Salimans et al. 2017)
             if weight_decay > 0:
                 params.mul_(1.0 - current_lr * weight_decay)
 
             # Restore current best params to model
             set_flat_params(model, params)
 
-            # --- Logging ---
+            # Logging
             if gen % log_interval == 0 or gen == generations:
                 elapsed = time.time() - start_time
                 log_entry = {

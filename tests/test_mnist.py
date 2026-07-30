@@ -4,10 +4,9 @@ Real-dataset validation for every subspace mode. These are ``slow``-marked becau
 download MNIST and train for multiple epochs; the fast, network-free learning check that
 runs in CI is ``tests/test_end_to_end_learning.py``.
 
-MNIST loaders live in ``conftest.py`` as the ``mnist_loaders`` factory fixture; this file
-previously carried three copies of the download and IDX-parsing code.
+MNIST loaders live in ``conftest.py`` as the ``mnist_loaders`` factory fixture.
 
-Model size note: the optimizer reshapes parameters to ``(num_particles, particle_dim)``,
+Model size: the optimizer reshapes parameters to ``(num_particles, particle_dim)``,
 so each OT problem has ``2 * particle_dim`` vertices per particle and costs ``P * V * K``
 model evaluations per step. Downsampling the images to 7x7 keeps that tractable on CPU.
 """
@@ -15,6 +14,8 @@ model evaluations per step. Downsampling the images to 7x7 keeps that tractable 
 from __future__ import annotations
 
 import pytest
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 
@@ -26,32 +27,43 @@ from polystep.subspace import LinearSubspace, LowRankSubspace
 from polystep.transform import ParamLayout
 
 
-class SmallMNISTNet(nn.Module):
-    """7x7 input, 16 hidden: 49*16+16 + 16*10+10 = 970 params."""
+class SmallMNISTNet(nn.Sequential):
+    """7x7 input, 16 hidden: 49*16+16 + 16*10+10 = 970 params.
+
+    An ``nn.Sequential`` subclass, not a plain ``nn.Module``: every batched
+    evaluator checks ``type(model).forward is nn.Sequential.forward`` before it will
+    build a plan, so an identical hand-written ``forward`` silently opts the model out
+    of the bmm and subspace-delta paths. The ``OrderedDict`` keeps the ``fc1``/``fc2``
+    state_dict keys.
+    """
 
     def __init__(self, input_dim: int = 49, hidden: int = 16):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(input_dim, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden, 10)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", nn.Linear(input_dim, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", nn.Linear(hidden, 10)),
+                ]
+            )
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.relu(self.fc1(self.flatten(x))))
 
-
-class SmallMLP(nn.Module):
+class SmallMLP(nn.Sequential):
     """Full 28x28 input, 64 hidden: 50890 params. Used for the subspace tests."""
 
     def __init__(self, hidden: int = 64):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(784, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden, 10)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.relu(self.fc1(self.flatten(x))))
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", nn.Linear(784, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", nn.Linear(hidden, 10)),
+                ]
+            )
+        )
 
 
 @torch.no_grad()
@@ -69,34 +81,27 @@ def _accuracy(model: nn.Module, loader, device=None) -> float:
     return correct / total if total > 0 else 0.0
 
 
+@torch.no_grad()
+def _mean_loss(model: nn.Module, loader) -> float:
+    """Mean cross-entropy over a loader, for a fixed before/after descent baseline."""
+    was_training = model.training
+    model.eval()
+    loss_fn = nn.CrossEntropyLoss(reduction="sum")
+    total_loss = total = 0.0
+    for inputs, targets in loader:
+        total_loss += loss_fn(model(inputs), targets).item()
+        total += targets.size(0)
+    if was_training:
+        model.train()
+    return total_loss / total if total > 0 else float("inf")
+
+
 class _EpochLoss(TrainCallback):
     def __init__(self):
         self.losses = []
 
     def on_epoch_end(self, metrics: dict) -> None:
         self.losses.append(metrics["avg_loss"])
-
-
-def _make_subspace(kind, model):
-    layout = ParamLayout.from_module(model)
-    if kind == "linear":
-        return LinearSubspace.from_layout(layout, rank=4)
-    if kind == "adaptive":
-        return AdaptiveSubspace.from_layout(
-            layout,
-            rank=128,
-            rotation_mode="displacement",
-            absorb_mode="periodic",
-            absorb_interval=20,
-        )
-    return HybridSubspace.from_layout(
-        layout,
-        rank=4,
-        rotation_mode="random",
-        rotation_interval=0,
-        absorb_mode="periodic",
-        absorb_interval=20,
-    )
 
 
 @pytest.mark.slow
@@ -127,18 +132,33 @@ def test_mnist_accuracy(mnist_loaders):
 
 @pytest.mark.slow
 @pytest.mark.timeout(600)
+@pytest.mark.flaky(reruns=2)
 @pytest.mark.parametrize("kind", ["linear", "adaptive", "hybrid"])
 def test_subspace_trains(mnist_loaders, kind):
-    """Each subspace mode trains: steps are taken, displacement is real, loss falls.
+    """One training run per subspace mode, checking everything that run can show.
 
-    Replaces three near-identical per-subspace copies. The loss bound is a strict
-    decrease; the previous hybrid version accepted ``last < first * 1.5``, which passes
-    on a 50% loss increase.
+    Steps are taken, displacement is real, absorb fires and moves the base, the loss
+    falls, and the mode clears an accuracy floor.
     """
-    train_loader, _ = mnist_loaders(n_train=500, n_test=200, batch_size=512)
+    train_loader, test_loader = mnist_loaders(n_train=1000, n_test=500, batch_size=512)
 
     torch.manual_seed(42)
-    model = SmallMLP(hidden=64)
+    # hidden=32 rather than 64: half the parameters converge faster per step in a fixed
+    # subspace rank, so this reaches a higher accuracy in a third of the wall clock.
+    # Do not shrink it further: at hidden=24 the linear floor fails at 26.2%.
+    model = SmallMLP(hidden=32)
+    layout = ParamLayout.from_module(model)
+    if kind == "linear":
+        subspace = LinearSubspace.from_layout(layout, rank=4)
+    elif kind == "adaptive":
+        subspace = AdaptiveSubspace.from_layout(
+            layout, rank=128, rotation_mode="displacement", absorb_mode="periodic", absorb_interval=5
+        )
+    else:
+        subspace = HybridSubspace.from_layout(
+            layout, rank=4, rotation_interval=0, absorb_mode="periodic", absorb_interval=5
+        )
+
     optimizer = PolyStepOptimizer(
         model,
         compile=False,
@@ -146,10 +166,14 @@ def test_subspace_trains(mnist_loaders, kind):
         epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
         step_radius=10.0 if kind == "adaptive" else 4.5,
         probe_radius=2.0,
-        num_probe=3,
+        # K=1 is the library default and evaluates 31,320 candidates here against 93,960
+        # at K=3, for higher accuracy on two of the three modes.
+        num_probe=1,
         sinkhorn_max_iters=50,
-        subspace=_make_subspace(kind, model),
+        subspace=subspace,
     )
+    initial_base = {k: v.clone() for k, v in optimizer.state.base_params.items()}
+    initial_loss = _mean_loss(model, train_loader)
 
     tracker = _EpochLoss()
     model = train(
@@ -165,149 +189,35 @@ def test_subspace_trains(mnist_loaders, kind):
 
     finite_disps = [d for d in optimizer.state.displacement_sqnorms if d == d]
     assert sum(finite_disps) > 0, "every displacement was zero or NaN, so no step moved"
+
     if kind != "linear":
         # LinearSubspace has a fixed projection and never rotates, so it keeps no
         # displacement history; the rotating subspaces steer their next basis with it.
         assert optimizer.state.displacement_history_count > 0, "displacement history was never populated"
+        assert optimizer.state.absorb_count > 0, (
+            f"absorb never fired in {optimizer.state.iteration_count} steps with absorb_interval=5"
+        )
+        base = optimizer.state.base_params
+        assert any(not torch.equal(initial_base[k], base[k]) for k in initial_base), (
+            "absorb_count incremented but the base weights are unchanged"
+        )
 
+    # Against the untrained model, not against epoch 1: the first epoch's average is
+    # taken over a model that is already improving, so it is a moving baseline.
     assert len(tracker.losses) >= 2
-    assert min(tracker.losses) < tracker.losses[0], f"loss never improved across epochs: {tracker.losses}"
-
-
-@pytest.mark.slow
-@pytest.mark.timeout(600)
-@pytest.mark.parametrize("kind", ["adaptive", "hybrid"])
-def test_periodic_absorb_fires_and_moves_the_base(mnist_loaders, kind):
-    """Periodic absorb folds the perturbation into the base weights.
-
-    Asserting the base actually moved, not just that a counter incremented.
-    """
-    train_loader, _ = mnist_loaders(n_train=1000, n_test=500, batch_size=512)
-
-    torch.manual_seed(42)
-    model = SmallMLP(hidden=64)
-    layout = ParamLayout.from_module(model)
-    if kind == "adaptive":
-        subspace = AdaptiveSubspace.from_layout(
-            layout, rank=128, rotation_mode="displacement", absorb_mode="periodic", absorb_interval=5
-        )
-    else:
-        subspace = HybridSubspace.from_layout(
-            layout, rank=4, rotation_interval=0, absorb_mode="periodic", absorb_interval=5
-        )
-
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=False,
-        seed=42,
-        epsilon=0.5,
-        step_radius=10.0,
-        probe_radius=2.0,
-        num_probe=3,
-        sinkhorn_max_iters=50,
-        subspace=subspace,
-    )
-    initial_base = {k: v.clone() for k, v in optimizer.state.base_params.items()}
-
-    train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=6, restore_best=False))
-
-    assert optimizer.state.absorb_count > 0, (
-        f"absorb never fired in {optimizer.state.iteration_count} steps with absorb_interval=5"
-    )
-    base = optimizer.state.base_params
-    assert any(not torch.equal(initial_base[k], base[k]) for k in initial_base), (
-        "absorb_count incremented but the base weights are unchanged"
+    final_loss = _mean_loss(model, train_loader)
+    assert final_loss < initial_loss, (
+        f"train loss did not fall: {initial_loss:.4f} -> {final_loss:.4f} (epochs: {tracker.losses})"
     )
 
-
-@pytest.mark.slow
-@pytest.mark.timeout(900)
-@pytest.mark.flaky(reruns=2)
-def test_hybrid_reaches_a_useful_accuracy(mnist_loaders):
-    """HybridSubspace clears 25% on 10-class MNIST.
-
-    The documented range for this configuration is 30-45%. The floors this replaces were
-    0.12 and 0.15, which are 2 and 5 points over chance.
-    """
-    train_loader, test_loader = mnist_loaders(n_train=1000, n_test=500, batch_size=512)
-
-    torch.manual_seed(42)
-    model = SmallMLP(hidden=64)
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=False,
-        seed=42,
-        epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
-        step_radius=4.5,
-        probe_radius=2.0,
-        num_probe=3,
-        sinkhorn_max_iters=50,
-        subspace=_make_subspace("hybrid", model),
-    )
-    train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=8))
-
+    # 10-class MNIST, so 10% is chance. Measured: linear 44.6%, adaptive 30.0%,
+    # hybrid 60.2%. Per-step coverage differs a lot between the families, so
+    # adaptive's global projection gets a lower floor than the per-layer ones.
+    # A floor at 2x chance would pass on a near-dead run; these sit just under
+    # the measured values instead.
+    floor = {"hybrid": 0.50, "linear": 0.32, "adaptive": 0.25}[kind]
     accuracy = _accuracy(model, test_loader)
-    assert accuracy >= 0.25, f"hybrid accuracy {accuracy * 100:.1f}% is below the 25% floor"
-
-
-@pytest.mark.slow
-@pytest.mark.timeout(1800)
-def test_adaptive_and_linear_both_reach_the_accuracy_target(mnist_loaders):
-    """Both subspace families reach 20% within the budget, and report steps-to-target.
-
-    Per-step coverage differs a lot (LinearSubspace's per-layer projections touch ~4.3%
-    of parameters per step, AdaptiveSubspace's global projection ~0.25%), so this checks
-    both arrive rather than that one arrives sooner.
-    """
-    train_loader, test_loader = mnist_loaders(n_train=1000, n_test=500, batch_size=512)
-    target_acc, epochs = 0.20, 5
-
-    class StepAccuracy(TrainCallback):
-        def __init__(self, model, loader):
-            self.model, self.loader = model, loader
-            self.steps_to_target = None
-            self._step = 0
-
-        def on_step_end(self, metrics: dict) -> bool:
-            self._step += 1
-            if self.steps_to_target is None and _accuracy(self.model, self.loader) >= target_acc:
-                self.steps_to_target = self._step
-            return False
-
-    results = {}
-    for kind, step_radius, subspace_kwargs in (
-        ("linear", 4.5, {}),
-        ("adaptive", 10.0, {"rank": 4096, "rotation_mode": "displacement", "absorb_interval": 20}),
-    ):
-        torch.manual_seed(42)
-        model = SmallMLP(hidden=64)
-        layout = ParamLayout.from_module(model)
-        if kind == "linear":
-            subspace = LinearSubspace.from_layout(layout, rank=4)
-        else:
-            subspace = AdaptiveSubspace.from_layout(layout, absorb_mode="periodic", **subspace_kwargs)
-
-        opt = PolyStepOptimizer(
-            model,
-            compile=False,
-            seed=42,
-            epsilon=0.5,
-            step_radius=step_radius,
-            probe_radius=2.0,
-            num_probe=3,
-            sinkhorn_max_iters=50,
-            subspace=subspace,
-        )
-        tracker = StepAccuracy(model, test_loader)
-        train(model, train_loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=epochs, callbacks=[tracker]))
-        final = _accuracy(model, test_loader)
-        results[kind] = (tracker.steps_to_target or (opt.state.iteration_count if final >= target_acc else None), final)
-
-    for kind, (steps, final) in results.items():
-        assert steps is not None and steps > 0, (
-            f"{kind} did not reach {target_acc * 100:.0f}% in {epochs} epochs (final {final * 100:.1f}%)"
-        )
-        assert final >= target_acc, f"{kind} final accuracy {final * 100:.1f}% fell back below target"
+    assert accuracy >= floor, f"{kind} accuracy {accuracy * 100:.1f}% is below the {floor * 100:.0f}% floor"
 
 
 @pytest.mark.gpu

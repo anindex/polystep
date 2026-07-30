@@ -38,10 +38,10 @@ Backends. ``--backend cpu_sim`` (default) uses PyTorch as the forward
 evaluator. The host loop is identical to the on-chip loop: only
 ``LoihiSpikeEvaluator.evaluate`` would change for ``--backend loihi2``.
 
-What you should see. On an RTX 5090 at the defaults, about 13 minutes:
-Stage 1 reaches ~64% clean test accuracy, which drops to ~44% under the
-shift; Stage 2 recovers it to ~55% while holding clean accuracy, a paired
-shift-recovery of about +10 pp over the frozen readout. CUDA reductions
+What you should see at the defaults:
+Stage 1 reaches ~74% clean test accuracy, which drops to ~50% under the
+shift; Stage 2 recovers it to ~61% while holding clean accuracy, a paired
+shift-recovery of about +12 pp over the frozen readout. CUDA reductions
 are non-deterministic, so expect a couple of points of run-to-run spread.
 
 Run::
@@ -62,18 +62,11 @@ from pathlib import Path
 
 import torch
 
-# On CPU, PolyStep issues many small tensor ops per step, where torch's intra-op pool
-# costs more than the arithmetic. On CUDA the forward runs on the device and pinning
-# only slows the host side, so leave torch's default there (measured 845s pinned
-# against 794s free on this example, identical accuracy). See docs/performance.md.
-_threads = os.environ.get("POLYSTEP_THREADS")
-if _threads:
-    torch.set_num_threads(int(_threads))
-elif not torch.cuda.is_available():
-    torch.set_num_threads(1)
+# One thread: PolyStep's per-step ops are small enough that torch's default pool of
+# nproc threads costs far more than it returns. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
 import torch.nn as nn
 
-# Allow running directly from a source checkout without `pip install -e .`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polystep import PolyStepOptimizer  # noqa: E402
@@ -161,11 +154,12 @@ class MnistSpikingNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[0]
         x = x.reshape(batch, -1)
+        cur1 = self.fc1(x)  # static input: same injected current at every timestep
         mem1 = torch.zeros(batch, self.hidden, device=x.device, dtype=x.dtype)
         mem2 = torch.zeros(batch, 10, device=x.device, dtype=x.dtype)
         total = torch.zeros(batch, 10, device=x.device, dtype=x.dtype)
         for _ in range(self.num_steps):
-            spk1, mem1 = self.lif1(self.fc1(x), mem1)
+            spk1, mem1 = self.lif1(cur1, mem1)
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
         return total  # (batch, 10): raw spike counts (rate code)
@@ -249,7 +243,7 @@ def make_pretrain_optimizer(
     """Stage 1 optimizer (off-chip pretrain): paper SNN config from ``run_elevation.py``.
 
     Mirrors ``PSTORCH_CONFIGS["snn"]`` exactly. Key insight from the
-    paper sweeps (see ``experiments/runners/run_elevation.py:84``):
+    paper sweeps (see ``experiments/runners/run_elevation.py``):
     *flat* epsilon / step_radius / probe_radius, ``CosineEpsilon``
     scheduling on any of them collapses SNN accuracy to 10-47%.
     """
@@ -272,10 +266,7 @@ def make_pretrain_optimizer(
         num_probe=1,
         subspace=subspace,
         chunk_size=1024,
-        amortize_steps=1,
-        biased_rotation=True,
-        anderson_depth=5,
-        adaptive_omega=True,
+        biased_rotation=True,  # orient each polytope along the previous OT displacement
         solver="softmax",
     )
 
@@ -323,10 +314,7 @@ def make_adapt_optimizer(
         num_probe=num_probe,
         subspace=subspace,
         chunk_size=1024,
-        amortize_steps=1,
         biased_rotation=True,
-        anderson_depth=5,
-        adaptive_omega=True,
         solver="softmax",
     )
 
@@ -373,11 +361,11 @@ def train_loop(
     """Per-batch PolyStep updates with best-test early stopping.
 
     ``mixed_shift=True`` concatenates each batch with a shifted copy of
-    itself (half clean, half ``+ N(0, sigma^2)``). This is the standard
-    online-adaptation safeguard against catastrophic forgetting of the
-    in-distribution manifold while recovering on the shifted one --
-    important for *continuous* on-chip adaptation where the deployed
-    model must keep performing well when the shift weakens or vanishes.
+    itself (half clean, half ``+ N(0, sigma^2)``), the standard
+    online-adaptation safeguard against forgetting the in-distribution
+    manifold while recovering on the shifted one. It matters for
+    continuous on-chip adaptation, where the deployed model has to keep
+    performing when the shift weakens or vanishes.
 
     Returns ``(best_acc, best_state_dict)``. The model's parameters are
     restored to ``best_state_dict`` before return, so the caller never
@@ -403,6 +391,10 @@ def train_loop(
             def closure(stacked_params, _x=x, _y=y):
                 return evaluator.evaluate(stacked_params, _x, _y)
 
+            # No register_evaluator: the site-aware path batches one
+            # parameter and shares the rest, but this net's forward is a loop over
+            # timesteps, so vmapping it per site costs more than the materializing path
+            # it replaces.
             optimizer.step(closure)
             last_x, last_y = x, y
             step += 1
@@ -513,9 +505,7 @@ def _save_visualization(
         wspace=0.16,
     )
 
-    # ============================================================
     # Panel (a): clean vs. shifted MNIST inputs
-    # ============================================================
     ax_left = fig.add_subplot(gs_outer[0])
     ax_left.axis("off")
     ax_left.set_title(
@@ -571,9 +561,7 @@ def _save_visualization(
                     color=color,
                 )
 
-    # ============================================================
     # Panel (b): grouped accuracy bars + recovery annotation
-    # ============================================================
     ax_bar = fig.add_subplot(gs_outer[1])
     ax_bar.set_title(
         "(b)  Accuracy recovery via on-chip PolyStep adaptation",
@@ -701,7 +689,6 @@ def _save_visualization(
         style="italic",
     )
 
-    # Suptitle
     fig.suptitle(
         "PolyStep -> Loihi 2 (skeleton):  spiking MNIST + on-chip readout adaptation",
         fontsize=13,
@@ -805,7 +792,7 @@ def main():
     init_clean = evaluate(model, test_loader, device)
     print(f"  init test acc (clean): {100 * init_clean:.1f}%")
 
-    # ----- Stage 1: off-chip pretrain (clean MNIST) -----
+    # Stage 1: off-chip pretrain (clean MNIST)
     print()
     print("Stage 1: off-chip PolyStep pretrain (paper SNN config)")
     print("-" * 70)
@@ -840,7 +827,7 @@ def main():
     # Snapshot the Stage 1 best for the frozen-readout baseline.
     pretrained_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-    # ----- Stage 2: 'on-chip' readout + LIF Var adaptation -----
+    # Stage 2: 'on-chip' readout + LIF Var adaptation
     print()
     print(f"Stage 2: 'on-chip' readout + LIF Var adaptation (shift sigma={args.shift_sigma})")
     print("-" * 70)
@@ -899,7 +886,6 @@ def main():
         noise_seed=args.seed,
     )
 
-    # ----- Report -----
     print()
     print("=" * 70)
     print("  Results")

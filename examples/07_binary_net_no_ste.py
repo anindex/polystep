@@ -18,14 +18,19 @@ Run:
 from __future__ import annotations
 
 import os
+import sys
 import torch
 
-# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
-# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
-# Set POLYSTEP_THREADS to override. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
+# Eight threads, not the one every other example pins: the cost here is this file's own
+# objective, sign() over a (258, 400, 32) activation, which is wide enough for the pool
+# to pay for itself at an unchanged accuracy. Capped below nproc, where it collapses.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or min(8, os.cpu_count() or 1))
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from polystep import PolyStepES
+
+from _openai_es import OpenAIES, run  # noqa: E402
 
 HIDDEN = 32
 GENERATIONS = 200
@@ -78,39 +83,6 @@ def error_rate(flat, X, y, hidden=HIDDEN):
     h = torch.sign(torch.einsum("bhi,ni->bnh", W1, X) + b1[:, None, :])  # (B, N, H)
     out = torch.einsum("boh,bnh->bno", W2, h).squeeze(-1) + b2  # (B, N)
     return ((out > 0).float() != y[None, :]).float().mean(dim=1)
-
-
-class OpenAIES:
-    """OpenAI-ES ask/tell (Salimans et al., 2017): antithetic sampling, z-score
-    fitness shaping, gradient estimate g = (1/(pop*sigma)) * sum(shaped * eps)."""
-
-    def __init__(self, dim, popsize, x0, sigma=0.5, lr=0.2, seed=0):
-        self.dim = dim
-        self.popsize = popsize + (popsize % 2)  # even, for antithetic pairs
-        self.sigma = sigma
-        self.lr = lr
-        self.mean = x0.clone()
-        self.generator = torch.Generator().manual_seed(seed)
-        self._eps = None
-        self.best_fitness = float("inf")
-
-    def ask(self):
-        half = torch.randn(self.popsize // 2, self.dim, generator=self.generator)
-        self._eps = torch.cat([half, -half], dim=0)
-        return self.mean.unsqueeze(0) + self.sigma * self._eps
-
-    def tell(self, fitness):
-        self.best_fitness = min(self.best_fitness, fitness.min().item())
-        adv = (fitness - fitness.mean()) / (fitness.std() + 1e-8)
-        self.mean = self.mean - self.lr * (self._eps * adv.unsqueeze(1)).mean(dim=0) / self.sigma
-
-
-def run(opt, fit_fn, generations):
-    curve = []
-    for _ in range(generations):
-        opt.tell(fit_fn(opt.ask()))
-        curve.append(100.0 * (1.0 - opt.best_fitness))  # best accuracy so far
-    return curve
 
 
 def solve_task(name, X, y):

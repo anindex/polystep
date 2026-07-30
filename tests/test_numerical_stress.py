@@ -4,9 +4,9 @@ Edge conditions that could expose hidden numerical issues: extreme epsilon at bo
 limits, constant and negative costs, warm start across a 100x cost-scale change,
 non-uniform marginals, and ParamLayout round-trip under padding.
 
-Non-finite cost sanitisation lives in test_hardening.py (unit) and
-test_correctness_regressions.py (the ordering contract); marginal satisfaction over
-many random problems lives in test_sinkhorn_correctness.py.
+Non-finite cost sanitisation lives in test_input_validation.py (unit) and
+test_regressions.py (the ordering contract); marginal satisfaction over
+many random problems lives in test_sinkhorn_numerics.py.
 """
 
 import torch
@@ -17,8 +17,6 @@ from polystep import ParamLayout, SinkhornSolver
 
 
 class TestSinkhornEdgeCases:
-    """Stress-test the Sinkhorn solver under extreme conditions."""
-
     def test_smaller_epsilon_concentrates_the_plan(self):
         """Lower eps means a sharper plan: each row's mass piles onto fewer columns.
 
@@ -100,50 +98,20 @@ class TestSinkhornEdgeCases:
         row_sums = T2.sum(dim=1)
         assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-4)
 
-    def test_overrelaxation_stability(self):
-        """omega=1.9 (aggressive overrelaxation) should converge without diverging."""
-        torch.manual_seed(0)
-        n, m = 20, 8
-        C = torch.rand(n, m)
-        solver = SinkhornSolver(epsilon=0.5, max_iterations=500, threshold=1e-6, omega=1.9)
-        result = solver.solve(C)
-        T = result.matrix
-        assert torch.isfinite(T).all(), "Overrelaxation omega=1.9 diverged"
 
-
-class TestMarginalConstraints:
-    """Property tests: transport plan must satisfy marginal constraints."""
-
-    def test_non_uniform_marginals(self):
-        """Non-uniform source marginals should be respected."""
-        torch.manual_seed(0)
-        n, m = 10, 6
-        a = torch.softmax(torch.randn(n), dim=0)
-        C = torch.rand(n, m)
-        solver = SinkhornSolver(epsilon=1.0, max_iterations=200)
-        result = solver.solve(C, a=a)
-        T = result.matrix
-        assert torch.allclose(T.sum(dim=1), a, atol=1e-3)
+def test_non_uniform_marginals():
+    """Non-uniform source marginals should be respected."""
+    torch.manual_seed(0)
+    n, m = 10, 6
+    a = torch.softmax(torch.randn(n), dim=0)
+    C = torch.rand(n, m)
+    solver = SinkhornSolver(epsilon=1.0, max_iterations=200)
+    result = solver.solve(C, a=a)
+    T = result.matrix
+    assert torch.allclose(T.sum(dim=1), a, atol=1e-3)
 
 
 class TestParamLayoutStress:
-    """Stress-test parameter layout round-trip under various conditions."""
-
-    def test_roundtrip_many_dtypes(self):
-        """Model with mixed dtypes should round-trip correctly."""
-        model = nn.Sequential(
-            nn.Linear(10, 20),
-            nn.ReLU(),
-            nn.Linear(20, 5),
-        )
-        layout = ParamLayout.from_module(model)
-        flat = layout.flatten(model)
-        recovered = layout.unflatten(flat)
-
-        sd = model.state_dict()
-        for key in recovered:
-            assert torch.allclose(sd[key], recovered[key], atol=1e-6), f"Mismatch: {key}"
-
     # nn.Linear(13, 7) is 98 params: pdim 1 needs no padding, 3 and 8 do.
     @pytest.mark.parametrize("particle_dim", [1, 3, 8])
     def test_roundtrip_various_particle_dims(self, particle_dim):

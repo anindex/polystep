@@ -13,8 +13,29 @@ from typing import List, Optional, Union
 
 import torch
 
-from ..costs import resolve_cost_scale
-from ._prelude import align_dual, align_marginal, recenter_cost, sanitize_cost, validate_positive
+from ._shared import (
+    align_dual,
+    align_marginal,
+    exp_plan,
+    prepare_cost,
+    validate_positive,
+    warn_tiny_temperature,
+)
+
+
+def _warn_dual_reset() -> None:
+    """Announce that the duals went non-finite and were reset.
+
+    ``converged=False`` was the only signal, and ``.matrix`` still returns a
+    plausible-looking ``exp(-C/eps)`` whose rows do not sum to ``a``. The
+    integrated path renormalizes and survives; a direct caller does not.
+    """
+    warnings.warn(
+        "Sinkhorn duals went non-finite and were reset to zero. The returned plan is "
+        "exp(-C/eps) and does not satisfy the marginals; check `converged` before use. "
+        "A smaller epsilon or a larger cost scale usually triggers this.",
+        stacklevel=3,
+    )
 
 
 @dataclass
@@ -52,8 +73,7 @@ class SinkhornResult:
     @functools.cached_property
     def matrix(self) -> torch.Tensor:
         """Transport plan, computed lazily: P_ij = exp((f_i + g_j - C_ij) / eps)."""
-        log_P = (self.f.unsqueeze(1) + self.g.unsqueeze(0) - self._cost_matrix) / self._eps
-        return torch.exp(log_P)
+        return exp_plan(self.f, self.g, self._cost_matrix, self._eps)
 
     @functools.cached_property
     def ent_reg_cost(self) -> float:
@@ -146,27 +166,23 @@ class SinkhornSolver:
     ) -> SinkhornResult:
         """Solve entropic OT problem.
 
-        Solves: min_P <C, P> + eps * KL(P || a x b)
+        Solves: min_P <C, P> + eps * sum_ij P_ij (log P_ij - 1)
         s.t.  P 1 = a,  P^T 1 = b,  P >= 0
 
+        The negative-entropy form, which is what ``ent_reg_cost`` reports. Under the
+        marginal constraints it has the same argmin as the KL(P || a x b) form, but a
+        different value.
+
+        Arguments are :meth:`Solver.solve`'s, plus:
+
         Args:
-            cost_matrix: Cost matrix C of shape (n, m).
-            a: Source marginal of shape (n,). Defaults to uniform 1/n.
-            b: Target marginal of shape (m,). Defaults to uniform 1/m.
-            init_f: Warm-start first dual potential of shape (n,).
-            init_g: Warm-start second dual potential of shape (m,).
-            scale_cost: Cost scaling: 'mean', 'max_cost', float, or None.
-            init_eps: Epsilon under which ``init_f`` / ``init_g`` were
-                computed by a previous solve. When provided and different
-                from ``self.epsilon``, the duals are rescaled by
-                ``self.epsilon / init_eps`` (holding the log-domain scaling
-                ``u = f / eps`` fixed). This is a numerical *heuristic*, not
-                an exact warm start: entropic cost-unit potentials are not
-                homogeneous in epsilon. Benchmarks
-                (``experiments/scripts/bench_eps_rescale.py``) show it is
-                ~neutral for well-scaled costs and modestly reduces
-                non-converged solves in the large-cost / small-epsilon
-                regime, where un-rescaled duals risk ``exp`` overflow.
+            init_eps: Epsilon the warm-start duals were computed under. When it differs
+                from ``self.epsilon`` the duals are rescaled by ``self.epsilon/init_eps``,
+                holding ``u = f/eps`` fixed. A heuristic, not an exact warm start:
+                cost-unit potentials are not homogeneous in epsilon. Measured neutral for
+                well-scaled costs and fewer non-converged solves at large cost / small
+                epsilon, where un-rescaled duals risk ``exp`` overflow
+                (``experiments/scripts/bench_eps_rescale.py``).
 
         Returns:
             SinkhornResult with dual potentials and transport plan access.
@@ -199,24 +215,14 @@ class SinkhornSolver:
         init_eps: Optional[float] = None,
     ) -> SinkhornResult:
         """Full-rank log-domain Sinkhorn iterations."""
-        # Shared prelude: FP32 promotion (BF16's 7 mantissa bits collapse the
-        # log-sum-exp row-max trick past ~15 nats) + device-side non-finite
-        # cost handling (no host sync), then device/dtype-aligned marginals.
-        cost_matrix = sanitize_cost(cost_matrix)
-        n, m = cost_matrix.shape
-        if n == 0 or m == 0:
-            raise ValueError(
-                f"Sinkhorn received an empty cost matrix (shape {(n, m)}); "
-                "at least one source and target point are required."
-            )
-        device, dtype = cost_matrix.device, cost_matrix.dtype
         # Balanced Sinkhorn needs sum(a) == sum(b). Check whenever the caller gave
         # either marginal: a supplied a=[1,1] against the default unit-mass b is
-        # just as infeasible as two mismatched supplied marginals, and previously
-        # returned converged=True with row sums [0.5, 0.5]. The default
+        # just as infeasible as two mismatched supplied marginals. The default
         # a=b=None is balanced by construction, so the hot path stays sync-free.
         marginals_given = a is not None or b is not None
-        a = align_marginal(a, n, device, dtype, "a")
+        cost_matrix, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, "Sinkhorn")
+        n, m = cost_matrix.shape
+        device, dtype = cost_matrix.device, cost_matrix.dtype
         b = align_marginal(b, m, device, dtype, "b")
         if marginals_given and not torch.isclose(a.sum(), b.sum(), rtol=1e-3, atol=1e-6):
             warnings.warn(
@@ -226,16 +232,7 @@ class SinkhornSolver:
                 stacklevel=2,
             )
 
-        # Recenter to min(C)=0 BEFORE scaling. The entropic plan is invariant to a
-        # constant shift of C, but 'mean'/'max_cost' are not, so scaling first makes
-        # the effective temperature depend on the (arbitrary) absolute loss level.
-        # Recentering also keeps FP32 precision in the log-sum-exp and the
-        # exp((f+g-C)/eps) plan when |C| is much larger than eps.
-        cost_matrix, cost_shift = recenter_cost(cost_matrix)
-        # Division creates a new tensor; no clone needed. cost_scale and cost_shift
-        # are both undone in ent_reg_cost below.
-        cost_scale = resolve_cost_scale(cost_matrix, scale_cost)
-        cost_matrix = cost_matrix / cost_scale
+        warn_tiny_temperature(self, float(self.epsilon), cost_matrix, "SinkhornSolver", "epsilon")
 
         # Log kernel: log_K = -C / eps
         eps = self.epsilon
@@ -244,13 +241,12 @@ class SinkhornSolver:
         log_a = torch.log(torch.clamp(a, min=1e-30))
         log_b = torch.log(torch.clamp(b, min=1e-30))
 
-        # Initialize dual potentials with warm-start validation
         # Data-dependent initialization: set initial duals from cost matrix means
         # Only when no warm-start provided. Applied AFTER cost scaling on the scaled matrix.
         if self.data_dependent_init and init_f is None and init_g is None:
             # Closed form of the first f then g update from zero duals. The optimal
             # potentials satisfy f_i + g_j - C_ij ~ 0 where the plan carries mass, so f
-            # tracks a row softmin; the old -C.mean() put the exponent near -3C/eps.
+            # tracks a row softmin, which keeps the exponent near zero.
             f = eps * (log_a - torch.logsumexp(log_K, dim=1))
             g = eps * (log_b - torch.logsumexp(f.unsqueeze(1) / eps + log_K, dim=0))
         else:
@@ -287,17 +283,14 @@ class SinkhornSolver:
         f = torch.where(finite, f.clamp(-max_abs_dual, max_abs_dual), torch.zeros_like(f))
         g = torch.where(finite, g.clamp(-max_abs_dual, max_abs_dual), torch.zeros_like(g))
 
-        # Re-center using the only valid dual gauge ``f -> f + c, g -> g - c``,
-        # which leaves ``f_i + g_j`` (and hence the plan ``P``) unchanged. The
-        # half-difference shift balances the two potentials' magnitudes so the
-        # warm-start clamp above keeps them bounded across a long schedule.
-        # NB: independent mean subtraction (``f -= f.mean(); g -= g.mean()``)
-        # is NOT a valid gauge and perturbs the iterate under overrelaxation.
+        # Gauge f -> f + c, g -> g - c leaves f_i + g_j and the plan unchanged. The
+        # half-difference balances their magnitudes so the warm-start clamp holds over a
+        # long schedule. Independent mean subtraction is NOT a gauge and perturbs the
+        # iterate under overrelaxation.
         c = 0.5 * (g.mean() - f.mean())
         f = f + c
         g = g - c
 
-        # Determine if we should check convergence
         fixed_mode = self.threshold <= 0
 
         if fixed_mode:
@@ -327,10 +320,9 @@ class SinkhornSolver:
         # demote our log-sum-exp intermediates.
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
             if fixed_mode:
-                # Fixed-iteration path: compiled body with post-loop NaN check.
-                # Warm-started solver with well-conditioned cost matrix rarely
-                # diverges mid-iteration; checking only at the end avoids
-                # GPU-CPU sync overhead from periodic isfinite() reductions.
+                # Compiled body, NaN check after the loop: a warm-started solve on a
+                # well-conditioned cost rarely diverges mid-iteration, and a periodic
+                # isfinite() would sync every check.
                 sinkhorn_iter = self._compiled.sinkhorn_iter
                 for i in range(self.max_iterations):
                     f, g = sinkhorn_iter(f, g, log_K, log_a, log_b, eps, omega)
@@ -342,6 +334,7 @@ class SinkhornSolver:
                 if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
                     f.zero_()
                     g.zero_()
+                    _warn_dual_reset()
                 else:
                     converged = True
             else:
@@ -393,7 +386,6 @@ class SinkhornSolver:
 
                         if len(aa_history_r) >= 2:
                             k = len(aa_history_r) - 1
-                            # Build residual difference matrix
                             delta_r = torch.stack(
                                 [
                                     torch.cat(
@@ -408,10 +400,10 @@ class SinkhornSolver:
                             )  # (n+m, k)
                             current_r = torch.cat([r_f, r_g])  # (n+m,)
 
-                            # Tikhonov-regularized least squares via the augmented
-                            # system [dR; sqrt(lambda) I] alpha = [r; 0], solved by
-                            # QR (more stable than the normal equations). lambda
-                            # scales with ||dR||^2 to track conditioning.
+                            # Tikhonov-regularized least squares on the augmented
+                            # system [dR; sqrt(lambda) I] alpha = [r; 0], which is more
+                            # stable than the normal equations. lambda scales with
+                            # ||dR||^2 to track conditioning.
                             try:
                                 lam = 1e-8 * (delta_r * delta_r).sum().clamp(min=1e-30)
                                 aug_A = torch.cat(
@@ -447,12 +439,10 @@ class SinkhornSolver:
                                     combined = torch.cat([f_new, g_new]) - (delta_x + delta_r) @ alpha
                                     # Validate combined result before assigning
                                     if torch.isfinite(combined).all():
-                                        # Accept the Anderson step only when its dual
-                                        # objective beats the plain iterate and does
-                                        # not regress below the previous iterate. The
-                                        # previous-iterate check stays monotone under
-                                        # overrelaxation, where the plain SOR step is
-                                        # not. Device-side compare avoids a sync.
+                                        # Accept only when it beats the plain iterate
+                                        # and does not regress below the previous one,
+                                        # which stays monotone under overrelaxation
+                                        # where the SOR step does not.
                                         f_combined = combined[:n]
                                         g_combined = combined[n:]
                                         lyap_prev = dual_objective(f, g)
@@ -469,14 +459,10 @@ class SinkhornSolver:
                     f, g = f_new, g_new
                     n_iters = i + 1
 
-                    # Convergence and divergence check (every check_every iterations
-                    # to avoid GPU-CPU sync on every iteration). All scalar
-                    # measurements are batched into a single device->host
-                    # transfer per check to amortize the sync cost. The last
-                    # iteration is always checked, so a solve that finished inside
-                    # the budget is not reported as unconverged just because
-                    # max_iterations was not a multiple of check_every: that would
-                    # make ProgressiveEpsilon inflate epsilon after a clean solve.
+                    # Checked every check_every, with all scalars batched into one
+                    # device->host transfer. The last iteration is always checked, or a
+                    # clean solve whose budget is not a multiple of check_every reports
+                    # unconverged and ProgressiveEpsilon inflates epsilon for it.
                     if (i + 1) % self.check_every == 0 or i == self.max_iterations - 1:
                         # Divergence check
                         # One sync, not four: `or` does not short-circuit on the
@@ -484,6 +470,7 @@ class SinkhornSolver:
                         if not (torch.isfinite(f).all() & torch.isfinite(g).all()):
                             f.zero_()
                             g.zero_()
+                            _warn_dual_reset()
                             break
 
                         log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
@@ -500,14 +487,10 @@ class SinkhornSolver:
                         err_a, err_b, dual_norm_v = torch.stack([err_a_t, err_b_t, dual_norm_t]).tolist()
                         err = max(err_a, err_b)
 
-                        # Static-omega divergence detector. Lehmann et al.
-                        # 2022 give a safe range ``omega in (0, 2 - rho)``
-                        # where rho is the linearised spectral radius.
-                        # Empirically ``omega <= 1.5`` is safe on
-                        # well-conditioned C; only monitor at the aggressive
-                        # end. Require both sustained growth (>5% per check)
-                        # and three-in-a-row to avoid firing on the benign
-                        # iterate ripples that occur near the fixed point.
+                        # Lehmann et al. 2022 give omega in (0, 2 - rho); omega <= 1.5
+                        # is safe on well-conditioned C, so only monitor above it.
+                        # Sustained growth (>5%) three checks running, or this fires on
+                        # the benign ripples near the fixed point.
                         if omega > 1.5:
                             if dual_norm_v > _divergence_prev_norm * 1.05:
                                 _divergence_growth_count += 1

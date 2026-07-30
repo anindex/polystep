@@ -6,7 +6,7 @@ Tests verify that:
 3. Synchronized absorb resets all blocks and rotates global projection
 4. Memory usage is reduced compared to alternatives
 
-Note: Tests that call optimizer.step() use minimal configs (low rank,
+Tests that call optimizer.step() use minimal configs (low rank,
 few Sinkhorn iters) to keep wall-clock time under the 120s timeout.
 The sequential closure is inherently slow on CPU.
 """
@@ -77,8 +77,6 @@ def simple_closure(simple_model):
 
 
 class TestSubspaceBlockFunctions:
-    """Tests for subspace-aware block splitting functions."""
-
     def test_create_subspace_blocks_basic(self):
         """Test block creation with divisible dimensions."""
         blocks = create_subspace_blocks(subspace_dim=256, num_blocks=4, subspace_particle_dim=8)
@@ -117,10 +115,8 @@ class TestSubspaceBlockFunctions:
 
 
 class TestCombinedModeInitialization:
-    """Tests for combined subspace + blockwise optimizer initialization."""
-
-    def test_combined_mode_no_error(self, simple_model):
-        """Test that combined mode initializes without NotImplementedError."""
+    def test_combined_mode_builds_subspace_blocks(self, simple_model):
+        """Combined subspace + blockwise splits the subspace into usable blocks."""
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5)
 
         # This should NOT raise NotImplementedError anymore
@@ -131,9 +127,11 @@ class TestCombinedModeInitialization:
             epsilon=0.1,
         )
 
-        assert optimizer._subspace_blockwise is True
-        assert optimizer._subspace_blocks is not None
-        assert len(optimizer._subspace_blocks) > 0
+        # The blocks must partition the subspace coordinates exactly once, or a step
+        # would leave some coordinates unoptimized or update others twice.
+        blocks = optimizer._subspace_blocks
+        assert [b.flat_start for b in blocks] == [0] + [b.flat_end for b in blocks[:-1]]
+        assert blocks[-1].flat_end >= subspace.subspace_dim
 
     def test_rank_schedule_disabled_for_non_monolithic(self, simple_model):
         """rank_schedule only runs in the monolithic step; with a block strategy
@@ -185,8 +183,6 @@ class TestCombinedModeInitialization:
 
 @pytest.mark.timeout(180)
 class TestCombinedModeStep:
-    """Tests for combined mode step execution."""
-
     def test_step_updates_state(self, simple_model, simple_closure):
         """Test that the represented point moves after a step.
 
@@ -240,8 +236,6 @@ class TestCombinedModeStep:
 
 @pytest.mark.timeout(180)
 class TestSynchronizedAbsorb:
-    """Tests for synchronized absorb in combined mode."""
-
     def test_absorb_resets_all_coords(self, simple_model, simple_closure):
         """Test that absorb resets all block coordinates to zero."""
         subspace = AdaptiveSubspace.auto_from_params(
@@ -300,74 +294,95 @@ class TestSynchronizedAbsorb:
         assert not torch.allclose(P_before, P_after)
 
 
-class TestCMACombinedMode:
-    """Tests for CMAAdaptiveSubspace in combined mode."""
+def test_cma_combined_mode_steps(simple_model, simple_closure):
+    """CMAAdaptiveSubspace runs a combined subspace + blockwise step."""
+    cma_subspace = CMAAdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
 
-    def test_cma_combined_mode_initializes(self, simple_model):
-        """Test that CMAAdaptiveSubspace works in combined mode."""
-        cma_subspace = CMAAdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
+    optimizer = PolyStepOptimizer(
+        simple_model,
+        subspace=cma_subspace,
+        block_strategy="per_layer",
+        **_FAST_OPT_KWARGS,
+    )
 
-        optimizer = PolyStepOptimizer(
-            simple_model,
-            subspace=cma_subspace,
-            block_strategy="per_layer",
-            **_FAST_OPT_KWARGS,
-        )
+    # Construction alone proves nothing; the combined mode has to take a step that
+    # moves the model. The coordinates themselves can come back to zero, because an
+    # absorb folds them into the base and re-anchors the origin.
+    before = torch.cat([p.detach().reshape(-1) for p in simple_model.parameters()]).clone()
+    optimizer.step(simple_closure)
+    assert optimizer.state.iteration_count == 1
+    assert not torch.equal(before, torch.cat([p.detach().reshape(-1) for p in simple_model.parameters()]))
 
-        assert optimizer._subspace_blockwise is True
-        assert optimizer._cma_subspace is True
+
+@pytest.mark.parametrize("interval, expected_rotations", [(1, 6), (3, 2), (0, 0)])
+def test_global_subspace_honours_rotation_interval(simple_model, simple_closure, interval, expected_rotations):
+    """The global-subspace branch rotated every step regardless of the interval."""
+    sub = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, min_rank=8, max_rank=16)
+    sub.rotation_interval = interval
+    sub.absorb_mode = "interval"
+    sub.absorb_interval = 0
+
+    opt = PolyStepOptimizer(simple_model, subspace=sub, block_strategy="per_layer", **_FAST_OPT_KWARGS)
+
+    seen = [opt.state.projection.clone()]
+    for _ in range(6):
+        opt.step(simple_closure)
+        seen.append(opt.state.projection.clone())
+
+    changed = sum(not torch.equal(a, b) for a, b in zip(seen, seen[1:]))
+    assert changed == expected_rotations
 
 
 @pytest.mark.timeout(180)
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-class TestMemoryReduction:
-    """Tests for memory efficiency of combined mode."""
+def test_combined_mode_runs_without_hang():
+    """Smaller combined subspace+blockwise test that completes without deadlock."""
+    model = nn.Sequential(
+        nn.Linear(64, 128),
+        nn.ReLU(),
+        nn.Linear(128, 10),
+    ).cuda()
 
-    def test_combined_mode_runs_without_hang(self):
-        """Smaller combined subspace+blockwise test that completes without deadlock."""
-        model = nn.Sequential(
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10),
-        ).cuda()
+    criterion = nn.CrossEntropyLoss()
+    inputs = torch.randn(8, 64).cuda()
+    targets = torch.randint(0, 10, (8,)).cuda()
 
-        criterion = nn.CrossEntropyLoss()
-        inputs = torch.randn(8, 64).cuda()
-        targets = torch.randint(0, 10, (8,)).cuda()
+    subspace = AdaptiveSubspace.auto_from_params(model, compression_target=0.1)
 
-        subspace = AdaptiveSubspace.auto_from_params(model, compression_target=0.1)
+    optimizer = PolyStepOptimizer(
+        model,
+        subspace=subspace,
+        block_strategy="per_layer",
+        epsilon=0.1,
+        chunk_size=32,
+    )
 
-        optimizer = PolyStepOptimizer(
-            model,
-            subspace=subspace,
-            block_strategy="per_layer",
-            epsilon=0.1,
-            chunk_size=32,
-        )
+    def closure(batched_params):
+        batch_size = next(iter(batched_params.values())).shape[0]
+        losses = []
+        for i in range(batch_size):
+            params_i = {k: v[i] for k, v in batched_params.items()}
+            model.load_state_dict(params_i, strict=False)
+            out = model(inputs)
+            losses.append(criterion(out, targets))
+        return torch.stack(losses)
 
-        def closure(batched_params):
-            batch_size = next(iter(batched_params.values())).shape[0]
-            losses = []
-            for i in range(batch_size):
-                params_i = {k: v[i] for k, v in batched_params.items()}
-                model.load_state_dict(params_i, strict=False)
-                out = model(inputs)
-                losses.append(criterion(out, targets))
-            return torch.stack(losses)
-
-        # Should complete without hanging - 2 steps
-        for _ in range(2):
-            cost = optimizer.step(closure)
-            assert torch.isfinite(torch.tensor(cost)), "Cost should be finite"
+    # Should complete without hanging - 2 steps
+    for _ in range(2):
+        cost = optimizer.step(closure)
+        assert torch.isfinite(torch.tensor(cost)), "Cost should be finite"
 
 
 class TestEdgeCases:
-    """Tests for edge cases and boundary conditions."""
-
     def test_with_momentum(self, simple_model, simple_closure):
         """Test combined mode with momentum enabled."""
+        # A basis change zeroes the velocity, which is a displacement in the basis it
+        # replaces. AdaptiveSubspace rotates every step by default, so hold the basis
+        # still or there is never a second step for momentum to accumulate over.
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
+        subspace.absorb_mode = "none"
+        subspace.rotation_interval = 0
 
         optimizer = PolyStepOptimizer(
             simple_model,
@@ -390,7 +405,8 @@ class TestEdgeCases:
     def test_grouped_block_strategy_warns_and_behaves_like_per_layer(self, simple_model, simple_closure):
         """In subspace mode the blocks slice coordinates, so 'grouped' cannot group anything.
 
-        It used to be accepted silently while producing exactly the per_layer blocks.
+        It produces exactly the per_layer blocks, so accepting it silently would hide
+        that the requested grouping did not happen.
         """
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
 
@@ -416,3 +432,36 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_blockwise_keeps_the_displacement_history_in_full_space():
+    """The basis rotates every step, so subspace-coordinate history mixes frames.
+
+    Both drivers must store the full-space image under the basis in use at measurement
+    time, or the rotation SVD reads old displacements along directions never measured.
+    """
+    from torch.func import functional_call
+
+    from polystep.adaptive_subspace import AdaptiveSubspace
+    from polystep.optimizer import PolyStepOptimizer
+
+    model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
+    full_dim = sum(p.numel() for p in model.parameters())
+    sub = AdaptiveSubspace.auto_from_params(model, compression_target=0.15)
+    sub.rotation_mode = "displacement"
+    opt = PolyStepOptimizer(model, subspace=sub, block_strategy="per_layer", epsilon=0.1, seed=0, compile=False)
+    x = torch.randn(8, 16, generator=torch.Generator().manual_seed(0))
+
+    def closure(batched_params):
+        n = next(iter(batched_params.values())).shape[0]
+        return torch.stack(
+            [functional_call(model, {k: v[i] for k, v in batched_params.items()}, (x,)).pow(2).mean() for i in range(n)]
+        )
+
+    for _ in range(3):
+        opt.step(closure)
+
+    hist_full = opt.state.displacement_history_full
+    assert hist_full is not None, "block-wise step kept no full-space history"
+    assert hist_full.shape[1] == full_dim
+    assert hist_full[: opt.state.displacement_history_count].abs().sum() > 0

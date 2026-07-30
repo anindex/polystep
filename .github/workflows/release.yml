@@ -3,27 +3,39 @@ name: Publish to PyPI
 # Publishes on a GitHub Release via PyPI Trusted Publishing (OIDC), no API tokens.
 # One-time setup on PyPI: Project -> Publishing -> add a trusted publisher for
 #   owner=anindex, repo=polystep, workflow=release.yml, environment=pypi.
+#
+# Actions are pinned to a commit SHA rather than a tag: a tag is mutable, and publish
+# holds id-token: write, so a retagged action could mint an OIDC token for this project.
 
 on:
   release:
     types: [published]
 
-env:
-  # Same reason as ci.yml: the default PyPI torch drags in ~2.7 GB of nvidia-* CUDA
-  # wheels on a runner with no GPU, which is slow and crowds the disk.
-  UV_TORCH_BACKEND: cpu
-  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+permissions:
+  contents: read
 
 jobs:
-  # The matrix in ci.yml runs on push and pull_request, which does not guarantee it
-  # ever ran on the tagged commit. Re-run the gate here so a release cannot publish
-  # code that has not passed tests and lint at that exact revision. Keep the lint and
-  # test commands identical to ci.yml, or the release gate is the weaker of the two.
+  # ci.yml runs on push and pull_request, so it may never have run on the tagged
+  # commit. Re-check lint and tests at that revision before publishing. Keep both
+  # commands identical to ci.yml, or this check is the weaker of the two.
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Default PyPI torch pulls ~2.7 GB of nvidia-* wheels onto a runner with no GPU.
+      # Set per job, not workflow-wide: publish resolves nothing and holds the OIDC
+      # token, so it inherits no package-resolution settings from here.
+      UV_TORCH_BACKEND: cpu
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'pyproject.toml'
+          cache-suffix: release
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Check the tag matches the packaged version
@@ -37,33 +49,59 @@ jobs:
       - name: Check the changelog has a section for this version
         run: grep -q "^## ${GITHUB_REF_NAME#v} " CHANGELOG.md
       - name: Install
-        run: pip install -e ".[dev]"
+        run: uv pip install --system -e ".[dev]"
       - name: Lint
         run: |
-          ruff check src/polystep/ tests/ examples/ experiments/scripts/
-          ruff format --check src/polystep/ tests/ examples/ experiments/scripts/
+          ruff check .
+          ruff format --check .
       - name: Test
-        run: pytest tests/ -q -m "not slow and not gpu" --timeout=120 -n auto
+        run: pytest tests/ -q -rs -m "not slow and not gpu" --timeout=120 -n auto
 
-  publish:
+  # Separate from publish so the build backend, which runs code from the source tree,
+  # never executes in the job that can mint an OIDC token.
+  build:
     needs: verify
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write  # required for trusted publishing
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: Build sdist + wheel
         run: uv build
       - name: Check artifact metadata
-        run: uvx twine check dist/*
+        run: uvx twine check --strict dist/*
       - name: Install wheel + import smoke test
+        env:
+          UV_TORCH_BACKEND: cpu
         run: |
           uv venv
           uv pip install dist/*.whl
           .venv/bin/python -c "import polystep; from polystep import *"
       - name: Verify py.typed ships in the wheel
         run: .venv/bin/python -c "import importlib.resources, polystep; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      contents: read   # a job-level block replaces the top-level default
+      id-token: write  # required for trusted publishing
+    steps:
+      # No checkout: this job only forwards what build produced, so nothing from the
+      # source tree runs alongside the token.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

@@ -11,9 +11,9 @@ example doubles as a small reproducible test of zeroth-order policy
 search against a black-box objective.
 
 What you should see:
-  Mean episode return rises from ~10-40 (random policy) toward 200+ over
-  ~80 PolyStep steps. CartPole-v1's max return is 500; we use a reduced
-  horizon of 200 to keep the demo at a few seconds on CPU.
+  Mean episode return rises from ~10-20 (random policy) to the 200 cap
+  over 40 PolyStep steps. CartPole-v1's max return is 500; we use a
+  reduced horizon of 200 to keep the demo at a couple of seconds on CPU.
 
   After training, the script launches a Gymnasium render window to visually
   verify the trained policy (pass ``--no-render`` to skip).
@@ -37,12 +37,10 @@ from pathlib import Path
 
 import torch
 
-# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
-# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
-# Set POLYSTEP_THREADS to override. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
+# One thread: PolyStep's per-step ops are small enough that torch's default pool of
+# nproc threads costs far more than it returns. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
 
-# Allow running directly from a source checkout without `pip install -e .`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polystep import PolyStepOptimizer  # noqa: E402
@@ -102,13 +100,16 @@ def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
 def main():
     parser = argparse.ArgumentParser(description="CartPole policy search with PolyStep")
     parser.add_argument("--no-render", action="store_true", help="skip Gymnasium visualization after training")
+    # CPU by default: the rollout loop is sequential and each step is tiny, so launch
+    # overhead outweighs the device. CUDA measured slower here.
+    parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
     seed = 42
-    device = "cpu"
+    device = args.device
     target_steps = 40
     rollouts_per_candidate = 16
-    horizon = 200  # below the 500 max so the demo runs in <60s on CPU
+    horizon = 200  # below the 500 max to keep the demo quick on CPU
     eval_episodes = 32
 
     torch.manual_seed(seed)
@@ -117,7 +118,7 @@ def main():
     print("CartPole-v1 direct policy search with PolyStep")
     print("=" * 60)
 
-    policy = DiscreteMLPPolicy(obs_dim=4, hidden=16, action_dim=2)
+    policy = DiscreteMLPPolicy(obs_dim=4, hidden=16, action_dim=2).to(device)
     num_params = sum(p.numel() for p in policy.parameters())
     print(f"  policy params: {num_params}")
 

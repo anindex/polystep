@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -96,11 +95,12 @@ class TinySNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[0]
         x = x.reshape(batch, -1)
+        cur1 = self.fc1(x)  # static input: same injected current at every timestep
         mem1 = torch.zeros(batch, self.hidden, device=x.device, dtype=x.dtype)
         mem2 = torch.zeros(batch, self.num_classes, device=x.device, dtype=x.dtype)
         total = torch.zeros(batch, self.num_classes, device=x.device, dtype=x.dtype)
         for _ in range(self.num_steps):
-            spk1, mem1 = self.lif1(self.fc1(x), mem1)
+            spk1, mem1 = self.lif1(cur1, mem1)
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
         # Mean spike rate per output class in [0, 1]; multiply by OUTPUT_SCALE
@@ -116,7 +116,7 @@ def make_dataset(
     Each class is a distinct subset of "on" features; samples are noisy
     versions of the per-class template. Easy enough for the tiny network to
     learn in tens of steps yet rugged enough that the LIF non-smoothness
-    shows up in the loss landscape (which is the whole point of the GIF).
+    shows up in the loss landscape, which is what the GIF is for.
     """
     rng = torch.Generator().manual_seed(seed)
     neurons_per_class = max(1, input_dim // num_classes)
@@ -184,7 +184,7 @@ def make_optimizer(model: nn.Module, *, seed: int = 42, config: SNNDemoConfig | 
 
     Larger radii than typical NN settings (0.15 / 0.3) because the LIF
     temporal dynamics make the loss landscape rugged on the scale of a few
-    weight units. Values come from the historical ``examples/spiking_nn.py``.
+    weight units. Values are the ones the SNN examples were tuned at.
     """
     cfg = config or SNNDemoConfig()
     return PolyStepOptimizer(
@@ -202,8 +202,10 @@ def make_optimizer(model: nn.Module, *, seed: int = 42, config: SNNDemoConfig | 
 @torch.no_grad()
 def evaluate_accuracy(model: nn.Module, loader: DataLoader) -> float:
     """Classification accuracy using the ``OUTPUT_SCALE`` convention."""
+    device = next(model.parameters()).device
     correct = total = 0
     for inputs, targets in loader:
+        inputs, targets = inputs.to(device), targets.to(device)
         logits = model(inputs) * OUTPUT_SCALE
         preds = logits.argmax(dim=-1)
         correct += (preds == targets).sum().item()

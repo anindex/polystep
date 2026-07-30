@@ -219,11 +219,8 @@ class GymVectorEvaluator:
             if not active.any():
                 break
 
-        # Successes: env-specific. ``success_fn`` lets the caller supply
-        # env-aware logic; the default "survived to horizon" is appropriate
-        # for fixed-horizon balancing tasks (CartPole) and clearly wrong for
-        # goal-reaching tasks (Acrobot), which is why custom ``success_fn``
-        # is encouraged.
+        # The default "survived to horizon" suits fixed-horizon balancing (CartPole)
+        # and is wrong for goal-reaching tasks. Pass ``success_fn`` for those.
         if self.success_fn is not None:
             successes = self.success_fn(returns, lengths)
         else:

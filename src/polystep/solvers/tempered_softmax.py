@@ -11,8 +11,7 @@ from typing import Optional, Union
 
 import torch
 
-from ..costs import resolve_cost_scale
-from ._prelude import align_marginal, recenter_cost, sanitize_cost, validate_positive
+from ._shared import solve_softmax
 from .base import SolverResult
 
 
@@ -61,39 +60,5 @@ class TemperedSoftmaxSolver:
         Raises:
             ValueError: If tau <= 0.
         """
-        validate_positive(
-            self.tau,
-            "tau",
-            "tau is the temperature in softmax(-C/tau).",
-        )
-
-        P, V = cost_matrix.shape
-        cost_matrix = sanitize_cost(cost_matrix)  # FP32 promote + finite costs
-        device, dtype = cost_matrix.device, cost_matrix.dtype
-        a = align_marginal(a, P, device, dtype)
-
-        # Recenter BEFORE scaling: softmax is shift-invariant but 'mean'/'max_cost'
-        # are not. Recentering also keeps min(C)=0 so -C/tau cannot form a +inf
-        # logit at tiny tau.
-        C, cost_shift = recenter_cost(cost_matrix)
-        cost_scale = resolve_cost_scale(C, scale_cost)
-        C = C / cost_scale
-
-        # Use fixed tau (NOT self.epsilon) for the softmax. Pin inside an
-        # autocast-disabled FP32 region so an outer mixed-precision context
-        # can't downcast -C/tau before softmax subtracts the row max.
-        with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
-            W = torch.softmax(-C / self.tau, dim=-1)
-            transport = W * a.unsqueeze(-1)
-            # Undo both frame changes so the reported cost is <C_raw, transport>.
-            ent_cost = ((C * transport).sum() * cost_scale + cost_shift * a.sum()).item()
-
-        return SolverResult(
-            matrix=transport,
-            cost=ent_cost,
-            f=None,
-            g=None,
-            converged=True,
-            n_iters=1,
-            ent_reg_cost=ent_cost,
-        )
+        # tau, not self.epsilon: that is what this solver exists for.
+        return solve_softmax(self, cost_matrix, a, self.tau, scale_cost, "TemperedSoftmaxSolver", "tau")

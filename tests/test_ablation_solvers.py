@@ -10,6 +10,8 @@ import torch.nn as nn
 
 from polystep.solvers.base import SolverResult
 from polystep.solvers.greedy import MinCostGreedySolver, TopKMeanSolver
+from polystep.solvers.sinkhorn import SinkhornSolver
+from polystep.solvers.softmax import SoftmaxSolver
 from polystep.solvers.tempered_softmax import TemperedSoftmaxSolver
 
 
@@ -114,6 +116,26 @@ class TestTopKMeanSolver:
             assert (T[i] > 0).sum().item() == 2
         assert torch.allclose(T.sum(dim=1), a, atol=1e-7)
 
+    def test_masked_vertices_get_no_mass(self):
+        """sanitize_cost only guarantees a rank, which topk does not respect.
+
+        With fewer than k finite entries the penalty slots won top-k places and took
+        real mass, so the step moved toward directions marked forbidden.
+        """
+        inf = float("inf")
+        C = torch.tensor([[1.0, inf, inf, inf], [1.0, 2.0, inf, 3.0]])
+        a = torch.tensor([0.5, 0.5])
+        T = TopKMeanSolver(k=3).solve(C, a=a).matrix
+
+        assert T[0].tolist() == [0.5, 0.0, 0.0, 0.0]
+        assert T[1, 2] == 0.0
+        torch.testing.assert_close(T.sum(dim=1), a)
+
+    def test_a_fully_masked_row_keeps_its_mass(self):
+        """No feasible vertex leaves nowhere better to put the row's mass."""
+        T = TopKMeanSolver(k=2).solve(torch.full((1, 4), float("inf"))).matrix
+        assert T.sum().item() == pytest.approx(1.0)
+
     def test_k_equals_1_matches_greedy(self, cost_matrix, source_marginal):
         """TopKMean with k=1 should match greedy exactly."""
         greedy = MinCostGreedySolver()
@@ -131,6 +153,9 @@ class TestTemperedSoftmaxSolver:
         assert isinstance(result, SolverResult)
         assert result.matrix.shape == (4, 6)
         assert result.converged is True
+        # One-sided solver: the rows must carry the source marginal exactly.
+        torch.testing.assert_close(result.matrix.sum(dim=-1), source_marginal, atol=1e-6, rtol=1e-6)
+        assert (result.matrix >= 0).all()
 
     def test_uses_tau_not_epsilon(self, cost_matrix, source_marginal):
         """Output should depend on tau, not epsilon."""
@@ -147,6 +172,18 @@ class TestTemperedSoftmaxSolver:
         r1 = solver1.solve(cost_matrix, a=source_marginal)
         r2 = solver2.solve(cost_matrix, a=source_marginal)
         assert not torch.allclose(r1.matrix, r2.matrix, atol=1e-3)
+
+    def test_shifts_per_row_like_softmax(self):
+        """A row sitting far above the global minimum must not lose its spread to the
+        -C/tau division before softmax subtracts the row max."""
+        from polystep.solvers.softmax import SoftmaxSolver
+
+        # Row 1 is offset far above row 0, so a global-only recentre leaves it huge.
+        cost = torch.tensor([[0.0, 1.0], [1e4, 1e4 + 1.0]])
+        tempered = TemperedSoftmaxSolver(epsilon=0.1, tau=1.0).solve(cost).matrix
+        assert torch.isfinite(tempered).all()
+        # tau == epsilon and both are one-sided softmax, so the two must agree.
+        torch.testing.assert_close(tempered, SoftmaxSolver(epsilon=1.0).solve(cost).matrix, atol=1e-6, rtol=1e-6)
 
     def test_tau_validation(self):
         solver = TemperedSoftmaxSolver(tau=-1.0)
@@ -178,15 +215,14 @@ class TestTemperedSoftmaxSolver:
         assert torch.allclose(T, r_greedy.matrix, atol=1e-5)
 
 
-class TestShapeConsistency:
-    @pytest.mark.parametrize("P,V", [(1, 4), (10, 2), (50, 16), (100, 8)])
-    def test_various_sizes(self, P, V):
-        C = torch.rand(P, V)
-        a = torch.ones(P) / P
-        for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3), TemperedSoftmaxSolver(tau=1.0)]:
-            result = solver.solve(C, a=a)
-            assert result.matrix.shape == (P, V)
-            assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-6)
+@pytest.mark.parametrize("P,V", [(1, 4), (10, 2), (50, 16), (100, 8)])
+def test_various_sizes(P, V):
+    C = torch.rand(P, V)
+    a = torch.ones(P) / P
+    for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3), TemperedSoftmaxSolver(tau=1.0)]:
+        result = solver.solve(C, a=a)
+        assert result.matrix.shape == (P, V)
+        assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-6)
 
 
 class TestSolverSelection:
@@ -202,6 +238,7 @@ class TestSolverSelection:
             "min_cost_greedy",
             "top_k_mean",
             "tempered_softmax",
+            "kl_softmax",
         ],
     )
     def test_optimizer_accepts_solver(self, solver_name, simple_model):
@@ -225,6 +262,7 @@ class TestSolverSelection:
             MinCostGreedySolver,
             TopKMeanSolver,
             TemperedSoftmaxSolver,
+            KLSoftmaxSolver,
         )
 
         expected = {
@@ -233,6 +271,7 @@ class TestSolverSelection:
             "min_cost_greedy": MinCostGreedySolver,
             "top_k_mean": TopKMeanSolver,
             "tempered_softmax": TemperedSoftmaxSolver,
+            "kl_softmax": KLSoftmaxSolver,
         }
         assert isinstance(opt.solver, expected[solver_name])
 
@@ -241,3 +280,16 @@ class TestSolverSelection:
 
         with pytest.raises(ValueError, match="Unknown solver"):
             PolyStepOptimizer(simple_model, solver="nonexistent")
+
+
+@pytest.mark.parametrize(
+    "solver",
+    [MinCostGreedySolver(), TopKMeanSolver(k=2), SoftmaxSolver(epsilon=0.1), SinkhornSolver(epsilon=0.1)],
+    ids=["min_cost", "top_k", "softmax", "sinkhorn"],
+)
+def test_half_precision_cost_gives_a_full_precision_plan(solver):
+    """sanitize_cost promotes to fp32; every solver must report the promoted dtype."""
+    C = torch.randn(5, 8, generator=torch.Generator().manual_seed(0)).to(torch.bfloat16)
+    result = solver.solve(C)
+    assert result.matrix.dtype == torch.float32
+    assert torch.allclose(result.matrix.sum(dim=1), torch.full((5,), 0.2), atol=1e-5)

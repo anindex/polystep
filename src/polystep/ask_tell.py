@@ -38,7 +38,8 @@ class PolyStepES:
             a float divisor, or None).
         x0: Initial position(s), shape ``(dim,)`` or ``(num_particles, dim)``.
         seed: Seed for the rotation generator.
-        device, dtype: Tensor device and dtype.
+        device: Tensor device. ``None`` follows ``x0``, else CPU.
+        dtype: Tensor dtype.
     """
 
     def __init__(
@@ -51,7 +52,7 @@ class PolyStepES:
         scale_cost: Optional[Union[str, float]] = "mean",
         x0: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
-        device: Union[str, torch.device] = "cpu",
+        device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
     ):
         if dim < 1:
@@ -67,6 +68,10 @@ class PolyStepES:
         self.epsilon = epsilon
         self.step_radius = step_radius
         self.scale_cost = scale_cost
+        # Follow x0 when the caller did not say: handing a CUDA x0 to CPU internals
+        # fails later inside the step with a device-mismatch on the polytope template.
+        if device is None:
+            device = x0.device if isinstance(x0, torch.Tensor) else "cpu"
         self.device = torch.device(device)
         self.dtype = dtype
         self.solver = solver if solver is not None else SoftmaxSolver(epsilon=epsilon)
@@ -94,7 +99,6 @@ class PolyStepES:
         if X.shape[0] != num_particles:
             raise ValueError(f"x0 has {X.shape[0]} particle rows but num_particles={num_particles}.")
         self.X = X.clone()
-        self.a = torch.full((num_particles,), 1.0 / num_particles, device=self.device, dtype=dtype)
 
         self._pending: Optional[torch.Tensor] = None
         self.best_solution: Optional[torch.Tensor] = None
@@ -130,15 +134,16 @@ class PolyStepES:
             self.num_particles, self.num_vertices
         )
         self.solver.epsilon = self.epsilon
-        # Source marginal defaults to uniform 1/P inside the solver, which is
-        # exactly ``self.a``: pass None so the solver skips the (host-syncing)
-        # user-marginal validation on this per-step path.
+        # The solver defaults the source marginal to uniform 1/P, so passing None
+        # skips its host-syncing user-marginal validation on this per-step path.
         transport = self.solver.solve(cost, scale_cost=self.scale_cost).matrix
-        X_new = _barycentric_projection(transport, self.a, self._pending)
+        X_new = _barycentric_projection(transport, self._pending)
         if torch.isfinite(X_new).all():
             self.X = X_new
 
-        flat_cost = cost.reshape(-1)
+        # nan_to_num first: one NaN fitness makes torch.min return NaN and no
+        # finite candidate is ever recorded as best.
+        flat_cost = torch.nan_to_num(cost.reshape(-1), nan=float("inf"))
         fmin, idx = torch.min(flat_cost, dim=0)
         if fmin.item() < self.best_fitness:
             self.best_fitness = fmin.item()

@@ -4,6 +4,8 @@ Implements the core Sinkhorn Step algorithm that samples polytope vertices
 around particles, solves entropic OT, and updates via barycentric projection.
 """
 
+import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Union
 
@@ -11,69 +13,52 @@ import torch
 
 from ._compiled import CompiledFunctions
 from .costs import compute_cost_matrix
-from .epsilon import LinearEpsilon
+from .epsilon import feed_solver_stats, LinearEpsilon
 from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
-from .solvers import SinkhornSolver
-from .solvers._prelude import sanitize_cost
+from .solvers import SinkhornSolver, SoftmaxSolver
+from .solvers._shared import sanitize_cost, solver_health
 
 
 @dataclass
 class SolverState:
     """State of the Sinkhorn Step solver.
 
-    Attributes:
-        X: Current particle positions of shape (num_particles, dim).
-        costs: Per-iteration entropic OT costs.
-        linear_convergence: Per-iteration convergence flags.
-        displacement_sqnorms: Per-iteration mean squared displacements.
-        a: Source marginal weights.
-        iteration_count: Number of completed iterations.
-        f: Dual potential for warm-start.
-        g: Dual potential for warm-start.
-        epsilon: Current epsilon value (for diagnostics).
-        base_params: Base state_dict for subspace mode (None when unused).
-        subspace: LowRankSubspace instance for subspace mode (None when unused).
-        block_duals: Per-block dual potentials for warm-start in block-wise mode.
-            List of (f_block, g_block) tuples, one per block. None when unused.
-        velocity: Momentum velocity tensor, same shape as X. None until first momentum step.
-        stagnation_count: Consecutive iterations with small relative loss change.
-        radius_multiplier: Adaptive radius scaling factor applied to step_radius.
-        prev_loss: Previous iteration loss for stagnation detection.
-        projection: Orthonormal projection matrix for adaptive subspace mode.
-            Shape (full_dim, subspace_dim). None when not using AdaptiveSubspace.
-        displacement_history_full: Same displacements mapped to full parameter space
-            with the basis that was current when each was recorded. The basis rotates
-            between steps, so re-projecting stored subspace coordinates through the
-            latest basis would mix frames.
-        displacement_history: Rolling buffer of recent subspace displacement vectors.
-            Shape (history_size, subspace_dim). None when not using AdaptiveSubspace.
-        displacement_history_idx: Current write position in the rolling buffer.
-        displacement_history_count: Number of entries filled (0..history_size).
-        absorb_count: Total number of absorb events performed.
-        p_c: Evolution path for covariance adaptation.
-            Shape (subspace_dim,). Tracks cumulative displacement direction over
-            generations, used to update the covariance matrix. None until CMA enabled.
-        p_sigma: Evolution path for step-size adaptation.
-            Shape (subspace_dim,). Tracks cumulative step length for CSA
-            (Cumulative Step-size Adaptation). None until CMA enabled.
-        C_diag: Diagonal covariance for sep-CMA-ES.
-            Shape (subspace_dim,). Scales per-dimension search variance.
-            Full covariance would be C = diag(C_diag) in the diagonal case.
-            None until CMA enabled.
-        sigma: Global step-size controlled by CSA.
-            Replaces radius_multiplier when use_csa=True.
-        generation: CMA generation counter for hyperparameter scheduling.
-            Used in the Heaviside function computation for evolution path updates.
-        use_csa: Flag indicating CSA mode is active.
-            When True, sigma replaces the heuristic radius_multiplier.
-        prev_prev_f: Previous-previous dual potential f for dual momentum extrapolation.
-            Used with dual_momentum_beta > 0 to compute f_init = f + beta*(f - prev_prev_f).
-            None until at least 2 OT solves have completed. Reset on absorb/rotation/epsilon change.
-        prev_prev_g: Previous-previous dual potential g (matching prev_prev_f).
+    Most fields are named for what they hold. The ones below carry a convention that
+    is not readable off the name:
+
+    ``costs`` is the mean over all ``P * V`` probe vertices, not the entropic dual and
+    not the objective at any particle, so ``min(costs)`` is the best step-mean, not a
+    best-seen value. ``ess``, ``rho`` and ``evals`` are index-aligned with it.
+
+    ``ess`` is the effective sample size of the transport weights over the vertex
+    count: 1.0 means uniform weights, so the barycenter is a plain mean and the
+    entropic machinery is doing nothing at that temperature.
+
+    ``rho`` is ``||Delta|| / step_radius``, how far the barycenter moves as a
+    fraction of the polytope it came from. Solvers differ in contraction by ``1/rho``,
+    so comparing two of them without re-tuning the step size for each is invalid.
+
+    ``evals`` counts candidate evaluations actually spent, net of probe reuse and of
+    whatever the screen dropped; multiply by the batch size for sample-forwards.
+
+    ``displacement_history`` is in subspace coordinates and
+    ``displacement_history_full`` in parameter space, each entry keeping the basis it
+    was measured in: the basis rotates between steps, so re-projecting stored
+    coordinates through the current one would mix frames.
+
+    ``p_c``, ``p_sigma``, ``C_diag`` and ``generation`` are the sep-CMA-ES state,
+    ``(subspace_dim,)`` each and None until covariance adaptation is enabled.
+
+    ``prev_prev_f`` / ``prev_prev_g`` feed the dual momentum extrapolation
+    ``f_init = f + beta * (f - prev_prev_f)``. None until two OT solves have
+    completed, and reset on absorb, rotation and epsilon change.
     """
 
     X: torch.Tensor
     costs: List[float] = field(default_factory=list)
+    ess: List[float] = field(default_factory=list)
+    rho: List[float] = field(default_factory=list)
+    evals: List[int] = field(default_factory=list)
     linear_convergence: List[bool] = field(default_factory=list)
     displacement_sqnorms: List[float] = field(default_factory=list)
     a: Optional[torch.Tensor] = None
@@ -99,9 +84,7 @@ class SolverState:
     p_c: Optional[torch.Tensor] = None
     p_sigma: Optional[torch.Tensor] = None
     C_diag: Optional[torch.Tensor] = None
-    sigma: float = 1.0
     generation: int = 0
-    use_csa: bool = False
     # Dual potential momentum
     prev_prev_f: Optional[torch.Tensor] = None
     prev_prev_g: Optional[torch.Tensor] = None
@@ -113,6 +96,17 @@ class SolverState:
     trust_region_multipliers: List[float] = field(default_factory=list)
     # HybridSubspace state
     hybrid_projections: Optional[dict] = None
+
+    def record_solver_health(self, ess=None, rho=None, evals=0) -> None:
+        """Append one entry each to ess/rho/evals, keeping them aligned with ``costs``.
+
+        A step with no OT solve passes ``ess=rho=None``, carrying the last value forward.
+        """
+        self.ess.append(ess if ess is not None else (self.ess[-1] if self.ess else 0.0))
+        self.rho.append(rho if rho is not None else (self.rho[-1] if self.rho else 0.0))
+        # Rounded, not truncated: a screened step spends a fractional count and
+        # truncation loses up to one evaluation per step over a long run.
+        self.evals.append(round(evals))
 
 
 @dataclass
@@ -170,34 +164,22 @@ class PolyStep:
     scale_cost: Optional[Union[str, float]] = 1.0
     step_radius: float = 1.0
     probe_radius: float = 2.0
-    # K=1 is empirically optimal for the softmax solver and is what
-    # every runner uses; matches PolyStepOptimizer's default.
-    # Multi-probe averaging adds variance reduction that the entropic
-    # regularization already provides.
+    # K=1 matches PolyStepOptimizer's default: multi-probe averaging duplicates the
+    # variance reduction entropic regularization already gives.
     num_probe: int = 1
     max_iterations: int = 50
     min_iterations: int = 5
     threshold: float = 1e-3
     sinkhorn_max_iters: int = 2000
     chunk_size: Optional[int] = None
-    compile: bool = True
+    compile: bool = False
     subspace: Optional[object] = None
     nn_evaluator: Optional[object] = None
-    layout: Optional[object] = None
     train_inputs: Optional[object] = None
     train_targets: Optional[object] = None
-    block_strategy: str = "monolithic"
-    block_group_size: int = 2
 
     def __post_init__(self):
         """Initialize derived state: polytope template, probes, solver, compiled fns."""
-        # Validate: subspace + block-wise not yet supported together
-        if self.subspace is not None and self.block_strategy != "monolithic":
-            raise NotImplementedError(
-                "Combined subspace + block-wise mode is not yet supported. "
-                "Use subspace or block_strategy independently."
-            )
-
         if self.num_probe < 1:
             raise ValueError(
                 f"num_probe must be >= 1, got {self.num_probe}. num_probe=0 yields an "
@@ -212,27 +194,6 @@ class PolyStep:
             compile=self.compile,
         )
         self._compiled = CompiledFunctions(compile=self.compile and torch.cuda.is_available())
-
-        # Create blocks if block-wise mode
-        self._blocks = None
-        if self.block_strategy != "monolithic" and self.layout is not None:
-            from .blockwise import create_per_layer_blocks, create_grouped_blocks
-
-            if self.block_strategy == "per_layer":
-                self._blocks = create_per_layer_blocks(
-                    self.layout,
-                    particle_dim=self.layout.particle_dim,
-                )
-            elif self.block_strategy == "grouped":
-                self._blocks = create_grouped_blocks(
-                    self.layout,
-                    group_size=self.block_group_size,
-                    particle_dim=self.layout.particle_dim,
-                )
-            else:
-                raise ValueError(
-                    f"Unknown block_strategy: {self.block_strategy!r}. Use 'monolithic', 'per_layer', or 'grouped'."
-                )
 
     @classmethod
     def create(
@@ -292,15 +253,21 @@ class PolyStep:
         num_points = X_init.shape[0]
         a = torch.ones(num_points, device=X_init.device, dtype=X_init.dtype) / num_points
 
+        # One particle: the column marginal forces a uniform plan, so the step ignores
+        # the cost and the point never moves. PolyStepOptimizer swaps solvers here too.
+        if num_points == 1 and isinstance(self.sinkhorn_solver, SinkhornSolver):
+            warnings.warn(
+                "Single particle: balanced Sinkhorn yields a uniform transport plan, so "
+                "steps would ignore the cost. Using the one-sided SoftmaxSolver instead.",
+                stacklevel=2,
+            )
+            self.sinkhorn_solver = SoftmaxSolver(epsilon=self.sinkhorn_solver.epsilon)
+
         state = SolverState(X=X_init.clone(), a=a)
 
         if self.subspace is not None and base_params is not None:
             state.base_params = base_params
             state.subspace = self.subspace
-
-        # Initialize per-block dual potentials if block-wise mode
-        if self._blocks is not None:
-            state.block_duals = [(None, None) for _ in self._blocks]
 
         return state
 
@@ -353,12 +320,6 @@ class PolyStep:
         step_radius = self.step_radius * current_eps
         probe_radius = self.probe_radius * current_eps
 
-        # Block-wise mode: independent OT solve per block
-        if self._blocks is not None and self.nn_evaluator is not None:
-            return self._step_blockwise(state, generator, current_eps, step_radius, probe_radius)
-
-        # --- Monolithic mode (original path) ---
-
         # Move templates to device if needed
         polytope_verts = self.polytope_vertices.to(device=device, dtype=X.dtype)
         probes = self.probes.to(device=device, dtype=X.dtype)
@@ -386,7 +347,6 @@ class PolyStep:
             step_radius,
         )
 
-        # Compiled probe generation
         X_probe = self._compiled.compute_probe_points(
             X,
             rotated,
@@ -429,12 +389,15 @@ class PolyStep:
         self.sinkhorn_solver.epsilon = ot_epsilon
         solve_kwargs = dict(
             cost_matrix=cost_matrix,
-            a=state.a,
+            # state.a is the uniform marginal the solver builds itself from a=None.
+            # Passing it explicitly only buys align_marginal's validation, three host
+            # syncs per step, which the other call sites already skip.
+            a=None,
             init_f=state.f,
             init_g=state.g,
             scale_cost=self.scale_cost,
         )
-        if state.last_solve_eps is not None:
+        if state.last_solve_eps is not None and isinstance(self.sinkhorn_solver, SinkhornSolver):
             solve_kwargs["init_eps"] = state.last_solve_eps
         ot_result = self.sinkhorn_solver.solve(**solve_kwargs)
         state.last_solve_eps = ot_epsilon
@@ -442,9 +405,9 @@ class PolyStep:
         transport_matrix = ot_result.matrix  # (batch, num_vertices)
         X_new = self._compiled.barycentric_projection(
             transport_matrix,
-            state.a,
             X_vertices,
         )
+        ess, rho = solver_health(transport_matrix, X_new - X, step_radius)
 
         # NaN-safe state update - revert if X_new has NaN
         _nan_reverted = not torch.isfinite(X_new).all()
@@ -454,211 +417,41 @@ class PolyStep:
         disp_sqnorm = torch.mean(torch.sum((X_new - X) ** 2, dim=-1)).item()
 
         state.X = X_new
-        # Record the raw mean objective (not the OT-regularized dual) so
-        # ``min(state.costs)`` reports the best objective value, matching the
-        # integrated optimizer path (which appends the raw cost mean). The
-        # regularized dual remains available as ``ot_result.ent_reg_cost``.
+        # The raw mean objective, not the OT-regularized dual, so ``min(state.costs)``
+        # is the best objective value. The dual stays available as ``ent_reg_cost``.
         state.costs.append(cost_matrix.mean().item())
+        state.record_solver_health(ess.item(), rho.item(), X_probe[..., 0].numel())
         state.linear_convergence.append(ot_result.converged)
+        feed_solver_stats(self.epsilon, self.sinkhorn_solver, ot_result.n_iters, ot_result.converged)
         state.displacement_sqnorms.append(disp_sqnorm)
         state.iteration_count += 1
         if _nan_reverted:
             state.f = None
             state.g = None
         else:
-            state.f = ot_result.f.detach()
-            state.g = ot_result.g.detach()
+            # None on the one-particle SoftmaxSolver path, which has no duals.
+            state.f = ot_result.f.detach() if ot_result.f is not None else None
+            state.g = ot_result.g.detach() if ot_result.g is not None else None
         state.epsilon = current_eps
 
         return state
 
     @torch.inference_mode()
-    def _step_blockwise(
-        self,
-        state: SolverState,
-        generator: Optional[torch.Generator],
-        current_eps: float,
-        step_radius: float,
-        probe_radius: float,
-    ) -> SolverState:
-        """Run one block-wise Sinkhorn Step iteration.
-
-        Each block gets its own polytope sampling, cost evaluation (full model
-        forward with only the current block perturbed), independent OT solve
-        with per-block warm-started duals, and barycentric projection.
-
-        Args:
-            state: Current solver state.
-            generator: Optional random generator for reproducibility.
-            current_eps: Current epsilon value.
-            step_radius: Step radius (already scaled by epsilon).
-            probe_radius: Probe radius (already scaled by epsilon).
-
-        Returns:
-            Updated SolverState.
-        """
-        from .blockwise import split_particles, reassemble_blocks, compute_block_cost_matrix
-        from .blockwise import layout_flat_to_block_flat, blocks_to_layout_flat
-
-        X = state.X
-        device = X.device
-        blocks = self._blocks
-
-        # Convert layout-indexed flat to block-indexed before splitting.
-        total_flat_size = sum(b.flat_end - b.flat_start for b in blocks)
-        block_flat = layout_flat_to_block_flat(
-            X.reshape(-1),
-            blocks,
-            self.layout,
-        )
-        block_X_2d = block_flat.reshape(-1, X.shape[-1]) if X.dim() > 1 else block_flat
-        all_block_particles = split_particles(block_X_2d, blocks)
-
-        ent_eps = self._get_ent_epsilon(state.iteration_count)
-        ot_epsilon = ent_eps if ent_eps is not None else current_eps
-
-        updated_block_particles = []
-        new_block_duals = []
-        total_ent_cost = 0.0
-        block_cost_means: List[torch.Tensor] = []
-        all_converged = True
-        total_disp = 0.0
-        total_particles = 0
-
-        # Python loop over blocks (sequential per-block OT solves)
-        for block_idx, block in enumerate(blocks):
-            block_X = all_block_particles[block_idx]
-            block_dim = block.particle_dim
-
-            # Per-block polytope template and probes
-            block_polytope_verts = POLYTOPE_MAP[self.polytope_type](
-                block_dim,
-                device=device,
-                dtype=X.dtype,
-                radius=1.0,
-            )
-            block_probes = self.probes.to(device=device, dtype=X.dtype)
-
-            P_block = block.num_particles
-            if block_X.dim() == 1:
-                block_X = block_X.unsqueeze(0)
-
-            # Rotation matrices for this block
-            rot_mats = get_random_rotation_matrices(
-                P_block,
-                block_dim,
-                device=device,
-                dtype=X.dtype,
-                generator=generator,
-            )
-
-            # Rotate and translate
-            X_vertices, rotated = self._compiled.rotate_and_translate(
-                rot_mats,
-                block_polytope_verts,
-                block_X,
-                step_radius,
-            )
-
-            # Probe generation
-            X_probe = self._compiled.compute_probe_points(
-                block_X,
-                rotated,
-                block_probes,
-                probe_radius,
-            )
-
-            # Block cost: full forward, perturb only this block
-            cost_matrix = compute_block_cost_matrix(
-                block_idx=block_idx,
-                X_probe_block=X_probe,
-                all_block_particles=all_block_particles,
-                blocks=blocks,
-                layout=self.layout,
-                evaluator=self.nn_evaluator,
-                inputs=self.train_inputs,
-                targets=self.train_targets,
-            )
-
-            # Per-block OT solve with warm-started duals. Forward the previous
-            # epsilon so the solver can rescale the warm start when the schedule
-            # moved it, matching the monolithic path.
-            self.sinkhorn_solver.epsilon = ot_epsilon
-            init_f, init_g = state.block_duals[block_idx]
-            solve_kwargs = dict(
-                cost_matrix=cost_matrix,
-                a=torch.ones(P_block, device=device, dtype=X.dtype) / P_block,
-                init_f=init_f,
-                init_g=init_g,
-                scale_cost=self.scale_cost,
-            )
-            if state.last_solve_eps is not None:
-                solve_kwargs["init_eps"] = state.last_solve_eps
-            ot_result = self.sinkhorn_solver.solve(**solve_kwargs)
-
-            # Barycentric projection for this block
-            transport_matrix = ot_result.matrix
-            block_a = torch.ones(P_block, device=device, dtype=X.dtype) / P_block
-            X_new_block = self._compiled.barycentric_projection(
-                transport_matrix,
-                block_a,
-                X_vertices,
-            )
-
-            # Track per-block displacement
-            block_disp = torch.sum((X_new_block - block_X) ** 2, dim=-1).sum().item()
-            total_disp += block_disp
-            total_particles += P_block
-
-            updated_block_particles.append(X_new_block)
-            new_block_duals.append((ot_result.f.detach(), ot_result.g.detach()))
-            total_ent_cost += ot_result.ent_reg_cost
-            block_cost_means.append(cost_matrix.mean())
-            all_converged = all_converged and ot_result.converged
-
-        # Reassemble and convert back to layout-indexed format
-        full_flat = reassemble_blocks(updated_block_particles, blocks, total_flat_size)
-        layout_flat_new = blocks_to_layout_flat(full_flat, blocks, self.layout)
-        X_new = layout_flat_new.reshape(X.shape)
-
-        # Revert on a non-finite update, matching the monolithic path. One bad block
-        # evaluation would otherwise poison every particle and the dual warm-start chain.
-        if not torch.isfinite(X_new).all():
-            X_new = X.clone()
-            new_block_duals = [(None, None) for _ in blocks]
-            total_disp = 0.0
-
-        disp_sqnorm = total_disp / total_particles if total_particles > 0 else 0.0
-
-        state.X = X_new
-        # Raw objective mean, matching the monolithic path, so min(state.costs) means
-        # the same thing in both modes. The summed entropic dual scales with the block
-        # count and drifts with the epsilon schedule at a fixed objective.
-        state.costs.append(torch.stack(block_cost_means).mean().item() if block_cost_means else 0.0)
-        state.linear_convergence.append(all_converged)
-        state.displacement_sqnorms.append(disp_sqnorm)
-        state.iteration_count += 1
-        state.block_duals = new_block_duals
-        state.last_solve_eps = ot_epsilon
-        state.epsilon = current_eps
-
-        return state
-
     def _converged(self, state: SolverState) -> bool:
-        """Check if the solver has converged based on displacement change."""
-        it = state.iteration_count
-        if it < 3:
+        """Converged when the displacement has both settled and gone small.
+
+        The relative test alone accepts a constant-speed trajectory: ``[1, 1, 1]``
+        looks settled while the particle is still crossing one step per iteration.
+        """
+        if state.iteration_count < 3:
             return False
         d = state.displacement_sqnorms
-        return abs(d[-1] - d[-2]) / (abs(d[-2]) + 1e-10) < self.threshold
+        settled = abs(d[-1] - d[-2]) / (abs(d[-2]) + 1e-10) < self.threshold
+        return settled and d[-1] < self.threshold * max(d[0], 1e-30)
 
     def _diverged(self, state: SolverState) -> bool:
         """Check if the solver has diverged (non-finite cost)."""
-        if not state.costs:
-            return False
-        import math
-
-        return not math.isfinite(state.costs[-1])
+        return bool(state.costs) and not math.isfinite(state.costs[-1])
 
     def run(
         self,
@@ -690,7 +483,8 @@ class PolyStep:
         for i in range(self.max_iterations):
             state = self.step(state, generator=generator)
 
-            if i >= self.min_iterations:
+            # i is 0-based, so i + 1 steps have run.
+            if i + 1 >= self.min_iterations:
                 if self._converged(state) or self._diverged(state):
                     break
 

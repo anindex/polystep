@@ -9,7 +9,6 @@ uniform random baseline are supported per env.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time

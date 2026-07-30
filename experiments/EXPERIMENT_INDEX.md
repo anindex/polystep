@@ -1,12 +1,11 @@
 # Experiment Index
 
-All runners default to the honest protocol (val-selected checkpoints). Seeds: `{42, 123, 456, 789, 1337}`.
+Expected results per experiment. All runners default to the honest protocol (val-selected
+checkpoints) and 5 seeds `{42, 123, 456, 789, 1337}`; numbers are mean +/- std across
+them and vary slightly with hardware and PyTorch version.
 
-## Installation
-
-```bash
-pip install -e ".[experiments]"
-```
+Setup and per-runner commands:
+[`../docs/reproducibility.md`](../docs/reproducibility.md).
 
 ## Experiments
 
@@ -14,7 +13,7 @@ pip install -e ".[experiments]"
 
 | # | Task | Runner | Result (5-seed mean ± std) |
 |---|------|--------|---------------------------|
-| 1 | SNN hard-LIF | `run_elevation.py` | 93.4% ± 0.2 |
+| 1 | SNN hard-LIF | `run_elevation.py` | 93.4% ± 0.3 |
 | 2 | INT8 quantized | `run_elevation.py` | 97.1% ± 0.1 |
 | 3 | Argmax attention | `run_elevation.py` | 86.8% ± 0.4 |
 | 4 | Staircase | `run_elevation.py` | 93.2% ± 0.3 |
@@ -28,44 +27,34 @@ pip install -e ".[experiments]"
 |---|------|--------|--------|
 | 8 | MNIST (101K MLP) | `run_mnist.py` | 96.0% ± 0.1 |
 | 9 | ETTh1 timeseries | `run_timeseries.py` | MSE 0.121 ± 0.004 |
-| 10 | GPT-2 SST-2 (head-only) | `run_gpt2_finetune.py` | 76.8% (head-only fine-tune; see `LIMITATIONS.md`) |
+| 10 | GPT-2 SST-2 (head-only) | `run_gpt2_finetune.py` | 76.8%, no JSON shipped; run the runner. See [`../LIMITATIONS.md`](../LIMITATIONS.md) |
 
 ### RL Policy Search
 
-| # | Task | Runner |
-|---|------|--------|
-| 11 | CartPole / Acrobot (vanilla + hardened) | `run_rl.py` |
+| Task | Runner |
+|------|--------|
+| CartPole / Acrobot (vanilla + hardened) | `run_rl.py` |
 
 ### Ablations
 
-| # | Study | Runner |
-|---|-------|--------|
-| 13 | OT vs Softmax solver | `ablation_ot_vs_softmax.py` |
-| 14 | Epsilon / radius / particles / subspace grid | `run_fill_ablation_grid.py` |
-| 15 | MAX-SAT scaling (100-1M vars) | `run_maxsat_softmax_scaling.py` |
-
-## Reproduce all
-
-```bash
-cd experiments/runners
-bash run_all_paper.sh              # ~8-10 GPU hours (RTX 5090)
-```
-
-Results are saved to `experiments/results/`. Figures referenced in the
-paper are not bundled with this repository: see the arXiv preprint
-(arXiv:2605.01928) for the rendered versions.
+| Study | Runner |
+|-------|--------|
+| OT vs Softmax solver | `ablation_ot_vs_softmax.py` |
+| Epsilon / radius / particles / subspace grid | `run_fill_ablation_grid.py` |
+| MAX-SAT scaling (100-1M vars) | `run_maxsat_softmax_scaling.py` |
 
 ## Result layout
 
-```
+```text
 experiments/results/softmax/
   main/          SNN, INT8, argmax, staircase, MNIST, timeseries, MAX-SAT, MoE
-  ablations/     Epsilon, radius, particles, compile, subspace, convergence, OT
+  ablations/     Epsilon, radius, particles, compile, subspace, convergence,
+                 blockwise, OT (full-space and mechanism)
   scalability/   Parameter scaling, sparse projection, memory
   rl/            RL policy search results (CartPole, Acrobot)
 ```
 
-Each JSON file contains method, dataset, seed, config, and metrics (accuracy/loss/wallclock).
+Per-file JSON schema: see [`../docs/reproducibility.md`](../docs/reproducibility.md).
 
 ## Hardware
 

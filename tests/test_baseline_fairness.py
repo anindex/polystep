@@ -1,8 +1,8 @@
-"""Baseline-fairness regression tests.
+"""Baselines must not borrow polystep's acceleration.
 
 - Contamination check: baseline implementations under
   ``experiments/baselines/`` and ``src/polystep/benchmarks/baselines.py``
-  must NOT import any polystep turbo / acceleration helper. Otherwise
+  must NOT import any polystep acceleration helper. Otherwise
   the "fair" comparison silently runs PolyStep-style acceleration on
   the other side of the table.
 - ``experiments/baselines/sls_pysat.py`` (the PySAT replacement
@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -24,7 +23,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 _TURBO_TOKENS = (
     "apply_momentum",
-    "update_adaptive_radius",
     "amortize_steps",
     "amortize_ema",
     "biased_rotation",
@@ -53,7 +51,7 @@ def _baseline_python_files():
 
 
 def test_no_baseline_imports_polystep_turbo_features(require_experiments):
-    """Baselines must not import polystep turbo helpers; otherwise the
+    """Baselines must not import polystep acceleration helpers; otherwise the
     "fair" comparison is silently using PolyStep acceleration on the
     other side of the table."""
     failures = []

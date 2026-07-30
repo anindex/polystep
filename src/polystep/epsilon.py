@@ -1,19 +1,13 @@
 """Epsilon schedulers for entropic regularization decay.
 
-Entropic regularization (epsilon) controls the smoothness of the optimal
-transport plan. Higher epsilon gives a smoother, more diffuse plan (easier
-to solve but less precise). Lower epsilon gives a sharper plan (closer to
-exact OT but harder to solve numerically). Annealing from high to low
-epsilon allows coarse-to-fine optimization.
+High epsilon gives a smooth, diffuse transport plan that is easy to solve; low epsilon
+gives a sharp one closer to exact OT but harder numerically. Annealing high to low is
+coarse-to-fine.
 
-Provides three schedulers:
-
-- ``LinearEpsilon``: Fixed linear decay: ``eps_t = max(init - decay * t, target)``.
-- ``CosineEpsilon``: Cosine annealing with optional SGDR-style warm restarts.
-- ``ProgressiveEpsilon``: Feedback-driven auto-adjustment based on Sinkhorn
-  solver convergence, inspired by ProgOT (Kassraie, Pooladian, Klein,
-  Thornton, Niles-Weed & Cuturi, *Progressive Entropic Optimal Transport
-  Solvers*, NeurIPS 2024, arXiv:2406.05061).
+- ``LinearEpsilon``: ``eps_t = max(init - decay * t, target)``.
+- ``CosineEpsilon``: cosine annealing, optional SGDR-style warm restarts.
+- ``ProgressiveEpsilon``: driven by Sinkhorn convergence rather than by ``t``, after
+  ProgOT (Kassraie et al., NeurIPS 2024, arXiv:2406.05061).
 """
 
 import math
@@ -23,37 +17,21 @@ from typing import Optional
 
 @dataclass
 class LinearEpsilon:
-    """Linearly decaying epsilon scheduler.
-
-    Computes epsilon at step t as:
-        epsilon(t) = max(init - decay * t, target)
-
-    The schedule starts at ``init`` and decreases by ``decay`` per iteration
-    until it reaches the ``target`` floor. This enables coarse-to-fine
-    optimization: early iterations use high epsilon for broad exploration,
-    later iterations use low epsilon for precise refinement.
-
-    Attributes:
-        target: Floor value for epsilon.
-        init: Starting value at iteration 0.
-        decay: Amount to subtract per iteration.
-    """
+    """``epsilon(t) = max(init - decay * t, target)``."""
 
     target: float = 1e-3
     init: float = 1.0
     decay: float = 0.01
 
-    def at(self, iteration: Optional[int] = 1) -> float:
-        """Compute epsilon at the given iteration.
+    def __post_init__(self) -> None:
+        # A negative decay grows epsilon without bound: the plan flattens to uniform, the
+        # step becomes the mean of the polytope vertices, and training stalls with no error.
+        if self.decay < 0:
+            raise ValueError(f"decay must be >= 0, got {self.decay}")
 
-        Args:
-            iteration: Current iteration number.
-
-        Returns:
-            Epsilon value (float).
-        """
+    def at(self, iteration: Optional[int] = None) -> float:
         if iteration is None:
-            # Not yet started - return initial epsilon, not target
+            # Not yet started: initial epsilon, not target.
             return self.init
         eps = self.init - (self.decay * iteration)
         return max(eps, self.target)
@@ -61,29 +39,16 @@ class LinearEpsilon:
 
 @dataclass
 class ProgressiveEpsilon:
-    """Auto-adjusting epsilon based on Sinkhorn solver feedback.
+    """Epsilon driven by Sinkhorn convergence, after ProgOT (arXiv:2406.05061).
 
-    Inspired by ProgOT (Kassraie et al., NeurIPS 2024, arXiv:2406.05061):
-    epsilon is adjusted from actual solver convergence behavior rather than
-    a fixed schedule.
-
-    When the solver converges quickly (few iterations), epsilon is decreased
-    to sharpen the transport plan. When the solver struggles (many iterations
-    or fails to converge), epsilon is increased to stabilize solving.
-
-    The ``at()`` method is a drop-in replacement for ``LinearEpsilon.at()``,
-    but ignores the ``iteration`` parameter. Instead, epsilon is driven by
-    explicit ``update()`` calls from the optimizer after each OT solve.
+    A fast solve sharpens the plan by decreasing epsilon; a slow or failed one raises it
+    to stay solvable. ``at()`` ignores its ``iteration`` argument, matching
+    ``LinearEpsilon``'s interface; the optimizer calls ``update()`` after each solve.
 
     Attributes:
-        init: Starting epsilon value.
-        target: Floor value (minimum epsilon).
-        max_epsilon: Ceiling value (maximum epsilon).
-        increase_factor: Multiplicative increase when solver struggles.
-        decrease_factor: Multiplicative decrease when solver converges fast.
-        fast_threshold: n_iters below this fraction of max_iterations triggers decrease.
-        slow_threshold: n_iters above this fraction of max_iterations triggers increase.
-        ema_alpha: EMA smoothing for epsilon changes (0 = no smoothing, 1 = no change).
+        fast_threshold: ``n_iters/max_iterations`` below this decreases epsilon.
+        slow_threshold: the same ratio above this increases it.
+        ema_alpha: smoothing on the change; 0 none, 1 freezes epsilon.
     """
 
     init: float = 1.0
@@ -104,68 +69,55 @@ class ProgressiveEpsilon:
         self._smoothed = self.init
 
     def at(self, iteration: Optional[int] = None) -> float:
-        """Return current epsilon value. Compatible with LinearEpsilon interface.
-
-        The ``iteration`` parameter is accepted for API compatibility with
-        ``LinearEpsilon`` but is ignored. ProgressiveEpsilon is driven by
-        explicit ``update()`` calls, not iteration count.
-
-        Args:
-            iteration: Ignored. Present for API compatibility.
-
-        Returns:
-            Current smoothed epsilon value (float).
-        """
+        """``iteration`` is ignored; ``update()`` drives this scheduler."""
         return self._smoothed
 
     def update(self, n_iters: int, max_iterations: int, converged: bool) -> None:
-        """Update epsilon based on solver feedback.
-
-        Args:
-            n_iters: Number of Sinkhorn iterations used in the last solve.
-            max_iterations: Maximum iterations the solver was allowed.
-            converged: Whether the solver converged.
-        """
+        """Move epsilon from the last solve's iteration count and converged flag."""
         ratio = n_iters / max(max_iterations, 1)
 
         if not converged or ratio > self.slow_threshold:
-            # Solver struggling: increase epsilon
             self._current = min(self._current * self.increase_factor, self.max_epsilon)
         elif ratio < self.fast_threshold:
-            # Solver converging fast: decrease epsilon
             self._current = max(self._current * self.decrease_factor, self.target)
-        # else: ratio in [fast_threshold, slow_threshold]: keep current
+        # Between the thresholds epsilon holds.
 
-        # EMA smooth
         self._smoothed = self.ema_alpha * self._smoothed + (1.0 - self.ema_alpha) * self._current
         self._smoothed = max(self._smoothed, self.target)
         self._smoothed = min(self._smoothed, self.max_epsilon)
 
 
+def feed_solver_stats(scheduler, solver, n_iters: int, converged: bool) -> None:
+    """Feed a solve's stats to ``scheduler``; no-op for schedulers that ignore them.
+
+    Called by every step driver, so ``ProgressiveEpsilon`` advances in monolithic,
+    block-wise and standalone ``PolyStep`` runs alike.
+
+    Skipped at ``threshold <= 0``: fixed-iteration Sinkhorn always reports converged
+    with ``n_iters == max_iterations``, a ratio of 1.0, which would raise epsilon to
+    ``max_epsilon`` every step.
+    """
+    if not isinstance(scheduler, ProgressiveEpsilon) or getattr(solver, "threshold", 1.0) <= 0:
+        return
+    scheduler.update(
+        n_iters=n_iters,
+        max_iterations=getattr(solver, "max_iterations", 1),
+        converged=converged,
+    )
+
+
 @dataclass
 class CosineEpsilon:
-    """Cosine-annealed epsilon scheduler.
+    """``epsilon(t) = target + 0.5 * (init - target) * (1 + cos(pi * t / T))``.
 
-    Computes epsilon at step t using cosine annealing:
-        epsilon(t) = target + 0.5 * (init - target) * (1 + cos(pi * t / T))
-
-    where T = total_steps (computed from init/target/decay for API compatibility
-    with LinearEpsilon, or set explicitly via total_steps).
-
-    Cosine annealing keeps epsilon higher for longer in the middle of training
-    (encouraging exploration) then decays rapidly at the end (encouraging
-    exploitation). This typically improves convergence versus linear decay.
-
-    Supports optional warm restarts (SGDR-style): epsilon periodically resets
-    to init, with each period multiplied by ``restart_mult``.
+    Holds epsilon high through the middle of the run and drops it late, where linear
+    decay is already at the floor.
 
     Attributes:
-        target: Floor value for epsilon.
-        init: Starting value at iteration 0.
-        decay: Per-step linear decay rate (used to infer total_steps if
-            total_steps is not set: T = (init - target) / decay).
-        total_steps: Explicit total step count. Overrides decay-based inference.
-        restart_mult: Period multiplier for warm restarts (1.0 = no restarts).
+        decay: infers ``T = (init - target) / decay`` when ``total_steps`` is unset,
+            so a ``LinearEpsilon`` config transfers unchanged.
+        total_steps: explicit ``T``, overriding that inference.
+        restart_mult: SGDR period multiplier; 1.0 disables warm restarts.
     """
 
     target: float = 1e-3
@@ -174,30 +126,23 @@ class CosineEpsilon:
     total_steps: int = 0
     restart_mult: float = 1.0
 
-    def at(self, iteration: Optional[int] = 1) -> float:
-        """Compute epsilon at the given iteration.
-
-        Args:
-            iteration: Current iteration number.
-
-        Returns:
-            Epsilon value (float).
-        """
+    def at(self, iteration: Optional[int] = None) -> float:
         if iteration is None:
             return self.init
 
+        # ceil, not truncation: a fractional ratio (the defaults give 99.9) would
+        # otherwise reach the floor one step before the LinearEpsilon it transfers from.
         T = (
             self.total_steps
             if self.total_steps > 0
-            else max(1, int((self.init - self.target) / max(self.decay, 1e-12)))
+            else max(1, math.ceil((self.init - self.target) / max(self.decay, 1e-12)))
         )
 
         if self.restart_mult > 1.0:
-            # Warm restart: find which period we're in
+            # Walk to the current restart period. Bounded: a restart_mult near 1.0 or a
+            # tiny period would otherwise loop unbounded.
             period = T
             t = iteration
-            # Guard: limit iterations to prevent unbounded loop when
-            # restart_mult is very close to 1.0 or period is tiny
             max_restarts = 100
             restarts = 0
             while t >= period and period > 0 and restarts < max_restarts:

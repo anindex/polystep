@@ -30,10 +30,8 @@ from __future__ import annotations
 import argparse
 import gc
 import os
-import signal
 import sys
 import time
-from typing import Any, Dict, List, Optional
 
 # Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -1276,7 +1274,7 @@ def main():
         # Give ES methods the same number of optimizer steps as polystep,
         # each evaluating popsize candidates. This is a step-matched budget:
         # ES gets (polystep_steps * popsize) function evaluations.
-        # Note: polystep evaluates many more candidates per step (polytope
+        # polystep evaluates many more candidates per step (polytope
         # vertices * probes) via GPU parallelism, but step-matching is the
         # fairest comparison since each step represents one optimization update.
         es_popsize = CMAES_CONFIG["popsize"]

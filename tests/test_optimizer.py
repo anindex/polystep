@@ -1,6 +1,7 @@
 """Integration tests for PolyStepOptimizer step, momentum, and adaptive radius."""
 
 import copy
+import warnings
 
 import math
 
@@ -8,10 +9,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from polystep import PolyStepOptimizer, SolverState
+from polystep.solver import PolyStep
+from polystep import CosineEpsilon, PolyStepOptimizer, SolverState
 from polystep.cost_nn import NNCostEvaluator
 from polystep.dynamics import compute_momentum_coefficient
-from polystep.epsilon import LinearEpsilon
 
 
 def _make_model():
@@ -55,20 +56,6 @@ def optimizer(model):
 
 
 class TestClosureInterface:
-    """Tests for basic step(closure) interface."""
-
-    def test_step_returns_float(self, model, closure):
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        loss = opt.step(closure)
-        assert math.isfinite(loss)
-
     def test_step_updates_model(self, model, closure):
         initial_params = {k: v.clone() for k, v in model.state_dict().items()}
         opt = PolyStepOptimizer(
@@ -105,8 +92,6 @@ class TestClosureInterface:
 
 
 class TestMomentum:
-    """Tests for momentum integration."""
-
     def test_momentum_disabled_by_default(self, model, closure):
         opt = PolyStepOptimizer(
             model,
@@ -206,8 +191,6 @@ class TestMomentum:
 
 
 class TestAdaptiveRadius:
-    """Tests for adaptive radius integration."""
-
     def test_adaptive_disabled_by_default(self, model, closure):
         opt = PolyStepOptimizer(
             model,
@@ -238,8 +221,6 @@ class TestAdaptiveRadius:
 
 
 class TestIntegration:
-    """Combined integration tests."""
-
     def test_momentum_and_adaptive_together(self, model, closure):
         opt = PolyStepOptimizer(
             model,
@@ -270,31 +251,21 @@ class TestIntegration:
 
 
 class TestParticleDim:
-    """Tests for configurable particle_dim in full-space mode."""
+    @pytest.mark.parametrize(
+        "polytope, dim, verts", [("orthoplex", 4, 8), ("orthoplex", 8, 16), ("simplex", 4, 5), ("simplex", 8, 9)]
+    )
+    def test_particle_dim_4(self, polytope, dim, verts):
+        """particle_dim=D gives D-dim particles and the polytope's own vertex count.
 
-    def test_particle_dim_default(self):
-        """particle_dim=2 (default) produces same layout as current behavior."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        assert opt.layout.particle_dim == 2
-        assert opt._particle_dim == 2
-
-    @pytest.mark.parametrize("dim, verts", [(4, 8), (8, 16)])
-    def test_particle_dim_4(self, dim, verts):
-        """particle_dim=D creates layout with D-dim particles and orthoplex 2*D vertices."""
+        The simplex (the default) is D+1, the orthoplex 2*D. Naming the polytope keeps this
+        from silently re-testing whatever the default happens to be.
+        """
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
             model,
             particle_dim=dim,
+            polytope_type=polytope,
             max_iterations=50,
             epsilon=0.1,
             sinkhorn_max_iters=100,
@@ -485,19 +456,21 @@ class TestAdaptiveProbes:
         any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Model parameters should change with adaptive_probes=True"
 
-    def test_adaptive_probes_saves_evals(self):
-        """Stagnant particles get cost rows reused (fewer forward passes).
-
-        We verify this by counting closure calls with a wrapper. After the
-        first step (no reuse possible), subsequent steps should call the
-        closure fewer times if some particles are stagnant.
-        """
+    @pytest.mark.parametrize(
+        "threshold, reuses",
+        [
+            (1e10, True),  # every particle counts as stagnant, so every row is reused
+            (0.0, False),  # strict <, so nothing is stagnant and every row is re-measured
+        ],
+    )
+    def test_adaptive_probes_reuse_follows_the_threshold(self, threshold, reuses):
+        """Reused rows cost no forward passes, so the closure call count is the check."""
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
             model,
             adaptive_probes=True,
-            adaptive_probes_threshold=1e10,  # Very high: ALL particles stagnant after step 1
+            adaptive_probes_threshold=threshold,
             max_iterations=50,
             epsilon=0.1,
             sinkhorn_max_iters=100,
@@ -512,58 +485,20 @@ class TestAdaptiveProbes:
             call_counts.append(batched_params[next(iter(batched_params))].shape[0])
             return base_closure(batched_params)
 
-        # Step 1: no reuse possible (no previous cost matrix)
-        opt.step(counting_closure)
+        opt.step(counting_closure)  # no previous cost matrix, so no reuse is possible
         step1_evals = sum(call_counts)
         call_counts.clear()
 
-        # Step 2: all particles are "stagnant" (threshold=1e10),
-        # so all rows should be reused -> 0 evaluations
         opt.step(counting_closure)
         step2_evals = sum(call_counts)
 
-        assert step2_evals < step1_evals, f"Step 2 should have fewer evals than step 1: {step2_evals} vs {step1_evals}"
-
-    def test_adaptive_probes_threshold(self):
-        """adaptive_probes_threshold controls which particles get reduced probes."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            adaptive_probes=True,
-            adaptive_probes_threshold=0.0,  # Threshold 0: NO particles are stagnant
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-
-        call_counts = []
-        base_closure = _make_closure(model)
-
-        def counting_closure(batched_params):
-            call_counts.append(batched_params[next(iter(batched_params))].shape[0])
-            return base_closure(batched_params)
-
-        # Step 1
-        opt.step(counting_closure)
-        step1_evals = sum(call_counts)
-        call_counts.clear()
-
-        # Step 2: threshold=0.0 means no particles match as stagnant (strict <)
-        # so all should be re-evaluated
-        opt.step(counting_closure)
-        step2_evals = sum(call_counts)
-
-        assert step2_evals == step1_evals, (
-            f"With threshold=0.0, step 2 should have same evals as step 1: {step2_evals} vs {step1_evals}"
-        )
+        if reuses:
+            assert step2_evals < step1_evals, f"{step2_evals} vs {step1_evals}"
+        else:
+            assert step2_evals == step1_evals, f"{step2_evals} vs {step1_evals}"
 
 
 class TestDualMomentum:
-    """Tests for dual potential momentum (dual momentum extension)."""
-
     def test_beta_zero_matches_standard(self):
         """dual_momentum_beta=0.0 produces identical cost to default optimizer over 3 steps."""
         torch.manual_seed(42)
@@ -627,7 +562,11 @@ class TestDualMomentum:
         assert opt.state.prev_prev_g is not None, "After 2 steps, prev_prev_g should be set"
 
     def test_extrapolation_clamped(self):
-        """Dual momentum extrapolation does not exceed max_abs_dual bounds."""
+        """The extrapolated warm start handed to the solver stays inside the clamp.
+
+        Checked on the value passed to solve(), not on state.f: sinkhorn clamps its
+        output again internally, so the output cannot show whether this clamp ran.
+        """
         torch.manual_seed(42)
         model = _make_model()
         closure = _make_closure(model)
@@ -640,16 +579,22 @@ class TestDualMomentum:
             seed=42,
             dual_momentum_beta=0.3,
         )
+        seen = []
+        real_solve = opt.solver.solve
+
+        def spy(*args, **kwargs):
+            seen.append((kwargs.get("init_f"), kwargs.get("init_g")))
+            return real_solve(*args, **kwargs)
+
+        opt.solver.solve = spy
         for _ in range(5):
             opt.step(closure)
-        # Check that duals are within bounds
-        if opt.state.f is not None:
-            max_abs = 80.0 * max(opt.state.epsilon, 0.01)
-            assert opt.state.f.abs().max().item() <= max_abs + 1e-6, f"Dual f exceeds max_abs={max_abs}"
 
-
-class TestSinkhornAccelerationIntegration:
-    """Integration tests verifying all convergence acceleration improvements compose correctly."""
+        max_abs = 80.0 * max(opt.state.epsilon, 0.01)
+        warm = [f for f, _ in seen if f is not None]
+        assert warm, "no warm start was ever passed, so the clamp was never reached"
+        for f in warm:
+            assert f.abs().max().item() <= max_abs + 1e-6, f"warm-start dual exceeds max_abs={max_abs}"
 
 
 class TestSinkhornParamWiring:
@@ -672,56 +617,6 @@ class TestSinkhornParamWiring:
         assert opt.solver.anderson_depth == 5
         assert opt.solver.adaptive_omega is True
         assert opt.solver.data_dependent_init is True
-
-    def test_default_sinkhorn_params_backward_compat(self):
-        """Default PolyStepOptimizer(model) creates solver with all convergence acceleration
-        Sinkhorn params disabled (backward compatibility)."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            compile=False,
-            seed=42,
-        )
-        assert opt.solver.anderson_depth == 0
-        assert opt.solver.adaptive_omega is False
-        assert opt.solver.data_dependent_init is False
-
-
-class TestEntEpsilon:
-    """Tests for the ent_epsilon parameter (separate OT solver epsilon)."""
-
-    def test_ent_epsilon_none_default(self):
-        """ent_epsilon=None (default) means the main epsilon is used."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        assert opt.ent_epsilon is None
-
-
-class TestStagnationThreshold:
-    """Tests for stagnation_threshold parameter with adaptive radius."""
-
-    def test_stagnation_threshold_default(self):
-        """Default stagnation_threshold is 1e-4."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        assert opt.stagnation_threshold == 1e-4
 
 
 class TestAutoEpsilon:
@@ -758,29 +653,49 @@ class TestAutoEpsilon:
         # All values should be finite and positive
         assert all(0 < e < 100 for e in eps_values)
 
-    def test_auto_epsilon_default_off(self):
-        """auto_epsilon=False (default) should not create progressive epsilon."""
-        torch.manual_seed(42)
-        model = nn.Sequential(nn.Linear(4, 3), nn.Linear(3, 2))
-        opt = PolyStepOptimizer(model, epsilon=0.5, compile=False)
-        assert opt._progressive_epsilon is None
 
-
-class TestRemovedParameters:
+@pytest.mark.parametrize(
+    "param_name, value",
+    [
+        ("curvature_aware_radius", True),
+        ("entropy_target", 0.7),
+        ("nesterov_lookahead", True),
+    ],
+)
+def test_curvature_aware_radius_removed(param_name, value):
     """Parameters removed in cleanup should raise TypeError."""
+    model = nn.Linear(4, 2)
+    with pytest.raises(TypeError, match=param_name):
+        PolyStepOptimizer(model, **{param_name: value})
 
-    @pytest.mark.parametrize(
-        "param_name, value",
-        [
-            ("curvature_aware_radius", True),
-            ("entropy_target", 0.7),
-            ("nesterov_lookahead", True),
-        ],
-    )
-    def test_curvature_aware_radius_removed(self, param_name, value):
-        model = nn.Linear(4, 2)
-        with pytest.raises(TypeError, match=param_name):
-            PolyStepOptimizer(model, **{param_name: value})
+
+@pytest.mark.parametrize(
+    "attribute, expected",
+    [
+        ("layout.particle_dim", 2),
+        ("_particle_dim", 2),
+        ("ent_epsilon", None),
+        ("stagnation_threshold", 1e-4),
+        ("_progressive_epsilon", None),
+        ("solver.anderson_depth", 0),
+        ("solver.adaptive_omega", False),
+        ("solver.data_dependent_init", False),
+    ],
+)
+def test_documented_defaults(attribute, expected):
+    """The published defaults, pinned off one optimizer rather than one build each.
+
+    Every acceleration knob is off unless asked for, so a default construction runs
+    the plain algorithm.
+    """
+    opt = PolyStepOptimizer(_make_model(), epsilon=0.1, compile=False, seed=42)
+    value = opt
+    for part in attribute.split("."):
+        value = getattr(value, part)
+    if expected is None:
+        assert value is None
+    else:
+        assert value == expected
 
 
 class TestProbeRadiusJitter:
@@ -869,3 +784,45 @@ class TestProbeRadiusJitter:
         # The step must have produced a finite, non-trivial update.
         assert torch.isfinite(params_after).all()
         assert not torch.equal(params_before, params_after)
+
+
+def test_num_probe_defaults_to_one_on_both_entry_points():
+    """K=1 is the reported and optimal setting; the two APIs must not disagree."""
+
+    def objective(x):
+        return (x**2).sum(-1)
+
+    assert PolyStepOptimizer(nn.Linear(4, 2, bias=False), epsilon=0.5).num_probe == 1
+    assert PolyStep.create(objective, dim=4).num_probe == 1
+
+
+class _FakeLIF(nn.Module):
+    """Stand-in for an snnTorch Leaky neuron, without the snntorch dependency."""
+
+    def forward(self, x):
+        return torch.relu(x)
+
+
+class _SNNStub(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 8)
+        self.lif1 = _FakeLIF()  # the name pattern the guard matches on
+        self.fc2 = nn.Linear(8, 2)
+
+
+@pytest.mark.parametrize("build, expect_warning", [(_SNNStub, True), (_make_model, False)])
+def test_cosine_step_radius_warns_only_on_an_snn(build, expect_warning):
+    """Scheduling step_radius on an SNN collapsed accuracy from ~93% to 10-47%
+    (experiments/EXPERIMENT_INDEX.md), so the combination must warn, and only there."""
+    cosine = CosineEpsilon(init=5.0, target=1.0, decay=0.01)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        PolyStepOptimizer(build(), epsilon=0.5, step_radius=cosine)
+
+    hits = [
+        m
+        for m in (str(w.message).lower() for w in caught)
+        if any(k in m for k in ("snn", "leaky", "lif", "spik")) and ("step_radius" in m or "cosine" in m)
+    ]
+    assert bool(hits) is expect_warning, hits

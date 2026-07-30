@@ -646,8 +646,6 @@ def run_cmaes(seed, device, train_data, val_data, test_data, results_dir, epochs
         print("    Skipping cmaes (EvoTorch not installed)")
         return
 
-    from experiments.runners.common import load_flat_params, set_flat_params
-
     set_seed(seed)
     model = TimeSeriesLSTM().to(device)
     loss_fn = nn.MSELoss()
@@ -807,7 +805,6 @@ def run_openai_es(seed, device, train_data, val_data, test_data, results_dir, ep
         eval_fn=regression_eval,
     )
 
-    # Re-evaluate final regression metrics
     final_metrics = evaluate_regression(model, test_data, device=device)
 
     # Track best_mse from epoch_logs (baseline doesn't track it internally for regression)
@@ -876,7 +873,6 @@ def run_spsa(seed, device, train_data, val_data, test_data, results_dir, epochs_
         eval_fn=regression_eval,
     )
 
-    # Re-evaluate final regression metrics
     final_metrics = evaluate_regression(model, test_data, device=device)
 
     # Track best_mse from epoch_logs (baseline doesn't track it internally for regression)

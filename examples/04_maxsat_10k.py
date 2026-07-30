@@ -12,12 +12,12 @@ runnable script. The hyperparameters mirror the 10K row of
 
 Hardware:
   Default: 10,000 variables, ~42,700 clauses. Best on a CUDA GPU with
-  >=4 GB free; runs on one CPU core in about 50 s.
-  ``--small``: 2,000 variables, ~8,500 clauses. Completes on CPU in <60s.
+  >=4 GB free.
+  ``--small``: 2,000 variables, ~8,500 clauses. Runs on CPU.
 
 What you should see:
   SAT ratio climbs from ~0.86 (random assignment) past 0.98 within
-  ~1000 steps and continues to creep upward. The default 1500-step
+  ~700 steps and continues to creep upward. The default 1500-step
   budget gives comfortable margin above the 98%% threshold across
   seeds. Phase-transition 3-SAT is intrinsically hard; domain solvers
   like probSAT reach ~0.996.
@@ -42,12 +42,10 @@ from pathlib import Path
 
 import torch
 
-# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
-# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
-# Set POLYSTEP_THREADS to override. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
+# One thread: PolyStep's per-step ops are small enough that torch's default pool of
+# nproc threads costs far more than it returns. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
 
-# Allow running directly from a source checkout without `pip install -e .`.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))  # so experiments/runners/* is importable
@@ -76,13 +74,22 @@ def scaled_radii(num_vars: int):
     )
 
 
+def satisfied_clauses(assignments: torch.Tensor, clause_vars: torch.Tensor, clause_signs: torch.Tensor):
+    """Which clauses each assignment satisfies, shape ``assignments.shape[:-1] + (C,)``.
+
+    A literal is true exactly when its rounded variable equals its sign, so the whole
+    clause test is one equality on booleans. The gathered ``(..., C, k)`` tensor is the
+    largest thing in the step, and a bool one is a quarter the memory traffic of the
+    arithmetic form.
+    """
+    hard = torch.sigmoid(assignments) > 0.5
+    return (hard[..., clause_vars] == clause_signs).any(dim=-1)
+
+
 @torch.no_grad()
 def sat_ratio(model: MaxSATModel, clause_vars: torch.Tensor, clause_signs: torch.Tensor) -> float:
-    hard = torch.round(torch.sigmoid(model.assignments))
-    gathered = hard[clause_vars]
-    literals = gathered * clause_signs + (1.0 - clause_signs) * (1.0 - gathered)
-    satisfied = (literals > 0.5).any(dim=-1).float()
-    return float(satisfied.mean().item())
+    satisfied = satisfied_clauses(model.assignments, clause_vars, clause_signs)
+    return float(satisfied.sum().item()) / clause_vars.shape[0]
 
 
 def main():
@@ -116,7 +123,7 @@ def main():
     print(f"  device:    {device}")
 
     clause_vars = instance["clause_vars"].to(device)
-    clause_signs = instance["clause_signs"].to(device)
+    clause_signs = instance["clause_signs"].to(device).bool()  # 1 for a positive literal
 
     model = MaxSATModel(num_vars=num_vars).to(device)
 
@@ -138,17 +145,10 @@ def main():
     )
 
     def closure(stacked_params):
-        # The optimizer hands us a dict {"assignments": (N, num_vars)}.
-        # Compute fraction of unsatisfied clauses per candidate.
-        assignments = stacked_params["assignments"]
-        soft = torch.sigmoid(assignments)
-        hard = torch.round(soft)
-        # Index along the variable axis: (N, C, k)
-        gathered = hard[:, clause_vars]
-        signs = clause_signs.unsqueeze(0).to(dtype=gathered.dtype)
-        literals = gathered * signs + (1.0 - signs) * (1.0 - gathered)
-        satisfied = (literals > 0.5).any(dim=-1).float()
-        return 1.0 - satisfied.mean(dim=-1)
+        # The optimizer hands us {"assignments": (N, num_vars)}; return the fraction
+        # of unsatisfied clauses per candidate.
+        satisfied = satisfied_clauses(stacked_params["assignments"], clause_vars, clause_signs)
+        return 1.0 - satisfied.sum(dim=-1) / clause_vars.shape[0]
 
     print(f"  initial SAT ratio: {sat_ratio(model, clause_vars, clause_signs):.3f}")
     print()

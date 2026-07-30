@@ -1,8 +1,8 @@
 """SoftmaxSolver: direct softmax weighting for subspace modes.
 
-Replaces iterative Sinkhorn OT with a single softmax(-C/epsilon) pass.
-Mathematically equivalent when the OT target marginal constraint is
-naturally satisfied (few particles in subspace mode). See paper Section 5.10.
+Replaces iterative Sinkhorn OT with a single softmax(-C/epsilon) pass. This is
+the exact lambda -> 0 unbalanced limit, and coincides with balanced OT only when
+the column sums happen to hit the target marginal. See paper Section 5.10.
 
 Key properties:
     - Row sums of transport matrix equal source marginal a
@@ -17,17 +17,8 @@ from typing import Optional, Union
 
 import torch
 
-from ..costs import resolve_cost_scale
-from ._prelude import align_marginal, recenter_cost, sanitize_cost, validate_positive
+from ._shared import solve_softmax
 from .base import SolverResult
-
-
-# Below this ratio of `epsilon` to `max|C|`, ``-C/epsilon`` overflows
-# before ``torch.softmax`` gets a chance to subtract the row max.
-# Tested empirically at FP32 / BF16: ratios above ~1e-6 stay finite.
-_TINY_EPSILON_RATIO = 1e-6
-
-SoftmaxResult = SolverResult
 
 
 @dataclass
@@ -75,19 +66,10 @@ class SoftmaxSolver:
         Raises:
             ValueError: If epsilon <= 0.
         """
-        validate_positive(
-            self.epsilon,
-            "epsilon",
-            "epsilon is the temperature in softmax(-C/epsilon).",
-        )
-
-        P, V = cost_matrix.shape
-
-        # SoftmaxSolver is one-sided: it only enforces row sums equal `a`.
-        # If a caller passes a non-uniform `b` they probably meant to call
-        # SinkhornSolver; warn loudly so the constraint isn't silently dropped.
+        # One-sided: only row sums are enforced. A caller passing a non-uniform `b`
+        # probably wanted SinkhornSolver.
         if b is not None:
-            uniform = torch.full_like(b, 1.0 / V)
+            uniform = torch.full_like(b, 1.0 / cost_matrix.shape[1])
             if not torch.allclose(b.to(device=uniform.device, dtype=uniform.dtype), uniform, atol=1e-6):
                 warnings.warn(
                     "SoftmaxSolver ignores the target marginal `b`: it only "
@@ -96,64 +78,4 @@ class SoftmaxSolver:
                     stacklevel=2,
                 )
 
-        # FP32 promotion (softmax subtracts the row max only after an outer
-        # autocast may have downcast -C/epsilon) + finite-cost handling
-        # (+Inf models a hard "never pick this vertex" constraint).
-        cost_matrix = sanitize_cost(cost_matrix)
-        device, dtype = cost_matrix.device, cost_matrix.dtype
-        a = align_marginal(a, P, device, dtype)
-
-        # Recenter BEFORE scaling. softmax is shift-invariant but 'mean'/'max_cost'
-        # are not, so scaling first would let the arbitrary absolute loss level set
-        # the effective temperature. min(C)=0 also avoids a +inf logit that would
-        # NaN the softmax at tiny eps.
-        C, cost_shift = recenter_cost(cost_matrix)
-        cost_scale = resolve_cost_scale(C, scale_cost)
-        C = C / cost_scale
-
-        # ``epsilon > 0`` is enough to avoid division-by-zero, but
-        # eps=1e-30 with cost_max~10 still overflows -C/epsilon before
-        # softmax can subtract the row max. Warn at extreme ratios, but avoid a
-        # host sync every solve: only run the reduction when epsilon drops below
-        # the smallest value already checked (a new, sharper regime).
-        # Only runs on an epsilon decrease, so a fixed-epsilon cost blowup is not caught.
-        min_checked = getattr(self, "_min_eps_checked", None)
-        if min_checked is None or self.epsilon < min_checked:
-            self._min_eps_checked = self.epsilon
-            cost_max = C.detach().abs().max().item() if C.numel() > 0 else 0.0
-            if cost_max > 0 and self.epsilon < _TINY_EPSILON_RATIO * cost_max:
-                warnings.warn(
-                    f"SoftmaxSolver epsilon={self.epsilon:.2e} is very small "
-                    f"relative to the cost-matrix scale (max |C|={cost_max:.2e}); "
-                    f"-C/epsilon may underflow / overflow before the row-max "
-                    f"subtraction inside torch.softmax. Consider rescaling the "
-                    f"cost or raising epsilon.",
-                    stacklevel=2,
-                )
-
-        # PyTorch's softmax subtracts the row max internally for stability.
-        # Pin the whole block inside an autocast-disabled context so an outer
-        # mixed-precision region can't downcast intermediates back to BF16.
-        with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
-            # Shift per row, not just globally, before dividing. torch.softmax
-            # subtracts the row max only *after* the division, so at tiny epsilon a
-            # row whose entries all sit above the global minimum sends every logit to
-            # -inf and the row comes back NaN. Softmax is row-wise shift-invariant,
-            # so this changes nothing except which values reach the exponent.
-            W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / self.epsilon, dim=-1)
-
-            # Row sums equal source marginal a
-            transport = W * a.to(W.dtype).unsqueeze(-1)
-
-            # Undo both frame changes so the reported cost is <C_raw, transport>.
-            ent_cost = ((C * transport).sum() * cost_scale + cost_shift * a.to(W.dtype).sum()).item()
-
-        return SolverResult(
-            matrix=transport,
-            cost=ent_cost,
-            f=None,
-            g=None,
-            converged=True,
-            n_iters=1,
-            ent_reg_cost=ent_cost,
-        )
+        return solve_softmax(self, cost_matrix, a, self.epsilon, scale_cost, "SoftmaxSolver", "epsilon")

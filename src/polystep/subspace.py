@@ -63,6 +63,37 @@ if TYPE_CHECKING:
     from .transform import ParamLayout
 
 
+class AbsorbMixin:
+    """``absorb`` for subspaces whose ``apply_perturbation`` takes no projection."""
+
+    def absorb(self, base_sd, flat_subspace):
+        """Fold the perturbation into the base weights.
+
+        Returns ``(new_base_sd, zeroed_subspace_vector)``.
+        """
+        return self.apply_perturbation(base_sd, flat_subspace), torch.zeros_like(flat_subspace)
+
+
+class ProjectedAbsorbMixin:
+    """``absorb`` for subspaces whose ``apply_perturbation`` takes a projection."""
+
+    def absorb(self, projection, base_sd, flat_subspace):
+        """Fold the perturbation into the base weights.
+
+        Returns ``(new_base_sd, zeroed_subspace_vector)``.
+        """
+        return self.apply_perturbation(projection, base_sd, flat_subspace), torch.zeros_like(flat_subspace)
+
+
+class SvdRatioMixin:
+    """Linear ramp of the SVD-derived fraction of a rotated basis."""
+
+    def get_svd_ratio(self, step: int, total_steps: int) -> float:
+        """Linear interpolation from ``svd_ratio_init`` at step 0 to ``svd_ratio_final``."""
+        progress = min(1.0, step / max(1, total_steps or 1))
+        return self.svd_ratio_init + progress * (self.svd_ratio_final - self.svd_ratio_init)
+
+
 @dataclass(frozen=True)
 class FactorSpec:
     """Describes the low-rank decomposition of a single parameter entry.
@@ -87,7 +118,7 @@ class FactorSpec:
 
 
 @dataclass
-class LowRankSubspace:
+class LowRankSubspace(AbsorbMixin):
     """Low-rank subspace compression for neural network parameters.
 
     Packs per-layer B and A factors into a single flat subspace vector.
@@ -267,6 +298,9 @@ class LowRankSubspace:
         for spec in self.specs:
             chunk = flat_subspace[spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
+            # Coordinates carry the layout's dominant dtype, the parameter its own.
+            # They differ on a mixed-dtype model.
+            chunk = chunk.to(base.dtype)
             if spec.is_lowrank:
                 b_size = spec.b_shape[0] * spec.b_shape[1]
                 B = chunk[:b_size].reshape(spec.b_shape)
@@ -296,65 +330,49 @@ class LowRankSubspace:
         for spec in self.specs:
             chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
+            chunk = chunk.to(base.dtype)
             if spec.is_lowrank:
                 b_size = spec.b_shape[0] * spec.b_shape[1]
                 B = chunk[:, :b_size].reshape(N, *spec.b_shape)
                 A = chunk[:, b_size:].reshape(N, *spec.a_shape)
                 delta_2d = torch.bmm(B, A)  # (N, d_out, d_in)
-                delta = delta_2d.reshape(N, *spec.original_shape)
-                result[spec.entry_key] = base.unsqueeze(0) + delta
+                # bmm output is ours, so fold the base into it rather than
+                # allocating a second (N, num_params).
+                result[spec.entry_key] = delta_2d.reshape(N, *spec.original_shape).add_(base)
             else:
                 delta = chunk.reshape(N, *spec.original_shape)
                 result[spec.entry_key] = base.unsqueeze(0) + delta
         return result
 
-    def absorb(
-        self,
-        base_sd: Dict[str, torch.Tensor],
-        flat_subspace: torch.Tensor,
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Fold subspace perturbation into base weights and zero the subspace.
-
-        Args:
-            base_sd: Base state_dict to absorb perturbation into.
-            flat_subspace: Current subspace vector of shape (subspace_dim,).
-
-        Returns:
-            Tuple of (new_base_sd, zeroed_subspace_vector).
-        """
-        new_sd = self.apply_perturbation(base_sd, flat_subspace)
-        return new_sd, torch.zeros_like(flat_subspace)
-
-
-# ======================================================================
-# LinearSubspace: random projection (linear mapping)
-# ======================================================================
-
 
 @dataclass(frozen=True)
 class ProjectionSpec:
-    """Describes the random projection mapping for a single parameter entry.
+    """How one parameter entry maps to its slice of the subspace vector.
+
+    Shared by :class:`LinearSubspace`, :class:`HybridSubspace` and
+    :class:`FactoredSubspace`, which allocate coordinates per entry and reconstruct
+    through a per-layer projection.
 
     Attributes:
-        entry_key: ParamLayout entry key (e.g., "fc1.weight").
+        entry_key: state_dict key (e.g. "fc1.weight").
         original_shape: Original parameter shape.
-        is_projected: True for 2D+ params (random projection), False for 1D (full).
-        num_params: Total elements in this parameter (d_out * d_in).
-        num_coords: Number of subspace coordinates allocated.
-        flat_start: Start offset into the flat subspace vector.
-        flat_end: End offset into the flat subspace vector.
+        num_params: Elements in this parameter.
+        num_coords: Subspace coordinates allocated to it.
+        flat_start: Start offset into the global subspace vector.
+        flat_end: End offset into the global subspace vector.
+        is_projected: False for 1D params, which are perturbed directly.
     """
 
     entry_key: str
     original_shape: Tuple[int, ...]
-    is_projected: bool
     num_params: int
     num_coords: int
     flat_start: int
     flat_end: int
+    is_projected: bool = True
 
 
-class LinearSubspace:
+class LinearSubspace(AbsorbMixin):
     """Linear subspace compression via fixed random projection matrices.
 
     For each 2D+ parameter, weight perturbation is:
@@ -475,7 +493,6 @@ class LinearSubspace:
                 )
                 offset += num_elements
 
-        # Apply budget cap if specified
         from .hybrid_subspace import _scale_specs_to_budget
 
         specs, offset = _scale_specs_to_budget(specs, max_subspace_dim, offset)
@@ -557,7 +574,6 @@ class LinearSubspace:
                 )
                 offset += num_elements
 
-        # Apply budget cap if specified
         from .hybrid_subspace import _scale_specs_to_budget
 
         specs, offset = _scale_specs_to_budget(specs, max_subspace_dim, offset)
@@ -644,10 +660,12 @@ class LinearSubspace:
             base = base_sd[spec.entry_key]
             if spec.is_projected:
                 P = self._get_projection(spec, base.device, base.dtype)
-                delta = (P @ chunk).reshape(spec.original_shape)
+                # Coordinates carry the layout's dominant dtype; the projection carries
+                # this parameter's. They differ on a mixed-dtype model.
+                delta = (P @ chunk.to(P.dtype)).reshape(spec.original_shape)
                 result[spec.entry_key] = base + delta
             else:
-                result[spec.entry_key] = base + chunk.reshape(spec.original_shape)
+                result[spec.entry_key] = base + chunk.reshape(spec.original_shape).to(base.dtype)
         return result
 
     def reconstruct_batch(
@@ -676,27 +694,11 @@ class LinearSubspace:
                 P = self._get_projection(spec, base.device, base.dtype)
                 # chunk: (N, num_coords), P: (num_params, num_coords)
                 # delta_flat = chunk @ P.T -> (N, num_params)
-                delta_flat = chunk @ P.t()
-                delta = delta_flat.reshape(N, *spec.original_shape)
-                result[spec.entry_key] = base.unsqueeze(0) + delta
+                # The matmul output is ours, so fold the base into it rather than
+                # allocating a second (N, num_params).
+                delta_flat = chunk.to(P.dtype) @ P.t()
+                result[spec.entry_key] = delta_flat.reshape(N, *spec.original_shape).add_(base)
             else:
-                delta = chunk.reshape(N, *spec.original_shape)
+                delta = chunk.reshape(N, *spec.original_shape).to(base.dtype)
                 result[spec.entry_key] = base.unsqueeze(0) + delta
         return result
-
-    def absorb(
-        self,
-        base_sd: Dict[str, torch.Tensor],
-        flat_subspace: torch.Tensor,
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Fold subspace perturbation into base weights and zero the subspace.
-
-        Args:
-            base_sd: Base state_dict to absorb perturbation into.
-            flat_subspace: Current subspace vector of shape (subspace_dim,).
-
-        Returns:
-            Tuple of (new_base_sd, zeroed_subspace_vector).
-        """
-        new_sd = self.apply_perturbation(base_sd, flat_subspace)
-        return new_sd, torch.zeros_like(flat_subspace)

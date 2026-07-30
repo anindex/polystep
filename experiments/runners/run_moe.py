@@ -12,7 +12,7 @@ Data: Combined MNIST + Fashion-MNIST (20 classes)
 
 polystep config from r4_sr12t4 config (90.92% at 20ep, seed 42):
   Flat eps=0.5 (eps scheduling -> collapse), scheduled sr 12->4,
-  flat pr=1.0, rank=4, advanced features (biased_rotation, anderson, adaptive_omega).
+  flat pr=1.0, rank=4, biased_rotation.
 
 Results saved as: experiments/results/softmax/main/moe_{method}_{seed}.json
 """
@@ -25,12 +25,10 @@ import os
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Optional
 
 # Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -82,8 +80,6 @@ PSTORCH_CONFIG = {
     "rotation_interval": 0,
     "absorb_interval": 20,
     "biased_rotation": True,
-    "anderson_depth": 0,  # Option 3: ablation showed zero effect on MoE (identical 3-epoch numerics vs depth=5)
-    "adaptive_omega": True,
 }
 
 
@@ -162,8 +158,6 @@ def run_polystep(seed, device, results_dir, epochs=EPOCHS, dry_run=False, audit_
         chunk_size=PSTORCH_CONFIG["chunk_size"],
         amortize_steps=PSTORCH_CONFIG["amortize_steps"],
         biased_rotation=PSTORCH_CONFIG.get("biased_rotation", False),
-        anderson_depth=PSTORCH_CONFIG.get("anderson_depth", 0),
-        adaptive_omega=PSTORCH_CONFIG.get("adaptive_omega", False),
         solver="softmax",
     )
 

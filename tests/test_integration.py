@@ -8,6 +8,8 @@ Tests combinations NOT already covered by test_optimizer.py:
 - Parametric improvements: particle_dim, omega, rank_schedule, adaptive_probes
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn as nn
@@ -21,8 +23,6 @@ from polystep.transform import ParamLayout
 
 
 class TestFeatureInteractions:
-    """Tests for feature combination correctness."""
-
     def test_subspace_with_momentum(self, simple_mlp, make_closure):
         """Subspace + momentum runs 5 steps without crash, produces non-zero velocity."""
         torch.manual_seed(42)
@@ -288,139 +288,108 @@ class TestParticleDimAdaptiveProbes:
 
 
 class TestSinkhornAccelerationComposition:
-    """Composition tests verifying the four knobs work together.
+    """The acceleration knobs must compose, in full space and in a subspace."""
 
-    ``particle_dim`` is full-space mode and ``rank_schedule`` is
-    subspace mode, so we cover both scenarios:
-
-    * Full-space: ``particle_dim=4`` + ``omega=1.5`` + ``adaptive_probes=True``.
-    * Subspace: ``rank_schedule`` + ``omega=1.5`` + ``adaptive_probes=True``.
-    """
-
-    def test_fullspace_composition(self):
-        """Full-space: particle_dim=4 + omega=1.5 + adaptive_probes=True."""
+    def test_full_space_particle_dim_with_omega_and_probe_reuse(self):
+        """particle_dim=4 + adaptive_omega + Anderson + probe reuse still descends."""
         torch.manual_seed(42)
         model = _make_small_model()
-        initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-
+        closure = _make_integration_closure(model)
         opt = PolyStepOptimizer(
             model,
-            particle_dim=4,  # improvement 1
-            adaptive_probes=True,  # improvement 4
+            particle_dim=4,
+            solver="sinkhorn",
+            adaptive_omega=True,
+            anderson_depth=3,
+            adaptive_probes=True,
             epsilon=0.1,
-            max_iterations=50,
             sinkhorn_max_iters=100,
-            compile=False,
             seed=42,
         )
-        opt.solver.omega = 1.5  # improvement 2
+        losses = [opt.step(closure) for _ in range(8)]  # stationary objective, so probe reuse engages
+        assert all(math.isfinite(v) for v in losses), losses
+        assert min(losses) < losses[0], f"no descent under the composed knobs: {losses}"
 
-        closure = _make_integration_closure(model)
-        for step_i in range(5):
-            loss = opt.step(closure)
-            assert torch.isfinite(torch.tensor(loss)), f"Step {step_i}: loss not finite"
-
-        assert opt.state.iteration_count == 5
-
-        # Verify optimization happened (params changed)
-        updated_params = model.state_dict()
-        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
-        assert any_changed, "Full-space composition should produce parameter changes"
-
-        # Verify no NaN in state
-        assert torch.isfinite(opt.state.X).all(), "State X should be finite"
-
-    def test_subspace_composition(self):
-        """Subspace: rank_schedule + omega=1.5 + adaptive_probes=True."""
+    def test_subspace_rank_schedule_with_omega_and_probe_reuse(self):
+        """rank_schedule + adaptive_omega + Anderson + probe reuse survives a rank change."""
         torch.manual_seed(42)
         model = _make_small_model()
-
         layout = ParamLayout.from_module(model)
-        subspace = HybridSubspace.from_layout(layout, rank=2, rotation_interval=0)
-        schedule = RankSchedule(stages=[(0, 2), (3, 4)])  # improvement 3
-
+        subspace = LinearSubspace.from_layout(layout, rank=2)
+        closure = _make_integration_closure(model)
         opt = PolyStepOptimizer(
             model,
             subspace=subspace,
-            rank_schedule=schedule,  # improvement 3
-            adaptive_probes=True,  # improvement 4
-            epsilon=0.1,
-            max_iterations=50,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        opt.solver.omega = 1.5  # improvement 2
-
-        closure = _make_integration_closure(model)
-        for step_i in range(5):
-            loss = opt.step(closure)
-            assert torch.isfinite(torch.tensor(loss)), f"Step {step_i}: loss not finite"
-
-        assert opt.state.iteration_count == 5
-
-        # Verify no NaN in state
-        assert torch.isfinite(opt.state.X).all(), "State X should be finite"
-
-
-class TestTurboBlockwiseRegression:
-    """Regression guard: default parameters produce identical behavior."""
-
-    def test_default_step_is_deterministic(self):
-        """PolyStepOptimizer with default kwargs and a fixed seed produces a
-        finite, reproducible step trajectory over a small model."""
-        torch.manual_seed(42)
-        model = _make_small_model()
-        initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
+            rank_schedule=RankSchedule(stages=[(0, 2), (3, 4)]),
+            solver="sinkhorn",
+            adaptive_omega=True,
+            anderson_depth=3,
+            adaptive_probes=True,
             epsilon=0.1,
             sinkhorn_max_iters=100,
-            compile=False,
+            max_iterations=8,
             seed=42,
         )
+        losses = [opt.step(closure) for _ in range(8)]  # stationary objective, so probe reuse engages
+        assert all(math.isfinite(v) for v in losses), losses
+        assert min(losses) < losses[0], f"no descent across the rank transition: {losses}"
 
-        closure = _make_integration_closure(model)
 
-        # Run 3 steps with default parameters
-        losses = []
-        for _ in range(3):
-            loss = opt.step(closure)
-            losses.append(loss)
-            assert torch.isfinite(torch.tensor(loss))
+def test_default_step_is_deterministic():
+    """PolyStepOptimizer with default kwargs and a fixed seed produces a
+    finite, reproducible step trajectory over a small model."""
+    torch.manual_seed(42)
+    model = _make_small_model()
+    initial_params = {k: v.clone() for k, v in model.state_dict().items()}
 
-        assert opt._particle_dim == 2, "Default particle_dim should be 2"
-        assert opt.solver.omega == 1.0, "Default omega should be 1.0"
-        assert opt._rank_schedule is None, "Default rank_schedule should be None"
-        # Monolithic is where cost-row reuse is implemented, so it is on by default
-        # and the reuse cache is populated after a step.
-        assert opt._adaptive_probes
-        assert opt._prev_X is not None
-        assert opt._prev_cost_matrix is not None
+    opt = PolyStepOptimizer(
+        model,
+        max_iterations=50,
+        epsilon=0.1,
+        sinkhorn_max_iters=100,
+        compile=False,
+        seed=42,
+    )
 
-        # Verify optimization succeeded
-        assert opt.state.iteration_count == 3
-        updated_params = model.state_dict()
-        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
-        assert any_changed, "Default optimization should still update parameters"
+    closure = _make_integration_closure(model)
 
-        # Verify reproducibility (same seed gives same results)
-        torch.manual_seed(42)
-        model2 = _make_small_model()
-        opt2 = PolyStepOptimizer(
-            model2,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        closure2 = _make_integration_closure(model2)
-        losses2 = []
-        for _ in range(3):
-            losses2.append(opt2.step(closure2))
+    # Run 3 steps with default parameters
+    losses = []
+    for _ in range(3):
+        loss = opt.step(closure)
+        losses.append(loss)
+        assert torch.isfinite(torch.tensor(loss))
 
-        for i, (l1, l2) in enumerate(zip(losses, losses2)):
-            assert abs(l1 - l2) < 1e-6, f"Step {i}: losses differ ({l1} vs {l2}), default behavior not reproducible"
+    assert opt._particle_dim == 2, "Default particle_dim should be 2"
+    assert opt.solver.omega == 1.0, "Default omega should be 1.0"
+    assert opt._rank_schedule is None, "Default rank_schedule should be None"
+    # Monolithic is where cost-row reuse is implemented, so it is on by default
+    # and the reuse cache is populated after a step.
+    assert opt._adaptive_probes
+    assert opt._prev_X is not None
+    assert opt._prev_cost_matrix is not None
+
+    # Verify optimization succeeded
+    assert opt.state.iteration_count == 3
+    updated_params = model.state_dict()
+    any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
+    assert any_changed, "Default optimization should still update parameters"
+
+    # Verify reproducibility (same seed gives same results)
+    torch.manual_seed(42)
+    model2 = _make_small_model()
+    opt2 = PolyStepOptimizer(
+        model2,
+        max_iterations=50,
+        epsilon=0.1,
+        sinkhorn_max_iters=100,
+        compile=False,
+        seed=42,
+    )
+    closure2 = _make_integration_closure(model2)
+    losses2 = []
+    for _ in range(3):
+        losses2.append(opt2.step(closure2))
+
+    for i, (l1, l2) in enumerate(zip(losses, losses2)):
+        assert abs(l1 - l2) < 1e-6, f"Step {i}: losses differ ({l1} vs {l2}), default behavior not reproducible"

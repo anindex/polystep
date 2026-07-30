@@ -13,7 +13,9 @@ from typing import Callable
 import torch
 
 from .costs import scale_cost_matrix
-from .solvers._prelude import loss_buffer_dtype, recenter_cost, sanitize_cost
+from .solvers._shared import loss_buffer_dtype, recenter_cost, sanitize_cost, solver_health
+from .epsilon import feed_solver_stats
+from ._step_core import invalidate_for_basis_change
 from .dynamics import (
     apply_momentum,
     compute_momentum_coefficient,
@@ -22,33 +24,40 @@ from .dynamics import (
 )
 from .geometry import apply_biased_rotation, get_random_rotation_matrices
 from .solvers import SinkhornSolver
+from .solvers.greedy import MinCostGreedySolver, TopKMeanSolver
 from .solvers.base import SolverResult
-from .adaptive_subspace import AdaptiveSubspace
-from .hybrid_subspace import HybridSubspace
 from .cma import (
     update_evolution_path_sigma,
     compute_heaviside_sigma,
     update_evolution_path_c,
     update_covariance_diagonal,
-    update_step_size_csa,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P_active, V, K_eff):
+def _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P_active, V, K_eff, mask_dropped=False):
     """Assemble the (P_active*V*K_eff,) loss vector from a screened evaluation.
 
-    Kept vertices carry their full-fidelity values. Dropped vertices carry their
-    cheap-fidelity value plus a per-particle offset, estimated as the mean
-    difference between the two fidelities on the kept vertices of that particle.
-    ``keep_mask`` is (P_active, V): each particle keeps its own vertex set.
+    Kept vertices carry their full-fidelity values. ``keep_mask`` is (P_active, V): each
+    particle keeps its own vertex set.
+
+    What happens to the dropped ones depends on what the solver does with the cost matrix.
+    A weighted mean reads every entry, so a dropped vertex must carry a usable value: its
+    cheap-fidelity value plus a per-particle offset, estimated as the mean difference
+    between the two fidelities on that particle's kept vertices. A SELECTION solver
+    (argmin, top-k) instead reads only the winner, and an imputed value can win, sending
+    the step to a vertex that was never scored at full fidelity. For those solvers the
+    dropped entries are made ineligible instead (``mask_dropped=True``), which is the same
+    ``+inf`` convention ``sanitize_cost`` already uses for a failed evaluation.
     """
     losses = screen_cost.new_empty(P_active * V * K_eff)
     losses[sel_idx] = kept
 
     full_3d = losses.reshape(P_active, V, K_eff)
     mask_3d = keep_mask.unsqueeze(-1)
+    if mask_dropped:
+        return torch.where(mask_3d, full_3d, torch.full_like(full_3d, float("inf"))).reshape(-1)
     # Dropped positions hold uninitialized memory, so zero them before summing
     # rather than weighting them: 0 * inf is NaN.
     full_kept = torch.where(mask_3d, full_3d, torch.zeros_like(full_3d))
@@ -58,6 +67,173 @@ def _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P_active, V, K_
     calibrated = (screen_cost + (full_mean - screen_mean)).unsqueeze(-1).expand(P_active, V, K_eff)
 
     return torch.where(mask_3d, full_3d, calibrated).reshape(-1)
+
+
+def _chunk_spans(n_cand: int, chunk: int, bounds=None):
+    """``(start, end)`` chunks of at most ``chunk``, also breaking at ``bounds``.
+
+    ``bounds`` are candidate indices where a new parameter entry begins. Cutting there
+    keeps every candidate in a chunk inside one entry, which is what lets the
+    site-aware paths resolve a site instead of falling back.
+    """
+    stops = sorted(set(bounds or ()) | {n_cand})
+    start = 0
+    for stop in stops:
+        if stop <= start:
+            continue
+        for chunk_start in range(start, stop, chunk):
+            yield chunk_start, min(chunk_start + chunk, stop)
+        start = stop
+
+
+def _rotation_due(adaptive_sub, iteration: int) -> bool:
+    """Whether the basis rotates on this step.
+
+    The default of 1 rotates every step, matching what the OT solve extracts. Raising
+    it amortizes the absorb plus QR/SVD, which dominate at large ``full_dim``.
+    """
+    interval = getattr(adaptive_sub, "rotation_interval", 1)
+    if interval <= 0:
+        return False
+    return iteration % interval == 0
+
+
+def record_displacement(state, adaptive_sub, pre_step_sub_coords, proj_used) -> None:
+    """Append this step's subspace displacement to the rolling history.
+
+    Stores the full-space image under the current basis: the basis rotates every
+    step, so mapping old coordinates through the latest one misattributes them.
+    """
+    post_step_sub_coords = state.X.reshape(-1)[: adaptive_sub.subspace_dim]
+    displacement = post_step_sub_coords - pre_step_sub_coords
+
+    idx = state.displacement_history_idx
+    state.displacement_history[idx] = displacement
+    # Sparse projections rotate by reseeding, so they never read this history.
+    if isinstance(proj_used, torch.Tensor):
+        if state.displacement_history_full is None:
+            state.displacement_history_full = displacement.new_zeros(
+                adaptive_sub.displacement_history_size, proj_used.shape[0]
+            )
+        state.displacement_history_full[idx] = (proj_used @ displacement.to(proj_used.dtype)).to(
+            state.displacement_history_full.dtype
+        )
+    state.displacement_history_idx = (idx + 1) % adaptive_sub.displacement_history_size
+    state.displacement_history_count = min(
+        state.displacement_history_count + 1,
+        adaptive_sub.displacement_history_size,
+    )
+
+
+def maintain_per_layer_subspace(opt, state, cost_mean: float, pre_step_sub_coords) -> bool:
+    """Displacement tracking, absorb, and rotation for a per-layer subspace.
+
+    Shared with the blockwise step, which otherwise never rotates or absorbs.
+    Returns whether the basis changed, so callers can drop warm-started duals.
+    """
+    if not opt._per_layer_projections:
+        return False
+    hybrid_sub = opt.subspace
+    _basis_before = state.hybrid_projections
+
+    post_step_sub_coords = state.X.reshape(-1)[: hybrid_sub.subspace_dim]
+    displacement = post_step_sub_coords - pre_step_sub_coords
+
+    idx = state.displacement_history_idx
+    state.displacement_history[idx] = displacement
+    state.displacement_history_idx = (idx + 1) % hybrid_sub.displacement_history_size
+    state.displacement_history_count = min(
+        state.displacement_history_count + 1,
+        hybrid_sub.displacement_history_size,
+    )
+
+    should_absorb = hybrid_sub.should_absorb(
+        state.stagnation_count,
+        state.iteration_count,
+    )
+
+    if should_absorb:
+        full_flat_sub = state.X.reshape(-1)[: hybrid_sub.subspace_dim]
+        new_base, _zeroed = hybrid_sub.absorb(
+            state.hybrid_projections,
+            state.base_params,
+            full_flat_sub,
+        )
+        state.base_params = new_base
+        state.X = torch.zeros_like(state.X)
+        # init_projections seeds step=0, so every absorb returns the same basis and the
+        # run stays in one affine subspace. Redrawing instead loses accuracy on SNNs.
+        # absorb_aligned_active biases the new basis toward the window's productive
+        # directions by displacement-SVD.
+        if getattr(hybrid_sub, "absorb_aligned_active", False) and state.displacement_history_count > 0:
+            hist = state.displacement_history[: state.displacement_history_count]
+            svd_ratio = hybrid_sub.get_svd_ratio(state.iteration_count, opt.max_iterations or 1)
+            state.hybrid_projections = hybrid_sub._rotate_all_displacement(
+                state.hybrid_projections,
+                hist,
+                svd_ratio,
+                state.X.device,
+                state.X.dtype,
+                state.iteration_count,
+            )
+        else:
+            state.hybrid_projections = hybrid_sub.init_projections(
+                state.X.device,
+                state.X.dtype,
+            )
+        # Otherwise the fused matrix still holds the pre-absorb basis and candidates get
+        # scored in the old one while _sync_model writes the new. Skipped when the basis
+        # came back by identity, since the fused matrix is a function of it alone.
+        if state.hybrid_projections is not _basis_before and hasattr(hybrid_sub, "build_fused_projection"):
+            hybrid_sub.build_fused_projection(state.hybrid_projections)
+        state.displacement_history.zero_()
+        if state.displacement_history_full is not None:
+            state.displacement_history_full.zero_()
+        state.displacement_history_idx = 0
+        state.displacement_history_count = 0
+        invalidate_for_basis_change(opt, state)
+        state.absorb_count += 1
+        # Else absorb_mode='stagnation' stays triggered on a plateau and redraws every
+        # step; the absorb re-anchors the origin, so the old loss history is void.
+        state.stagnation_count = 0
+        state.prev_loss = cost_mean
+    else:
+        hist = (
+            state.displacement_history[: state.displacement_history_count]
+            if state.displacement_history_count > 0
+            else None
+        )
+        new_projections = hybrid_sub.rotate_all(
+            state.hybrid_projections,
+            step=state.iteration_count,
+            total_steps=opt.max_iterations,
+            displacement_history=hist,
+        )
+        # Only act when projections changed (a rotation happened). With the
+        # default rotation_interval=0 rotate_all returns the same dict, so the
+        # block_diag rebuild below is skipped: it is a full, wasteful rebuild.
+        if new_projections is not state.hybrid_projections:
+            # Re-anchor first: the point is base + P @ coords, so swapping P at non-zero
+            # coords moves the weights with nothing evaluated behind it.
+            state.base_params, _ = hybrid_sub.absorb(
+                state.hybrid_projections,
+                state.base_params,
+                state.X.reshape(-1)[: hybrid_sub.subspace_dim],
+            )
+            state.X = torch.zeros_like(state.X)
+            # Rows are coordinates under the basis being replaced, so the next rotation
+            # would read them through the new projections and learn phantom directions.
+            state.displacement_history.zero_()
+            state.displacement_history_idx = 0
+            state.displacement_history_count = 0
+            invalidate_for_basis_change(opt, state)
+            state.hybrid_projections = new_projections
+            if hasattr(hybrid_sub, "build_fused_projection"):
+                hybrid_sub.build_fused_projection(new_projections)
+    # An absorb re-anchors the origin even when init_projections hands back the same
+    # basis by identity, so identity alone would under-report it and the blockwise
+    # caller would keep duals warm-started against the pre-absorb origin.
+    return should_absorb or state.hybrid_projections is not _basis_before
 
 
 def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = None) -> float:
@@ -78,12 +254,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # Cache the coord->param projection for this step (covariance-scaled for CMA).
     opt._update_sampling_projection()
 
-    # Resolve epsilon and radii
     current_eps = opt._get_epsilon(iteration)
-    # Use CSA sigma or heuristic radius_multiplier
-    if opt.use_csa and state.use_csa:
-        radius_mult = state.sigma
-    elif opt.use_adaptive_radius:
+    if opt.use_adaptive_radius:
         radius_mult = state.radius_multiplier
     else:
         radius_mult = 1.0
@@ -103,12 +275,10 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # Probe-radius jitter (Thm. 4.2 condition (iv); no-op when probe_radius_jitter == 0).
     probe_r = opt._apply_probe_radius_jitter(probe_r)
 
-    # Ensure 2D
     if X.dim() == 1:
         X = X.unsqueeze(0)
     P, pdim = X.shape
 
-    # Move templates to device (cache after first transfer)
     if opt._polytope_vertices.device != device or opt._polytope_vertices.dtype != X.dtype:
         opt._polytope_vertices = opt._polytope_vertices.to(device=device, dtype=X.dtype)
     polytope_verts = opt._polytope_vertices
@@ -118,7 +288,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     V = polytope_verts.shape[0]  # num vertices
     K = probes.shape[0]  # num probes
 
-    # Adaptive probe count: reduce K during exploitation
     K_eff = K  # effective probe count for this step
     if opt.adaptive_num_probe and iteration >= opt._adaptive_probe_warmup:
         # Reduce K once the last 3 OT-step costs are strictly decreasing. Finiteness,
@@ -135,15 +304,12 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             if opt._loss_decreasing_count >= 3:
                 K_eff = 1
 
-    # Select reduced probes if K_eff < K
     if K_eff < K:
         probes = probes[K // 2 : K // 2 + 1]  # center scale, shape (1,)
 
-    # Adaptive probes: decide reuse before generating rotations. Every candidate is
-    # the whole configuration X with one row replaced, so a cached row for particle i
-    # was measured against every other particle's position too. Any particle that moves
-    # invalidates all the rows, not just its own: reuse is all or nothing on X. The
-    # cached rotations come back with it, so the rows still describe the same vertices.
+    # All or nothing on X: a candidate is X with one row replaced, so any particle
+    # moving invalidates every row. _prev_X is where the cached costs were measured, not
+    # the last position, so slow drift cannot reset the budget.
     _can_reuse = (
         opt._adaptive_probes
         and opt._prev_cost_matrix is not None
@@ -165,7 +331,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     if _can_reuse:
         rot_mats = opt._prev_rot_mats
     else:
-        # Generate rotation matrices: (P, pdim, pdim)
         rot_mats = get_random_rotation_matrices(
             P,
             pdim,
@@ -174,7 +339,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             generator=opt._generator,
         )
 
-        # Transport-biased rotation: replace first column with previous OT descent direction
         if (
             opt.biased_rotation
             and opt._prev_descent_direction is not None
@@ -183,7 +347,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         ):
             rot_mats = apply_biased_rotation(rot_mats, opt._prev_descent_direction)
 
-    # Rotate + translate: X_vertices (P, V, pdim), rotated (P, V, pdim)
     X_vertices, rotated = opt._compiled.rotate_and_translate(
         rot_mats,
         polytope_verts,
@@ -191,7 +354,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         step_r,
     )
 
-    # Probe generation: X_probe (P, V, K, pdim)
     X_probe = opt._compiled.compute_probe_points(
         X,
         rotated,
@@ -199,24 +361,23 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         probe_r,
     )
 
-    # Build full model configs and evaluate cost
     # For each (i, v, k), construct a full (P, pdim) config with row i
     # replaced by X_probe[i, v, k]. Then unflatten to params and evaluate.
 
     # The configuration has not moved since the cached matrix was measured, so every
     # row still describes its vertices. Zero forwards this step.
+    _evals_this_step = 0
     if _can_reuse:
-        cost_matrix = opt._prev_cost_matrix.clone()
+        # An alias, not a copy: no consumer writes into the cost matrix. Every downstream
+        # operation (recenter, scale, prepare_cost) allocates a fresh tensor, and this
+        # path deliberately skips sanitize because the cached matrix is already sanitized.
+        cost_matrix = opt._prev_cost_matrix
     else:
         # More efficient: process all probes for each particle in a batch
-        # Total evaluations: P_active * V * K_eff. Each builds full config (P, pdim)
-        # flattened to (padded_size,), then batch-unflattened.
-        #
-        # Strategy: process in chunks to control memory.
-        # Build indices for all (active_i, v, k) combinations.
+        # Every (particle, vertex, probe) candidate, evaluated in chunks to bound memory.
         total_evals = P_active * V * K_eff
+        _evals_this_step = total_evals
 
-        # Cache subspace info for the loop
         _is_subspace = opt.subspace is not None
         _sub_dim = state.subspace.subspace_dim if _is_subspace else 0
 
@@ -237,29 +398,64 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # every layer but that one holds the shared base weight and the per-candidate
         # bmm is unnecessary. Needs the evaluator's data, same as the in-place path.
         _sparse_delta = getattr(opt, "_sparse_delta_evaluator", None) if not _is_subspace else None
-        if _sparse_delta is not None:
+        # Same locality argument with no module-set assumption, so it covers the models
+        # and the chunks the sparse-delta path declines.
+        _site_vmap = getattr(opt, "_site_vmap_evaluator", None) if not _is_subspace else None
+        _pdim_arange = torch.arange(pdim, device=device)
+        if _sparse_delta is not None or _site_vmap is not None:
             _base_sd = opt.layout.unflatten(X)
-            _pdim_arange = torch.arange(pdim, device=device)
 
-        # Two-stage multi-fidelity screening. Requires a cheap closure from the
-        # caller; without one there is no cheaper way to rank directions, so the
-        # feature degrades to the post-hoc reweighting below (which saves nothing).
-        # The quadratic-model consumers need a full (P, V, K) loss tensor measured at
-        # a single fidelity, so screening stays off whenever one of them is active.
+        # Needs a cheap closure from the caller; without one there is no cheaper way to
+        # rank directions. Off whenever a quadratic-model consumer is active: those need
+        # a full (P, V, K) loss tensor at a single fidelity.
         _fused_inputs = getattr(opt, "_fused_inputs", None)
         _fused_targets = getattr(opt, "_fused_targets", None)
-        screen_inputs, screen_targets = opt._screen_data(_use_fused_inplace)
+        # Every path reading the registered batch needs the sliced copy, or stage one
+        # runs at full fidelity while the accounting below charges screen_fidelity.
+        _subspace_delta = getattr(opt, "_subspace_delta_evaluator", None) if opt._hybrid else None
+        # The same site argument in coordinate space, for the models the delta path
+        # declines: a per-layer block maps to one parameter, so only that one is batched.
+        _subspace_site = getattr(opt, "_site_vmap_evaluator", None) if opt._hybrid else None
+        _bary_sd = None
+        if _fused_inputs is not None and (_subspace_delta is not None or _subspace_site is not None):
+            _bary_sd = state.subspace.apply_perturbation(
+                state.hybrid_projections,
+                state.base_params,
+                X.reshape(-1)[:_sub_dim],
+            )
+            _bary_coords = X.reshape(-1)[:_sub_dim]
+        else:
+            _subspace_delta = _subspace_site = None
+            _bary_coords = None
+
+        _evaluator_native = (
+            _use_fused_inplace
+            or _sparse_delta is not None
+            or _factored_eval is not None
+            or _subspace_delta is not None
+            or _subspace_site is not None
+        )
+        # At K_eff == 1 the curvature regression has nothing to regress on, so the
+        # quadratic model buys a shared f(X) per particle instead of a second scale.
+        _center_wanted = (
+            K_eff == 1
+            and opt.use_quadratic_model
+            and (opt.biased_rotation or opt.trust_region)
+            and opt.polytope_type == "orthoplex"
+        )
+        screen_inputs, screen_targets = opt._screen_data(_evaluator_native)
+        # A selection solver reads only the winner, so its screen ranks vertices by their own
+        # screened cost and never touches an antithetic partner. That is what lets it run on
+        # any polytope; the contrast-ranked branch below still needs the orthoplex's pairing.
+        _selection_solver = isinstance(opt.solver, (MinCostGreedySolver, TopKMeanSolver))
         _screen_ready = (
             opt.multifidelity_screen
             and screen_closure is not None
-            and opt.polytope_type == "orthoplex"
-            and V == 2 * pdim
+            and (_selection_solver or (opt.polytope_type == "orthoplex" and V == 2 * pdim))
             and opt.screen_keep_ratio < 1.0
             and not (opt.use_quadratic_model or opt._newton_refinement or opt.trust_region)
-            # Stage one costs P_active*V forwards on screen_fidelity of the data,
-            # stage two keep_ratio * P_active*V*K_eff full ones, against a dense
-            # budget of P_active*V*K_eff. Only pays when
-            # screen_fidelity/K_eff + keep_ratio < 1.
+            # Stage one is P_active*V cheap forwards, stage two keep_ratio of the dense
+            # P_active*V*K_eff. Only pays when screen_fidelity/K_eff + keep_ratio < 1.
             and opt.screen_fidelity / K_eff + opt.screen_keep_ratio < 1.0
         )
         if opt.multifidelity_screen and not _screen_ready and not getattr(opt, "_screen_warned", False):
@@ -267,22 +463,24 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             warnings.warn(
                 "multifidelity_screen=True but the screen did not run, so no forward "
                 "evaluations are saved this step. It needs a cheap screen_closure passed "
-                "to step() (api.train builds one), polytope_type='orthoplex', "
-                "screen_fidelity/num_probe + screen_keep_ratio < 1 (above that the screen "
-                "costs more work than it saves), and none of use_quadratic_model / "
-                "newton_refinement / trust_region enabled.",
+                "to step() (api.train builds one), screen_fidelity/num_probe + "
+                "screen_keep_ratio < 1 (above that the screen costs more work than it "
+                "saves), none of use_quadratic_model / newton_refinement / trust_region "
+                "enabled, and either polytope_type='orthoplex' or a selection solver "
+                "(min_cost_greedy / top_k_mean), whose screen ranks vertices directly and "
+                "so needs no antithetic pairing.",
                 stacklevel=3,
             )
 
-        # Budget on what a candidate actually allocates: the config tensor, a full weight
-        # set when a subspace runs without the fused or factored path, and the vmap
-        # activations. Counting configs alone missed the other two and peaked at 1.6 GB
-        # full-space / 10 GB subspace on a 120k-param model. Chunking only splits the
-        # loop, so results are unchanged.
+        # Budget on what a candidate allocates: the config tensor, a full weight set
+        # when a subspace runs without the fused or factored path, and the vmap
+        # activations. Chunking only splits the loop, so results are unchanged.
         if opt.chunk_size:
             chunk = opt.chunk_size
         else:
             per_candidate = max(1, X.numel())  # P * pdim
+            # The delta path is picked per chunk and any chunk can straddle a coordinate
+            # block and fall back, so the budget still has to cover a materialized chunk.
             if _is_subspace and not _use_fused_inplace and _factored_eval is None:
                 per_candidate += opt.layout.total_params
             if _fused_inputs is not None and opt.layout.entries:
@@ -290,40 +488,78 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 per_candidate += _fused_inputs.shape[0] * widest
             chunk = min(total_evals, max(1, (1 << 26) // per_candidate))
 
-        # These are shape-determined and fully overwritten each step, so they are cached
-        # on the optimizer and reused across steps rather than reallocated. The config
-        # buffer stays None until a chunk actually needs it: a step the sparse-delta path
-        # covers end to end never builds a candidate config at all.
+        _group = V * K_eff
+        _site_bounds = None
+        if _subspace_delta is not None or _sparse_delta is not None or _site_vmap is not None or _subspace_site:
+            # Every site-aware path groups a chunk by particle, so a chunk holds whole
+            # groups of V*K_eff candidates. A ragged chunk would split one particle's
+            # group across two calls and misalign the (G, C, pdim) reshape.
+            chunk = max(_group, (chunk // _group) * _group)
+        # A site-aware path needs every candidate in the chunk inside one parameter, so
+        # the chunk loop breaks where the sites do. Otherwise a chunk spans several,
+        # resolves to no site, and the whole sweep materializes.
+        if _sparse_delta is not None or _site_vmap is not None:
+            _starts = [e.offset for e in opt.layout.entries]
+        elif _subspace_delta is not None or _subspace_site is not None:
+            _starts = [s.flat_start for s in state.subspace.specs]
+        else:
+            _starts = []
+        if _starts:
+            # Sites do not land on particle boundaries, so each start contributes its own
+            # group and the next. That isolates the straddling particle in its own chunk.
+            _site_bounds = sorted(
+                {min(b, total_evals) for s in _starts for b in ((s // pdim) * _group, -(-s // pdim) * _group)}
+            )
+
+        # Shape-determined and fully overwritten each step, so cached on the optimizer.
+        # The config buffer stays None until a chunk needs it; a step the sparse-delta
+        # path covers end to end never builds one.
         _loss_dtype = loss_buffer_dtype(X.dtype)
-        _buf_key = (total_evals, chunk, X.shape[0], X.shape[1], device, X.dtype)
+        _buf_key = (total_evals, chunk, V, K_eff, X.shape[0], X.shape[1], device, X.dtype)
         _bufs = getattr(opt, "_step_buffers", None)
         if _bufs is None or _bufs[0] != _buf_key:
+            _all = torch.arange(total_evals, device=device)
+            # The (i, v, k) candidate list is a pure function of the key, so it is built
+            # with the buffers rather than recomputed from integer division every step.
+            _vk = _all % (V * K_eff)
             _bufs = [
                 _buf_key,
                 torch.empty(total_evals, dtype=_loss_dtype, device=device),
                 None,
                 torch.arange(chunk, device=device) if chunk <= total_evals else None,
-                torch.arange(total_evals, device=device),
+                _all // (V * K_eff),
+                _vk // K_eff,
+                _vk % K_eff,
             ]
             opt._step_buffers = _bufs
-        _, losses, _, _local_range_full, _all_indices = _bufs
+        _, losses, _, _local_range_full, _i_all, _v_all, _k_all = _bufs
         _configs_wanted = chunk <= total_evals
 
-        def _evaluate_candidates(i_all, v_all, k_all, closure_fn, fused_inputs, fused_targets, out):
+        def _evaluate_candidates(
+            i_all,
+            v_all,
+            k_all,
+            closure_fn,
+            fused_inputs,
+            fused_targets,
+            out,
+            sanitize=True,
+            dense=False,
+            probes_src=None,
+        ):
             """Evaluate an explicit list of (particle, vertex, probe) candidates.
 
-            The candidate list is explicit rather than a dense range so the
-            multi-fidelity screen below can evaluate a *subset* of vertices; the
-            unscreened path passes the full dense list and behaves exactly as before.
+            The list is explicit rather than a dense range so the multi-fidelity
+            screen can evaluate a subset of vertices. ``dense`` marks the full list,
+            whose particle-major grouping both delta paths need; a screened subset has
+            no such grouping.
             """
+            probe_src = X_probe if probes_src is None else probes_src
             n_cand = i_all.shape[0]
-            # Rows the previous chunk perturbed in the cached buffer. Each candidate
-            # differs from X in one row, so restoring those costs O(chunk * pdim)
-            # against O(chunk * P * pdim) for a full copy. None means the buffer is
-            # not ours yet and needs the full copy first.
+            # Rows the previous chunk dirtied. Restoring just those is O(chunk * pdim)
+            # against O(chunk * P * pdim) for a full copy. None means copy it all first.
             dirty_rows = None
-            for chunk_start in range(0, n_cand, chunk):
-                chunk_end = min(chunk_start + chunk, n_cand)
+            for chunk_start, chunk_end in _chunk_spans(n_cand, chunk, _site_bounds if dense else None):
                 chunk_size_actual = chunk_end - chunk_start
 
                 i_idx = i_all[chunk_start:chunk_end]
@@ -334,21 +570,74 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 # contiguous run inside a single parameter, so all the other layers
                 # keep the shared base weight and no candidate config is built at all.
                 _site = None
-                if _sparse_delta is not None and fused_inputs is not None:
+                if (_sparse_delta is not None or _site_vmap is not None) and fused_inputs is not None:
+                    # Perturbed positions follow the particle, so the particle-major list
+                    # gathers once per group. A screened chunk has no grouping.
                     _offsets = i_idx * pdim
-                    _site = _sparse_delta.resolve_site(_offsets, pdim)
+                    _cand = _group if dense else 1
+                    _span = (
+                        ((chunk_start // _group) * pdim, ((chunk_end - 1) // _group) * pdim + pdim) if dense else None
+                    )
+                    _owner = _sparse_delta if _sparse_delta is not None else _site_vmap
+                    _site = _owner.resolve_site(_offsets, pdim, _span)
+                    if _site is None and _sparse_delta is not None and _site_vmap is not None:
+                        # The sparse-delta correction is confined to Linear layers; the
+                        # site-aware vmap still shares the graph ahead of any entry.
+                        _owner = _site_vmap
+                        _site = _site_vmap.resolve_site(_offsets, pdim, _span)
                 if _site is not None:
-                    out[chunk_start:chunk_end] = _sparse_delta.evaluate(
-                        _base_sd,
-                        _site.key,
-                        _offsets.unsqueeze(1) + _pdim_arange - _site.offset,
-                        X_probe[i_idx, v_idx, k_idx],
-                        fused_inputs,
-                        fused_targets,
+                    _local_idx = _offsets[::_cand].unsqueeze(1) + _pdim_arange - _site.offset
+                    _values = probe_src[i_idx, v_idx, k_idx].reshape(chunk_size_actual // _cand, _cand, pdim)
+                    _key = _site if _owner is _site_vmap else _site.key
+                    out[chunk_start:chunk_end] = _owner.evaluate(
+                        _base_sd, _key, _local_idx, _values, fused_inputs, fused_targets
                     ).to(out.dtype)
                     continue
 
-                # Reuse pre-allocated buffer when chunk size matches, otherwise allocate
+                # Subspace delta path. The dense list is particle-major, so this chunk
+                # covers groups [chunk_start // C, chunk_end // C) and its coordinate
+                # span follows from arithmetic, with no read back from the device.
+                if _subspace_delta is not None and dense and fused_inputs is not None:
+                    _g0, _g1 = chunk_start // _group, chunk_end // _group
+                    _spec = _subspace_delta.resolve_site(state.subspace, _g0 * pdim, _g1 * pdim, _sub_dim)
+                    if _spec is not None:
+                        _d = (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(_g1 - _g0, _group, pdim)
+                        out[chunk_start:chunk_end] = _subspace_delta.evaluate(
+                            state.subspace,
+                            state.hybrid_projections,
+                            _bary_sd,
+                            _spec,
+                            _g0 * pdim - _spec.flat_start,
+                            _d,
+                            fused_inputs,
+                            fused_targets,
+                        ).to(out.dtype)
+                        continue
+
+                # Same locality in coordinate space, for a model the delta path declines:
+                # build only the one perturbed parameter and share the rest.
+                if _subspace_site is not None and dense and fused_inputs is not None:
+                    _g0, _g1 = chunk_start // _group, chunk_end // _group
+                    _spec = _subspace_site.resolve_spec(state.subspace, _g0 * pdim, _g1 * pdim, _sub_dim)
+                    if _spec is not None:
+                        # An offset from the barycentre, which _bary_sd already carries.
+                        _dcoords = probe_src.new_zeros(chunk_size_actual, _spec.flat_end - _spec.flat_start)
+                        _cols = (
+                            torch.arange(_g0, _g1, device=device).unsqueeze(1) * pdim + _pdim_arange
+                        ).repeat_interleave(_group, dim=0).reshape(chunk_size_actual, pdim) - _spec.flat_start
+                        _dcoords.scatter_(
+                            1, _cols, (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(chunk_size_actual, pdim)
+                        )
+                        out[chunk_start:chunk_end] = _subspace_site.evaluate_subspace(
+                            state.hybrid_projections,
+                            _bary_sd,
+                            _spec,
+                            _dcoords,
+                            fused_inputs,
+                            fused_targets,
+                        ).to(out.dtype)
+                        continue
+
                 if _configs_wanted and chunk_size_actual == chunk:
                     local_range = _local_range_full
                     if _bufs[2] is None:
@@ -365,19 +654,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 else:
                     batch_configs = X.unsqueeze(0).expand(chunk_size_actual, -1, -1).clone()
                     local_range = torch.arange(chunk_size_actual, device=device)
-                batch_configs[local_range, i_idx] = X_probe[i_idx, v_idx, k_idx]
+                batch_configs[local_range, i_idx] = probe_src[i_idx, v_idx, k_idx]
 
-                # Flatten each config to (padded_size,)
                 flat_configs = batch_configs.reshape(chunk_size_actual, -1)
-                # flat_configs: (chunk_size, P * pdim)
 
                 if _use_fused_inplace and _is_subspace and opt._hybrid:
-                    # Fused path (EGGROLL-inspired): reconstruct + forward one
-                    # config at a time via in-place weight swap. Never materializes
-                    # the full (N, *param_shape) stacked dict. Memory: O(1 x activation).
+                    # EGGROLL-inspired: one config at a time via in-place weight swap,
+                    # never the full (N, *param_shape) stack. Memory O(1 x activation).
                     flat_sub = flat_configs[:, :_sub_dim]
-                    if opt._mixed_precision and getattr(state, "projection", None) is not None:
-                        flat_sub = flat_sub.to(dtype=state.projection.dtype)
                     chunk_losses = opt._cost_evaluator.evaluate_subspace_inplace(
                         state.subspace,
                         state.hybrid_projections,
@@ -396,7 +680,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                         fused_targets,
                     )
                 elif _is_subspace:
-                    # Subspace mode: reconstruct full params from subspace coords
                     flat_sub = flat_configs[:, :_sub_dim]
                     if opt._mixed_precision and state.projection is not None:
                         flat_sub = flat_sub.to(dtype=state.projection.dtype)
@@ -419,7 +702,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                         )
                     chunk_losses = closure_fn(chunk_params)
                 else:
-                    # Trim to layout padded_size if needed
                     layout_flat = opt.layout.padded_size
                     if flat_configs.shape[1] >= layout_flat:
                         flat_for_layout = flat_configs[:, :layout_flat]
@@ -433,30 +715,25 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
 
                 out[chunk_start:chunk_end] = chunk_losses.to(out.dtype)
 
-            # Sanitize over every candidate at once, not per chunk: the +inf penalty is
-            # 2*max|finite|+1 of whatever it is handed, so a per-chunk penalty can rank
-            # an infeasible vertex above a legitimate expensive one from another chunk.
-            # Doing it here also keeps NaN out of the quadratic model, which reads these.
-            out.copy_(sanitize_cost(out))
+            # Over every candidate at once, not per chunk: the penalty is
+            # 2*max|finite|+1 of what it is handed, so a per-chunk one could rank an
+            # infeasible vertex above an expensive-but-legal vertex from another chunk.
+            if sanitize:
+                out.copy_(sanitize_cost(out))
             return out
 
-        # Dense candidate list, computed once per step: (i, v, k) in the row-major
-        # order the reshape below expects.
-        _i_all = _all_indices // (V * K_eff)
-        _vk_all = _all_indices % (V * K_eff)
-        _v_all = _vk_all // K_eff
-        _k_all = _vk_all % K_eff
-
         if not _screen_ready:
-            _evaluate_candidates(_i_all, _v_all, _k_all, closure, _fused_inputs, _fused_targets, losses)
+            _evaluate_candidates(_i_all, _v_all, _k_all, closure, _fused_inputs, _fused_targets, losses, dense=True)
         else:
             # Stage 1: rank every direction on the cheap fidelity, one probe scale.
             # Cost: P_active * V forwards on a fraction of the data.
             k_center = K_eff // 2
+            _center = _k_all == k_center
+            _i_center = _i_all[_center]
             screen_flat = _evaluate_candidates(
-                _i_all[_k_all == k_center],
-                _v_all[_k_all == k_center],
-                torch.full_like(_i_all[_k_all == k_center], k_center),
+                _i_center,
+                _v_all[_center],
+                torch.full_like(_i_center, k_center),
                 screen_closure,
                 screen_inputs,
                 screen_targets,
@@ -464,18 +741,26 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             )
             screen_cost = screen_flat.reshape(P_active, V)
 
-            # Stage 2: keep the highest-contrast antithetic pairs and spend the full
-            # fidelity only on those. Both signs of a direction are kept together so
-            # the orthoplex stays antithetic. Ranked per particle: each carries its own
-            # rotation, so vertex index j is a different direction in every row and a
-            # contrast averaged down the rows would rank noise.
-            pdim_local = V // 2
-            contrast = (screen_cost[:, :pdim_local] - screen_cost[:, pdim_local:]).abs()
-            keep_k = max(1, min(pdim_local, int(round(pdim_local * opt.screen_keep_ratio))))
-            keep_dirs = torch.topk(contrast, keep_k, dim=1).indices  # (P_active, keep_k)
+            # Stage 2: full fidelity only where it can still matter. Ranked per particle:
+            # each carries its own rotation, so vertex j is a different direction in every
+            # row and a statistic averaged down the rows would rank noise.
             keep_mask = torch.zeros(P_active, V, dtype=torch.bool, device=device)
-            keep_mask.scatter_(1, keep_dirs, True)
-            keep_mask.scatter_(1, keep_dirs + pdim_local, True)
+            if _selection_solver:
+                # Selection rules need no antithetic pairing, hence no orthoplex here.
+                # TopKMeanSolver averages min(k, V) vertices, so keeping fewer would feed
+                # it screen-ineligible entries carrying the sanitize penalty.
+                keep_v = max(1, min(V, int(round(V * opt.screen_keep_ratio))), min(getattr(opt.solver, "k", 1), V))
+                keep_idx = torch.topk(screen_cost, keep_v, dim=1, largest=False).indices
+                keep_mask.scatter_(1, keep_idx, True)
+            else:
+                # A weighted mean is moved by the contrast between antithetic partners, so
+                # rank directions by that and keep both signs of each.
+                pdim_local = V // 2
+                contrast = (screen_cost[:, :pdim_local] - screen_cost[:, pdim_local:]).abs()
+                keep_k = max(1, min(pdim_local, int(round(pdim_local * opt.screen_keep_ratio))))
+                keep_dirs = torch.topk(contrast, keep_k, dim=1).indices  # (P_active, keep_k)
+                keep_mask.scatter_(1, keep_dirs, True)
+                keep_mask.scatter_(1, keep_dirs + pdim_local, True)
 
             sel_idx = torch.nonzero(keep_mask[_i_all, _v_all], as_tuple=True)[0]
             kept = _evaluate_candidates(
@@ -486,18 +771,29 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 _fused_inputs,
                 _fused_targets,
                 X_probe.new_empty(sel_idx.numel(), dtype=_loss_dtype),
+                sanitize=False,
             )
 
-            # The two fidelities estimate the same loss on different data, so they
-            # sit at different levels. Offset the dropped entries by the per-particle
-            # difference measured on the kept vertices, or the OT solve would rank
-            # vertices by which fidelity they came from rather than by cost.
-            losses = _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P_active, V, K_eff)
-            # Screen forwards see only screen_fidelity of the data, so weight them
-            # rather than counting them as full evaluations.
-            opt._last_screen_savings = 1.0 - (sel_idx.numel() + opt.screen_fidelity * P_active * V) / max(
-                1, total_evals
+            # The two fidelities sit at different levels. Offset the dropped entries by
+            # the per-particle difference on the kept ones, or the solve ranks by
+            # fidelity rather than by cost.
+            losses = _fill_screened_losses(
+                screen_cost, kept, sel_idx, keep_mask, P_active, V, K_eff, mask_dropped=_selection_solver
             )
+            # One penalty over the merged population. Sanitizing the screen and the kept
+            # vector separately gives them different 2*max|finite|+1 substitutes, which
+            # then get compared against each other in the same cost matrix.
+            losses = sanitize_cost(losses)
+            # Screen forwards see part of the data, so weight them rather than counting
+            # them whole. Use the realized slice when the batch is in hand; a
+            # closure-only screen has none, so fall back to the configured fraction.
+            _fidelity = (
+                screen_inputs.shape[0] / _fused_inputs.shape[0]
+                if screen_inputs is not None and _fused_inputs is not None
+                else opt.screen_fidelity
+            )
+            _evals_this_step = sel_idx.numel() + _fidelity * P_active * V
+            opt._last_screen_savings = 1.0 - _evals_this_step / max(1, total_evals)
             logger.debug(
                 "multifidelity_screen: %d/%d full-fidelity forwards + %d screen forwards",
                 sel_idx.numel(),
@@ -506,38 +802,60 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             )
 
         if K_eff == 1:
-            # K=1 fast path: no averaging needed
             cost_matrix = losses.reshape(P, V)
             if opt.use_quadratic_model:
                 # clone: `losses` is the persistent step buffer, so a view would
                 # silently become the *next* step's values.
-                opt._prev_losses_3d = losses.reshape(P, V, 1).detach().clone()
+                opt._losses_3d = losses.reshape(P, V, 1).detach().clone()
+                # One centre per particle replaces the second probe scale the
+                # regression needs: P extra evaluations against P*V.
+                opt._center_loss = None
+                if _center_wanted:
+                    _range_P = torch.arange(P, device=device)
+                    _zeros_P = torch.zeros_like(_range_P)
+                    opt._center_loss = _evaluate_candidates(
+                        _range_P,
+                        _zeros_P,
+                        _zeros_P,
+                        closure,
+                        _fused_inputs,
+                        _fused_targets,
+                        X.new_empty(P, dtype=_loss_dtype),
+                        probes_src=X.reshape(P, 1, 1, -1),
+                    ).detach()
         else:
             losses_3d_full = losses.reshape(P, V, K_eff)
             cost_matrix = losses_3d_full.mean(dim=-1)  # (P, V)
+            opt._center_loss = None
             if opt.use_quadratic_model:
                 # clone: `losses` is the persistent step buffer, so a view would
                 # silently become the *next* step's values.
-                opt._prev_losses_3d = losses_3d_full.detach().clone()
+                opt._losses_3d = losses_3d_full.detach().clone()
 
-    # Sanitize cost (FP32 promote + finite penalty), branch-free / no host sync.
-    # Protects the downstream trust-region / multifidelity readers and BOTH
-    # solver paths: the fused softmax scales this same sanitized tensor.
-    cost_matrix = sanitize_cost(cost_matrix)
+    # No sanitize here: `losses` was sanitized per chunk and a mean of finite
+    # values is finite, and the reuse path holds an already-sanitized matrix.
 
     # Raw cost for next step's contrast/trust-region baseline; dampening below
     # only shapes the current OT solve.
     raw_cost_matrix = cost_matrix
 
-    # Deferred trust-region update: the cost matrix at this step is evaluated
-    # at the particle position produced by the *previous* step. Comparing the
-    # prediction stored on the previous step against this step's pre-OT min cost
-    # gives a real predicted-vs-actual reduction ratio.
-    if opt.trust_region and opt._prev_predicted_improvement is not None and opt._prev_pre_step_loss is not None:
-        current_loss_proxy = cost_matrix.min(dim=1).values.mean().item()
+    # Deferred: this step's cost matrix is measured at the position the previous step
+    # produced, so comparing it against that step's prediction gives a real ratio.
+    # Both ends must use the same estimator, so a step that has a centre and one that
+    # does not are never compared.
+    _center_now = opt._center_loss is not None
+    if (
+        opt.trust_region
+        and opt._prev_predicted_improvement is not None
+        and opt._prev_pre_step_loss is not None
+        and _center_now == opt._prev_loss_from_center
+    ):
+        # f(X) where available. The fallback proxy is min-over-vertices under a fresh
+        # random rotation, so it moves between steps even at a fixed point.
+        current_loss = opt._center_loss.mean().item() if _center_now else cost_matrix.min(dim=1).values.mean().item()
         # Sign convention matches update_trust_region and predicted improvement:
         # negative means loss decreased.
-        actual_improvement = torch.tensor([current_loss_proxy - opt._prev_pre_step_loss])
+        actual_improvement = torch.tensor([current_loss - opt._prev_pre_step_loss])
         from .quadratic_model import update_trust_region
 
         opt._trust_region_multiplier = update_trust_region(
@@ -554,18 +872,15 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     ent_eps = opt._get_ent_epsilon(iteration)
     ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
-    # If the schedule jumped epsilon by more than 2x in one step,
-    # invalidate the dual-momentum history. prev_prev_f / prev_prev_g
-    # were computed at the old epsilon; extrapolating across a big
-    # epsilon change pushes the warm-start far from the new fixed
-    # point and the next solve has to undo the bad init.
+    # A >2x epsilon jump invalidates the dual-momentum history: prev_prev_f/g were
+    # measured at the old epsilon, and extrapolating across the jump lands the warm
+    # start far from the new fixed point.
     if state.last_solve_eps is not None and (
         ot_epsilon / state.last_solve_eps > 2.0 or state.last_solve_eps / ot_epsilon > 2.0
     ):
         state.prev_prev_f = None
         state.prev_prev_g = None
 
-    # Dual potential momentum: extrapolate warm-start duals
     init_f_for_solve = state.f
     init_g_for_solve = state.g
     if (
@@ -577,17 +892,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         beta = opt._dual_momentum_beta
         init_f_for_solve = state.f + beta * (state.f - state.prev_prev_f)
         init_g_for_solve = state.g + beta * (state.g - state.prev_prev_g)
-        # Clamp to prevent overflow (same bounds as warm-start validation)
-        max_abs = 80.0 * max(ot_epsilon, 0.01)
-        init_f_for_solve = init_f_for_solve.clamp(-max_abs, max_abs)
-        init_g_for_solve = init_g_for_solve.clamp(-max_abs, max_abs)
+        # No clamp here: SinkhornSolver bounds any warm start it is handed by
+        # 10 * max|C_scaled| and zeroes a non-finite one. Duals scale with cost
+        # magnitude, so an epsilon-scaled bound truncated valid extrapolations.
 
     opt.solver.epsilon = ot_epsilon
     if opt._use_fused_softmax:
-        # Fused path: softmax + vertex-free projection in one compiled call
-        # Scale the cost outside the compiled kernel so every scale_cost mode
-        # ('mean'/'max_cost'/float/None) matches the non-fused solvers; the
-        # kernel then runs on the already-scaled cost (scale_cost_mean=False).
+        # Fused softmax + vertex-free projection. Scale outside the kernel so every
+        # scale_cost mode matches the non-fused solvers.
         scaled_cost = scale_cost_matrix(recenter_cost(cost_matrix)[0], opt.scale_cost)
         X_new_fused, transport_matrix = opt._compiled.fused_softmax_project(
             scaled_cost,
@@ -610,10 +922,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             ent_reg_cost=0.0,
         )
     else:
-        # Forward the previous solve's epsilon so SinkhornSolver
-        # can rescale the warm-started duals when epsilon changed.
-        # a defaults to uniform 1/P inside the solver, which equals state.a; pass
-        # None so the solver skips the host-syncing user-marginal validation.
+        # prev_epsilon lets the solver rescale warm-started duals across an epsilon
+        # change. a=None takes the solver's uniform 1/P and skips a host sync.
         solve_kwargs = dict(
             cost_matrix=cost_matrix,
             init_f=init_f_for_solve,
@@ -625,17 +935,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         ot_result = opt.solver.solve(**solve_kwargs)
     state.last_solve_eps = ot_epsilon
 
-    # Update progressive epsilon from solver stats. Skip in fixed-iteration
-    # Sinkhorn mode (threshold <= 0): there the solver always returns
-    # converged=True with n_iters == max_iterations, so the ratio is 1.0 and the
-    # increase branch would push epsilon to max_epsilon every step. Progressive
-    # epsilon is only paired with SinkhornSolver, so threshold always exists.
-    if opt._progressive_epsilon is not None and getattr(opt.solver, "threshold", 1.0) > 0:
-        opt._progressive_epsilon.update(
-            n_iters=ot_result.n_iters,
-            max_iterations=getattr(opt.solver, "max_iterations", 1),
-            converged=ot_result.converged,
-        )
+    feed_solver_stats(opt._progressive_epsilon, opt.solver, ot_result.n_iters, ot_result.converged)
 
     # Save pre-step subspace coords for AdaptiveSubspace displacement
     # history and CMA evolution paths. Declared here, populated conditionally.
@@ -647,24 +947,37 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         sub_dim = opt.subspace.subspace_dim
         _pre_step_sub_coords = state.X.reshape(-1)[:sub_dim].clone()
 
-    # Compute rotation bias direction
     # The finite-difference model feeds two independent features: biased_rotation
     # (descent/Newton directions) and trust_region (predicted-vs-actual ratio), so it
     # is built whenever either is active.
+    _center_loss = getattr(opt, "_center_loss", None)
+    if _center_loss is not None and _center_loss.shape != (P,):
+        _center_loss = None
     _quad_ready = (
         opt.use_quadratic_model
-        and opt._prev_losses_3d is not None
-        and K_eff >= 2
-        and opt._prev_losses_3d.shape == (P, V, K_eff)
+        and opt._losses_3d is not None
+        and (K_eff >= 2 or _center_loss is not None)
+        and opt._losses_3d.shape == (P, V, K_eff)
         and opt.polytope_type == "orthoplex"  # FD extractors assume orthoplex vertex order
     )
     _fd_grad = _fd_hess = None
+    if not _quad_ready:
+        # Stale otherwise: adaptive_num_probe can drop K_eff to 1 mid-run, and the
+        # amortized step prefers this direction over the transport EMA.
+        opt._newton_direction = None
     if (opt.biased_rotation or opt.trust_region) and _quad_ready:
-        from .quadratic_model import compute_newton_step, extract_fd_gradient, extract_fd_hessian_diag
+        from .quadratic_model import (
+            compute_newton_step,
+            extract_fd_gradient,
+            extract_fd_hessian_diag,
+            extract_fd_hessian_diag_centered,
+        )
 
-        # FD gradient and diagonal Hessian in the rotated frame.
-        _fd_grad = extract_fd_gradient(opt._prev_losses_3d, probes, probe_r, pdim)  # (P, pdim)
-        _fd_hess = extract_fd_hessian_diag(opt._prev_losses_3d, probes, probe_r, pdim)  # (P, pdim)
+        _fd_grad = extract_fd_gradient(opt._losses_3d, probes, probe_r, pdim)  # (P, pdim)
+        if _center_loss is not None:
+            _fd_hess = extract_fd_hessian_diag_centered(opt._losses_3d, probes, probe_r, pdim, _center_loss)
+        else:
+            _fd_hess = extract_fd_hessian_diag(opt._losses_3d, probes, probe_r, pdim)  # (P, pdim)
 
         if opt.biased_rotation:
             # Descent direction = negative gradient in original space (rot_mats @ .).
@@ -675,7 +988,18 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             newton_orig = torch.einsum("bij,bj->bi", rot_mats, newton_rot)
             opt._newton_direction = newton_orig.detach()
     elif opt.biased_rotation:
-        # Fallback: OT descent direction when the quadratic model is unavailable.
+        # OT descent direction when the quadratic model is unavailable. A different
+        # mechanism, not a degraded one, so warn rather than let the caller assume the
+        # finite-difference path is running.
+        if not getattr(opt, "_biased_rotation_fallback_warned", False):
+            opt._biased_rotation_fallback_warned = True
+            warnings.warn(
+                "biased_rotation is aligning the chart to the OT barycenter's displacement, "
+                "not to a finite-difference descent/Newton direction. The FD path needs "
+                "use_quadratic_model=True and polytope_type='orthoplex'; num_probe=1 is "
+                "enough, the step then evaluates one f(X) per particle for the curvature.",
+                stacklevel=3,
+            )
         transport_weights = ot_result.matrix  # (P, V)
         vertex_offsets = X_vertices - X.unsqueeze(1)  # (P, V, pdim)
         weight_sums = transport_weights.sum(dim=1, keepdim=True).clamp(min=1e-10)
@@ -684,15 +1008,16 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         opt._prev_descent_direction = weighted_dir.detach()
         opt._prev_descent_direction_finite = bool(torch.isfinite(weighted_dir).all())
 
-    # Barycentric projection: (P, pdim)
     if opt._use_fused_softmax:
         X_bary = X_new_fused  # Already computed by fused function
     else:
         X_bary = opt._compiled.barycentric_projection(
             ot_result.matrix,
-            state.a,
             X_vertices,
         )
+
+    # Reduced from tensors already in hand; syncs with the cost mean below.
+    _ess_tensor, _rho_tensor = solver_health(ot_result.matrix, X_bary - X, step_r)
 
     if opt.use_momentum and state.velocity is not None:
         beta = compute_momentum_coefficient(
@@ -716,12 +1041,12 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # Newton refinement: post-OT correction using quadratic model
     # Tracks whether a post-solve move (refinement) makes the solve's duals stale.
     _duals_invalidated = False
-    if opt._newton_refinement and opt._prev_losses_3d is not None and K_eff >= 2 and opt.polytope_type == "orthoplex":
+    if opt._newton_refinement and opt._losses_3d is not None and K_eff >= 2 and opt.polytope_type == "orthoplex":
         from .quadratic_model import apply_newton_refinement
 
         X_refined = apply_newton_refinement(
             X_bary=state.X,
-            losses_3d=opt._prev_losses_3d,
+            losses_3d=opt._losses_3d,
             scales=probes,
             probe_radius=probe_r,
             pdim=pdim,
@@ -738,27 +1063,25 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             # below does not warm-start the next step from them.
             _duals_invalidated = True
 
-    # Trust region: predict the improvement of the step actually taken.
-    # state.X is final here, so the model scores the realized move (transport +
-    # momentum + refinement) instead of a Newton step that was never applied.
-    # Otherwise the ratio compares two different displacements.
+    # state.X is final here, so the model scores the realized move (transport, momentum
+    # and refinement) rather than a Newton step that was never applied.
     if opt.trust_region and _fd_grad is not None:
         from .quadratic_model import compute_predicted_improvement
 
         realized_rot = torch.einsum("bij,bj->bi", rot_mats.transpose(-1, -2), state.X - X)
         opt._prev_predicted_improvement = compute_predicted_improvement(_fd_grad, _fd_hess, realized_rot).detach()
-        opt._prev_pre_step_loss = raw_cost_matrix.min(dim=1).values.mean().item()
+        opt._prev_loss_from_center = _center_loss is not None
+        opt._prev_pre_step_loss = (
+            _center_loss.mean().item() if _center_loss is not None else raw_cost_matrix.min(dim=1).values.mean().item()
+        )
 
-    # CMA-ES updates
-    if opt._cma_subspace and (opt.use_covariance_adaptation or opt.use_csa):
+    if opt._cma_subspace and opt.use_covariance_adaptation:
         cma_sub = opt.subspace  # CMAAdaptiveSubspace
         sub_dim = cma_sub.subspace_dim
 
-        # Displacement of the OT step alone, taken from X_bary rather than state.X.
-        # The evolution paths and the rank-mu term below must describe the same
-        # offspring distribution, and rank-mu uses the raw OT vertex steps; reading
-        # state.X here would fold in momentum velocity and the Newton correction, so
-        # the paths would track a step the covariance update never saw.
+        # OT displacement alone, from X_bary not state.X: the paths and rank-mu must
+        # describe the same offspring distribution, and state.X carries momentum and
+        # the Newton correction the covariance update never saw.
         post_step_coords = X_bary.reshape(-1)[:sub_dim]
         raw_displacement = post_step_coords - _pre_step_sub_coords
 
@@ -770,29 +1093,29 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # alone leaves a (step_radius * epsilon)^2 factor in every second moment.
         step_scale = max(abs(step_r), 1e-12)
 
-        # Paths take the step direction, not its magnitude. An OT step over an orthoplex
-        # has no fixed norm to compare against (antithetic vertex pairs cancel toward
-        # zero), so sqrt(n) does not apply and any measured reference lags and drives
-        # sigma into its clamp. With unit-norm innovations the stationary ||p_sigma|| is
-        # exactly 1 in any dimension, so the ratio reads pure directional agreement.
+        # Direction only, not magnitude: an OT step over an orthoplex has no fixed norm
+        # to compare against, so sqrt(n) does not apply. With unit-norm innovations the
+        # stationary ||p_sigma|| is 1 in any dimension, so the ratio is pure agreement.
         z_displacement = raw_displacement / step_scale
-        z_norm = torch.linalg.vector_norm(z_displacement).clamp(min=1e-12)
-        z_direction = z_displacement / z_norm
-        # Sampling scales the projection columns by sqrt(C_diag), so the offspring step
-        # in covariance-metric coordinates is y = sqrt(C_diag) * z. The evolution paths
-        # are defined on y, not the raw z.
-        sqrt_C = torch.sqrt(torch.clamp(state.C_diag, min=opt._cma_params["cov_min"]))
-        y_displacement = sqrt_C * z_direction
+        z_norm = torch.linalg.vector_norm(z_displacement)
+        # Below this the step is rounding, and normalising it feeds the paths noise.
+        if bool(z_norm > 1e-12):
+            z_direction = z_displacement / z_norm
+            # p_c lives on y = sqrt(C) z; p_sigma lives on whitened z, which z_direction
+            # already is, so it takes C_diag=None instead of a cancelling round trip.
+            sqrt_C = torch.sqrt(torch.clamp(state.C_diag, min=opt._cma_params["cov_min"]))
+            y_displacement = sqrt_C * z_direction
 
-        # Update p_sigma; its internal C^{-1/2} whitens y back to the unit direction.
-        state.p_sigma = update_evolution_path_sigma(
-            p_sigma=state.p_sigma,
-            displacement=y_displacement,
-            C_diag=state.C_diag,
-            c_sigma=opt._cma_params["c_sigma"],
-            mu_eff=1.0,
-            cov_min=opt._cma_params["cov_min"],
-        )
+            state.p_sigma = update_evolution_path_sigma(
+                p_sigma=state.p_sigma,
+                displacement=z_direction,
+                C_diag=None,
+                c_sigma=opt._cma_params["c_sigma"],
+                mu_eff=opt._cma_params["mu_eff"],
+            )
+        else:
+            y_displacement = torch.zeros_like(state.C_diag)
+            state.p_sigma = (1.0 - opt._cma_params["c_sigma"]) * state.p_sigma
 
         # Stall test against the same unit reference.
         p_sigma_norm = torch.norm(state.p_sigma).item()
@@ -804,29 +1127,22 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             generation=state.generation,
         )
 
-        # Update p_c (covariance evolution path) on the y-scaled step.
         state.p_c = update_evolution_path_c(
             p_c=state.p_c,
             displacement=y_displacement,
             h_sigma=h_sigma,
             c_c=opt._cma_params["c_c"],
-            mu_eff=1.0,
+            mu_eff=opt._cma_params["mu_eff"],
         )
 
-        # Update diagonal covariance.
         if opt.use_covariance_adaptation:
-            # c_mu = 2*(mu_eff - 2 + 1/mu_eff)/(...) is exactly 0 at mu_eff = 1, which is
-            # what the optimizer derives its rates at unless the subspace was given an
-            # explicit mu_eff. So the default configuration is rank-one only and the
-            # rank-mu term below would be multiplied by zero; skip building it.
+            # c_mu is exactly 0 at mu_eff = 1, the default the optimizer derives its
+            # rates at, so rank-mu would be multiplied by zero. Skip building it.
             _c_mu = opt._cma_params["c_mu"]
             if _c_mu > 0.0:
-                # Rank-mu offspring are the polytope vertices, weighted by transport mass.
-                # Each coordinate belongs to one particle, so its variance is the weighted
-                # mean of its V squared vertex steps, laid out to match the flattened
-                # C_diag. The pdim factor makes the update trace-preserving:
-                # sum_v w_v z_v z_v^T has trace 1 per particle while C restricted to that
-                # particle has trace pdim.
+                # Offspring are the polytope vertices weighted by transport mass. The
+                # pdim factor keeps the update trace-preserving: sum_v w_v z_v z_v^T has
+                # trace 1 per particle where C has trace pdim.
                 vertex_steps = (X_vertices - X.unsqueeze(1)) / step_scale  # (P, V, pdim)
                 rank_mu_local = (recomb.unsqueeze(-1) * vertex_steps**2).sum(dim=1)  # (P, pdim)
                 # rank-mu is sum_v w_v * y_v^2 = C_diag * sum_v w_v * z_v^2.
@@ -842,45 +1158,24 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 c_mu=_c_mu,
                 h_sigma=h_sigma,
                 c_c=opt._cma_params["c_c"],
-                # p_c accumulates sqrt(C_diag) * z_direction with no whitening, so its
-                # squares sum to E[z^T C z], which is 1 only for isotropic C, while
-                # C_diag sums to sub_dim. The renormalisation below absorbs the
-                # residual mismatch, so this scale only sets the rank-one strength.
+                # p_c is unwhitened, so its squares sum to E[z^T C z] while C_diag sums
+                # to sub_dim. The renormalisation below absorbs the mismatch, leaving
+                # this scale to set rank-one strength only.
                 trace_scale=float(sub_dim),
                 cov_min=opt._cma_params["cov_min"],
                 cov_max=opt._cma_params["cov_max"],
+                # Mean 1: C carries shape, the step radius carries scale.
+                trace=float(sub_dim),
             )
-            state.C_diag = torch.clamp(
-                state.C_diag,
-                opt._cma_params["cov_min"],
-                opt._cma_params["cov_max"],
-            )
-            # Mean 1 so C carries shape and sigma carries scale. Otherwise both grow along
-            # the same direction and the effective step, sigma * sqrt(C), overshoots.
-            state.C_diag = state.C_diag * (sub_dim / state.C_diag.sum().clamp(min=1e-12))
-
-        # Update step-size via CSA (if enabled), against the same unit reference.
-        if opt.use_csa:
-            state.sigma = update_step_size_csa(
-                sigma=state.sigma,
-                p_sigma=state.p_sigma,
-                c_sigma=opt._cma_params["c_sigma"],
-                d_sigma=opt._cma_params["d_sigma"],
-                n=sub_dim,
-                p_sigma_norm=p_sigma_norm,
-                expected_norm=1.0,
-            )
-            # Floor sigma to prevent collapse to zero
-            state.sigma = max(state.sigma, 1e-6)
 
         state.generation += 1
 
-    # Cache cost_matrix mean as tensor (defer .item() sync until needed)
-    _cost_mean_tensor = cost_matrix.mean()
-
-    # Adaptive radius (use model loss, not OT regularized cost)
-    # Single GPU-CPU sync point for cost mean
-    _cost_mean = _cost_mean_tensor.item()
+    # One transfer for all three: read separately they cost three device syncs a step,
+    # and only the cost mean is needed before the step ends.
+    _cost_mean, _ess, _rho = torch.stack([cost_matrix.mean(), _ess_tensor, _rho_tensor]).tolist()
+    # evals is candidate evaluations this step, net of probe reuse and screening.
+    # Multiply by the batch size for sample-forwards.
+    state.record_solver_health(_ess, _rho, _evals_this_step)
     # Tracked unconditionally: absorb_mode="stagnation" reads this counter, which
     # use_adaptive_radius (default False) does not gate.
     _prev_loss_for_radius = state.prev_loss
@@ -903,46 +1198,38 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             radius_max=opt.radius_max,
         )
 
-    # NaN-safe state update - revert X, velocity, and duals if NaN after projection
     _nan_reverted = False
     if not torch.isfinite(state.X).all():
         # Reverting to the pre-step X only helps when that point was itself finite;
         # if the state arrived poisoned, fall back to the coordinate origin, which is
         # the base weights in subspace mode and the layout flatten in full space.
         state.X = X.clone() if torch.isfinite(X).all() else torch.zeros_like(X)
-        # Reset velocity to prevent NaN propagation through momentum
         if opt.use_momentum and state.velocity is not None:
             state.velocity = torch.zeros_like(state.velocity)
         # The CMA block above consumed the same non-finite X, so reverting X alone leaves
         # sqrt(C_diag) poisoned in the sampling projection and the run cannot recover.
-        if opt._cma_subspace and (opt.use_covariance_adaptation or opt.use_csa):
+        if opt._cma_subspace and opt.use_covariance_adaptation:
             if state.p_c is not None:
                 state.p_c = torch.zeros_like(state.p_c)
             if state.p_sigma is not None:
                 state.p_sigma = torch.zeros_like(state.p_sigma)
             if state.C_diag is not None:
                 state.C_diag = torch.ones_like(state.C_diag)
-            state.sigma = 1.0
         _nan_reverted = True
 
-    # Clear biased rotation descent direction and Newton direction on NaN revert
     if _nan_reverted and opt.biased_rotation:
         opt._prev_descent_direction = None
         opt._prev_descent_direction_finite = False
     if _nan_reverted:
         opt._newton_direction = None
 
-    # Capture transport direction for amortized OT (after NaN check)
     if opt.amortize_steps > 1:
         if _nan_reverted:
-            opt._transport_direction = None  # NaN step, no valid direction
             opt._transport_direction_ema = None
         else:
             # Pure OT step from X_bary, not state.X: momentum and Newton are
             # applied separately, so the coasting direction must not re-carry them.
             raw_direction = (X_bary - X).detach()
-            opt._transport_direction = raw_direction
-            # EMA blend: smooth transport direction across OT steps
             alpha = opt.amortize_ema
             if opt._transport_direction_ema is None:
                 opt._transport_direction_ema = raw_direction
@@ -952,29 +1239,20 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # NB: trust-region update happens at the start of the next call to
     # ``step`` (deferred), where we have a real post-step pre-OT measurement.
 
-    # Update diagnostics (defer GPU-CPU sync for displacement)
     per_particle_disp_sqnorms = torch.sum((state.X - X) ** 2, dim=-1)  # (P,)
     disp_sqnorm_tensor = torch.mean(per_particle_disp_sqnorms)
     state.costs.append(_cost_mean)
     state.linear_convergence.append(ot_result.converged)
     state.displacement_sqnorms.append(disp_sqnorm_tensor.item())
     state.iteration_count += 1
-    # Track OT-step costs separately for adaptive_num_probe (excludes momentum steps)
     opt._ot_step_costs.append(_cost_mean)
 
-    # Adaptive probes: cache the matrix with the configuration it was measured at, so
-    # the next step can tell whether it still describes the vertices it will score.
-    if opt._adaptive_probes:
+    # Cache the matrix with the configuration it was measured at. A reuse step measured
+    # nothing, so it leaves the anchor where it is.
+    if opt._adaptive_probes and not _can_reuse:
         opt._prev_X = X.detach().clone()
         opt._prev_cost_matrix = raw_cost_matrix.detach()
         opt._prev_rot_mats = rot_mats.detach()
-        opt._prev_k_eff = K_eff
-        opt._prev_step_r = step_r
-        opt._prev_probe_r = probe_r
-    # Multi-fidelity screening: store cost matrix for next step's direction contrast
-    # analysis (independent of adaptive probes)
-    if opt.multifidelity_screen and not opt._adaptive_probes:
-        opt._prev_cost_matrix = raw_cost_matrix.detach()
         opt._prev_k_eff = K_eff
         opt._prev_step_r = step_r
         opt._prev_probe_r = probe_r
@@ -983,12 +1261,10 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     if _nan_reverted or _duals_invalidated:
         state.f = None
         state.g = None
-        # Also clear momentum history - can't extrapolate from invalid state
         if opt._dual_momentum_beta > 0.0:
             state.prev_prev_f = None
             state.prev_prev_g = None
     else:
-        # Dual momentum: save previous duals before overwriting
         if opt._dual_momentum_beta > 0.0:
             state.prev_prev_f = state.f.clone() if state.f is not None else None
             state.prev_prev_g = state.g.clone() if state.g is not None else None
@@ -1006,42 +1282,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # and move the weights.
         proj_used = opt._sampling_projection if opt._sampling_projection is not None else state.projection
 
-        # Compute displacement in subspace coords
-        # The displacement is the change in the flattened subspace coordinate
-        # vector after the barycentric projection + momentum update.
-        post_step_sub_coords = state.X.reshape(-1)[: adaptive_sub.subspace_dim]
-        displacement = post_step_sub_coords - _pre_step_sub_coords
+        record_displacement(state, adaptive_sub, _pre_step_sub_coords, proj_used)
 
-        # Update displacement history (rolling buffer). Also store the full-space
-        # image under the basis in use right now: the basis rotates every step, so
-        # mapping all stored coordinates through the latest basis would attribute old
-        # displacements to directions they were never measured along.
-        idx = state.displacement_history_idx
-        state.displacement_history[idx] = displacement
-        # Only dense bases take the displacement-SVD rotation; a sparse projection
-        # rotates by reseeding, so it has no use for the full-space history.
-        if isinstance(proj_used, torch.Tensor):
-            if state.displacement_history_full is None:
-                state.displacement_history_full = displacement.new_zeros(
-                    adaptive_sub.displacement_history_size, proj_used.shape[0]
-                )
-            state.displacement_history_full[idx] = (proj_used @ displacement.to(proj_used.dtype)).to(
-                state.displacement_history_full.dtype
-            )
-        state.displacement_history_idx = (idx + 1) % adaptive_sub.displacement_history_size
-        state.displacement_history_count = min(
-            state.displacement_history_count + 1,
-            adaptive_sub.displacement_history_size,
-        )
-
-        # Check for absorb trigger
         should_absorb = adaptive_sub.should_absorb(
             state.stagnation_count,
             state.iteration_count,  # already incremented above
         )
 
         if should_absorb:
-            # Absorb: fold perturbation into base, zero coords, new random basis.
             full_flat_sub = state.X.reshape(-1)[: adaptive_sub.subspace_dim]
             new_base, _zeroed = adaptive_sub.absorb(
                 proj_used,
@@ -1049,18 +1297,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 full_flat_sub,
             )
             state.base_params = new_base
-            # Zero the subspace coordinates rather than re-projecting onto
-            # the new basis. The new and old bases are largely uncorrelated
-            # after a random redraw, so re-projection adds complexity for
-            # little benefit; the next OT solve will discover a fresh
-            # descent direction.
+            # Zero rather than re-project: after a random redraw the bases are largely
+            # uncorrelated, and the next OT solve finds a fresh descent direction.
             state.X = torch.zeros_like(state.X)
             # New random projection
             # Sparse projection: create new SparseRandomProjection with fresh seed
             from .projection import SparseRandomProjection
 
             if isinstance(state.projection, SparseRandomProjection):
-                # Increment seed based on absorb count for fresh random basis
                 new_seed = state.projection.seed + state.absorb_count + 1000
                 state.projection = SparseRandomProjection(
                     full_dim=state.projection.full_dim,
@@ -1078,53 +1322,26 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 state.displacement_history_full.zero_()
             state.displacement_history_idx = 0
             state.displacement_history_count = 0
-            # Reset duals (cost landscape changed)
-            state.f = None
-            state.g = None
-            state.prev_prev_f = None
-            state.prev_prev_g = None
-            # Invalidate EMA transport direction (cost geometry changed)
-            opt._transport_direction_ema = None
-            opt._transport_direction = None
+            invalidate_for_basis_change(opt, state)
             state.absorb_count += 1
             # Clear the stagnation counter, else absorb_mode='stagnation' stays
             # triggered on a plateau and redraws the basis every step. The absorb
             # re-anchors the origin, so the old loss history no longer applies.
             state.stagnation_count = 0
             state.prev_loss = _cost_mean
-            # Invalidate cached cost/probe state (cost landscape changed after absorb)
-            opt._invalidate_reuse_cache()
-            opt._newton_direction = None
-            opt._prev_descent_direction = None
-            opt._prev_descent_direction_finite = False
-            # Momentum velocity lives in the pre-absorb basis; zero it.
-            if opt.use_momentum and state.velocity is not None:
-                state.velocity = torch.zeros_like(state.velocity)
-            # CMA-ES: Reset evolution paths and covariance after absorb
-            if opt._cma_subspace and (opt.use_covariance_adaptation or opt.use_csa):
+            if opt._cma_subspace and opt.use_covariance_adaptation:
                 state.p_c = torch.zeros_like(state.p_c)
                 state.p_sigma = torch.zeros_like(state.p_sigma)
                 state.C_diag = torch.ones_like(state.C_diag)
-                state.sigma = 1.0
                 # Keep generation counter (don't reset to preserve cumulation history)
-        elif opt._cma_subspace and (opt.use_covariance_adaptation or opt.use_csa):
-            # sep-CMA learns a per-axis variance for THIS basis, so rotating the basis
-            # under it would invalidate everything it has accumulated: C_diag[j] and the
-            # evolution paths index axis j, and a diagonal covariance does not stay
-            # diagonal under an arbitrary rotation. Hold the basis fixed between absorbs
-            # and let the covariance scaling shape the search instead; absorb still
-            # redraws the basis and resets the CMA state above.
+        elif opt._cma_subspace and opt.use_covariance_adaptation:
+            # sep-CMA's C_diag and evolution paths index axes of THIS basis, and a
+            # diagonal covariance does not stay diagonal under rotation. Hold the basis
+            # between absorbs; absorb redraws it and resets the CMA state above.
             pass
-        else:
-            # Re-anchor the coordinate origin, then rotate the basis for next step.
-            # The represented point is base + P @ coords, so replacing P while coords are
-            # non-zero moves the weights with nothing evaluated behind it. Folding coords
-            # into base first keeps the point fixed. Only the origin moves, so duals,
-            # momentum and CMA state stay as they are (duals are invalidated below).
-            #
-            # Rotate every step rather than every N: the OT solve already extracts one
-            # step's worth of information. For large full_dim the basis QR/SVD dominates
-            # the step and far exceeds the tiny-V Sinkhorn solve, so it runs in fp32.
+        elif _rotation_due(adaptive_sub, state.iteration_count):
+            # Re-anchor first: the point is base + P @ coords, so swapping P at non-zero
+            # coords moves the weights unevaluated. The basis QR/SVD runs in fp32.
             state.base_params, _ = adaptive_sub.absorb(
                 proj_used,
                 state.base_params,
@@ -1132,11 +1349,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             )
             state.X = torch.zeros_like(state.X)
 
-            # Sparse projection: use seed increment instead of QR rotation
             from .projection import SparseRandomProjection
 
             if isinstance(state.projection, SparseRandomProjection):
-                # Sparse projection doesn't support QR rotation; increment seed
                 new_seed = state.projection.seed + state.iteration_count
                 state.projection = SparseRandomProjection(
                     full_dim=state.projection.full_dim,
@@ -1158,152 +1373,13 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                     total_steps=opt.max_iterations,
                     displacement_history=hist,
                     generator=opt._generator,
+                    history_is_full=True,
                 )
-            # Reset duals after rotation (cost geometry changed)
-            state.f = None
-            state.g = None
-            state.prev_prev_f = None
-            state.prev_prev_g = None
-            # Invalidate EMA transport direction and reuse cache (geometry changed)
-            opt._transport_direction_ema = None
-            opt._transport_direction = None
-            opt._invalidate_reuse_cache()
+            invalidate_for_basis_change(opt, state)
 
-    # Per-layer projections (Hybrid / Factored): displacement tracking, absorb, rotation.
-    if opt._per_layer_projections:
-        hybrid_sub = opt.subspace
-
-        # Compute displacement in subspace coords
-        post_step_sub_coords = state.X.reshape(-1)[: hybrid_sub.subspace_dim]
-        displacement = post_step_sub_coords - _pre_step_sub_coords
-
-        # Update displacement history (rolling buffer)
-        idx = state.displacement_history_idx
-        state.displacement_history[idx] = displacement
-        state.displacement_history_idx = (idx + 1) % hybrid_sub.displacement_history_size
-        state.displacement_history_count = min(
-            state.displacement_history_count + 1,
-            hybrid_sub.displacement_history_size,
-        )
-
-        # Check for absorb trigger
-        should_absorb = hybrid_sub.should_absorb(
-            state.stagnation_count,
-            state.iteration_count,
-        )
-
-        if should_absorb:
-            # Absorb: fold perturbation into base, zero coords, new projections
-            full_flat_sub = state.X.reshape(-1)[: hybrid_sub.subspace_dim]
-            new_base, _zeroed = hybrid_sub.absorb(
-                state.hybrid_projections,
-                state.base_params,
-                full_flat_sub,
-            )
-            state.base_params = new_base
-            # Reset subspace coordinates to zero
-            state.X = torch.zeros_like(state.X)
-            # Regenerate ALL per-layer projections. Deliberately NOT a fresh draw:
-            # init_projections seeds every layer with step=0, so each absorb returns a
-            # bit-identical basis and the run stays in one fixed affine subspace.
-            # Redrawing per absorb cost 0.61 -> 0.33 median test accuracy on a 101k
-            # hard-threshold LIF SNN, since it also discards the state reset below.
-            #
-            # absorb_aligned_active (opt-in) instead biases the new basis toward the
-            # window's productive directions by displacement-SVD, before the history is
-            # zeroed. Safe here because the duals are reset in this same block.
-            if getattr(hybrid_sub, "absorb_aligned_active", False) and state.displacement_history_count > 0:
-                hist = state.displacement_history[: state.displacement_history_count]
-                svd_ratio = hybrid_sub.get_svd_ratio(state.iteration_count, opt.max_iterations or 1)
-                state.hybrid_projections = hybrid_sub._rotate_all_displacement(
-                    state.hybrid_projections,
-                    hist,
-                    svd_ratio,
-                    state.X.device,
-                    state.X.dtype,
-                    state.iteration_count,
-                )
-            else:
-                state.hybrid_projections = hybrid_sub.init_projections(
-                    state.X.device,
-                    state.X.dtype,
-                )
-            state.displacement_history.zero_()
-            if state.displacement_history_full is not None:
-                state.displacement_history_full.zero_()
-            state.displacement_history_idx = 0
-            state.displacement_history_count = 0
-            # Reset duals (cost landscape changed)
-            state.f = None
-            state.g = None
-            state.prev_prev_f = None
-            state.prev_prev_g = None
-            # Invalidate EMA transport direction (cost geometry changed)
-            opt._transport_direction_ema = None
-            opt._transport_direction = None
-            state.absorb_count += 1
-            # Clear the stagnation counter, else absorb_mode='stagnation' stays
-            # triggered on a plateau and redraws the basis every step. The absorb
-            # re-anchors the origin, so the old loss history no longer applies.
-            state.stagnation_count = 0
-            state.prev_loss = _cost_mean
-            # Invalidate cached cost/probe state (cost landscape changed after absorb)
-            opt._invalidate_reuse_cache()
-            opt._newton_direction = None
-            opt._prev_descent_direction = None
-            opt._prev_descent_direction_finite = False
-            # Momentum velocity lives in the pre-absorb basis; zero it.
-            if opt.use_momentum and state.velocity is not None:
-                state.velocity = torch.zeros_like(state.velocity)
-        else:
-            # Rotate all per-layer projections for next step
-            hist = (
-                state.displacement_history[: state.displacement_history_count]
-                if state.displacement_history_count > 0
-                else None
-            )
-            new_projections = hybrid_sub.rotate_all(
-                state.hybrid_projections,
-                step=state.iteration_count,
-                total_steps=opt.max_iterations,
-                displacement_history=hist,
-            )
-            # Only act when projections changed (a rotation happened). With the
-            # default rotation_interval=0 rotate_all returns the same dict, so the
-            # block_diag rebuild below is skipped: it is a full, wasteful rebuild.
-            if new_projections is not state.hybrid_projections:
-                # Re-anchor before swapping the basis. The represented point is
-                # base + P @ coords, so replacing P while coords are non-zero moves the
-                # weights with nothing evaluated behind it. Fold the coordinates in
-                # under the OLD projections first, then zero them.
-                state.base_params, _ = hybrid_sub.absorb(
-                    state.hybrid_projections,
-                    state.base_params,
-                    state.X.reshape(-1)[: hybrid_sub.subspace_dim],
-                )
-                state.X = torch.zeros_like(state.X)
-                state.f = None
-                state.g = None
-                state.prev_prev_f = None
-                state.prev_prev_g = None
-                # Invalidate EMA transport direction and reuse cache (geometry changed)
-                opt._transport_direction_ema = None
-                opt._transport_direction = None
-                opt._invalidate_reuse_cache()
-                opt._newton_direction = None
-                opt._prev_descent_direction = None
-                opt._prev_descent_direction_finite = False
-                # Momentum velocity lives in the pre-rotation basis.
-                if opt.use_momentum and state.velocity is not None:
-                    state.velocity = torch.zeros_like(state.velocity)
-                state.hybrid_projections = new_projections
-                if hasattr(hybrid_sub, "build_fused_projection"):
-                    hybrid_sub.build_fused_projection(new_projections)
-
-    # Periodic absorb: fold perturbation into base, zero subspace
-    # Only for non-adaptive/non-hybrid subspaces; their absorb handled separately.
-    # Semantics: absorb AFTER every N steps (iteration_count already incremented above).
-    # E.g., absorb_every=10 triggers at iteration_count=10,20,30,...
+    maintain_per_layer_subspace(opt, state, _cost_mean, _pre_step_sub_coords)
+    # Periodic absorb for plain subspaces only; adaptive and hybrid handle their own.
+    # Fires after every N steps, iteration_count having been incremented above.
     if (
         not opt._adaptive
         and not opt._per_layer_projections
@@ -1315,28 +1391,24 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         flat_sub = state.X.reshape(-1)[: state.subspace.subspace_dim]
         new_base, _zeroed = state.subspace.absorb(state.base_params, flat_sub)
         state.base_params = new_base
-        # Zero the particle array (subspace coords reset)
         state.X = torch.zeros_like(state.X)
-        # Reset dual potentials since cost landscape changed
         state.f = None
         state.g = None
         state.prev_prev_f = None
         state.prev_prev_g = None
-        # Invalidate EMA transport direction and reuse cache (geometry changed)
         opt._transport_direction_ema = None
-        opt._transport_direction = None
         opt._invalidate_reuse_cache()
         if opt.use_momentum and state.velocity is not None:
             state.velocity = torch.zeros_like(state.velocity)
 
-    # Rank schedule transition check
+    # Against the applied rank, not subspace_dim: the schedule yields a per-layer rank
+    # while subspace_dim sums the coordinate counts it produces, so comparing the two
+    # fires every step and rebuilds the subspace from scratch each time.
     if opt._rank_schedule is not None and opt.subspace is not None:
         current_rank = opt._rank_schedule.at(state.iteration_count)
-        prev_rank = opt._rank_schedule.at(state.iteration_count - 1)
-        if current_rank != prev_rank:
+        if current_rank != opt._applied_rank:
             opt._transition_rank(current_rank)
 
-    # Write particles back to model
     opt._sync_model()
 
     return _cost_mean

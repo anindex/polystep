@@ -2,7 +2,6 @@
 
 import math
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -94,50 +93,27 @@ class TestFromLayout:
                 assert effective_rank <= min(100, d_in, d_out)
 
 
-class TestAutoFromLayout:
-    def test_auto_from_layout(self):
-        """auto_from_layout selects per-layer ranks without user tuning."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.auto_from_layout(layout)
+def test_auto_from_layout():
+    """auto_from_layout selects per-layer ranks without user tuning."""
+    model = SimpleMLP()
+    layout = ParamLayout.from_module(model)
+    sub = LowRankSubspace.auto_from_layout(layout)
 
-        assert sub.rank == 0  # auto mode marker
-        assert sub.subspace_dim > 0
-        assert sub.subspace_dim < layout.total_params
-        assert sub.compression_ratio < 1.0
+    assert sub.rank == 0  # auto mode marker
+    assert sub.subspace_dim > 0
+    assert sub.subspace_dim < layout.total_params
+    assert sub.compression_ratio < 1.0
 
-        # Ranks should be bounded by min(auto_rank, d_in, d_out)
-        for spec in sub.specs:
-            if spec.is_lowrank:
-                r = spec.b_shape[1]
-                d_out = spec.original_shape[0]
-                d_in = math.prod(spec.original_shape[1:])
-                # effective_rank = min(auto_rank, d_in, d_out)
-                # auto_rank >= min_rank=4, but effective_rank capped by layer dims
-                assert r <= min(64, d_in, d_out)
-                assert r <= 64  # max_rank default
-
-
-class TestApplyPerturbation:
-    def test_apply_perturbation_nonzero(self):
-        """Nonzero perturbation changes parameters."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.from_layout(layout, rank=4)
-        base_sd = model.state_dict()
-
-        torch.manual_seed(42)
-        flat_sub = torch.randn(sub.subspace_dim) * 0.01
-        result = sub.apply_perturbation(base_sd, flat_sub)
-
-        # At least some parameters should differ
-        any_different = False
-        assert set(result) == set(base_sd), "apply_perturbation dropped keys; the value checks below would be vacuous"
-        for key in base_sd:
-            if not torch.allclose(result[key], base_sd[key]):
-                any_different = True
-                break
-        assert any_different, "Nonzero perturbation should change some params"
+    # Ranks should be bounded by min(auto_rank, d_in, d_out)
+    for spec in sub.specs:
+        if spec.is_lowrank:
+            r = spec.b_shape[1]
+            d_out = spec.original_shape[0]
+            d_in = math.prod(spec.original_shape[1:])
+            # effective_rank = min(auto_rank, d_in, d_out)
+            # auto_rank >= min_rank=4, but effective_rank capped by layer dims
+            assert r <= min(64, d_in, d_out)
+            assert r <= 64  # max_rank default
 
 
 class TestConvHandling:
@@ -173,95 +149,87 @@ class TestConvHandling:
         assert result["conv.weight"].shape == (16, 3, 3, 3)
 
 
-class TestOneDimParams:
-    def test_1d_params_full_perturbation(self):
-        """1D parameters (biases, LayerNorm) use full perturbation, not B@A."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.from_layout(layout, rank=4)
+def test_1d_params_full_perturbation():
+    """1D parameters (biases, LayerNorm) use full perturbation, not B@A."""
+    model = SimpleMLP()
+    layout = ParamLayout.from_module(model)
+    sub = LowRankSubspace.from_layout(layout, rank=4)
 
-        for spec in sub.specs:
-            if len(spec.original_shape) == 1:
-                assert not spec.is_lowrank
-                # flat chunk size equals numel
-                assert spec.flat_end - spec.flat_start == spec.original_shape[0]
-
-
-class TestSolverIntegration:
-    def test_subspace_solver_integration(self):
-        """PolyStep with subspace runs end-to-end on a synthetic NN objective."""
-        from polystep.solver import PolyStep
-        from polystep.cost_nn import NNCostEvaluator
-        from polystep.transform import ParamLayout
-
-        # Tiny model keeps subspace_dim small; the test checks the solver
-        # contract (iteration count, costs, displacements, X shape), not accuracy.
-        model = nn.Sequential(nn.Linear(4, 3))
-        layout = ParamLayout.from_module(model)
-        sub = LowRankSubspace.from_layout(layout, rank=4)
-
-        # Create inputs and targets
-        torch.manual_seed(0)
-        inputs = torch.randn(8, 4)
-        targets = torch.randint(0, 3, (8,)).long()
-        loss_fn = nn.CrossEntropyLoss()
-
-        # Create evaluator
-        evaluator = NNCostEvaluator(model, loss_fn)
-
-        # Base params
-        base_sd = {k: v.clone() for k, v in model.state_dict().items()}
-
-        # In subspace mode, each particle IS a full subspace vector.
-        # num_particles = number of candidate solutions (e.g. 5).
-        # dim = subspace_dim (each particle row is a full subspace vector).
-        num_particles = 5
-        dim = sub.subspace_dim
-
-        # A dummy objective_fn (not used in subspace mode)
-        def dummy_obj(x):
-            return torch.zeros(x.shape[0])
-
-        solver = PolyStep(
-            objective_fn=dummy_obj,
-            dim=dim,
-            epsilon=0.1,
-            num_probe=2,
-            max_iterations=2,
-            min_iterations=1,
-            sinkhorn_max_iters=50,
-            compile=False,
-            subspace=sub,
-            nn_evaluator=evaluator,
-            layout=layout,
-            train_inputs=inputs,
-            train_targets=targets,
-        )
-
-        # Init with small random subspace vectors (near base params)
-        torch.manual_seed(99)
-        X_init = torch.randn(num_particles, dim) * 0.001
-        state = solver.init_state(X_init, base_params=base_sd)
-
-        assert state.base_params is not None
-        assert state.subspace is not None
-
-        # Run one step
-        gen = torch.Generator().manual_seed(42)
-        state = solver.step(state, generator=gen)
-
-        # State should be updated
-        assert state.iteration_count == 1
-        assert len(state.costs) == 1
-        assert len(state.displacement_sqnorms) == 1
-        # Particles should have moved (at least slightly)
-        assert state.X is not None
-        assert state.X.shape == (num_particles, dim)
+    for spec in sub.specs:
+        if len(spec.original_shape) == 1:
+            assert not spec.is_lowrank
+            # flat chunk size equals numel
+            assert spec.flat_end - spec.flat_start == spec.original_shape[0]
 
 
-# ===========================================================================
-# LinearSubspace tests
-# ===========================================================================
+def test_subspace_solver_integration():
+    """PolyStep with subspace runs end-to-end on a synthetic NN objective."""
+    from polystep.solver import PolyStep
+    from polystep.cost_nn import NNCostEvaluator
+    from polystep.transform import ParamLayout
+
+    # Tiny model keeps subspace_dim small; the test checks the solver
+    # contract (iteration count, costs, displacements, X shape), not accuracy.
+    model = nn.Sequential(nn.Linear(4, 3))
+    layout = ParamLayout.from_module(model)
+    sub = LowRankSubspace.from_layout(layout, rank=4)
+
+    # Create inputs and targets
+    torch.manual_seed(0)
+    inputs = torch.randn(8, 4)
+    targets = torch.randint(0, 3, (8,)).long()
+    loss_fn = nn.CrossEntropyLoss()
+
+    # Create evaluator
+    evaluator = NNCostEvaluator(model, loss_fn)
+
+    # Base params
+    base_sd = {k: v.clone() for k, v in model.state_dict().items()}
+
+    # In subspace mode, each particle IS a full subspace vector.
+    # num_particles = number of candidate solutions (e.g. 5).
+    # dim = subspace_dim (each particle row is a full subspace vector).
+    num_particles = 5
+    dim = sub.subspace_dim
+
+    # A dummy objective_fn (not used in subspace mode)
+    def dummy_obj(x):
+        return torch.zeros(x.shape[0])
+
+    solver = PolyStep(
+        objective_fn=dummy_obj,
+        dim=dim,
+        epsilon=0.1,
+        num_probe=2,
+        max_iterations=2,
+        min_iterations=1,
+        sinkhorn_max_iters=50,
+        compile=False,
+        subspace=sub,
+        nn_evaluator=evaluator,
+        train_inputs=inputs,
+        train_targets=targets,
+    )
+
+    # Init with small random subspace vectors (near base params)
+    torch.manual_seed(99)
+    X_init = torch.randn(num_particles, dim) * 0.001
+    state = solver.init_state(X_init, base_params=base_sd)
+
+    assert state.base_params is not None
+    assert state.subspace is not None
+
+    # Run one step
+    gen = torch.Generator().manual_seed(42)
+    state = solver.step(state, generator=gen)
+
+    # State should be updated
+    assert state.iteration_count == 1
+    assert len(state.costs) == 1
+    assert len(state.displacement_sqnorms) == 1
+    # Particles should have moved (at least slightly)
+    assert state.X is not None
+    assert state.X.shape == (num_particles, dim)
 
 
 class TestLinearSubspaceFromLayout:
@@ -304,27 +272,6 @@ class TestLinearSubspaceFromLayout:
         assert lin_sub.subspace_dim == lr_sub.subspace_dim
         assert lin_sub.subspace_dim > 0
         assert lin_sub.subspace_dim < layout.total_params
-
-
-class TestLinearSubspaceApplyPerturbation:
-    def test_apply_perturbation_nonzero_linear(self):
-        """Nonzero perturbation changes parameters."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        sub = LinearSubspace.from_layout(layout, rank=4, seed=42)
-        base_sd = model.state_dict()
-
-        torch.manual_seed(42)
-        flat_sub = torch.randn(sub.subspace_dim) * 0.01
-        result = sub.apply_perturbation(base_sd, flat_sub)
-
-        any_different = False
-        assert set(result) == set(base_sd), "apply_perturbation dropped keys; the value checks below would be vacuous"
-        for key in base_sd:
-            if not torch.allclose(result[key], base_sd[key]):
-                any_different = True
-                break
-        assert any_different, "Nonzero perturbation should change some params"
 
 
 class TestLinearSubspaceLinearity:

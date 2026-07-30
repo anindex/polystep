@@ -1,6 +1,4 @@
-"""Tests for momentum and adaptive radius dynamics functions."""
-
-import math
+"""Momentum and adaptive radius dynamics."""
 
 import pytest
 import torch
@@ -8,194 +6,132 @@ import torch
 from polystep.dynamics import (
     apply_momentum,
     compute_momentum_coefficient,
-    update_adaptive_radius,
+    update_radius_multiplier,
+    update_stagnation,
 )
 
 
-class TestMomentumCoefficient:
-    """Tests for compute_momentum_coefficient linear warmup."""
-
-    @pytest.mark.parametrize(
-        "iteration, max_iterations, momentum_init, momentum_final, expected",
-        [
-            (0, 100, 0.5, 0.95, 0.5),
-            (99, 100, 0.5, 0.95, 0.95),
-            (200, 100, 0.5, 0.95, 0.95),
-            (0, 1, 0.5, 0.95, 0.5),
-            (9, 10, 0.0, 1.0, 1.0),
-        ],
+@pytest.mark.parametrize(
+    "iteration, max_iterations, momentum_init, momentum_final, expected",
+    [
+        (0, 100, 0.5, 0.95, 0.5),
+        (49, 100, 0.5, 0.95, 0.5 + (49 / 99) * 0.45),  # midpoint of the warm-up
+        (99, 100, 0.5, 0.95, 0.95),
+        (200, 100, 0.5, 0.95, 0.95),  # capped past the end
+        (0, 1, 0.5, 0.95, 0.5),  # max_iterations=1 must not divide by zero
+        (9, 10, 0.0, 1.0, 1.0),
+    ],
+)
+def test_warms_up_linearly(iteration, max_iterations, momentum_init, momentum_final, expected):
+    beta = compute_momentum_coefficient(
+        iteration,
+        max_iterations=max_iterations,
+        momentum_init=momentum_init,
+        momentum_final=momentum_final,
     )
-    def test_warmup_start(self, iteration, max_iterations, momentum_init, momentum_final, expected):
-        """Warmup endpoints, cap beyond max, div-guard at max_iterations=1, and custom range."""
-        beta = compute_momentum_coefficient(
-            iteration,
-            max_iterations=max_iterations,
-            momentum_init=momentum_init,
-            momentum_final=momentum_final,
-        )
-        assert beta == pytest.approx(expected)
+    assert beta == pytest.approx(expected)
 
-    def test_warmup_midpoint(self):
-        """At midpoint, beta is halfway between init and final."""
-        mid = 49  # (100-1)//2
-        beta = compute_momentum_coefficient(mid, max_iterations=100)
-        expected = 0.5 + (mid / 99) * (0.95 - 0.5)
-        assert beta == pytest.approx(expected)
+
+def test_default_endpoints():
+    """The 0.5 to 0.95 default range, pinned so a changed default is visible."""
+    assert compute_momentum_coefficient(0, 100) == pytest.approx(0.5)
+    assert compute_momentum_coefficient(99, 100) == pytest.approx(0.95)
 
 
 class TestApplyMomentum:
-    """Tests for apply_momentum velocity update."""
-
     def test_zero_velocity(self):
-        """Starting from zero velocity, X_new = X_old + velocity_lr * displacement."""
+        """From rest the step is the plain displacement, scaled by velocity_lr."""
         X_old = torch.tensor([[1.0, 2.0]])
         X_bary = torch.tensor([[3.0, 4.0]])
-        velocity = torch.zeros_like(X_old)
+        X_new, v_new = apply_momentum(X_old, X_bary, torch.zeros_like(X_old), beta=0.9)
 
-        X_new, v_new = apply_momentum(X_old, X_bary, velocity, beta=0.9)
-
-        displacement = X_bary - X_old  # [[2, 2]]
-        expected_v = displacement  # beta * 0 + displacement
-        expected_X = X_old + expected_v
-        assert torch.allclose(X_new, expected_X)
-        assert torch.allclose(v_new, expected_v)
+        assert torch.allclose(v_new, X_bary - X_old)
+        assert torch.allclose(X_new, X_old + (X_bary - X_old))
 
     def test_accumulation(self):
-        """Two successive calls accumulate velocity."""
+        """Velocity carries beta of the previous step into the next."""
         X0 = torch.tensor([[0.0, 0.0]])
-        X1_bary = torch.tensor([[1.0, 0.0]])
-        v0 = torch.zeros_like(X0)
-
-        X1, v1 = apply_momentum(X0, X1_bary, v0, beta=0.5)
-        # v1 = 0.5*0 + (1-0) = [1, 0]
+        X1, v1 = apply_momentum(X0, torch.tensor([[1.0, 0.0]]), torch.zeros_like(X0), beta=0.5)
         assert torch.allclose(v1, torch.tensor([[1.0, 0.0]]))
 
-        X2_bary = torch.tensor([[2.0, 0.0]])
-        X2, v2 = apply_momentum(X1, X2_bary, v1, beta=0.5)
-        # displacement = X2_bary - X1 = [2, 0] - [1, 0] = [1, 0]
-        # v2 = 0.5 * [1, 0] + [1, 0] = [1.5, 0]
+        # displacement = [2,0] - [1,0] = [1,0], so v2 = 0.5 * [1,0] + [1,0]
+        _, v2 = apply_momentum(X1, torch.tensor([[2.0, 0.0]]), v1, beta=0.5)
         assert torch.allclose(v2, torch.tensor([[1.5, 0.0]]))
 
-    def test_velocity_lr_scaling(self):
-        """velocity_lr=0.5 halves the effective movement."""
+    @pytest.mark.parametrize("velocity_lr, expected_x", [(1.0, 2.0), (0.5, 1.0)])
+    def test_velocity_lr_scales_the_move(self, velocity_lr, expected_x):
         X_old = torch.tensor([[0.0, 0.0]])
-        X_bary = torch.tensor([[2.0, 0.0]])
-        velocity = torch.zeros_like(X_old)
-
-        X_full, _ = apply_momentum(X_old, X_bary, velocity, beta=0.0, velocity_lr=1.0)
-        X_half, _ = apply_momentum(X_old, X_bary, velocity, beta=0.0, velocity_lr=0.5)
-
-        # X_full = [0,0] + 1.0 * [2,0] = [2,0]
-        # X_half = [0,0] + 0.5 * [2,0] = [1,0]
-        assert torch.allclose(X_full, torch.tensor([[2.0, 0.0]]))
-        assert torch.allclose(X_half, torch.tensor([[1.0, 0.0]]))
-
-    def test_shape_preservation(self):
-        """Output shapes match input shapes."""
-        N, D = 10, 5
-        X_old = torch.randn(N, D)
-        X_bary = torch.randn(N, D)
-        velocity = torch.randn(N, D)
-
-        X_new, v_new = apply_momentum(X_old, X_bary, velocity, beta=0.9)
-        assert X_new.shape == (N, D)
-        assert v_new.shape == (N, D)
-
-
-class TestAdaptiveRadius:
-    """Tests for update_adaptive_radius stagnation and radius adaptation."""
-
-    def test_stagnation_detection(self):
-        """Small relative change increments stagnation_count."""
-        rm, sc, pl = update_adaptive_radius(
-            current_loss=1.0,
-            prev_loss=1.0 + 1e-6,  # tiny change
-            stagnation_count=0,
-            radius_multiplier=1.0,
+        X_new, _ = apply_momentum(
+            X_old, torch.tensor([[2.0, 0.0]]), torch.zeros_like(X_old), beta=0.0, velocity_lr=velocity_lr
         )
-        assert sc == 1  # incremented
+        assert torch.allclose(X_new, torch.tensor([[expected_x, 0.0]]))
 
-    def test_stagnation_reset_on_change(self):
-        """Large relative change resets stagnation_count to 0."""
-        rm, sc, pl = update_adaptive_radius(
-            current_loss=0.5,
-            prev_loss=1.0,  # 50% change
-            stagnation_count=5,
-            radius_multiplier=1.0,
-        )
-        assert sc == 0
 
-    def test_boost_after_patience(self):
-        """After patience iterations, radius_multiplier increases."""
-        rm, sc, pl = update_adaptive_radius(
-            current_loss=1.0,
-            prev_loss=1.0 + 1e-6,
-            stagnation_count=9,  # will become 10 == patience
-            radius_multiplier=1.0,
-            stagnation_patience=10,
-            radius_increase=1.5,
-        )
-        assert rm == pytest.approx(1.5)
-        assert sc == 0
+# (kwargs, expected subset of the (radius_multiplier, stagnation_count, prev_loss) return).
+# The radius grows on stagnation and decays on improvement, which is deliberately the
+# opposite of a trust region; see update_radius_multiplier.
+_RADIUS_CASES = [
+    ("a tiny relative change counts as stagnation", dict(current_loss=1.0, prev_loss=1.0 + 1e-6), {"sc": 1}),
+    ("a large change resets the counter", dict(current_loss=0.5, prev_loss=1.0, stagnation_count=5), {"sc": 0}),
+    # Straddle the threshold: the counter must turn over within a factor of two of it,
+    # or absorb_mode='stagnation' fires on a run that is still descending.
+    # These cases leave the tuning knobs at their defaults on purpose, so a changed
+    # default shows up here rather than silently shifting every run.
+    (
+        "just under the default threshold still stagnates",
+        dict(current_loss=1.0, prev_loss=1.0 + 0.9e-4, stagnation_count=3),
+        {"sc": 4},
+    ),
+    (
+        "just over the default threshold resets",
+        dict(current_loss=1.0, prev_loss=1.0 + 1.1e-4, stagnation_count=3),
+        {"sc": 0},
+    ),
+    (
+        "reaching the default patience boosts the radius and clears the counter",
+        dict(current_loss=1.0, prev_loss=1.0 + 1e-6, stagnation_count=9),
+        {"rm": 1.5, "sc": 0},
+    ),
+    (
+        "one short of the default patience does not boost",
+        dict(current_loss=1.0, prev_loss=1.0, stagnation_count=8),
+        {"rm": 1.0, "sc": 9},
+    ),
+    ("an improving step decays the radius", dict(current_loss=0.5, prev_loss=1.0), {"rm": 0.9}),
+    (
+        "the boost clamps at the default radius_max (2.5 * 1.5 = 3.75)",
+        dict(current_loss=1.0, prev_loss=1.0 + 1e-6, stagnation_count=9, radius_multiplier=2.5),
+        {"rm": 3.0},
+    ),
+    (
+        "the decay clamps at the default radius_min (0.55 * 0.9 = 0.495)",
+        dict(current_loss=0.5, prev_loss=1.0, radius_multiplier=0.55),
+        {"rm": 0.5},
+    ),
+    (
+        "the first step has no history, so nothing adapts",
+        dict(current_loss=1.0, prev_loss=float("inf")),
+        {"rm": 1.0, "sc": 0},
+    ),
+    ("the loss comes back for the caller to store", dict(current_loss=42.0, prev_loss=100.0), {"pl": 42.0}),
+]
 
-    def test_decay_on_improvement(self):
-        """When current_loss < prev_loss and not stagnating, radius decays."""
-        rm, sc, pl = update_adaptive_radius(
-            current_loss=0.5,
-            prev_loss=1.0,
-            stagnation_count=0,
-            radius_multiplier=1.0,
-            radius_decrease=0.9,
-        )
-        assert rm == pytest.approx(0.9)
 
-    def test_radius_upper_bound(self):
-        """radius_multiplier cannot exceed radius_max."""
-        rm, sc, pl = update_adaptive_radius(
-            current_loss=1.0,
-            prev_loss=1.0 + 1e-6,
-            stagnation_count=9,
-            radius_multiplier=2.5,
-            stagnation_patience=10,
-            radius_increase=1.5,
-            radius_max=3.0,
-        )
-        # 2.5 * 1.5 = 3.75, clamped to 3.0
-        assert rm == pytest.approx(3.0)
+@pytest.mark.parametrize("label, kwargs, expected", _RADIUS_CASES, ids=[c[0] for c in _RADIUS_CASES])
+def test_radius_and_stagnation(label, kwargs, expected):
+    """Drive the pair the way both step paths do: stagnation first, then the radius."""
+    current_loss = kwargs.pop("current_loss")
+    prev_loss = kwargs.pop("prev_loss")
+    stagnation_count = kwargs.pop("stagnation_count", 0)
+    radius_multiplier = kwargs.pop("radius_multiplier", 1.0)
+    threshold = {"stagnation_threshold": kwargs.pop("stagnation_threshold")} if "stagnation_threshold" in kwargs else {}
 
-    def test_radius_lower_bound(self):
-        """radius_multiplier cannot go below radius_min."""
-        rm, sc, pl = update_adaptive_radius(
-            current_loss=0.5,
-            prev_loss=1.0,
-            stagnation_count=0,
-            radius_multiplier=0.55,
-            radius_decrease=0.9,
-            radius_min=0.5,
-        )
-        # 0.55 * 0.9 = 0.495, clamped to 0.5
-        assert rm == pytest.approx(0.5)
+    count, returned_loss = update_stagnation(current_loss, prev_loss, stagnation_count, **threshold)
+    multiplier, count = update_radius_multiplier(current_loss, prev_loss, count, radius_multiplier, **kwargs)
 
-    def test_inf_prev_loss(self):
-        """First iteration with prev_loss=inf detects improvement."""
-        rm, sc, pl = update_adaptive_radius(
-            current_loss=1.0,
-            prev_loss=float("inf"),
-            stagnation_count=0,
-            radius_multiplier=1.0,
-            radius_decrease=0.9,
-        )
-        # With inf prev_loss (first step), skip adaptation entirely -
-        # no history to compare against, so radius stays unchanged
-        assert sc == 0
-        assert rm == pytest.approx(1.0)
-
-    def test_returns_current_loss(self):
-        """Third return value is current_loss for storing as prev_loss."""
-        _, _, pl = update_adaptive_radius(
-            current_loss=42.0,
-            prev_loss=100.0,
-            stagnation_count=0,
-            radius_multiplier=1.0,
-        )
-        assert pl == 42.0
+    if "sc" in expected:
+        assert count == expected["sc"]
+    if "rm" in expected:
+        assert multiplier == pytest.approx(expected["rm"])
+    if "pl" in expected:
+        assert returned_loss == pytest.approx(expected["pl"])

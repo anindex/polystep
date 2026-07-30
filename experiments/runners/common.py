@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from polystep.benchmarks.utils import (
     BenchmarkResult,
@@ -52,8 +52,9 @@ from polystep.benchmarks.utils import (
 
 _HAS_TONIC = False
 try:
+    # The submodule import is what makes tonic.transforms resolvable below.
     import tonic
-    import tonic.transforms as tonic_transforms
+    import tonic.transforms  # noqa: F401
 
     _HAS_TONIC = True
 except ImportError:
@@ -1056,6 +1057,17 @@ def _run_polystep(model, train_loader, test_loader, loss_fn, epochs, device, see
     from polystep.optimizer import PolyStepOptimizer
     from polystep.cost_nn import NNCostEvaluator
 
+    solver = config.get("solver")
+    # The Sinkhorn accelerators only reach SinkhornSolver, so passing the defaults on a
+    # one-shot solver is inert and the optimizer says so.
+    sinkhorn_opts = (
+        {}
+        if solver not in (None, "sinkhorn")
+        else {
+            "anderson_depth": config.get("anderson_depth", 5),
+            "adaptive_omega": config.get("adaptive_omega", True),
+        }
+    )
     optimizer = PolyStepOptimizer(
         model,
         compile=config.get("compile", False),
@@ -1068,9 +1080,8 @@ def _run_polystep(model, train_loader, test_loader, loss_fn, epochs, device, see
         amortize_steps=config.get("amortize_steps", 2),
         amortize_ema=config.get("amortize_ema", 0.7),
         biased_rotation=config.get("biased_rotation", True),
-        anderson_depth=config.get("anderson_depth", 5),
-        adaptive_omega=config.get("adaptive_omega", True),
-        solver=config.get("solver"),
+        solver=solver,
+        **sinkhorn_opts,
     )
 
     evaluator = NNCostEvaluator(

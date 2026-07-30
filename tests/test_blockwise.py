@@ -1,19 +1,17 @@
-"""Tests for block-wise Sinkhorn decomposition and solver integration."""
+"""Tests for block-wise Sinkhorn decomposition: block construction and layout mapping."""
 
 import pytest
 import torch
 import torch.nn as nn
 
 from polystep.blockwise import (
-    create_per_layer_blocks,
+    blocks_to_layout_flat,
     create_grouped_blocks,
-    split_particles,
+    create_per_layer_blocks,
     reassemble_blocks,
-    compute_block_cost_matrix,
+    split_particles,
 )
 from polystep.transform import ParamLayout
-from polystep.cost_nn import NNCostEvaluator
-from polystep.solver import PolyStep
 
 
 class SimpleMLP(nn.Module):
@@ -53,12 +51,14 @@ class TestPerLayerBlocks:
 
 
 class TestGroupedBlocks:
-    def test_grouped_pairs(self):
+    @pytest.mark.parametrize("kwargs", [{}, {"group_size": 2}], ids=["default", "explicit"])
+    def test_grouped_pairs(self, kwargs):
+        """group_size defaults to 2, so both calls give the same 4-entry-into-2 split."""
         model = SimpleMLP()
         layout = ParamLayout.from_module(model)
-        blocks = create_grouped_blocks(layout, group_size=2)
-        # 4 entries grouped by 2 -> 2 blocks
+        blocks = create_grouped_blocks(layout, **kwargs)
         assert len(blocks) == 2
+        assert [b.leaf_indices for b in blocks] == [(0, 1), (2, 3)]
 
     def test_grouped_leaf_indices(self):
         model = SimpleMLP()
@@ -101,151 +101,8 @@ class TestSplitReassemble:
         torch.testing.assert_close(original, reconstructed)
 
 
-class TestBlockCost:
-    def test_block_cost_shape(self):
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        blocks = create_per_layer_blocks(layout, particle_dim=layout.particle_dim)
-        total_flat = sum(b.flat_end - b.flat_start for b in blocks)
-        flat_vec = torch.randn(total_flat)
-        all_block_parts = split_particles(flat_vec, blocks)
-
-        loss_fn = nn.MSELoss()
-        evaluator = NNCostEvaluator(model, loss_fn)
-        inputs = torch.randn(4, 4)
-        targets = torch.randn(4, 2)
-
-        # Create fake probe for block 0
-        block = blocks[0]
-        P, V, K = block.num_particles, 5, 3  # 5 vertices, 3 probes
-        X_probe = torch.randn(P, V, K, block.particle_dim)
-
-        cost = compute_block_cost_matrix(
-            block_idx=0,
-            X_probe_block=X_probe,
-            all_block_particles=all_block_parts,
-            blocks=blocks,
-            layout=layout,
-            evaluator=evaluator,
-            inputs=inputs,
-            targets=targets,
-        )
-        assert cost.shape == (P, V)
-        assert torch.isfinite(cost).all()
-
-
-class TestBlockwiseSolverIntegration:
-    def test_blockwise_solver_integration(self):
-        """End-to-end test: block-wise mode runs on synthetic NN objective."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        loss_fn = nn.MSELoss()
-        evaluator = NNCostEvaluator(model, loss_fn)
-        inputs = torch.randn(8, 4)
-        targets = torch.randn(8, 2)
-
-        # Create solver with block-wise per-layer mode
-        # dim = particle_dim since particles are block-level
-        # For block-wise, the full flat is split per block, so dim is layout.particle_dim
-        solver = PolyStep(
-            objective_fn=lambda x: x.sum(),  # placeholder, not used in block mode
-            dim=layout.particle_dim,
-            block_strategy="per_layer",
-            nn_evaluator=evaluator,
-            layout=layout,
-            train_inputs=inputs,
-            train_targets=targets,
-            compile=False,
-            epsilon=0.5,
-            num_probe=2,
-            sinkhorn_max_iters=50,
-        )
-
-        # Initialize particles from model
-        X_init = layout.flatten(model)
-        state = solver.init_state(X_init)
-
-        # Verify block_duals initialized
-        assert state.block_duals is not None
-        assert len(state.block_duals) == len(layout.entries)
-
-        # Run a step
-        state = solver.step(state)
-
-        # Verify state updated
-        assert state.iteration_count == 1
-        assert len(state.costs) == 1
-        assert state.block_duals is not None
-        # Block duals should now have actual tensors
-        for f_b, g_b in state.block_duals:
-            assert f_b is not None
-            assert g_b is not None
-
-    def test_blockwise_grouped_mode(self):
-        """Block-wise grouped mode runs end-to-end."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        loss_fn = nn.MSELoss()
-        evaluator = NNCostEvaluator(model, loss_fn)
-        inputs = torch.randn(8, 4)
-        targets = torch.randn(8, 2)
-
-        solver = PolyStep(
-            objective_fn=lambda x: x.sum(),
-            dim=layout.particle_dim,
-            block_strategy="grouped",
-            block_group_size=2,
-            nn_evaluator=evaluator,
-            layout=layout,
-            train_inputs=inputs,
-            train_targets=targets,
-            compile=False,
-            epsilon=0.5,
-            num_probe=2,
-            sinkhorn_max_iters=50,
-        )
-
-        X_init = layout.flatten(model)
-        state = solver.init_state(X_init)
-        state = solver.step(state)
-
-        assert state.iteration_count == 1
-        assert len(state.block_duals) == 2  # 4 entries / group_size 2 = 2 blocks
-
-    def test_subspace_plus_blockwise_raises(self):
-        """Combined subspace + block-wise should raise NotImplementedError."""
-        from polystep.subspace import LowRankSubspace
-
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        subspace = LowRankSubspace.from_layout(layout, rank=4)
-
-        with pytest.raises(NotImplementedError):
-            PolyStep(
-                objective_fn=lambda x: x.sum(),
-                dim=layout.particle_dim,
-                block_strategy="per_layer",
-                subspace=subspace,
-                layout=layout,
-                compile=False,
-            )
-
-    def test_invalid_block_strategy_raises(self):
-        """Unknown block_strategy should raise ValueError."""
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        with pytest.raises(ValueError, match="Unknown block_strategy"):
-            PolyStep(
-                objective_fn=lambda x: x.sum(),
-                dim=layout.particle_dim,
-                block_strategy="invalid",
-                layout=layout,
-                compile=False,
-            )
-
-
 class TestBlockLayoutConversion:
-    """Tests for layout_flat_to_block_flat, blocks_to_layout_flat, and batch variant."""
+    """Tests for layout_flat_to_block_flat, blocks_to_layout_flat, and the column map."""
 
     @pytest.mark.parametrize(
         "make_blocks",
@@ -301,32 +158,38 @@ class TestBlockLayoutConversion:
         assert torch.all(b1_data[:5] == 2.0)
         assert torch.all(b1_data[5:] == 0.0)
 
-    def test_batch_conversion_matches_unbatched(self):
-        """Batch conversion produces same result as looping over single conversion."""
-        from polystep.blockwise import (
-            layout_flat_to_block_flat,
-            blocks_to_layout_flat,
-            blocks_to_layout_flat_batch,
-        )
+    @pytest.mark.parametrize(
+        "make_blocks",
+        [
+            lambda layout: create_per_layer_blocks(layout, particle_dim=2),
+            lambda layout: create_grouped_blocks(layout, group_size=2, particle_dim=2),
+        ],
+        ids=["per_layer", "grouped"],
+    )
+    def test_column_map_scatters_to_the_same_place_as_the_slice_copy(self, make_blocks):
+        """The blockwise step scatters candidates straight into layout order.
+
+        The column map has to agree with ``blocks_to_layout_flat``, which builds the
+        same vector by slice copies, or a candidate lands on the wrong parameter and
+        the cost matrix scores a configuration nobody asked for.
+        """
+        from polystep.blockwise import block_to_layout_columns
 
         model = SimpleMLP()
         layout = ParamLayout.from_module(model, particle_dim=2)
-        blocks = create_per_layer_blocks(layout, particle_dim=2)
+        blocks = make_blocks(layout)
+        block_flat = torch.randn(blocks[-1].flat_end)
 
-        # Create batch of 4 different block-indexed flat vectors
-        batch_size = 4
-        total_block_flat = blocks[-1].flat_end
-        block_batch = torch.randn(batch_size, total_block_flat)
+        columns = block_to_layout_columns(blocks, layout, block_flat.device)
+        # One past the end absorbs per-block padding, which has no layout counterpart.
+        scattered = torch.zeros(layout.padded_size + 1)
+        scattered.scatter_(0, columns, block_flat)
 
-        layout_batch = blocks_to_layout_flat_batch(block_batch, blocks, layout)
-
-        for i in range(batch_size):
-            single = blocks_to_layout_flat(block_batch[i], blocks, layout)
-            torch.testing.assert_close(layout_batch[i], single)
+        torch.testing.assert_close(scattered[: layout.padded_size], blocks_to_layout_flat(block_flat, blocks, layout))
 
     def test_split_after_conversion_gives_correct_data(self):
         """split_particles on block-indexed data gives correct per-entry values."""
-        from polystep.blockwise import layout_flat_to_block_flat, blocks_to_layout_flat
+        from polystep.blockwise import layout_flat_to_block_flat
 
         class TwoLayer(nn.Module):
             def __init__(self):

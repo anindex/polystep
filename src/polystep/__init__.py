@@ -1,15 +1,12 @@
 """polystep: PyTorch PolyStep Optimizer."""
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 __all__ = [
     # Core solver
-    "Solver",
     "SolverResult",
     "SinkhornSolver",
-    "SinkhornResult",
     "SoftmaxSolver",
-    "SoftmaxResult",
     "KLSoftmaxSolver",
     "TemperedSoftmaxSolver",
     "MinCostGreedySolver",
@@ -18,10 +15,8 @@ __all__ = [
     "get_orthoplex_vertices",
     "get_simplex_vertices",
     "get_cube_vertices",
-    "get_sampled_polytope_vertices",
     "get_random_rotation_matrices",
     "POLYTOPE_MAP",
-    "POLYTOPE_NUM_VERTICES_MAP",
     # Cost & epsilon
     "compute_cost_matrix",
     "scale_cost_matrix",
@@ -29,16 +24,13 @@ __all__ = [
     "CosineEpsilon",
     "ProgressiveEpsilon",
     # Solver
-    "PolyStep",
     "SolverState",
     # Transform
     "ParamEntry",
     "ParamLayout",
-    "get_device",
     "create_generator",
     # NN cost evaluation
     "NNCostEvaluator",
-    "compute_nn_cost_matrix",
     "auto_detect_chunk_size",
     # Compilation
     "CompiledFunctions",
@@ -52,14 +44,12 @@ __all__ = [
     "CMAAdaptiveSubspace",
     # CMA
     "compute_cma_hyperparameters",
-    "update_step_size_csa",
     # Blockwise
     "BlockConfig",
     "create_per_layer_blocks",
     "create_grouped_blocks",
     # Dynamics
     "apply_momentum",
-    "update_adaptive_radius",
     "update_radius_multiplier",
     "update_stagnation",
     "compute_momentum_coefficient",
@@ -81,15 +71,9 @@ __all__ = [
     "Ackley",
     "Rosenbrock",
     "Rastrigin",
-    "StyblinskiTang",
-    "Levy",
-    "Griewank",
-    "Beale",
-    "Branin",
     "Sphere",
     # Layers
     "VmapSafeMultiHeadAttention",
-    "VmapSafeLSTMCell",
     "VmapSafeLSTM",
     # Projection
     "SparseRandomProjection",
@@ -100,12 +84,9 @@ __all__ = [
 ]
 
 from .solvers import (
-    Solver,
     SolverResult,
     SinkhornSolver,
-    SinkhornResult,
     SoftmaxSolver,
-    SoftmaxResult,
     KLSoftmaxSolver,
     TemperedSoftmaxSolver,
     MinCostGreedySolver,
@@ -116,20 +97,18 @@ from .geometry import (
     get_orthoplex_vertices,
     get_simplex_vertices,
     get_cube_vertices,
-    get_sampled_polytope_vertices,
     get_random_rotation_matrices,
     POLYTOPE_MAP,
-    POLYTOPE_NUM_VERTICES_MAP,
 )
 
 from .costs import compute_cost_matrix, scale_cost_matrix
 from .epsilon import LinearEpsilon, CosineEpsilon, ProgressiveEpsilon
 
-from .solver import PolyStep, SolverState
+from .solver import SolverState
 
-from .transform import ParamEntry, ParamLayout, get_device, create_generator
+from .transform import ParamEntry, ParamLayout, create_generator
 
-from .cost_nn import NNCostEvaluator, compute_nn_cost_matrix, auto_detect_chunk_size
+from .cost_nn import NNCostEvaluator, auto_detect_chunk_size
 
 from ._compiled import CompiledFunctions, try_compile
 
@@ -140,14 +119,12 @@ from .adaptive_subspace import AdaptiveSubspace
 from .cma_subspace import CMAAdaptiveSubspace
 from .cma import (
     compute_cma_hyperparameters,
-    update_step_size_csa,
 )
 
 from .blockwise import BlockConfig, create_per_layer_blocks, create_grouped_blocks
 
 from .dynamics import (
     apply_momentum,
-    update_adaptive_radius,
     update_radius_multiplier,
     update_stagnation,
     compute_momentum_coefficient,
@@ -171,16 +148,11 @@ from .objectives import (
     Ackley,
     Rosenbrock,
     Rastrigin,
-    StyblinskiTang,
-    Levy,
-    Griewank,
-    Beale,
-    Branin,
     Sphere,
 )
 
 # Vmap-safe layers
-from .layers import VmapSafeMultiHeadAttention, VmapSafeLSTMCell, VmapSafeLSTM
+from .layers import VmapSafeMultiHeadAttention, VmapSafeLSTM
 
 # Sparse projection for large-scale models
 from .projection import SparseRandomProjection

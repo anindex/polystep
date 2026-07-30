@@ -9,7 +9,8 @@ import math
 import pytest
 import torch
 
-from polystep import PolyStep, LinearEpsilon
+from polystep import LinearEpsilon
+from polystep.solver import PolyStep
 from polystep.objectives import Ackley, Rosenbrock, Rastrigin, Sphere
 
 
@@ -43,7 +44,7 @@ def _run_benchmark(
     return state, X_init
 
 
-# --- Test class ---
+# Test class
 
 
 class TestSyntheticBenchmarks:
@@ -85,6 +86,41 @@ class TestSyntheticBenchmarks:
         assert final_dist < init_dist * dist_factor, (
             f"particles did not converge: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
+
+    def test_health_series_stay_aligned_with_costs(self):
+        """``record_solver_health`` promises ess/rho/evals indexed like ``costs``.
+
+        The standalone solver appended only ``costs``, so any reader of the health
+        series got them empty or short.
+        """
+        state, _ = _run_benchmark(Sphere(dim=2), dim=2, num_particles=8, max_iters=6)
+
+        n = len(state.costs)
+        assert n > 0
+        assert len(state.ess) == len(state.rho) == len(state.evals) == n
+        # ESS/V is a fraction of the vertex count and rho is a fraction of the probe
+        # radius, so both live in a bounded range whatever the objective.
+        assert all(0.0 < e <= 1.0 for e in state.ess), state.ess
+        assert all(r >= 0.0 for r in state.rho), state.rho
+        assert all(v > 0 for v in state.evals), state.evals
+
+    def test_run_stops_early_once_the_displacement_settles(self):
+        """The convergence break is the point of ``threshold`` and never had a test."""
+        torch.manual_seed(0)
+        solver = PolyStep(
+            objective_fn=Sphere(dim=2),
+            dim=2,
+            epsilon=0.5,
+            step_radius=1.0,
+            probe_radius=2.0,
+            num_probe=5,
+            max_iterations=200,
+            min_iterations=3,
+            threshold=1e9,  # any relative change counts as settled
+            compile=False,
+        )
+        state = solver.run(torch.randn(8, 2), generator=torch.Generator().manual_seed(0))
+        assert state.iteration_count == 3, state.iteration_count
 
     def test_epsilon_schedule_synthetic(self):
         """LinearEpsilon schedule with Sphere: solver completes and converges."""

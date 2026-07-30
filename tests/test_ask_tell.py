@@ -21,12 +21,33 @@ def test_ask_returns_population_shape():
 
 def test_tell_requires_ask_first():
     es = PolyStepES(4, seed=0)
-    try:
+    with pytest.raises(RuntimeError, match="before ask"):
         es.tell(torch.zeros(es.popsize))
-        raised = False
-    except RuntimeError:
-        raised = True
-    assert raised
+
+
+def test_tell_keeps_the_best_candidate_it_was_shown():
+    """``best_solution`` is what the adapter exists to return, and only its type was checked."""
+    es = PolyStepES(3, num_particles=2, seed=0)
+    candidates = es.ask()
+    fitness = _sphere(candidates)
+    es.tell(fitness)
+
+    best = int(torch.argmin(fitness))
+    assert es.best_fitness == pytest.approx(fitness[best].item())
+    torch.testing.assert_close(es.best_solution, candidates[best])
+
+    # A worse round must not overwrite it.
+    es.tell(_sphere(es.ask()) + 1e6)
+    assert es.best_fitness == pytest.approx(fitness[best].item())
+
+
+def test_tell_ignores_a_non_finite_update():
+    """A NaN fitness must leave the particles where they were, not poison them."""
+    es = PolyStepES(3, num_particles=2, seed=0)
+    es.ask()
+    before = es.X.clone()
+    es.tell(torch.full((es.popsize,), float("nan")))
+    torch.testing.assert_close(es.X, before)
 
 
 def test_ask_twice_before_tell_raises():

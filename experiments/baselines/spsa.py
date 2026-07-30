@@ -16,7 +16,7 @@ Gain sequences (Spall's practical recommendations):
     alpha = 0.602, gamma = 0.101  (finite-sample optimal)
     A = 10% of max_iters          (stability constant)
 
-Note: The gain sequence a_k can become very small for large k. If alpha
+The gain sequence a_k can become very small for large k. If alpha
 is too high or a is too small, the algorithm may stall. Tuning a and c
 per task is recommended.
 
@@ -134,14 +134,14 @@ def train_spsa(
 
     with track_gpu_memory() as mem:
         for k in range(1, max_iters + 1):
-            # --- 1. Gain sequences ---
+            # 1. Gain sequences
             a_k = a / ((A + k) ** alpha)
             c_k = c / (k**gamma)
 
-            # --- 2. Bernoulli perturbation: each element +1 or -1 ---
+            # 2. Bernoulli perturbation: each element +1 or -1
             delta.bernoulli_(0.5).mul_(2.0).sub_(1.0)
 
-            # --- 3. Evaluate at perturbed points (same batch for both) ---
+            # 3. Evaluate at perturbed points (same batch for both)
             torch.add(params, delta, alpha=c_k, out=params_plus)
             torch.sub(params, delta, alpha=c_k, out=params_minus)
 
@@ -159,7 +159,7 @@ def train_spsa(
             with torch.no_grad():
                 loss_minus = loss_fn(model(batch_inputs), batch_targets).item()
 
-            # --- 4. Approximate gradient & 5. Update parameters (fused) ---
+            # 4. Approximate gradient & 5. Update parameters (fused)
             # g_hat_i = (loss_plus - loss_minus) / (2 * c_k * delta_i)
             # params -= a_k * g_hat = a_k * (L+ - L-) / (2*c_k) * (1/delta)
             # Since delta ∈ {-1, +1}, 1/delta = delta, so:
@@ -169,7 +169,7 @@ def train_spsa(
             # Restore params to model for evaluation
             set_flat_params(model, params)
 
-            # --- Logging ---
+            # Logging
             if k % log_interval == 0 or k == max_iters:
                 elapsed = time.time() - start_time
                 avg_loss = (loss_plus + loss_minus) / 2.0

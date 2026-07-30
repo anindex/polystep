@@ -21,22 +21,6 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
-def get_device(model: nn.Module) -> torch.device:
-    """Get device from model's first parameter, defaulting to CPU.
-
-    Args:
-        model: Any PyTorch module.
-
-    Returns:
-        Device of the first parameter, or ``torch.device('cpu')``
-        if the module has no parameters or buffers.
-    """
-    try:
-        return next(model.parameters()).device
-    except StopIteration:
-        return torch.device("cpu")
-
-
 def create_generator(seed: int, device: torch.device) -> torch.Generator:
     """Create a seeded ``torch.Generator`` on the given device.
 
@@ -50,6 +34,17 @@ def create_generator(seed: int, device: torch.device) -> torch.Generator:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     return gen
+
+
+def _element_span(tensor: torch.Tensor) -> Tuple[int, int]:
+    """Half-open byte range this tensor can touch in its storage.
+
+    From strides, so a strided view reports its extent rather than its element count.
+    """
+    esize = tensor.element_size()
+    start = tensor.storage_offset() * esize
+    reach = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())) * esize
+    return start, start + reach + esize
 
 
 @dataclass(frozen=True)
@@ -137,13 +132,14 @@ class ParamLayout:
                 _all_keys=(),
             )
 
-        # --- Pass 1: detect shared storage via data_ptr ---
-        seen_ptrs: dict[int, str] = {}  # data_ptr -> canonical key
+        # Pass 1: shared storage, keyed on the storage rather than the first element's
+        # address. Two views at different offsets have different data_ptr(), so a
+        # data_ptr key calls them independent and both then write the same bytes.
+        seen_storage: dict[int, list[tuple[str, int, int, tuple]]] = {}
         canonical_entries: list[ParamEntry] = []
         shared_map: dict[str, list[str]] = {}  # canonical_key -> [alias keys]
         offset = 0
 
-        # Build a lookup for requires_grad from named_parameters.
         # Also collect data_ptrs of trainable params so shared aliases
         # (e.g., tied weights) can be detected even if they appear under
         # a different name in state_dict.
@@ -167,16 +163,32 @@ class ParamLayout:
                 continue
 
             all_keys.append(key)
-            ptr = tensor.data_ptr()
-
-            if ptr in seen_ptrs and tensor.numel() > 0:
-                # This tensor shares storage with an earlier one
-                canonical_key = seen_ptrs[ptr]
-                shared_map.setdefault(canonical_key, [canonical_key]).append(key)
-                continue
 
             if tensor.numel() > 0:
-                seen_ptrs[ptr] = key
+                storage_id = tensor.untyped_storage().data_ptr()
+                start, stop = _element_span(tensor)
+                view = (tuple(tensor.shape), tensor.stride(), tensor.storage_offset())
+                group = seen_storage.setdefault(storage_id, [])
+                alias_of = None
+                for canonical_key, c_start, c_stop, canonical_view in group:
+                    if stop <= c_start or c_stop <= start:
+                        continue  # disjoint slices of one buffer stay independent
+                    # Only an identical view is a tie: unflatten writes the canonical
+                    # tensor to every alias. Stride and offset matter as much as shape -
+                    # a square weight and its transpose match on pointer and shape, and
+                    # merging them silently transposes one of the two.
+                    if view != canonical_view:
+                        raise ValueError(
+                            f"{key!r} and {canonical_key!r} share storage but are different views "
+                            f"(shape/stride/offset {view} vs {canonical_view}). Overlapping views of "
+                            "one buffer cannot be laid out as independent parameters."
+                        )
+                    alias_of = canonical_key
+                    break
+                if alias_of is not None:
+                    shared_map.setdefault(alias_of, [alias_of]).append(key)
+                    continue
+                group.append((key, start, stop, view))
 
             numel = tensor.numel()
             module_path = key.rsplit(".", 1)[0] if "." in key else ""
@@ -196,7 +208,6 @@ class ParamLayout:
 
         total_params = offset
 
-        # --- Build shared_groups tuples ---
         shared_groups: list[Tuple[str, ...]] = []
         # Also update entries with shared_with info
         updated_entries: list[ParamEntry] = []
@@ -218,10 +229,8 @@ class ParamLayout:
                 )
             updated_entries.append(entry)
 
-        # Surface tied-weight detection at INFO level so users see when
-        # their model has shared parameters (e.g. transformer embedding
-        # tied to lm_head). Otherwise the dedup happens silently and a
-        # mysterious parameter-count gap is hard to track down.
+        # Log the dedup, or a shared embedding leaves an unexplained gap between the
+        # model's parameter count and the layout's.
         if shared_groups:
             tied_summary = ", ".join(f"{group[0]} <- {{{', '.join(group[1:])}}}" for group in shared_groups)
             logger.info(
@@ -229,13 +238,13 @@ class ParamLayout:
                 tied_summary,
             )
 
-        # --- Determine dominant dtype ---
+        # Determine dominant dtype
         dtype_counts: dict[torch.dtype, int] = {}
         for entry in updated_entries:
             dtype_counts[entry.dtype] = dtype_counts.get(entry.dtype, 0) + entry.numel
         dominant_dtype = max(dtype_counts, key=dtype_counts.get) if dtype_counts else torch.float32
 
-        # --- Padding ---
+        # Padding
         padded_size = total_params + ((-total_params) % particle_dim) if total_params > 0 else 0
 
         return cls(
@@ -342,7 +351,6 @@ class ParamLayout:
             for alias_key in entry.shared_with:
                 reconstructed[alias_key] = param
 
-        # Return in original key order
         result = OrderedDict()
         for key in self._all_keys:
             result[key] = reconstructed[key]

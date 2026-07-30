@@ -1,6 +1,7 @@
 # API Overview
 
-polystep provides two levels of API for gradient-free neural network training.
+Four entry points: `PolyStepOptimizer`, the `train()` loop, the low-level `PolyStep`
+solver, and the `PolyStepES` ask/tell interface.
 
 ## High-Level API
 
@@ -18,7 +19,6 @@ model = nn.Sequential(nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, 10))
 optimizer = PolyStepOptimizer(model,
     epsilon=0.1,
     step_radius=0.15,
-    polytope_type='orthoplex',
 )
 
 # The closure receives batched candidate parameters and returns one loss
@@ -34,8 +34,8 @@ cost = optimizer.step(closure)
 ### train()
 
 Complete training loop with automatic closure construction. Pass any
-``torch.utils.data.DataLoader`` (or compatible iterable of
-``(inputs, targets)`` batches) as ``train_loader``.
+``torch.utils.data.DataLoader`` (or compatible iterable of ``(inputs, targets)`` batches)
+as ``dataloader``.
 
 ```python
 import torch.nn as nn
@@ -69,8 +69,7 @@ For large models, subspace projection reduces the OT problem dimension.
 
 ### HybridSubspace
 
-Per-layer projections with coordinated rotations. The default choice
-for most workloads.
+Per-layer projections with coordinated rotations. The default choice for most workloads.
 
 ```python
 from polystep import HybridSubspace
@@ -90,14 +89,14 @@ optimizer = PolyStepOptimizer(model, subspace=subspace,
 
 ### FactoredSubspace
 
-Perturbs each 2D parameter by `dW = A @ B` with `B` fixed, so a candidate's weights
-are never built: `x (W + A B)^T = x W^T + (x B^T) A^T`. 11x faster per step than
-`HybridSubspace` at matched search dimension, and 2.5x less memory
-(see [`docs/performance.md`](performance.md)).
+Perturbs each 2D parameter by `dW = A @ B` with `B` fixed, so a candidate's weights are
+never built. 11x faster per step than `HybridSubspace` at matched search dimension, and
+2.5x less memory; the identity and the accuracy trade are in
+[`docs/performance.md`](performance.md#trading-accuracy-for-speed-factoredsubspace).
 
-Needs a plain `nn.Sequential` of Linear and activation layers; anything else falls
-back to the materializing path with a warning. Pass the evaluator via
-`register_evaluator` so the optimizer can build the fused path.
+Needs a plain `nn.Sequential` of Linear and activation layers; anything else falls back
+to the materializing path with a warning. Pass the evaluator via `register_evaluator` so
+the optimizer can build the fused path.
 
 ```python
 from polystep import FactoredSubspace, NNCostEvaluator
@@ -136,10 +135,9 @@ subspace = LinearSubspace.from_layout(layout, rank=8)
 
 ### SparseRandomProjection
 
-For models with 1M+ parameters. Uses a sparse Johnson-Lindenstrauss transform
-under the hood and is typically created automatically when the optimizer is
-constructed with `projection_type='sparse'` or `'auto'`. The constructor
-signature is:
+For models with 1M+ parameters. Uses a sparse Johnson-Lindenstrauss transform internally
+and is typically created automatically when the optimizer is constructed with
+`projection_type='sparse'` or `'auto'`. The constructor signature is:
 
 ```python
 from polystep import SparseRandomProjection
@@ -149,7 +147,8 @@ proj = SparseRandomProjection(full_dim=10_000_000, subspace_dim=64, seed=0)
 
 ## VmapSafe Layers
 
-Standard `nn.MultiheadAttention` and `nn.LSTM` fail under `torch.vmap`. Use these drop-in replacements:
+Standard `nn.MultiheadAttention` and `nn.LSTM` fail under `torch.vmap`. Use these drop-in
+replacements:
 
 ```python
 from polystep.layers import VmapSafeMultiHeadAttention, VmapSafeLSTM
@@ -158,6 +157,35 @@ attention = VmapSafeMultiHeadAttention(embed_dim=256, num_heads=4)
 lstm = VmapSafeLSTM(input_size=128, hidden_size=256, num_layers=2)
 ```
 
+## Custom Layers on the Batched Paths
+
+The batched evaluators accept a fixed set of `torch.nn` layers. A custom layer opts in by
+declaring the one thing the evaluators cannot infer:
+
+```python
+class Staircase(nn.Module):
+    polystep_elementwise = True           # module(x)[i] == module(x[i])
+
+    def forward(self, x):
+        return torch.floor(torch.sigmoid(x) * 5) / 5
+
+
+class BinaryLinear(nn.Module):
+    polystep_weight_transform = staticmethod(torch.sign)   # forward is x @ Q(w).t() + b
+    polystep_bias_transform = None
+
+    def forward(self, x):
+        return x @ torch.sign(self.weight).t() + self.bias
+```
+
+`polystep_elementwise` requires no parameters, no buffers, no in-place writes, and the
+same answer for a slice as for the whole tensor; `try_build` probes that and declines a
+module that fails, so a softmax or layer norm falls back rather than returning a
+plausible wrong loss. Continuity is not required. `polystep_weight_transform` requires
+`Q` elementwise; `SubspaceDeltaEvaluator` and `FactoredEvaluator` decline such a layer
+because their correction is linear in the coordinate delta by construction. See
+[`docs/performance.md`](performance.md) for the measured effect.
+
 ## Low-Level API
 
 ### PolyStep
@@ -165,12 +193,11 @@ lstm = VmapSafeLSTM(input_size=128, hidden_size=256, num_layers=2)
 For synthetic objectives or custom optimization loops.
 
 ```python
-from polystep import PolyStep
+from polystep.solver import PolyStep
 
 solver = PolyStep.create(objective_fn,
     epsilon=0.5,
     max_iterations=100,
-    polytope_type='orthoplex',
 )
 
 # Full run
@@ -195,7 +222,15 @@ Mutable dataclass tracking optimization state:
 Built-in functions for testing:
 
 ```python
-from polystep import Ackley, Rosenbrock, Rastrigin, Levy, Sphere
+from polystep import Ackley, Rastrigin, Rosenbrock, Sphere
+```
+
+## Diagnostics
+
+```python
+from polystep import get_diagnostics
+
+get_diagnostics(optimizer)  # per-step ess, rho and evals
 ```
 
 ## Block-Wise OT
@@ -213,14 +248,14 @@ optimizer = PolyStepOptimizer(model,
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | `epsilon` | 0.1 | Use `CosineEpsilon` for scheduled decay |
-| `step_radius` | 1.0 | Multiplied by current epsilon |
-| `probe_radius` | 2.0 | Multiplied by current epsilon |
-| `num_probe` | 1 | Default; larger K trades evaluations for variance reduction |
-| `polytope_type` | `'orthoplex'` | `'orthoplex'`, `'simplex'`, `'cube'` |
+| `step_radius` | 1.0 | Multiplied by the current epsilon unless itself a schedule |
+| `probe_radius` | 2.0 | Multiplied by the current epsilon unless itself a schedule |
+| `num_probe` | 1 | K=1 is optimal: entropic regularization already does the averaging that larger K buys |
+| `polytope_type` | `'simplex'` | `'orthoplex'`, `'simplex'`, `'cube'`. The simplex is the minimum positive spanning set, so a step costs `k+1` evaluations instead of `2k`. Features that read the orthoplex's antithetic vertex pairing need `'orthoplex'` |
 | `compile` | False | Compiles the geometry and solver kernels. Off by default because ablations showed no end-to-end gain against the JIT warm-up cost; also a no-op on CPU. For forward-pass compilation see `compile_evaluator` / `compile_forward` |
 | `chunk_size` | None | Estimated from the tensors a step allocates; set it only to override |
 | `adaptive_probes` | True (monolithic) | Reuses the cached cost matrix while the configuration has not moved |
-| `adaptive_num_probe` | True (monolithic) | Drops to K=1 once the last OT-step costs are strictly decreasing |
+| `adaptive_num_probe` | monolithic and `num_probe > 1` | Drops to K=1 once the last OT-step costs are strictly decreasing |
 | `subspace` | None | Use `HybridSubspace` for large models |
 | `block_strategy` | `'monolithic'` | `'per_layer'` for memory efficiency |
 
@@ -242,8 +277,8 @@ es = minimize(objective, dim=20, steps=200)
 best_x, best_f = es.best_solution, es.best_fitness
 ```
 
-`PolyStepES` has its own defaults (`epsilon=0.5`, `step_radius=0.5`,
-`scale_cost="mean"`) and takes neither `probe_radius` nor `num_probe`.
+`PolyStepES` has its own defaults (`epsilon=0.5`, `step_radius=0.5`, `scale_cost="mean"`)
+and takes neither `probe_radius` nor `num_probe`.
 
 ## Checkpoint and Resume
 
@@ -263,14 +298,14 @@ optimizer.load_state_dict(ckpt["opt"])
 ```
 
 Resume is bit-exact for every configuration: alongside the solver state, `state_dict()`
-captures the optimizer-owned control state that steers the next step (amortization
-phase, transport-direction memory, adaptive-probe reuse caches, trust-region multiplier
-and pending prediction, block-wise dual-momentum history), and `load_state_dict()`
-rebuilds the fused `HybridSubspace` basis from the restored projections.
+captures the optimizer-owned control state that steers the next step (amortization phase,
+transport-direction memory, adaptive-probe reuse caches, trust-region multiplier and
+pending prediction, block-wise dual-momentum history), and `load_state_dict()` rebuilds
+the fused `HybridSubspace` basis from the restored projections.
 
-The dict carries a `format` key. Loading a checkpoint written by a newer polystep
-raises; an older one loads with the pre-`format=2` behaviour of dropping the reuse
-caches.
+The dict carries a `format` key, currently 3. Loading a newer checkpoint raises. A
+format-1 checkpoint loads with the reuse caches dropped; a format-2 one warns and resets
+the rotation-bias and quadratic-model steering state.
 
 ## Cutting the Forward Budget
 
@@ -303,26 +338,29 @@ Two options then cut the count itself:
   [`docs/performance.md`](performance.md) for the budget arithmetic and the measured
   wall-clock crossover.
 
-  It needs a cheap closure. `api.train` builds one; when driving `step()` yourself:
+It needs a cheap closure. `api.train` builds one; when driving `step()` yourself:
 
   ```python
   opt = PolyStepOptimizer(model, multifidelity_screen=True, screen_keep_ratio=0.5,
-                          screen_fidelity=0.25)
-  screen = opt.screen_closure_from(closure, inputs, targets)  # None when screening is off
+                          screen_fidelity=0.25, polytope_type='orthoplex')
+  screen = opt.screen_closure_from(closure, inputs, targets)  # None when screening is
+  off
   opt.step(closure, screen_closure=screen)
   ```
 
-  Screening is skipped, with a one-time warning, while `use_quadratic_model`,
-  `newton_refinement` or `trust_region` is on, or when
-  `screen_fidelity/num_probe + screen_keep_ratio >= 1`.
+Screening is skipped, with a one-time warning, when the polytope is neither an orthoplex
+nor paired with a selection solver (`min_cost_greedy`, `top_k_mean`), while
+`use_quadratic_model`, `newton_refinement` or `trust_region` is on, or when
+`screen_fidelity/num_probe + screen_keep_ratio >= 1`. The contrast ranking needs the
+orthoplex's antithetic pairs, so the default simplex does not screen.
 
 ## Restoring the Best Weights
 
 `TrainConfig.restore_best` defaults to `True`. Gradient-free search updates the model in
 place and the last step is not necessarily the best, so `train()` snapshots the weights
 whenever the tracked loss reaches a new minimum and restores that snapshot before
-returning. The tracked loss is the exact per-batch loss when a callback consumes per-step
-metrics, otherwise the already-computed OT cost proxy.
+returning. The tracked loss is the exact minibatch loss, one extra forward per step,
+which `restore_best` and any callback both require.
 
 ## Forward-Pass Compilation
 
@@ -331,7 +369,7 @@ Separate from `compile` (which covers the geometry and solver kernels):
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | `compile_evaluator` | False | Compiles the batched `vmap` candidate evaluation |
-| `compile_forward` | False | Compiles the single-candidate forward used by the in-place path, with CUDA graph replay on GPU |
+| `compile_forward` | None | Compiles the single-candidate forward used by the in-place path, with CUDA graph replay on GPU. `None` enables it wherever that path runs; pass `False` to opt out |
 
 See [performance.md](performance.md) for which backend is chosen when.
 

@@ -15,8 +15,7 @@ from typing import Optional, Union
 
 import torch
 
-from ..costs import scale_cost_matrix
-from ._prelude import align_marginal, sanitize_cost
+from ._shared import align_marginal, sanitize_cost, validate_cost_shape
 from .base import SolverResult
 
 
@@ -58,26 +57,25 @@ class MinCostGreedySolver:
         Returns:
             SolverResult with sparse transport matrix (one non-zero per row).
         """
-        P, V = cost_matrix.shape
-        device = cost_matrix.device
-        dtype = cost_matrix.dtype
-
-        # Shared marginal handling: validates a user-supplied `a` (finite, nonneg,
-        # positive mass) instead of scattering a bad marginal straight into the plan.
+        # sanitize first: argmin over a NaN is undefined and would hand all the mass
+        # to a masked vertex. No recentering, the selection is shift-invariant.
+        P, V = validate_cost_shape(cost_matrix, "MinCostGreedySolver")
+        C_raw = sanitize_cost(cost_matrix)
+        device, dtype = C_raw.device, C_raw.dtype
         a = align_marginal(a, P, device, dtype, "a")
 
-        # Replace non-finite costs with a finite penalty first: argmin over a
-        # NaN is undefined and would happily assign all mass to a masked vertex.
-        C_raw = sanitize_cost(cost_matrix)
-        C = scale_cost_matrix(C_raw, scale_cost)
-
         # Greedy: each particle picks the single lowest-cost vertex
-        min_indices = C.argmin(dim=-1)  # (P,)
+        min_indices = C_raw.argmin(dim=-1)  # (P,)
         transport = torch.zeros(P, V, device=device, dtype=dtype)
         transport.scatter_(1, min_indices.unsqueeze(1), a.unsqueeze(1))
+        # An all-infeasible row is constant after sanitize, so argmin picks vertex 0 and
+        # the particle takes a full step on nothing. Spread it uniformly: the polytope is
+        # centred, so the barycentre is the particle itself.
+        informative = (C_raw.amax(dim=-1) > C_raw.amin(dim=-1)).unsqueeze(1)
+        transport = torch.where(informative, transport, a.unsqueeze(1).expand(P, V) / V)
 
-        # Report in the caller's frame, like the entropic solvers do. The argmin is
-        # invariant to the positive divisor, so only the reported number changes.
+        # scale_cost is accepted but unused: argmin is invariant to a positive
+        # divisor, and the reported cost is in the caller's frame either way.
         ent_cost = (C_raw * transport).sum().item()
 
         return SolverResult(
@@ -142,30 +140,29 @@ class TopKMeanSolver:
         Returns:
             SolverResult with transport matrix (k non-zeros per row).
         """
-        P, V = cost_matrix.shape
-        device = cost_matrix.device
-        dtype = cost_matrix.dtype
-
-        # Shared marginal handling: validates a user-supplied `a` (finite, nonneg,
-        # positive mass) instead of scattering a bad marginal straight into the plan.
+        P, V = validate_cost_shape(cost_matrix, "TopKMeanSolver")
+        C_raw = sanitize_cost(cost_matrix)
+        device, dtype = C_raw.device, C_raw.dtype
         a = align_marginal(a, P, device, dtype, "a")
 
-        C_raw = sanitize_cost(cost_matrix)
-        C = scale_cost_matrix(C_raw, scale_cost)
-
-        # Graceful fallback when fewer vertices than k
         k_eff = min(self.k, V)
+        _, topk_indices = C_raw.topk(k_eff, dim=-1, largest=False)  # (P, k_eff)
 
-        # Top-k: find k lowest-cost vertex indices per particle
-        _, topk_indices = C.topk(k_eff, dim=-1, largest=False)  # (P, k_eff)
+        # sanitize_cost only guarantees a masked vertex ranks below every finite one,
+        # which argmin honours and topk does not: a row with fewer than k finite
+        # entries would hand real mass to forbidden directions. Drop those picks and
+        # spread the row's mass over what is left, so the row still sums to a. A row
+        # with nothing feasible keeps its picks rather than losing its mass.
+        feasible = ~(torch.isnan(cost_matrix) | (cost_matrix == float("inf")))
+        keep = feasible.gather(1, topk_indices)
+        keep = keep | ~keep.any(dim=1, keepdim=True)
 
-        # Uniform mass over top-k vertices
         transport = torch.zeros(P, V, device=device, dtype=dtype)
-        mass_per_vertex = a.unsqueeze(1) / k_eff  # (P, 1)
-        transport.scatter_(1, topk_indices, mass_per_vertex.expand_as(topk_indices))
+        mass = a.unsqueeze(1) / keep.sum(dim=1, keepdim=True) * keep
+        transport.scatter_(1, topk_indices, mass.to(dtype))
 
-        # Report in the caller's frame, like the entropic solvers do. topk is
-        # invariant to the positive divisor, so only the reported number changes.
+        # scale_cost is accepted but unused: topk is invariant to a positive
+        # divisor, and the reported cost is in the caller's frame either way.
         ent_cost = (C_raw * transport).sum().item()
 
         return SolverResult(

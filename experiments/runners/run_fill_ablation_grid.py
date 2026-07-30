@@ -20,17 +20,14 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-import torch
 import torch.nn as nn
 
 from experiments.runners.common import (
     evaluate_accuracy,
-    save_result,
     set_seed,
     track_gpu_memory,
     load_mnist,
     MNISTNet,
-    SEEDS,
 )
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "results")
@@ -293,7 +290,7 @@ def main():
 
     all_seeds = [42, 123, 456, 789, 1337]
 
-    # === RADIUS GRID ===
+    # RADIUS GRID
     # Clean 5x5 grid (drop sr=2.0,8.0 and pr=0.25,1.5)
     pr_vals = [0.1, 0.5, 1.0, 2.0, 3.0]
     sr_vals = [1.0, 3.0, 4.5, 6.0, 10.0]
@@ -315,7 +312,7 @@ def main():
     if not radius_todo:
         print("Radius grid is already complete!")
 
-    # === EPSILON GRID ===
+    # EPSILON GRID
     ei_vals = [0.5, 1.0, 2.0, 3.0]
     et_vals = [0.01, 0.1, 0.5]
     epsilon_dir = os.path.join(ABLATION_DIR, "epsilon")
@@ -354,7 +351,7 @@ def main():
         print(f"  {len(eps_todo)} epsilon cells")
         return
 
-    # === RUN RADIUS FILLS ===
+    # RUN RADIUS FILLS
     if radius_todo:
         print(f"\n{'=' * 60}")
         print(f"Running {len(radius_todo)} radius fills...")
@@ -363,7 +360,7 @@ def main():
             print(f"\n[{i + 1}/{len(radius_todo)}] pr={pr} sr={sr} seed={seed}")
             run_one(pr, sr, seed, args.device, "ablation_radius", radius_dir)
 
-    # === RUN EPSILON FILLS ===
+    # RUN EPSILON FILLS
     if eps_todo:
         print(f"\n{'=' * 60}")
         print(f"Running {len(eps_todo)} epsilon fills...")

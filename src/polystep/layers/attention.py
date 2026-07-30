@@ -70,10 +70,8 @@ class VmapSafeMultiHeadAttention(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         bias: bool = True,
-        # Mirror the upstream nn.MultiheadAttention signature so that
-        # callers passing unsupported features get a clear
-        # NotImplementedError instead of a generic Python
-        # "got an unexpected keyword argument".
+        # Mirror nn.MultiheadAttention's signature so unsupported features raise
+        # NotImplementedError rather than an unexpected-keyword TypeError.
         add_bias_kv: bool = False,
         add_zero_attn: bool = False,
         kdim: Optional[int] = None,
@@ -197,10 +195,8 @@ class VmapSafeMultiHeadAttention(nn.Module):
         # Q @ K.T = (batch, num_heads, seq_q, head_dim) @ (batch, num_heads, head_dim, seq_k)
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
-        # Bool masks are mask-filled with -inf to match
-        # ``nn.MultiheadAttention`` semantics. Float masks are additive
-        # (use -inf for hard masking, finite values for soft biases like
-        # ALiBi or relative-position embeddings).
+        # Bool masks fill with -inf, matching ``nn.MultiheadAttention``. Float masks
+        # are additive: -inf to mask, finite values for soft biases.
         if attn_mask is not None:
             if attn_mask.dim() == 2:
                 # (seq_q, seq_k) -> (1, 1, seq_q, seq_k)
@@ -218,7 +214,6 @@ class VmapSafeMultiHeadAttention(nn.Module):
             else:
                 scores = scores + attn_mask
 
-        # Apply key padding mask
         if key_padding_mask is not None:
             # (batch, seq_k) -> (batch, 1, 1, seq_k)
             padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
@@ -233,8 +228,8 @@ class VmapSafeMultiHeadAttention(nn.Module):
         context = torch.matmul(attn_weights, V)
 
         # Reshape back: (batch, num_heads, seq_q, head_dim) -> (batch, seq_q, embed_dim)
-        # Use reshape instead of .contiguous().view() to avoid a full tensor copy
-        # per candidate under vmap (N candidates x this copy = ~1.3 GB overhead).
+        # reshape, not .contiguous().view(): the latter copies once per candidate
+        # under vmap.
         context = context.transpose(1, 2).reshape(batch_size, seq_q, self.embed_dim)
 
         # Output projection

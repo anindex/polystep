@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import warnings
 from dataclasses import dataclass, fields as dataclass_fields
 from typing import Callable, List, Optional, Tuple, TYPE_CHECKING, Union
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+INF = float("inf")
 
 # Minimum params for sparse projection (below this, dense is more efficient)
 _MIN_PARAMS_FOR_SPARSE = 10_000
@@ -35,39 +37,6 @@ _MIN_PARAMS_FOR_SPARSE = 10_000
 # Threshold for auto-selecting sparse vs dense (device-dependent)
 _AUTO_SPARSE_THRESHOLD_CPU = 1_000_000  # 1M params for CPU
 _AUTO_SPARSE_THRESHOLD_GPU = 2_000_000  # 2M params for GPU
-
-# state_dict schema version. Bump when a key changes meaning; load rejects anything
-# newer and fills the gaps for anything older. 1: SolverState only. 2: adds "control".
-# 3: adds rotation-bias and quadratic-model state. See CHANGELOG.md.
-_STATE_DICT_FORMAT = 3
-
-# Optimizer attributes outside SolverState that steer the *next* step. Every one of
-# these is read before it is written on a step, so dropping it changes the resumed
-# trajectory.
-_CONTROL_STATE_KEYS = (
-    "_amortize_counter",
-    "_transport_direction",
-    "_transport_direction_ema",
-    "_trust_region_multiplier",
-    "_prev_predicted_improvement",
-    "_prev_pre_step_loss",
-    "_prev_cost_matrix",
-    "_prev_rot_mats",
-    "_prev_losses_3d",
-    "_prev_X",
-    "_prev_k_eff",
-    "_prev_step_r",
-    "_prev_probe_r",
-    # Read before they are written on the next step: the rotation bias picks the
-    # search frame, the Newton direction is what an amortized step coasts along, and
-    # the decreasing-run counter decides whether the probe count drops.
-    "_prev_descent_direction",
-    "_prev_descent_direction_finite",
-    "_prev_block_descent_directions",
-    "_newton_direction",
-    "_loss_decreasing_count",
-    "_prev_objective_token",
-)
 
 
 def _select_projection_type(
@@ -77,9 +46,8 @@ def _select_projection_type(
 ) -> str:
     """Determine whether to use dense or sparse projection.
 
-    Auto-selection thresholds are based on memory efficiency vs setup overhead.
-    For small models, dense projection is more efficient. For large models,
-    sparse projection reduces memory footprint significantly.
+    Dense projection wins on small models, where setup dominates. Sparse wins on
+    large ones, where the dense matrix would be O(num_params * num_coords).
 
     Args:
         num_params: Total model parameters.
@@ -114,7 +82,14 @@ from .blockwise import (
 )
 from .epsilon import LinearEpsilon
 from .geometry import POLYTOPE_MAP
-from .solvers import SinkhornSolver, SoftmaxSolver, MinCostGreedySolver, TopKMeanSolver, TemperedSoftmaxSolver
+from .solvers import (
+    KLSoftmaxSolver,
+    MinCostGreedySolver,
+    SinkhornSolver,
+    SoftmaxSolver,
+    TemperedSoftmaxSolver,
+    TopKMeanSolver,
+)
 from .solver import SolverState
 from .adaptive_subspace import AdaptiveSubspace
 from .cma import compute_cma_hyperparameters
@@ -122,12 +97,40 @@ from .cma_subspace import CMAAdaptiveSubspace
 from .subspace import LowRankSubspace, LinearSubspace
 from .factored_subspace import FactoredSubspace
 from .hybrid_subspace import HybridSubspace
+from ._serialization import SerializationMixin
 from .transform import ParamLayout, create_generator
 
 from ._step_monolithic import step_monolithic as _step_monolithic_fn
 from ._step_blockwise import step_blockwise as _step_blockwise_fn
 from ._step_blockwise import step_subspace_blockwise as _step_subspace_blockwise_fn
 from ._step_momentum import step_momentum as _step_momentum_fn
+
+_THREAD_WARNING_ISSUED = False
+
+
+def _warn_thread_oversubscription() -> None:
+    """Warn once when the intra-op pool is sized to saturate every core.
+
+    A step is thousands of small forwards, so the OpenMP barrier is hit constantly. With
+    the pool at or one below the core count, the pool threads and the main thread
+    oversubscribe and the spin-wait takes over. The cost depends on core count and on
+    what else the machine is running; see docs/performance.md for a measured table.
+    """
+    global _THREAD_WARNING_ISSUED
+    if _THREAD_WARNING_ISSUED:
+        return
+    ncpu = os.cpu_count() or 1
+    threads = torch.get_num_threads()
+    if ncpu >= 4 and threads >= ncpu - 1:
+        _THREAD_WARNING_ISSUED = True
+        warnings.warn(
+            f"torch.get_num_threads()={threads} on {ncpu} cores saturates the intra-op "
+            f"pool, where OpenMP spin-wait dominates PolyStep's many small forwards. "
+            f"Call torch.set_num_threads({max(1, ncpu - 8)}) "
+            f"before building the optimizer, or set OMP_WAIT_POLICY=PASSIVE. "
+            f"See docs/performance.md.",
+            stacklevel=3,
+        )
 
 
 @dataclass
@@ -169,26 +172,21 @@ class RankSchedule:
         return [s for s, _ in self.stages if s > 0]
 
 
-class PolyStepOptimizer:
+class PolyStepOptimizer(SerializationMixin):
     """Gradient-free optimizer via entropic optimal transport.
 
     Wraps polytope sampling, OT solve, barycentric projection, momentum,
     and adaptive radius into a single ``step(closure)`` interface. Updates
     the model weights in-place after each step.
 
-    The optimizer uses entropic regularization (controls smoothness of the
-    transport plan; higher values give smoother but less precise solutions)
-    to solve an optimal transport problem between current particle positions
-    and candidate polytope vertices. The solution yields a transport plan
-    whose weights are used for barycentric projection (updates particle
-    positions as a weighted average of polytope vertices, with weights from
-    the optimal transport plan). Between iterations, dual potentials
-    (auxiliary variables from the Sinkhorn algorithm that encode the optimal
-    transport solution) are warm-started for faster convergence.
+    Each step solves an entropically regularized transport problem between the
+    particles and the polytope vertices around them, then moves every particle to the
+    transport-weighted mean of its vertices. Higher ``epsilon`` smooths the plan.
+    Dual potentials are warm-started across iterations.
 
     This is a standalone class (NOT a ``torch.optim.Optimizer`` subclass)
-    because Sinkhorn Step is fundamentally gradient-free and does not use
-    parameter groups or ``zero_grad()``.
+    because Sinkhorn Step is gradient-free and uses neither parameter groups nor
+    ``zero_grad()``.
 
     **Multi-particle architecture:** Model parameters are laid out as
     ``(num_particles, particle_dim)`` where ``particle_dim`` defaults to 2.
@@ -221,16 +219,31 @@ class PolyStepOptimizer:
 
     Args:
         model: The ``nn.Module`` to optimize. Weights are updated in-place.
-        polytope_type: Polytope template ('orthoplex', 'simplex', 'cube').
-        epsilon: Entropic regularization (float or LinearEpsilon schedule).
+        polytope_type: Polytope template ('simplex', 'orthoplex', 'cube').
+            Default ``'simplex'``: ``k+1`` vertices, the minimum positive spanning set of
+            ``R^k`` (Davis 1954), so the smallest probe set that can still guarantee a
+            descent direction. The ``2k``-vertex orthoplex spends its extra ``k-1``
+            vertices cancelling the curvature term the simplex leaks.
+
+            Take the orthoplex when ``cur/|lin|`` at your probe radius is ``O(1)`` or
+            larger, or for a feature that reads its antithetic vertex ordering:
+            ``use_quadratic_model``, ``newton_refinement``, ``trust_region``, and the
+            contrast-ranked ``multifidelity_screen``. The constructor warns if one of
+            those is enabled on another polytope. Otherwise the simplex is the cheaper
+            step at equal accuracy. See ``docs/performance.md``.
+        epsilon: Entropic regularization: a float, or any scheduler exposing ``.at()``
+            (``LinearEpsilon``, ``CosineEpsilon``, ``ProgressiveEpsilon``). A
+            ``ProgressiveEpsilon`` here is fed solver stats exactly as ``auto_epsilon``
+            does, so it needs an iterative solver.
 
             ``epsilon`` is overloaded. With float ``step_radius``/``probe_radius`` it
             multiplies both (the geometry scale), and it is also the softmax/Sinkhorn
             temperature when ``ent_epsilon is None``. Polytopes are mean-centred, so
-            ``Delta/r = sum_j (W_j - 1/V) u_j ~= -(1/(V*eps)) sum_j (C_j - Cbar) u_j``,
-            giving ``Delta = -(step_radius*probe_radius/(eps*k)) * g`` to first order.
-            ``(step_radius, probe_radius, epsilon)`` thus has two effective degrees of
-            freedom: the product is the learning rate, the ratio is a signal-to-noise knob.
+            ``Delta/r = sum_j (W_j - 1/V) u_j ~= -(1/(V*eps)) sum_j (C_j - Cbar) u_j``.
+            With ``sum_j u_j u_j^T = (V/d) I`` over the particle dimension ``d``, that
+            gives ``Delta = -(step_radius * probe_radius * sbar * eps / d) * g`` to first
+            order, where ``sbar`` is the mean probe scale (0.5 at ``num_probe=1``).
+            ``step_radius * probe_radius * epsilon`` is therefore the learning rate.
 
             So with float radii, sweeping ``epsilon`` alone mostly moves step size, not
             weight concentration. With ``rho = ||Delta||/r`` and
@@ -244,11 +257,17 @@ class PolyStepOptimizer:
             entropic temperature to the probe/step geometry. See ``epsilon``.
         scale_cost: Cost scaling strategy ('mean', 'max_cost', float, or None).
         step_radius: Base step radius multiplied by epsilon (see ``epsilon``).
+            Measured in subspace coordinates, and the subspace classes do not share a
+            normalization. ``LinearSubspace`` amplifies by
+            ``sqrt(num_params / num_coords)`` (4.38 on a 784-256-10 MLP at rank 8),
+            while ``HybridSubspace`` and ``FactoredSubspace`` are unit gain. The same
+            ``step_radius`` is therefore a ~4.4x different weight-space step across
+            classes, and switching class needs it retuned.
         probe_radius: Base probe radius multiplied by epsilon (see ``epsilon``).
         num_probe: Number of probe points per direction (default 1).
             K=1 is optimal: multi-probe averaging is redundant when entropic
-            regularization is active. K=1 gives ~3x speedup over K=3 with no
-            accuracy loss.
+            regularization is active, and K forward passes per direction drop to one
+            at no accuracy cost.
         adaptive_probes: Reuse the previous step's cost row for stagnant particles
             (small displacement) instead of recomputing it, saving ``V * K`` forward
             passes each. ``None`` (default) enables it wherever it is implemented,
@@ -261,16 +280,31 @@ class PolyStepOptimizer:
         sinkhorn_max_iters: Maximum inner Sinkhorn iterations.
         chunk_size: Chunk size for cost evaluation memory control.
         cost_batch_size: Optional mini-batch size for cost matrix evaluation.
-            Note: stored for the training loop closure to read; not used
+            stored for the training loop closure to read; not used
             internally by the optimizer.
         compile: Whether to compile hot-path tensor functions. Defaults to
             False because ablation experiments show no measurable end-to-end
             speedup while incurring JIT warm-up overhead.
         solver: OT/weighting solver strategy. 'softmax' for direct softmax
             weighting (fast, no dual potentials), 'sinkhorn' for entropic OT
-            solver (iterative, with warm-started duals). None (default)
-            auto-selects: softmax for subspace modes, sinkhorn for full-space.
+            solver (iterative, with warm-started duals), 'kl_softmax' for the
+            one-sided KL-penalized interpolation between the two (``kl_softmax_lam=0``
+            is softmax, ``inf`` is Sinkhorn), 'min_cost_greedy' and 'top_k_mean' for
+            selection rather than weighting, 'tempered_softmax' for a softmax at a
+            fixed temperature the epsilon schedule does not touch. None (default) auto-selects: softmax for subspace modes,
+            sinkhorn for full-space.
             ProgressiveEpsilon (auto_epsilon=True) is incompatible with softmax.
+
+            Solvers differ in contraction by ``1/rho``, where ``rho = ||Delta||/r`` is
+            the fraction of the step radius the step travels: a selection solver has
+            ``rho = 1`` by construction, a hot softmax far less. Swapping solvers without
+            re-sweeping ``step_radius`` measures the step size, not the solver.
+            ``get_diagnostics`` reports ``rho`` and ``ess`` per step.
+        tempered_softmax_tau: Fixed temperature for ``solver='tempered_softmax'``, a
+            divisor on the cost. Lower is sharper; at the default 1.0 against an
+            epsilon of 0.1 it is flatter than the plain softmax, not sharper.
+        kl_softmax_lam: Column-marginal KL penalty for ``solver='kl_softmax'``.
+            ``0`` reduces it to softmax, ``inf`` (default) to Sinkhorn.
         subspace: Subspace object for subspace mode. ``HybridSubspace`` is the
             recommended choice; ``AdaptiveSubspace``, ``CMAAdaptiveSubspace``,
             ``LinearSubspace`` and ``LowRankSubspace`` are also accepted. None runs in
@@ -292,9 +326,23 @@ class PolyStepOptimizer:
             no effect for them.
         block_strategy: 'monolithic', 'per_layer', or 'grouped'.
         block_group_size: Number of consecutive entries per block group.
-        use_momentum: Enable momentum velocity accumulation.
+        biased_rotation: Replace the chart's first axis with the previous step's descent
+            direction instead of leaving the rotation fully Haar (default False). Two
+            mechanisms sit behind this flag and ``num_probe`` picks which. With
+            ``use_quadratic_model=True``, ``num_probe >= 2`` and
+            ``polytope_type='orthoplex'`` the direction is the finite-difference gradient
+            from the ``(P, V, K)`` loss tensor. Otherwise, including at the default
+            ``num_probe=1`` where that model cannot be built, it is the OT barycenter's
+            displacement; the step warns once when it takes that path. Either way this is
+            rank-1 subspace alignment, not preconditioning.
+        use_momentum: Enable momentum velocity accumulation (default False). The velocity
+            lives in the subspace basis, so absorb zeroes it and the averaging window
+            cannot exceed ``absorb_interval``. It also multiplies the effective step by
+            ``1/(1-beta)`` while improving the direction only by ``sqrt(1/(1-beta))``, so
+            ``step_radius`` has to be re-tuned per ``momentum_final`` or the comparison
+            measures the step size instead.
         momentum_init: Starting momentum coefficient.
-        momentum_final: Final momentum coefficient.
+        momentum_final: Final momentum coefficient, reached linearly over ``max_iterations``.
         velocity_lr: Learning rate for velocity update.
         use_adaptive_radius: Enable stagnation-based radius adaptation. The stagnation
             counter is tracked either way, since ``absorb_mode="stagnation"`` reads it;
@@ -332,46 +380,29 @@ class PolyStepOptimizer:
             distribution. The diagonal is renormalized to mean 1 each step, so it
             redistributes step size across coordinates without changing the overall
             scale, which stays owned by the radii.
-        use_csa: Accepted but refused, with a warning. CSA reads step size off the
-            agreement between consecutive mutations, which requires those mutations to
-            be random. PolyStep's OT step is a deterministic descent direction, so
-            agreement is the normal state, CSA reads maximum coherence every generation,
-            and sigma grows multiplicatively without bound. Use ``use_adaptive_radius``
-            for loss-driven step adaptation.
         seed: Optional seed for reproducible random rotations.
-        mixed_precision: Enable BF16 model forward passes with FP32 Sinkhorn
-            solver internals. Reduces memory usage (~50% for weights) while
-            maintaining numerical stability. Requires GPU compute capability
-            >= 7.0 (Volta) or CPU. Default False.
+        mixed_precision: Cast the model, particles and projections to BF16, keeping
+            the Sinkhorn internals in FP32. Halves weight memory. Because the
+            parameters themselves are BF16, a candidate perturbation below their
+            resolution rounds away; use ``candidate_autocast`` to keep FP32 masters.
+            Default False.
+        candidate_autocast: Run the candidate forward's arithmetic in BF16 under
+            ``torch.amp.autocast`` while the parameters stay at their own dtype. The
+            delta evaluators are excluded: their correction is a small offset on a
+            full-scale output, which half precision erases. Default False.
         projection_type: Type of projection for AdaptiveSubspace mode.
             'dense' uses QR-orthogonalized dense matrices (default).
             'sparse' uses SparseRandomProjection for memory efficiency.
             'auto' will auto-select based on model size.
 
-    Hyperparameter quick reference (MNIST as a sanity check):
-
-    - **Full-space (no subspace).** ``epsilon=LinearEpsilon(1.0 -> 0.1)``,
-      ``step_radius=0.15``, ``probe_radius=0.12``.
-    - **HybridSubspace.** ``rank=4``, ``rotation_interval=0``, decaying
-      ``epsilon``, ``step_radius=4.5``, ``probe_radius=2.0``.
-    - **LinearSubspace.** Decaying ``epsilon``, but a *larger* ``step_radius`` than
-      HybridSubspace: its Gaussian columns are scaled by ``1/sqrt(num_coords)``, so the
-      gain is layer-dependent rather than Hybrid's uniform QR-orthonormal 1 (see the
-      ``LinearSubspace`` docstring for the exact factor).
-    - **AdaptiveSubspace.** Large ``rank`` (e.g. 4096), *fixed* ``epsilon=0.5``,
-      ``step_radius=10.0``, ``probe_radius=2.0``, ``use_adaptive_radius=True``.
-
-    Rule of thumb: per-layer subspaces benefit from a decaying epsilon
-    schedule; a single global projection prefers a fixed epsilon with
-    adaptive radius. Global projections also need a larger ``step_radius``
-    than per-layer ones.
+    See ``docs/performance.md`` for starting hyperparameters per subspace.
     """
 
     def __init__(
         self,
         model: nn.Module,
         *,
-        polytope_type: str = "orthoplex",
+        polytope_type: str = "simplex",
         particle_dim: int = 2,
         epsilon: Union[float, LinearEpsilon] = 0.1,
         ent_epsilon: Optional[Union[float, LinearEpsilon]] = None,
@@ -381,13 +412,10 @@ class PolyStepOptimizer:
         scale_cost: Optional[Union[str, float]] = 1.0,
         step_radius: float = 1.0,
         probe_radius: float = 2.0,
-        # Probe-radius jitter (Theorem 4.2 condition (iv)): per-step uniform
-        # multiplicative perturbation eta_t ~ U[-eta_max, +eta_max] applied to
-        # the resolved probe radius so the joint (rotation, jitter) probe
-        # distribution is absolutely continuous on a positive-Lebesgue-measure
-        # tube around the (d_p-1)-sphere. The convergence proof formally
-        # requires probe_radius_jitter > 0; default 0.0 keeps existing
-        # experiments bit-for-bit reproducible. Recommended value: 0.05.
+        # Theorem 4.2 condition (iv): eta_t ~ U[-eta_max, eta_max] on the probe radius
+        # makes the joint (rotation, jitter) distribution absolutely continuous on a
+        # tube around the sphere. The proof needs it > 0; the default 0.0 keeps existing
+        # experiments reproducible. Try 0.05.
         probe_radius_jitter: float = 0.0,
         num_probe: int = 1,
         # Adaptive probe count: reduce K during exploitation.
@@ -408,6 +436,7 @@ class PolyStepOptimizer:
         compile: bool = False,
         solver: Optional[str] = None,
         tempered_softmax_tau: float = 1.0,
+        kl_softmax_lam: float = float("inf"),
         subspace: Optional[
             Union[LowRankSubspace, LinearSubspace, AdaptiveSubspace, HybridSubspace, CMAAdaptiveSubspace]
         ] = None,
@@ -449,23 +478,27 @@ class PolyStepOptimizer:
         screen_fidelity: float = 0.25,
         # CMA-ES configuration
         use_covariance_adaptation: bool = False,
-        use_csa: bool = False,
         seed: Optional[int] = None,
-        # Mixed precision
         mixed_precision: bool = False,
-        # Projection type
+        candidate_autocast: bool = False,
         projection_type: str = "dense",
-        # Compile vmap in NNCostEvaluator (fusion-only torch.compile of the
-        # vectorized forward; ~2-4x, no CUDA graphs: see NNCostEvaluator).
+        # Compile vmap in NNCostEvaluator (fusion only, no CUDA graphs).
         compile_evaluator: bool = False,
         # CUDA-graph-compile the in-place forward+loss closure (reduce-overhead).
         # Only bites on the in-place path (>500K-param GPU models); the
         # launch-bound win for recurrent nets. See NNCostEvaluator.compile_forward.
-        compile_forward: bool = False,
+        compile_forward: Optional[bool] = None,
     ) -> None:
-        # Projection type validation
         if projection_type not in ("dense", "sparse", "auto"):
             raise ValueError(f"Invalid projection_type: {projection_type!r}. Use 'dense', 'sparse', or 'auto'.")
+        # Every downstream site tests `!= "monolithic"`, so an unrecognised value would
+        # silently select block-wise mode rather than raise.
+        if block_strategy not in ("monolithic", "per_layer", "grouped"):
+            raise ValueError(
+                f"Invalid block_strategy: {block_strategy!r}. Use 'monolithic', 'per_layer', or 'grouped'."
+            )
+        if polytope_type not in POLYTOPE_MAP:
+            raise ValueError(f"Invalid polytope_type: {polytope_type!r}. Use one of {sorted(POLYTOPE_MAP)}.")
         self._requested_projection_type = projection_type
         self._compile_evaluator = compile_evaluator
         self._compile_forward = compile_forward
@@ -485,6 +518,33 @@ class PolyStepOptimizer:
             )
         self._full_space_particle_dim = particle_dim
 
+        _warn_thread_oversubscription()
+
+        # Features that read the orthoplex's antithetic vertex ordering. The default
+        # polytope is the simplex, so enabling one of these without also asking for the
+        # orthoplex leaves it inert: the finite-difference extractors check
+        # polytope_type, and the contrast-ranked screen needs vertex j and j+k to be a
+        # +/- pair.
+        _needs_orthoplex = [
+            name
+            for name, on in (
+                ("use_quadratic_model", use_quadratic_model),
+                ("newton_refinement", newton_refinement),
+                ("trust_region", trust_region),
+                # A selection solver ranks vertices directly, so its screen needs no pairing.
+                ("multifidelity_screen", multifidelity_screen and solver not in ("min_cost_greedy", "top_k_mean")),
+            )
+            if on
+        ]
+        if polytope_type != "orthoplex" and _needs_orthoplex:
+            warnings.warn(
+                f"{', '.join(_needs_orthoplex)} depend on the orthoplex's antithetic vertex "
+                f"ordering, but polytope_type={polytope_type!r}. They will not take effect. Pass "
+                f"polytope_type='orthoplex' to use them, or drop them to keep the simplex, which "
+                f"is the minimal positive spanning set and the cheaper step.",
+                stacklevel=2,
+            )
+
         # Warn if particle_dim is set but will be overridden by subspace_particle_dim
         if subspace is not None and particle_dim != 2:
             warnings.warn(
@@ -500,22 +560,24 @@ class PolyStepOptimizer:
         if subspace is not None and block_strategy == "grouped":
             warnings.warn(
                 "block_strategy='grouped' has no effect in subspace mode: blocks divide the "
-                "subspace coordinates evenly, not the parameter entries, so it behaves exactly "
+                "subspace coordinates evenly, not the parameter entries, so it produces exactly "
                 "like 'per_layer'. Use block_strategy='per_layer', or drop the subspace to group "
                 "parameter entries.",
                 stacklevel=2,
             )
 
-        # Combined subspace + block-wise mode
-        # When both subspace and block_strategy are specified, operate in combined mode:
-        # global projection compresses full params to subspace coords, then per-block OT
-        # decomposes the subspace coordinate optimization.
+        # Combined mode: the global projection compresses full params to subspace
+        # coords, then per-block OT decomposes the coordinate optimization.
         self._subspace_blockwise = subspace is not None and block_strategy != "monolithic"
 
         # Mixed precision config. Default to the model's own dtype rather than a
         # hardcoded fp32: a float64 model would otherwise get fp32 projections and
         # CMA state, and the reconstruct matmul fails on the dtype mismatch.
         self._mixed_precision = mixed_precision
+        # Distinct from mixed_precision, which casts the parameters: autocast leaves
+        # them alone and runs only the candidate forward's arithmetic in bf16, so a
+        # small perturbation still reaches the loss.
+        self._candidate_autocast_dtype = torch.bfloat16 if candidate_autocast else None
         try:
             self._model_dtype = next(model.parameters()).dtype
         except StopIteration:
@@ -523,16 +585,19 @@ class PolyStepOptimizer:
         if not self._model_dtype.is_floating_point:
             self._model_dtype = torch.float32
 
-        # Store model and config
         self.model = model
         self.polytope_type = polytope_type
         self.epsilon = epsilon
         self.ent_epsilon = ent_epsilon
 
-        # Auto-epsilon: ProgressiveEpsilon with solver feedback
-        if auto_epsilon:
-            from .epsilon import ProgressiveEpsilon
+        # ProgressiveEpsilon needs solver feedback, which only ``_progressive_epsilon``
+        # receives. A scheduler passed as ``epsilon`` is adopted here so it advances the
+        # same way ``auto_epsilon=True`` does; otherwise it would sit frozen at ``init``.
+        from .epsilon import ProgressiveEpsilon
 
+        if isinstance(epsilon, ProgressiveEpsilon):
+            self._progressive_epsilon = epsilon
+        elif auto_epsilon:
             if isinstance(epsilon, LinearEpsilon):
                 prog_init = epsilon.init
                 prog_target = epsilon.target
@@ -556,6 +621,13 @@ class PolyStepOptimizer:
         else:
             self._progressive_epsilon = None
         self.scale_cost = scale_cost
+        # A negative radius flips the finite-difference denominator, which
+        # clamp(min=1e-10) then turns positive and scales the gradient by 1e10.
+        # step_radius=0 is allowed: it is the no-movement control.
+        if isinstance(step_radius, (int, float)) and step_radius < 0:
+            raise ValueError(f"step_radius must be >= 0, got {step_radius}.")
+        if isinstance(probe_radius, (int, float)) and probe_radius <= 0:
+            raise ValueError(f"probe_radius must be > 0, got {probe_radius}.")
         self.step_radius = step_radius
         self.probe_radius = probe_radius
         if not (0.0 <= probe_radius_jitter < 1.0):
@@ -571,6 +643,11 @@ class PolyStepOptimizer:
                 f"num_probe=0 yields an empty probe tensor and NaN costs."
             )
         self.num_probe = num_probe
+        # The fused softmax path divides by epsilon directly and never reaches a solver's
+        # own validation. A zero gives NaN, a negative silently inverts the plan into ascent.
+        for _name, _value in (("epsilon", epsilon), ("ent_epsilon", ent_epsilon)):
+            if isinstance(_value, (int, float)) and _value <= 0:
+                raise ValueError(f"{_name} must be > 0, got {_value}.")
         # Both features are wired into the monolithic step only. Defaulting them to
         # None rather than True keeps the "you asked for this and it was ignored"
         # warning below honest: it fires on an explicit True, not on the default.
@@ -578,7 +655,10 @@ class PolyStepOptimizer:
         # Whether the caller asked for reuse, as opposed to inheriting the default.
         # Diagnostics about reuse never firing are addressed to the caller who asked.
         self._adaptive_probes_explicit = adaptive_probes is not None
-        adaptive_num_probe = _savings_default if adaptive_num_probe is None else adaptive_num_probe
+        # Reducing K to 1 needs a K above 1 to reduce, so the default stays off at the
+        # default num_probe=1 rather than arming machinery with nothing to do.
+        if adaptive_num_probe is None:
+            adaptive_num_probe = _savings_default and num_probe > 1
         adaptive_probes = _savings_default if adaptive_probes is None else adaptive_probes
         self.adaptive_num_probe = adaptive_num_probe
         self._adaptive_probe_warmup = adaptive_probe_warmup
@@ -593,6 +673,7 @@ class PolyStepOptimizer:
         self._prev_X: Optional[torch.Tensor] = None
         # Previous cost matrix, reused whole when X has not moved
         self._prev_cost_matrix: Optional[torch.Tensor] = None
+        self._param_write_cache = None
         # Previous rotation matrices: they come back with the matrix so the rows
         # still describe the vertices they were evaluated at.
         self._prev_rot_mats: Optional[torch.Tensor] = None
@@ -609,15 +690,17 @@ class PolyStepOptimizer:
         self._objective_token_warned = False
         self.max_iterations = max_iterations
         self.chunk_size = chunk_size
+        if cost_batch_size is not None and cost_batch_size <= 0:
+            # 0 slices an empty batch, so every candidate scores NaN, sanitize flattens
+            # the matrix, and the run trains nothing while diagnostics stay finite.
+            raise ValueError(f"cost_batch_size must be > 0 or None, got {cost_batch_size}.")
         self.cost_batch_size = cost_batch_size
         self.amortize_steps = max(1, amortize_steps)
         self.amortize_ema = amortize_ema
 
-        # SNN-like models (LIF / Leaky / Spiking / ALIF cells) collapse
-        # from ~93% to 10-47% accuracy when step_radius is on a cosine
-        # schedule: the discrete spike landscape is too chaotic for a
-        # shrinking step. Warn loudly when we detect that combination.
-        # Heuristic only: matches substring of module class names.
+        # SNN-like models lose accuracy badly under a shrinking step_radius: the
+        # discrete spike landscape is too chaotic. Warn on that combination.
+        # Heuristic: matches substrings of module class names.
         if hasattr(step_radius, "at"):
             module_classes = {type(m).__name__ for m in model.modules()}
             snn_markers = ("lif", "leaky", "spik", "spiking", "alif")
@@ -631,7 +714,6 @@ class PolyStepOptimizer:
                     stacklevel=2,
                 )
         self._amortize_counter = 0
-        self._transport_direction = None
         self._transport_direction_ema = None
         # Transport-biased rotation: store previous OT descent direction
         self.biased_rotation = biased_rotation
@@ -639,7 +721,7 @@ class PolyStepOptimizer:
         self._prev_descent_direction_finite: bool = False
         # Quadratic model: FD gradient/Hessian extraction from cost evaluations
         self.use_quadratic_model = use_quadratic_model
-        self._prev_losses_3d = None  # (P, V, K) retained for quadratic model
+        self._losses_3d = None  # (P, V, K) retained for quadratic model
         # Newton refinement: post-OT correction using quadratic model
         self._newton_refinement = newton_refinement
         self._newton_refinement_alpha = newton_refinement_alpha
@@ -657,11 +739,13 @@ class PolyStepOptimizer:
             )
 
         self._newton_direction = None  # (P, pdim) Newton step in original space
+        self._center_loss = None  # (P,) f(X) when the K=1 quadratic model asked for it
         # Trust region: adapt step_radius via multiplier based on quadratic model
         self.trust_region = trust_region
         self._trust_region_multiplier = 1.0  # Multiplier on step_radius, range [0.1, 3.0]
         self._prev_predicted_improvement = None
-        self._prev_pre_step_loss = None  # Per-particle min cost proxy
+        self._prev_pre_step_loss = None  # f(X), or the min-cost proxy when no centre ran
+        self._prev_loss_from_center = False
         # Trust region needs the finite-difference model to form predicted-vs-actual
         # ratios; auto-enable it (mirrors newton_refinement) and warn on the two
         # prerequisites that would otherwise leave the multiplier frozen at 1.0.
@@ -671,12 +755,9 @@ class PolyStepOptimizer:
                 "trust_region=True auto-enables use_quadratic_model=True "
                 "(needed for the predicted-vs-actual ratio test)"
             )
-        if trust_region and num_probe < 2:
-            warnings.warn(
-                "trust_region needs num_probe>=2 to build the finite-difference model; "
-                "it stays inactive until num_probe>=2.",
-                stacklevel=2,
-            )
+        # num_probe=1 is fine for trust_region: the step evaluates one f(X) per particle
+        # and reads curvature from L(+s) + L(-s) - 2 L(0). newton_refinement still needs
+        # the regression, hence the separate warning above.
         if trust_region and block_strategy != "monolithic":
             warnings.warn(
                 f"trust_region is only applied with block_strategy='monolithic'; "
@@ -708,21 +789,15 @@ class PolyStepOptimizer:
                 stacklevel=2,
             )
             self._rank_schedule = None
-        # HybridSubspace absorb and rotation only run in the monolithic step, so with a
-        # block strategy the absorb_* and rotation_* settings never take effect.
-        if isinstance(subspace, HybridSubspace) and block_strategy != "monolithic":
-            warnings.warn(
-                f"HybridSubspace absorb and rotation only run with "
-                f"block_strategy='monolithic'; with block_strategy='{block_strategy}' the "
-                f"absorb_mode, absorb_interval, absorb_patience and rotation_interval "
-                f"settings have no effect.",
-                stacklevel=2,
-            )
+        # Rank the subspace was last rebuilt at. None until the first step, because a
+        # subspace does not record the rank it was built from and may not be at stage 0.
+        self._applied_rank = None
         self.block_strategy = block_strategy
         self.block_group_size = block_group_size
 
-        # Warn if quadratic model used with non-monolithic block strategy
-        if use_quadratic_model and block_strategy != "monolithic":
+        # Reads self., not the argument: newton_refinement and trust_region auto-enable
+        # the quadratic model above, and the argument alone would miss both.
+        if self.use_quadratic_model and block_strategy != "monolithic":
             warnings.warn(
                 f"use_quadratic_model=True is not supported with "
                 f"block_strategy='{block_strategy}'. Quadratic model will be "
@@ -745,31 +820,25 @@ class PolyStepOptimizer:
         self.radius_min = radius_min
         self.radius_max = radius_max
 
-        # Dual momentum config
         self._dual_momentum_beta = dual_momentum_beta
 
-        # CMA-ES config
         # Detect CMA subspace mode early for validation
         self._cma_subspace = isinstance(subspace, CMAAdaptiveSubspace)
 
         # Validate: CMA features require CMAAdaptiveSubspace
-        if (use_covariance_adaptation or use_csa) and not self._cma_subspace:
-            warnings.warn(
-                "use_covariance_adaptation or use_csa requires CMAAdaptiveSubspace. CMA features will be disabled."
-            )
+        if use_covariance_adaptation and not self._cma_subspace:
+            warnings.warn("use_covariance_adaptation requires CMAAdaptiveSubspace. It will be disabled.")
             use_covariance_adaptation = False
-            use_csa = False
 
         # Validate: CMA covariance scaling and the CMA state update are wired
         # only into the monolithic step; blockwise samples through per-block
         # projections, so the paths/covariance never adapt there.
-        if (use_covariance_adaptation or use_csa) and self.block_strategy != "monolithic":
+        if use_covariance_adaptation and self.block_strategy != "monolithic":
             warnings.warn(
-                "use_covariance_adaptation/use_csa are only supported with block_strategy='monolithic'; "
+                "use_covariance_adaptation is only supported with block_strategy='monolithic'; "
                 f"disabled for block_strategy='{self.block_strategy}'."
             )
             use_covariance_adaptation = False
-            use_csa = False
 
         # Blockwise re-evaluates the full closure per block, never calls screen_closure
         # and never populates the reuse cache, so these flags save nothing there. Only
@@ -792,24 +861,8 @@ class PolyStepOptimizer:
                     stacklevel=2,
                 )
 
-        # CSA reads step size off the agreement between consecutive mutations, which needs
-        # them to be random. An OT step is a deterministic descent direction, so agreement
-        # is the normal state, CSA reads maximum coherence every generation and sigma grows
-        # without bound. Path length carries no step-size information here, so refuse the
-        # flag rather than degrade the run.
-        if use_csa:
-            warnings.warn(
-                "use_csa is not supported: CSA infers step size from the agreement between "
-                "consecutive mutations, but PolyStep's OT step is a deterministic descent "
-                "direction, so agreement is the normal state and sigma grows without bound. "
-                "Disabling it; use use_adaptive_radius for loss-driven step adaptation.",
-                stacklevel=2,
-            )
-            use_csa = False
-
         # A radius boost consumes the stagnation counter, so if it fires first or at the
-        # same time, a stagnation absorb never reaches its own patience. Checked after
-        # the CSA override above so the effective use_adaptive_radius is used.
+        # same time, a stagnation absorb never reaches its own patience.
         _absorb_mode = getattr(subspace, "absorb_mode", None)
         _absorb_patience = getattr(subspace, "absorb_patience", None)
         if (
@@ -829,7 +882,6 @@ class PolyStepOptimizer:
             )
 
         self.use_covariance_adaptation = use_covariance_adaptation
-        self.use_csa = use_csa
         # Coord-to-param projection for the current step, covariance-scaled for
         # CMA. Cached so a step's probes and its sync share one metric.
         self._sampling_projection = None
@@ -901,6 +953,21 @@ class PolyStepOptimizer:
         self._factored = isinstance(subspace, FactoredSubspace)
         self._per_layer_projections = self._hybrid or self._factored
 
+        # A per-entry projection keeps each parameter's own dtype. Full space and a single
+        # global projection instead hold every parameter in one vector at the layout's
+        # dominant dtype, so a minority-dtype weight would be optimized at the majority's
+        # precision. Say so rather than downgrade it silently.
+        _param_dtypes = {e.dtype for e in self.layout.entries if e.dtype.is_floating_point}
+        if len(_param_dtypes) > 1 and (subspace is None or self._adaptive):
+            _names = ", ".join(sorted(str(d) for d in _param_dtypes))
+            raise ValueError(
+                f"Model mixes parameter dtypes ({_names}). "
+                f"{'AdaptiveSubspace' if self._adaptive else 'Full-space mode'} stores every parameter in one "
+                f"vector at {self.layout.dominant_dtype}, so the others would be optimized at that precision. "
+                "Cast the model to a single dtype, or use HybridSubspace or LinearSubspace, "
+                "which give each parameter its own projection and keep its dtype."
+            )
+
         if subspace is not None:
             # Subspace mode: subspace coords reshaped to multi-particle format.
             # Use the user-specified particle_dim if it was explicitly set;
@@ -912,7 +979,6 @@ class PolyStepOptimizer:
             # Pad subspace_dim to be divisible by particle_dim
             padded_sub = sub_dim + (-sub_dim % pdim)
             num_sub_particles = padded_sub // pdim
-            self._sub_padded = padded_sub  # for unpadding later
             # Start at base params => delta=0 => subspace coords = zeros
             # Use model_dtype for mixed precision compatibility
             x_dtype = self._model_dtype if self._mixed_precision else self.layout.dominant_dtype
@@ -948,12 +1014,9 @@ class PolyStepOptimizer:
         # Probe linspace (exclude endpoints)
         self._probes = torch.linspace(0, 1, num_probe + 2)[1 : num_probe + 1]
 
-        # Balanced OT with a single particle has exactly one feasible plan: the row
-        # constraint gives sum_j T_0j = 1 and the column constraint pins each
-        # T_0j = b_j = 1/V, so the plan carries no cost information. Every polytope
-        # template is mean-centered, so the barycentric projection returns X
-        # unchanged and the optimizer freezes without any error. PolyStepES already
-        # warns about this (ask_tell.py); the same guard belongs here.
+        # One particle leaves balanced OT one feasible plan: the column constraint pins
+        # T_0j = 1/V, so the plan carries no cost information and the mean-centered
+        # polytope returns X unchanged. The optimizer would freeze with no error.
         _single_particle = X_init.shape[0] == 1 and block_strategy == "monolithic"
         if _single_particle and solver is None:
             # Never let the *default* produce a frozen optimizer.
@@ -966,9 +1029,9 @@ class PolyStepOptimizer:
                 "or reduce particle_dim so the layout gives more than one particle.",
                 stacklevel=2,
             )
-        elif _single_particle and solver == "sinkhorn":
+        elif _single_particle and (solver == "sinkhorn" or (solver == "kl_softmax" and kl_softmax_lam == INF)):
             warnings.warn(
-                "num_particles=1 with solver='sinkhorn': the column marginal forces a "
+                f"num_particles=1 with solver={solver!r}: the column marginal forces a "
                 "uniform transport plan, so every step ignores the cost and the "
                 "parameters will not move. Use solver='softmax' (one-sided), or reduce "
                 "particle_dim so the layout gives more than one particle.",
@@ -977,6 +1040,23 @@ class PolyStepOptimizer:
 
         if solver is None:
             solver = "softmax" if subspace is not None else "sinkhorn"
+
+        if solver != "sinkhorn":
+            inert = [
+                name
+                for name, value in (
+                    ("anderson_depth", anderson_depth),
+                    ("adaptive_omega", adaptive_omega),
+                    ("data_dependent_init", data_dependent_init),
+                )
+                if value
+            ]
+            if inert:
+                warnings.warn(
+                    f"{', '.join(inert)} accelerate the Sinkhorn fixed-point iteration and are "
+                    f"ignored by solver={solver!r}.",
+                    stacklevel=2,
+                )
 
         if solver == "softmax":
             self.solver = SoftmaxSolver(compile=compile)
@@ -997,14 +1077,27 @@ class PolyStepOptimizer:
                 tau=tempered_softmax_tau,
                 compile=compile,
             )
+        elif solver == "kl_softmax":
+            self.solver = KLSoftmaxSolver(
+                lam=kl_softmax_lam,
+                max_iterations=sinkhorn_max_iters,
+            )
         else:
             raise ValueError(
                 f"Unknown solver: {solver!r}. Expected 'softmax', 'sinkhorn', "
-                f"'min_cost_greedy', 'top_k_mean', 'tempered_softmax', or None."
+                f"'min_cost_greedy', 'top_k_mean', 'tempered_softmax', 'kl_softmax', or None."
             )
 
-        _non_iterative_solvers = ("softmax", "min_cost_greedy", "top_k_mean", "tempered_softmax")
-        if self._progressive_epsilon is not None and solver in _non_iterative_solvers:
+        # KLSoftmaxSolver interpolates between the two limits: lam=0 is the one-shot
+        # softmax and lam=inf is balanced Sinkhorn, so each limit inherits that
+        # solver's guards.
+        _one_shot = isinstance(
+            self.solver, (SoftmaxSolver, MinCostGreedySolver, TopKMeanSolver, TemperedSoftmaxSolver)
+        ) or (isinstance(self.solver, KLSoftmaxSolver) and self.solver.lam == 0)
+        self._balanced_ot = isinstance(self.solver, SinkhornSolver) or (
+            isinstance(self.solver, KLSoftmaxSolver) and self.solver.lam == INF
+        )
+        if self._progressive_epsilon is not None and _one_shot:
             raise ValueError(
                 "ProgressiveEpsilon requires Sinkhorn convergence feedback. "
                 "Use LinearEpsilon or CosineEpsilon with non-iterative solvers."
@@ -1019,12 +1112,10 @@ class PolyStepOptimizer:
         self._compiled = CompiledFunctions(compile=compile and torch.cuda.is_available())
 
         # Random generator (created early so AdaptiveSubspace init can use it)
-        self._seed = seed
         self._generator: Optional[torch.Generator] = None
         if seed is not None:
             self._generator = create_generator(seed, device)
 
-        # Initialize solver state
         num_points = X_init.shape[0]
         a = torch.ones(num_points, device=device, dtype=X_init.dtype) / num_points
         self._state = SolverState(X=X_init.clone(), a=a)
@@ -1033,7 +1124,6 @@ class PolyStepOptimizer:
             self._state.base_params = self._base_params
             self._state.subspace = subspace
 
-        # Initialize subspace projections and displacement history
         self._init_subspace(subspace, seed, model_device)
 
         # Initialize CMA-ES state (evolution paths, covariance, step-size)
@@ -1052,6 +1142,12 @@ class PolyStepOptimizer:
             X_init,
             device,
         )
+
+        # Stage 0 before the first step, so the first sweep runs at the scheduled rank
+        # rather than whatever the supplied subspace carried. X is still zero, so the
+        # absorb inside the transition is a no-op.
+        if self._rank_schedule is not None and self.subspace is not None:
+            self._transition_rank(self._rank_schedule.at(0))
 
     def _init_subspace(self, subspace, seed, model_device) -> None:
         """Initialize subspace projections and displacement history."""
@@ -1124,12 +1220,11 @@ class PolyStepOptimizer:
             dtype=self._model_dtype,
         )
 
-        if self.use_covariance_adaptation or self.use_csa:
+        if self.use_covariance_adaptation:
             # The accumulators run at fp32 even under mixed_precision. c_1 is
             # ~2/(n+1.3)^2 (8e-6 at n=512) and bf16 has 8 mantissa bits, so
-            # 1 + c_1*x rounds straight back to 1 and C_diag never moves --
-            # adaptation would be silently inert. The solvers promote for the
-            # same reason.
+            # 1 + c_1*x rounds straight back to 1 and C_diag never moves, leaving
+            # adaptation silently inert. The solvers promote for the same reason.
             cma_state = subspace.init_cma_state(
                 device=model_device,
                 dtype=torch.float32,
@@ -1137,20 +1232,19 @@ class PolyStepOptimizer:
             self._state.p_c = cma_state["p_c"]
             self._state.p_sigma = cma_state["p_sigma"]
             self._state.C_diag = cma_state["C_diag"]
-            self._state.sigma = 1.0
             self._state.generation = 0
-            self._state.use_csa = self.use_csa
-            # mu_eff = 1/sum(w^2) over the transport row. The step feeds the paths a
-            # unit-norm innovation (a direction, not a weighted recombination of mu
-            # offspring), which is the mu_eff = 1 convention, so the learning rates
-            # must be derived at mu_eff = 1 too. Deriving them from the vertex count
-            # while the paths run at 1 gave c_sigma ~ 2/3: a 1.5-step path memory
-            # against a 1/(c_sigma) = 1.5 generation horizon the updates never used.
+            # The step feeds the paths a unit-norm direction, not a weighted
+            # recombination of mu offspring, so the rates must be derived at
+            # mu_eff = 1 too. Deriving them from the vertex count instead gave
+            # c_sigma ~ 2/3, a path memory the updates never used.
             n = subspace.subspace_dim
             mu_eff = float(subspace.mu_eff) if getattr(subspace, "_mu_eff_explicit", False) else 1.0
             hyperparams = compute_cma_hyperparameters(n, mu_eff)
             self._cma_params = {
                 **hyperparams,
+                # A rate the caller set explicitly wins over the derived one; without
+                # this the constructor argument is accepted and then discarded.
+                **getattr(subspace, "_explicit_rates", {}),
                 "mu_eff": mu_eff,
                 "cov_min": subspace.cov_min,
                 "cov_max": subspace.cov_max,
@@ -1230,15 +1324,15 @@ class PolyStepOptimizer:
 
             # Same single-particle degeneracy as the monolithic path, but per block:
             # a block holding one particle solves a balanced OT with one row, whose
-            # plan is forced uniform, so that block freezes while the rest train --
-            # invisible in the loss. Small layers hit this under 'per_layer'.
-            if isinstance(self.solver, SinkhornSolver):
+            # plan is forced uniform, so that block freezes while the rest train and
+            # nothing shows in the loss. Small layers hit this under 'per_layer'.
+            if self._balanced_ot:
                 frozen = [b.name for b in self._blocks if b.num_particles == 1]
                 if frozen:
                     warnings.warn(
                         f"{len(frozen)} block(s) hold a single particle "
-                        f"({', '.join(frozen[:5])}{', ...' if len(frozen) > 5 else ''}); with "
-                        "solver='sinkhorn' the column marginal forces a uniform plan there, "
+                        f"({', '.join(frozen[:5])}{', ...' if len(frozen) > 5 else ''}); with a "
+                        "balanced solver the column marginal forces a uniform plan there, "
                         "so those blocks will never move. Use solver='softmax', "
                         "block_strategy='grouped', or a smaller particle_dim.",
                         stacklevel=2,
@@ -1248,144 +1342,6 @@ class PolyStepOptimizer:
     def state(self) -> SolverState:
         """Read-only access to the current solver state."""
         return self._state
-
-    def state_dict(self) -> dict:
-        """Serialize the resumable optimizer state (NOT the model weights).
-
-        Captures the solver state (particle positions, warm-start duals,
-        momentum velocity, adaptive radius, subspace projection / CMA evolution
-        paths and rolling histories, and step counters), the
-        ``ProgressiveEpsilon`` scheduler internals, and the RNG generator
-        state. Save the model weights separately with ``model.state_dict()``.
-
-        Restore with :meth:`load_state_dict` onto an optimizer built with the
-        same configuration and (weight-loaded) model to resume a run. Every value
-        that steers the next step is captured, including the optimizer-owned
-        control state that lives outside ``SolverState`` (amortization phase,
-        transport-direction memory, adaptive-probe reuse caches, trust-region
-        multiplier and pending prediction, blockwise dual-momentum history), so
-        resume is bit-exact for every configuration.
-        """
-
-        def _ser(v):
-            if isinstance(v, torch.Tensor):
-                return v.detach().to("cpu").clone()
-            if isinstance(v, dict):
-                return {k: _ser(x) for k, x in v.items()}
-            if isinstance(v, (list, tuple)):
-                out = [_ser(x) for x in v]
-                return tuple(out) if isinstance(v, tuple) else out
-            return v
-
-        solver_state = {}
-        for name in type(self._state).__dataclass_fields__:
-            if name == "subspace":
-                continue  # object; re-linked from construction on load
-            solver_state[name] = _ser(getattr(self._state, name))
-
-        sd = {"format": _STATE_DICT_FORMAT, "solver_state": solver_state}
-
-        # Attached to the state object by the blockwise step rather than declared
-        # as a dataclass field, so the loop above cannot see it.
-        sd["prev_prev_block_duals"] = _ser(getattr(self._state, "_prev_prev_block_duals", None))
-
-        # Optimizer-owned control state. Omitting any of these makes the next step
-        # after a resume differ from the uninterrupted run: the amortization phase
-        # decides whether a step evaluates at all, the reuse caches decide which
-        # particles are re-evaluated, and the trust-region pair rescales the radius.
-        sd["control"] = {name: _ser(getattr(self, name, None)) for name in _CONTROL_STATE_KEYS}
-        sd["control"]["_ot_step_costs"] = list(self._ot_step_costs)
-
-        if self._progressive_epsilon is not None:
-            sd["progressive_epsilon"] = {
-                "current": self._progressive_epsilon._current,
-                "smoothed": self._progressive_epsilon._smoothed,
-            }
-        if self._generator is not None:
-            # torch.Generator state is a CPU ByteTensor for CPU *and* CUDA generators.
-            sd["generator_state"] = self._generator.get_state().clone()
-        return sd
-
-    def load_state_dict(self, sd: dict) -> None:
-        """Restore optimizer state saved by :meth:`state_dict` (in place).
-
-        The optimizer must have been constructed with the same configuration
-        and model as the one that produced ``sd``. Restored tensors are moved
-        onto the current optimizer device; the linked subspace object is
-        preserved (only its tensor state is restored).
-        """
-        fmt = sd.get("format")
-        if fmt is None or fmt > _STATE_DICT_FORMAT:
-            raise ValueError(
-                f"Unsupported optimizer state_dict format {fmt!r}; this build writes and "
-                f"reads format {_STATE_DICT_FORMAT}. The checkpoint was written by a newer "
-                "polystep."
-            )
-        device = self._state.X.device
-        valid = set(type(self._state).__dataclass_fields__)
-
-        def _de(v):
-            if isinstance(v, torch.Tensor):
-                return v.to(device)
-            if isinstance(v, dict):
-                return {k: _de(x) for k, x in v.items()}
-            if isinstance(v, (list, tuple)):
-                out = [_de(x) for x in v]
-                return tuple(out) if isinstance(v, tuple) else out
-            return v
-
-        for name, value in sd.get("solver_state", {}).items():
-            if name == "subspace" or name not in valid:
-                continue
-            setattr(self._state, name, _de(value))
-
-        self._state._prev_prev_block_duals = _de(sd.get("prev_prev_block_duals"))
-
-        pe = sd.get("progressive_epsilon")
-        if pe is not None and self._progressive_epsilon is not None:
-            self._progressive_epsilon._current = pe["current"]
-            self._progressive_epsilon._smoothed = pe["smoothed"]
-
-        gs = sd.get("generator_state")
-        if gs is not None and self._generator is not None:
-            self._generator.set_state(gs.to("cpu"))
-
-        # Restore the optimizer-owned control state. Format-0 checkpoints predate
-        # this block; fall back to dropping the caches, which is what those runs did.
-        control = sd.get("control")
-        if control is None:
-            self._invalidate_reuse_cache()
-            self._transport_direction = None
-            self._transport_direction_ema = None
-        else:
-            for name in _CONTROL_STATE_KEYS:
-                setattr(self, name, _de(control.get(name)))
-            self._ot_step_costs.clear()
-            self._ot_step_costs.extend(control.get("_ot_step_costs", []))
-            if fmt < 3:
-                # Format 2 did not carry the steering state below, so it comes back as
-                # None and the first resumed step picks a different search frame.
-                warnings.warn(
-                    "Loading a format-2 optimizer state_dict. It predates the rotation-bias "
-                    "and quadratic-model steering state, so the first step after resume can "
-                    "differ from the uninterrupted run when biased_rotation, "
-                    "adaptive_num_probe or use_quadratic_model is enabled. Re-checkpoint to "
-                    "get exact resume.",
-                    stacklevel=2,
-                )
-                self._prev_descent_direction_finite = False
-                self._loss_decreasing_count = 0
-
-        # Recomputed at the start of every step, so it carries nothing across a resume.
-        self._sampling_projection = None
-
-        # The fused block-diagonal projection is a cache of the *step-0* basis. The
-        # restored checkpoint carries a later basis, so leaving the old one in place
-        # evaluates probes through one basis while _sync_model writes another.
-        if self._hybrid and hasattr(self.subspace, "build_fused_projection"):
-            projections = self._state.hybrid_projections
-            if projections:
-                self.subspace.build_fused_projection(projections)
 
     @property
     def mixed_precision(self) -> bool:
@@ -1401,7 +1357,7 @@ class PolyStepOptimizer:
     def projection_type(self) -> str:
         """Actual projection type being used ('dense' or 'sparse').
 
-        Note: When 'auto' is requested, this returns the resolved type based
+        When 'auto' is requested, this returns the resolved type based
         on model size (sparse for >1M params on CPU, >2M on GPU).
         """
         return self._actual_projection_type
@@ -1462,10 +1418,8 @@ class PolyStepOptimizer:
         except StopIteration:
             return False
         if device.type == "cuda":
-            if torch.cuda.is_available():
-                cap = torch.cuda.get_device_capability(device)
-                return cap[0] >= 7  # Volta (7.0) and newer
-            return False
+            # torch's own check, which also covers emulated bf16 on older cards.
+            return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         elif device.type == "cpu":
             return True  # CPU BF16 works, may be slower without AMX
         else:
@@ -1479,7 +1433,7 @@ class PolyStepOptimizer:
         """
         self._prev_cost_matrix = None
         self._prev_rot_mats = None
-        self._prev_losses_3d = None
+        self._losses_3d = None
         self._prev_X = None
         self._prev_k_eff = None
         self._prev_step_r = None
@@ -1497,11 +1451,12 @@ class PolyStepOptimizer:
         return self._compile_evaluator
 
     @property
-    def compile_forward(self) -> bool:
+    def compile_forward(self) -> Optional[bool]:
         """Whether evaluators should CUDA-graph-compile the in-place forward.
 
-        Public, read-only view of the constructor flag. Propagated to a
-        registered evaluator's ``compile_forward`` in ``register_evaluator``.
+        Read-only view of the constructor flag, propagated to a registered evaluator in
+        ``register_evaluator``. ``None`` leaves the evaluator's own default, which
+        enables it on the in-place path; ``False`` opts out.
         """
         return self._compile_forward
 
@@ -1525,6 +1480,11 @@ class PolyStepOptimizer:
         The fused path is only used when the evaluator has ``_use_inplace=True``
         (auto-detected for GPU models >500K params).
 
+        The evaluator's ``loss_fn`` becomes the objective on every site-aware chunk,
+        while chunks that fall back score ``closure()``. Give both the same objective:
+        a closure that adds regularization the evaluator does not know about makes one
+        step rank part of its candidates on a different function.
+
         The optimizer's ``compile_evaluator`` / ``compile_forward`` flags are
         propagated to the evaluator here, so those public knobs work on the
         fused/runner path too (not only via ``api.train()``). torch.compile is
@@ -1539,10 +1499,28 @@ class PolyStepOptimizer:
         self._cost_evaluator = evaluator
         self._fused_inputs = inputs
         self._fused_targets = targets
+        if self._candidate_autocast_dtype is not None:
+            evaluator.autocast_dtype = self._candidate_autocast_dtype
         if self._compile_evaluator:
             evaluator._compile_vmap = True
-        if self._compile_forward:
-            evaluator._compile_forward = True
+        # None leaves the evaluator's own default, which pairs CUDA graphs with the
+        # in-place path they exist for. Only an explicit True/False overrides it.
+        if self._compile_forward is not None:
+            evaluator._compile_forward = self._compile_forward
+        # Rebuild the fast paths when the objective changes: they cache the model and
+        # loss_fn they were built from, and would otherwise keep scoring the previous
+        # evaluator's objective.
+        fastpath_key = (id(evaluator.model), id(evaluator.loss_fn))
+        if getattr(self, "_fastpath_key", None) != fastpath_key:
+            self._fastpath_key = fastpath_key
+            for attr in (
+                "_factored_evaluator",
+                "_sparse_delta_evaluator",
+                "_site_vmap_evaluator",
+                "_subspace_delta_evaluator",
+            ):
+                if hasattr(self, attr):
+                    delattr(self, attr)
         # A FactoredSubspace can be scored through the low-rank identity, which never
         # builds a candidate weight. Built once; None when the model is outside the
         # supported module set, in which case the step falls back to reconstruct_batch.
@@ -1561,11 +1539,27 @@ class PolyStepOptimizer:
         # the shared base weight and the per-candidate bmm is avoidable. Built once;
         # None when the model is outside the supported module set.
         if self.subspace is None and not hasattr(self, "_sparse_delta_evaluator"):
-            from .cost_nn import SparseDeltaEvaluator
+            from .cost_nn import SiteVmapEvaluator, SparseDeltaEvaluator
 
             self._sparse_delta_evaluator = SparseDeltaEvaluator.try_build(
                 evaluator.model, evaluator.loss_fn, self.layout
             )
+            # Same locality, no assumption about the module set: batches only the
+            # perturbed tensor so the graph ahead of it is shared. Picks up the chunks
+            # the sparse-delta path declines, and the models it cannot be built for.
+            self._site_vmap_evaluator = SiteVmapEvaluator.try_build(evaluator, self.layout)
+        # Subspace candidates perturb one particle's coordinate run, so when that run
+        # sits inside one layer's coordinate block only that layer's weight moves.
+        # Built once; None when the model is outside the supported module set.
+        if self._hybrid and not hasattr(self, "_subspace_delta_evaluator"):
+            from .cost_nn import SiteVmapEvaluator, SubspaceDeltaEvaluator
+
+            self._subspace_delta_evaluator = SubspaceDeltaEvaluator.try_build(
+                evaluator.model, evaluator.loss_fn, self.subspace
+            )
+            # A per-layer block maps to one parameter, so the same site argument holds
+            # in coordinate space. Covers the models the delta path declines.
+            self._site_vmap_evaluator = SiteVmapEvaluator.try_build(evaluator, self.layout)
 
     def release_evaluator(self) -> None:
         """Drop the registered evaluator and its batch data.
@@ -1669,6 +1663,10 @@ class PolyStepOptimizer:
                     stacklevel=2,
                 )
             self._invalidate_reuse_cache()
+            # A prediction made on the previous minibatch cannot be scored against
+            # this one's loss.
+            self._prev_predicted_improvement = None
+            self._prev_pre_step_loss = None
             self._prev_objective_token = objective_token
         # Amortized OT: cheap momentum steps between full OT solves
         if (
@@ -1676,6 +1674,10 @@ class PolyStepOptimizer:
             and self._amortize_counter % self.amortize_steps != 0
             and self._transport_direction_ema is not None
         ):
+            # Coasting moves the parameters with nothing predicting the move, so the
+            # deferred trust-region comparison would charge them to the last OT step.
+            self._prev_predicted_improvement = None
+            self._prev_pre_step_loss = None
             result = self._step_momentum(closure)
             self._amortize_counter += 1
             return result
@@ -1715,7 +1717,7 @@ class PolyStepOptimizer:
         return _step_subspace_blockwise_fn(self, closure)
 
     def _step_momentum(self, closure: Callable) -> float:
-        """Cheap momentum step: apply EMA transport direction with decay.
+        """Cheap step: reapply the last direction with decay, no forward passes.
 
         Delegates to ``_step_momentum.step_momentum()``.
         """
@@ -1732,6 +1734,7 @@ class PolyStepOptimizer:
             new_rank: Target rank for the new subspace.
         """
         state = self._state
+        self._applied_rank = new_rank
 
         # Absorb current perturbation into base weights
         old_subspace = self.subspace
@@ -1758,7 +1761,17 @@ class PolyStepOptimizer:
         if isinstance(old_subspace, HybridSubspace):
             # Carry every config field across the transition, so a field added later
             # is not silently dropped at the rank change.
-            _structural = {"specs", "subspace_dim", "compression_ratio", "_total_params", "_max_subspace_dim", "seed"}
+            # Rebuilt by from_layout from the layout itself, so carrying them over would
+            # collide with the explicit keyword and pin the old rank's values.
+            _structural = {
+                "specs",
+                "subspace_dim",
+                "compression_ratio",
+                "_total_params",
+                "_max_subspace_dim",
+                "_entry_dtypes",
+                "seed",
+            }
             carried = {
                 f.name: getattr(old_subspace, f.name)
                 for f in dataclass_fields(old_subspace)
@@ -1779,7 +1792,6 @@ class PolyStepOptimizer:
                 max_subspace_dim=getattr(old_subspace, "_max_subspace_dim", None),
             )
 
-        # Update state reference
         state.subspace = self.subspace
 
         # Resize particle array for new subspace dimension
@@ -1807,7 +1819,6 @@ class PolyStepOptimizer:
             state.p_sigma = torch.zeros(sub_dim, dtype=new_X.dtype, device=new_X.device)
         if state.C_diag is not None:
             state.C_diag = torch.ones(sub_dim, dtype=new_X.dtype, device=new_X.device)
-        state.sigma = 1.0
 
         # Re-initialize displacement history at new subspace dimension
         if isinstance(self.subspace, HybridSubspace):
@@ -1824,7 +1835,11 @@ class PolyStepOptimizer:
                 state.X.device,
                 state.X.dtype,
             )
-            # Update hybrid subspace reference
+            # The fused matrix is per basis, and the step only rebuilds it when the basis
+            # object changes. Nothing changes it again after a transition, so skipping
+            # this leaves _fused_P at the old rank's shape, or None, for the whole run.
+            if hasattr(self.subspace, "build_fused_projection"):
+                self.subspace.build_fused_projection(state.hybrid_projections)
             self._hybrid_subspace = self.subspace
 
         # Update uniform distribution to match new particle count
@@ -1834,7 +1849,6 @@ class PolyStepOptimizer:
         # Clear stale adaptive probe state (shape changed with new rank)
         self._invalidate_reuse_cache()
         self._transport_direction_ema = None
-        self._transport_direction = None
         self._newton_direction = None
 
         logger.info(
@@ -1847,17 +1861,43 @@ class PolyStepOptimizer:
         Scaled by sqrt(C_diag) when CMA covariance adaptation is on, else the
         plain projection. Cached at step start so a step's probes and its
         end-of-step sync share one metric (C_diag only changes at step end).
+
+        Absorbs first when the scaling moved. ``X`` is read through this
+        projection, so rescaling it under a nonzero ``X`` moves the represented
+        parameters without any candidate having scored the move, and the drift
+        compounds every step.
         """
         state = self._state
         proj = state.projection
-        if (
+        if not (
             self._cma_subspace
             and self.use_covariance_adaptation
             and isinstance(proj, torch.Tensor)
             and state.C_diag is not None
         ):
-            proj = self.subspace.apply_covariance_scaling(proj, state.C_diag)
-        self._sampling_projection = proj
+            self._sampling_projection = proj
+            return
+
+        # Identity, not value: C_diag is always rebound, never written in place, so this
+        # skips a clone, a torch.equal sync and the full projection multiply on every
+        # step that did not change it. Not the projection itself, which
+        # apply_covariance_scaling returns from a cached buffer.
+        previous_C = getattr(self, "_sampling_C_diag", None)
+        if previous_C is state.C_diag and getattr(self, "_sampling_proj_src", None) is proj:
+            return
+        if previous_C is not None and previous_C.shape == state.C_diag.shape and self._sampling_projection is not None:
+            flat = state.X.reshape(-1)[: state.subspace.subspace_dim]
+            if bool(flat.any()):
+                # Absorb under the projection X was measured in, before the buffer is
+                # overwritten with the new scaling.
+                state.base_params, _ = state.subspace.absorb(self._sampling_projection, state.base_params, flat)
+                self._base_params = state.base_params
+                state.X = torch.zeros_like(state.X)
+                self._invalidate_reuse_cache()
+
+        self._sampling_C_diag = state.C_diag
+        self._sampling_proj_src = proj
+        self._sampling_projection = self.subspace.apply_covariance_scaling(proj, state.C_diag)
 
     def resync_from_model(self) -> None:
         """Re-read the optimizer's particle state from the model's current weights.
@@ -1879,11 +1919,10 @@ class PolyStepOptimizer:
         self._state.prev_prev_f = None
         self._state.prev_prev_g = None
         self._invalidate_reuse_cache()
-        # Every direction and counter below was measured at the old anchor. Left in
-        # place, the next call to step() can coast along a stale EMA direction without
-        # evaluating anything, moving the weights the caller just wrote.
+        # Every direction and counter below was measured at the old anchor. Keeping them
+        # would let the next step() coast along a stale EMA direction without evaluating
+        # anything, moving the weights the caller just wrote.
         self._amortize_counter = 0
-        self._transport_direction = None
         self._transport_direction_ema = None
         self._newton_direction = None
         self._prev_descent_direction = None
@@ -1891,12 +1930,32 @@ class PolyStepOptimizer:
         self._prev_block_descent_directions = None
         self._prev_predicted_improvement = None
         self._prev_pre_step_loss = None
+        self._prev_loss_from_center = False
         if self._state.velocity is not None:
             self._state.velocity = torch.zeros_like(self._state.velocity)
         self._state._prev_prev_block_duals = None
 
+    def _write_params(self, sd: dict) -> None:
+        """Copy the parameter entries of ``sd`` into the live parameters, once per step.
+
+        ``load_state_dict`` re-walks the module tree, re-validates every shape and
+        rebuilds its own bookkeeping on each call. The keys come from the layout built
+        from this model, so the mapping is fixed: cache it and issue one grouped copy.
+
+        Non-parameter keys are skipped. In subspace mode ``sd`` is reconstructed from
+        ``base_params``, a ``state_dict()`` snapshot taken at construction, so it carries
+        buffers as well; writing those back would both bypass this copy for the whole
+        dict and revert live buffers (BatchNorm running stats, say) to the snapshot.
+        """
+        cache = self._param_write_cache
+        if cache is None or cache[0] is not self.model:
+            cache = self._param_write_cache = (self.model, dict(self.model.named_parameters()))
+        params = cache[1]
+        keys = [k for k in sd if k in params]
+        torch._foreach_copy_([params[k].data for k in keys], [sd[k] for k in keys])
+
     def _sync_model(self) -> None:
-        """Write current particles back to the model via load_state_dict."""
+        """Write current particles back to the model."""
         state = self._state
 
         if self.subspace is not None:
@@ -1926,7 +1985,7 @@ class PolyStepOptimizer:
                     state.base_params,
                     flat_sub,
                 )
-            self.model.load_state_dict(full_sd, strict=False)
+            self._write_params(full_sd)
         else:
             # Multi-particle mode: X is already (num_particles, particle_dim)
             particles_2d = state.X
@@ -1934,4 +1993,4 @@ class PolyStepOptimizer:
                 particles_2d = particles_2d.reshape(-1, self._particle_dim)
 
             sd = self.layout.unflatten(particles_2d)
-            self.model.load_state_dict(sd, strict=False)
+            self._write_params(sd)

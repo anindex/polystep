@@ -33,14 +33,14 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .solvers._prelude import thin_qr
-from .subspace import absorb_due
+from .solvers._shared import thin_qr
+from .subspace import ProjectedAbsorbMixin, absorb_due
 
 from .hybrid_subspace import LayerProjectionSpec, _stable_entry_seed
 
 
 @dataclass(frozen=True)
-class FactoredSubspace:
+class FactoredSubspace(ProjectedAbsorbMixin):
     """Per-layer low-rank subspace whose coordinates are the ``A`` factors.
 
     Args:
@@ -165,6 +165,9 @@ class FactoredSubspace:
         """
         if self.rotation_interval <= 0 or step <= 0 or step % self.rotation_interval != 0:
             return projections
+        # Empty when every parameter is a vector: nothing is projected, nothing to redraw.
+        if not projections:
+            return projections
         device = next(iter(projections.values())).device
         dtype = next(iter(projections.values())).dtype
         return self.init_projections(device, dtype, step=step)
@@ -217,7 +220,7 @@ class FactoredSubspace:
         """Materialize ``{key: (N, *shape)}``.
 
         Only used for models :class:`~polystep.cost_nn.FactoredEvaluator` cannot handle.
-        The whole point of this subspace is to avoid this call.
+        This subspace exists to avoid this call.
         """
         N = flat_subspace_batch.shape[0]
         out = {}
@@ -230,15 +233,3 @@ class FactoredSubspace:
             out[spec.entry_key] = base.reshape(1, -1) + delta.to(base.dtype)
             out[spec.entry_key] = out[spec.entry_key].reshape(N, *spec.original_shape)
         return out
-
-    def absorb(
-        self,
-        projections: Dict[str, torch.Tensor],
-        base_sd: Dict[str, torch.Tensor],
-        flat_subspace: torch.Tensor,
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Fold the current perturbation into the base weights and zero the coords."""
-        return (
-            self.apply_perturbation(projections, base_sd, flat_subspace),
-            torch.zeros_like(flat_subspace),
-        )

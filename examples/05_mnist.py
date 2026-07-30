@@ -6,8 +6,8 @@ explicit per-epoch training loop with best-state tracking. Downloads
 MNIST data directly (no torchvision dependency).
 
 What you should see:
-  ~95% test accuracy after 15 epochs (~3 min on one CPU core).
-  ~96% with 30 epochs (matches the paper).
+  ~95% test accuracy after 15 epochs, ~96% with 30 (matches the paper). Much
+  slower on CPU than on a GPU.
   Best-state tracking restores the peak accuracy across epochs.
 
 Output:
@@ -21,98 +21,59 @@ Run:
 from __future__ import annotations
 
 import argparse
-import gzip
+import copy
 import os
-import struct as pystruct
-from pathlib import Path
-from urllib.request import urlretrieve
+import sys
 
-import numpy as np
+from collections import OrderedDict
+
 import torch
 
-# On CPU, PolyStep issues many small tensor ops per step, where torch's intra-op pool
-# costs more than the arithmetic. On CUDA the forward runs on the device and pinning
-# only slows the host side, so leave torch's default there (measured 845s pinned
-# against 794s free on this example, identical accuracy). See docs/performance.md.
-_threads = os.environ.get("POLYSTEP_THREADS")
-if _threads:
-    torch.set_num_threads(int(_threads))
-elif not torch.cuda.is_available():
-    torch.set_num_threads(1)
+# One thread: PolyStep's per-step ops are small enough that torch's default pool of
+# nproc threads costs far more than it returns. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from polystep import PolyStepOptimizer
+from polystep.cost_nn import NNCostEvaluator
 from polystep.epsilon import CosineEpsilon
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
-
-MNIST_URL = "https://storage.googleapis.com/cvdf-datasets/mnist/"
-MNIST_FILES = {
-    "train_images": "train-images-idx3-ubyte.gz",
-    "train_labels": "train-labels-idx1-ubyte.gz",
-    "test_images": "t10k-images-idx3-ubyte.gz",
-    "test_labels": "t10k-labels-idx1-ubyte.gz",
-}
-
-
-def download_mnist(data_dir: str = "/tmp/mnist") -> None:
-    """Download MNIST dataset if not already present."""
-    os.makedirs(data_dir, exist_ok=True)
-    for name, filename in MNIST_FILES.items():
-        filepath = os.path.join(data_dir, filename)
-        if not os.path.exists(filepath):
-            print(f"  Downloading {filename}...")
-            urlretrieve(MNIST_URL + filename, filepath)
-
-
-def load_mnist_images(filepath: str) -> np.ndarray:
-    with gzip.open(filepath, "rb") as f:
-        _magic, num, rows, cols = pystruct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8)
-        images = images.reshape(num, 1, rows, cols)
-    return images.astype(np.float32) / 255.0
-
-
-def load_mnist_labels(filepath: str) -> np.ndarray:
-    with gzip.open(filepath, "rb") as f:
-        _magic, _num = pystruct.unpack(">II", f.read(8))
-        labels = np.frombuffer(f.read(), dtype=np.uint8)
-    return labels.astype(np.int64)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _mnist_data import get_mnist_tensors  # noqa: E402
 
 
 def get_mnist_loaders(data_dir: str = "/tmp/mnist", batch_size: int = 512):
-    download_mnist(data_dir)
-    train_images = load_mnist_images(os.path.join(data_dir, MNIST_FILES["train_images"]))
-    train_labels = load_mnist_labels(os.path.join(data_dir, MNIST_FILES["train_labels"]))
-    test_images = load_mnist_images(os.path.join(data_dir, MNIST_FILES["test_images"]))
-    test_labels = load_mnist_labels(os.path.join(data_dir, MNIST_FILES["test_labels"]))
-
-    mean, std = 0.1307, 0.3081
-    train_images = (train_images - mean) / std
-    test_images = (test_images - mean) / std
-
-    train_ds = TensorDataset(torch.from_numpy(train_images), torch.from_numpy(train_labels))
-    test_ds = TensorDataset(torch.from_numpy(test_images), torch.from_numpy(test_labels))
+    train_x, train_y, test_x, test_y = get_mnist_tensors(0, 0, data_dir)
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0),
-        DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0),
+        DataLoader(TensorDataset(train_x, train_y), batch_size=batch_size, shuffle=True),
+        DataLoader(TensorDataset(test_x, test_y), batch_size=256, shuffle=False),
     )
 
 
-class MNISTNet(nn.Module):
-    """Two-layer MLP (101K parameters)."""
+class MNISTNet(nn.Sequential):
+    """Two-layer MLP (101K parameters).
+
+    An ``nn.Sequential`` subclass, not a plain ``nn.Module``: every batched
+    evaluator checks ``type(model).forward is nn.Sequential.forward`` before it will
+    build a plan, so an identical hand-written ``forward`` silently opts the model out
+    of the bmm and subspace-delta paths. The ``OrderedDict`` keeps the ``fc1``/``fc2``
+    state_dict keys.
+    """
 
     def __init__(self, hidden: int = 128):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(784, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden, 10)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.relu(self.fc1(self.flatten(x))))
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", nn.Linear(784, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", nn.Linear(hidden, 10)),
+                ]
+            )
+        )
 
 
 @torch.no_grad()
@@ -145,14 +106,16 @@ def main():
     model = MNISTNet(hidden=args.hidden).to(device)
     num_params = sum(p.numel() for p in model.parameters())
 
-    # --- Optimizer config (matches paper runner) ---
-    # HybridSubspace rank=8 gives 16 polytope vertices per step.
-    # Cosine schedules: broad exploration early -> fine exploitation late.
+    # rank=8 gives 16 polytope vertices per step. Cosine schedules run broad exploration
+    # early into fine exploitation late.
     total_steps = args.epochs * len(train_loader)
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(layout, rank=8, rotation_interval=0, absorb_interval=0)
 
-    eps_init, eps_target = 10.0, 0.1
+    # eps_target 0.5, not 0.1: a plan that concentrates toward argmax takes the full
+    # step_radius, so the effective step grows late even as step_radius anneals. At 0.1
+    # the last epoch diverged on every seed (loss 0.17 -> 0.27..0.49); 0.5 holds it.
+    eps_init, eps_target = 10.0, 0.5
     sr_init, sr_target = 5.0, 1.0
     pr_init, pr_target = 10.0, 2.0
 
@@ -165,9 +128,14 @@ def main():
         epsilon=CosineEpsilon(init=eps_init, target=eps_target, decay=(eps_init - eps_target) / total_steps),
         step_radius=CosineEpsilon(init=sr_init, target=sr_target, decay=(sr_init - sr_target) / total_steps),
         probe_radius=CosineEpsilon(init=pr_init, target=pr_target, decay=(pr_init - pr_target) / total_steps),
-        amortize_steps=3,
+        # Four momentum steps between OT steps: only every fifth pays for probes, and
+        # a momentum step needs no forward pass at all. Past 5 the trajectory coasts
+        # on a stale direction.
+        amortize_steps=5,
         amortize_ema=0.7,
-        compile=(device.type == "cuda"),
+        # Inductor's warm-up costs more than it returns over a run this short, at an
+        # unchanged accuracy. Example 06 runs 2750 steps and does win.
+        compile=False,
     )
 
     print(f"  params: {num_params:,}  device: {device}  epochs: {args.epochs}")
@@ -179,12 +147,8 @@ def main():
     print(f"  initial test accuracy: {100 * init_acc:.1f}%")
     print()
 
-    # --- Training loop with best-state tracking ---
-    # PolyStep can exhibit late-epoch instability as schedules bottom out;
-    # restoring the best checkpoint ensures reported accuracy is stable.
-    import copy
-    from polystep.cost_nn import NNCostEvaluator
-
+    # Best-state tracking: the reported number is the peak, not wherever the last
+    # epoch landed. api.train(restore_best=True) does the same thing.
     loss_fn = nn.CrossEntropyLoss()
     evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
     best_acc = 0.0
@@ -200,9 +164,7 @@ def main():
             def closure(stacked_params, _in=inputs, _tgt=targets):
                 return evaluator.evaluate(stacked_params, _in, _tgt)
 
-            # Hand-rolled loops must register the evaluator themselves. Without it the
-            # step can only reach the objective through closure(), so the fused in-place
-            # and sparse-delta evaluators never run. api.train() does this for you.
+            # Hand-rolled loops must register the evaluator; api.train() does it for you.
             optimizer.register_evaluator(evaluator, inputs, targets)
             optimizer.step(closure)
 
@@ -220,7 +182,6 @@ def main():
 
         print(f"  epoch {epoch:2d} | loss={avg_loss:.4f} | test={100 * test_acc:.1f}% | best={100 * best_acc:.1f}%")
 
-    # Restore best checkpoint
     if best_state is not None:
         model.load_state_dict(best_state)
 

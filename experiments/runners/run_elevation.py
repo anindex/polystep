@@ -29,12 +29,10 @@ import os
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Optional
 
 # Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -125,8 +123,6 @@ PSTORCH_CONFIGS = {
         "rotation_interval": 0,
         "absorb_interval": 20,
         "biased_rotation": True,
-        "anderson_depth": 5,
-        "adaptive_omega": True,
     },
     # INT8: Best sweep config = rank8 (97.18% at 20ep, beats 40ep production)
     # CosineEpsilon scheduling works well on quantization plateaus
@@ -278,8 +274,6 @@ def run_polystep(showcase_name, seed, device, results_dir, dry_run=False, audit_
         momentum_init=polystep_cfg.get("momentum_init", 0.5),
         momentum_final=polystep_cfg.get("momentum_final", 0.95),
         biased_rotation=polystep_cfg.get("biased_rotation", False),
-        anderson_depth=polystep_cfg.get("anderson_depth", 0),
-        adaptive_omega=polystep_cfg.get("adaptive_omega", False),
         solver="softmax",
     )
 

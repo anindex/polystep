@@ -32,8 +32,8 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 
-from .solvers._prelude import thin_qr
-from .subspace import absorb_due
+from .solvers._shared import decomposition_dtype, thin_qr
+from .subspace import ProjectedAbsorbMixin, SvdRatioMixin, absorb_due
 import torch.nn as nn
 
 if TYPE_CHECKING:
@@ -91,7 +91,7 @@ class EntrySpec:
 
 
 @dataclass
-class AdaptiveSubspace:
+class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     """Adaptive subspace compression with rotating orthogonal projection.
 
     Stores static configuration only. The projection matrix P lives in
@@ -101,7 +101,7 @@ class AdaptiveSubspace:
     Two rotation modes are supported:
 
     - ``'random'``: Draws entirely new QR-orthogonalized basis each call
-      to ``rotate()``. Simple but effective: equivalent to random search
+      to ``rotate()``. Cheap, and equivalent to random search
       in a new subspace each iteration.
 
     - ``'displacement'``: Uses SVD of recent displacement history to retain
@@ -135,6 +135,10 @@ class AdaptiveSubspace:
         absorb_mode: 'stagnation' or 'periodic' (default 'stagnation').
         absorb_patience: Steps of stagnation before absorb (default 20).
         absorb_interval: Periodic absorb interval; 0 = disabled (default 0).
+        rotation_interval: Steps between basis rotations (default 1, every step).
+            Each rotation costs an absorb plus a QR/SVD over ``(full_dim, subspace_dim)``,
+            which dominates the step at large ``full_dim``. Raising it trades basis
+            freshness for that cost.
     """
 
     full_dim: int
@@ -147,9 +151,16 @@ class AdaptiveSubspace:
     absorb_mode: str = "stagnation"
     absorb_patience: int = 20
     absorb_interval: int = 0
+    rotation_interval: int = 1
     _entry_specs: Tuple[EntrySpec, ...] = ()
 
     def __post_init__(self) -> None:
+        if not 0 < self.subspace_dim <= self.full_dim:
+            raise ValueError(
+                f"subspace_dim must be in (0, full_dim={self.full_dim}], got {self.subspace_dim}. "
+                "A reduced QR cannot return more orthonormal columns than rows, so the "
+                "projection would come back narrower than the coordinates allocated for it."
+            )
         if self.compression_ratio == 0.0 and self.full_dim > 0:
             object.__setattr__(self, "compression_ratio", self.subspace_dim / self.full_dim)
 
@@ -206,9 +217,8 @@ class AdaptiveSubspace:
         Returns:
             Orthogonal matrix of shape (rows, cols).
         """
-        # QR of the tall (rows, cols) matrix dominates the per-step cost. Run it on the
-        # GPU when the target is CUDA (measured several times faster than CPU QR at
-        # large full_dim); bf16 QR is unsupported, so decompose in fp32 and cast below.
+        # QR of the tall (rows, cols) matrix dominates the per-step cost, so keep it on
+        # the GPU when the target is CUDA. bf16 QR is unsupported: decompose in fp32.
         target_device = torch.device(device)
         qr_device = target_device if target_device.type == "cuda" else torch.device("cpu")
         Z = _draw_basis_gaussian(rows, cols, qr_device, torch.float32, generator)
@@ -231,6 +241,7 @@ class AdaptiveSubspace:
         total_steps: int,
         displacement_history: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        history_is_full: bool = False,
     ) -> torch.Tensor:
         """Rotate the projection basis according to the configured mode.
 
@@ -248,6 +259,9 @@ class AdaptiveSubspace:
                 vectors in subspace coordinates. Required for displacement
                 mode; if None, falls back to random rotation.
             generator: Optional torch.Generator for reproducibility.
+            history_is_full: True when ``displacement_history`` is already in full
+                parameter space ``(history_len, full_dim)``, so each row keeps the
+                basis it was measured in instead of being reprojected.
 
         Returns:
             New projection matrix P_new of shape ``(full_dim, subspace_dim)``
@@ -281,6 +295,7 @@ class AdaptiveSubspace:
                 device,
                 dtype,
                 generator,
+                history_is_full,
             )
 
     @torch.inference_mode()
@@ -317,6 +332,7 @@ class AdaptiveSubspace:
         device: str | torch.device,
         dtype: torch.dtype,
         generator: Optional[torch.Generator] = None,
+        history_is_full: bool = False,
     ) -> torch.Tensor:
         """Rotate basis using SVD of displacement history.
 
@@ -336,13 +352,19 @@ class AdaptiveSubspace:
         Returns:
             New orthogonal projection of shape (full_dim, subspace_dim).
         """
+        # Asking for no SVD directions means a fresh random basis, and skips the SVD.
+        if svd_ratio <= 0.0:
+            return self._rotate_random(device, dtype, generator)
+
         k_svd = max(1, int(svd_ratio * self.subspace_dim))
         k_random = self.subspace_dim - k_svd
 
         # D_full: (full_dim, history_len). A history already in full parameter space
         # is used as-is; each row then carries the basis it was measured in, instead of
-        # being re-projected through whichever basis happens to be current.
-        if displacement_history.shape[1] == projection.shape[0]:
+        # being re-projected through whichever basis happens to be current. The caller
+        # states which frame it holds: inferring it from the shape picks the wrong
+        # branch whenever subspace_dim == full_dim.
+        if history_is_full:
             D_full = displacement_history.T
         else:
             D_full = projection @ displacement_history.T
@@ -351,18 +373,16 @@ class AdaptiveSubspace:
         if not torch.isfinite(D_full).all():
             return self._rotate_random(device, dtype, generator)
 
-        # SVD/QR reject bf16 on CPU; run the decomposition in fp32 and cast back.
-        compute_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
+        compute_dtype = decomposition_dtype(dtype)
         D_full = D_full.to(compute_dtype)
 
-        # SVD of the full-space displacement matrix.
-        # pca_lowrank draws its test matrix from the global RNG and takes no
-        # generator, so a seeded run would still depend on torch.manual_seed. Use
-        # the deterministic full SVD whenever the caller asked for reproducibility;
-        # the history is short, so the two cost about the same.
+        # pca_lowrank draws from the global RNG and takes no generator, so a seeded
+        # run would still depend on torch.manual_seed; the history is short enough that
+        # the full SVD costs the same. center=False: centering each displacement is a
+        # different operator, not an approximation of the else-branch.
         if generator is None and k_svd < min(D_full.shape) // 2 and min(D_full.shape) > 6:
             # Randomized SVD: faster when k_svd << rank
-            U_top, S_top, V_top = torch.pca_lowrank(D_full, q=k_svd, niter=2)
+            U_top, S_top, V_top = torch.pca_lowrank(D_full, q=k_svd, center=False, niter=2)
         else:
             U, S, Vh = torch.linalg.svd(D_full, full_matrices=False)
             k_svd = min(k_svd, U.shape[1])
@@ -389,22 +409,6 @@ class AdaptiveSubspace:
             P_new = P_new.to(device=device)
 
         return P_new
-
-    def get_svd_ratio(self, step: int, total_steps: int) -> float:
-        """Compute SVD ratio at the given step via linear interpolation.
-
-        The ratio starts at ``svd_ratio_init`` (step 0) and linearly
-        increases to ``svd_ratio_final`` (step = total_steps).
-
-        Args:
-            step: Current optimization step.
-            total_steps: Total number of steps.
-
-        Returns:
-            SVD ratio in [svd_ratio_init, svd_ratio_final].
-        """
-        progress = min(1.0, step / max(1, total_steps or 1))
-        return self.svd_ratio_init + progress * (self.svd_ratio_final - self.svd_ratio_init)
 
     def apply_perturbation(
         self,
@@ -448,8 +452,9 @@ class AdaptiveSubspace:
     ) -> Dict[str, torch.Tensor]:
         """Vectorized reconstruction for N probe points.
 
-        Computes ``delta_batch = batch @ P.T`` to get (N, full_dim) deltas,
-        then slices and reshapes per entry.
+        Computes ``delta_batch = batch @ P.T`` to get (N, full_dim) deltas, then
+        adds each entry's base into its slice in place and hands out a view of
+        it, so the entries alias one buffer and callers must not write to them.
 
         Args:
             projection: Projection matrix P of shape (full_dim, subspace_dim),
@@ -460,46 +465,24 @@ class AdaptiveSubspace:
         Returns:
             Dict ``{key: (N, *original_shape)}`` with batched perturbed params.
         """
-        N = flat_subspace_batch.shape[0]
         # Handle sparse projection
         from .projection import SparseRandomProjection
 
         if isinstance(projection, SparseRandomProjection):
-            # Sparse projection: use project() method for batch
-            delta_batch = projection.project(flat_subspace_batch)  # (N, full_dim)
+            # project() returns a transposed sparse-mm result. One copy here beats
+            # handing the evaluator a tensor strided by N along the parameter axis.
+            delta_batch = projection.project(flat_subspace_batch).contiguous()  # (N, full_dim)
         else:
             # (N, subspace_dim) @ (subspace_dim, full_dim) -> (N, full_dim)
             delta_batch = flat_subspace_batch @ projection.T  # (N, full_dim)
         result: Dict[str, torch.Tensor] = {}
         for spec in self._entry_specs:
             delta_chunk = delta_batch[:, spec.flat_start : spec.flat_end]
-            base = base_sd[spec.entry_key]
-            result[spec.entry_key] = base.unsqueeze(0) + delta_chunk.reshape(N, *spec.original_shape)
+            delta_chunk.add_(base_sd[spec.entry_key].reshape(1, -1))
+            # unflatten, not reshape: the slice is contiguous inside each row, so
+            # this is a view. reshape would copy the whole (N, num_params).
+            result[spec.entry_key] = delta_chunk.unflatten(1, spec.original_shape)
         return result
-
-    def absorb(
-        self,
-        projection,
-        base_sd: Dict[str, torch.Tensor],
-        flat_subspace: torch.Tensor,
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Fold subspace perturbation into base weights and zero the subspace.
-
-        This is the standard absorb operation: apply the current perturbation
-        to base weights, then return zeroed subspace coordinates. Combined
-        with rotation, this recenters the subspace around updated parameters.
-
-        Args:
-            projection: Projection matrix P of shape (full_dim, subspace_dim),
-                or SparseRandomProjection instance for sparse mode.
-            base_sd: Base state_dict to absorb perturbation into.
-            flat_subspace: Current subspace vector of shape (subspace_dim,).
-
-        Returns:
-            Tuple of (new_base_sd, zeroed_subspace_vector).
-        """
-        new_sd = self.apply_perturbation(projection, base_sd, flat_subspace)
-        return new_sd, torch.zeros_like(flat_subspace)
 
     def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
         """Whether to fold the perturbation into the base weights this step."""

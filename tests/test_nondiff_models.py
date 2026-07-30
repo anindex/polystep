@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.nn as nn
 from torch.func import functional_call, vmap
 
 # experiments/ is the paper reproduction harness and is not part of the distributed
@@ -58,55 +57,51 @@ from experiments.runners.nondiff_models import (  # noqa: E402
 )
 
 
-class TestLIFNeuron:
-    def test_spike_values_binary(self):
-        """Spike output must be in {0.0, 1.0}."""
-        lif = LIFNeuron(beta=0.95, threshold=1.0)
-        x = torch.randn(4, 32) * 2.0  # Large values to trigger spikes
-        mem = torch.randn(4, 32).abs() * 1.5  # Some above threshold
-        spike, _ = lif(x, mem)
-        unique_vals = spike.unique()
-        for v in unique_vals:
-            assert v.item() in (0.0, 1.0), f"Spike value {v.item()} not in {{0, 1}}"
+def test_spike_values_binary():
+    """Spike output must be in {0.0, 1.0}."""
+    lif = LIFNeuron(beta=0.95, threshold=1.0)
+    x = torch.randn(4, 32) * 2.0  # Large values to trigger spikes
+    mem = torch.randn(4, 32).abs() * 1.5  # Some above threshold
+    spike, _ = lif(x, mem)
+    unique_vals = spike.unique()
+    for v in unique_vals:
+        assert v.item() in (0.0, 1.0), f"Spike value {v.item()} not in {{0, 1}}"
 
 
-class TestQuantizedLinear:
-    def test_weights_are_int8_rounded(self):
-        """forward() must apply int8 round-quantization to the weights it uses."""
-        ql = QuantizedLinear(2, 1, scale=0.5)
-        with torch.no_grad():
-            ql.weight.copy_(torch.tensor([[0.4, -0.8]]))  # /0.5=[0.8,-1.6]->round[1,-2]->*0.5=[0.5,-1.0]
-            ql.bias.zero_()
-        x = torch.tensor([[1.0, 1.0]])
-        out = ql(x)
-        assert torch.allclose(out, torch.tensor([[-0.5]]), atol=1e-6)  # uses quantized weights
-        assert not torch.allclose(out, x @ ql.weight.t(), atol=1e-3)  # not the raw linear (-0.4)
+def test_weights_are_int8_rounded():
+    """forward() must apply int8 round-quantization to the weights it uses."""
+    ql = QuantizedLinear(2, 1, scale=0.5)
+    with torch.no_grad():
+        ql.weight.copy_(torch.tensor([[0.4, -0.8]]))  # /0.5=[0.8,-1.6]->round[1,-2]->*0.5=[0.5,-1.0]
+        ql.bias.zero_()
+    x = torch.tensor([[1.0, 1.0]])
+    out = ql(x)
+    assert torch.allclose(out, torch.tensor([[-0.5]]), atol=1e-6)  # uses quantized weights
+    assert not torch.allclose(out, x @ ql.weight.t(), atol=1e-3)  # not the raw linear (-0.4)
 
 
-class TestBinaryLinear:
-    def test_effective_weights_binary(self):
-        """forward() must binarize weights to {-1, +1} via sign()."""
-        bl = BinaryLinear(2, 1)
-        with torch.no_grad():
-            bl.weight.copy_(torch.tensor([[0.3, -0.7]]))  # sign -> [+1, -1]
-            bl.bias.zero_()
-        x = torch.tensor([[2.0, 5.0]])
-        out = bl(x)
-        assert torch.allclose(out, torch.tensor([[-3.0]]))  # 2*(+1) + 5*(-1)
-        assert not torch.allclose(out, x @ bl.weight.t())  # not the raw linear (-2.9)
+def test_effective_weights_binary():
+    """forward() must binarize weights to {-1, +1} via sign()."""
+    bl = BinaryLinear(2, 1)
+    with torch.no_grad():
+        bl.weight.copy_(torch.tensor([[0.3, -0.7]]))  # sign -> [+1, -1]
+        bl.bias.zero_()
+    x = torch.tensor([[2.0, 5.0]])
+    out = bl(x)
+    assert torch.allclose(out, torch.tensor([[-3.0]]))  # 2*(+1) + 5*(-1)
+    assert not torch.allclose(out, x @ bl.weight.t())  # not the raw linear (-2.9)
 
 
-class TestTernaryLinear:
-    def test_effective_weights_ternary(self):
-        """forward() must ternarize weights to {-1, 0, +1} using the threshold."""
-        tl = TernaryLinear(3, 1, threshold=0.5)
-        with torch.no_grad():
-            tl.weight.copy_(torch.tensor([[0.9, -0.1, 0.6]]))  # |.|>=0.5 -> [+1, 0, +1]
-            tl.bias.zero_()
-        x = torch.tensor([[1.0, 1.0, 1.0]])
-        out = tl(x)
-        assert torch.allclose(out, torch.tensor([[2.0]]))  # +1 + 0 + +1
-        assert not torch.allclose(out, x @ tl.weight.t())  # not the raw linear (1.4)
+def test_effective_weights_ternary():
+    """forward() must ternarize weights to {-1, 0, +1} using the threshold."""
+    tl = TernaryLinear(3, 1, threshold=0.5)
+    with torch.no_grad():
+        tl.weight.copy_(torch.tensor([[0.9, -0.1, 0.6]]))  # |.|>=0.5 -> [+1, 0, +1]
+        tl.bias.zero_()
+    x = torch.tensor([[1.0, 1.0, 1.0]])
+    out = tl(x)
+    assert torch.allclose(out, torch.tensor([[2.0]]))  # +1 + 0 + +1
+    assert not torch.allclose(out, x @ tl.weight.t())  # not the raw linear (1.4)
 
 
 class TestSTESign:
@@ -144,67 +139,48 @@ class TestSTETernary:
         assert input.grad is not None
 
 
-class TestBinaryLinearSTE:
-    def test_gradient_flows(self):
-        layer = BinaryLinearSTE(16, 8)
-        x = torch.randn(2, 16)
-        out = layer(x).sum()
-        out.backward()
-        assert layer.weight.grad is not None
-        assert layer.weight.grad.shape == (8, 16)
+@pytest.mark.parametrize(
+    "build, input_shape",
+    [
+        (lambda: BinaryLinearSTE(16, 8), (2, 16)),
+        (lambda: BinaryConv2dSTE(3, 16, 3, padding=1), (2, 3, 8, 8)),
+        (lambda: SoftMoELayer(input_dim=32, hidden_dim=64, num_experts=4), (2, 32)),
+        (BinaryMNISTNetSTE, (2, 1, 28, 28)),
+        (BinaryCIFAR10NetSTE, (2, 3, 32, 32)),
+        (SoftMoENet, (2, 1, 28, 28)),
+    ],
+)
+def test_ste_passes_gradient_to_every_weight(build, input_shape):
+    """The reason the STE exists: a hard forward must still reach every parameter."""
+    model = build()
+    model(torch.randn(*input_shape)).sum().backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, name
+        assert p.grad.shape == p.shape, name
 
 
-class TestTernaryLinearSTE:
-    def test_forward_shape_and_gradient(self):
-        layer = TernaryLinearSTE(16, 8, threshold=0.3)
-        x = torch.randn(2, 16)
-        out = layer(x)
-        assert out.shape == (2, 8)
-        out.sum().backward()
-        assert layer.weight.grad is not None
+def test_forward_shape_and_gradient():
+    layer = TernaryLinearSTE(16, 8, threshold=0.3)
+    x = torch.randn(2, 16)
+    out = layer(x)
+    assert out.shape == (2, 8)
+    out.sum().backward()
+    assert layer.weight.grad is not None
 
 
-class TestBinaryConv2d:
-    def test_weights_are_binary(self):
-        """forward() must convolve with sign-binarized weights, not the raw ones."""
-        layer = BinaryConv2d(1, 1, 1, padding=0)  # 1x1 conv -> per-pixel scale by the (binarized) weight
-        x = torch.randn(1, 1, 4, 4)
-        with torch.no_grad():
-            layer.bias.zero_()
-            layer.weight.copy_(torch.tensor([[[[0.3]]]]))  # sign -> +1
-        assert torch.allclose(layer(x), x, atol=1e-6)  # +1 -> identity
-        with torch.no_grad():
-            layer.weight.copy_(torch.tensor([[[[-0.2]]]]))  # sign -> -1
-        out = layer(x)
-        assert torch.allclose(out, -x, atol=1e-6)  # -1 -> negate
-        assert not torch.allclose(out, -0.2 * x, atol=1e-3)  # not the raw (-0.2) conv
-
-
-class TestBinaryConv2dSTE:
-    def test_gradient_flows(self):
-        layer = BinaryConv2dSTE(3, 16, 3, padding=1)
-        x = torch.randn(2, 3, 8, 8)
-        out = layer(x).sum()
-        out.backward()
-        assert layer.weight.grad is not None
-
-
-class TestBinaryMNISTNetSTE:
-    @pytest.mark.parametrize(
-        "model_fn, input_shape",
-        [
-            (lambda: BinaryMNISTNetSTE(), (2, 1, 28, 28)),
-            (lambda: BinaryCIFAR10NetSTE(), (2, 3, 32, 32)),
-            (lambda: SoftMoENet(), (2, 1, 28, 28)),
-        ],
-    )
-    def test_gradient_flows(self, model_fn, input_shape):
-        model = model_fn()
-        x = torch.randn(*input_shape)
-        out = model(x).sum()
-        out.backward()
-        for name, p in model.named_parameters():
-            assert p.grad is not None, f"No gradient for {name}"
+def test_weights_are_binary():
+    """forward() must convolve with sign-binarized weights, not the raw ones."""
+    layer = BinaryConv2d(1, 1, 1, padding=0)  # 1x1 conv -> per-pixel scale by the (binarized) weight
+    x = torch.randn(1, 1, 4, 4)
+    with torch.no_grad():
+        layer.bias.zero_()
+        layer.weight.copy_(torch.tensor([[[[0.3]]]]))  # sign -> +1
+    assert torch.allclose(layer(x), x, atol=1e-6)  # +1 -> identity
+    with torch.no_grad():
+        layer.weight.copy_(torch.tensor([[[[-0.2]]]]))  # sign -> -1
+    out = layer(x)
+    assert torch.allclose(out, -x, atol=1e-6)  # -1 -> negate
+    assert not torch.allclose(out, -0.2 * x, atol=1e-3)  # not the raw (-0.2) conv
 
 
 @pytest.mark.parametrize(
@@ -224,64 +200,52 @@ def test_forward_shape(build, input_shape, output_shape):
     assert torch.isfinite(out).all()
 
 
-class TestStaircaseActivation:
-    def test_output_values_quantized(self):
-        """Output values must be in {0/5, 1/5, 2/5, 3/5, 4/5}."""
-        sa = StaircaseActivation(levels=5)
-        x = torch.randn(100, 16)  # Enough samples for variety
-        out = sa(x)
-        valid_values = {0.0, 0.2, 0.4, 0.6, 0.8}
-        unique_vals = out.unique()
-        for v in unique_vals:
-            assert round(v.item(), 6) in valid_values, f"Staircase value {v.item()} not in {valid_values}"
+def test_output_values_quantized():
+    """Output values must be in {0/5, 1/5, 2/5, 3/5, 4/5}."""
+    sa = StaircaseActivation(levels=5)
+    x = torch.randn(100, 16)  # Enough samples for variety
+    out = sa(x)
+    valid_values = {0.0, 0.2, 0.4, 0.6, 0.8}
+    unique_vals = out.unique()
+    for v in unique_vals:
+        assert round(v.item(), 6) in valid_values, f"Staircase value {v.item()} not in {valid_values}"
 
 
-class TestHardMoELayer:
-    def test_hard_routing_selects_argmax_expert(self):
-        """forward() must return the argmax-gated expert's output (hard top-1),
-        not a soft average of the experts."""
-        torch.manual_seed(0)
-        moe = HardMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
-        x = torch.randn(5, 8)
-        out = moe(x)
-        gate_idx = moe.gate(x).argmax(dim=-1)
-        for i in range(x.shape[0]):
-            selected = moe.experts[int(gate_idx[i])](x[i : i + 1])[0]
-            assert torch.allclose(out[i], selected, atol=1e-5)
-        avg = torch.stack([e(x) for e in moe.experts], dim=1).mean(dim=1)
-        assert not torch.allclose(out, avg, atol=1e-4)  # hard threshold, not averaging
+def test_hard_routing_selects_argmax_expert():
+    """forward() must return the argmax-gated expert's output (hard top-1),
+    not a soft average of the experts."""
+    torch.manual_seed(0)
+    moe = HardMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
+    x = torch.randn(5, 8)
+    out = moe(x)
+    gate_idx = moe.gate(x).argmax(dim=-1)
+    for i in range(x.shape[0]):
+        selected = moe.experts[int(gate_idx[i])](x[i : i + 1])[0]
+        assert torch.allclose(out[i], selected, atol=1e-5)
+    avg = torch.stack([e(x) for e in moe.experts], dim=1).mean(dim=1)
+    assert not torch.allclose(out, avg, atol=1e-4)  # hard threshold, not averaging
 
 
-class TestSoftMoELayer:
-    def test_gradient_flows(self):
-        moe = SoftMoELayer(input_dim=32, hidden_dim=64, num_experts=4)
-        x = torch.randn(2, 32)
-        out = moe(x).sum()
-        out.backward()
-        assert moe.gate.weight.grad is not None
-        assert moe.gate.weight.grad.shape == (4, 32)
-
-    def test_soft_routing_is_softmax_weighted(self):
-        """forward() must return the softmax-weighted expert mix, not hard top-1."""
-        torch.manual_seed(0)
-        moe = SoftMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
-        x = torch.randn(5, 8)
-        out = moe(x)
-        weights = torch.softmax(moe.gate(x), dim=-1)
-        all_out = torch.stack([e(x) for e in moe.experts], dim=1)
-        expected = (all_out * weights.unsqueeze(-1)).sum(dim=1)
-        assert torch.allclose(out, expected, atol=1e-5)  # soft-weighted mix
-        hard = all_out[torch.arange(5), moe.gate(x).argmax(dim=-1)]
-        assert not torch.allclose(out, hard, atol=1e-4)  # not hard argmax
+def test_soft_routing_is_softmax_weighted():
+    """forward() must return the softmax-weighted expert mix, not hard top-1."""
+    torch.manual_seed(0)
+    moe = SoftMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
+    x = torch.randn(5, 8)
+    out = moe(x)
+    weights = torch.softmax(moe.gate(x), dim=-1)
+    all_out = torch.stack([e(x) for e in moe.experts], dim=1)
+    expected = (all_out * weights.unsqueeze(-1)).sum(dim=1)
+    assert torch.allclose(out, expected, atol=1e-5)  # soft-weighted mix
+    hard = all_out[torch.arange(5), moe.gate(x).argmax(dim=-1)]
+    assert not torch.allclose(out, hard, atol=1e-4)  # not hard argmax
 
 
-class TestSoftMoENet:
-    def test_param_count_matches_hard(self):
-        hard = HardMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
-        soft = SoftMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
-        hard_params = sum(p.numel() for p in hard.parameters())
-        soft_params = sum(p.numel() for p in soft.parameters())
-        assert hard_params == soft_params, f"Param count mismatch: hard={hard_params}, soft={soft_params}"
+def test_param_count_matches_hard():
+    hard = HardMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
+    soft = SoftMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
+    hard_params = sum(p.numel() for p in hard.parameters())
+    soft_params = sum(p.numel() for p in soft.parameters())
+    assert hard_params == soft_params, f"Param count mismatch: hard={hard_params}, soft={soft_params}"
 
 
 class TestExpertUtilization:
@@ -336,24 +300,22 @@ class TestMaxSATModel:
         )
 
 
-class TestCraPenalty:
-    def test_known_values(self):
-        """cra_penalty should be 0 for {0, 1} values and positive for 0.5."""
-        soft = torch.tensor([0.0, 1.0, 0.5])
-        penalty = cra_penalty(soft)
-        # For x=0: (2*0-1)^2 = 1, so 1-1=0
-        # For x=1: (2*1-1)^2 = 1, so 1-1=0
-        # For x=0.5: (2*0.5-1)^2 = 0, so 1-0=1
-        assert penalty.item() == pytest.approx(1.0, abs=1e-5)
+def test_known_values():
+    """cra_penalty should be 0 for {0, 1} values and positive for 0.5."""
+    soft = torch.tensor([0.0, 1.0, 0.5])
+    penalty = cra_penalty(soft)
+    # For x=0: (2*0-1)^2 = 1, so 1-1=0
+    # For x=1: (2*1-1)^2 = 1, so 1-1=0
+    # For x=0.5: (2*0.5-1)^2 = 0, so 1-0=1
+    assert penalty.item() == pytest.approx(1.0, abs=1e-5)
 
 
-class TestEvaluateSatLoss:
-    def test_returns_scalar(self):
-        soft = torch.tensor([0.5, 0.8, 0.2])
-        clause_vars = torch.tensor([[0, 1], [1, 2]])
-        clause_signs = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
-        loss = evaluate_sat_loss(soft, clause_vars, clause_signs)
-        assert loss.dim() == 0 or loss.numel() == 1
+def test_returns_scalar():
+    soft = torch.tensor([0.5, 0.8, 0.2])
+    clause_vars = torch.tensor([[0, 1], [1, 2]])
+    clause_signs = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
+    loss = evaluate_sat_loss(soft, clause_vars, clause_signs)
+    assert loss.dim() == 0 or loss.numel() == 1
 
 
 class TestVmapCompatibility:
@@ -407,15 +369,13 @@ class TestVmapCompatibility:
         assert outputs.shape == expected_shape
 
 
-class TestHardPermutationNet:
-    def test_output_is_long_indices(self):
-        """Output dtype is long, values in [0, N)."""
-        model = HardPermutationNet(N=10, hidden_dim=64)
-        x = torch.randn(4, 10)
-        out = model(x)
-        assert out.dtype == torch.long
-        assert out.min() >= 0
-        assert out.max() < 10
+def test_output_is_long_indices():
+    """Output dtype is long, values in [0, N)."""
+    model = HardPermutationNet(N=10, hidden_dim=64)
+    x = torch.randn(4, 10)
+    out = model(x)
+    assert out.dtype == torch.long
+    assert out.max() < 10
 
 
 class TestSoftPermutationNet:
@@ -442,20 +402,19 @@ class TestSoftPermutationNet:
         assert hard_params == soft_params, f"Param count mismatch: hard={hard_params}, soft={soft_params}"
 
 
-class TestPermutationLoss:
-    @pytest.mark.parametrize(
-        "pred, target, expected",
-        [
-            (
-                torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
-                torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
-                0.0,
-            ),
-            (torch.tensor([[1, 0, 3, 2]]), torch.tensor([[0, 1, 2, 3]]), 1.0),
-            (torch.tensor([[0, 1, 3, 2]]), torch.tensor([[0, 1, 2, 3]]), 0.5),
-        ],
-    )
-    def test_perfect_match(self, pred, target, expected):
-        loss_fn = PermutationLoss()
-        loss = loss_fn(pred, target)
-        assert loss.item() == pytest.approx(expected)
+@pytest.mark.parametrize(
+    "pred, target, expected",
+    [
+        (
+            torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
+            torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
+            0.0,
+        ),
+        (torch.tensor([[1, 0, 3, 2]]), torch.tensor([[0, 1, 2, 3]]), 1.0),
+        (torch.tensor([[0, 1, 3, 2]]), torch.tensor([[0, 1, 2, 3]]), 0.5),
+    ],
+)
+def test_perfect_match(pred, target, expected):
+    loss_fn = PermutationLoss()
+    loss = loss_fn(pred, target)
+    assert loss.item() == pytest.approx(expected)

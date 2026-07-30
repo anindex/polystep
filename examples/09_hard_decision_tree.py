@@ -30,14 +30,18 @@ Run:
 from __future__ import annotations
 
 import os
+import sys
 import torch
 
-# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
-# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
-# Set POLYSTEP_THREADS to override. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
+# One thread: PolyStep's per-step ops are small enough that torch's default pool of
+# nproc threads costs far more than it returns. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from polystep import PolyStepES
+
+from _openai_es import OpenAIES  # noqa: E402
 
 DEPTH = 4  # complete binary tree: 15 internal nodes, 16 leaves
 TOTAL_EVALS = 40_000  # matched forward-pass budget for the gradient-free methods
@@ -95,31 +99,6 @@ def hard_error(flat, X, y, depth=DEPTH):
     return (pred.float() != y[None, :]).float().mean(dim=1)
 
 
-class OpenAIES:
-    """OpenAI-ES ask/tell (Salimans et al., 2017): antithetic sampling, z-scored
-    fitness shaping, estimate g = (1/(pop*sigma)) sum(shaped * eps)."""
-
-    def __init__(self, dim, popsize, x0, sigma=0.3, lr=0.15, seed=0):
-        self.dim = dim
-        self.popsize = popsize + (popsize % 2)
-        self.sigma = sigma
-        self.lr = lr
-        self.mean = x0.clone()
-        self.generator = torch.Generator().manual_seed(seed)
-        self._eps = None
-        self.best_fitness = float("inf")
-
-    def ask(self):
-        half = torch.randn(self.popsize // 2, self.dim, generator=self.generator)
-        self._eps = torch.cat([half, -half], dim=0)
-        return self.mean.unsqueeze(0) + self.sigma * self._eps
-
-    def tell(self, fitness):
-        self.best_fitness = min(self.best_fitness, fitness.min().item())
-        adv = (fitness - fitness.mean()) / (fitness.std() + 1e-8)
-        self.mean = self.mean - self.lr * (self._eps * adv.unsqueeze(1)).mean(dim=0) / self.sigma
-
-
 class SPSA:
     """SPSA ask/tell (Spall, 1992): a two-point Rademacher gradient estimate with
     decaying gain sequences a_k and c_k."""
@@ -172,7 +151,6 @@ def adam_soft_tree(X, y, depth=DEPTH, steps=800, temp=0.2, seed=0):
     n_internal, n_leaves = tree_shape(depth)
     flat = torch.nn.Parameter(0.3 * torch.randn(D))
     opt = torch.optim.Adam([flat], lr=0.05)
-    y2 = y.long()
 
     for _ in range(steps):
         W, b, leaf = _unpack(flat.unsqueeze(0), d_in, depth)
@@ -197,8 +175,7 @@ def adam_soft_tree(X, y, depth=DEPTH, steps=800, temp=0.2, seed=0):
         loss.backward()
         opt.step()
 
-    hard_acc = 100.0 * (1.0 - hard_error(flat.detach().unsqueeze(0), X, y, depth).item())
-    return hard_acc, y2  # y2 unused, kept for clarity
+    return 100.0 * (1.0 - hard_error(flat.detach().unsqueeze(0), X, y, depth).item())
 
 
 def solve(X, y, seed=0):
@@ -215,7 +192,7 @@ def solve(X, y, seed=0):
     ps_evals, ps_curve = run_to_budget(ps, fit, ps_pop)
     es_evals, es_curve = run_to_budget(es, fit, ps_pop)
     spsa_evals, spsa_curve = run_to_budget(spsa, fit, 2)
-    adam_hard, _ = adam_soft_tree(X, y)
+    adam_hard = adam_soft_tree(X, y)
     return {
         "PolyStep": (ps_evals, ps_curve),
         "OpenAI-ES": (es_evals, es_curve),

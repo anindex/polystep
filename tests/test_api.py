@@ -269,6 +269,9 @@ class TestGetDiagnostics:
         diag = get_diagnostics(opt)
         expected = {
             "costs",
+            "ess",
+            "rho",
+            "evals",
             "displacement_sqnorms",
             "convergence",
             "velocity_magnitude",
@@ -293,30 +296,29 @@ class TestGetDiagnostics:
         model = _make_model()
         opt = self._run_optimizer(model, steps=2, use_momentum=True)
         diag = get_diagnostics(opt)
-        assert isinstance(diag["velocity_magnitude"], float)
-        assert diag["velocity_magnitude"] >= 0.0
+        # The reported magnitude is the velocity's norm, not just some non-negative float.
+        assert diag["velocity_magnitude"] == pytest.approx(opt.state.velocity.norm().item(), rel=1e-6)
 
 
-class TestIntegration:
-    def test_train_with_logging_and_early_stop(self, capsys):
-        torch.manual_seed(42)
-        model = _make_model()
-        dl = _make_dataloader(num_samples=32, batch_size=16)  # 2 batches
-        opt = _make_optimizer(model)
+def test_train_with_logging_and_early_stop(capsys):
+    torch.manual_seed(42)
+    model = _make_model()
+    dl = _make_dataloader(num_samples=32, batch_size=16)  # 2 batches
+    opt = _make_optimizer(model)
 
-        logging_cb = LoggingCallback(log_every=1)
-        early_cb = EarlyStoppingCallback(patience=2, min_delta=1e-8)
-        config = TrainConfig(epochs=10, callbacks=[logging_cb, early_cb])
+    logging_cb = LoggingCallback(log_every=1)
+    early_cb = EarlyStoppingCallback(patience=2, min_delta=1e-8)
+    config = TrainConfig(epochs=10, callbacks=[logging_cb, early_cb])
 
-        result = train(model, dl, nn.MSELoss(), opt, config)
-        assert result is model
+    result = train(model, dl, nn.MSELoss(), opt, config)
+    assert result is model
 
-        # Verify logging output was produced
-        captured = capsys.readouterr().out
-        assert "[Step 0]" in captured
+    # Verify logging output was produced
+    captured = capsys.readouterr().out
+    assert "[Step 0]" in captured
 
-        # Verify training ran (callback mechanism works).
-        # With multi-particle architecture, loss may continue improving
-        # so early stopping may or may not trigger within 20 steps.
-        assert opt.state.iteration_count > 0
-        assert opt.state.iteration_count <= 20
+    # Verify training ran (callback mechanism works).
+    # With multi-particle architecture, loss may continue improving
+    # so early stopping may or may not trigger within 20 steps.
+    assert opt.state.iteration_count > 0
+    assert opt.state.iteration_count <= 20

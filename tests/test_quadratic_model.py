@@ -1,5 +1,7 @@
-import torch
+import math
+
 import pytest
+import torch
 
 
 def test_fd_gradient_quadratic_function():
@@ -56,6 +58,32 @@ def test_fd_hessian_diagonal_quadratic_function():
     torch.testing.assert_close(hess, true_hess, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("probe_radius", [1.0, 1e-2, 2e-3, 1e-4])
+def test_fd_hessian_survives_small_probe_radius(probe_radius):
+    """Curvature must not depend on the probe radius the loss was measured at.
+
+    The regression denominator scales as probe_radius**4, so regressing on the
+    absolute offsets loses the curvature entirely once epsilon anneals: at
+    probe_radius=2e-3 the estimate collapsed to 0.9% of the true value.
+    """
+    pdim, P, K = 2, 1, 2
+    true_grad = torch.tensor([[0.5, 0.2]])
+    true_hess = torch.tensor([[3.0, -1.0]])
+    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
+
+    losses_3d = torch.zeros(P, 2 * pdim, K)
+    for k in range(K):
+        t = scales[k] * probe_radius
+        for i in range(pdim):
+            losses_3d[0, i, k] = true_grad[0, i] * t + 0.5 * true_hess[0, i] * t**2
+            losses_3d[0, i + pdim, k] = -true_grad[0, i] * t + 0.5 * true_hess[0, i] * t**2
+
+    from polystep.quadratic_model import extract_fd_hessian_diag
+
+    hess = extract_fd_hessian_diag(losses_3d, scales, probe_radius, pdim)
+    torch.testing.assert_close(hess, true_hess, atol=1e-2, rtol=1e-2)
+
+
 def test_newton_step_recovers_minimum():
     """Newton step from quadratic model should point toward the minimum."""
     gradient = torch.tensor([[3.0, -2.0]])
@@ -80,15 +108,19 @@ def test_newton_step_clamps_norm():
 
 
 def test_newton_step_regularizes_small_hessian():
-    """Newton step should handle near-zero Hessian via regularization."""
+    """A flat coordinate divides by hessian_reg, so both clips have to bind.
+
+    Left at the default max_step_norm: -1/1e-4 caps per coordinate to -10, then the
+    global clip rescales to a norm of exactly 10.
+    """
     gradient = torch.tensor([[1.0, 1.0]])
     hessian_diag = torch.tensor([[1e-10, 1e-10]])
 
     from polystep.quadratic_model import compute_newton_step
 
     step = compute_newton_step(gradient, hessian_diag, hessian_reg=1e-4)
-    assert torch.isfinite(step).all()
-    assert torch.norm(step).item() < 1e6
+    torch.testing.assert_close(step, torch.full((1, 2), -10.0 / math.sqrt(2)))
+    assert torch.norm(step).item() == pytest.approx(10.0)
 
 
 def test_trust_region_no_expand_on_predicted_increase():
@@ -96,7 +128,24 @@ def test_trust_region_no_expand_on_predicted_increase():
     from polystep.quadratic_model import update_trust_region
 
     r = update_trust_region(torch.tensor([1.0]), torch.tensor([1.0]), current_radius=1.0)
-    assert r <= 1.0
+    assert r == pytest.approx(1.0)
+
+
+# ratio = actual / pred against the default thresholds (shrink 0.25, expand 0.75).
+@pytest.mark.parametrize(
+    "actual, expected",
+    [
+        (-1.6, 1.5),  # ratio 0.8, above the expand threshold
+        (-1.4, 1.0),  # ratio 0.7, between the two: hold
+        (-0.6, 1.0),  # ratio 0.3, still above the shrink threshold
+        (-0.4, 0.5),  # ratio 0.2, below it
+    ],
+)
+def test_trust_region_straddles_the_default_thresholds(actual, expected):
+    from polystep.quadratic_model import update_trust_region
+
+    r = update_trust_region(torch.tensor([-2.0]), torch.tensor([actual]), current_radius=1.0)
+    assert r == pytest.approx(expected)
 
 
 def test_predicted_improvement():
@@ -110,6 +159,24 @@ def test_predicted_improvement():
     pred = compute_predicted_improvement(gradient, hessian_diag, step)
     expected = torch.tensor([-2.65])
     torch.testing.assert_close(pred, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_predicted_improvement_floors_negative_curvature():
+    """Scoring must use the model the step was built from, which floors curvature.
+
+    With raw negative curvature the model rewards distance without bound, so a
+    zero-gradient coordinate reads as an improvement and the trust ratio measures
+    a model no step was ever taken against.
+    """
+    from polystep.quadratic_model import compute_predicted_improvement
+
+    gradient = torch.zeros(1, 1)
+    hessian_diag = torch.tensor([[-4.0]])
+    near = compute_predicted_improvement(gradient, hessian_diag, torch.tensor([[1.0]]))
+    far = compute_predicted_improvement(gradient, hessian_diag, torch.tensor([[10.0]]))
+
+    assert near.item() > 0.0, "flat gradient with floored curvature cannot predict a gain"
+    assert far.item() > near.item(), "a longer step must not score better under a floored model"
 
 
 def test_fd_gradient_batch_particles():
@@ -141,24 +208,13 @@ def test_fd_gradient_batch_particles():
     torch.testing.assert_close(hess, true_hess, atol=1e-3, rtol=1e-3)
 
 
-def test_trust_region_expands_on_good_step():
-    """Trust region should expand when actual closely matches predicted."""
+@pytest.mark.parametrize("actual, expand", [(-1.8, True), (-0.1, False)])
+def test_trust_region_follows_prediction_accuracy(actual, expand):
+    """An accurate prediction earns a wider radius; a badly overshot one loses it."""
     from polystep.quadratic_model import update_trust_region
 
-    predicted = torch.tensor([-2.0])
-    actual = torch.tensor([-1.8])
-    new_radius = update_trust_region(predicted, actual, current_radius=1.0)
-    assert new_radius > 1.0
-
-
-def test_trust_region_shrinks_on_bad_step():
-    """Trust region should shrink when actual is much worse than predicted."""
-    from polystep.quadratic_model import update_trust_region
-
-    predicted = torch.tensor([-2.0])
-    actual = torch.tensor([-0.1])
-    new_radius = update_trust_region(predicted, actual, current_radius=1.0)
-    assert new_radius < 1.0
+    new_radius = update_trust_region(torch.tensor([-2.0]), torch.tensor([actual]), current_radius=1.0)
+    assert (new_radius > 1.0) is expand, new_radius
 
 
 def _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P, c=10.0):

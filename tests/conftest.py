@@ -56,7 +56,9 @@ def _cplus_include_path():
             os.environ["CPLUS_INCLUDE_PATH"] = previous
 
 
-_DEFAULT_TORCH_THREADS = torch.get_num_threads()
+# The slow tests train at batch 512, where the intra-op pool does pay off. Capped at 16
+# to leave cores free, floored at 2 so a 4-core CI runner does not land on one thread.
+_SLOW_TEST_THREADS = max(2, min(16, (os.cpu_count() or 1) - 8))
 _FAST_TEST_THREADS = int(os.environ.get("POLYSTEP_TEST_THREADS", "1"))
 
 
@@ -65,8 +67,8 @@ def pytest_configure(config):
 
     The fast suite's tensors are small enough that the intra-op pool's fork/join costs
     more than the arithmetic, and under ``-n auto`` it also stops each worker grabbing
-    every core. ``POLYSTEP_TEST_THREADS`` overrides the count; ``slow`` tests get the
-    machine default back from the ``_torch_threads`` fixture. Numbers in CONTRIBUTING.md.
+    every core. ``POLYSTEP_TEST_THREADS`` overrides the count; ``slow`` tests get a
+    multi-threaded pool from the ``_torch_threads`` fixture. Numbers in CONTRIBUTING.md.
     """
     config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
     config.addinivalue_line("markers", "gpu: marks tests requiring CUDA GPU")
@@ -74,15 +76,25 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _seed_global_rng():
+    """Seed the global RNG before every test.
+
+    Per test, not per call, so tests needing distinct successive draws still work.
+    Without it, files drawing with a bare ``torch.randn`` depend on execution order.
+    """
+    torch.manual_seed(1234)
+
+
+@pytest.fixture(autouse=True)
 def _torch_threads(request):
-    """Give ``slow`` tests the machine's default thread count, pin everything else.
+    """Give ``slow`` tests a multi-threaded but unsaturated pool, pin everything else.
 
     Switching the count back and forth does not leave the pool degraded.
     """
     if "slow" not in request.keywords:
         yield
         return
-    torch.set_num_threads(_DEFAULT_TORCH_THREADS)
+    torch.set_num_threads(_SLOW_TEST_THREADS)
     try:
         yield
     finally:
@@ -119,16 +131,6 @@ def simple_mlp():
     """Small MLP for fast testing: Linear(4,8) -> ReLU -> Linear(8,2)."""
     torch.manual_seed(42)
     return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
-
-
-@pytest.fixture
-def simple_dataloader():
-    """DataLoader with 32 random samples, batch_size=16."""
-    torch.manual_seed(42)
-    X = torch.randn(32, 4)
-    y = torch.randn(32, 2)
-    dataset = TensorDataset(X, y)
-    return DataLoader(dataset, batch_size=16, shuffle=False)
 
 
 @pytest.fixture
@@ -194,8 +196,8 @@ def _read_idx_labels(path):
 def mnist_arrays():
     """Download MNIST once per session and return normalized ``(train_x, train_y, test_x, test_y)``.
 
-    Skips only on a download failure. A gzip or IDX parse error is a real bug and is
-    allowed to propagate; catching everything here used to disable a whole file silently.
+    Skips only on a download failure. A gzip or IDX parse error is a real bug and must
+    propagate rather than silently skip the file.
     """
     os.makedirs(MNIST_DIR, exist_ok=True)
     for filename in MNIST_FILES.values():

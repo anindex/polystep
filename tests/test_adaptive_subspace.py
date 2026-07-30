@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from polystep.adaptive_subspace import AdaptiveSubspace, EntrySpec
+from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.transform import ParamLayout
 
 
@@ -78,25 +78,24 @@ class TestInitProjection:
         assert not torch.allclose(P1, P2), "seeded CUDA basis is frozen"
 
 
-class TestRotateRandom:
-    def test_rotate_random_produces_orthogonal_basis(self, adaptive_sub):
-        """Random rotation produces orthogonal P different from input."""
-        sub = AdaptiveSubspace(
-            full_dim=adaptive_sub.full_dim,
-            subspace_dim=adaptive_sub.subspace_dim,
-            rotation_mode="random",
-            _entry_specs=adaptive_sub._entry_specs,
-        )
-        P_old = sub.init_projection(generator=torch.Generator().manual_seed(0))
-        P_new = sub.rotate(P_old, step=5, total_steps=100, generator=torch.Generator().manual_seed(99))
+def test_rotate_random_produces_orthogonal_basis(adaptive_sub):
+    """Random rotation produces orthogonal P different from input."""
+    sub = AdaptiveSubspace(
+        full_dim=adaptive_sub.full_dim,
+        subspace_dim=adaptive_sub.subspace_dim,
+        rotation_mode="random",
+        _entry_specs=adaptive_sub._entry_specs,
+    )
+    P_old = sub.init_projection(generator=torch.Generator().manual_seed(0))
+    P_new = sub.rotate(P_old, step=5, total_steps=100, generator=torch.Generator().manual_seed(99))
 
-        # Orthogonality
-        PtP = P_new.T @ P_new
-        eye = torch.eye(sub.subspace_dim)
-        assert torch.allclose(PtP, eye, atol=1e-4)
+    # Orthogonality
+    PtP = P_new.T @ P_new
+    eye = torch.eye(sub.subspace_dim)
+    assert torch.allclose(PtP, eye, atol=1e-4)
 
-        # Different from old
-        assert not torch.allclose(P_old, P_new, atol=1e-3), "Rotated P should differ from original"
+    # Different from old
+    assert not torch.allclose(P_old, P_new, atol=1e-3), "Rotated P should differ from original"
 
 
 class TestRotateDisplacement:
@@ -124,8 +123,8 @@ class TestRotateDisplacement:
         eye = torch.eye(adaptive_sub.subspace_dim)
         assert torch.allclose(PtP, eye, atol=1e-4), f"Orthogonality error: {(PtP - eye).abs().max().item()}"
 
-    def test_rotate_displacement_bf16_does_not_crash(self, adaptive_sub):
-        """Rotation upcasts for SVD/QR so bf16 mixed precision does not crash."""
+    def test_rotate_displacement_bf16_stays_orthonormal(self, adaptive_sub):
+        """Rotation upcasts for SVD/QR, so the bf16 result is still a basis."""
         sub = AdaptiveSubspace(
             full_dim=adaptive_sub.full_dim,
             subspace_dim=adaptive_sub.subspace_dim,
@@ -137,6 +136,10 @@ class TestRotateDisplacement:
         P_new = sub.rotate(P, step=5, total_steps=100, displacement_history=disp)
         assert P_new.dtype == torch.bfloat16
         assert P_new.shape == (sub.full_dim, sub.subspace_dim)
+        # The contract is orthonormal columns, not just the right box of numbers:
+        # a bf16 QR that silently degraded would still pass a shape check.
+        gram = P_new.float().T @ P_new.float()
+        assert torch.allclose(gram, torch.eye(sub.subspace_dim), atol=5e-2), gram.diagonal()[:4]
 
     @pytest.mark.parametrize(
         "use_zero_history, step, seed, atol",
@@ -168,10 +171,16 @@ class TestRotateDisplacement:
         # Orthogonality alone does not prove a fallback happened: returning the input
         # basis unchanged satisfies it. The result has to be the freshly drawn basis.
         assert not torch.allclose(P_new, P, atol=1e-6), "rotate returned the input basis"
-        expected = adaptive_sub._rotate_random(
-            device=P.device, dtype=P.dtype, generator=torch.Generator().manual_seed(seed)
+        # Same seed, same basis: the fallback must be a pure function of the generator,
+        # not of the (zero or absent) history.
+        again = adaptive_sub.rotate(
+            P,
+            step=step,
+            total_steps=100,
+            displacement_history=disp_history,
+            generator=torch.Generator().manual_seed(seed),
         )
-        torch.testing.assert_close(P_new, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(P_new, again, rtol=1e-5, atol=1e-6)
 
     def test_rotate_displacement_incorporates_svd(self):
         """Displacement rotation incorporates SVD directions when history has clear dominant direction."""
@@ -218,46 +227,43 @@ class TestRotateDisplacement:
             "expected > 0.3 for displacement-biased rotation"
         )
 
+    def test_svd_ratio_zero_keeps_no_displacement_direction(self):
+        """``svd_ratio_init`` defaults to 0, which must mean none.
 
-class TestSvdRatioSchedule:
-    @pytest.mark.parametrize(
-        "step, total, expected",
-        [
-            (0, 100, 0.0),
-            (50, 100, 0.25),
-            (100, 100, 0.5),
-            (200, 100, 0.5),
-        ],
-    )
-    def test_svd_ratio_at_start(self, step, total, expected):
-        """SVD ratio interpolates from init to final and clamps beyond total_steps."""
-        sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
-        assert sub.get_svd_ratio(step, total) == pytest.approx(expected)
+        A ``max(1, ...)`` floor forced the top singular vector in at the documented
+        default, so the basis was never fully random.
+        """
+        sub = AdaptiveSubspace(
+            full_dim=100, subspace_dim=20, rotation_mode="displacement", svd_ratio_init=0.0, svd_ratio_final=0.0
+        )
+        P = sub.init_projection(generator=torch.Generator().manual_seed(0))
+
+        direction = torch.randn(20, generator=torch.Generator().manual_seed(1))
+        history = (direction / direction.norm()).expand(5, 20) * 10.0
+        dominant_full = P @ direction
+        dominant_full = dominant_full / dominant_full.norm()
+
+        P_new = sub.rotate(
+            P, step=0, total_steps=100, displacement_history=history, generator=torch.Generator().manual_seed(99)
+        )
+        # A retained singular vector lands at |dot| = 1; a random basis stays near the
+        # sqrt(2 ln k / n) ~ 0.24 baseline.
+        assert (P_new.T @ dominant_full).abs().max().item() < 0.5
 
 
-class TestApplyPerturbation:
-    def test_apply_perturbation_matches_manual(self, model, adaptive_sub):
-        """apply_perturbation matches manual P @ flat_subspace computation."""
-        P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
-        base_sd = model.state_dict()
-
-        torch.manual_seed(42)
-        flat_sub = torch.randn(adaptive_sub.subspace_dim) * 0.01
-
-        # Manual computation
-        delta_flat = P @ flat_sub
-        manual_result = {}
-        for spec in adaptive_sub._entry_specs:
-            chunk = delta_flat[spec.flat_start : spec.flat_end]
-            manual_result[spec.entry_key] = base_sd[spec.entry_key] + chunk.reshape(spec.original_shape)
-
-        # Method computation
-        method_result = adaptive_sub.apply_perturbation(P, base_sd, flat_sub)
-
-        for key in manual_result:
-            assert torch.allclose(method_result[key], manual_result[key], atol=1e-6), (
-                f"Key {key}: manual vs method mismatch"
-            )
+@pytest.mark.parametrize(
+    "step, total, expected",
+    [
+        (0, 100, 0.0),
+        (50, 100, 0.25),
+        (100, 100, 0.5),
+        (200, 100, 0.5),
+    ],
+)
+def test_svd_ratio_at_start(step, total, expected):
+    """SVD ratio interpolates from init to final and clamps beyond total_steps."""
+    sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
+    assert sub.get_svd_ratio(step, total) == pytest.approx(expected)
 
 
 def _absorb_schedules(**kwargs):
@@ -305,15 +311,21 @@ class TestShouldAbsorb:
 
 
 class TestFactoryMethods:
-    def test_auto_from_params(self, model):
-        """auto_from_params matches model parameter count and gives reasonable rank."""
-        sub = AdaptiveSubspace.auto_from_params(model)
-        total = sum(p.numel() for p in model.parameters())
-        assert sub.full_dim == total
-        assert 8 <= sub.subspace_dim <= 512
-        assert sub.subspace_dim <= sub.full_dim
-        assert sub.compression_ratio > 0
-        assert sub.compression_ratio <= 1.0
+    @pytest.mark.parametrize(
+        "full_dim, expected",
+        [
+            (100, 64),  # 5% of 100 is under min_rank, so the floor binds
+            (10_000, 500),  # 5% sits between the bounds
+            (10_000_000, 4096),  # 5% is over max_rank, so the ceiling binds
+            (16, 16),  # a model smaller than min_rank cannot exceed its own width
+        ],
+    )
+    def test_auto_from_params_defaults(self, full_dim, expected):
+        """5% of the parameter count, clamped to the default [64, 4096]."""
+        sub = AdaptiveSubspace.auto_from_params(nn.Linear(full_dim, 1, bias=False))
+        assert sub.full_dim == full_dim
+        assert sub.subspace_dim == expected
+        assert sub.compression_ratio == pytest.approx(expected / full_dim)
 
     def test_from_layout(self, model, layout):
         """from_layout with explicit rank creates correct subspace."""
@@ -343,113 +355,164 @@ class TestFactoryMethods:
             prev_end = spec.flat_end
 
 
-class TestDisplacementProductivity:
-    def test_displacement_mode_productivity(self):
-        """Displacement mode converges better than random on a controlled quadratic.
+def test_displacement_mode_productivity():
+    """Displacement mode converges better than random on a controlled quadratic.
 
-        This validates that incorporating SVD directions from displacement
-        history actually helps optimization, not just that it runs correctly.
-        """
-        torch.manual_seed(42)
-        full_dim = 100
-        subspace_dim = 20
-        num_steps = 30
+    This validates that incorporating SVD directions from displacement
+    history actually helps optimization, not just that it runs correctly.
+    """
+    torch.manual_seed(42)
+    full_dim = 100
+    subspace_dim = 20
+    num_steps = 30
 
-        # Define a simple quadratic objective: f(x) = ||Ax - b||^2
-        A = torch.randn(full_dim, full_dim)
-        b = torch.randn(full_dim)
+    # Define a simple quadratic objective: f(x) = ||Ax - b||^2
+    A = torch.randn(full_dim, full_dim)
+    b = torch.randn(full_dim)
 
-        def objective(x_flat):
-            """Evaluate quadratic cost for a flat parameter vector."""
-            return ((A @ x_flat - b) ** 2).sum().item()
+    def objective(x_flat):
+        """Evaluate quadratic cost for a flat parameter vector."""
+        return ((A @ x_flat - b) ** 2).sum().item()
 
-        def run_optimization(rotation_mode: str, seed: int):
-            """Run simple subspace optimization with given rotation mode."""
-            sub = AdaptiveSubspace(
-                full_dim=full_dim,
-                subspace_dim=subspace_dim,
-                rotation_mode=rotation_mode,
-                svd_ratio_init=0.3,
-                svd_ratio_final=0.6,
-                displacement_history_size=5,
-            )
-
-            gen = torch.Generator().manual_seed(seed)
-            P = sub.init_projection(generator=gen)
-
-            # Start from zero
-            x_base = torch.zeros(full_dim)
-            costs = []
-            disp_history_list = []
-
-            for step in range(num_steps):
-                # Generate candidate perturbations in subspace
-                gen_step = torch.Generator().manual_seed(seed + step * 1000)
-                num_candidates = 50
-                candidates = torch.randn(num_candidates, subspace_dim, generator=gen_step) * 0.5
-
-                # Evaluate all candidates
-                best_cost = float("inf")
-                best_coords = torch.zeros(subspace_dim)
-                for j in range(num_candidates):
-                    x_perturbed = x_base + P @ candidates[j]
-                    cost = objective(x_perturbed)
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_coords = candidates[j].clone()
-
-                costs.append(best_cost)
-
-                # Update base
-                displacement = P @ best_coords
-                x_base = x_base + displacement
-
-                # Track displacement in subspace coords for next rotation
-                disp_history_list.append(best_coords.clone())
-                if len(disp_history_list) > sub.displacement_history_size:
-                    disp_history_list.pop(0)
-
-                # Rotate projection for next step
-                disp_tensor = torch.stack(disp_history_list) if disp_history_list else None
-                gen_rot = torch.Generator().manual_seed(seed + step * 2000 + 1)
-                P = sub.rotate(P, step=step, total_steps=num_steps, displacement_history=disp_tensor, generator=gen_rot)
-
-            return costs
-
-        # Run both modes with same seed
-        costs_displacement = run_optimization("displacement", seed=42)
-        costs_random = run_optimization("random", seed=42)
-
-        # Displacement mode should achieve lower final cost OR converge faster
-        final_disp = costs_displacement[-1]
-        final_rand = costs_random[-1]
-
-        # Also check area under curve (lower = faster convergence)
-        auc_disp = sum(costs_displacement)
-        auc_rand = sum(costs_random)
-
-        # At least one criterion should hold: lower final cost OR lower AUC
-        displacement_wins = (final_disp < final_rand) or (auc_disp < auc_rand)
-        assert displacement_wins, (
-            f"Displacement mode did not outperform random.\n"
-            f"  Final cost - displacement: {final_disp:.4f}, random: {final_rand:.4f}\n"
-            f"  AUC - displacement: {auc_disp:.4f}, random: {auc_rand:.4f}"
-        )
-
-
-class TestCudaGeneratorFallback:
-    @pytest.mark.gpu
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_cuda_generator_creates_cpu_fallback(self):
-        """CUDA generator should silently create a CPU generator for reproducibility."""
+    def run_optimization(rotation_mode: str, seed: int):
+        """Run simple subspace optimization with given rotation mode."""
         sub = AdaptiveSubspace(
-            full_dim=100,
-            subspace_dim=10,
-            rotation_mode="random",
+            full_dim=full_dim,
+            subspace_dim=subspace_dim,
+            rotation_mode=rotation_mode,
+            svd_ratio_init=0.3,
+            svd_ratio_final=0.6,
+            displacement_history_size=5,
         )
-        P = sub.init_projection(generator=torch.Generator().manual_seed(0))
-        cuda_gen = torch.Generator(device="cuda").manual_seed(42)
-        # Should not warn - silently creates CPU generator from CUDA seed
-        P_rotated = sub.rotate(P, step=0, total_steps=100, generator=cuda_gen)
-        assert P_rotated.shape == P.shape
-        assert torch.isfinite(P_rotated).all()
+
+        gen = torch.Generator().manual_seed(seed)
+        P = sub.init_projection(generator=gen)
+
+        # Start from zero
+        x_base = torch.zeros(full_dim)
+        costs = []
+        disp_history_list = []
+
+        for step in range(num_steps):
+            # Generate candidate perturbations in subspace
+            gen_step = torch.Generator().manual_seed(seed + step * 1000)
+            num_candidates = 50
+            candidates = torch.randn(num_candidates, subspace_dim, generator=gen_step) * 0.5
+
+            # Evaluate all candidates
+            best_cost = float("inf")
+            best_coords = torch.zeros(subspace_dim)
+            for j in range(num_candidates):
+                x_perturbed = x_base + P @ candidates[j]
+                cost = objective(x_perturbed)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_coords = candidates[j].clone()
+
+            costs.append(best_cost)
+
+            # Update base
+            displacement = P @ best_coords
+            x_base = x_base + displacement
+
+            # Track displacement in subspace coords for next rotation
+            disp_history_list.append(best_coords.clone())
+            if len(disp_history_list) > sub.displacement_history_size:
+                disp_history_list.pop(0)
+
+            # Rotate projection for next step
+            disp_tensor = torch.stack(disp_history_list) if disp_history_list else None
+            gen_rot = torch.Generator().manual_seed(seed + step * 2000 + 1)
+            P = sub.rotate(P, step=step, total_steps=num_steps, displacement_history=disp_tensor, generator=gen_rot)
+
+        return costs
+
+    # Run both modes with same seed
+    costs_displacement = run_optimization("displacement", seed=42)
+    costs_random = run_optimization("random", seed=42)
+
+    # Displacement mode should achieve lower final cost OR converge faster
+    final_disp = costs_displacement[-1]
+    final_rand = costs_random[-1]
+
+    # Also check area under curve (lower = faster convergence)
+    auc_disp = sum(costs_displacement)
+    auc_rand = sum(costs_random)
+
+    # At least one criterion should hold: lower final cost OR lower AUC
+    displacement_wins = (final_disp < final_rand) or (auc_disp < auc_rand)
+    assert displacement_wins, (
+        f"Displacement mode did not outperform random.\n"
+        f"  Final cost - displacement: {final_disp:.4f}, random: {final_rand:.4f}\n"
+        f"  AUC - displacement: {auc_disp:.4f}, random: {auc_rand:.4f}"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_generator_creates_cpu_fallback():
+    """CUDA generator should silently create a CPU generator for reproducibility."""
+    sub = AdaptiveSubspace(
+        full_dim=100,
+        subspace_dim=10,
+        rotation_mode="random",
+    )
+    P = sub.init_projection(generator=torch.Generator().manual_seed(0))
+    cuda_gen = torch.Generator(device="cuda").manual_seed(42)
+    # Should not warn - silently creates CPU generator from CUDA seed
+    P_rotated = sub.rotate(P, step=0, total_steps=100, generator=cuda_gen)
+    assert P_rotated.shape == P.shape
+    assert torch.isfinite(P_rotated).all()
+
+
+def test_randomized_svd_branch_keeps_the_uncentered_displacement_direction():
+    """pca_lowrank centers by default; the SVD branch does not. Both must agree."""
+    full_dim, sub_dim, history_len = 200, 8, 16
+    sub = AdaptiveSubspace(
+        full_dim=full_dim,
+        subspace_dim=sub_dim,
+        rotation_mode="displacement",
+        svd_ratio_init=0.25,
+        svd_ratio_final=0.25,
+    )
+    projection = torch.linalg.qr(torch.randn(full_dim, sub_dim, generator=torch.Generator().manual_seed(0)))[0]
+
+    # Every displacement is a large common offset plus small noise, so the dominant
+    # uncentered direction is the offset itself. Centering removes exactly that.
+    offset = torch.ones(full_dim) / full_dim**0.5
+    noise = torch.randn(history_len, full_dim, generator=torch.Generator().manual_seed(1)) * 1e-3
+    history = offset.unsqueeze(0) + noise
+
+    # generator=None takes the randomized branch, a generator takes the full SVD.
+    P_random_branch = sub.rotate(projection, 0, 10, history, generator=None, history_is_full=True)
+    alignment = (P_random_branch.T @ offset).abs().max()
+    assert alignment > 0.9, f"randomized branch lost the dominant direction: {alignment:.3f}"
+
+
+@pytest.mark.parametrize("interval, expected_rotations", [(1, 4), (2, 2), (0, 0)])
+def test_rotation_interval_amortizes_the_basis_decomposition(interval, expected_rotations):
+    """Each rotation costs an absorb plus a QR/SVD, which dominate at large full_dim."""
+    from torch.func import functional_call
+
+    from polystep.optimizer import PolyStepOptimizer
+
+    model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
+    sub = AdaptiveSubspace.auto_from_params(model, compression_target=0.15)
+    sub.rotation_interval = interval
+    opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.1, seed=0, compile=False)
+    x = torch.randn(8, 16, generator=torch.Generator().manual_seed(0))
+
+    seen = [opt.state.projection.clone()]
+    for _ in range(4):
+        opt.step(
+            lambda bp: torch.stack(
+                [
+                    functional_call(model, {k: v[i] for k, v in bp.items()}, (x,)).pow(2).mean()
+                    for i in range(next(iter(bp.values())).shape[0])
+                ]
+            )
+        )
+        seen.append(opt.state.projection.clone())
+
+    changes = sum(not torch.equal(a, b) for a, b in zip(seen, seen[1:]))
+    assert changes == expected_rotations

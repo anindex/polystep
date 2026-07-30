@@ -15,14 +15,6 @@ def test_scale_cost_matrix_rejects_nonpositive_float():
         scale_cost_matrix(C, 0.0)
 
 
-def test_compute_cost_matrix_shape():
-    """Output shape should be (batch, num_vertices)."""
-    batch, verts, probes, dim = 3, 5, 2, 4
-    X = torch.randn(batch, verts, probes, dim)
-    C = compute_cost_matrix(lambda x: x.sum(dim=-1), X)
-    assert C.shape == (batch, verts)
-
-
 def test_compute_cost_matrix_averages_probes():
     """Cost should be the mean over probe dimension."""
     batch, verts, probes, dim = 2, 3, 4, 2
@@ -51,20 +43,10 @@ def test_scale_cost_matrix_none():
     assert torch.equal(scale_cost_matrix(C, None), C)
 
 
-def test_scale_cost_matrix_mean():
-    """Mean scaling divides by the mean."""
-    C = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
-    scaled = scale_cost_matrix(C, "mean")
-    expected = C / C.mean()
-    assert torch.allclose(scaled, expected)
-
-
-def test_scale_cost_matrix_max():
-    """Max scaling divides by the max."""
-    C = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
-    scaled = scale_cost_matrix(C, "max_cost")
-    expected = C / 8.0
-    assert torch.allclose(scaled, expected)
+@pytest.mark.parametrize("mode, divisor", [("mean", 5.0), ("max_cost", 8.0)])
+def test_scale_cost_matrix_named_modes(mode, divisor):
+    C = torch.tensor([[2.0, 4.0], [6.0, 8.0]])  # mean 5, max 8
+    assert torch.allclose(scale_cost_matrix(C, mode), C / divisor)
 
 
 def test_scale_cost_matrix_float():

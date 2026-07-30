@@ -1,4 +1,4 @@
-"""Unit tests for geometry module: polytopes, rotations, and probe points."""
+"""Polytope templates and random rotations."""
 
 import math
 
@@ -10,33 +10,35 @@ from polystep.geometry import (
     get_simplex_vertices,
     get_cube_vertices,
     get_random_rotation_matrices,
+    _QR_MAX_BATCH,
     get_rotation_matrix_2d,
-    get_probe_points,
-    get_sampled_polytope_vertices,
-    POLYTOPE_NUM_VERTICES_MAP,
 )
 
 
 class TestPolytopes:
-    """Tests for polytope vertex generators."""
-
-    @pytest.mark.parametrize("dim", [2, 3, 5, 10])
-    def test_orthoplex_vertex_count(self, dim):
-        """Orthoplex generates exactly 2*dim vertices."""
-        verts = get_orthoplex_vertices(dim)
-        assert verts.shape == (2 * dim, dim), f"Expected ({2 * dim}, {dim}), got {verts.shape}"
-
-    @pytest.mark.parametrize("dim", [2, 3, 5, 10])
-    def test_simplex_vertex_count(self, dim):
-        """Simplex generates exactly dim+1 vertices."""
-        verts = get_simplex_vertices(dim)
-        assert verts.shape == (dim + 1, dim), f"Expected ({dim + 1}, {dim}), got {verts.shape}"
-
     @pytest.mark.parametrize("dim", [2, 3, 4])
-    def test_cube_vertex_count(self, dim):
-        """Cube generates exactly 2^dim vertices."""
-        verts = get_cube_vertices(dim)
-        assert verts.shape == (2**dim, dim), f"Expected ({2**dim}, {dim}), got {verts.shape}"
+    @pytest.mark.parametrize(
+        "gen, name",
+        [(get_orthoplex_vertices, "orthoplex"), (get_simplex_vertices, "simplex"), (get_cube_vertices, "cube")],
+    )
+    def test_vertex_count(self, gen, name, dim):
+        """The count is the per-step forward budget: P * V * K evaluations."""
+        expected = {"orthoplex": 2 * dim, "simplex": dim + 1, "cube": 2**dim}[name]
+        verts = gen(dim)
+        assert verts.shape == (expected, dim)
+
+    @pytest.mark.parametrize("dim", [2, 3, 5])
+    @pytest.mark.parametrize("gen", [get_orthoplex_vertices, get_simplex_vertices, get_cube_vertices])
+    def test_every_vertex_sits_at_the_requested_radius(self, gen, dim):
+        """step_radius is a distance, so the templates must be unit-norm before scaling.
+
+        A template whose vertices are not all at radius 1 makes the realized step depend
+        on which vertex the transport picks, and rescales it silently on any polytope
+        change.
+        """
+        verts = gen(dim, radius=2.5)
+        norms = verts.norm(dim=-1)
+        torch.testing.assert_close(norms, torch.full_like(norms, 2.5), rtol=1e-5, atol=1e-6)
 
     def test_orthoplex_centered_at_origin(self):
         """Orthoplex vertices are centered at the origin."""
@@ -64,17 +66,8 @@ class TestPolytopes:
             f"Distance range: [{dists_t.min():.6f}, {dists_t.max():.6f}]"
         )
 
-    def test_vertex_count_map(self):
-        """POLYTOPE_NUM_VERTICES_MAP returns correct counts."""
-        dim = 5
-        assert POLYTOPE_NUM_VERTICES_MAP["orthoplex"](dim) == 2 * dim
-        assert POLYTOPE_NUM_VERTICES_MAP["simplex"](dim) == dim + 1
-        assert POLYTOPE_NUM_VERTICES_MAP["cube"](dim) == 2**dim
-
 
 class TestRotations:
-    """Tests for rotation matrix generation."""
-
     @pytest.mark.parametrize("dim", [3, 5, 8])
     def test_rotation_matrix_is_in_so_d(self, dim):
         """Random rotation matrices are orthogonal (``R R^T = I``) and
@@ -89,11 +82,54 @@ class TestRotations:
         dets = torch.det(R)
         assert torch.allclose(dets, torch.ones(4), atol=1e-4), f"Determinants: {dets.tolist()}"
 
+    @pytest.mark.parametrize("dim", [3, 5, 8])
+    def test_rotation_matches_reference_qr_sampler(self, dim):
+        """The Householder subgroup sampler is distributionally identical to
+        Mezzadri sign-corrected QR, which it replaced for speed.
+
+        Moments alone would pass on samplers that are merely orthogonal, so
+        compare full distributions: a two-sample KS statistic on ``tr(R)`` and on
+        individual entries, against an old-vs-old control drawn from the
+        reference sampler itself. A biased sampler separates from the reference
+        while the control does not.
+        """
+        n = 20000
+
+        def reference(batch, d, generator):
+            Z = torch.randn(batch, d, d, generator=generator)
+            Q, R = torch.linalg.qr(Z)
+            diag = torch.diagonal(R, dim1=-2, dim2=-1)
+            Q = Q * torch.where(diag == 0, torch.ones_like(diag), torch.sign(diag)).unsqueeze(-2)
+            Q[:, :, 0] = Q[:, :, 0] * torch.where(torch.det(Q) < 0, -1.0, 1.0).unsqueeze(-1)
+            return Q
+
+        def ks(a, b):
+            a = a.sort().values
+            b = b.sort().values
+            grid = torch.cat([a, b]).sort().values
+            fa = torch.searchsorted(a, grid, right=True).float() / len(a)
+            fb = torch.searchsorted(b, grid, right=True).float() / len(b)
+            return (fa - fb).abs().max().item()
+
+        actual = get_random_rotation_matrices(n, dim, generator=torch.Generator().manual_seed(1))
+        expected = reference(n, dim, torch.Generator().manual_seed(2))
+        control = reference(n, dim, torch.Generator().manual_seed(3))
+
+        # KS 99.9% critical value for two samples of size n.
+        crit = 1.95 * (2.0 / n) ** 0.5
+        for name, stat in (
+            ("trace", lambda Q: Q.diagonal(dim1=-2, dim2=-1).sum(-1)),
+            ("R[0,0]", lambda Q: Q[:, 0, 0]),
+            ("R[2,1]", lambda Q: Q[:, 2, 1]),
+        ):
+            d_new = ks(stat(actual), stat(expected))
+            d_ctl = ks(stat(control), stat(expected))
+            assert d_new < crit, f"{name}: KS={d_new:.5f} exceeds {crit:.5f} (control {d_ctl:.5f})"
+
     def test_rotation_is_haar_distributed(self):
-        """Mezzadri 2007 sign-corrected QR produces Haar-distributed
-        ``O(d)``, restricted to ``SO(d)`` by the det fix-up in
-        :func:`get_random_rotation_matrices`. Verify both moments:
-        ``E[R_ij] -> 0`` and ``Var[R_ij] -> 1/d``.
+        """The Householder subgroup algorithm produces Haar-distributed ``O(d)``,
+        restricted to ``SO(d)`` by fixing the sign of the last coordinate.
+        Verify both moments: ``E[R_ij] -> 0`` and ``Var[R_ij] -> 1/d``.
         """
         d = 8
         n = 8000
@@ -135,99 +171,50 @@ class TestRotations:
         assert torch.equal(R1, R2), "Same seed should produce identical rotations"
 
 
-class TestProbes:
-    """Tests for probe point generation."""
+@pytest.mark.parametrize(
+    "theta, expected",
+    [
+        (0.0, [[1.0, 0.0], [0.0, 1.0]]),
+        (math.pi / 2, [[0.0, -1.0], [1.0, 0.0]]),
+        (math.pi, [[-1.0, 0.0], [0.0, -1.0]]),
+    ],
+)
+def test_rotation_matrix_2d_against_known_angles(theta, expected):
+    """A swapped sign gives a reflection, which every orthonormality check accepts."""
+    R = get_rotation_matrix_2d(torch.tensor(theta))
+    torch.testing.assert_close(R, torch.tensor(expected), atol=1e-6, rtol=0)
+    # Counter-clockwise: e_x must land on +e_y at a quarter turn, not -e_y.
+    assert torch.det(R) == pytest.approx(1.0, abs=1e-6)
 
-    def test_probe_points_shape(self):
-        """Probe points have correct output shape (batch, num_points, num_probe, dim)."""
-        batch, num_points, dim, num_probe = 3, 6, 4, 5
 
-        origin = torch.randn(batch, dim)
-        directions = torch.randn(batch, num_points, dim)
-        scales = torch.linspace(0, 1, num_probe)
+def test_small_batch_takes_qr_and_stays_haar_on_so():
+    """At or below ``_QR_MAX_BATCH`` one batched QR replaces the reflection loop.
 
-        probes = get_probe_points(origin, directions, scales, probe_radius=2.0)
+    The substitute has to be the same distribution, not merely orthogonal: assert it
+    reproduces the Mezzadri sampler this file already uses as ground truth, and that it
+    lands on ``SO(d)`` rather than ``O(d)``.
+    """
+    cap = _QR_MAX_BATCH[False]
 
-        assert probes.shape == (batch, num_points, num_probe, dim), (
-            f"Expected ({batch}, {num_points}, {num_probe}, {dim}), got {probes.shape}"
-        )
+    def reference(batch, d, generator):
+        Z = torch.randn(batch, d, d, generator=generator)
+        Q, R = torch.linalg.qr(Z)
+        diag = torch.diagonal(R, dim1=-2, dim2=-1)
+        Q = Q * torch.where(diag == 0, torch.ones_like(diag), torch.sign(diag)).unsqueeze(-2)
+        Q[:, :, 0] = Q[:, :, 0] * torch.where(torch.det(Q) < 0, -1.0, 1.0).unsqueeze(-1)
+        return Q
 
-    def test_probe_points_at_zero_scale(self):
-        """Probe points at scale=0 should be at the origin."""
-        batch, num_points, dim = 2, 4, 3
+    for dim in (3, 4, 8, 16):
+        got = get_random_rotation_matrices(cap, dim, generator=torch.Generator().manual_seed(7))
+        want = reference(cap, dim, torch.Generator().manual_seed(7))
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
 
-        origin = torch.randn(batch, dim)
-        directions = torch.randn(batch, num_points, dim)
-        scales = torch.tensor([0.0, 0.5, 1.0])
+        eye = torch.eye(dim).expand(cap, dim, dim)
+        torch.testing.assert_close(got @ got.transpose(-1, -2), eye, atol=1e-5, rtol=0)
+        # det = +1, not -1: a reflection passes every orthonormality check. The tolerance
+        # is fp32's, not fp64's; .double() promotes the rounding rather than removing it.
+        torch.testing.assert_close(torch.det(got.double()), torch.ones(cap, dtype=torch.float64), atol=1e-5, rtol=0)
 
-        probes = get_probe_points(origin, directions, scales, probe_radius=2.0)
-
-        # At scale=0 (index 0), probes should equal origin
-        for b in range(batch):
-            for p in range(num_points):
-                assert torch.allclose(probes[b, p, 0], origin[b], atol=1e-6), (
-                    f"Probe at scale=0 differs from origin at batch={b}, point={p}"
-                )
-
-    def test_sampled_polytope_vertices_shapes(self):
-        """get_sampled_polytope_vertices returns correct shapes."""
-        dim = 4
-        batch = 3
-        num_probe = 5
-
-        origin = torch.randn(batch, dim)
-        probes = torch.linspace(0, 1, num_probe)
-        polytope_verts = get_orthoplex_vertices(dim)  # (2*dim, dim)
-
-        gen = torch.Generator()
-        gen.manual_seed(42)
-
-        step_pts, probe_pts, rot_verts = get_sampled_polytope_vertices(
-            origin,
-            probes,
-            polytope_verts,
-            step_radius=1.0,
-            probe_radius=2.0,
-            generator=gen,
-        )
-
-        n_verts = 2 * dim
-        assert step_pts.shape == (batch, n_verts, dim), (
-            f"step_pts: expected ({batch}, {n_verts}, {dim}), got {step_pts.shape}"
-        )
-        assert probe_pts.shape == (batch, n_verts, num_probe, dim), (
-            f"probe_pts: expected ({batch}, {n_verts}, {num_probe}, {dim}), got {probe_pts.shape}"
-        )
-        assert rot_verts.shape == (batch, n_verts, dim), (
-            f"rot_verts: expected ({batch}, {n_verts}, {dim}), got {rot_verts.shape}"
-        )
-
-    def test_sampled_polytope_deterministic_with_generator(self):
-        """Same generator seed produces identical sampled vertices."""
-        dim = 3
-        batch = 2
-        origin = torch.randn(batch, dim)
-        probes = torch.linspace(0, 1, 4)
-        polytope_verts = get_orthoplex_vertices(dim)
-
-        gen1 = torch.Generator()
-        gen1.manual_seed(99)
-        s1, p1, r1 = get_sampled_polytope_vertices(
-            origin,
-            probes,
-            polytope_verts,
-            generator=gen1,
-        )
-
-        gen2 = torch.Generator()
-        gen2.manual_seed(99)
-        s2, p2, r2 = get_sampled_polytope_vertices(
-            origin,
-            probes,
-            polytope_verts,
-            generator=gen2,
-        )
-
-        assert torch.equal(s1, s2), "Step points differ with same seed"
-        assert torch.equal(p1, p2), "Probe points differ with same seed"
-        assert torch.equal(r1, r2), "Rotated vertices differ with same seed"
+    # Just past the cap the reflection loop takes over and must still be SO(d).
+    over = get_random_rotation_matrices(cap + 1, 8, generator=torch.Generator().manual_seed(7))
+    torch.testing.assert_close(torch.det(over.double()), torch.ones(cap + 1, dtype=torch.float64), atol=1e-5, rtol=0)

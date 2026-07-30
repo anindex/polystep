@@ -24,7 +24,7 @@ Usage:
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
@@ -109,7 +109,7 @@ def train_sgd(
 
     with track_gpu_memory() as mem:
         for epoch in range(1, epochs + 1):
-            # --- Training ---
+            # Training
             model.train()
             epoch_loss = 0.0
             epoch_batches = 0
@@ -137,7 +137,7 @@ def train_sgd(
             avg_loss = epoch_loss / max(epoch_batches, 1)
             train_acc = epoch_correct / max(epoch_total, 1)
 
-            # --- Evaluation ---
+            # Evaluation
             test_acc = evaluate_accuracy(model, test_loader, device=device)
             elapsed = time.time() - start_time
 

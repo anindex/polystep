@@ -32,7 +32,7 @@ re-quantification is requested.
 from __future__ import annotations
 
 import time
-from typing import Dict, Optional
+from typing import Dict
 
 
 def run_sls_pysat(

@@ -25,7 +25,7 @@ grows.
 The α-scaling matches the scaling-algorithm form for unbalanced OT in
 Chizat, Peyré, Schmitzer & Vialard, *Scaling Algorithms for Unbalanced
 Optimal Transport Problems*, Math. Comp. 87 (2018), arXiv:1607.05816.
-We also support `lam = inf` explicitly (the user-facing default for
+`lam = inf` is accepted explicitly (the user-facing default for
 "go to full Sinkhorn") so downstream code can pass `float('inf')`
 without arithmetic on infinity.
 """
@@ -33,14 +33,19 @@ without arithmetic on infinity.
 from __future__ import annotations
 
 import math
-import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import torch
 
-from ..costs import resolve_cost_scale
-from ._prelude import align_dual, align_marginal, recenter_cost, sanitize_cost, validate_positive
+from ._shared import (
+    align_dual,
+    align_marginal,
+    exp_plan,
+    prepare_cost,
+    validate_positive,
+    warn_tiny_temperature,
+)
 from .base import SolverResult
 
 
@@ -54,7 +59,10 @@ class KLSoftmaxSolver:
             `0` reduces to ``SoftmaxSolver``; `inf` reduces to
             ``SinkhornSolver``. Must be >= 0.
         max_iterations: Maximum dual-update iterations.
-        threshold: Convergence tolerance on max(|Δf|, |Δg|).
+        threshold: Convergence tolerance on the fixed-point residual
+            ``max(|Δf|, |Δg|/alpha)``. This is a dual increment, not the marginal
+            violation ``SinkhornSolver.threshold`` measures: at ``lam < inf`` the
+            fixed point does not satisfy the column marginal by construction.
         compile: Placeholder for API compatibility (unused).
     """
 
@@ -102,24 +110,12 @@ class KLSoftmaxSolver:
         validate_positive(self.epsilon, "epsilon", "the entropic temperature")
         if not math.isfinite(self.lam) and self.lam != float("inf"):
             raise ValueError(f"lam must be a non-negative number or +inf, got {self.lam!r}.")
-        # Shared prelude: FP32 promotion for LSE stability plus device-side non-finite
-        # handling, then device/dtype-aligned marginals. Sanitizing before scaling keeps
-        # +Inf out of the 'mean'/'max_cost' reduction; the substituted penalty is relative
-        # to the finite scale so it does not distort that reduction either.
-        cost_matrix = sanitize_cost(cost_matrix)
-        n, m = cost_matrix.shape
-        device, dtype = cost_matrix.device, cost_matrix.dtype
-        a = align_marginal(a, n, device, dtype, "a")
+        C, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, "KLSoftmaxSolver")
+        n, m = C.shape
+        device, dtype = C.device, C.dtype
         b = align_marginal(b, m, device, dtype, "b")
 
-        # Recenter to min(C)=0 BEFORE the optional rescale: the plan is invariant to
-        # a constant cost shift but 'mean'/'max_cost' are not, so scaling first ties
-        # the effective temperature to the arbitrary absolute loss level. Recentering
-        # also keeps the log-sum-exp updates and the exp((f+g-C)/eps) plan in FP32
-        # range when |C| is much larger than eps.
-        C, cost_shift = recenter_cost(cost_matrix)
-        cost_scale = resolve_cost_scale(C, scale_cost)
-        C = C / cost_scale
+        warn_tiny_temperature(self, float(self.epsilon), C, "KLSoftmaxSolver", "epsilon")
 
         eps = float(self.epsilon)
         alpha = self.alpha
@@ -144,8 +140,12 @@ class KLSoftmaxSolver:
                 f = torch.zeros(n, device=device, dtype=dtype)
                 g = torch.zeros(m, device=device, dtype=dtype)
 
-            # Special-case alpha == 0 (softmax limit): single closed-form.
-            if alpha == 0.0:
+            # Softmax limit, closed form in one iteration. The bound is the working dtype's
+            # smallest normal, not 0: below it the damped g-update underflows to exactly
+            # zero, the residual's /alpha becomes 0/0 = nan, and the loop runs to
+            # max_iterations reporting converged=False on an already-correct plan. Keyed to
+            # dtype so an fp64 cost is not flattened by an fp32 bound.
+            if alpha < torch.finfo(dtype).tiny:
                 f = eps * (log_a - torch.logsumexp(-C / eps, dim=1))
                 g = torch.zeros_like(g)
                 converged = True
@@ -165,9 +165,13 @@ class KLSoftmaxSolver:
                     g_new = alpha * g_target
 
                     if (it + 1) % check_every == 0 or it == self.max_iterations - 1:
+                        # The g-update is damped by alpha, so its raw increment shrinks
+                        # with lam and the same threshold would stop earlier the smaller
+                        # alpha gets. Dividing it back out makes the residual comparable
+                        # to the undamped Sinkhorn step at any lam.
                         delta = torch.maximum(
                             (f_new - f).abs().amax(),
-                            (g_new - g).abs().amax(),
+                            (g_new - g).abs().amax() / alpha,
                         )
                         # ``<=`` so threshold=0 means "converge on an exact fixed
                         # point" rather than "never converge".
@@ -178,16 +182,14 @@ class KLSoftmaxSolver:
                             break
                     f, g = f_new, g_new
 
-            log_P = (f.unsqueeze(1) + g.unsqueeze(0) - C) / eps
-            P = log_P.exp()
+                # The loop leaves f one update behind g, so a plan built from this pair
+                # misses the row marginal by whatever the last g-step moved. One more
+                # f-update makes P1 == a hold at any iteration count.
+                f = eps * (log_a - torch.logsumexp((g.unsqueeze(0) - C) / eps, dim=1))
 
-            # Numerical hygiene
-            if not torch.isfinite(P).all():
-                warnings.warn(
-                    "KLSoftmaxSolver produced non-finite transport entries; consider raising epsilon or lowering lam.",
-                    stacklevel=2,
-                )
-                P = torch.where(torch.isfinite(P), P, torch.zeros_like(P))
+            # Clamped exponent, not a zero-fill after the fact: zeroing overflowed
+            # entries drops the mass the final f-update placed to make P1 == a.
+            P = exp_plan(f, g, C, eps)
 
             # Undo both frame changes so cost is <C_raw, P> (sum(P) == a.sum()).
             cost = ((C * P).sum() * cost_scale + cost_shift * a.sum()).item()

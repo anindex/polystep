@@ -1,7 +1,6 @@
-"""Regression tests for the Softmax solver.
+"""Numerical contract of the Softmax solver.
 
-The Softmax solver is on the critical path for every reported number
-in the paper. This file checks:
+It is on the critical path for every reported number, so this file checks:
 
 - numerical safety of ``softmax(-C/eps)`` under FP32 / BF16
 - identical-row behavior (uniform output, no NaN)
@@ -166,11 +165,11 @@ SOLVER_PINNED_RUNNERS = (
 
 @pytest.mark.parametrize("relpath,literal", SOLVER_PINNED_RUNNERS)
 def test_runner_pins_softmax_solver(relpath, literal, require_experiments):
-    """Verify that the result-reporting runners hard-code solver=softmax.
+    """The result-reporting runners must pin ``solver='softmax'`` explicitly.
 
-    Sets a regression guard if a refactor accidentally removes the explicit pin
-    and lets the auto-selection rule (subspace -> softmax, else sinkhorn)
-    silently pick a different solver.
+    Without the pin they inherit the auto-selection rule (subspace picks softmax,
+    otherwise sinkhorn), so a config change would quietly rerun them on a different
+    solver than the published numbers.
     """
     path = REPO_ROOT / relpath
     src = path.read_text()
@@ -209,3 +208,12 @@ def test_softmax_init_f_and_g_are_ignored():
     r0 = solver.solve(C)
     r1 = solver.solve(C, init_f=torch.rand(5), init_g=torch.rand(8))
     torch.testing.assert_close(r0.matrix, r1.matrix)
+
+
+def test_default_epsilon_sets_the_selectivity():
+    """The 0.1 default is what an unconfigured solver picks with, so pin its weights."""
+    C = torch.tensor([[0.0, 0.1, 0.2]])
+    weights = SoftmaxSolver().solve(C).matrix
+    expected = torch.softmax(-C / 0.1, dim=1)
+    torch.testing.assert_close(weights, expected)
+    assert weights[0, 0].item() == pytest.approx(0.6652409, abs=1e-6)

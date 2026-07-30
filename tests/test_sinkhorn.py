@@ -7,8 +7,6 @@ from polystep.solvers import SinkhornSolver
 
 
 class TestSinkhornSolver:
-    """Tests for the unified Sinkhorn solver."""
-
     def test_small_epsilon_near_deterministic(self):
         """Small epsilon pushes transport toward deterministic (near one-hot rows).
 
@@ -115,8 +113,6 @@ def test_invalid_marginal_raises(a):
 
 
 class TestOverrelaxation:
-    """Tests for overrelaxed Sinkhorn iterations (parametric extension)."""
-
     def test_omega_default(self):
         """SinkhornSolver() with default omega=1.0 produces same result as standard Sinkhorn."""
         torch.manual_seed(42)
@@ -230,44 +226,29 @@ class TestAndersonAcceleration:
     @pytest.mark.parametrize(
         "override, shape, max_iterations",
         [
-            ({"omega": 1.0}, (8, 8), 500),
-            ({"anderson_depth": 0}, (10, 8), 2000),
-            ({"data_dependent_init": False}, (10, 8), 2000),
-            ({"adaptive_omega": False}, (10, 8), 2000),
+            ({"omega": 1.5}, (8, 8), 500),
+            ({"anderson_depth": 3}, (10, 8), 2000),
+            ({"data_dependent_init": True}, (10, 8), 2000),
+            ({"adaptive_omega": True}, (10, 8), 2000),
         ],
     )
-    def test_anderson_depth_zero_matches_standard(self, override, shape, max_iterations):
-        """A flag left at its dataclass default takes the standard path (identical f, g, n_iters)."""
+    def test_acceleration_knobs_reach_the_same_fixed_point(self, override, shape, max_iterations):
+        """Acceleration may change the path to the optimum, never the optimum.
+
+        Every override is off-default, so the two solvers really do differ.
+        """
         torch.manual_seed(42)
         n, m = shape
         C = torch.rand(n, m)
 
-        solver_standard = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=max_iterations,
-            threshold=1e-8,
-            compile=False,
-        )
-        result_standard = solver_standard.solve(C)
+        base = dict(epsilon=0.1, max_iterations=max_iterations, threshold=1e-6, compile=False)
+        result_standard = SinkhornSolver(**base).solve(C)
+        result_configured = SinkhornSolver(**base, **override).solve(C)
 
-        solver_configured = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=max_iterations,
-            threshold=1e-8,
-            compile=False,
-            **override,
-        )
-        result_configured = solver_configured.solve(C)
-
-        assert torch.allclose(result_standard.f, result_configured.f, atol=1e-10), (
-            f"f difference: {(result_standard.f - result_configured.f).abs().max():.2e}"
-        )
-        assert torch.allclose(result_standard.g, result_configured.g, atol=1e-10), (
-            f"g difference: {(result_standard.g - result_configured.g).abs().max():.2e}"
-        )
-        assert result_standard.n_iters == result_configured.n_iters, (
-            f"n_iters differ: standard={result_standard.n_iters}, configured={result_configured.n_iters}"
-        )
+        torch.testing.assert_close(result_configured.matrix, result_standard.matrix, rtol=1e-4, atol=1e-6)
+        a = torch.full((n,), 1.0 / n)
+        torch.testing.assert_close(result_configured.matrix.sum(dim=1), a, rtol=1e-4, atol=1e-6)
+        assert result_configured.converged
 
     @pytest.mark.parametrize("noise", [1e-4, 1e-6])
     def test_anderson_near_singular_no_nan(self, noise):
@@ -384,40 +365,36 @@ class TestDataDependentInit:
         )
 
 
-class TestAdaptiveOmega:
-    """Tests for adaptive omega in Sinkhorn solver (convergence acceleration)."""
+def test_ill_conditioned_stays_finite():
+    """On a stiff cost the divergence back-off latches, so adaptive omega
+    cannot re-raise itself into a runaway; the plan stays valid."""
+    torch.manual_seed(0)
+    n = 20
+    C = torch.full((n, n), 10.0)
+    C[:, 0] = 0.0  # one vastly cheaper column stresses overrelaxation
 
-    def test_ill_conditioned_stays_finite(self):
-        """On a stiff cost the divergence back-off latches, so adaptive omega
-        cannot re-raise itself into a runaway; the plan stays valid."""
-        torch.manual_seed(0)
-        n = 20
-        C = torch.full((n, n), 10.0)
-        C[:, 0] = 0.0  # one vastly cheaper column stresses overrelaxation
+    solver = SinkhornSolver(
+        epsilon=0.01,
+        max_iterations=500,
+        threshold=1e-8,
+        check_every=10,
+        compile=False,
+        adaptive_omega=True,
+    )
+    result = solver.solve(C)
 
-        solver = SinkhornSolver(
-            epsilon=0.01,
-            max_iterations=500,
-            threshold=1e-8,
-            check_every=10,
-            compile=False,
-            adaptive_omega=True,
-        )
-        result = solver.solve(C)
-
-        assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all()
-        a = torch.ones(n) / n
-        assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-3)
+    assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all()
+    a = torch.ones(n) / n
+    assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-3)
 
 
 class TestFixedModeLogic:
-    """Tests for fixed_mode determination (OR -> AND fix).
+    """``fixed_mode`` is determined by ``threshold <= 0`` alone.
 
-    Before the fix, fixed_mode = threshold <= 0 OR check_every > max_iterations.
-    This meant that setting check_every > max_iterations silently forced the solver
-    into the fixed-iteration (compiled) path, disabling Anderson acceleration and
-    adaptive_omega even when threshold > 0. After the fix, fixed_mode = threshold <= 0,
-    so the convergence-checking (eager) code path is always used when threshold > 0.
+    ``check_every`` sets how often convergence is tested, not whether it is tested, so
+    raising it above ``max_iterations`` must not divert the solver into the
+    fixed-iteration compiled path, which has no Anderson acceleration and no
+    adaptive omega.
     """
 
     def test_check_every_exceeds_max_iterations_uses_eager_path(self):
@@ -459,11 +436,9 @@ class TestFixedModeLogic:
         ],
     )
     def test_anderson_not_silently_disabled_by_check_every(self, override, substring):
-        """Acceleration is not warned/disabled when check_every > max_iterations.
+        """``check_every > max_iterations`` must leave the acceleration enabled.
 
-        Before the fix, setting check_every > max_iterations triggered fixed_mode,
-        which emitted a warning that the acceleration has no effect. After the fix,
-        no warning is emitted because the solver correctly enters the eager path.
+        The eager path still runs it, so warning that it has no effect would be wrong.
         """
         import warnings
 
@@ -531,120 +506,3 @@ class TestFixedModeLogic:
 
         anderson_warnings = [x for x in w if "anderson_depth" in str(x.message) and "fixed-iteration" in str(x.message)]
         assert len(anderson_warnings) == 1, f"Expected 1 Anderson fixed-mode warning, got {len(anderson_warnings)}"
-
-
-class TestDualClamping:
-    """Tests for dual potential clamping behavior."""
-
-
-class TestProgressiveEpsilon:
-    """Tests for ProgressiveEpsilon auto-epsilon scheduler."""
-
-    def test_at_returns_init_value(self):
-        """ProgressiveEpsilon.at(0) returns init value."""
-        from polystep.epsilon import ProgressiveEpsilon
-
-        pe = ProgressiveEpsilon(init=1.0, target=0.01)
-        assert pe.at(0) == 1.0
-
-    def test_fast_convergence_decreases_epsilon(self):
-        """After update(n_iters=5, converged=True) (fast), next epsilon decreases."""
-        from polystep.epsilon import ProgressiveEpsilon
-
-        pe = ProgressiveEpsilon(
-            init=1.0,
-            target=0.01,
-            max_epsilon=5.0,
-            fast_threshold=0.1,
-            slow_threshold=0.5,
-            decrease_factor=0.95,
-            increase_factor=1.2,
-            ema_alpha=0.0,  # no smoothing for clear test
-        )
-        initial = pe.at()
-        pe.update(n_iters=5, max_iterations=1000, converged=True)
-        after = pe.at()
-        assert after < initial, f"Expected decrease: {after} < {initial}"
-
-    def test_slow_convergence_increases_epsilon(self):
-        """After update(n_iters=500, converged=False) (slow), next epsilon increases."""
-        from polystep.epsilon import ProgressiveEpsilon
-
-        pe = ProgressiveEpsilon(
-            init=1.0,
-            target=0.01,
-            max_epsilon=5.0,
-            fast_threshold=0.1,
-            slow_threshold=0.5,
-            decrease_factor=0.95,
-            increase_factor=1.2,
-            ema_alpha=0.0,  # no smoothing for clear test
-        )
-        initial = pe.at()
-        pe.update(n_iters=500, max_iterations=1000, converged=False)
-        after = pe.at()
-        assert after > initial, f"Expected increase: {after} > {initial}"
-
-    def test_epsilon_never_below_target(self):
-        """Epsilon never goes below target floor."""
-        from polystep.epsilon import ProgressiveEpsilon
-
-        pe = ProgressiveEpsilon(
-            init=0.05,
-            target=0.01,
-            max_epsilon=5.0,
-            decrease_factor=0.5,
-            ema_alpha=0.0,
-        )
-        # Repeatedly decrease
-        for _ in range(100):
-            pe.update(n_iters=1, max_iterations=1000, converged=True)
-        assert pe.at() >= 0.01
-
-    def test_epsilon_never_above_max(self):
-        """Epsilon never goes above max_epsilon ceiling."""
-        from polystep.epsilon import ProgressiveEpsilon
-
-        pe = ProgressiveEpsilon(
-            init=1.0,
-            target=0.01,
-            max_epsilon=5.0,
-            increase_factor=2.0,
-            ema_alpha=0.0,
-        )
-        # Repeatedly increase
-        for _ in range(100):
-            pe.update(n_iters=999, max_iterations=1000, converged=False)
-        assert pe.at() <= 5.0
-
-    def test_ema_smoothing_prevents_oscillation(self):
-        """Multiple update() calls with EMA smoothing create a smooth trajectory."""
-        from polystep.epsilon import ProgressiveEpsilon
-
-        pe = ProgressiveEpsilon(
-            init=1.0,
-            target=0.01,
-            max_epsilon=5.0,
-            fast_threshold=0.1,
-            slow_threshold=0.5,
-            decrease_factor=0.8,
-            increase_factor=1.5,
-            ema_alpha=0.7,  # heavy smoothing
-        )
-        values = [pe.at()]
-        # Alternate fast and slow convergence
-        for i in range(10):
-            if i % 2 == 0:
-                pe.update(n_iters=1, max_iterations=1000, converged=True)  # fast
-            else:
-                pe.update(n_iters=999, max_iterations=1000, converged=False)  # slow
-            values.append(pe.at())
-
-        # With heavy EMA smoothing, changes between consecutive steps
-        # should be relatively small (smoothed, not jumping wildly)
-        max_change = max(abs(values[i + 1] - values[i]) for i in range(len(values) - 1))
-        # Without EMA, changes would be large (0.8x or 1.5x swings)
-        # With EMA=0.7, each step changes by at most 30% of the raw change
-        assert max_change < 0.5, (
-            f"EMA smoothing failed: max step change = {max_change:.4f}, values = {[f'{v:.4f}' for v in values]}"
-        )

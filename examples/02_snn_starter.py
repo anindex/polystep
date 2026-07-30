@@ -1,7 +1,7 @@
 """02 - SNN starter: train a tiny spiking network without gradients.
 
 A small spiking neural network with hard-threshold LIF spikes (truly
-non-differentiable) trained via PolyStep in about 5 s on one CPU core.
+non-differentiable) trained via PolyStep on CPU.
 
 Why gradient-free for SNNs?
   Hard LIF spikes have ``d(spike) / d(mem) == 0`` almost everywhere, so
@@ -10,7 +10,7 @@ Why gradient-free for SNNs?
   SNN forward only and leaves the spikes alone.
 
 What you should see:
-  Training accuracy climbs from ~25% (chance, 4 classes) to >70% over 60
+  Test accuracy climbs from single digits to 100% within ~20 of the 60
   steps. A 2-panel figure shows the loss + accuracy curves.
 
 Output:
@@ -23,6 +23,7 @@ Run:
 from __future__ import annotations
 
 import importlib.util
+import argparse
 import os
 import sys
 import time
@@ -30,13 +31,11 @@ from pathlib import Path
 
 import torch
 
-# PolyStep issues many small tensor ops per step, where torch's intra-op pool costs
-# more than the arithmetic. Pinning to one thread is worth a lot at these sizes.
-# Set POLYSTEP_THREADS to override. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", "1")))
+# One thread: PolyStep's per-step ops are small enough that torch's default pool of
+# nproc threads costs far more than it returns. See docs/performance.md.
+torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
 import torch.nn as nn
 
-# Allow running directly from a source checkout without `pip install -e .`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -51,6 +50,11 @@ from polystep.cost_nn import NNCostEvaluator  # noqa: E402
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+    device = torch.device(args.device)
+
     seed = 42
     torch.manual_seed(seed)
 
@@ -59,7 +63,7 @@ def main():
     print("=" * 60)
 
     train_loader, test_loader = make_loaders(seed=seed)
-    model = TinySNN()
+    model = TinySNN().to(device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"  parameters: {num_params:,}")
     print(f"  train/test: {len(train_loader.dataset)}/{len(test_loader.dataset)} samples")
@@ -86,11 +90,12 @@ def main():
             if global_step >= target_steps:
                 break
 
+            inputs, targets = inputs.to(device), targets.to(device)
+
             def closure(stacked_params, _in=inputs, _tgt=targets):
                 return evaluator.evaluate(stacked_params, _in, _tgt)
 
-            # A hand-rolled loop has to register the evaluator itself for the optimizer
-            # to use anything but closure(). api.train() does this for you.
+            # Hand-rolled loops must register the evaluator; api.train() does it for you.
             optimizer.register_evaluator(evaluator, inputs, targets)
             optimizer.step(closure)
 

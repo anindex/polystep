@@ -1,6 +1,6 @@
 """Aggregate per-run JSON experiment results into pandas DataFrames.
 
-Reads JSON files from experiments/results/ (produced by paper.experiments.common.save_result)
+Reads JSON files from experiments/results/ (produced by experiments/runners/common.py::save_result)
 and produces summary DataFrames with mean/std per (benchmark, method) group.
 
 Functions:

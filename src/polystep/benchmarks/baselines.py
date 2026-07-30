@@ -1,36 +1,20 @@
-"""EvoTorch CMA-ES and Nevergrad baseline wrappers for benchmarks.
+"""EvoTorch CMA-ES baseline wrapper for benchmarks.
 
-Shared implementations used across all benchmark comparison scripts.
+Shared implementation used across the benchmark comparison scripts. Uses
+``separable=True`` for models above 10K params (O(n) memory instead of O(n^2)),
+runs on GPU when available, and reports ``function_evals = generations * popsize``.
 
-EvoTorch CMA-ES:
-    - Uses separable=True for models >10K params (O(n) vs O(n^2) memory)
-    - GPU-accelerated when available
-    - Reports function_evals = generations * popsize
-
-Nevergrad ES:
-    - Uses OnePlusOne (1+1)-ES optimizer
-    - Simple and effective for neural network optimization
-    - Reports function_evals = budget
-
-Usage:
-    from polystep.benchmarks.baselines import train_cmaes, train_nevergrad
-
-    # CMA-ES training
+    from polystep.benchmarks.baselines import train_cmaes
     result = train_cmaes(model, train_data, train_labels, test_data, test_labels)
 
-    # Nevergrad training
-    result = train_nevergrad(model, train_data, train_labels, test_data, test_labels)
-
-Installation:
-    pip install evotorch nevergrad
+Needs ``pip install evotorch``.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -49,24 +33,9 @@ except ImportError as e:
     _EVOTORCH_ERROR = str(e)
 
 
-_HAS_NEVERGRAD = False
-_NEVERGRAD_ERROR = None
-try:
-    import nevergrad as ng
-
-    _HAS_NEVERGRAD = True
-except ImportError as e:
-    _NEVERGRAD_ERROR = str(e)
-
-
 def has_evotorch() -> bool:
     """Check if EvoTorch is available."""
     return _HAS_EVOTORCH
-
-
-def has_nevergrad() -> bool:
-    """Check if Nevergrad is available."""
-    return _HAS_NEVERGRAD
 
 
 if _HAS_EVOTORCH:
@@ -107,7 +76,6 @@ if _HAS_EVOTORCH:
             self._param_count = sum(p.numel() for p in model.parameters())
             self._param_shapes = [p.shape for p in model.parameters()]
 
-            # Store training data on device
             self._train_data = train_data.to(device)
             self._train_labels = train_labels.to(device)
             self._batch_size = batch_size
@@ -134,7 +102,7 @@ if _HAS_EVOTORCH:
         def _evaluate(self, solution) -> None:
             """Evaluate a single solution (parameter vector).
 
-            EvoTorch calls this with a Solution object. We must SET the
+            EvoTorch calls this with a Solution object, so set the
             evaluation on the solution, not return a value.
 
             Args:
@@ -150,7 +118,6 @@ if _HAS_EVOTORCH:
             batch_data = self._train_data[indices]
             batch_labels = self._train_labels[indices]
 
-            # Create model on correct device for evaluation
             # Clone model architecture (create fresh instance)
             model = type(self._model)(*self._get_model_init_args()).to(device)
             model.eval()
@@ -224,15 +191,12 @@ def train_cmaes(
             f"Import error: {_EVOTORCH_ERROR}"
         )
 
-    # Move model to device
     model = model.to(device)
     param_count = sum(p.numel() for p in model.parameters())
 
-    # Reset GPU memory stats
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    # Create Problem with model cloning support
     class ModelProblem(NNOptimizationProblem):
         def _get_model_init_args(self):
             return model_init_args
@@ -279,7 +243,6 @@ def train_cmaes(
             return 0.0
         values = solution.values if hasattr(solution, "values") else solution
 
-        # Load weights into the reused model.
         offset = 0
         with torch.no_grad():
             for p in eval_model.parameters():
@@ -306,7 +269,6 @@ def train_cmaes(
     for gen in range(generations):
         searcher.step()
 
-        # Get stats from status
         status = searcher.status
         pop_best_fitness = float(status.get("pop_best_eval", 0.0))
         mean_fitness = float(status.get("mean_eval", 0.0))
@@ -350,7 +312,6 @@ def train_cmaes(
     # Final evaluation
     final_test_acc = evaluate_on_test(best_solution) if best_solution is not None else best_test_acc
 
-    # Get memory stats
     peak_memory = 0.0
     if device == "cuda" and torch.cuda.is_available():
         peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
@@ -368,219 +329,3 @@ def train_cmaes(
         convergence_epoch=None,
         epoch_logs=epoch_logs,
     )
-
-
-def train_nevergrad(
-    model: nn.Module,
-    train_data: Tensor,
-    train_labels: Tensor,
-    test_data: Tensor,
-    test_labels: Tensor,
-    budget: int = 10000,
-    batch_size: int = 512,
-    device: str = "cuda",
-    log_interval: int = 100,
-    verbose: bool = True,
-    model_init_args: tuple = (),
-) -> BenchmarkResult:
-    """Train model using Nevergrad OnePlusOne ES.
-
-    Nevergrad minimizes, so we negate accuracy for the fitness function.
-    Reports function_evals = budget.
-
-    Args:
-        model: PyTorch model to optimize.
-        train_data: Training data tensor, shape (N, ...).
-        train_labels: Training labels tensor, shape (N,).
-        test_data: Test data tensor, shape (M, ...).
-        test_labels: Test labels tensor, shape (M,).
-        budget: Total function evaluations (budget).
-        batch_size: Batch size for fitness evaluation.
-        device: Device for computation.
-        log_interval: Print stats every N evaluations.
-        verbose: Print progress.
-        model_init_args: Arguments for model constructor (for cloning).
-
-    Returns:
-        BenchmarkResult with training metrics.
-
-    Raises:
-        ImportError: If Nevergrad is not installed.
-    """
-    if not _HAS_NEVERGRAD:
-        raise ImportError(
-            f"Nevergrad is required for ES baseline. Install with: pip install nevergrad\n"
-            f"Import error: {_NEVERGRAD_ERROR}"
-        )
-
-    # Move model to device
-    model = model.to(device)
-    param_count = sum(p.numel() for p in model.parameters())
-
-    # Reset GPU memory stats
-    if device == "cuda" and torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-    # Move data to device
-    train_data_t = train_data.to(device)
-    train_labels_t = train_labels.to(device)
-    test_data_t = test_data.to(device)
-    test_labels_t = test_labels.to(device)
-
-    # Create Nevergrad parametrization
-    # OnePlusOne works well for neural network optimization
-    parametrization = ng.p.Array(shape=(param_count,), lower=-2.0, upper=2.0)
-    optimizer = ng.optimizers.OnePlusOne(
-        parametrization=parametrization,
-        budget=budget,
-    )
-
-    def load_params(params: np.ndarray) -> None:
-        """Load flattened numpy array into model parameters."""
-        offset = 0
-        with torch.no_grad():
-            for p in model.parameters():
-                numel = p.numel()
-                p.data.copy_(torch.from_numpy(params[offset : offset + numel]).view(p.shape).to(device))
-                offset += numel
-
-    def fitness(params: np.ndarray) -> float:
-        """Fitness function: negative accuracy (Nevergrad minimizes)."""
-        load_params(params)
-
-        # Sample random batch
-        batch_size_actual = min(batch_size, len(train_data_t))
-        indices = torch.randperm(len(train_data_t), device=device)[:batch_size_actual]
-        batch_data = train_data_t[indices]
-        batch_labels = train_labels_t[indices]
-
-        model.eval()
-        with torch.no_grad():
-            outputs = model(batch_data)
-            preds = outputs.argmax(dim=-1)
-            accuracy = (preds == batch_labels).float().mean().item()
-
-        return -accuracy  # Negate for minimization
-
-    def evaluate_on_test(params: np.ndarray) -> float:
-        """Evaluate on full test set."""
-        load_params(params)
-        model.eval()
-
-        correct = 0
-        total = 0
-        eval_batch_size = 512
-
-        with torch.no_grad():
-            for i in range(0, len(test_data_t), eval_batch_size):
-                batch_data = test_data_t[i : i + eval_batch_size]
-                batch_labels = test_labels_t[i : i + eval_batch_size]
-                outputs = model(batch_data)
-                preds = outputs.argmax(dim=-1)
-                correct += (preds == batch_labels).sum().item()
-                total += len(batch_labels)
-
-        return correct / total if total > 0 else 0.0
-
-    # Optimization loop
-    epoch_logs = []
-    best_test_acc = 0.0
-    eval_count = 0
-    start_time = time.time()
-
-    if verbose:
-        print(f"  Nevergrad OnePlusOne: budget={budget}, params={param_count:,}")
-
-    # Use tell/ask interface for finer control
-    while eval_count < budget:
-        # Ask for candidate
-        candidate = optimizer.ask()
-        params = candidate.value
-
-        # Evaluate fitness
-        loss = fitness(params)
-        eval_count += 1
-
-        # Tell optimizer the result
-        optimizer.tell(candidate, loss)
-
-        # Periodic logging and test evaluation
-        if eval_count % log_interval == 0 or eval_count == budget:
-            test_acc = evaluate_on_test(params)
-            if test_acc > best_test_acc:
-                best_test_acc = test_acc
-
-            epoch_logs.append(
-                {
-                    "eval_count": eval_count,
-                    "fitness": -loss,  # Convert back to accuracy
-                    "test_accuracy": test_acc,
-                }
-            )
-
-            if verbose:
-                print(f"  Eval {eval_count:5d}/{budget} | fitness={-loss:.4f} | test_acc={test_acc * 100:.1f}%")
-
-    elapsed = time.time() - start_time
-
-    # Get best recommendation
-    recommendation = optimizer.recommend()
-    final_params = recommendation.value
-    final_test_acc = evaluate_on_test(final_params)
-    if final_test_acc > best_test_acc:
-        best_test_acc = final_test_acc
-
-    # Get memory stats
-    peak_memory = 0.0
-    if device == "cuda" and torch.cuda.is_available():
-        peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
-
-    return BenchmarkResult(
-        optimizer="nevergrad",
-        seed=0,  # Nevergrad uses internal randomness
-        final_accuracy=final_test_acc,
-        best_accuracy=best_test_acc,
-        final_loss=None,  # ES optimizes accuracy, no loss
-        wall_time_seconds=elapsed,
-        peak_gpu_memory_mb=peak_memory,
-        total_steps=budget,
-        function_evals=budget,
-        convergence_epoch=None,
-        epoch_logs=epoch_logs,
-    )
-
-
-def check_gradient_free_deps() -> Tuple[bool, bool, str]:
-    """Check which gradient-free dependencies are available.
-
-    Returns:
-        Tuple of (has_evotorch, has_nevergrad, message).
-    """
-    messages = []
-    if not _HAS_EVOTORCH:
-        messages.append(f"EvoTorch not installed: {_EVOTORCH_ERROR}")
-    if not _HAS_NEVERGRAD:
-        messages.append(f"Nevergrad not installed: {_NEVERGRAD_ERROR}")
-
-    message = "\n".join(messages) if messages else "All gradient-free dependencies available"
-    return _HAS_EVOTORCH, _HAS_NEVERGRAD, message
-
-
-def get_available_optimizers(include_gradient_free: bool = True) -> List[str]:
-    """Get list of available optimizers.
-
-    Args:
-        include_gradient_free: Whether to include CMA-ES and Nevergrad.
-
-    Returns:
-        List of available optimizer names.
-    """
-    optimizers = ["sgd", "adam", "adamw", "polystep"]
-
-    if include_gradient_free:
-        if _HAS_EVOTORCH:
-            optimizers.append("cmaes")
-        if _HAS_NEVERGRAD:
-            optimizers.append("nevergrad")
-
-    return optimizers

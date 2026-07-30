@@ -35,7 +35,7 @@ from typing import Callable, Optional, Tuple
 import torch
 
 
-# Note: "reduce-overhead" uses CUDA graphs which cause tensor ownership conflicts
+# "reduce-overhead" uses CUDA graphs which cause tensor ownership conflicts
 # when chaining multiple compiled functions (rotate->probe->barycentric) within one step.
 # "default" mode still compiles with Inductor but avoids CUDA graph issues.
 DEFAULT_MODE = "default"
@@ -107,22 +107,11 @@ def _sinkhorn_iteration(
     eps: float,
     omega: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Single log-domain Sinkhorn iteration with optional overrelaxation (pure tensor ops).
+    """One log-domain Sinkhorn iteration on duals ``f`` ``(n,)`` and ``g`` ``(m,)``.
 
-    When omega=1.0 (default), this is standard Sinkhorn. When omega>1.0,
-    overrelaxation accelerates convergence from O(1/t) to O(1/t^2).
-
-    Args:
-        f: First dual potential of shape (n,).
-        g: Second dual potential of shape (m,).
-        log_K: Log kernel matrix (-C / eps) of shape (n, m).
-        log_a: Log source marginal of shape (n,).
-        log_b: Log target marginal of shape (m,).
-        eps: Entropic regularization strength.
-        omega: Overrelaxation parameter in [0.5, 1.95]. Default 1.0 (no overrelaxation).
-
-    Returns:
-        Tuple of updated (f, g) dual potentials.
+    ``log_K`` is ``-C/eps``, ``(n, m)``. ``omega`` in [0.5, 1.95] over-relaxes, which
+    empirically cuts the iteration count; 1.0 is plain Sinkhorn. Sinkhorn converges
+    linearly, and SOR-type extrapolation carries no proven rate improvement here.
     """
     f_target = eps * (log_a - torch.logsumexp(log_K + g.unsqueeze(0) / eps, dim=1))
     f_new = (1 - omega) * f + omega * f_target
@@ -138,13 +127,9 @@ def _rotate_and_translate(
     origin: torch.Tensor,
     step_radius: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Rotate polytope vertices and translate to particle positions (pure tensor ops).
+    """Rotate the template vertices ``(num_verts, dim)`` onto each particle.
 
-    Args:
-        rot_mats: Rotation matrices of shape (batch, dim, dim).
-        polytope_vertices: Template vertices of shape (num_verts, dim).
-        origin: Particle positions of shape (batch, dim).
-        step_radius: Step distance multiplier.
+    ``rot_mats`` is ``(batch, dim, dim)`` and ``origin`` ``(batch, dim)``.
 
     Returns:
         Tuple of (step_points, rotated_vertices):
@@ -158,21 +143,19 @@ def _rotate_and_translate(
 
 def _barycentric_projection(
     transport_matrix: torch.Tensor,
-    a: torch.Tensor,
     X_vertices: torch.Tensor,
 ) -> torch.Tensor:
     """Barycentric projection: weighted average of vertices by transport plan (pure tensor ops).
 
     Args:
         transport_matrix: Transport plan of shape (batch, num_vertices).
-        a: Source marginal weights of shape (batch,).
         X_vertices: Vertex positions of shape (batch, num_vertices, dim).
 
     Returns:
         Updated particle positions of shape (batch, dim).
     """
-    # Divide by the realized row sum (the OT barycenter), not the target marginal
-    # a. Equal for softmax rows; correct for unconverged Sinkhorn (a kept for API).
+    # Divide by the realized row sum (the OT barycenter), not the target marginal a:
+    # equal for softmax rows, correct for an unconverged Sinkhorn.
     row_sum = transport_matrix.sum(dim=-1, keepdim=True).clamp(min=1e-12)
     weights = transport_matrix / row_sum
     # Cast to vertex dtype so the matmul works in mixed precision (no fp32/bf16 promote).
@@ -254,7 +237,10 @@ def _fused_softmax_project(
     # the division, so at tiny epsilon a row sitting entirely above the global minimum
     # sends every logit to -inf and comes back NaN. Softmax is row-wise
     # shift-invariant, so only the values reaching the exponent change.
-    W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / epsilon, dim=-1)  # (P, V)
+    # Pinned outside autocast like the eager softmax_plan: torch.softmax is on the
+    # fp32 list but the logit arithmetic feeding it is not.
+    with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
+        W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / epsilon, dim=-1)  # (P, V)
 
     # Transport matrix: row sums equal source marginal a
     transport = W * a.unsqueeze(-1)  # (P, V)
@@ -305,8 +291,6 @@ class CompiledFunctions:
         compute_probe_points: Compiled or eager _compute_probe_points.
         fused_softmax_project: Compiled or eager _fused_softmax_project.
     """
-
-    DEFAULT_MODE = DEFAULT_MODE
 
     def __init__(self, compile: bool = True) -> None:
         self.compile = compile and torch.cuda.is_available()
@@ -374,9 +358,8 @@ class CompiledFunctions:
 
             # Warm barycentric_projection
             transport = torch.ones(batch, num_verts, device=device) / num_verts
-            a = torch.ones(batch, device=device) / batch
             vertices = torch.randn(batch, num_verts, dim, device=device)
-            self.barycentric_projection(transport, a, vertices)
+            self.barycentric_projection(transport, vertices)
 
             # Warm compute_probe_points
             directions = torch.randn(batch, num_verts, dim, device=device)

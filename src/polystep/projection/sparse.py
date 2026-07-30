@@ -19,11 +19,8 @@ from typing import Optional
 import torch
 
 
-# Below this ratio of subspace-dim to source-dim, the Johnson-
-# Lindenstrauss distance guarantees stop holding for typical
-# optimization workloads. Empirical floor: GPT-2 124M projected to
-# 128-dim (ratio ~ 1e-6) collapsed to random predictions in early
-# experiments.
+# Below this subspace-to-source ratio the Johnson-Lindenstrauss distance guarantees
+# stop holding and the run collapses to random predictions.
 _EXTREME_COMPRESSION_RATIO = 1e-5
 
 
@@ -116,7 +113,8 @@ class SparseRandomProjection:
             device: Device for the sparse matrix.
             dtype: Data type for values.
         """
-        # Use CPU generator for consistent behavior (avoids CUDA generator issues)
+        # Built on CPU and moved below. device="cpu" is explicit on every factory:
+        # without it they follow torch.set_default_device and desync from the generator.
         generator = torch.Generator(device="cpu")
         generator.manual_seed(self.seed)
 
@@ -131,11 +129,12 @@ class SparseRandomProjection:
             self.full_dim,
             (total_nnz,),
             generator=generator,
+            device="cpu",
         )
 
         # Column indices: each column gets nnz_per_col consecutive entries
         col_indices = (
-            torch.arange(self.subspace_dim)
+            torch.arange(self.subspace_dim, device="cpu")
             .unsqueeze(1)
             .expand(
                 -1,
@@ -151,6 +150,7 @@ class SparseRandomProjection:
                 2,
                 (total_nnz,),
                 generator=generator,
+                device="cpu",
             )
             * 2
             - 1
@@ -179,15 +179,35 @@ class SparseRandomProjection:
             self._sparse_matrix = None
 
         if self._sparse_matrix is None:
+            # The indices are generated here and in range by construction, so the
+            # invariant check buys nothing. Declining it per call also silences torch's
+            # warning about leaving the choice implicit; the context-manager form of
+            # this opt-out is process-global and would disarm other threads.
             self._sparse_matrix = torch.sparse_coo_tensor(
                 self._indices,
                 self._values,
                 size=(self.full_dim, self.subspace_dim),
                 device=device,
                 dtype=dtype,
+                check_invariants=False,
             ).coalesce()
 
         return self._sparse_matrix
+
+    def columns(self, cols: torch.Tensor, device: torch.device, dtype: torch.dtype):
+        """Row indices and values of the requested columns.
+
+        Returns ``(rows, vals)``, both ``(len(cols), nnz_per_col)``. The generator
+        lays each column's entries out contiguously before ``coalesce``, so this is
+        a reshape, not a search. Duplicate rows within a column stay separate here;
+        a caller that scatter-adds them reproduces what ``coalesce`` would sum.
+        """
+        if self._indices is None or self._device != device or self._dtype != dtype:
+            self._init_sparse_matrix(device, dtype)
+            self._sparse_matrix = None
+        rows = self._indices[0].view(self.subspace_dim, self._nnz_per_col)
+        vals = self._values.view(self.subspace_dim, self._nnz_per_col)
+        return rows.index_select(0, cols), vals.index_select(0, cols)
 
     def project(self, coords: torch.Tensor) -> torch.Tensor:
         """Project subspace coordinates to full parameter space.
@@ -204,7 +224,6 @@ class SparseRandomProjection:
         if is_1d:
             coords = coords.unsqueeze(0)  # (1, subspace_dim)
 
-        # Get sparse matrix
         P = self._get_sparse_matrix(coords.device, coords.dtype)
 
         # Sparse-dense matmul: P @ coords.T -> (full_dim, batch)

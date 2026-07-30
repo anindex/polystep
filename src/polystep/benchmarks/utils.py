@@ -1,37 +1,29 @@
-"""Benchmark utilities: data loaders, model factories, metrics, and output formatting.
+"""Benchmark utilities shared by the experiment runners.
 
-Shared utilities for all benchmark scripts:
-- Data loading (MNIST, CIFAR-10, N-MNIST, DVS-Gesture) without torchvision dependency
-- Model factories for consistent architectures (MLP, SNN with LIF neurons)
-- Evaluation and metrics utilities
-- Environment info collection
-- JSON output and console table formatting
+MNIST and CIFAR-10 loaders that read the raw archives instead of pulling in
+torchvision, the MLP and SNN architectures the paper uses, accuracy evaluation, and
+environment capture for the result JSON.
 
-SNN utilities require snnTorch for optimal experience:
-    pip install snntorch
-
-If snnTorch is not installed, falls back to:
-- Pure PyTorch LIF neurons (truly non-differentiable)
-- Synthetic spike data for neuromorphic datasets
+The SNN path uses snnTorch when installed (``pip install snntorch``) and otherwise
+falls back to pure-PyTorch LIF neurons, which are non-differentiable either way.
 """
 
 from __future__ import annotations
 
 import gzip
-import json
 import os
 import pickle
 import platform
 import struct as pystruct
 import tempfile
 import tarfile
-from collections import defaultdict
 from dataclasses import dataclass, asdict, field
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import urlretrieve
 
 import numpy as np
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -48,7 +40,6 @@ def _default_data_dir(name: str) -> str:
 
 # Benchmark validation seeds. The published experiments use 5 seeds, set in
 # experiments/runners/common.py.
-SEEDS = [42, 123, 456]
 
 
 MNIST_URL = "https://storage.googleapis.com/cvdf-datasets/mnist/"
@@ -191,7 +182,6 @@ def get_cifar10_loaders(
 
     batch_dir = os.path.join(data_dir, "cifar-10-batches-py")
 
-    # Load all training batches
     train_images_list = []
     train_labels_list = []
     for i in range(1, 6):
@@ -203,7 +193,6 @@ def get_cifar10_loaders(
     train_images = np.concatenate(train_images_list, axis=0)
     train_labels = np.concatenate(train_labels_list, axis=0)
 
-    # Load test batch
     test_path = os.path.join(batch_dir, "test_batch")
     test_images, test_labels = _load_cifar10_batch(test_path)
 
@@ -235,191 +224,27 @@ def get_cifar10_loaders(
     return train_loader, test_loader
 
 
-# Check for HuggingFace datasets at module load time
-try:
-    from datasets import load_dataset as _hf_load_dataset
+class MNISTNet(nn.Sequential):
+    """Two-layer MLP for MNIST: 784 -> hidden -> 10, ~101K params at hidden=128.
 
-    HAS_DATASETS = True
-except ImportError:
-    HAS_DATASETS = False
-
-
-def _simple_tokenize(
-    texts: List[str],
-    vocab: Dict[str, int],
-    max_seq_len: int,
-    pad_idx: int = 0,
-    unk_idx: int = 1,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Tokenize texts using simple word-to-index mapping.
-
-    Args:
-        texts: List of text strings to tokenize.
-        vocab: Vocabulary mapping word -> index.
-        max_seq_len: Maximum sequence length (pad/truncate to this).
-        pad_idx: Index for padding token.
-        unk_idx: Index for unknown token.
-
-    Returns:
-        Tuple of (input_ids, attention_mask) as numpy arrays.
-    """
-    input_ids = []
-    attention_masks = []
-
-    for text in texts:
-        # Simple word tokenization: lowercase, split on whitespace/punctuation
-        words = text.lower().replace(",", " ").replace(".", " ").replace("!", " ").replace("?", " ").split()
-
-        # Convert to indices
-        ids = [vocab.get(w, unk_idx) for w in words]
-
-        # Truncate if needed
-        if len(ids) > max_seq_len:
-            ids = ids[:max_seq_len]
-
-        # Create attention mask (1 for real tokens)
-        mask = [1] * len(ids)
-
-        # Pad if needed
-        padding_len = max_seq_len - len(ids)
-        if padding_len > 0:
-            ids = ids + [pad_idx] * padding_len
-            mask = mask + [0] * padding_len
-
-        input_ids.append(ids)
-        attention_masks.append(mask)
-
-    return np.array(input_ids, dtype=np.int64), np.array(attention_masks, dtype=np.int64)
-
-
-def _build_vocab(texts: List[str], vocab_size: int) -> Dict[str, int]:
-    """Build vocabulary from texts.
-
-    Args:
-        texts: List of text strings.
-        vocab_size: Maximum vocabulary size (including special tokens).
-
-    Returns:
-        Dictionary mapping word -> index.
-    """
-    # Count word frequencies
-    word_counts: Dict[str, int] = defaultdict(int)
-    for text in texts:
-        words = text.lower().replace(",", " ").replace(".", " ").replace("!", " ").replace("?", " ").split()
-        for w in words:
-            word_counts[w] += 1
-
-    # Sort by frequency and take top vocab_size - 2 (reserve 0=PAD, 1=UNK)
-    sorted_words = sorted(word_counts.items(), key=lambda x: -x[1])
-    vocab = {"<PAD>": 0, "<UNK>": 1}
-
-    for word, _ in sorted_words[: vocab_size - 2]:
-        vocab[word] = len(vocab)
-
-    return vocab
-
-
-def get_sst2_loaders(
-    max_train: int = 0,
-    max_test: int = 0,
-    max_seq_len: int = 64,
-    batch_size: int = 32,
-    vocab_size: int = 10000,
-    data_dir: Optional[str] = None,
-) -> Tuple[DataLoader, DataLoader, int, str]:
-    """Load SST-2 sentiment dataset as PyTorch DataLoaders.
-
-    Uses HuggingFace datasets with simple word-to-index tokenization.
-    Raises error if HuggingFace datasets is not installed (no synthetic fallback).
-
-    Args:
-        max_train: Maximum training samples (0=all available).
-        max_test: Maximum test samples (0=all available).
-        max_seq_len: Maximum sequence length for padding/truncation.
-        batch_size: Batch size for DataLoaders.
-        vocab_size: Maximum vocabulary size for tokenization.
-        data_dir: Directory for caching HuggingFace datasets.
-
-    Returns:
-        Tuple of (train_loader, test_loader, actual_vocab_size, data_type).
-        DataLoaders yield (input_ids, attention_mask, labels) tuples.
-        data_type is "real" for HuggingFace data.
-
-    Raises:
-        ImportError: If HuggingFace datasets is not installed.
-    """
-    if not HAS_DATASETS:
-        raise ImportError("HuggingFace datasets required for SST-2 benchmark. Install with: pip install datasets")
-
-    print("  Loading SST-2 from HuggingFace datasets...")
-    data_dir = data_dir or _default_data_dir("sst2")
-    dataset = _hf_load_dataset("glue", "sst2", cache_dir=data_dir)
-
-    # Get train/validation splits (SST-2 test set has no labels)
-    train_texts = dataset["train"]["sentence"]
-    train_labels = dataset["train"]["label"]
-    test_texts = dataset["validation"]["sentence"]
-    test_labels = dataset["validation"]["label"]
-
-    # Apply max samples
-    if max_train > 0:
-        train_texts = train_texts[:max_train]
-        train_labels = train_labels[:max_train]
-    if max_test > 0:
-        test_texts = test_texts[:max_test]
-        test_labels = test_labels[:max_test]
-
-    print(f"  Building vocabulary from {len(train_texts)} training samples...")
-    vocab = _build_vocab(train_texts, vocab_size)
-    actual_vocab_size = len(vocab)
-    print(f"  Vocabulary size: {actual_vocab_size}")
-
-    # Tokenize
-    print(f"  Tokenizing with max_seq_len={max_seq_len}...")
-    train_ids, train_mask = _simple_tokenize(train_texts, vocab, max_seq_len)
-    test_ids, test_mask = _simple_tokenize(test_texts, vocab, max_seq_len)
-    train_labels_arr = np.array(train_labels, dtype=np.int64)
-    test_labels_arr = np.array(test_labels, dtype=np.int64)
-
-    # Convert to tensors and create DataLoaders
-    train_ds = TensorDataset(
-        torch.from_numpy(train_ids),
-        torch.from_numpy(train_mask),
-        torch.from_numpy(train_labels_arr),
-    )
-    test_ds = TensorDataset(
-        torch.from_numpy(test_ids),
-        torch.from_numpy(test_mask),
-        torch.from_numpy(test_labels_arr),
-    )
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    data_type = "real"
-    print(f"  Train: {len(train_ds)} samples, Test: {len(test_ds)} samples")
-    print(f"  Data type: {data_type} (HuggingFace SST-2)")
-    return train_loader, test_loader, actual_vocab_size, data_type
-
-
-class MNISTNet(nn.Module):
-    """Two-layer MLP for MNIST digit classification.
-
-    Architecture: 784 -> hidden -> 10
-    Uses ReLU activation, ~101K params with hidden=128.
+    An ``nn.Sequential`` subclass, not a plain ``nn.Module``: every batched
+    evaluator checks ``type(model).forward is nn.Sequential.forward`` before it will
+    build a plan, so an identical hand-written ``forward`` silently opts the model out
+    of the bmm and subspace-delta paths. The ``OrderedDict`` keeps the ``fc1``/``fc2``
+    state_dict keys.
     """
 
     def __init__(self, hidden: int = 128):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(784, hidden)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden, 10)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.flatten(x)
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
+        super().__init__(
+            OrderedDict(
+                [
+                    ("flatten", nn.Flatten()),
+                    ("fc1", nn.Linear(784, hidden)),
+                    ("relu", nn.ReLU()),
+                    ("fc2", nn.Linear(hidden, 10)),
+                ]
+            )
+        )
 
 
 class CIFAR10Net(nn.Module):
@@ -451,35 +276,6 @@ class CIFAR10Net(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.features(x))
-
-
-def create_model(
-    dataset_name: str,
-    hidden: int = 128,
-    **kwargs,
-) -> nn.Module:
-    """Factory function to create models for different datasets.
-
-    Args:
-        dataset_name: One of 'mnist', 'cifar10'
-        hidden: Hidden layer size
-        **kwargs: Additional model-specific arguments
-
-    Returns:
-        nn.Module: The created model
-
-    Raises:
-        ValueError: If dataset_name is not recognized
-    """
-    dataset_name = dataset_name.lower()
-
-    if dataset_name == "mnist":
-        return MNISTNet(hidden=hidden)
-    elif dataset_name == "cifar10":
-        # CIFAR10Net has a fixed architecture; ``hidden`` is ignored.
-        return CIFAR10Net()
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Supported: mnist, cifar10")
 
 
 @torch.no_grad()
@@ -579,149 +375,6 @@ def get_environment_info() -> Dict[str, Any]:
         info["gpu_count"] = 0
 
     return info
-
-
-def compute_summary_stats(results: List[BenchmarkResult]) -> Dict[str, Dict[str, float]]:
-    """Compute summary statistics grouped by optimizer.
-
-    Args:
-        results: List of BenchmarkResult objects
-
-    Returns:
-        Dict mapping optimizer names to stats dicts with mean_accuracy, std_accuracy, etc.
-    """
-    by_optimizer: Dict[str, List[BenchmarkResult]] = defaultdict(list)
-    for r in results:
-        by_optimizer[r.optimizer].append(r)
-
-    summary = {}
-    for optimizer, runs in by_optimizer.items():
-        accs = [r.best_accuracy for r in runs]
-        times = [r.wall_time_seconds for r in runs]
-        mems = [r.peak_gpu_memory_mb for r in runs]
-        evals = [r.function_evals for r in runs]
-
-        summary[optimizer] = {
-            "mean_accuracy": float(np.mean(accs)),
-            "std_accuracy": float(np.std(accs)),
-            "min_accuracy": float(np.min(accs)),
-            "max_accuracy": float(np.max(accs)),
-            "mean_time": float(np.mean(times)),
-            "std_time": float(np.std(times)),
-            "mean_memory_mb": float(np.mean(mems)),
-            "mean_function_evals": float(np.mean(evals)),
-            "num_runs": len(runs),
-        }
-
-    return summary
-
-
-def save_results_json(
-    results: List[BenchmarkResult],
-    output_dir: str,
-    benchmark_name: str,
-    config: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Save benchmark results to JSON file.
-
-    Args:
-        results: List of BenchmarkResult objects
-        output_dir: Directory to save results
-        benchmark_name: Name of the benchmark (e.g., 'mnist', 'cifar10')
-        config: Optional benchmark configuration dict
-
-    Returns:
-        Path to the saved JSON file
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    filename = f"{benchmark_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    filepath = os.path.join(output_dir, filename)
-
-    output = {
-        "benchmark": benchmark_name,
-        "timestamp": timestamp,
-        "environment": get_environment_info(),
-        "config": config or {},
-        "results": [r.to_dict() for r in results],
-        "summary": compute_summary_stats(results),
-    }
-
-    with open(filepath, "w") as f:
-        json.dump(output, f, indent=2)
-
-    return filepath
-
-
-def format_results_table(results: List[BenchmarkResult]) -> str:
-    """Format results as a console table using tabulate.
-
-    Args:
-        results: List of BenchmarkResult objects
-
-    Returns:
-        Formatted table string
-    """
-    try:
-        from tabulate import tabulate
-    except ImportError:
-        # Fallback to simple formatting if tabulate not installed
-        return _format_results_simple(results)
-
-    headers = ["Optimizer", "Mean Acc", "Std", "Mean Time", "Peak Mem (MB)", "Func Evals"]
-    rows = []
-
-    # Group by optimizer
-    by_opt: Dict[str, List[BenchmarkResult]] = defaultdict(list)
-    for r in results:
-        by_opt[r.optimizer].append(r)
-
-    for opt, runs in sorted(by_opt.items()):
-        mean_acc = sum(r.best_accuracy for r in runs) / len(runs)
-        std_acc = (sum((r.best_accuracy - mean_acc) ** 2 for r in runs) / len(runs)) ** 0.5
-        mean_time = sum(r.wall_time_seconds for r in runs) / len(runs)
-        mean_mem = sum(r.peak_gpu_memory_mb for r in runs) / len(runs)
-        total_evals = sum(r.function_evals for r in runs) // len(runs)  # Average
-
-        rows.append(
-            [
-                opt,
-                f"{mean_acc * 100:.1f}%",
-                f"+/-{std_acc * 100:.1f}%",
-                f"{mean_time:.1f}s",
-                f"{mean_mem:.0f}",
-                f"{total_evals:,}",
-            ]
-        )
-
-    return tabulate(rows, headers=headers, tablefmt="github")
-
-
-def _format_results_simple(results: List[BenchmarkResult]) -> str:
-    """Simple fallback table formatting without tabulate."""
-    lines = []
-    lines.append("| Optimizer | Mean Acc | Std | Mean Time | Peak Mem (MB) | Func Evals |")
-    lines.append("|-----------|----------|-----|-----------|---------------|------------|")
-
-    # Group by optimizer
-    by_opt: Dict[str, List[BenchmarkResult]] = defaultdict(list)
-    for r in results:
-        by_opt[r.optimizer].append(r)
-
-    for opt, runs in sorted(by_opt.items()):
-        mean_acc = sum(r.best_accuracy for r in runs) / len(runs)
-        std_acc = (sum((r.best_accuracy - mean_acc) ** 2 for r in runs) / len(runs)) ** 0.5
-        mean_time = sum(r.wall_time_seconds for r in runs) / len(runs)
-        mean_mem = sum(r.peak_gpu_memory_mb for r in runs) / len(runs)
-        total_evals = sum(r.function_evals for r in runs) // len(runs)
-
-        lines.append(
-            f"| {opt:<9} | {mean_acc * 100:>6.1f}% | +/-{std_acc * 100:.1f}% | "
-            f"{mean_time:>8.1f}s | {mean_mem:>13.0f} | {total_evals:>10,} |"
-        )
-
-    return "\n".join(lines)
 
 
 _HAS_SNNTORCH = False
@@ -838,25 +491,27 @@ class SpikingNet(nn.Module):
         Returns:
             Spike rates, shape (batch, output_dim). Values in [0, 1].
         """
-        # Detect input format and normalize to (num_steps, batch, features)
+        # Static input is constant in time, so fc1 runs once and broadcasts, which is
+        # bit-identical to the T calls it replaces. Temporal input keeps its per-timestep
+        # call: one (T*B, F) GEMM blocks differently from T (B, F) ones, and the LIF
+        # threshold turns that ULP into a whole spike.
         if x.dim() >= 3 and x.shape[0] == self.num_steps:
             # Temporal format: (num_steps, batch, ...)
             num_steps = x.shape[0]
             batch = x.shape[1]
-            x_seq = x.reshape(num_steps, batch, -1)  # (T, B, features)
+            x_seq = x.reshape(num_steps, batch, -1)
+            cur_seq = None
         elif x.dim() >= 3 and x.shape[1] == self.num_steps:
             # Alternate temporal: (batch, num_steps, ...)
             batch = x.shape[0]
             num_steps = x.shape[1]
-            x_seq = x.reshape(batch, num_steps, -1).permute(1, 0, 2)  # (T, B, features)
+            x_seq = x.reshape(batch, num_steps, -1).permute(1, 0, 2)
+            cur_seq = None
         else:
-            # Static input: repeat across timesteps
             batch = x.shape[0]
             num_steps = self.num_steps
-            x_flat = x.reshape(batch, -1)
-            x_seq = x_flat.unsqueeze(0).expand(num_steps, -1, -1)  # (T, B, features)
+            cur_seq = self.fc1(x.reshape(batch, -1)).unsqueeze(0).expand(num_steps, -1, -1)
 
-        # Initialize membrane potentials
         if self.use_snntorch:
             mem1 = self.lif1.init_leaky()
             mem2 = self.lif2.init_leaky()
@@ -867,357 +522,8 @@ class SpikingNet(nn.Module):
         total_spikes = torch.zeros(batch, self.output_dim, device=x.device, dtype=x.dtype)
 
         for t in range(num_steps):
-            cur1 = self.fc1(x_seq[t])
-            spk1, mem1 = self.lif1(cur1, mem1)
-            cur2 = self.fc2(spk1)
-            spk2, mem2 = self.lif2(cur2, mem2)
+            spk1, mem1 = self.lif1(cur_seq[t] if cur_seq is not None else self.fc1(x_seq[t]), mem1)
+            spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total_spikes = total_spikes + spk2
 
         return total_spikes / num_steps  # Spike rate in [0, 1]
-
-
-def get_nmnist_loaders(
-    data_dir: Optional[str] = None,
-    num_steps: int = 25,
-    batch_size: int = 64,
-    max_train: int = 0,
-    max_test: int = 0,
-    synthetic: bool = False,
-) -> Tuple[DataLoader, DataLoader]:
-    """Load N-MNIST neuromorphic dataset.
-
-    N-MNIST is a neuromorphic version of MNIST created by displaying MNIST
-    digits on a monitor and recording with a DVS (Dynamic Vision Sensor) camera.
-    It contains ON and OFF polarity events encoding digit patterns.
-
-    Uses snnTorch spikevision. Pass ``synthetic=True`` for generated spike data;
-    a load failure raises rather than silently substituting it.
-
-    Args:
-        data_dir: Directory to store/load N-MNIST data.
-        num_steps: Number of timesteps for spike binning.
-        batch_size: Batch size for DataLoader.
-        max_train: Maximum training samples (0=full dataset, ~60K).
-        max_test: Maximum test samples (0=full dataset, ~10K).
-
-    Returns:
-        Tuple of (train_loader, test_loader).
-        Data format: (batch, num_steps, 2, 34, 34) for snnTorch
-                     (batch, num_steps, 2, 32, 32) for synthetic
-        Label format: (batch,) with values 0-9.
-
-    Note:
-        With snnTorch, the actual data shape depends on snnTorch version.
-        The SpikingNet model handles both formats automatically.
-
-    Example:
-        >>> train_loader, test_loader = get_nmnist_loaders(max_train=1000)
-        >>> for data, labels in train_loader:
-        ...     # data: (batch, time, polarity, H, W)
-        ...     pass
-    """
-    if synthetic:
-        return _generate_synthetic_nmnist(num_steps, batch_size, max_train, max_test)
-
-    data_dir = data_dir or _default_data_dir("nmnist")
-    if not _HAS_SNNTORCH:
-        raise RuntimeError(
-            "N-MNIST needs snnTorch (pip install 'polystep[experiments]'). "
-            "Pass synthetic=True to benchmark on generated spike data instead."
-        )
-    try:
-        return _load_nmnist_snntorch(data_dir, num_steps, batch_size, max_train, max_test)
-    except Exception as e:
-        # Substituting synthetic data here would report a benchmark number that has
-        # nothing to do with N-MNIST, so the caller has to ask for it.
-        raise RuntimeError(
-            f"Loading N-MNIST from {data_dir} failed: {e}. Pass synthetic=True to "
-            "benchmark on generated spike data instead."
-        ) from e
-
-
-def _load_nmnist_snntorch(
-    data_dir: str,
-    num_steps: int,
-    batch_size: int,
-    max_train: int,
-    max_test: int,
-) -> Tuple[DataLoader, DataLoader]:
-    """Load N-MNIST using snnTorch spikevision."""
-    from snntorch.spikevision import spikedata
-
-    print(f"  Loading N-MNIST from snnTorch (data_dir={data_dir})...")
-
-    # snnTorch NMNIST returns data in format (time, polarity, H, W)
-    train_ds = spikedata.NMNIST(
-        root=data_dir,
-        train=True,
-        num_steps=num_steps,
-        dt=1000,  # 1ms time bins
-    )
-    test_ds = spikedata.NMNIST(
-        root=data_dir,
-        train=False,
-        num_steps=num_steps,
-        dt=1000,
-    )
-
-    # Apply sample limits using Subset
-    if max_train > 0 and len(train_ds) > max_train:
-        train_ds = torch.utils.data.Subset(train_ds, range(max_train))
-    if max_test > 0 and len(test_ds) > max_test:
-        test_ds = torch.utils.data.Subset(test_ds, range(max_test))
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    return train_loader, test_loader
-
-
-def _generate_synthetic_nmnist(
-    num_steps: int,
-    batch_size: int,
-    max_train: int,
-    max_test: int,
-) -> Tuple[DataLoader, DataLoader]:
-    """Generate synthetic N-MNIST-like spike data.
-
-    Creates synthetic spike patterns for digits 0-9. Each digit has a
-    distinct activation pattern simulating rate-coded neural spikes.
-    """
-    print("  Generating synthetic N-MNIST data...")
-
-    num_train = max_train if max_train > 0 else 5000
-    num_test = max_test if max_test > 0 else 1000
-    height, width = 32, 32
-    num_classes = 10
-
-    def generate_digit_spikes(num_samples: int, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        rng = torch.Generator().manual_seed(seed)
-
-        # Create templates for each digit - different spatial patterns
-        templates = torch.zeros(num_classes, 2, height, width)
-        for c in range(num_classes):
-            # Each digit activates different regions
-            y_start = (c // 2) * (height // 5)
-            x_start = (c % 5) * (width // 5)
-            y_end = min(y_start + height // 4, height)
-            x_end = min(x_start + width // 4, width)
-            templates[c, 0, y_start:y_end, x_start:x_end] = 0.8  # ON polarity
-            templates[c, 1, y_start:y_end, x_start:x_end] = 0.3  # OFF polarity
-
-        labels = torch.randint(0, num_classes, (num_samples,), generator=rng)
-
-        # Generate spike data: (samples, time, polarity, H, W)
-        data = torch.zeros(num_samples, num_steps, 2, height, width)
-        for i, label in enumerate(labels):
-            template = templates[label.item()]
-            # Spike with probability proportional to template
-            for t in range(num_steps):
-                noise = torch.rand(2, height, width, generator=rng)
-                spikes = (noise < template).float()
-                data[i, t] = spikes
-
-        return data, labels
-
-    train_data, train_labels = generate_digit_spikes(num_train, seed=42)
-    test_data, test_labels = generate_digit_spikes(num_test, seed=123)
-
-    train_ds = TensorDataset(train_data, train_labels)
-    test_ds = TensorDataset(test_data, test_labels)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    print(f"  Generated {num_train} train, {num_test} test samples (synthetic)")
-    return train_loader, test_loader
-
-
-def get_dvs_gesture_loaders(
-    data_dir: Optional[str] = None,
-    num_steps: int = 50,
-    batch_size: int = 16,
-    max_train: int = 0,
-    max_test: int = 0,
-    synthetic: bool = False,
-) -> Tuple[DataLoader, DataLoader]:
-    """Load DVS-Gesture neuromorphic dataset.
-
-    DVS-Gesture contains 11 hand gestures recorded with a DVS camera.
-    The dataset is ~1.5GB, so fallback to synthetic is supported.
-
-    Uses snnTorch spikevision. Pass ``synthetic=True`` for generated spike data;
-    a load failure raises rather than silently substituting it.
-
-    Args:
-        data_dir: Directory to store/load DVS-Gesture data.
-        num_steps: Number of timesteps for spike binning.
-        batch_size: Batch size for DataLoader.
-        max_train: Maximum training samples (0=full dataset, ~1077).
-        max_test: Maximum test samples (0=full dataset, ~264).
-        synthetic: Force synthetic data (skip download attempt).
-
-    Returns:
-        Tuple of (train_loader, test_loader).
-        Data format: (batch, num_steps, 2, 128, 128) or downsampled.
-        Label format: (batch,) with values 0-10 (11 gesture classes).
-
-    Gesture classes:
-        0: hand_clapping, 1: right_hand_wave, 2: left_hand_wave,
-        3: right_arm_cw, 4: right_arm_ccw, 5: left_arm_cw,
-        6: left_arm_ccw, 7: arm_roll, 8: air_drums,
-        9: air_guitar, 10: other_gestures
-
-    Example:
-        >>> train_loader, test_loader = get_dvs_gesture_loaders(synthetic=True)
-        >>> for data, labels in train_loader:
-        ...     # data: (batch, time, polarity, H, W)
-        ...     pass
-    """
-    if synthetic:
-        return _generate_synthetic_dvs_gesture(num_steps, batch_size, max_train, max_test)
-
-    data_dir = data_dir or _default_data_dir("dvs_gesture")
-    if not _HAS_SNNTORCH:
-        raise RuntimeError(
-            "DVS-Gesture needs snnTorch (pip install 'polystep[experiments]'). "
-            "Pass synthetic=True to benchmark on generated spike data instead."
-        )
-    try:
-        return _load_dvs_gesture_snntorch(data_dir, num_steps, batch_size, max_train, max_test)
-    except Exception as e:
-        raise RuntimeError(
-            f"Loading DVS-Gesture from {data_dir} failed: {e}. Pass synthetic=True to "
-            "benchmark on generated spike data instead."
-        ) from e
-
-
-def _load_dvs_gesture_snntorch(
-    data_dir: str,
-    num_steps: int,
-    batch_size: int,
-    max_train: int,
-    max_test: int,
-) -> Tuple[DataLoader, DataLoader]:
-    """Load DVS-Gesture using snnTorch spikevision."""
-    from snntorch.spikevision import spikedata
-
-    print(f"  Loading DVS-Gesture from snnTorch (data_dir={data_dir})...")
-    print("  Note: First download is ~1.5GB and may take several minutes.")
-
-    train_ds = spikedata.DVSGesture(
-        root=data_dir,
-        train=True,
-        num_steps=num_steps,
-        dt=1000,
-    )
-    test_ds = spikedata.DVSGesture(
-        root=data_dir,
-        train=False,
-        num_steps=num_steps,
-        dt=1000,
-    )
-
-    if max_train > 0 and len(train_ds) > max_train:
-        train_ds = torch.utils.data.Subset(train_ds, range(max_train))
-    if max_test > 0 and len(test_ds) > max_test:
-        test_ds = torch.utils.data.Subset(test_ds, range(max_test))
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    return train_loader, test_loader
-
-
-def _generate_synthetic_dvs_gesture(
-    num_steps: int,
-    batch_size: int,
-    max_train: int,
-    max_test: int,
-) -> Tuple[DataLoader, DataLoader]:
-    """Generate synthetic DVS-Gesture-like spike data.
-
-    Creates synthetic gesture patterns. Each gesture has a distinct
-    spatio-temporal activation pattern.
-    """
-    print("  Generating synthetic DVS-Gesture data...")
-
-    num_train = max_train if max_train > 0 else 500
-    num_test = max_test if max_test > 0 else 100
-    height, width = 32, 32  # Downsampled from 128x128 for efficiency
-    num_classes = 11
-
-    def generate_gesture_spikes(num_samples: int, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        rng = torch.Generator().manual_seed(seed)
-
-        labels = torch.randint(0, num_classes, (num_samples,), generator=rng)
-        data = torch.zeros(num_samples, num_steps, 2, height, width)
-
-        for i, label in enumerate(labels):
-            c = label.item()
-            # Each gesture has different temporal pattern
-            for t in range(num_steps):
-                # Spatial pattern varies by gesture class
-                phase = (t / num_steps + c / num_classes) * 2 * 3.14159
-                center_y = int((height // 2) + (height // 4) * np.sin(phase * (c % 3 + 1)))
-                center_x = int((width // 2) + (width // 4) * np.cos(phase * (c % 4 + 1)))
-
-                # Create activation region around center
-                y_start = max(0, center_y - height // 8)
-                y_end = min(height, center_y + height // 8)
-                x_start = max(0, center_x - width // 8)
-                x_end = min(width, center_x + width // 8)
-
-                # Spike probability in active region
-                prob = 0.3 + 0.3 * np.sin(phase)
-                noise = torch.rand(y_end - y_start, x_end - x_start, generator=rng)
-                spikes = (noise < prob).float()
-
-                data[i, t, c % 2, y_start:y_end, x_start:x_end] = spikes
-
-        return data, labels
-
-    train_data, train_labels = generate_gesture_spikes(num_train, seed=42)
-    test_data, test_labels = generate_gesture_spikes(num_test, seed=123)
-
-    train_ds = TensorDataset(train_data, train_labels)
-    test_ds = TensorDataset(test_data, test_labels)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    print(f"  Generated {num_train} train, {num_test} test samples (synthetic gestures)")
-    return train_loader, test_loader
-
-
-@torch.no_grad()
-def evaluate_snn_accuracy(model: nn.Module, dataloader: DataLoader, scale_output: float = 10.0) -> float:
-    """Compute classification accuracy for SNN models.
-
-    Args:
-        model: SNN model that outputs spike rates.
-        dataloader: DataLoader with (spike_data, labels).
-        scale_output: Scale factor for spike rates before argmax.
-            SNNs output rates in [0,1], scaling helps with CrossEntropyLoss.
-
-    Returns:
-        Accuracy as a float between 0 and 1.
-    """
-    model.eval()
-    device = next(model.parameters()).device
-    correct = 0
-    total = 0
-
-    for batch in dataloader:
-        data, targets = batch
-        data = data.to(device)
-        targets = targets.to(device)
-
-        # SNN outputs spike rates
-        outputs = model(data) * scale_output
-        preds = outputs.argmax(dim=-1)
-        correct += (preds == targets).sum().item()
-        total += targets.size(0)
-
-    model.train()
-    return correct / total if total > 0 else 0.0

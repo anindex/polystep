@@ -5,63 +5,112 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Pull requests only. On main the ref is shared with the nightly schedule, so
+  # cancelling would let a push kill an in-flight slow run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
-  # The runners have no GPU. The default PyPI torch drags in ~2.7 GB of nvidia-*
-  # CUDA wheels on top of a 1.1 GB torch; the CPU index ships one ~200 MB wheel.
+  # Runners have no GPU. Default PyPI torch pulls ~2.7 GB of nvidia-* wheels on top of a
+  # 1.1 GB torch; the cpu index ships one ~200 MB wheel. uv-only, and no pip extra index:
+  # an extra index widens the set of package names a second host can claim, and the jobs
+  # that need torch all resolve it through uv.
   UV_TORCH_BACKEND: cpu
-  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
-          cache: 'pip'
-          cache-dependency-path: 'pyproject.toml'
-      - run: pip install ruff==0.15.12
-      - run: ruff check src/polystep/ tests/ examples/ experiments/scripts/
-      - run: ruff format --check src/polystep/ tests/ examples/ experiments/scripts/
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # Pinned to the same version as the dev extra, so format never disagrees with a
+      # local run. uvx fetches the one tool without resolving the project.
+      - run: uvx ruff@0.15.13 check .
+      - run: uvx ruff@0.15.13 format --check .
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        # 3.13 dropped on pull requests: the four legs test the same code and the
+        # bookends have caught every version-specific failure so far.
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11","3.12","3.14"]') || fromJSON('["3.11","3.12","3.13","3.14"]') }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: 'pyproject.toml'
-      - uses: actions/setup-python@v5
+          # setup-uv's key omits the interpreter: without a suffix the legs share one
+          # entry and three re-download torch for the wrong cpXY tag every run.
+          cache-suffix: py${{ matrix.python-version }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      # Coverage instrumentation costs ~30% and the number is identical on every
-      # leg, so only 3.12 pays for it.
+      # Coverage costs ~30% and reports the same number on every leg, so only 3.12
+      # runs it. -rs prints skip reasons: ~14 tests importorskip torchvision,
+      # gymnasium or pysat, which [dev] does not install.
       - name: Core library tests
         run: |
           uv pip install --system -e ".[dev]"
           if [ "${{ matrix.python-version }}" = "3.12" ]; then
-            pytest tests/ -m "not slow and not gpu" --timeout=120 -n auto \
+            pytest tests/ -rs -m "not slow and not gpu" --timeout=120 -n auto \
               --cov=polystep --cov-report=term-missing
           else
-            pytest tests/ -q -m "not slow and not gpu" --timeout=120 -n auto
+            pytest tests/ -q -rs -m "not slow and not gpu" --timeout=120 -n auto
           fi
+
+  slow:
+    # The real-data accuracy assertions live behind -m slow, which every other job
+    # deselects. Nightly and on demand, not per push: the MNIST legs download the
+    # dataset and take about a minute.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'pyproject.toml'
+          cache-suffix: slow
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Slow tests
+        run: |
+          uv pip install --system -e ".[dev]" torchvision
+          pytest tests/ -q -rs -m "slow and not gpu" --timeout=900
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'pyproject.toml'
+          cache-suffix: build
       - name: Build sdist + wheel
         run: uv build
       - name: Install wheel into a clean venv
@@ -74,20 +123,30 @@ jobs:
         run: .venv/bin/python -c "import importlib.resources, polystep; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
 
   sdist:
-    # The sdist ships the test suite, so it must actually be runnable from the tarball.
-    # setuptools' default selection picks up tests/test*.py but not conftest.py, which
-    # silently shipped a suite that errored on every fixture lookup.
+    # The sdist ships the test suite, so it has to run from the tarball. setuptools'
+    # default selection takes tests/test*.py but not conftest.py, which once shipped a
+    # suite that errored on every fixture lookup.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - uses: astral-sh/setup-uv@v5
-      - name: Unpack, install and run the shipped tests
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'pyproject.toml'
+          cache-suffix: sdist
+      - name: Unpack and check the shipped tests are runnable
         run: |
           uv build --sdist
           mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
           cd /tmp/sdist
           uv pip install --system ".[dev]"
-          pytest tests/ -q -m "not slow and not gpu" --timeout=120 -n auto
+          # Collection is the check: it fails if conftest.py did not ship. The test job
+          # already runs the suite itself.
+          pytest tests/ -q --collect-only -m "not slow and not gpu" > /dev/null
+          pytest tests/test_api.py -q -m "not slow and not gpu" --timeout=120

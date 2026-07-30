@@ -11,9 +11,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
 requires-python = ">=3.11"
-# numpy is required at import time by the shipped polystep.benchmarks subpackage
-# (utils, baselines, rl.gym_evaluator), not by the optimizer itself.
-dependencies = ["torch>=2.8", "numpy>=2.0"]
+dependencies = ["torch>=2.8"]
 keywords = ["pytorch", "optimal-transport", "gradient-free", "sinkhorn", "polystep", "optimization", "neural-network"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -39,6 +37,7 @@ Issues = "https://github.com/anindex/polystep/issues"
 [project.optional-dependencies]
 # Lightweight: just enough for examples/ demos
 examples = [
+    "numpy>=2.0",
     "torchvision>=0.25",
     "matplotlib>=3.8",
     "Pillow>=10.0",
@@ -47,24 +46,24 @@ examples = [
 ]
 # Core dev: lint + test the library itself (no experiment deps)
 dev = [
+    "numpy>=2.0",  # the test suite loads MNIST through it
     "pytest>=8.0",
     "pytest-timeout>=2.2",
     "pytest-rerunfailures>=14.0",
     "pytest-cov>=5.0",
     "pytest-xdist>=3.5",  # -n auto; the suite has no shared mutable state between tests
-    "ruff==0.15.12",  # pinned to match CI so `ruff format` never disagrees local vs CI
+    "ruff==0.15.13",  # pinned to match CI so `ruff format` never disagrees local vs CI
 ]
 # Full experiment reproduction (paper results, ablations, baselines)
 experiments = [
+    "numpy>=2.0",  # polystep.benchmarks imports it; the optimizer itself does not
     "pandas>=2.0",
     "python-sat",  # unusual pre-release versioning, left unpinned to stay installable
     "torchvision>=0.25",
     "cma>=3.3",  # run_elevation / run_moe / run_maxsat baselines
     "evotorch>=0.5",  # CMAES baseline (benchmarks.baselines.train_cmaes)
-    "nevergrad>=1.0",  # nevergrad baseline (benchmarks.baselines)
-    "snntorch>=0.7",  # SNN spike datasets (benchmarks.utils)
-    "tabulate>=0.9",  # results tables (benchmarks.utils)
-    "datasets>=2.14",  # HuggingFace SST-2 / text loaders (benchmarks.utils)
+    "snntorch>=0.7",  # LIF neurons in benchmarks.utils.SpikingNet
+    "datasets>=2.14",  # HuggingFace loader in experiments/runners/run_gpt2_finetune.py
     "gymnasium>=0.29",
 ]
 # RL experiments (Box2D envs)
@@ -90,14 +89,13 @@ target-version = "py311"
 src = ["src"]
 
 [tool.ruff.lint]
-ignore = ["E501", "F401"]
+ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
-# Benchmark scripts, optimizer, and examples use deferred imports after
-# sys.path manipulation or long module-level docstrings - E402 is intentional.
-"src/polystep/benchmarks/*.py" = ["E402"]
+# Deferred imports after sys.path manipulation or a long module-level docstring.
+# Every entry below suppresses a live violation; the __init__.py F401 entry that used
+# to sit here suppressed none, since those modules re-export through __all__.
 "src/polystep/optimizer.py" = ["E402"]
-"experiments/scripts/*.py" = ["E402"]
 "examples/*.py" = ["E402"]
 
 [tool.pytest.ini_options]
@@ -107,7 +105,9 @@ markers = [
     "gpu: marks tests requiring CUDA GPU",
     "flaky: retried by pytest-rerunfailures; registered so a missing plugin only skips the retry",
 ]
-addopts = "-m 'not slow' --timeout=60"
+# Matches the CI gate, so a local run selects the same tests as a PR. Opt back in
+# with `pytest -m gpu` or `pytest -m slow`, which override this.
+addopts = "-m 'not slow and not gpu' --timeout=120"
 filterwarnings = [
     "ignore:`torch.jit.script_method`:DeprecationWarning",
     "ignore:This process.*is multi-threaded, use of fork:DeprecationWarning",

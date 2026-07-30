@@ -9,10 +9,8 @@ projections with :class:`AdaptiveSubspace`'s synchronized rotation:
   (empirically ~4.3% vs ~0.25% on MNIST MLPs).
 - **Synchronized rotation.** All layer projections rotate on the same
   schedule (every ``rotation_interval`` steps; ``0`` disables rotation).
-- **QR-orthonormal per-layer columns** in the common tall case
-  (``num_params >= num_coords``), giving isotropic unit-norm perturbations
-  (``||delta||^2 ~ num_coords`` for unit-variance coords); the rare wide case
-  falls back to ``1/sqrt(num_coords)`` scaled Gaussian. This differs from
+- **QR-orthonormal per-layer columns**, giving isotropic unit-norm perturbations
+  (``||delta||^2 ~ num_coords`` for unit-variance coords). This differs from
   :class:`LinearSubspace`'s scaled-Gaussian columns (``||delta||^2 ~ num_params``):
   switching ``LinearSubspace`` -> ``HybridSubspace`` at the *same* ``step_radius``
   changes the actual perturbation magnitude by ``sqrt(num_coords / num_params)``
@@ -45,10 +43,10 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
 
-from .solvers._prelude import thin_qr
+from .solvers._shared import decomposition_dtype, thin_qr
 
 from .projection.sparse import SparseRandomProjection
-from .subspace import _stable_entry_seed, absorb_due
+from .subspace import ProjectedAbsorbMixin, ProjectionSpec, SvdRatioMixin, _stable_entry_seed, absorb_due
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -56,32 +54,34 @@ if TYPE_CHECKING:
     from .transform import ParamLayout
 
 
-@dataclass(frozen=True)
-class LayerProjectionSpec:
-    """Describes the projection mapping for a single parameter entry.
+# Same seven fields as the canonical spec; kept as a name, not a second class.
+LayerProjectionSpec = ProjectionSpec
 
-    Each layer has its own projection matrix P_layer of shape
-    (num_params, num_coords) that maps subspace coordinates to parameter
-    perturbations.
 
-    Attributes:
-        entry_key: state_dict key (e.g., "fc1.weight").
-        original_shape: Original parameter shape.
-        num_params: Total elements in this parameter (d_out * d_in for 2D).
-        num_coords: Number of subspace coordinates allocated to this layer.
-        flat_start: Start offset into the global subspace vector.
-        flat_end: End offset into the global subspace vector.
-        is_projected: True for 2D+ params (uses projection), False for 1D
-            (biases pass through directly without projection).
+def _mixed_entry_dtypes(layout: "ParamLayout") -> "Optional[Dict[str, torch.dtype]]":
+    """Per-entry dtypes, or None when they already agree.
+
+    Only heterogeneity needs recording. A uniform model must keep deferring to the dtype
+    the caller asks for, which is how ``mixed_precision`` casts the projections to BF16
+    and how a device move re-materializes them.
     """
+    dtypes = {e.key: e.dtype for e in layout.entries}
+    floats = {d for d in dtypes.values() if d.is_floating_point}
+    return dtypes if len(floats) > 1 else None
 
-    entry_key: str
-    original_shape: Tuple[int, ...]
-    num_params: int
-    num_coords: int
-    flat_start: int
-    flat_end: int
-    is_projected: bool = True
+
+def _require_tall(spec: "LayerProjectionSpec") -> None:
+    """Every spec builder caps ``num_coords`` at ``num_params``.
+
+    A wide spec has no orthonormal basis, so QR would drop columns and a Gaussian
+    fallback would sample at gain ``sqrt(num_params / num_coords)`` where the step
+    radii assume 1. Reject it rather than move at the wrong scale.
+    """
+    if spec.num_params < spec.num_coords:
+        raise ValueError(
+            f"{spec.entry_key}: num_coords ({spec.num_coords}) exceeds num_params "
+            f"({spec.num_params}), which has no orthonormal projection."
+        )
 
 
 def _scale_specs_to_budget(
@@ -89,59 +89,57 @@ def _scale_specs_to_budget(
     max_dim: "Optional[int]",
     current_dim: int,
 ) -> "Tuple[list, int]":
-    """Proportionally scale projected specs to fit within max_dim budget.
+    """Scale projected specs so the total stays within ``max_dim``.
 
-    Only scales specs that are already projected (2D+ weight matrices).
-    Unprojected 1D params (biases, LayerNorm) are kept at full size since
-    they are tiny and projecting them adds overhead without benefit.
+    Unprojected specs keep their full width: they are perturbed directly and have no
+    rank to trade away. The rest share what is left, proportionally, against a running
+    budget so per-spec rounding cannot accumulate past the cap.
 
-    Returns (new_specs, new_total_dim). No-op when max_dim is None or
-    current_dim already fits.
+    Returns ``(new_specs, new_total_dim)``. No-op when ``max_dim`` is None or the
+    current total already fits.
     """
     if max_dim is None or current_dim <= max_dim:
         return specs, current_dim
 
-    # Compute budget available for projected specs after reserving 1D params
     unprojected_dim = sum(s.num_coords for s in specs if not s.is_projected)
-    projected_dim = current_dim - unprojected_dim
-    target_projected = max(1, max_dim - unprojected_dim)
+    n_projected = sum(1 for s in specs if s.is_projected)
+    target_projected = max_dim - unprojected_dim
 
+    if target_projected < n_projected:
+        # Unprojected width alone exceeds the budget, so the cap is unreachable.
+        # Floor every projected spec at one coordinate and say what it cost.
+        target_projected = n_projected
+        warnings.warn(
+            f"max_subspace_dim={max_dim} is unreachable: unprojected parameters take "
+            f"{unprojected_dim} coordinates and {n_projected} projected layers need one "
+            f"each, so the subspace is {unprojected_dim + n_projected}.",
+            stacklevel=3,
+        )
+
+    projected_dim = current_dim - unprojected_dim
     if projected_dim <= target_projected:
         return specs, current_dim
 
     scale = target_projected / projected_dim
+    remaining, left = target_projected, n_projected
     new_specs: list = []
     new_offset = 0
     for spec in specs:
         if spec.is_projected:
-            new_coords = max(1, round(spec.num_coords * scale))
-            new_coords = min(new_coords, spec.num_params)
-            new_specs.append(
-                replace(
-                    spec,
-                    num_coords=new_coords,
-                    flat_start=new_offset,
-                    flat_end=new_offset + new_coords,
-                    # At full width the projection is the identity, so perturb the
-                    # parameter directly rather than allocating an eye(num_params).
-                    is_projected=new_coords < spec.num_params,
-                )
-            )
-        else:
-            # Keep 1D params at full size, no projection
-            new_specs.append(
-                replace(
-                    spec,
-                    flat_start=new_offset,
-                    flat_end=new_offset + spec.num_coords,
-                )
-            )
-        new_offset += new_specs[-1].num_coords
+            left -= 1
+            headroom = min(spec.num_params, remaining - left)
+            num_coords = min(max(1, round(spec.num_coords * scale)), headroom)
+            remaining -= num_coords
+            # At full width the projection is the identity, so perturb the parameter
+            # directly rather than allocating an eye(num_params).
+            spec = replace(spec, num_coords=num_coords, is_projected=num_coords < spec.num_params)
+        new_specs.append(replace(spec, flat_start=new_offset, flat_end=new_offset + spec.num_coords))
+        new_offset += spec.num_coords
     return new_specs, new_offset
 
 
 @dataclass
-class HybridSubspace:
+class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     """Hybrid subspace compression with per-layer projections and global rotation.
 
     Combines LinearSubspace's per-layer structure with AdaptiveSubspace's
@@ -151,7 +149,7 @@ class HybridSubspace:
     Two rotation modes are supported:
 
     - ``'random'``: Regenerates all layer projections with new seeds.
-      Simple but effective for exploration.
+      Cheap, and adequate for exploration.
 
     - ``'displacement'``: Uses SVD of recent displacement history to retain
       productive directions per layer. The fraction of SVD-derived directions
@@ -169,7 +167,6 @@ class HybridSubspace:
         # Auto rank selection based on compression ratio
         hybrid = HybridSubspace.auto_from_layout(layout, min_rank=4, max_rank=64)
 
-        # Initialize projections
         projections = hybrid.init_projections(torch.device('cpu'), torch.float32)
 
         # Rotate all projections together
@@ -205,19 +202,19 @@ class HybridSubspace:
     absorb_patience: int = 20
     absorb_interval: int = 0
     sparse_threshold_bytes: int = 1_000_000_000  # 1GB: layers exceeding this use sparse projection
-    projection_mode: str = "random"  # 'random' (dense Gaussian) or 'structured' (block-diagonal)
-    # Absorb-aligned active subspace (opt-in, default off = unchanged behavior). When True, the absorb
-    # boundary regenerates projections via displacement-SVD (retain productive directions) instead of a
-    # fresh RANDOM redraw. Safe precisely at absorb: the duals are already reset there, so this dodges the
-    # per-step-rotation dual-reset degradation that keeps rotation_interval=0. Lets a SMALLER rank stay
-    # aligned with descent across absorbs -> fewer working dims -> fewer forward-evals/step (if the local
-    # descent is truly low-rank; else it is a no-op).
+    # Regenerate at the absorb boundary by displacement-SVD instead of a random redraw.
+    # Safe there because the duals are already reset, so it avoids the per-step-rotation
+    # degradation that keeps rotation_interval=0. Lets a smaller rank track descent
+    # across absorbs, or is a no-op if the local descent is not low-rank.
     absorb_aligned_active: bool = False
 
-    # Track total params for compression ratio calculation
     _total_params: int = 0
     # Budget control settings (preserved across rank transitions)
     _max_subspace_dim: Optional[int] = None
+    # Per-entry parameter dtype. Coordinates carry the layout's dominant dtype, so on a
+    # mixed-dtype model a minority entry's projection has to be built at its own dtype or
+    # the reconstruction matmul mixes Double and Float. Empty means uniform.
+    _entry_dtypes: Optional[Dict[str, torch.dtype]] = None
 
     def __post_init__(self) -> None:
         if self.rotation_interval != 0:
@@ -229,9 +226,7 @@ class HybridSubspace:
         if self.compression_ratio == 0.0 and self._total_params > 0:
             object.__setattr__(self, "compression_ratio", self.subspace_dim / self._total_params)
 
-    # ------------------------------------------------------------------
     # Factory methods
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_layout(
@@ -312,7 +307,6 @@ class HybridSubspace:
                 )
                 offset += num_elements
 
-        # Apply budget cap if specified
         specs, offset = _scale_specs_to_budget(specs, max_subspace_dim, offset)
 
         total_params = layout.total_params
@@ -325,6 +319,7 @@ class HybridSubspace:
             seed=seed,
             _total_params=total_params,
             _max_subspace_dim=max_subspace_dim,
+            _entry_dtypes=_mixed_entry_dtypes(layout),
             **kwargs,
         )
 
@@ -404,7 +399,6 @@ class HybridSubspace:
                 )
                 offset += num_elements
 
-        # Apply budget cap if specified
         specs, offset = _scale_specs_to_budget(specs, max_subspace_dim, offset)
 
         total_params = layout.total_params
@@ -417,49 +411,37 @@ class HybridSubspace:
             seed=seed,
             _total_params=total_params,
             _max_subspace_dim=max_subspace_dim,
+            _entry_dtypes=_mixed_entry_dtypes(layout),
             **kwargs,
         )
 
-    # ------------------------------------------------------------------
     # Projection management
-    # ------------------------------------------------------------------
 
     def init_projections(
         self,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Dict[str, Union[torch.Tensor, SparseRandomProjection]]:
-        """Generate per-layer projection matrices.
+        """Per-layer projection matrices, one ``(num_params, num_coords)`` per layer.
 
-        Creates a projection matrix P_layer of shape (num_params, num_coords)
-        for each layer using deterministic seeded random generation. Each
-        projection is scaled by 1/sqrt(num_coords) for unit-variance output,
-        matching LinearSubspace's scaling convention.
+        Seeded at step 0, so every call for a given ``(device, dtype)`` rebuilds the same
+        basis. Memoized and returned by identity, which skips the per-layer QR on absorb.
+        Callers must not write into the result: rotations and rank transitions build new
+        projections rather than mutating these.
 
-        Layers whose dense projection would exceed ``sparse_threshold_bytes``
-        automatically use ``SparseRandomProjection`` instead, reducing memory
-        by ~100-1000x for large layers.
+        Layers whose dense projection would exceed ``sparse_threshold_bytes`` get a
+        ``SparseRandomProjection`` instead.
 
-        Args:
-            device: Target device for projection matrices.
-            dtype: Target dtype for projection matrices.
-
-        Returns:
-            Dict mapping entry_key to projection matrix (dense Tensor or
-            SparseRandomProjection for large layers).
-
-        Example::
-
-            projections = hybrid.init_projections(torch.device('cpu'), torch.float32)
-            for key, P in projections.items():
-                print(f'{key}: {type(P).__name__}')
+        Returns a dict keyed by entry, values dense or sparse per layer.
         """
+        cached = getattr(self, "_init_projections_cache", None)
+        if cached is not None and cached[0] == (device, dtype):
+            return cached[1]
         projections: Dict[str, Union[torch.Tensor, SparseRandomProjection]] = {}
         for spec in self.specs:
             if not spec.is_projected:
                 continue  # 1D params add coords directly; storing an eye wastes O(n^2)
-            dense_bytes = spec.num_params * spec.num_coords * 4  # float32
-            if spec.is_projected and dense_bytes > self.sparse_threshold_bytes:
+            if self._use_sparse(spec):
                 entry_seed = _stable_entry_seed(self.seed, spec.entry_key, 0)
                 projections[spec.entry_key] = SparseRandomProjection(
                     full_dim=spec.num_params,
@@ -469,7 +451,23 @@ class HybridSubspace:
             else:
                 P = self._get_projection(spec, device, dtype, step=0)
                 projections[spec.entry_key] = P
+        # Not an __init__ field, so dataclasses.replace drops it, matching _fused_P.
+        self._init_projections_cache = ((device, dtype), projections)
         return projections
+
+    def entry_dtype(self, spec: LayerProjectionSpec, default: torch.dtype) -> torch.dtype:
+        """The dtype this entry's projection is built at.
+
+        Its own parameter dtype, matching :class:`LinearSubspace`, which resolves it from
+        ``base.dtype`` at reconstruct time. Coordinates stay at the layout's dominant
+        dtype, so a minority entry's chunk is cast at the matmul rather than the whole
+        projection being rebuilt.
+        """
+        return (self._entry_dtypes or {}).get(spec.entry_key, default)
+
+    def _use_sparse(self, spec: LayerProjectionSpec) -> bool:
+        """Whether this layer's dense projection would exceed the byte threshold."""
+        return spec.num_params * spec.num_coords * 4 > self.sparse_threshold_bytes
 
     def _get_projection(
         self,
@@ -481,14 +479,7 @@ class HybridSubspace:
         """Generate the projection matrix for a parameter entry.
 
         Generates P of shape (num_params, num_coords) deterministically from
-        self.seed, spec.entry_key, and step. Dispatches on ``projection_mode``:
-
-        - ``'random'``: Dense Gaussian projection with 1/sqrt(num_coords) scaling.
-        - ``'structured'``: Block-diagonal projection preserving weight matrix
-          row structure (SubZero-inspired).
-
-        For 1D parameters (biases), returns identity-like mapping since
-        num_params == num_coords (regardless of projection_mode).
+        self.seed, spec.entry_key and step: a dense Gaussian, QR-orthogonalized.
 
         Args:
             spec: LayerProjectionSpec for this parameter.
@@ -499,21 +490,9 @@ class HybridSubspace:
         Returns:
             Projection matrix P of shape (num_params, num_coords).
         """
-        # 1D params: identity-like projection
-        if spec.num_params == spec.num_coords:
-            return torch.eye(
-                spec.num_params,
-                dtype=dtype,
-                device=device,
-            )
-
-        if self.projection_mode == "structured":
-            return self._init_structured_projection(spec, device, dtype, step)
-
-        # Default: dense random Gaussian projection with QR-orthogonal columns.
-        # QR orthogonalization (inspired by SubZero, ICCV 2025) gives lower
-        # variance perturbations than i.i.d. scaled Gaussian columns, improving
-        # per-step signal quality at negligible extra cost.
+        dtype = self.entry_dtype(spec, dtype)
+        # Dense Gaussian with QR-orthogonal columns: lower-variance perturbations than
+        # i.i.d. scaled columns at the same cost (SubZero, ICCV 2025).
         entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
         gen = torch.Generator(device="cpu")
         gen.manual_seed(entry_seed)
@@ -526,97 +505,15 @@ class HybridSubspace:
             dtype=dtype,
             device="cpu",
         )
-        # QR-orthogonalize columns when num_params >= num_coords (tall matrix).
-        # This produces orthonormal columns, giving isotropic perturbations.
-        # For wide matrices (more coords than params), fall back to scaled Gaussian.
-        if spec.num_params >= spec.num_coords:
-            # geqrf has no bf16/fp16 CPU kernel; orthogonalize in fp32, cast back.
-            qr_in = P_raw.float() if P_raw.dtype in (torch.bfloat16, torch.float16) else P_raw
-            P, _ = thin_qr(qr_in)  # (num_params, num_coords)
-            P = P.to(dtype=P_raw.dtype)
-        else:
-            P = P_raw * (1.0 / math.sqrt(spec.num_coords))
-        P = P.to(device=device)
+        _require_tall(spec)
+        # geqrf has no bf16/fp16 CPU kernel; orthogonalize in fp32, cast back.
+        qr_in = P_raw.to(decomposition_dtype(P_raw.dtype))
+        P, _ = thin_qr(qr_in)  # (num_params, num_coords)
+        P = P.to(dtype=P_raw.dtype).to(device=device)
 
         return P
 
-    def _init_structured_projection(
-        self,
-        spec: LayerProjectionSpec,
-        device: torch.device,
-        dtype: torch.dtype,
-        step: int = 0,
-    ) -> torch.Tensor:
-        """Create block-diagonal structured projection for a layer.
-
-        For a weight matrix of shape (d_out, d_in), treats each row as a group.
-        The projection matrix is block-diagonal: each d_in-sized block gets its
-        own small random projection. This preserves within-row correlations.
-
-        SubZero insight (Malladi et al. 2024): instead of projecting all
-        d_out*d_in params together (losing structure), project groups of d_in
-        params independently (preserving row structure of the weight matrix).
-
-        For layers where d_out*d_in = num_params:
-        - Split into d_out blocks of d_in params each
-        - Each block gets a (d_in, block_coords) random projection
-        - Assemble into a block-diagonal (num_params, num_coords) matrix
-
-        Args:
-            spec: LayerProjectionSpec for this parameter.
-            device: Target device.
-            dtype: Target dtype.
-            step: Current step (used for rotation seed).
-
-        Returns:
-            Block-diagonal projection matrix of shape (num_params, num_coords).
-        """
-        d_out = spec.original_shape[0]
-        d_in = spec.num_params // d_out
-
-        # Distribute coords across blocks
-        coords_per_block = max(1, math.ceil(spec.num_coords / d_out))
-        actual_total_coords = coords_per_block * d_out
-
-        # Deterministic seed from global seed + entry key + step
-        entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(entry_seed)
-
-        # Build block-diagonal projection on CPU
-        P = torch.zeros(spec.num_params, actual_total_coords, dtype=dtype, device="cpu")
-        for i in range(d_out):
-            row_start = i * d_in
-            row_end = row_start + d_in
-            col_start = i * coords_per_block
-            col_end = col_start + coords_per_block
-            block = torch.randn(
-                d_in,
-                coords_per_block,
-                generator=gen,
-                dtype=dtype,
-                device="cpu",
-            )
-            block.mul_(1.0 / math.sqrt(coords_per_block))
-            P[row_start:row_end, col_start:col_end] = block
-
-        # Handle rounding: pad or truncate to match num_coords
-        if actual_total_coords < spec.num_coords:
-            pad = torch.zeros(
-                spec.num_params,
-                spec.num_coords - actual_total_coords,
-                dtype=dtype,
-                device="cpu",
-            )
-            P = torch.cat([P, pad], dim=1)
-        elif actual_total_coords > spec.num_coords:
-            P = P[:, : spec.num_coords]
-
-        return P.to(device=device)
-
-    # ------------------------------------------------------------------
     # Rotation coordination
-    # ------------------------------------------------------------------
 
     def rotate_all(
         self,
@@ -655,10 +552,9 @@ class HybridSubspace:
                 displacement_history=displacement
             )
         """
-        # Skip rotation if rotation is disabled (interval <= 0) or not on interval
-        if self.rotation_interval <= 0:
-            return projections
-        if self.rotation_interval > 1 and step % self.rotation_interval != 0:
+        # Same guard as FactoredSubspace.rotate_all: step 0 is the freshly seeded basis,
+        # so rotating it discards a basis nothing has been evaluated against yet.
+        if self.rotation_interval <= 0 or step <= 0 or step % self.rotation_interval != 0:
             return projections
 
         # Get device/dtype from first dense projection (sparse tensors lack .device/.dtype)
@@ -717,8 +613,7 @@ class HybridSubspace:
         for spec in self.specs:
             if not spec.is_projected:
                 continue  # 1D params add coords directly; storing an eye wastes O(n^2)
-            dense_bytes = spec.num_params * spec.num_coords * 4
-            if spec.is_projected and dense_bytes > self.sparse_threshold_bytes:
+            if self._use_sparse(spec):
                 entry_seed = _stable_entry_seed(self.seed, spec.entry_key, step)
                 new_projections[spec.entry_key] = SparseRandomProjection(
                     full_dim=spec.num_params,
@@ -801,8 +696,8 @@ class HybridSubspace:
 
         Projects the layer's displacement history to parameter space, computes
         SVD to find productive directions, keeps top k_svd directions, and fills
-        the remainder with random directions. Scaling matches _get_projection:
-        unit-norm QR columns when tall, 1/sqrt(num_coords) Gaussian when wide.
+        the remainder with random directions. Columns come back unit-norm, matching
+        _get_projection.
 
         Args:
             P_old: Current projection matrix for this layer, shape (num_params, num_coords).
@@ -816,28 +711,27 @@ class HybridSubspace:
         Returns:
             New projection matrix of shape (num_params, num_coords).
         """
-        # 1D params: return identity
-        if spec.num_params == spec.num_coords:
-            return torch.eye(spec.num_params, dtype=dtype, device=device)
+        _require_tall(spec)
+        # The rotated basis has to come back at the same dtype as the one it replaces,
+        # and P_old carries this entry's, which is not the coordinates' on a mixed model.
+        dtype = self.entry_dtype(spec, dtype)
+        # Asking for no SVD directions means a fresh random basis, and skips the SVD.
+        if svd_ratio <= 0.0:
+            return self._get_projection(spec, device, dtype, step=step)
 
         k_svd = max(1, int(svd_ratio * spec.num_coords))
         k_random = spec.num_coords - k_svd
 
-        # Project displacement history to full parameter space
-        # layer_displacement: (history_len, num_coords)
-        # P_old: (num_params, num_coords)
-        # D_full: (num_params, history_len)
-        D_full = P_old @ layer_displacement.T
+        # Displacement history to full parameter space: D_full is
+        # (num_params, history_len).
+        D_full = P_old @ layer_displacement.T.to(P_old.dtype)
 
         # Guard against non-finite values
         if not torch.isfinite(D_full).all():
             return self._get_projection(spec, device, dtype, step=step)
 
-        # SVD/PCA reject bf16/fp16 on CPU; run the decomposition in fp32 and
-        # cast the result back (mirrors AdaptiveSubspace._rotate_displacement).
         svd_dtype = D_full.dtype
-        if D_full.dtype in (torch.bfloat16, torch.float16):
-            D_full = D_full.float()
+        D_full = D_full.to(decomposition_dtype(svd_dtype))
 
         # SVD of the full-space displacement matrix. The history is short, so the
         # full decomposition costs about the same as a randomized one and stays
@@ -865,41 +759,14 @@ class HybridSubspace:
         if U_top.device != Z_random.device:
             U_top = U_top.to(device=Z_random.device)
 
-        # Match _get_projection so magnitude is continuous across the first
-        # rotation: unit-norm QR when tall, 1/sqrt(num_coords) Gaussian when wide
-        # (reduced QR would drop columns in the wide case).
+        # Unit-norm QR, matching _get_projection so magnitude is continuous across
+        # the first rotation. Tall by the same invariant _get_projection enforces.
         combined = torch.cat([U_top, Z_random], dim=1)
-        if spec.num_params >= spec.num_coords:
-            # QR requires float32 on CPU (BF16 unsupported); upcast and convert back
-            orig_dtype = combined.dtype
-            if combined.dtype == torch.bfloat16 and combined.device.type == "cpu":
-                combined = combined.float()
-            Q, _ = thin_qr(combined)
-            combined = Q.to(orig_dtype) if Q.dtype != orig_dtype else Q
-        else:
-            combined = combined * (1.0 / math.sqrt(spec.num_coords))
+        orig_dtype = combined.dtype
+        Q, _ = thin_qr(combined.to(decomposition_dtype(orig_dtype)))
+        return Q.to(orig_dtype) if Q.dtype != orig_dtype else Q
 
-        return combined
-
-    def get_svd_ratio(self, step: int, total_steps: int) -> float:
-        """Compute SVD ratio at the given step via linear interpolation.
-
-        The ratio starts at ``svd_ratio_init`` (step 0) and linearly
-        increases to ``svd_ratio_final`` (step = total_steps).
-
-        Args:
-            step: Current optimization step.
-            total_steps: Total number of steps.
-
-        Returns:
-            SVD ratio in [svd_ratio_init, svd_ratio_final].
-        """
-        progress = min(1.0, step / max(1, total_steps or 1))
-        return self.svd_ratio_init + progress * (self.svd_ratio_final - self.svd_ratio_init)
-
-    # ------------------------------------------------------------------
     # Absorb coordination
-    # ------------------------------------------------------------------
 
     def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
         """Whether to fold the perturbation into the base weights this step."""
@@ -911,9 +778,7 @@ class HybridSubspace:
             iteration,
         )
 
-    # ------------------------------------------------------------------
     # Core reconstruction methods (matching LinearSubspace contract)
-    # ------------------------------------------------------------------
 
     def apply_perturbation(
         self,
@@ -960,13 +825,13 @@ class HybridSubspace:
                     # Dense path: fused add + projection via addmm
                     result_flat = torch.addmm(
                         base.reshape(1, -1),
-                        chunk.unsqueeze(0),
+                        chunk.unsqueeze(0).to(P.dtype),
                         P.t(),
                     )
                     result[spec.entry_key] = result_flat.reshape(spec.original_shape)
             else:
                 # 1D param (bias): add coords directly
-                result[spec.entry_key] = base + chunk.reshape(spec.original_shape)
+                result[spec.entry_key] = base + chunk.reshape(spec.original_shape).to(base.dtype)
 
         return result
 
@@ -1018,10 +883,13 @@ class HybridSubspace:
     ) -> None:
         """Build a fused block-diagonal projection matrix from per-layer projections.
 
-        Combines all dense per-layer projection matrices into a single
-        block-diagonal matrix for efficient single-matmul reconstruction.
-        Only used when the fused matrix is small enough (<256 MB) to avoid
-        memory regression from dense storage of a sparse block-diagonal.
+        Combines the dense per-layer projections into one block-diagonal matrix so
+        reconstruction is a single matmul instead of one per layer, at the cost of
+        reading the zero padding on every candidate.
+
+        Two guards. A single block is just a copy, so skip it. Past ``max_fused_bytes``
+        the padding read costs more than the launches saved, so the fuse declines.
+        Measured crossover in docs/performance.md.
 
         Called once after each rotation (in optimizer.py after rotate_all).
         The fused matrix is cached in ``self._fused_P`` and reused across
@@ -1031,8 +899,18 @@ class HybridSubspace:
         self._fused_dense_specs = []  # specs participating in fused matmul
         self._fused_sparse_specs = []  # specs needing per-layer sparse path
         self._fused_bias_specs = []  # 1D params (identity, no projection)
+        self._fused_odd_dtype_specs = []  # dense, but not the fused block's dtype
         total_params = 0
         total_coords = 0
+
+        # block_diag needs one dtype. On a mixed-dtype model fuse the majority and leave
+        # the rest on the per-layer dense path, which is where they already were.
+        dense_dtypes: Dict[torch.dtype, int] = {}
+        for spec in self.specs:
+            P = projections.get(spec.entry_key)
+            if spec.is_projected and isinstance(P, torch.Tensor):
+                dense_dtypes[P.dtype] = dense_dtypes.get(P.dtype, 0) + spec.num_params
+        fuse_dtype = max(dense_dtypes, key=dense_dtypes.get) if dense_dtypes else None
 
         for spec in self.specs:
             P = projections.get(spec.entry_key)
@@ -1040,24 +918,21 @@ class HybridSubspace:
                 self._fused_bias_specs.append(spec)
             elif isinstance(P, SparseRandomProjection):
                 self._fused_sparse_specs.append((spec, P))
+            elif P.dtype is not fuse_dtype:
+                self._fused_odd_dtype_specs.append((spec, P))
             else:
                 self._fused_dense_specs.append((spec, total_params))
                 dense_blocks.append(P)
                 total_params += spec.num_params
                 total_coords += spec.num_coords
 
-        # Only fuse if the dense block-diagonal matrix is < 256 MB.
-        # Otherwise the zero-padding wastes more memory than it saves in
-        # kernel launch overhead.
         fused_bytes = total_params * total_coords * 4
-        max_fused_bytes = 256 * 1024 * 1024  # 256 MB
+        max_fused_bytes = 32 * 1024 * 1024
 
-        if dense_blocks and fused_bytes <= max_fused_bytes:
+        if len(dense_blocks) > 1 and fused_bytes <= max_fused_bytes:
             self._fused_P = torch.block_diag(*dense_blocks)
-            self._fused_total_dense_params = total_params
         else:
             self._fused_P = None
-            self._fused_total_dense_params = 0
         # The cached base row describes the old block layout.
         self.release_inplace()
 
@@ -1107,7 +982,11 @@ class HybridSubspace:
                 srcs.append(buf[0, offset : offset + spec.num_params].view(spec.original_shape))
             if dsts:
                 torch._foreach_copy_(dsts, srcs)
-            remaining = [s for s, _ in self._fused_sparse_specs] + list(self._fused_bias_specs)
+            remaining = (
+                [s for s, _ in self._fused_sparse_specs]
+                + [s for s, _ in self._fused_odd_dtype_specs]
+                + list(self._fused_bias_specs)
+            )
         else:
             remaining = self.specs
 
@@ -1128,15 +1007,15 @@ class HybridSubspace:
                     # addmm writes straight into the parameter storage.
                     torch.addmm(
                         base.reshape(1, -1),
-                        chunk.unsqueeze(0),
+                        chunk.unsqueeze(0).to(P.dtype),
                         P.t(),
                         out=param.data.reshape(1, -1),
                     )
                 else:
-                    res = torch.addmm(base.reshape(1, -1), chunk.unsqueeze(0), P.t())
+                    res = torch.addmm(base.reshape(1, -1), chunk.unsqueeze(0).to(P.dtype), P.t())
                     param.data.copy_(res.reshape(spec.original_shape))
             else:
-                param.data.copy_(base + chunk.reshape(spec.original_shape))
+                param.data.copy_(base + chunk.reshape(spec.original_shape).to(base.dtype))
 
     def reconstruct_batch(
         self,
@@ -1146,12 +1025,15 @@ class HybridSubspace:
     ) -> Dict[str, torch.Tensor]:
         """Vectorized reconstruction for N probe points.
 
-        Uses a fused block-diagonal matmul for all dense layers (single cuBLAS
-        call instead of per-layer calls), with fallback to per-layer for sparse
-        projections and 1D biases.
+        One fused block-diagonal matmul covers every dense layer, then the base
+        weights are added into that buffer in place and each layer is handed out
+        as a strided view of it. Sparse projections and 1D biases still go
+        per-layer. Falls back to the per-layer loop entirely when
+        ``build_fused_projection`` has not been called.
 
-        If ``build_fused_projection`` has not been called, falls back to the
-        per-layer loop for all entries.
+        The dense entries alias one buffer, so callers must treat them as
+        read-only. Every evaluator does: vmap/functional_call and bmm read them,
+        and the in-place path copies out of them.
 
         Args:
             projections: Dict mapping entry_key to per-layer projection matrices
@@ -1171,22 +1053,28 @@ class HybridSubspace:
             fused_delta = fused_coords @ self._fused_P.t()
 
             for spec, param_offset in self._fused_dense_specs:
-                base = base_sd[spec.entry_key]
-                delta = fused_delta[:, param_offset : param_offset + spec.num_params]
-                result_flat = base.reshape(1, -1) + delta
-                result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
+                block = fused_delta[:, param_offset : param_offset + spec.num_params]
+                block.add_(base_sd[spec.entry_key].reshape(1, -1))
+                # unflatten, not reshape: the slice is contiguous inside each row,
+                # so this is a view. reshape would copy the whole (N, num_params).
+                result[spec.entry_key] = block.unflatten(1, spec.original_shape)
 
             for spec, P in self._fused_sparse_specs:
                 chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
-                base = base_sd[spec.entry_key]
-                delta = P.project(chunk)
-                result_flat = base.reshape(1, -1) + delta
-                result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
+                # project() returns a transposed sparse-mm result, so the reshape
+                # below already copies. Adding first fuses the two passes into one.
+                delta = base_sd[spec.entry_key].reshape(1, -1) + P.project(chunk)
+                result[spec.entry_key] = delta.reshape(N, *spec.original_shape)
+
+            for spec, P in self._fused_odd_dtype_specs:
+                chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
+                delta = (chunk.to(P.dtype) @ P.t()).reshape(N, *spec.original_shape)
+                result[spec.entry_key] = delta.add_(base_sd[spec.entry_key])
 
             for spec in self._fused_bias_specs:
                 chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
                 base = base_sd[spec.entry_key]
-                delta = chunk.reshape(N, *spec.original_shape)
+                delta = chunk.reshape(N, *spec.original_shape).to(base.dtype)
                 result[spec.entry_key] = base.unsqueeze(0) + delta
 
             return result
@@ -1198,91 +1086,33 @@ class HybridSubspace:
             if spec.is_projected:
                 P = projections[spec.entry_key]
                 if isinstance(P, SparseRandomProjection):
-                    delta = P.project(chunk)
-                    result_flat = base.reshape(1, -1) + delta
-                    result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
+                    # project() returns a transposed sparse-mm result, so the reshape
+                    # already copies. Adding first fuses the two passes into one.
+                    result[spec.entry_key] = (base.reshape(1, -1) + P.project(chunk)).reshape(N, *spec.original_shape)
                 else:
-                    result_flat = base.reshape(1, -1) + chunk @ P.t()
-                    result[spec.entry_key] = result_flat.reshape(N, *spec.original_shape)
+                    result[spec.entry_key] = (chunk.to(P.dtype) @ P.t()).reshape(N, *spec.original_shape).add_(base)
             else:
-                delta = chunk.reshape(N, *spec.original_shape)
+                delta = chunk.reshape(N, *spec.original_shape).to(base.dtype)
                 result[spec.entry_key] = base.unsqueeze(0) + delta
 
         return result
-
-    def absorb(
-        self,
-        projections: Dict[str, torch.Tensor],
-        base_sd: Dict[str, torch.Tensor],
-        flat_subspace: torch.Tensor,
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Fold subspace perturbation into base weights and zero the subspace.
-
-        This operation "absorbs" the current perturbation into the base parameters,
-        allowing exploration of a new region of parameter space on subsequent steps.
-        After absorb, the projection matrices should be regenerated via rotate_all
-        to ensure diverse exploration.
-
-        Args:
-            projections: Dict mapping entry_key to per-layer projection matrices.
-            base_sd: Base state_dict to absorb perturbation into.
-            flat_subspace: Current subspace vector of shape (subspace_dim,).
-
-        Returns:
-            Tuple of (new_base_sd, zeroed_subspace_vector).
-
-        Example::
-
-            if hybrid.should_absorb(stagnation_count, iteration):
-                new_base, zero_coords = hybrid.absorb(projections, base_sd, coords)
-                # Regenerate all projections for fresh exploration
-                projections = hybrid.init_projections(device, dtype)
-        """
-        new_sd = self.apply_perturbation(projections, base_sd, flat_subspace)
-        return new_sd, torch.zeros_like(flat_subspace)
-
-
-# ------------------------------------------------------------------
-# Block creation for per-layer OT decomposition
-# ------------------------------------------------------------------
 
 
 def create_hybrid_blocks(
     hybrid: HybridSubspace,
     particle_dim: int = 8,
 ) -> "List[BlockConfig]":
-    """Create blocks for per-layer OT decomposition in hybrid mode.
+    """One ``BlockConfig`` per spec, so each layer gets its own OT solve.
 
-    Creates one BlockConfig per LayerProjectionSpec, allowing independent
-    OT solves per layer while maintaining global cost evaluation through
-    the shared projection matrices.
-
-    Unlike create_subspace_blocks (which evenly divides a global subspace),
-    this function respects layer boundaries: each block corresponds exactly
-    to one layer's subspace coordinates.
-
-    Note: Block flat ranges are computed with contiguous offsets (accounting for
-    padding between layers) and may differ from the spec flat ranges. When
-    splitting/reassembling, use the block's flat_start/flat_end, not the spec's.
+    Respects layer boundaries, where ``blockwise.create_subspace_blocks`` divides a
+    global subspace evenly. Block flat ranges use contiguous offsets that account for
+    inter-layer padding, so they can differ from the spec flat ranges: split and
+    reassemble with the block's ``flat_start``/``flat_end``, not the spec's.
 
     Args:
         hybrid: HybridSubspace instance with per-layer specs.
-        particle_dim: Dimension of each particle within a block (default 8).
-            Higher values give more polytope vertices (2*dim for orthoplex)
-            but fewer particles per block.
-
-    Returns:
-        List of BlockConfig, one per layer in hybrid.specs.
-
-    Example::
-
-        hybrid = HybridSubspace.from_layout(layout, rank=4)
-        blocks = create_hybrid_blocks(hybrid, particle_dim=8)
-        # Use blocks for per-layer OT decomposition
-
-    See Also:
-        ``blockwise.create_subspace_blocks`` for uniform subspace division.
-        ``blockwise.BlockConfig`` for block configuration details.
+        particle_dim: Dimension of each particle within a block. Higher values give
+            more polytope vertices (``2 * dim`` for orthoplex) but fewer particles.
     """
     from .blockwise import BlockConfig
 
@@ -1308,7 +1138,7 @@ def create_hybrid_blocks(
         )
         offset += padded_coords
 
-    # Note: total offset (sum of padded block dims) may exceed hybrid.subspace_dim
+    # total offset (sum of padded block dims) may exceed hybrid.subspace_dim
     # due to per-block padding. Callers must allocate vectors of size `offset`,
     # not hybrid.subspace_dim, when using these blocks.
 

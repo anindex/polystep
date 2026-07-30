@@ -21,16 +21,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, Optional, Tuple
 
 import torch
 
 from .adaptive_subspace import AdaptiveSubspace
-
 from .cma import compute_cma_hyperparameters
-
-if TYPE_CHECKING:
-    pass
 
 
 def default_mu_eff(subspace_dim: int) -> float:
@@ -39,15 +35,13 @@ def default_mu_eff(subspace_dim: int) -> float:
     ``mu_eff`` is ``1 / sum(w^2)`` over the recombination weights, which are the OT
     transport row, so its ceiling is the vertex count rather than the subspace
     dimension. ``PolyStepOptimizer`` knows the vertex count and overrides this; the
-    dimension-derived value here only applies to a standalone subspace object.
-
-    Args:
-        subspace_dim: Subspace dimension ``n``.
-
-    Returns:
-        ``mu_eff`` capped per the Hansen tutorial's ``mu ~ lambda/2 ~ O(sqrt(n))``.
+    dimension-derived value here only applies to a standalone subspace object. Capped per
+    the Hansen tutorial's ``mu ~ lambda/2 ~ O(sqrt(n))``.
     """
     return max(1.0, min(subspace_dim / 4.0, 5.0 * math.sqrt(subspace_dim)))
+
+
+_RATE_KEYS = ("c_c", "c_sigma", "c_1", "c_mu")
 
 
 @dataclass
@@ -67,8 +61,6 @@ class CMAAdaptiveSubspace:
         c_sigma: Learning rate for step-size evolution path update.
         c_1: Learning rate for rank-one covariance update.
         c_mu: Learning rate for rank-mu covariance update.
-        d_sigma: Damping factor for step-size adaptation.
-        expected_norm: Expected length of N(0,I) random vector (chi_n).
         mu_eff: Effective population size for weighted recombination.
         cov_min: Minimum allowed value for C_diag entries.
         cov_max: Maximum allowed value for C_diag entries.
@@ -80,8 +72,6 @@ class CMAAdaptiveSubspace:
     c_sigma: float = 0.0
     c_1: float = 0.0
     c_mu: float = 0.0
-    d_sigma: float = 0.0
-    expected_norm: float = 0.0
     # 0.0 is a "derive me" sentinel, like the learning rates above. A literal 1.0
     # would be a legal-looking value that silently zeroes c_mu.
     mu_eff: float = 0.0
@@ -93,64 +83,36 @@ class CMAAdaptiveSubspace:
         """Fill unset CMA hyperparameters from the Hansen formulas.
 
         Direct construction leaves them at their ``0.0`` sentinel, which makes CMA
-        inert (``c_1 = c_mu = c_c = 0`` never updates the covariance) and divides by
-        zero in the CSA update. Filling them here makes every construction path
+        inert: ``c_1 = c_mu = c_c = 0`` never updates the covariance and ``c_sigma = 0``
+        freezes the evolution path. Filling them here makes every construction path
         behave like :meth:`from_adaptive_subspace`.
         """
-        # Recorded so PolyStepOptimizer knows whether to override mu_eff with the
-        # polytope vertex count or respect a value the caller chose.
+        # Recorded so PolyStepOptimizer knows which values the caller chose and
+        # which it may derive itself.
         self._mu_eff_explicit = self.mu_eff > 0.0
-        if self.d_sigma == 0.0:
-            n = self.base.subspace_dim
-            mu_eff = self.mu_eff if self.mu_eff > 0.0 else default_mu_eff(n)
-            hyperparams = compute_cma_hyperparameters(n, mu_eff)
-            self.c_c = self.c_c or hyperparams["c_c"]
-            self.c_sigma = self.c_sigma or hyperparams["c_sigma"]
-            self.c_1 = self.c_1 or hyperparams["c_1"]
-            self.c_mu = self.c_mu or hyperparams["c_mu"]
-            self.d_sigma = hyperparams["d_sigma"]
-            self.expected_norm = self.expected_norm or hyperparams["expected_norm"]
-            self.mu_eff = mu_eff
+        self._explicit_rates = {name: value for name in _RATE_KEYS if (value := getattr(self, name)) != 0.0}
+        n = self.base.subspace_dim
+        mu_eff = self.mu_eff if self._mu_eff_explicit else default_mu_eff(n)
+        hyperparams = compute_cma_hyperparameters(n, mu_eff)
+        # Each coefficient fills independently: gating the whole block on one of them
+        # left the others at their sentinel.
+        for name in _RATE_KEYS:
+            setattr(self, name, getattr(self, name) or hyperparams[name])
+        self.mu_eff = mu_eff
 
-    @property
-    def full_dim(self) -> int:
-        """Total flattened parameter count (delegated to base)."""
-        return self.base.full_dim
+    # Everything below the CMA state forwards to ``base`` unchanged. Written out
+    # rather than routed through __getattr__ so the subspace interface stays
+    # greppable and type-checkable.
 
-    @property
-    def displacement_history_size(self) -> int:
-        """Rolling displacement-history length (delegated to base)."""
-        return self.base.displacement_history_size
-
-    @property
-    def absorb_mode(self) -> str:
-        """Absorb trigger mode (delegated to base)."""
-        return self.base.absorb_mode
-
-    @property
-    def absorb_patience(self) -> int:
-        """Stagnation steps before a stagnation absorb (delegated to base)."""
-        return self.base.absorb_patience
-
-    @property
-    def absorb_interval(self) -> int:
-        """Steps between periodic absorbs (delegated to base)."""
-        return self.base.absorb_interval
-
-    @property
-    def subspace_dim(self) -> int:
-        """Subspace dimension / rank (delegated to base)."""
-        return self.base.subspace_dim
-
-    @property
-    def compression_ratio(self) -> float:
-        """Compression ratio: subspace_dim / full_dim (delegated to base)."""
-        return self.base.compression_ratio
-
-    @property
-    def rotation_mode(self) -> str:
-        """Rotation mode: 'random' or 'displacement' (delegated to base)."""
-        return self.base.rotation_mode
+    full_dim = property(lambda self: self.base.full_dim)
+    subspace_dim = property(lambda self: self.base.subspace_dim)
+    compression_ratio = property(lambda self: self.base.compression_ratio)
+    rotation_mode = property(lambda self: self.base.rotation_mode)
+    rotation_interval = property(lambda self: self.base.rotation_interval)
+    displacement_history_size = property(lambda self: self.base.displacement_history_size)
+    absorb_mode = property(lambda self: self.base.absorb_mode)
+    absorb_patience = property(lambda self: self.base.absorb_patience)
+    absorb_interval = property(lambda self: self.base.absorb_interval)
 
     def init_projection(
         self,
@@ -158,17 +120,6 @@ class CMAAdaptiveSubspace:
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        """Initialize projection matrix (delegated to base).
-
-        Args:
-            generator: Optional torch.Generator for reproducibility.
-            device: Target device for the projection matrix. If None, uses CPU.
-            dtype: Optional dtype for projection matrix. If None, uses float32.
-                Use bfloat16 for mixed precision mode to reduce memory.
-
-        Returns:
-            Projection matrix P with shape (full_dim, subspace_dim).
-        """
         return self.base.init_projection(generator=generator, device=device, dtype=dtype)
 
     def rotate(
@@ -178,20 +129,9 @@ class CMAAdaptiveSubspace:
         total_steps: int,
         displacement_history: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        history_is_full: bool = False,
     ) -> torch.Tensor:
-        """Rotate projection basis (delegated to base).
-
-        Args:
-            projection: Current projection matrix P.
-            step: Current optimization step.
-            total_steps: Total number of optimization steps.
-            displacement_history: Optional displacement history tensor.
-            generator: Optional torch.Generator for reproducibility.
-
-        Returns:
-            New projection matrix P_new.
-        """
-        return self.base.rotate(projection, step, total_steps, displacement_history, generator)
+        return self.base.rotate(projection, step, total_steps, displacement_history, generator, history_is_full)
 
     def apply_perturbation(
         self,
@@ -199,16 +139,6 @@ class CMAAdaptiveSubspace:
         base_sd: Dict[str, torch.Tensor],
         flat_subspace: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Reconstruct full state_dict from base + subspace coords (delegated to base).
-
-        Args:
-            projection: Projection matrix P.
-            base_sd: Base state_dict.
-            flat_subspace: Subspace coordinate vector.
-
-        Returns:
-            New state_dict with perturbed parameters.
-        """
         return self.base.apply_perturbation(projection, base_sd, flat_subspace)
 
     def reconstruct_batch(
@@ -217,16 +147,6 @@ class CMAAdaptiveSubspace:
         base_sd: Dict[str, torch.Tensor],
         flat_subspace_batch: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Vectorized reconstruction for N probe points (delegated to base).
-
-        Args:
-            projection: Projection matrix P.
-            base_sd: Base state_dict.
-            flat_subspace_batch: Batch of subspace coordinates (N, subspace_dim).
-
-        Returns:
-            Dict with batched perturbed params {key: (N, *shape)}.
-        """
         return self.base.reconstruct_batch(projection, base_sd, flat_subspace_batch)
 
     def absorb(
@@ -235,28 +155,9 @@ class CMAAdaptiveSubspace:
         base_sd: Dict[str, torch.Tensor],
         flat_subspace: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Fold subspace perturbation into base weights (delegated to base).
-
-        Args:
-            projection: Projection matrix P.
-            base_sd: Base state_dict.
-            flat_subspace: Current subspace vector.
-
-        Returns:
-            Tuple of (new_base_sd, zeroed_subspace_vector).
-        """
         return self.base.absorb(projection, base_sd, flat_subspace)
 
     def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
-        """Check whether absorb should be triggered (delegated to base).
-
-        Args:
-            stagnation_count: Consecutive steps without improvement.
-            iteration: Current iteration number.
-
-        Returns:
-            True if absorb should be triggered.
-        """
         return self.base.should_absorb(stagnation_count, iteration)
 
     def apply_covariance_scaling(
@@ -283,8 +184,8 @@ class CMAAdaptiveSubspace:
         """
         C_diag_clamped = torch.clamp(C_diag, min=self.cov_min, max=self.cov_max)
         sqrt_C = torch.sqrt(C_diag_clamped)
-        # Write into a cached buffer: this runs once per step and the result is a full
-        # (full_dim, subspace_dim) tensor, 1 GB in fp32 at full_dim=500K, subspace_dim=512.
+        # Cached buffer: runs once per step and the result is a full
+        # (full_dim, subspace_dim) tensor, too large to reallocate.
         out = getattr(self, "_scaled_projection_buf", None)
         if (
             out is None
@@ -301,22 +202,9 @@ class CMAAdaptiveSubspace:
         device: str | torch.device = "cpu",
         dtype: torch.dtype = torch.float32,
     ) -> Dict[str, torch.Tensor]:
-        """Initialize CMA-ES state tensors.
+        """Fresh ``p_c``, ``p_sigma``, ``C_diag``, each ``(subspace_dim,)``, for SolverState.
 
-        Creates the initial evolution paths and diagonal covariance for a fresh
-        CMA-ES optimization run. These should be stored in SolverState.
-
-        Initial values:
-        - p_c: zeros (no accumulated covariance direction yet)
-        - p_sigma: zeros (no accumulated step-size direction yet)
-        - C_diag: ones (isotropic initial covariance)
-
-        Args:
-            device: Target device for state tensors.
-            dtype: Target dtype for state tensors.
-
-        Returns:
-            Dict with keys 'p_c', 'p_sigma', 'C_diag', each of shape (subspace_dim,).
+        Both evolution paths start at zero and the covariance isotropic at one.
         """
         subspace_dim = self.base.subspace_dim
         return {
@@ -333,22 +221,12 @@ class CMAAdaptiveSubspace:
         cov_min: float = 1e-6,
         cov_max: float = 1e6,
     ) -> "CMAAdaptiveSubspace":
-        """Create CMAAdaptiveSubspace by wrapping an existing AdaptiveSubspace.
+        """Wrap an ``AdaptiveSubspace``, deriving the CMA constants from its dimension.
 
-        CMA-ES hyperparameters (c_c, c_sigma, c_1, c_mu, d_sigma, expected_norm)
-        are automatically computed from the subspace dimension using the standard
-        Hansen formulas.
-
-        Args:
-            base: The AdaptiveSubspace to wrap.
-            mu_eff: Effective population size. If None, falls back to
-                :func:`default_mu_eff`; ``PolyStepOptimizer`` overrides that with the
-                polytope vertex count, which is the real ceiling on ``1/sum(w^2)``.
-            cov_min: Minimum allowed C_diag entry (numerical stability).
-            cov_max: Maximum allowed C_diag entry (numerical stability).
-
-        Returns:
-            CMAAdaptiveSubspace wrapping the base instance.
+        ``c_c``, ``c_sigma``, ``c_1`` and ``c_mu`` follow the Hansen formulas.
+        ``mu_eff=None`` falls back to :func:`default_mu_eff`;
+        ``PolyStepOptimizer`` overrides that with the polytope vertex count, the real
+        ceiling on ``1/sum(w^2)``. ``cov_min``/``cov_max`` clamp ``C_diag``.
         """
         # 0.0 lets __post_init__ resolve mu_eff and record it as not caller-chosen, so
         # PolyStepOptimizer is free to substitute the polytope vertex count.

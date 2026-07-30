@@ -13,8 +13,6 @@ import pytest
 
 
 class TestGenerateMaxsatInstance:
-    """Tests for generate_maxsat_instance."""
-
     @pytest.mark.parametrize(
         "key, expected_dtype",
         [("clause_vars", torch.long), ("clause_signs", torch.float)],
@@ -75,8 +73,6 @@ class TestGenerateMaxsatInstance:
 
 
 class TestGenerateSortingData:
-    """Tests for generate_sorting_data."""
-
     def test_returns_correct_shapes(self, require_experiments):
         from experiments.runners.nondiff_data import generate_sorting_data
 
@@ -113,8 +109,6 @@ class TestGenerateSortingData:
 
 
 class TestGenerateMultidomainData:
-    """Tests for generate_multidomain_data."""
-
     def test_returns_dict_with_required_keys(self, require_experiments):
         pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data

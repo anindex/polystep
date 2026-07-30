@@ -49,7 +49,6 @@ from polystep.cost_nn import NNCostEvaluator
 from polystep.epsilon import CosineEpsilon, LinearEpsilon
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.objectives.synthetic import Ackley, Rastrigin, Rosenbrock, Sphere
-from polystep.solvers import SinkhornSolver
 from polystep.subspace import LinearSubspace
 from polystep.transform import ParamLayout
 
@@ -267,8 +266,9 @@ class TinySNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mem = torch.zeros(x.shape[0], self.fc1.out_features, device=x.device)
         out = torch.zeros(x.shape[0], 10, device=x.device)
+        cur = self.fc1(x)  # static input: same injected current at every timestep
         for _ in range(self.num_steps):
-            mem = mem + self.fc1(x)
+            mem = mem + cur
             spk = (mem >= 1.0).float()  # hard LIF threshold, zero gradient a.e.
             mem = mem - spk  # reset by subtraction
             out = out + self.fc2(spk)
@@ -428,14 +428,6 @@ def screen_configs(env: Env):
             "softmax",
             subspace=_cma,
             kwargs={"use_covariance_adaptation": True},
-            needs_subspace=True,
-        ),
-        Config(
-            "cma",
-            "covariance_csa",
-            "softmax",
-            subspace=_cma,
-            kwargs={"use_covariance_adaptation": True, "use_csa": True},
             needs_subspace=True,
         ),
     ]
@@ -642,9 +634,6 @@ def self_checks(cfg: Config, state, log):
     if kw.get("use_covariance_adaptation"):
         if state.generation == 0 or state.C_diag is None:
             reasons.append("CMA generation did not advance")
-    if kw.get("use_csa"):
-        if state.sigma <= 1e-6 or state.sigma >= 1e6:
-            reasons.append("CSA sigma pinned at bound")
     if kw.get("use_adaptive_radius"):
         if abs(state.radius_multiplier - 1.0) < 1e-9:
             reasons.append("adaptive radius never moved")
@@ -713,7 +702,6 @@ def run_one(env: Env, cfg: Config, seed: int, device: str):
         "diagnostics": {
             "solver": cfg.solver,
             "radius_multiplier": float(state.radius_multiplier),
-            "sigma": float(state.sigma),
             "generation": int(state.generation),
             "absorb_count": int(state.absorb_count),
             "n_trust_updates": len(state.trust_region_multipliers),
