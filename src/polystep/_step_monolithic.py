@@ -1023,14 +1023,11 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         )
 
     # Step-radius jitter, applied PER PARTICLE to the realised displacement rather
-    # than to the scalar radius. A single shared eta would scale every block by the
-    # same factor, leaving the joint one-step law on a manifold of dimension
-    # P(d_p - 1) + 1 inside the d_sub-dimensional search subspace -- lower
-    # dimensional, so it can still meet the discontinuity set in a set of positive
-    # measure within itself. Independent per-particle radii give each block a
-    # density on its own plane, and independence across blocks gives the joint step
-    # a density on the whole search subspace, which is what Lemma
-    # ``lem:blockwise-section`` uses. No-op when step_radius_jitter == 0.
+    # than to the scalar radius. The analysis needs one scalar to be diffuse, not the
+    # joint law: for a wall normal n, either no block moves along n (and the iterate
+    # is off the wall by initialisation) or some block does, and that block's jitter
+    # gives n.theta a density on R. Per-particle draws give P independent chances of
+    # the second case where a shared radius gives one. No-op at 0.
     X_bary = opt._apply_particle_step_jitter(X, X_bary)
 
     # Reduced from tensors already in hand; syncs with the cost mean below.
