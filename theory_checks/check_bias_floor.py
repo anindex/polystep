@@ -10,7 +10,7 @@ expected displacement as -r_s eps (c grad + e), descent fails once
 and the three sources of e give
 
     B = O(d_p^2 r_p^4)              softmax linearization remainder, e1 = O(r_p^3)
-      + Theta(d_p^2 eps^2 / L_D^2)  probes straddling D,             e2 = O(pi_D)
+      + Theta(d_p^2 eps / (r_p L_D)) probes straddling D,             e2 = O(pi_D)
       + O(delta^4 Lambda_3^2)       block-coordinate coupling,       e3 = c O(delta^2 Lambda_3)
 
 The coupling term is the one that is easy to get wrong.  ``G - grad L_delta`` is a
@@ -287,10 +287,205 @@ def check_straddle_probability():
     assert abs(consts.mean() - const_pred) / const_pred < 0.05, (consts.mean(), const_pred)
 
 
+def check_straddle_term_is_linear_not_quadratic():
+    """pi_D is indicator-like along a trajectory, so it cannot be squared.
+
+    The floor's middle term is (e_2/c)^2 with e_2 = pi_D(t), and the descent
+    inequality sums r_{s,t} (pi_D(t)/c)^2.  Writing that as (avg pi_D)^2 needs
+    pi_D(t) to be a genuine small per-step probability.  For an ADAPTED iterate it
+    is not: conditional on theta_t, the probe annulus either meets a wall or it
+    does not, up to a boundary layer, so pi_D(t) is near-binary and
+    avg(pi_D^2) = Theta(avg(pi_D)), not its square.  Measured below: the ratio
+    avg(pi_D^2)/avg(pi_D) is 0.87 and flat in eps.
+
+    Consequence, and it is a correction to the paper's own Eq. for the floor:
+
+        B_2  =  (1/c^2) avg(pi_D^2)  =  Theta( d_p^2 eps / (r_p L_D) ),
+
+    LINEAR in eps, not quadratic, and carrying 1/r_p rather than no r_p at all.
+    The quadratic form is recovered only under an extra mixing hypothesis that
+    makes pi_D(t) a genuine probability at each step -- which is exactly what the
+    uniform-base-point measurement in check_straddle_probability supplies.
+    """
+    eps, r_p, d_p, L_D = sp.symbols("eps r_p d_p L_D", positive=True)
+    c = r_p / (2 * d_p)
+    B2 = sp.simplify((1 / c**2) * (r_p * eps / L_D))          # avg(pi_D) = Theta(delta_out/L_D)
+    print("\n(4) the straddling term, on an adapted trajectory")
+    print(f"  B_2 = {B2}")
+    print(f"  exponent in eps: {sp.simplify(sp.log(B2).diff(eps) * eps)}   "
+          f"exponent in r_p: {sp.simplify(sp.log(B2).diff(r_p) * r_p)}")
+    assert sp.simplify(sp.log(B2).diff(eps) * eps) == 1
+    assert sp.simplify(sp.log(B2).diff(r_p) * r_p) == -1
+
+    # And the near-binary behaviour that forces it, measured on the real recursion.
+    ratios = []
+    for e in (0.2, 0.1, 0.05):
+        first, second = occupancy_moments(e)
+        ratios.append(second / first)
+        print(f"  eps={e:5.3f}  avg(pi_D)={first:.4f}  avg(pi_D^2)={second:.4f}  "
+              f"ratio={second / first:.3f}")
+    print("  -> the ratio is flat and far from avg(pi_D) itself, so squaring the average")
+    print("     would understate the term by an order of magnitude in eps.")
+    assert min(ratios) > 0.6, ratios
+    assert max(ratios) - min(ratios) < 0.1, ratios
+
+
+def check_epsilon_exchange_rate():
+    """What shrinking eps costs in iterations, and the interior optimum in r_p.
+
+    With B = Theta(b eps) the optimization term C/(c eps S_T) reaches the floor at
+    S_T ~ eps^-2, hence T ~ eps^{-2/(1/2-gamma)} -> eps^-4.  Separately, the floor
+    now has TWO competing r_p dependences -- the linearization remainder a r_p^4
+    falls with r_p while the straddling term b eps / r_p rises -- so unlike the
+    version the paper used to carry, it has an interior minimum.
+    """
+    eps, gamma, T, C, c0, b, alpha, r_p, a = sp.symbols(
+        "eps gamma T C c0 b alpha r_p a", positive=True)
+    S_T = T ** (sp.Rational(1, 2) - gamma)
+    T_star = sp.simplify(sp.solve(sp.Eq(C / (c0 * eps * S_T), b * eps), T)[0])
+    expo = sp.limit(sp.simplify(sp.log(T_star).diff(eps) * eps), gamma, 0)
+    ratio = sp.simplify(sp.limit(sp.simplify(T_star.subs(eps, alpha * eps) / T_star), gamma, 0))
+    print("\n(5) the eps exchange rate and the optimal probe radius")
+    print(f"  T*(eps) = {T_star},  d log T*/d log eps -> {expo}")
+    print(f"  T*(alpha eps)/T*(eps) -> {ratio}")
+    assert expo == -4, expo
+    assert sp.simplify(ratio - alpha**-4) == 0, ratio
+
+    B_tot = a * r_p**4 + b * eps / r_p
+    r_star = [r for r in sp.solve(sp.diff(B_tot, r_p), r_p) if r.is_real is not False][0]
+    B_star = sp.simplify(sp.powsimp(B_tot.subs(r_p, r_star)))
+    print(f"  r_p* = {sp.simplify(r_star)}   (so r_p* ~ eps^(1/5))")
+    print(f"  B(r_p*) = {B_star}   (so B ~ eps^(4/5))")
+    assert sp.simplify(sp.log(sp.simplify(r_star)).diff(eps) * eps - sp.Rational(1, 5)) == 0
+    assert sp.simplify(sp.log(B_star).diff(eps) * eps - sp.Rational(4, 5)) == 0
+    print("  -> at fixed r_p the floor falls as eps and costs eps^-4 in iterations;")
+    print("     optimising r_p jointly gives r_p* ~ eps^(1/5) and a floor ~ eps^(4/5).")
+
+
+def occupancy_along_a_trajectory(eps, r_s, period, n_steps, seed, r_p=0.5, jump=0.05):
+    """Occupancy of the delta-tube by an ADAPTED iterate, in PATH-LENGTH units.
+
+    ``check_straddle_probability`` above draws base points uniformly in a window,
+    which supplies the occupancy hypothesis by construction: it measures pi_D given
+    a bounded density for the iterate, not the density itself.  And pi_D as the
+    appendix used to define it -- ``sup_i Pr[G_i^c]``, a supremum over
+    configurations -- cannot be O(delta/L_D) at all, since conditional on an iterate
+    within delta of a wall the bad event has probability one.
+
+    The object the descent inequality actually sums is neither: the bad-event term
+    enters as ``r_{s,t} eps pi_D(t)``, weighted by the step size, so what has to be
+    O(delta/L_D) is the PATH-LENGTH-weighted occupancy
+
+        sum_t ||Delta x_t|| 1[bad] / sum_t ||Delta x_t||,
+
+    and that one is bounded by an elementary crossing argument: between two
+    consecutive wall crossings the path covers at least 2 L_D, and each crossing
+    spends at most 2 delta + ||Delta x|| inside the tube.
+
+    Measured here on the staircase L(x) = x_0 + jump * floor(x_0/period) + ||x_>||^2,
+    the geometry the INT8 and staircase showcases have: parallel walls of spacing
+    ``period``, so L_D = period/2, with a smooth tilt that keeps the iterate
+    crossing them instead of freezing on one step.
+    """
+    from check_stein_constant import haar_so, orthoplex
+
+    rng = np.random.default_rng(seed)
+    verts = orthoplex(DP)
+    x = np.full(DP, 0.37)
+    delta = 0.5 * r_p * eps                     # lambdabar = 1/2
+    inside = 0.0
+    total = 0.0
+    for _ in range(n_steps):
+        R = haar_so(1, DP, rng)[0]
+        dirs = verts @ R.T
+        probes = x[None, :] + r_p * eps * dirs
+        costs = (probes[:, 0] + jump * np.floor(probes[:, 0] / period)
+                 + 0.5 * (probes[:, 1:] ** 2).sum(axis=1))
+        w = np.exp(-(costs - costs.min()) / TAU)
+        w /= w.sum()
+        move = r_s * eps * (w[:, None] * dirs).sum(axis=0)
+        x = x + move
+        d_wall = abs(x[0] / period - np.round(x[0] / period)) * period
+        length = float(np.linalg.norm(move))
+        total += length
+        inside += length * (d_wall < delta)
+    return inside / total, delta
+
+
+def occupancy_moments(eps, r_s=0.5, r_p=0.5, period=0.25, n_steps=4000, seed=1, jump=0.05):
+    """(path-weighted avg of pi_D, path-weighted avg of pi_D^2) along a trajectory.
+
+    pi_D(t) := Pr[the probe annulus meets a wall | theta_t] is estimated by
+    resampling the probe randomness at the realised iterate, so the two moments are
+    measured rather than assumed equal or unequal.
+    """
+    from check_stein_constant import haar_so, orthoplex
+
+    verts = orthoplex(DP)
+    rng = np.random.default_rng(seed)
+    x = np.full(DP, 0.37)
+    first = second = total = 0.0
+    for _ in range(n_steps):
+        R = haar_so(1, DP, rng)[0]
+        dirs = verts @ R.T
+        probes = x[None, :] + r_p * eps * dirs
+        costs = (probes[:, 0] + jump * np.floor(probes[:, 0] / period)
+                 + 0.5 * (probes[:, 1:] ** 2).sum(axis=1))
+        w = np.exp(-(costs - costs.min()) / TAU)
+        w /= w.sum()
+        move = r_s * eps * (w[:, None] * dirs).sum(axis=0)
+        x = x + move
+        # pi_D at the realised iterate, over fresh probe randomness
+        m = 300
+        Rm = haar_so(m, DP, rng)
+        eta = rng.uniform(-ETA_MAX, ETA_MAX, size=m)
+        s_rad = r_p * eps * np.outer(1.0 + eta, LAM)
+        d0 = np.einsum("nij,vj->nvi", Rm, verts)[:, :, 0]
+        lo = np.floor((x[0] + d0[:, :, None] * s_rad[:, None, :]) / period).reshape(m, -1)
+        pi = float(np.mean(lo.max(axis=1) != lo.min(axis=1)))
+        length = float(np.linalg.norm(move))
+        total += length
+        first += length * pi
+        second += length * pi * pi
+    return first / total, second / total
+
+
+def check_occupancy_on_adapted_iterates():
+    """pi_D = O(delta/L_D) holds for the trajectory, in the units the proof uses."""
+    print("\n(3) path-weighted occupancy of the delta-tube by the actual iterate")
+    print("    (staircase of spacing 0.25, so L_D = 0.125)")
+    epss = np.array([0.2, 0.1, 0.05, 0.025])
+    r_s, period, n_steps = 0.5, 0.25, 20_000
+    l_d = 0.5 * period
+
+    occs, deltas = [], []
+    for i, e in enumerate(epss):
+        occ, delta = occupancy_along_a_trajectory(e, r_s, period, n_steps, 30 + i)
+        occs.append(occ)
+        deltas.append(delta)
+    occs, deltas = np.array(occs), np.array(deltas)
+    pred = deltas / l_d
+    slope = fit_slope(deltas, occs)
+    print(f"  {'eps':>7} {'delta':>8} {'path occupancy':>16} {'delta/L_D':>11} {'ratio':>8}")
+    for e, d, o, p in zip(epss, deltas, occs, pred):
+        print(f"  {e:7.4g} {d:8.4f} {o:16.4f} {p:11.4f} {o / p:8.3f}")
+    print(f"  fitted exponent in delta: {slope:.2f} (theory 1); "
+          f"ratio to delta/L_D within {100 * np.abs(occs / pred - 1).max():.0f}%")
+    assert 0.9 < slope < 1.1, slope
+    assert np.abs(occs / pred - 1).max() < 0.15, occs / pred
+
+    print("  -> the geometric bound is earned in path-length units, which is what the")
+    print("     descent inequality weights by, and it needs the step to be O(delta):")
+    print("     condition (v) delivers that eventually, since r_{s,t} -> 0.")
+
+
 def demo():
     check_floor_algebra()
     check_linearization_remainder()
     check_straddle_probability()
+    check_occupancy_on_adapted_iterates()
+    check_straddle_term_is_linear_not_quadratic()
+    check_epsilon_exchange_rate()
 
 
 if __name__ == "__main__":

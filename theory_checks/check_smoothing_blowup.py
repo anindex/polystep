@@ -154,6 +154,55 @@ def step_plus_quad(z):
     return (z > 0).astype(float) + 0.5 * z**2
 
 
+def good_event_hessian(loss1d, eps, u1, margin=1.4, h_frac=0.15, reach=3.0):
+    """sup |hess L_eps| over base points whose whole kernel support misses the wall.
+
+    The convergence proof never expands L at an arbitrary point: it conditions on
+    the good event that the entire probe annulus lies in one connected component of
+    the complement of D.  On that event the smoothing sees only the smooth part, so
+    the relevant second-derivative bound is the smooth part's Lambda_2 and NOT the
+    global K(eps) = Theta(J/eps^2), which is attained only within O(eps) of the
+    wall.  This is what makes the theorem's condition (vii) non-vacuous, and
+    eps-independent: the probe-radius correction it controls is r_p eps Lambda_2,
+    not r_p eps K(eps).
+    """
+    h = h_frac * eps
+    grid = np.concatenate([np.linspace(-reach, -margin, 30), np.linspace(margin, reach, 30)])
+    xs = grid * eps
+    disp = eps * u1
+
+    def prof(shift):
+        return np.array([loss1d(x + shift + disp).mean() for x in xs])
+
+    lo, mid, hi = prof(-h), prof(0.0), prof(h)
+    return float((np.abs(hi - 2 * mid + lo) / h**2).max())
+
+
+def check_good_event_hessian_is_bounded():
+    """K(eps) blows up; the good-event Hessian does not.  Condition (vii) uses the latter."""
+    d = 4
+    n = 1_500_000
+    epss = np.array([0.4, 0.2, 0.1, 0.05, 0.025])
+    lam2 = 1.0                       # second derivative of the smooth part, 0.5 z^2
+    print("\ngood-event Hessian: base points whose kernel support misses the wall")
+    print(f"{'eps':>7} {'global K(eps)':>14} {'good-event sup':>16} {'ratio to Lambda_2':>18}")
+    goods = []
+    for i, e in enumerate(epss):
+        cloud = marginal("ball", n, d, np.random.default_rng(2000 + i))
+        glob = sup_derivatives(step_plus_quad, e, cloud)[2]
+        good = good_event_hessian(step_plus_quad, e, cloud)
+        goods.append(good)
+        print(f"{e:7.4g} {glob:14.2f} {good:16.4f} {good / lam2:18.4f}")
+    goods = np.array(goods)
+    slope = fit_slope(epss, goods)
+    print(f"  good-event sup ~ eps^{slope:+.2f} (theory 0: it is Lambda_2, "
+          f"independent of the smoothing radius)")
+    print("  -> condition (vii) reads r_p eps Lambda_2 <= (1/2)||grad||, which does not")
+    print("     tighten as eps falls, so the eps-trade in the bias floor is unaffected.")
+    assert abs(slope) < 0.06, slope
+    assert np.allclose(goods, lam2, rtol=0.05), goods
+
+
 def demo():
     d = 4
     n = 1_500_000
@@ -257,4 +306,5 @@ def demo():
 
 if __name__ == "__main__":
     demo()
+    check_good_event_hessian_is_bounded()
     print("OK")
