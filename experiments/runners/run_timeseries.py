@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import gc
 import os
@@ -38,6 +39,16 @@ from experiments.runners.common import (
     save_result,
     set_seed,
     track_gpu_memory,
+)
+from experiments.runners.fairness import (
+    FAIR_METHODS,
+    apply_theory_mode,
+    make_subspace,
+    minibatch_loss,
+    polystep_eval_budget,
+    probe_scale_of,
+    run_baseline,
+    subspace_tag,
 )
 
 
@@ -265,6 +276,98 @@ def compute_persistence_baseline(
     }
 
 
+class ValSelected:
+    """Validation-based checkpoint selection for a regression run.
+
+    Every method in this runner routes its periodic evaluation through
+    one of these. Calling it scores the model on the *validation* split
+    and keeps a copy of the weights whenever val MSE improves; the test
+    split is only ever logged, never used to choose. ``metrics()`` then
+    loads the selected weights back and scores test once, producing the
+    metric dict handed to :func:`save_result`.
+
+    The instance is directly usable as the ``eval_fn`` of the ES/SPSA
+    baselines: they restore the current parameters into ``model`` before
+    calling it, and merge the returned dict into their epoch logs.
+
+    Args:
+        model: The model being trained (read live, not copied).
+        val_data: 1D normalized validation series.
+        test_data: 1D normalized test series.
+        device: Device for evaluation.
+        audit_no_leakage: False reverts to legacy test-set selection.
+    """
+
+    def __init__(self, model, val_data, test_data, device, audit_no_leakage: bool = True):
+        self.model = model
+        self.test_data = test_data
+        self.device = device
+        self.select_data = val_data if audit_no_leakage else test_data
+        self.best_mse = float("inf")
+        self.best_mae = float("inf")
+        self.best_state = None
+
+    def __call__(self, _model=None) -> dict:
+        """Score the selection split, snapshot on improvement, log both splits."""
+        sel = evaluate_regression(self.model, self.select_data, device=self.device)
+        if sel["mse"] < self.best_mse:
+            self.best_mse = sel["mse"]
+            self.best_mae = sel["mae"]
+            self.best_state = copy.deepcopy(self.model.state_dict())
+        # Logged for convergence curves only; selection never reads it.
+        test = (
+            sel
+            if self.select_data is self.test_data
+            else evaluate_regression(self.model, self.test_data, device=self.device)
+        )
+        return {
+            "val_mse": sel["mse"],
+            "val_mae": sel["mae"],
+            "test_mse": test["mse"],
+            "test_mae": test["mae"],
+        }
+
+    def metrics(self, **extra) -> dict:
+        """Restore the selected checkpoint, score test once, build the metric dict."""
+        if self.best_state is not None:
+            self.model.load_state_dict(self.best_state)
+        test = evaluate_regression(self.model, self.test_data, device=self.device)
+        return regression_metrics(test, self.best_mse, self.best_mae, **extra)
+
+
+def regression_metrics(test: dict, val_mse: float, val_mae: float, **extra) -> dict:
+    """Build the ``save_result`` metric dict for a regression run.
+
+    Args:
+        test: MSE/MAE of the selected checkpoint on the test split.
+        val_mse: Validation MSE that selected the checkpoint.
+        val_mae: Validation MAE at the selected checkpoint.
+        **extra: Remaining required keys (wall_time_seconds, etc.).
+    """
+    return {
+        # ETTh1 is regression: there is no accuracy to report. NaN rather
+        # than 0.0 so the aggregator's mean_accuracy column reads "not
+        # applicable" instead of "0%" -- the mirror image of the NaN it
+        # already writes into mean_mse for classification benchmarks.
+        "final_accuracy": float("nan"),
+        "best_accuracy": float("nan"),
+        "test_accuracy_at_selected": float("nan"),
+        # aggregate_results derives mean_mse/std_mse from best_mse, so
+        # best_mse has to carry the headline number: test MSE of the
+        # val-selected checkpoint. A min-over-epochs test MSE here would
+        # be exactly the leak this protocol removes.
+        "final_mse": test["mse"],
+        "best_mse": test["mse"],
+        "final_mae": test["mae"],
+        "best_mae": test["mae"],
+        "test_mse_at_selected": test["mse"],
+        "test_mae_at_selected": test["mae"],
+        "val_mse_at_selected": val_mse,
+        "val_mae_at_selected": val_mae,
+        **extra,
+    }
+
+
 BENCHMARK = "timeseries"
 BATCH_SIZE = 64
 EPOCHS = 30  # polystep epochs (30 for production)
@@ -289,38 +392,31 @@ PSTORCH_CONFIG = {
     "rotation_interval": 0,
     "absorb_interval": 0,
     "chunk_size": 1024,
+    # Per-step multiplicative jitter on the probe radius (transversality).
+    # Jitter makes the probe radius differ every step, so nothing measured
+    # at the previous step's radius is valid at this one. Amortized OT
+    # (amortize_steps=3, ema=0.7) would coast on a stale transport
+    # direction and adaptive_probes would reuse stale cost rows, so both
+    # are off while jitter is on. The optimizer already refuses cost-row
+    # reuse under jitter; this makes the intent explicit at the call site.
     "amortize_steps": 3,
     "amortize_ema": 0.7,
+    "adaptive_probes": False,
     "use_momentum": True,
     "momentum_init": 0.5,
     "momentum_final": 0.95,
 }
 
-# OpenAI ES hyperparameters (compute budget matched)
-OPENAI_ES_CONFIG = {
-    "sigma": 0.02,
-    "lr": 0.01,
-    "population_size": 50,
-    "generations": 2000,
-    "lr_decay": True,
-    "weight_decay": 0.01,
-    "fitness_shaping": "rank",
-}
-
-# SPSA hyperparameters
-SPSA_CONFIG = {
-    "a": 0.1,
-    "c": 0.1,
-    "alpha": 0.602,
-    "gamma": 0.101,
-    "max_iters": 10000,
-}
-
-# CMA-ES hyperparameters
-CMAES_CONFIG = {
-    "generations": 2000,
-    "popsize": 16,
-    "stdev_init": 0.5,
+# Free-running (non-fair) candidate budgets, preserving what the previous ad-hoc
+# implementations spent: ES 2000 gen x 50 pop, CMA-ES 2000 gen x 16 pop, SPSA 10000
+# iters x 2. `--fair` replaces all of these with one budget derived from PolyStep.
+LEGACY_BUDGETS = {
+    "openai_es": 100_000,
+    "eggroll": 100_000,
+    "cma_es": 32_000,
+    "spsa": 20_000,
+    "mezo": 20_000,
+    "random_search": 20_000,
 }
 
 # Adam hyperparameters
@@ -328,20 +424,6 @@ ADAM_CONFIG = {
     "lr": 0.001,
     "epochs": ADAM_EPOCHS,
 }
-
-
-def _build_window_tensors(data_array, seq_len=SEQ_LEN, pred_len=PRED_LEN, device="cuda"):
-    """Build sliding window input/target tensors for baselines.
-
-    Returns:
-        Tuple of (inputs, targets) tensors:
-        - inputs: (N, seq_len, 1)
-        - targets: (N, pred_len)
-    """
-    ds = TimeSeriesDataset(data_array, seq_len=seq_len, pred_len=pred_len)
-    loader = DataLoader(ds, batch_size=len(ds), shuffle=False)
-    inputs, targets = next(iter(loader))
-    return inputs.to(device), targets.to(device)
 
 
 def run_polystep(
@@ -354,6 +436,8 @@ def run_polystep(
     epochs_override=None,
     solver=None,
     audit_no_leakage: bool = True,
+    fair: bool = False,
+    theory_mode: bool = False,
 ):
     """Train time-series LSTM with polystep PolyStepOptimizer + HybridSubspace.
 
@@ -363,7 +447,6 @@ def run_polystep(
     """
     from polystep.optimizer import PolyStepOptimizer
     from polystep.epsilon import CosineEpsilon
-    from polystep.hybrid_subspace import HybridSubspace
     from polystep.transform import ParamLayout
     from polystep.cost_nn import NNCostEvaluator
 
@@ -376,58 +459,55 @@ def run_polystep(
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     total_steps = epochs * len(train_loader)
-    epsilon_decay = (PSTORCH_CONFIG["epsilon_init"] - PSTORCH_CONFIG["epsilon_target"]) / max(1, total_steps)
-    sr_decay = (PSTORCH_CONFIG["step_radius_init"] - PSTORCH_CONFIG["step_radius_target"]) / max(1, total_steps)
-    pr_decay = (PSTORCH_CONFIG["probe_radius_init"] - PSTORCH_CONFIG["probe_radius_target"]) / max(1, total_steps)
+    cfg = apply_theory_mode(PSTORCH_CONFIG) if theory_mode else dict(PSTORCH_CONFIG)
+
+    def sched(key, flat_default):
+        # Scheduled when the config carries both endpoints; flat otherwise, which is
+        # also what --theory-mode leaves behind.
+        if f"{key}_init" not in cfg:
+            return cfg.get(key, flat_default)
+        init, target = cfg[f"{key}_init"], cfg[f"{key}_target"]
+        return CosineEpsilon(init=init, target=target, decay=(init - target) / max(1, total_steps))
 
     layout = ParamLayout.from_module(model)
-    subspace = HybridSubspace.from_layout(
+    subspace = make_subspace(
         layout,
-        rank=PSTORCH_CONFIG["rank"],
+        rank=cfg["rank"],
+        seed=seed,
         rotation_mode="random",
-        rotation_interval=PSTORCH_CONFIG["rotation_interval"],
+        rotation_interval=cfg["rotation_interval"],
         absorb_mode="periodic",
-        absorb_interval=PSTORCH_CONFIG["absorb_interval"],
+        absorb_interval=cfg["absorb_interval"],
     )
 
     optimizer = PolyStepOptimizer(
         model,
         compile=False,
         seed=seed,
-        epsilon=CosineEpsilon(
-            init=PSTORCH_CONFIG["epsilon_init"],
-            target=PSTORCH_CONFIG["epsilon_target"],
-            decay=epsilon_decay,
-        ),
-        step_radius=CosineEpsilon(
-            init=PSTORCH_CONFIG["step_radius_init"],
-            target=PSTORCH_CONFIG["step_radius_target"],
-            decay=sr_decay,
-        ),
-        probe_radius=CosineEpsilon(
-            init=PSTORCH_CONFIG["probe_radius_init"],
-            target=PSTORCH_CONFIG["probe_radius_target"],
-            decay=pr_decay,
-        ),
-        num_probe=PSTORCH_CONFIG["num_probe"],
+        epsilon=sched("epsilon", 0.5),
+        step_radius=sched("step_radius", 1.0),
+        probe_radius=sched("probe_radius", 1.0),
+        num_probe=cfg["num_probe"],
         subspace=subspace,
-        chunk_size=PSTORCH_CONFIG.get("chunk_size", 1024),
-        amortize_steps=PSTORCH_CONFIG.get("amortize_steps", 0),
-        amortize_ema=PSTORCH_CONFIG.get("amortize_ema", 0.0),
-        use_momentum=PSTORCH_CONFIG.get("use_momentum", False),
-        momentum_init=PSTORCH_CONFIG.get("momentum_init", 0.5),
-        momentum_final=PSTORCH_CONFIG.get("momentum_final", 0.95),
+        chunk_size=cfg.get("chunk_size", 1024),
+        probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
+        probe_radius_jitter_dist=cfg.get("probe_radius_jitter_dist", "smooth"),
+        polytope_type=cfg.get("polytope_type", "simplex"),
+        adaptive_probes=cfg.get("adaptive_probes", None),
+        amortize_steps=cfg.get("amortize_steps", 1),
+        amortize_ema=cfg.get("amortize_ema", 0.0),
+        use_momentum=cfg.get("use_momentum", False),
+        momentum_init=cfg.get("momentum_init", 0.5),
+        momentum_final=cfg.get("momentum_final", 0.95),
+        biased_rotation=cfg.get("biased_rotation", False),
         solver=solver,
     )
-
-    import copy
+    eval_budget = polystep_eval_budget(optimizer, total_steps)
 
     evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
+    selector = ValSelected(model, val_data, test_data, device, audit_no_leakage=audit_no_leakage)
     epoch_logs = []
     step_logs = []
-    best_mse = float("inf")
-    best_mae = float("inf")
-    best_state_dict = None
     step_count = 0
     fwd_pass_count = 0
     start_time = time.time()
@@ -460,6 +540,9 @@ def run_polystep(
                         {
                             "step": step_count,
                             "epoch": epoch + 1,
+                            # Cumulative candidate evaluations: the x-axis of the
+                            # quality-vs-evaluations figure, shared with the baselines.
+                            "evals": fwd_pass_count,
                             "test_mse": step_metrics["mse"],
                             "test_mae": step_metrics["mae"],
                             "loss": loss,
@@ -467,15 +550,8 @@ def run_polystep(
                         }
                     )
 
-            # Evaluate on val and test sets
-            val_metrics = evaluate_regression(model, val_data, device=device)
-            test_metrics = evaluate_regression(model, test_data, device=device)
-            # Select best checkpoint on validation or test MSE
-            selection_metrics = val_metrics if audit_no_leakage else test_metrics
-            if selection_metrics["mse"] < best_mse:
-                best_mse = selection_metrics["mse"]
-                best_mae = selection_metrics["mae"]
-                best_state_dict = copy.deepcopy(model.state_dict())
+            # Score the selection split and snapshot if it improved.
+            ev = selector()
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / len(train_loader)
 
@@ -483,62 +559,52 @@ def run_polystep(
                 {
                     "epoch": epoch + 1,
                     "train_mse": avg_loss,
-                    "val_mse": val_metrics["mse"],
-                    "val_mae": val_metrics["mae"],
-                    "test_mse": test_metrics["mse"],
-                    "test_mae": test_metrics["mae"],
+                    **ev,
                     "loss": avg_loss,
                     "time": epoch_time,
                     "wall_time": time.time() - start_time,
                 }
             )
             print(
-                f"    Epoch {epoch + 1}/{epochs} | train={avg_loss:.4f} | val={val_metrics['mse']:.4f} | test={test_metrics['mse']:.4f}"
+                f"    Epoch {epoch + 1}/{epochs} | train={avg_loss:.4f} | val={ev['val_mse']:.4f} | test={ev['test_mse']:.4f}"
             )
 
     wall_time = time.time() - start_time
-    last_metrics = evaluate_regression(model, test_data, device=device)
-    last_val_metrics = evaluate_regression(model, val_data, device=device) if audit_no_leakage else None
-    last_epoch_mse = last_metrics["mse"]
-    last_epoch_mae = last_metrics["mae"]
-    last_selection_mse = last_val_metrics["mse"] if audit_no_leakage else last_epoch_mse
-    if last_selection_mse < best_mse:
-        best_mse = last_selection_mse
-        best_mae = last_val_metrics["mae"] if audit_no_leakage else last_epoch_mae
-        best_state_dict = copy.deepcopy(model.state_dict())
-    if best_state_dict is not None:
-        model.load_state_dict(best_state_dict)
-    final_metrics = evaluate_regression(model, test_data, device=device)
-    final_mse = final_metrics["mse"]
-    final_mae = final_metrics["mae"]
-
+    # The epoch loop already scored the final weights on the selection
+    # split, so there is nothing left to select; test is scored once, in
+    # metrics(), on whatever checkpoint won.
     filepath = save_result(
         benchmark=BENCHMARK,
         method="polystep",
         seed=seed,
-        metrics={
-            "final_accuracy": 0.0,
-            "best_accuracy": 0.0,
-            "final_mse": final_mse,
-            "best_mse": best_mse,
-            "final_mae": final_mae,
-            "best_mae": best_mae,
-            "last_epoch_mse": last_epoch_mse,
-            "last_epoch_mae": last_epoch_mae,
-            "wall_time_seconds": wall_time,
-            "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
-            "function_evals": fwd_pass_count,
-            "total_steps": step_count,
+        metrics=selector.metrics(
+            last_epoch_mse=ev["test_mse"],
+            last_epoch_mae=ev["test_mae"],
+            wall_time_seconds=wall_time,
+            peak_gpu_memory_mb=mem["peak_gpu_memory_mb"],
+            function_evals=fwd_pass_count,
+            total_steps=step_count,
+        ),
+        hyperparameters={
+            **cfg,
+            "epochs": epochs,
+            # The four keys that let a reader check the table was matched.
+            **subspace_tag(subspace, cfg["rank"]),
+            "eval_budget": eval_budget,
+            "evals_used": fwd_pass_count,
+            "fair": fair,
         },
-        hyperparameters=PSTORCH_CONFIG,
         epoch_logs=epoch_logs,
         step_logs=step_logs,
         results_dir=results_dir,
+        leaked=not audit_no_leakage,
     )
     print(f"    Saved: {filepath}")
 
 
-def run_adam(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
+def run_adam(
+    seed, device, train_data, val_data, test_data, results_dir, epochs_override=None, audit_no_leakage: bool = True
+):
     """Train time-series LSTM with Adam optimizer (gradient-based ceiling)."""
     set_seed(seed)
     model = TimeSeriesLSTM().to(device)
@@ -550,9 +616,8 @@ def run_adam(seed, device, train_data, val_data, test_data, results_dir, epochs_
 
     optimizer = torch.optim.Adam(model.parameters(), lr=ADAM_CONFIG["lr"])
 
+    selector = ValSelected(model, val_data, test_data, device, audit_no_leakage=audit_no_leakage)
     epoch_logs = []
-    best_mse = float("inf")
-    best_mae = float("inf")
     step_count = 0
     start_time = time.time()
 
@@ -572,12 +637,8 @@ def run_adam(seed, device, train_data, val_data, test_data, results_dir, epochs_
                 epoch_loss += loss.item()
                 step_count += 1
 
-            # Evaluate on val and test sets
-            val_metrics = evaluate_regression(model, val_data, device=device)
-            test_metrics = evaluate_regression(model, test_data, device=device)
-            if test_metrics["mse"] < best_mse:
-                best_mse = test_metrics["mse"]
-                best_mae = test_metrics["mae"]
+            # Score the selection split and snapshot if it improved.
+            ev = selector()
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / len(train_loader)
 
@@ -585,396 +646,245 @@ def run_adam(seed, device, train_data, val_data, test_data, results_dir, epochs_
                 {
                     "epoch": epoch + 1,
                     "train_mse": avg_loss,
-                    "val_mse": val_metrics["mse"],
-                    "val_mae": val_metrics["mae"],
-                    "test_mse": test_metrics["mse"],
-                    "test_mae": test_metrics["mae"],
+                    **ev,
                     "loss": avg_loss,
                     "time": epoch_time,
                     "wall_time": time.time() - start_time,
                 }
             )
             print(
-                f"    Epoch {epoch + 1}/{epochs} | train={avg_loss:.4f} | val={val_metrics['mse']:.4f} | test={test_metrics['mse']:.4f}"
+                f"    Epoch {epoch + 1}/{epochs} | train={avg_loss:.4f} | val={ev['val_mse']:.4f} | test={ev['test_mse']:.4f}"
             )
 
     wall_time = time.time() - start_time
-    final_metrics = evaluate_regression(model, test_data, device=device)
-    final_mse = final_metrics["mse"]
-    final_mae = final_metrics["mae"]
-    if final_mse < best_mse:
-        best_mse = final_mse
-        best_mae = final_mae
-
-    # Function evals: each batch forward pass = 1 eval per epoch batch
-    function_evals = step_count  # 1 forward pass per step
 
     filepath = save_result(
         benchmark=BENCHMARK,
         method="adam",
         seed=seed,
-        metrics={
-            "final_accuracy": 0.0,
-            "best_accuracy": 0.0,
-            "final_mse": final_mse,
-            "best_mse": best_mse,
-            "final_mae": final_mae,
-            "best_mae": best_mae,
-            "wall_time_seconds": wall_time,
-            "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
-            "function_evals": function_evals,
-            "total_steps": step_count,
-        },
+        metrics=selector.metrics(
+            wall_time_seconds=wall_time,
+            peak_gpu_memory_mb=mem["peak_gpu_memory_mb"],
+            # 1 forward pass per step
+            function_evals=step_count,
+            total_steps=step_count,
+        ),
         hyperparameters=ADAM_CONFIG,
         epoch_logs=epoch_logs,
         results_dir=results_dir,
+        leaked=not audit_no_leakage,
     )
     print(f"    Saved: {filepath}")
 
 
-def run_cmaes(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
-    """Train time-series LSTM with CMA-ES (EvoTorch) using negative MSE fitness."""
-    try:
-        from polystep.benchmarks.baselines import has_evotorch
-
-        if not has_evotorch():
-            print("    Skipping cmaes (EvoTorch not installed)")
-            return
-        from evotorch import Problem
-        from evotorch.algorithms import CMAES
-    except ImportError:
-        print("    Skipping cmaes (EvoTorch not installed)")
-        return
+def _fair_eval_budget(seed, device, train_loader, epochs, cfg, solver="softmax"):
+    """The shared candidate budget: what PolyStep spends over ``epochs`` epochs."""
+    from polystep.optimizer import PolyStepOptimizer
+    from polystep.transform import ParamLayout
 
     set_seed(seed)
     model = TimeSeriesLSTM().to(device)
-    loss_fn = nn.MSELoss()
-
-    # Build full sliding-window tensors for CMA-ES
-    train_inputs, train_targets = _build_window_tensors(train_data, device=device)
-    param_count = sum(p.numel() for p in model.parameters())
-
-    class RegressionProblem(Problem):
-        """EvoTorch Problem for regression using negative MSE fitness."""
-
-        def __init__(self):
-            super().__init__(
-                objective_sense="max",  # Maximize negative MSE
-                solution_length=param_count,
-                dtype=torch.float32,
-                device=device,
-                initial_bounds=(-1.0, 1.0),
-            )
-
-        def _evaluate(self, solution):
-            values = solution.values
-            eval_model = TimeSeriesLSTM().to(device)
-            eval_model.eval()
-            offset = 0
-            with torch.no_grad():
-                for p in eval_model.parameters():
-                    numel = p.numel()
-                    p.data.copy_(values[offset : offset + numel].view(p.shape))
-                    offset += numel
-            # Evaluate on a random batch
-            batch_size = min(512, len(train_inputs))
-            indices = torch.randperm(len(train_inputs), device=device)[:batch_size]
-            batch_data = train_inputs[indices]
-            batch_labels = train_targets[indices]
-            with torch.no_grad():
-                outputs = eval_model(batch_data)
-                mse = loss_fn(outputs, batch_labels).item()
-            # Return negative MSE as fitness (maximize = minimize MSE)
-            solution.set_evaluation(-mse)
-
-    problem = RegressionProblem()
-    use_separable = param_count > 10000
-    if use_separable:
-        print(f"  Using separable (diagonal) CMA-ES for {param_count:,} params")
-
-    searcher = CMAES(
-        problem,
-        popsize=CMAES_CONFIG["popsize"],
-        stdev_init=CMAES_CONFIG["stdev_init"],
-        separable=use_separable,
-    )
-
-    generations = CMAES_CONFIG["generations"]
-    epoch_logs = []
-    best_mse = float("inf")
-    start_time = time.time()
-
-    with track_gpu_memory() as mem:
-        for gen in range(generations):
-            searcher.step()
-            status = searcher.status
-            pop_best_fitness = float(status.get("pop_best_eval", 0.0))
-
-            if (gen + 1) % 100 == 0 or gen == generations - 1:
-                # Load best solution into model for evaluation
-                pop_best_sol = status.get("pop_best", None)
-                if pop_best_sol is not None:
-                    values = pop_best_sol.values if hasattr(pop_best_sol, "values") else pop_best_sol
-                    offset = 0
-                    with torch.no_grad():
-                        for p in model.parameters():
-                            numel = p.numel()
-                            p.data.copy_(values[offset : offset + numel].view(p.shape))
-                            offset += numel
-
-                metrics = evaluate_regression(model, test_data, device=device)
-                if metrics["mse"] < best_mse:
-                    best_mse = metrics["mse"]
-
-                epoch_logs.append(
-                    {
-                        "epoch": gen + 1,
-                        "generation": gen + 1,
-                        "pop_best_fitness": pop_best_fitness,
-                        "test_mse": metrics["mse"],
-                        "test_mae": metrics["mae"],
-                        "loss": metrics["mse"],
-                        "time": time.time() - start_time,
-                    }
-                )
-                print(
-                    f"    Gen {gen + 1}/{generations} | MSE={metrics['mse']:.4f} | MAE={metrics['mae']:.4f} | fitness={pop_best_fitness:.6f}"
-                )
-
-    wall_time = time.time() - start_time
-
-    # Re-evaluate final regression metrics on test data
-    final_metrics = evaluate_regression(model, test_data, device=device)
-
-    filepath = save_result(
-        benchmark=BENCHMARK,
-        method="cmaes",
+    layout = ParamLayout.from_module(model)
+    total_steps = epochs * len(train_loader)
+    subspace = make_subspace(
+        layout,
+        rank=cfg["rank"],
         seed=seed,
-        metrics={
-            "final_accuracy": 0.0,
-            "best_accuracy": 0.0,
-            "final_mse": final_metrics["mse"],
-            "best_mse": min(best_mse, final_metrics["mse"]),
-            "final_mae": final_metrics["mae"],
-            "best_mae": final_metrics["mae"],
-            "wall_time_seconds": wall_time,
-            "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
-            "function_evals": generations * CMAES_CONFIG["popsize"],
-            "total_steps": generations,
-        },
-        hyperparameters=CMAES_CONFIG,
-        epoch_logs=epoch_logs,
-        results_dir=results_dir,
+        rotation_mode="random",
+        rotation_interval=cfg["rotation_interval"],
+        absorb_mode="periodic",
+        absorb_interval=cfg["absorb_interval"],
     )
-    print(f"    Saved: {filepath}")
+    opt = PolyStepOptimizer(
+        model,
+        compile=False,
+        seed=seed,
+        num_probe=cfg["num_probe"],
+        subspace=subspace,
+        probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
+        polytope_type=cfg.get("polytope_type", "simplex"),
+        solver=solver,
+    )
+    return polystep_eval_budget(opt, total_steps)
 
 
-def run_openai_es(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
-    """Train time-series LSTM with OpenAI Evolution Strategy."""
-    from experiments.baselines.openai_es import train_openai_es
+def run_gradient_free(
+    method,
+    seed,
+    device,
+    train_data,
+    val_data,
+    test_data,
+    results_dir,
+    epochs_override=None,
+    audit_no_leakage: bool = True,
+    fair: bool = False,
+    theory_mode: bool = False,
+    budget: int = None,
+):
+    """Run one ``polystep.baselines`` method on the ETTh1 LSTM.
+
+    Replaces the inline EvoTorch CMA-ES copy and the two
+    ``experiments/baselines`` wrappers, which each counted evaluations
+    differently and searched full parameter space while PolyStep searched a
+    subspace. Selection is on validation MSE; test is scored once.
+    """
+    from polystep.cost_nn import NNCostEvaluator
+    from polystep.transform import ParamLayout
+
+    cfg = apply_theory_mode(PSTORCH_CONFIG) if theory_mode else dict(PSTORCH_CONFIG)
+    epochs = epochs_override if epochs_override is not None else EPOCHS
 
     set_seed(seed)
     model = TimeSeriesLSTM().to(device)
-    loss_fn = nn.MSELoss()
+    layout = ParamLayout.from_module(model)
+    train_loader = DataLoader(
+        TimeSeriesDataset(train_data, seq_len=SEQ_LEN, pred_len=PRED_LEN),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+    )
 
-    # Build DataLoaders for OpenAI-ES (uses train_loader/test_loader interface)
-    train_dataset = TimeSeriesDataset(train_data, seq_len=SEQ_LEN, pred_len=PRED_LEN)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_dataset = TimeSeriesDataset(test_data, seq_len=SEQ_LEN, pred_len=PRED_LEN)
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+    subspace = None
+    if fair:
+        subspace = make_subspace(layout, rank=cfg["rank"], seed=seed, method=method)
+        if budget is None:
+            budget = _fair_eval_budget(seed, device, train_loader, epochs, cfg)
+    if budget is None:
+        budget = LEGACY_BUDGETS[method]
 
-    # Regression eval callback: evaluates MSE/MAE instead of classification accuracy
-    def regression_eval(m):
-        metrics = evaluate_regression(m, test_data, device=device)
-        return {"test_mse": metrics["mse"], "test_mae": metrics["mae"]}
+    loss_batch = minibatch_loss(NNCostEvaluator(model, loss_fn=nn.MSELoss()), train_loader, device)
+    # Legacy mode selected on test; the honest protocol selects on val.
+    selection_data = test_data if not audit_no_leakage else val_data
 
-    result = train_openai_es(
+    out = run_baseline(
+        method,
         model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        loss_fn=loss_fn,
-        sigma=OPENAI_ES_CONFIG["sigma"],
-        lr=OPENAI_ES_CONFIG["lr"],
-        population_size=OPENAI_ES_CONFIG["population_size"],
-        generations=OPENAI_ES_CONFIG["generations"],
-        lr_decay=OPENAI_ES_CONFIG.get("lr_decay", False),
-        weight_decay=OPENAI_ES_CONFIG.get("weight_decay", 0.0),
-        fitness_shaping=OPENAI_ES_CONFIG.get("fitness_shaping", "zscore"),
-        device=device,
+        layout=layout,
+        loss_batch=loss_batch,
+        budget=budget,
+        val_fn=lambda m: evaluate_regression(m, selection_data, device=device)["mse"],
+        test_fn=lambda m: evaluate_regression(m, test_data, device=device)["mse"],
+        mode="min",
         seed=seed,
-        eval_fn=regression_eval,
+        subspace=subspace,
+        subspace_rank=cfg["rank"] if fair else None,
+        probe_scale=probe_scale_of(cfg),
+        quality_key="mse",
     )
-
-    final_metrics = evaluate_regression(model, test_data, device=device)
-
-    # Track best_mse from epoch_logs (baseline doesn't track it internally for regression)
-    best_mse = final_metrics["mse"]
-    best_mae = final_metrics["mae"]
-    for log in result["epoch_logs"]:
-        if "test_mse" in log and log["test_mse"] < best_mse:
-            best_mse = log["test_mse"]
-        if "test_mae" in log and log["test_mae"] < best_mae:
-            best_mae = log["test_mae"]
-
+    # run_baseline leaves the val-selected checkpoint loaded, so this scores the
+    # same weights the headline metric reports, on test, once.
+    final = evaluate_regression(model, test_data, device=device)
+    out["metrics"].update(
+        final_mse=final["mse"],
+        best_mse=final["mse"],
+        final_mae=final["mae"],
+        best_mae=final["mae"],
+        test_mse_at_selected=final["mse"],
+        test_mae_at_selected=final["mae"],
+        val_mse_at_selected=out["metrics"]["best_val_mse"],
+    )
+    out["hyperparameters"]["fair"] = fair
     filepath = save_result(
         benchmark=BENCHMARK,
-        method="openai_es",
+        method=method,
         seed=seed,
-        metrics={
-            "final_accuracy": 0.0,
-            "best_accuracy": 0.0,
-            "final_mse": final_metrics["mse"],
-            "best_mse": best_mse,
-            "final_mae": final_metrics["mae"],
-            "best_mae": best_mae,
-            "wall_time_seconds": result["metrics"]["wall_time_seconds"],
-            "peak_gpu_memory_mb": result["metrics"]["peak_gpu_memory_mb"],
-            "function_evals": result["metrics"]["function_evals"],
-            "total_steps": result["metrics"]["total_steps"],
-        },
-        hyperparameters=OPENAI_ES_CONFIG,
-        epoch_logs=result["epoch_logs"],
         results_dir=results_dir,
+        leaked=not audit_no_leakage,
+        **out,
     )
     print(f"    Saved: {filepath}")
 
 
-def run_spsa(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
-    """Train time-series LSTM with SPSA."""
-    from experiments.baselines.spsa import train_spsa
-
-    set_seed(seed)
-    model = TimeSeriesLSTM().to(device)
-    loss_fn = nn.MSELoss()
-
-    # Build DataLoaders for SPSA (uses train_loader/test_loader interface)
-    train_dataset = TimeSeriesDataset(train_data, seq_len=SEQ_LEN, pred_len=PRED_LEN)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_dataset = TimeSeriesDataset(test_data, seq_len=SEQ_LEN, pred_len=PRED_LEN)
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-
-    # Regression eval callback: evaluates MSE/MAE instead of classification accuracy
-    def regression_eval(m):
-        metrics = evaluate_regression(m, test_data, device=device)
-        return {"test_mse": metrics["mse"], "test_mae": metrics["mae"]}
-
-    result = train_spsa(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        loss_fn=loss_fn,
-        a=SPSA_CONFIG["a"],
-        c=SPSA_CONFIG["c"],
-        alpha=SPSA_CONFIG.get("alpha", 0.602),
-        gamma=SPSA_CONFIG.get("gamma", 0.101),
-        max_iters=SPSA_CONFIG["max_iters"],
-        device=device,
-        seed=seed,
-        eval_fn=regression_eval,
-    )
-
-    final_metrics = evaluate_regression(model, test_data, device=device)
-
-    # Track best_mse from epoch_logs (baseline doesn't track it internally for regression)
-    best_mse = final_metrics["mse"]
-    best_mae = final_metrics["mae"]
-    for log in result["epoch_logs"]:
-        if "test_mse" in log and log["test_mse"] < best_mse:
-            best_mse = log["test_mse"]
-        if "test_mae" in log and log["test_mae"] < best_mae:
-            best_mae = log["test_mae"]
-
-    filepath = save_result(
-        benchmark=BENCHMARK,
-        method="spsa",
-        seed=seed,
-        metrics={
-            "final_accuracy": 0.0,
-            "best_accuracy": 0.0,
-            "final_mse": final_metrics["mse"],
-            "best_mse": best_mse,
-            "final_mae": final_metrics["mae"],
-            "best_mae": best_mae,
-            "wall_time_seconds": result["metrics"]["wall_time_seconds"],
-            "peak_gpu_memory_mb": result["metrics"]["peak_gpu_memory_mb"],
-            "function_evals": result["metrics"]["function_evals"],
-            "total_steps": result["metrics"]["total_steps"],
-        },
-        hyperparameters=SPSA_CONFIG,
-        epoch_logs=result["epoch_logs"],
-        results_dir=results_dir,
-    )
-    print(f"    Saved: {filepath}")
-
-
-def run_persistence(seed, device, train_data, val_data, test_data, results_dir, epochs_override=None):
+def run_persistence(
+    seed, device, train_data, val_data, test_data, results_dir, epochs_override=None, audit_no_leakage: bool = True
+):
     """Compute persistence (naive) baseline for time-series forecasting.
 
     Persistence forecast: predict the last observed value for all H=96
     future steps. This is the floor that any learned model must beat.
+
+    It has no parameters and no checkpoints, so there is nothing to
+    select; the val split is still scored, for the same reason the other
+    methods report it. Test is scored once, as everywhere else.
     """
     start_time = time.time()
-    result = compute_persistence_baseline(test_data, seq_len=SEQ_LEN, pred_len=PRED_LEN)
+    val = compute_persistence_baseline(val_data, seq_len=SEQ_LEN, pred_len=PRED_LEN)
+    test = compute_persistence_baseline(test_data, seq_len=SEQ_LEN, pred_len=PRED_LEN)
     wall_time = time.time() - start_time
 
     filepath = save_result(
         benchmark=BENCHMARK,
         method="persistence",
         seed=seed,
-        metrics={
-            "final_accuracy": 0.0,
-            "best_accuracy": 0.0,
-            "final_mse": result["mse"],
-            "best_mse": result["mse"],
-            "final_mae": result["mae"],
-            "best_mae": result["mae"],
-            "wall_time_seconds": wall_time,
-            "peak_gpu_memory_mb": 0.0,
-            "function_evals": 0,
-            "total_steps": 0,
-        },
+        metrics=regression_metrics(
+            test,
+            val["mse"],
+            val["mae"],
+            wall_time_seconds=wall_time,
+            peak_gpu_memory_mb=0.0,
+            function_evals=0,
+            total_steps=0,
+        ),
         hyperparameters={"method": "persistence", "seq_len": SEQ_LEN, "pred_len": PRED_LEN},
         epoch_logs=[],
         results_dir=results_dir,
+        leaked=not audit_no_leakage,
     )
-    print(f"    Persistence MSE={result['mse']:.4f}, MAE={result['mae']:.4f}")
+    print(f"    Persistence MSE={test['mse']:.4f}, MAE={test['mae']:.4f}")
     print(f"    Saved: {filepath}")
 
 
-METHOD_RUNNERS = {
-    "polystep": run_polystep,
-    "adam": run_adam,
-    "cmaes": run_cmaes,
-    "openai_es": run_openai_es,
-    "spsa": run_spsa,
-    "persistence": run_persistence,
-}
+# polystep, adam and persistence have their own loops; every gradient-free method
+# goes through the one shared runner.
+METHOD_RUNNERS = {"polystep": run_polystep, "adam": run_adam, "persistence": run_persistence}
+ALL_METHODS = ("polystep", "adam", "persistence", *FAIR_METHODS)
+#: The old name for cma_es, kept so existing result files and scripts still resolve.
+ALIASES = {"cmaes": "cma_es"}
 
 
-def run_method(method, seed, device, results_dir, epochs_override=None, solver=None, audit_no_leakage: bool = True):
+def run_method(
+    method,
+    seed,
+    device,
+    results_dir,
+    epochs_override=None,
+    solver=None,
+    audit_no_leakage: bool = True,
+    fair: bool = False,
+    theory_mode: bool = False,
+    budget: int = None,
+):
     """Run a single method+seed combination.
 
     Loads ETTh1 data, then delegates to the method-specific runner.
     """
     train_data, val_data, test_data, scaler = load_etth1()
-    runner = METHOD_RUNNERS.get(method)
-    if runner is None:
-        print(f"    Unknown method: {method}")
-        return
-    if method == "polystep":
-        runner(
+    method = ALIASES.get(method, method)
+    # Every method gets the val split and the leakage guard; only the
+    # solver choice is polystep-specific.
+    kwargs = {"epochs_override": epochs_override, "audit_no_leakage": audit_no_leakage}
+    if method in FAIR_METHODS:
+        run_gradient_free(
+            method,
             seed,
             device,
             train_data,
             val_data,
             test_data,
             results_dir,
-            epochs_override=epochs_override,
-            solver=solver,
-            audit_no_leakage=audit_no_leakage,
+            fair=fair,
+            theory_mode=theory_mode,
+            budget=budget,
+            **kwargs,
         )
-    else:
-        runner(seed, device, train_data, val_data, test_data, results_dir, epochs_override=epochs_override)
+        return
+    runner = METHOD_RUNNERS.get(method)
+    if runner is None:
+        print(f"    Unknown method: {method}")
+        return
+    if method == "polystep":
+        kwargs.update(solver=solver, fair=fair, theory_mode=theory_mode)
+    runner(seed, device, train_data, val_data, test_data, results_dir, **kwargs)
 
 
 def main():
@@ -982,8 +892,8 @@ def main():
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["polystep", "adam", "cmaes", "openai_es", "spsa", "persistence"],
-        help="Methods to run (default: all 6)",
+        default=list(ALL_METHODS),
+        help=f"Methods to run (default: all of {list(ALL_METHODS)})",
     )
     parser.add_argument(
         "--seeds",
@@ -1015,6 +925,26 @@ def main():
             "Use only for bit-for-bit reproduction of earlier results."
         ),
     )
+    parser.add_argument(
+        "--fair",
+        action="store_true",
+        help=(
+            "Matched-budget, matched-representation table: every gradient-free "
+            "method gets the same subspace (FactoredSubspace for eggroll), the same "
+            "candidate budget derived from PolyStep, and the same probe radius."
+        ),
+    )
+    parser.add_argument(
+        "--theory-mode",
+        action="store_true",
+        help=(
+            "Run the configuration Theorem 4.2 analyses: probe_radius_jitter=0.05 "
+            "with the smooth density, independent rotations, flat epsilon, step "
+            "radius r0*(t+1)^-(1/2+0.1), orthoplex, HybridSubspace, no momentum / "
+            "amortization / Anderson."
+        ),
+    )
+    parser.add_argument("--budget", type=int, default=None, help="Override the candidate budget (smoke runs)")
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -1031,7 +961,7 @@ def main():
 
     for method in args.methods:
         for seed in args.seeds:
-            output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{method}_{seed}.json")
+            output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{ALIASES.get(method, method)}_{seed}.json")
             if os.path.exists(output_file):
                 print(f"Skipping {method} seed={seed} (result exists)")
                 continue
@@ -1045,6 +975,9 @@ def main():
                     epochs_override=args.epochs_override,
                     solver=args.solver,
                     audit_no_leakage=not args.allow_test_leakage,
+                    fair=args.fair,
+                    theory_mode=args.theory_mode,
+                    budget=args.budget,
                 )
             except Exception as e:
                 print(f"  ERROR: {method} seed={seed} failed: {e}")

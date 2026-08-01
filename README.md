@@ -180,6 +180,77 @@ PolyStep evaluates no incumbent (probes exclude scale 0), moves to the barycente
 step, and drives its radius from the epsilon schedule. Its guarantees come from the
 Sinkhorn Step analysis instead.
 
+## Gradient-free baselines
+
+`polystep.baselines` runs six gradient-free methods against the same protocol PolyStep
+uses, so a comparison is not confounded by the search space, the probe radius, the
+minibatch stream or the evaluation budget.
+
+| Method | Cost per iteration | Source |
+|--------|-------------------|--------|
+| `openai_es` | `popsize` | Salimans et al. 2017 (arXiv:1703.03864) |
+| `spsa` | 2 | Spall 1992 |
+| `mezo` | 2 | Malladi et al. 2023 (arXiv:2305.17333) |
+| `random_search` | 1 | control: random direction, keep it if the loss drops |
+| `eggroll` | `popsize` | Sarkar et al. (arXiv:2511.16652) |
+| `cma_es` | `popsize` | pycma (`pip install cma`) |
+
+```python
+from polystep.baselines import Objective, openai_es, random_search
+
+# fn: (N, dim) -> (N,) losses, lower is better. One call per generation, so a
+# stochastic fn draws one minibatch per call and every candidate sees the same data.
+obj = Objective(fn, dim=64, budget=10_000)
+result = openai_es(obj, sigma=0.05, lr=0.1, popsize=32)
+result.best_loss, result.evals   # evals is never above budget
+```
+
+To search a subspace instead, only the objective changes:
+
+```python
+obj = Objective.from_subspace(hybrid, base_sd, loss_batch, budget=10_000)
+result = random_search(obj, sigma=0.1)   # isolates the subspace from the update rule
+```
+
+**One evaluation means one candidate scored.** `Objective` counts rows, so a method that
+vmaps 32 candidates behind one call spends 32, exactly like one that makes 32 calls. It
+refuses a batch that would exceed the budget, so no method can overspend. This is a
+single replacement for the three older, mutually incompatible counters in `experiments/`
+(`FunctionEvalCounter` counts closure calls, `CountingClosure` counts `losses.shape[0]`,
+`sgd_baseline` counts samples).
+
+Note on EGGROLL: its rank-`r` perturbations `A B^T` are defined on weight *matrices*, and
+`Objective.shapes` says where those are. `Objective.from_layout` preserves the per-tensor
+shapes; `Objective.from_subspace` cannot, because `HybridSubspace` coordinates carry no
+matrix structure, so EGGROLL there degenerates to dense Gaussian ES on the coordinates.
+`FactoredSubspace` is the subspace that already implements the `A B^T` parameterization.
+
+### Fairness mode
+
+The paper runners take `--fair`, which hands every gradient-free method in a table the
+same subspace (same class, rank and seed), the same candidate budget derived from what
+PolyStep spends over its configured epochs, the same minibatch stream and the same probe
+radius. Each result JSON records `subspace_class`, `subspace_rank`, `eval_budget` and
+`evals_used`, plus a per-generation trajectory against *cumulative candidate
+evaluations* for the accuracy-vs-evaluations figure. EGGROLL is the one recorded
+exception: it gets `FactoredSubspace`, for the reason above.
+
+```bash
+python experiments/runners/run_mnist.py --fair --methods polystep openai_es spsa mezo random_search eggroll cma_es
+# tuning cost, in the same units, for both sides of the table
+python experiments/runners/variant_sweep.py --envs mnist_mlp --stage screen   # writes tuning_cost.json
+python experiments/runners/variant_sweep.py --envs mnist_mlp --baseline spsa  # appends to it
+```
+
+`--theory-mode` runs the configuration Theorem 4.2 assumes instead of the tuned one:
+`probe_radius_jitter=0.05` with the smooth mollifier density, independently sampled
+rotations, flat epsilon, step radius `r_0 (t+1)^-(1/2+0.1)` (`polystep.PowerDecay`),
+orthoplex, `HybridSubspace`, and no momentum, amortization or Anderson acceleration.
+Jitter and the amortization heuristics are mutually exclusive and `PolyStepOptimizer`
+enforces that itself: `probe_radius_jitter > 0` turns off `adaptive_probes` and
+`amortize_steps`, because jitter makes the per-step cost a noisy estimate that those
+heuristics read as progress.
+
 ## Benchmarks
 
 5-seed mean ± std (seeds: 42, 123, 456, 789, 1337). Hardware: NVIDIA RTX 5090.

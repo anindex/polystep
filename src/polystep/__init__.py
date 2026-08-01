@@ -23,6 +23,7 @@ __all__ = [
     "LinearEpsilon",
     "CosineEpsilon",
     "ProgressiveEpsilon",
+    "PowerDecay",
     # Solver
     "SolverState",
     # Transform
@@ -102,7 +103,7 @@ from .geometry import (
 )
 
 from .costs import compute_cost_matrix, scale_cost_matrix
-from .epsilon import LinearEpsilon, CosineEpsilon, ProgressiveEpsilon
+from .epsilon import LinearEpsilon, CosineEpsilon, ProgressiveEpsilon, PowerDecay
 
 from .solver import SolverState
 

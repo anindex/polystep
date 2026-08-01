@@ -8,6 +8,8 @@ coarse-to-fine.
 - ``CosineEpsilon``: cosine annealing, optional SGDR-style warm restarts.
 - ``ProgressiveEpsilon``: driven by Sinkhorn convergence rather than by ``t``, after
   ProgOT (Kassraie et al., NeurIPS 2024, arXiv:2406.05061).
+- ``PowerDecay``: ``r_t = init * (t + 1)^-(1/2 + gamma)``, the step-radius schedule
+  Theorem 4.2 assumes.
 """
 
 import math
@@ -35,6 +37,35 @@ class LinearEpsilon:
             return self.init
         eps = self.init - (self.decay * iteration)
         return max(eps, self.target)
+
+
+@dataclass
+class PowerDecay:
+    """``r(t) = max(init * (t + 1) ** -(0.5 + gamma), target)``.
+
+    The step-radius schedule the convergence analysis assumes: square-summable but
+    not summable, which is what makes the noise term vanish while the iterates can
+    still travel an unbounded distance. ``gamma`` around 0.1 is the usual choice.
+    Same ``at(iteration)`` interface as the epsilon schedulers, so it drops into
+    ``PolyStepOptimizer(step_radius=...)`` unchanged.
+
+    Attributes:
+        init: ``r_0``.
+        gamma: Extra decay beyond ``t^-1/2``; must be > 0 for square-summability.
+        target: Floor, so a long run does not shrink the step into fp32 noise.
+    """
+
+    init: float = 1.0
+    gamma: float = 0.1
+    target: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.gamma <= 0:
+            raise ValueError(f"gamma must be > 0 for a square-summable schedule, got {self.gamma}")
+
+    def at(self, iteration: Optional[int] = None) -> float:
+        t = 0 if iteration is None else max(int(iteration), 0)
+        return max(self.init * (t + 1) ** -(0.5 + self.gamma), self.target)
 
 
 @dataclass

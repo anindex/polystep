@@ -64,6 +64,7 @@ experiments = [
     "evotorch>=0.5",  # CMAES baseline (benchmarks.baselines.train_cmaes)
     "snntorch>=0.7",  # LIF neurons in benchmarks.utils.SpikingNet
     "datasets>=2.14",  # HuggingFace loader in experiments/runners/run_gpt2_finetune.py
+    "transformers>=4.40",  # GPT-2 tokenizer + pretrained weights, same runner
     "gymnasium>=0.29",
 ]
 # RL experiments (Box2D envs)

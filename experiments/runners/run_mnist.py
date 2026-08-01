@@ -1,17 +1,24 @@
 #!/usr/bin/env python
 """Run all methods and seeds for MNIST benchmark.
 
-Methods: polystep, cmaes, openai_es, spsa, adam
+Methods: polystep, adam, and the six gradient-free baselines from
+``polystep.baselines`` (cma_es, openai_es, spsa, mezo, random_search, eggroll).
 Model: MNISTNet MLP (784->128->10, ~102K params) for all methods.
 Data: Standard MNIST (28x28 grayscale, 10 classes)
 
 Hyperparameters are hardcoded constants for reproducibility.
 Results are saved as JSON files in experiments/results/softmax/main/.
 
+``--fair`` runs the matched-budget, matched-representation table: every
+gradient-free method gets the same subspace, the same candidate budget derived
+from what PolyStep spends, and the same probe radius. See
+``experiments/runners/fairness.py``.
+
 Usage:
     python experiments/runners/run_mnist.py
     python experiments/runners/run_mnist.py --methods polystep adam --seeds 42 123
-    python experiments/runners/run_mnist.py --device cpu
+    python experiments/runners/run_mnist.py --fair --device cpu
+    python experiments/runners/run_mnist.py --theory-mode --methods polystep
 """
 
 from __future__ import annotations
@@ -37,8 +44,16 @@ from experiments.runners.common import (
     set_seed,
     track_gpu_memory,
 )
-from experiments.baselines.openai_es import train_openai_es
-from experiments.baselines.spsa import train_spsa
+from experiments.runners.fairness import (
+    FAIR_METHODS,
+    apply_theory_mode,
+    make_subspace,
+    minibatch_loss,
+    polystep_eval_budget,
+    probe_scale_of,
+    run_baseline,
+    subspace_tag,
+)
 from experiments.baselines.sgd_baseline import train_sgd
 
 
@@ -53,6 +68,9 @@ EPOCHS = 30
 #   Cosine-scheduled step_radius (5->1) and probe_radius (10->2)
 #   absorb_interval=0 (continuous absorb), no biased_rotation (no effect on MNIST)
 #   NO momentum - sweep showed no_mom (95.70%) beats with-mom (94.82%)
+#   probe_radius_jitter=0.05: required by the convergence analysis. It forces
+#   amortize_steps=1 (see PolyStepOptimizer.__init__), so the amortization the
+#   sweep found is off here and the config records that rather than hiding it.
 PSTORCH_CONFIG = {
     "rank": 8,
     "step_radius_init": 5.0,
@@ -69,49 +87,98 @@ PSTORCH_CONFIG = {
     "amortize_ema": 0.7,
 }
 
-# OpenAI ES hyperparameters (Salimans et al. 2017 + compute budget matching)
-# polystep does ~2360 steps on MNIST (20 ep x 118 batches), each evaluating ~50 candidates
-# Give ES comparable: 2000 gen x 50 pop = 100K evals
-# Enable lr_decay (linear to 0) and weight_decay (0.01) per reference algorithm
-OPENAI_ES_CONFIG = {
-    "sigma": 0.02,
-    "lr": 0.01,
-    "population_size": 50,
-    "generations": 2000,
-    "lr_decay": True,
-    "weight_decay": 0.01,
-    "fitness_shaping": "rank",
-}
-
-# SPSA hyperparameters (compute budget matched)
-# 10000 iters x 2 evals = 20K evals, gain sequences tuned for MNIST MLP
-# a=0.1 (original stable value), c=0.1, alpha/gamma at Spall defaults
-# a=0.1 is stable; larger values diverge on this problem
-SPSA_CONFIG = {
-    "a": 0.1,
-    "c": 0.1,
-    "alpha": 0.602,
-    "gamma": 0.101,
-    "max_iters": 10000,
-}
-
 # Adam hyperparameters
 ADAM_CONFIG = {
     "lr": 0.001,
     "epochs": EPOCHS,
 }
 
-# CMA-ES hyperparameters (compute budget matched)
-# 2000 gen x 16 pop = 32K evals
-CMAES_CONFIG = {
-    "generations": 2000,
-    "popsize": 16,
-    "stdev_init": 0.5,
+# Free-running (non-fair) candidate budgets, preserving what the previous ad-hoc
+# implementations spent: ES 2000 gen x 50 pop, SPSA 10000 iters x 2, CMA-ES 2000 gen
+# x 16 pop. The new methods get the budget of the method they most resemble.
+# `--fair` overrides all of these with one budget derived from PolyStep.
+LEGACY_BUDGETS = {
+    "openai_es": 100_000,
+    "eggroll": 100_000,
+    "cma_es": 32_000,
+    "spsa": 20_000,
+    "mezo": 20_000,
+    "random_search": 20_000,
 }
 
 
+def _build_polystep(model, seed, total_steps, cfg, solver):
+    """Build the subspace and optimizer from ``cfg``.
+
+    Shared by the training run and by ``fair_eval_budget``, which needs the built
+    optimizer to know how many candidates a step costs.
+    """
+    from polystep.optimizer import PolyStepOptimizer
+    from polystep.epsilon import CosineEpsilon
+    from polystep.transform import ParamLayout
+
+    def sched(key, flat_default):
+        # Scheduled when the config carries both endpoints; flat otherwise, which is
+        # also what --theory-mode leaves behind.
+        if f"{key}_init" not in cfg:
+            return cfg.get(key, flat_default)
+        init, target = cfg[f"{key}_init"], cfg[f"{key}_target"]
+        return CosineEpsilon(init=init, target=target, decay=(init - target) / max(1, total_steps))
+
+    layout = ParamLayout.from_module(model)
+    subspace = make_subspace(
+        layout,
+        rank=cfg["rank"],
+        seed=seed,
+        rotation_mode="random",
+        rotation_interval=cfg["rotation_interval"],
+        absorb_mode="periodic",
+        absorb_interval=cfg["absorb_interval"],
+    )
+    optimizer = PolyStepOptimizer(
+        model,
+        compile=False,
+        seed=seed,
+        epsilon=sched("epsilon", 0.5),
+        step_radius=sched("step_radius", 1.0),
+        probe_radius=sched("probe_radius", 1.0),
+        num_probe=cfg["num_probe"],
+        subspace=subspace,
+        chunk_size=cfg.get("chunk_size", 1024),
+        probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
+        probe_radius_jitter_dist=cfg.get("probe_radius_jitter_dist", "smooth"),
+        polytope_type=cfg.get("polytope_type", "simplex"),
+        amortize_steps=cfg.get("amortize_steps", 1),
+        amortize_ema=cfg.get("amortize_ema", 0.0),
+        use_momentum=cfg.get("use_momentum", False),
+        momentum_init=cfg.get("momentum_init", 0.5),
+        momentum_final=cfg.get("momentum_final", 0.95),
+        biased_rotation=cfg.get("biased_rotation", False),
+        solver=solver,
+    )
+    return layout, subspace, optimizer
+
+
+def fair_eval_budget(seed, device, train_loader, epochs, cfg, solver):
+    """The shared candidate budget: what PolyStep spends over ``epochs`` epochs."""
+    set_seed(seed)
+    probe_model = MNISTNet().to(device)
+    _, _, opt = _build_polystep(probe_model, seed, epochs * len(train_loader), cfg, solver)
+    return polystep_eval_budget(opt, epochs * len(train_loader))
+
+
 def run_polystep(
-    seed, device, train_loader, test_loader, results_dir, solver=None, audit_no_leakage: bool = True, val_loader=None
+    seed,
+    device,
+    train_loader,
+    test_loader,
+    results_dir,
+    solver=None,
+    audit_no_leakage: bool = True,
+    val_loader=None,
+    fair: bool = False,
+    theory_mode: bool = False,
+    epochs: int = None,
 ):
     """Train MNIST with polystep PolyStepOptimizer + HybridSubspace.
 
@@ -120,11 +187,10 @@ def run_polystep(
     to the legacy behavior where ``best_state_dict`` was selected on
     the test set.
     """
-    from polystep.optimizer import PolyStepOptimizer
-    from polystep.epsilon import CosineEpsilon
-    from polystep.hybrid_subspace import HybridSubspace
-    from polystep.transform import ParamLayout
     from polystep.cost_nn import NNCostEvaluator
+
+    cfg = apply_theory_mode(PSTORCH_CONFIG) if theory_mode else dict(PSTORCH_CONFIG)
+    epochs = EPOCHS if epochs is None else epochs
 
     set_seed(seed)
     model = MNISTNet().to(device)
@@ -132,50 +198,9 @@ def run_polystep(
     selection_loader = val_loader if (audit_no_leakage and val_loader is not None) else test_loader
     selection_label = "val" if (audit_no_leakage and val_loader is not None) else "test"
 
-    total_steps = EPOCHS * len(train_loader)
-    epsilon_decay = (PSTORCH_CONFIG["epsilon_init"] - PSTORCH_CONFIG["epsilon_target"]) / max(1, total_steps)
-    sr_decay = (PSTORCH_CONFIG["step_radius_init"] - PSTORCH_CONFIG["step_radius_target"]) / max(1, total_steps)
-    pr_decay = (PSTORCH_CONFIG["probe_radius_init"] - PSTORCH_CONFIG["probe_radius_target"]) / max(1, total_steps)
-
-    layout = ParamLayout.from_module(model)
-    subspace = HybridSubspace.from_layout(
-        layout,
-        rank=PSTORCH_CONFIG["rank"],
-        rotation_mode="random",
-        rotation_interval=PSTORCH_CONFIG["rotation_interval"],
-        absorb_mode="periodic",
-        absorb_interval=PSTORCH_CONFIG["absorb_interval"],
-    )
-
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=False,
-        seed=seed,
-        epsilon=CosineEpsilon(
-            init=PSTORCH_CONFIG["epsilon_init"],
-            target=PSTORCH_CONFIG["epsilon_target"],
-            decay=epsilon_decay,
-        ),
-        step_radius=CosineEpsilon(
-            init=PSTORCH_CONFIG["step_radius_init"],
-            target=PSTORCH_CONFIG["step_radius_target"],
-            decay=sr_decay,
-        ),
-        probe_radius=CosineEpsilon(
-            init=PSTORCH_CONFIG["probe_radius_init"],
-            target=PSTORCH_CONFIG["probe_radius_target"],
-            decay=pr_decay,
-        ),
-        num_probe=PSTORCH_CONFIG["num_probe"],
-        subspace=subspace,
-        chunk_size=PSTORCH_CONFIG.get("chunk_size", 1024),
-        amortize_steps=PSTORCH_CONFIG.get("amortize_steps", 0),
-        amortize_ema=PSTORCH_CONFIG.get("amortize_ema", 0.0),
-        use_momentum=PSTORCH_CONFIG.get("use_momentum", False),
-        momentum_init=PSTORCH_CONFIG.get("momentum_init", 0.5),
-        momentum_final=PSTORCH_CONFIG.get("momentum_final", 0.95),
-        solver=solver,
-    )
+    total_steps = epochs * len(train_loader)
+    layout, subspace, optimizer = _build_polystep(model, seed, total_steps, cfg, solver)
+    eval_budget = polystep_eval_budget(optimizer, total_steps)
 
     import copy
 
@@ -189,7 +214,7 @@ def run_polystep(
     start_time = time.time()
 
     with track_gpu_memory() as mem:
-        for epoch in range(EPOCHS):
+        for epoch in range(epochs):
             epoch_loss = 0.0
             epoch_correct = 0
             epoch_total = 0
@@ -220,6 +245,9 @@ def run_polystep(
                         {
                             "step": step_count,
                             "epoch": epoch + 1,
+                            # Cumulative candidate evaluations: the x-axis of the
+                            # accuracy-vs-evaluations figure, shared with the baselines.
+                            "evals": fwd_pass_count,
                             "test_accuracy": step_test_acc,
                             "loss": loss,
                             "wall_time": time.time() - start_time,
@@ -257,20 +285,16 @@ def run_polystep(
                 }
             )
             print(
-                f"    Epoch {epoch + 1}/{EPOCHS} | train={train_acc * 100:.1f}% | "
+                f"    Epoch {epoch + 1}/{epochs} | train={train_acc * 100:.1f}% | "
                 f"test={test_acc * 100:.1f}% | {selection_label}-best={best_accuracy * 100:.1f}% | "
                 f"loss={avg_loss:.4f}"
             )
 
     wall_time = time.time() - start_time
-    last_epoch_acc = (
-        evaluate_accuracy(model, selection_loader, device=device)
-        if selection_loader is not test_loader
-        else evaluate_accuracy(model, test_loader, device=device)
-    )
-    if last_epoch_acc > best_accuracy:
-        best_accuracy = last_epoch_acc
-        best_state_dict = copy.deepcopy(model.state_dict())
+    # The epoch loop already scored (and, if better, saved) the final
+    # weights on the selection split; re-scoring here only ever added a
+    # second chance for the test set to pick the checkpoint.
+    last_epoch_acc = test_acc
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
     final_acc = evaluate_accuracy(model, test_loader, device=device)
@@ -282,150 +306,102 @@ def run_polystep(
         metrics={
             "final_accuracy": final_acc,
             "best_accuracy": best_accuracy,
+            "test_accuracy_at_selected": final_acc,
             "last_epoch_accuracy": last_epoch_acc,
             "wall_time_seconds": wall_time,
             "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
             "function_evals": fwd_pass_count,
             "total_steps": step_count,
         },
-        hyperparameters=PSTORCH_CONFIG,
+        hyperparameters={
+            **cfg,
+            "epochs": epochs,
+            # The four keys that let a reader check the table was matched.
+            **subspace_tag(subspace, cfg["rank"]),
+            "eval_budget": eval_budget,
+            "evals_used": fwd_pass_count,
+            "fair": fair,
+        },
         epoch_logs=epoch_logs,
         step_logs=step_logs,
         results_dir=results_dir,
+        leaked=not audit_no_leakage,
     )
     print(f"    Saved: {result}")
 
 
-def run_cmaes(seed, device, train_loader, test_loader, results_dir):
-    """Train MNIST with CMA-ES (EvoTorch)."""
-    try:
-        from polystep.benchmarks.baselines import train_cmaes, has_evotorch
-    except ImportError:
-        print("    Skipping cmaes (polystep.benchmarks.baselines not importable)")
-        return
+def run_gradient_free(
+    method,
+    seed,
+    device,
+    train_loader,
+    test_loader,
+    results_dir,
+    val_loader=None,
+    audit_no_leakage: bool = True,
+    fair: bool = False,
+    theory_mode: bool = False,
+    epochs: int = None,
+    budget: int = None,
+):
+    """Run one ``polystep.baselines`` method on MNIST.
 
-    if not has_evotorch():
-        print("    Skipping cmaes (EvoTorch not installed)")
-        return
+    Replaces the three ad-hoc implementations (EvoTorch CMA-ES,
+    ``experiments/baselines/openai_es.py``, ``experiments/baselines/spsa.py``), which
+    each counted evaluations differently and searched full parameter space while
+    PolyStep searched a subspace.
+
+    ``fair=True`` gives the method the same subspace, the same candidate budget as
+    PolyStep, and the same probe radius; otherwise it runs full-space on the budget
+    the old implementation spent.
+    """
+    from polystep.cost_nn import NNCostEvaluator
+    from polystep.transform import ParamLayout
+
+    cfg = apply_theory_mode(PSTORCH_CONFIG) if theory_mode else dict(PSTORCH_CONFIG)
+    epochs = EPOCHS if epochs is None else epochs
 
     set_seed(seed)
     model = MNISTNet().to(device)
+    layout = ParamLayout.from_module(model)
+    subspace = None
+    if fair:
+        subspace = make_subspace(layout, rank=cfg["rank"], seed=seed, method=method)
+        if budget is None:
+            budget = fair_eval_budget(seed, device, train_loader, epochs, cfg, "softmax")
+    if budget is None:
+        budget = LEGACY_BUDGETS[method]
 
-    # Extract data tensors for CMA-ES interface
-    train_data_list, train_labels_list = [], []
-    for data, labels in train_loader:
-        train_data_list.append(data)
-        train_labels_list.append(labels)
-    train_data = torch.cat(train_data_list).to(device)
-    train_labels = torch.cat(train_labels_list).to(device)
+    loss_batch = minibatch_loss(NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss()), train_loader, device)
+    selection_loader = val_loader if (audit_no_leakage and val_loader is not None) else test_loader
 
-    test_data_list, test_labels_list = [], []
-    for data, labels in test_loader:
-        test_data_list.append(data)
-        test_labels_list.append(labels)
-    test_data = torch.cat(test_data_list).to(device)
-    test_labels = torch.cat(test_labels_list).to(device)
-
-    with track_gpu_memory() as mem:
-        start_time = time.time()
-        result = train_cmaes(
-            model=model,
-            train_data=train_data,
-            train_labels=train_labels,
-            test_data=test_data,
-            test_labels=test_labels,
-            generations=CMAES_CONFIG["generations"],
-            popsize=CMAES_CONFIG["popsize"],
-            stdev_init=CMAES_CONFIG["stdev_init"],
-            device=device,
-            verbose=True,
-        )
-        wall_time = time.time() - start_time
-
-    filepath = save_result(
-        benchmark=BENCHMARK,
-        method="cmaes",
-        seed=seed,
-        metrics={
-            "final_accuracy": result.final_accuracy,
-            "best_accuracy": result.best_accuracy,
-            "wall_time_seconds": wall_time,
-            "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
-            "function_evals": result.function_evals,
-            "total_steps": result.total_steps,
-        },
-        hyperparameters=CMAES_CONFIG,
-        epoch_logs=result.epoch_logs,
-        results_dir=results_dir,
-    )
-    print(f"    Saved: {filepath}")
-
-
-def run_openai_es(seed, device, train_loader, test_loader, results_dir):
-    """Train MNIST with OpenAI Evolution Strategy."""
-    set_seed(seed)  # Seed before model init for deterministic weights
-    model = MNISTNet().to(device)
-
-    result = train_openai_es(
+    out = run_baseline(
+        method,
         model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        sigma=OPENAI_ES_CONFIG["sigma"],
-        lr=OPENAI_ES_CONFIG["lr"],
-        population_size=OPENAI_ES_CONFIG["population_size"],
-        generations=OPENAI_ES_CONFIG["generations"],
-        lr_decay=OPENAI_ES_CONFIG.get("lr_decay", False),
-        weight_decay=OPENAI_ES_CONFIG.get("weight_decay", 0.0),
-        fitness_shaping=OPENAI_ES_CONFIG.get("fitness_shaping", "zscore"),
-        device=device,
+        layout=layout,
+        loss_batch=loss_batch,
+        budget=budget,
+        val_fn=lambda m: evaluate_accuracy(m, selection_loader, device=device),
+        test_fn=lambda m: evaluate_accuracy(m, test_loader, device=device),
+        mode="max",
         seed=seed,
+        subspace=subspace,
+        subspace_rank=cfg["rank"] if fair else None,
+        probe_scale=probe_scale_of(cfg),
     )
-
-    result["benchmark"] = BENCHMARK
+    out["hyperparameters"]["fair"] = fair
     filepath = save_result(
         benchmark=BENCHMARK,
-        method="openai_es",
+        method=method,
         seed=seed,
-        metrics=result["metrics"],
-        hyperparameters=result["hyperparameters"],
-        epoch_logs=result["epoch_logs"],
         results_dir=results_dir,
+        leaked=not audit_no_leakage,
+        **out,
     )
     print(f"    Saved: {filepath}")
 
 
-def run_spsa(seed, device, train_loader, test_loader, results_dir):
-    """Train MNIST with SPSA."""
-    set_seed(seed)  # Seed before model init for deterministic weights
-    model = MNISTNet().to(device)
-
-    result = train_spsa(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        a=SPSA_CONFIG["a"],
-        c=SPSA_CONFIG["c"],
-        alpha=SPSA_CONFIG.get("alpha", 0.602),
-        gamma=SPSA_CONFIG.get("gamma", 0.101),
-        max_iters=SPSA_CONFIG["max_iters"],
-        device=device,
-        seed=seed,
-    )
-
-    result["benchmark"] = BENCHMARK
-    filepath = save_result(
-        benchmark=BENCHMARK,
-        method="spsa",
-        seed=seed,
-        metrics=result["metrics"],
-        hyperparameters=result["hyperparameters"],
-        epoch_logs=result["epoch_logs"],
-        results_dir=results_dir,
-    )
-    print(f"    Saved: {filepath}")
-
-
-def run_adam(seed, device, train_loader, test_loader, results_dir):
+def run_adam(seed, device, train_loader, test_loader, results_dir, val_loader=None, audit_no_leakage: bool = True):
     """Train MNIST with Adam (gradient-based ceiling)."""
     set_seed(seed)
     model = MNISTNet().to(device)
@@ -434,6 +410,7 @@ def run_adam(seed, device, train_loader, test_loader, results_dir):
         model=model,
         train_loader=train_loader,
         test_loader=test_loader,
+        val_loader=val_loader,
         optimizer_name="adam",
         lr=ADAM_CONFIG["lr"],
         epochs=ADAM_CONFIG["epochs"],
@@ -450,20 +427,32 @@ def run_adam(seed, device, train_loader, test_loader, results_dir):
         hyperparameters=result["hyperparameters"],
         epoch_logs=result["epoch_logs"],
         results_dir=results_dir,
+        leaked=not audit_no_leakage,
     )
     print(f"    Saved: {filepath}")
 
 
-METHOD_RUNNERS = {
-    "polystep": run_polystep,
-    "cmaes": run_cmaes,
-    "openai_es": run_openai_es,
-    "spsa": run_spsa,
-    "adam": run_adam,
-}
+# polystep and adam have their own loops; every gradient-free method goes through
+# the one shared runner.
+METHOD_RUNNERS = {"polystep": run_polystep, "adam": run_adam}
+ALL_METHODS = ("polystep", "adam", *FAIR_METHODS)
+#: The old name for cma_es, kept so existing result files and scripts still resolve.
+ALIASES = {"cmaes": "cma_es"}
 
 
-def run_method(method, seed, device, results_dir, data_dir, solver=None, audit_no_leakage: bool = True):
+def run_method(
+    method,
+    seed,
+    device,
+    results_dir,
+    data_dir,
+    solver=None,
+    audit_no_leakage: bool = True,
+    fair: bool = False,
+    theory_mode: bool = False,
+    epochs: int = None,
+    budget: int = None,
+):
     """Run a single method+seed combination."""
     from experiments.runners.common import make_train_val_split
 
@@ -478,23 +467,30 @@ def run_method(method, seed, device, results_dir, data_dir, solver=None, audit_n
             val_frac=0.1,
             seed=seed,
         )
-    runner = METHOD_RUNNERS.get(method)
-    if runner is None:
-        print(f"    Unknown method: {method}")
-        return
-    if method == "polystep":
-        runner(
+    method = ALIASES.get(method, method)
+    kwargs = dict(audit_no_leakage=audit_no_leakage, val_loader=val_loader)
+    if method in FAIR_METHODS:
+        run_gradient_free(
+            method,
             seed,
             device,
             train_loader,
             test_loader,
             results_dir,
-            solver=solver,
-            audit_no_leakage=audit_no_leakage,
-            val_loader=val_loader,
+            fair=fair,
+            theory_mode=theory_mode,
+            epochs=epochs,
+            budget=budget,
+            **kwargs,
         )
-    else:
-        runner(seed, device, train_loader, test_loader, results_dir)
+        return
+    runner = METHOD_RUNNERS.get(method)
+    if runner is None:
+        print(f"    Unknown method: {method}")
+        return
+    if method == "polystep":
+        kwargs.update(solver=solver, fair=fair, theory_mode=theory_mode, epochs=epochs)
+    runner(seed, device, train_loader, test_loader, results_dir, **kwargs)
 
 
 def main():
@@ -502,8 +498,8 @@ def main():
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["polystep", "cmaes", "openai_es", "spsa", "adam"],
-        help="Methods to run (default: all)",
+        default=list(ALL_METHODS),
+        help=f"Methods to run (default: all of {list(ALL_METHODS)})",
     )
     parser.add_argument(
         "--seeds",
@@ -531,6 +527,27 @@ def main():
             "of earlier results."
         ),
     )
+    parser.add_argument(
+        "--fair",
+        action="store_true",
+        help=(
+            "Matched-budget, matched-representation table: every gradient-free "
+            "method gets the same subspace (FactoredSubspace for eggroll), the same "
+            "candidate budget derived from PolyStep, and the same probe radius."
+        ),
+    )
+    parser.add_argument(
+        "--theory-mode",
+        action="store_true",
+        help=(
+            "Run the configuration Theorem 4.2 analyses: probe_radius_jitter=0.05 "
+            "with the smooth density, independent rotations, flat epsilon, step "
+            "radius r0*(t+1)^-(1/2+0.1), orthoplex, HybridSubspace, no momentum / "
+            "amortization / Anderson."
+        ),
+    )
+    parser.add_argument("--epochs", type=int, default=None, help="Override epochs (smoke runs)")
+    parser.add_argument("--budget", type=int, default=None, help="Override the candidate budget (smoke runs)")
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -541,11 +558,12 @@ def main():
     print(f"  Methods: {args.methods}")
     print(f"  Seeds: {args.seeds}")
     print(f"  Device: {args.device}")
+    print(f"  Fair: {args.fair}  Theory mode: {args.theory_mode}")
     print()
 
     for method in args.methods:
         for seed in args.seeds:
-            output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{method}_{seed}.json")
+            output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{ALIASES.get(method, method)}_{seed}.json")
             if os.path.exists(output_file):
                 print(f"Skipping {method} seed={seed} (result exists)")
                 continue
@@ -559,6 +577,10 @@ def main():
                     args.data_dir,
                     solver=args.solver,
                     audit_no_leakage=not args.allow_test_leakage,
+                    fair=args.fair,
+                    theory_mode=args.theory_mode,
+                    epochs=args.epochs,
+                    budget=args.budget,
                 )
             except Exception as e:
                 print(f"  ERROR: {method} seed={seed} failed: {e}")

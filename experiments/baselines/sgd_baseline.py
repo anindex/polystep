@@ -23,8 +23,9 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,7 @@ def train_sgd(
     model: nn.Module,
     train_loader: DataLoader,
     test_loader: DataLoader,
+    val_loader: Optional[DataLoader] = None,
     loss_fn: nn.Module = None,
     optimizer_name: str = "adam",
     lr: float = 0.001,
@@ -64,7 +66,12 @@ def train_sgd(
     Args:
         model: PyTorch model to train.
         train_loader: Training data loader.
-        test_loader: Test data loader for accuracy evaluation.
+        test_loader: Test data loader. Evaluated once, at the end, on the
+            selected checkpoint when ``val_loader`` is given.
+        val_loader: Held-out validation loader used for checkpoint
+            selection. When given, ``best_accuracy`` is a validation
+            number and the test set is not touched during training.
+            When None the legacy (test-selected) behavior is kept.
         loss_fn: Loss function. Defaults to CrossEntropyLoss.
         optimizer_name: Optimizer to use, "adam" or "sgd".
         lr: Learning rate.
@@ -104,8 +111,14 @@ def train_sgd(
 
     epoch_logs: List[Dict[str, Any]] = []
     best_accuracy = 0.0
+    best_state = None
     total_samples_seen = 0
     start_time = time.time()
+
+    # Model selection runs on the validation split when there is one, so
+    # the test set stays untouched until the selected checkpoint is scored.
+    selection_loader = val_loader if val_loader is not None else test_loader
+    selection_label = "val" if val_loader is not None else "test"
 
     with track_gpu_memory() as mem:
         for epoch in range(1, epochs + 1):
@@ -138,16 +151,19 @@ def train_sgd(
             train_acc = epoch_correct / max(epoch_total, 1)
 
             # Evaluation
-            test_acc = evaluate_accuracy(model, test_loader, device=device)
+            selection_acc = evaluate_accuracy(model, selection_loader, device=device)
             elapsed = time.time() - start_time
 
-            if test_acc > best_accuracy:
-                best_accuracy = test_acc
+            if selection_acc > best_accuracy:
+                best_accuracy = selection_acc
+                if val_loader is not None:
+                    best_state = copy.deepcopy(model.state_dict())
 
             epoch_logs.append(
                 {
                     "epoch": epoch,
-                    "accuracy": test_acc,
+                    "accuracy": selection_acc,
+                    f"{selection_label}_accuracy": selection_acc,
                     "train_accuracy": train_acc,
                     "loss": avg_loss,
                     "time": elapsed,
@@ -155,8 +171,10 @@ def train_sgd(
             )
 
     wall_time = time.time() - start_time
+    if best_state is not None:
+        model.load_state_dict(best_state)
     final_accuracy = evaluate_accuracy(model, test_loader, device=device)
-    if final_accuracy > best_accuracy:
+    if val_loader is None and final_accuracy > best_accuracy:
         best_accuracy = final_accuracy
 
     # function_evals = total forward passes = total training samples seen
@@ -175,6 +193,7 @@ def train_sgd(
         "metrics": {
             "final_accuracy": final_accuracy,
             "best_accuracy": best_accuracy,
+            "test_accuracy_at_selected": final_accuracy,
             "wall_time_seconds": wall_time,
             "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
             "function_evals": function_evals,

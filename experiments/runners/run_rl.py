@@ -33,7 +33,9 @@ from polystep.benchmarks.rl.cartpole import (
     ACTION_DIM as CARTPOLE_ACTION_DIM,
     random_policy_baseline as cartpole_random_baseline,
 )
-from polystep.epsilon import CosineEpsilon
+from polystep.epsilon import CosineEpsilon, PowerDecay
+
+from experiments.runners.fairness import THEORY_GAMMA, THEORY_JITTER
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
@@ -183,7 +185,11 @@ CARTPOLE_POLYSTEP_FINAL_CONFIG: dict[str, Any] = {
     "epsilon_target": 0.3,
     "step_radius": 0.1,
     "probe_radius": 1.5,
-    "amortize_steps": 3,
+    # Required by the convergence analysis; forces amortize_steps=1 and
+    # adaptive_probes=False in PolyStepOptimizer.__init__, so the amortization the
+    # sweep found is off here and the config records that rather than hiding it.
+
+    "amortize_steps": 1,
     "max_subspace_dim": 24,
     "selected_from": "hyperparameter sweep",
 }
@@ -203,11 +209,17 @@ def run_polystep_cartpole(
     epsilon_target: float = 0.3,
     step_radius: float = 0.1,
     probe_radius: float = 0.4,
+    probe_radius_jitter: float = 0.0,
     amortize_steps: int = 1,
     max_subspace_dim: int | None = None,
     method: str = "polystep",
+    theory_mode: bool = False,
 ) -> int:
-    """Run PolyStep direct policy search on CartPole-v1."""
+    """Run PolyStep direct policy search on CartPole-v1.
+
+    ``theory_mode`` selects the configuration Theorem 4.2 assumes; see
+    :func:`experiments.runners.fairness.apply_theory_mode`.
+    """
 
     set_seed(seed)
     model = DiscreteMLPPolicy(
@@ -232,15 +244,21 @@ def run_polystep_cartpole(
         model,
         solver="softmax",
         subspace=subspace,
-        epsilon=CosineEpsilon(
+        # Theory mode: flat epsilon and the decaying step radius the analysis needs.
+        epsilon=epsilon_target
+        if theory_mode
+        else CosineEpsilon(
             init=epsilon_init,
             target=epsilon_target,
             decay=(epsilon_init - epsilon_target) / total_steps,
         ),
-        step_radius=step_radius,
+        step_radius=PowerDecay(init=step_radius, gamma=THEORY_GAMMA) if theory_mode else step_radius,
         probe_radius=probe_radius,
+        probe_radius_jitter=THEORY_JITTER if theory_mode else probe_radius_jitter,
+        probe_radius_jitter_dist="smooth",
+        polytope_type="orthoplex" if theory_mode else "simplex",
         num_probe=1,
-        amortize_steps=amortize_steps,
+        amortize_steps=1 if theory_mode else amortize_steps,
         chunk_size=256,
         seed=seed,
     )
@@ -361,7 +379,9 @@ def run_polystep_cartpole(
             "epsilon_target": epsilon_target,
             "step_radius": step_radius,
             "probe_radius": probe_radius,
-            "amortize_steps": amortize_steps,
+            "probe_radius_jitter": THEORY_JITTER if theory_mode else probe_radius_jitter,
+            "amortize_steps": 1 if theory_mode else amortize_steps,
+            "theory_mode": theory_mode,
             "max_subspace_dim": max_subspace_dim,
             "param_count": param_count,
             "subspace_dim": subspace.subspace_dim,
@@ -518,9 +538,11 @@ def _run_cartpole_polystep_full(*, seed: int, device: str, results_dir: str, arg
         epsilon_target=config["epsilon_target"],
         step_radius=config["step_radius"],
         probe_radius=args.probe_radius if args.probe_radius is not None else config["probe_radius"],
+        probe_radius_jitter=config.get("probe_radius_jitter", 0.05),
         amortize_steps=config["amortize_steps"],
         max_subspace_dim=args.max_subspace_dim or config.get("max_subspace_dim"),
         results_dir=results_dir,
+        theory_mode=getattr(args, "theory_mode", False),
     )
 
 
@@ -543,7 +565,9 @@ GYM_ENV_REGISTRY: dict[str, dict[str, Any]] = {
             "epsilon_target": 0.3,
             "step_radius": 0.1,
             "probe_radius": 1.5,
-            "amortize_steps": 3,
+            # Jitter forces amortize_steps=1; see PolyStepOptimizer.__init__.
+
+            "amortize_steps": 1,
             "max_subspace_dim": 24,
         },
         "sb3_total_timesteps": {"sweep": 10_000, "full": 1_000_000},
@@ -565,6 +589,7 @@ GYM_ENV_REGISTRY: dict[str, dict[str, Any]] = {
             "epsilon_target": 0.3,
             "step_radius": 0.1,
             "probe_radius": 2.0,
+
             "amortize_steps": 1,
             "max_subspace_dim": 24,
         },
@@ -629,9 +654,11 @@ def run_polystep_gym(
     epsilon_target: float | None = None,
     step_radius: float | None = None,
     probe_radius: float | None = None,
+    probe_radius_jitter: float | None = None,
     amortize_steps: int | None = None,
     max_subspace_dim: int | None = None,
     method: str = "polystep",
+    theory_mode: bool = False,
     nondiff_mode: str = "float32",
 ) -> int:
     """Run PolyStep direct policy search on a generic discrete-action Gym env.
@@ -658,6 +685,9 @@ def run_polystep_gym(
     epsilon_target = float(epsilon_target) if epsilon_target is not None else float(pcfg["epsilon_target"])
     step_radius = float(step_radius) if step_radius is not None else float(pcfg["step_radius"])
     probe_radius = float(probe_radius) if probe_radius is not None else float(pcfg["probe_radius"])
+    probe_radius_jitter = (
+        float(probe_radius_jitter) if probe_radius_jitter is not None else float(pcfg.get("probe_radius_jitter", 0.05))
+    )
     amortize_steps = int(amortize_steps) if amortize_steps is not None else int(pcfg["amortize_steps"])
     max_subspace_dim = int(max_subspace_dim) if max_subspace_dim is not None else pcfg.get("max_subspace_dim")
 
@@ -701,15 +731,21 @@ def run_polystep_gym(
         model,
         solver="softmax",
         subspace=subspace,
-        epsilon=CosineEpsilon(
+        # Theory mode: flat epsilon and the decaying step radius the analysis needs.
+        epsilon=epsilon_target
+        if theory_mode
+        else CosineEpsilon(
             init=epsilon_init,
             target=epsilon_target,
             decay=(epsilon_init - epsilon_target) / total_steps,
         ),
-        step_radius=step_radius,
+        step_radius=PowerDecay(init=step_radius, gamma=THEORY_GAMMA) if theory_mode else step_radius,
         probe_radius=probe_radius,
+        probe_radius_jitter=THEORY_JITTER if theory_mode else probe_radius_jitter,
+        probe_radius_jitter_dist="smooth",
+        polytope_type="orthoplex" if theory_mode else "simplex",
         num_probe=1,
-        amortize_steps=amortize_steps,
+        amortize_steps=1 if theory_mode else amortize_steps,
         chunk_size=256,
         seed=seed,
     )
@@ -832,7 +868,9 @@ def run_polystep_gym(
             "epsilon_target": epsilon_target,
             "step_radius": step_radius,
             "probe_radius": probe_radius,
-            "amortize_steps": amortize_steps,
+            "probe_radius_jitter": THEORY_JITTER if theory_mode else probe_radius_jitter,
+            "amortize_steps": 1 if theory_mode else amortize_steps,
+            "theory_mode": theory_mode,
             "max_subspace_dim": max_subspace_dim,
             "param_count": param_count,
             "subspace_dim": subspace.subspace_dim,
@@ -1467,6 +1505,16 @@ def main() -> None:
         "--probe-radius", type=float, default=None, help="Override probe_radius in FINAL_CONFIG for PolyStep runs."
     )
     parser.add_argument(
+        "--theory-mode",
+        action="store_true",
+        help=(
+            "Run the configuration Theorem 4.2 analyses: probe_radius_jitter=0.05 "
+            "with the smooth density, independent rotations, flat epsilon, step "
+            "radius r0*(t+1)^-(1/2+0.1), orthoplex, HybridSubspace, no momentum / "
+            "amortization / Anderson."
+        ),
+    )
+    parser.add_argument(
         "--nondiff-mode",
         choices=["float32", "int8", "binary"],
         default="float32",
@@ -1561,6 +1609,7 @@ def main() -> None:
                         probe_radius=args.probe_radius,
                         max_subspace_dim=args.max_subspace_dim,
                         results_dir=args.results_dir,
+                        theory_mode=args.theory_mode,
                         nondiff_mode=args.nondiff_mode,
                         method=(
                             "polystep" if args.nondiff_mode == "float32" else f"polystep_nondiff_{args.nondiff_mode}"

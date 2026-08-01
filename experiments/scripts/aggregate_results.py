@@ -24,6 +24,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 
+class LeakedResultError(RuntimeError):
+    """Raised when a result file is stamped ``"leaked": true``.
+
+    Deliberately not caught by the aggregation loop: a run whose
+    checkpoint was picked on the test set must fail loudly rather than be
+    skipped with a warning and silently dropped from the mean.
+    """
+
+
 def load_single_result(path: str) -> Dict[str, Any]:
     """Load a single JSON result file and extract key fields into a flat dict.
 
@@ -35,17 +44,25 @@ def load_single_result(path: str) -> Dict[str, Any]:
         path: Path to a JSON result file.
 
     Returns:
-        Flat dict with keys: benchmark, method, seed, final_accuracy,
-        best_accuracy, wall_time_seconds, peak_gpu_memory_mb, function_evals,
-        total_steps, epoch_logs, source_file.
+        Flat dict with keys: benchmark, method, seed, test_accuracy_at_selected,
+        final_accuracy, best_accuracy, wall_time_seconds, peak_gpu_memory_mb,
+        function_evals, total_steps, epoch_logs, source_file.
 
     Raises:
         FileNotFoundError: If path does not exist.
         json.JSONDecodeError: If file is not valid JSON.
         KeyError: If required keys are missing from the JSON.
+        LeakedResultError: If the run was produced with --allow-test-leakage.
     """
     with open(path, "r") as f:
         data = json.load(f)
+
+    if data.get("leaked", False):
+        raise LeakedResultError(
+            f"{path} was produced with --allow-test-leakage: its checkpoint was "
+            "selected on the test set. Re-run without that flag; a leaked run "
+            "must never be aggregated into a reported number."
+        )
 
     metrics = data.get("metrics", {})
 
@@ -53,6 +70,10 @@ def load_single_result(path: str) -> Dict[str, Any]:
         "benchmark": data["benchmark"],
         "method": data["method"],
         "seed": data["seed"],
+        # Headline metric: test accuracy of the val-selected checkpoint.
+        # Pre-2026 result files predate the key; for those, final_accuracy is
+        # the closest honest number (best_accuracy was max-over-epochs test).
+        "test_accuracy_at_selected": metrics.get("test_accuracy_at_selected", metrics.get("final_accuracy", 0.0)),
         "final_accuracy": metrics.get("final_accuracy", 0.0),
         "best_accuracy": metrics.get("best_accuracy", 0.0),
         "final_mse": metrics.get("final_mse"),
@@ -79,7 +100,7 @@ def aggregate_results(
 
     Summary columns:
         - benchmark, method
-        - mean_accuracy, std_accuracy (from best_accuracy)
+        - mean_accuracy, std_accuracy (from test_accuracy_at_selected)
         - mean_time, std_time (from wall_time_seconds)
         - mean_memory (from peak_gpu_memory_mb)
         - mean_func_evals (from function_evals)
@@ -92,6 +113,9 @@ def aggregate_results(
     Returns:
         pd.DataFrame with one row per (benchmark, method) group.
         Empty DataFrame (with correct columns) if no results found.
+
+    Raises:
+        LeakedResultError: If any result file is stamped ``"leaked": true``.
     """
     summary_columns = [
         "benchmark",
@@ -136,6 +160,7 @@ def aggregate_results(
         "benchmark",
         "method",
         "seed",
+        "test_accuracy_at_selected",
         "final_accuracy",
         "best_accuracy",
         "final_mse",
@@ -160,8 +185,8 @@ def aggregate_results(
             {
                 "benchmark": bm,
                 "method": method,
-                "mean_accuracy": group["best_accuracy"].mean(),
-                "std_accuracy": group["best_accuracy"].std(ddof=1) if len(group) > 1 else 0.0,
+                "mean_accuracy": group["test_accuracy_at_selected"].mean(),
+                "std_accuracy": group["test_accuracy_at_selected"].std(ddof=1) if len(group) > 1 else 0.0,
                 "mean_mse": mse_vals.mean() if has_mse else float("nan"),
                 "std_mse": mse_vals.std(ddof=1)
                 if has_mse and len(mse_vals) > 1

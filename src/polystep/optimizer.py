@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import math
 import os
 import warnings
 from dataclasses import dataclass, fields as dataclass_fields
@@ -413,11 +414,16 @@ class PolyStepOptimizer(SerializationMixin):
         scale_cost: Optional[Union[str, float]] = 1.0,
         step_radius: float = 1.0,
         probe_radius: float = 2.0,
-        # Theorem 4.2 condition (iv): eta_t ~ U[-eta_max, eta_max] on the probe radius
-        # makes the joint (rotation, jitter) distribution absolutely continuous on a
-        # tube around the sphere. The proof needs it > 0; the default 0.0 keeps existing
-        # experiments reproducible. Try 0.05.
+        # Radius jitter eta_t on the probe radius. Together with the random
+        # per-layer projection this is what makes the probe law absolutely
+        # continuous inside the particle plane, so probes miss the discontinuity
+        # set; the convergence proof needs it > 0 and needs a smooth density.
+        # Default 0.0: jitter makes the recorded cost a noisy estimate, which the
+        # amortization heuristics (adaptive probes, cost-row reuse) read as
+        # non-monotone progress. The experiment configs set 0.05 and the
+        # theory-mode config disables those heuristics.
         probe_radius_jitter: float = 0.0,
+        probe_radius_jitter_dist: str = "smooth",
         num_probe: int = 1,
         # Adaptive probe count: reduce K during exploitation.
         # None means "on wherever implemented"; see the class docstring.
@@ -639,7 +645,12 @@ class PolyStepOptimizer(SerializationMixin):
                 f"probe_radius_jitter must be in [0, 1), got {probe_radius_jitter}. "
                 f"Values >= 1 risk negative effective probe radius."
             )
+        if probe_radius_jitter_dist not in ("smooth", "uniform"):
+            raise ValueError(
+                f"probe_radius_jitter_dist must be 'smooth' or 'uniform', got {probe_radius_jitter_dist!r}"
+            )
         self.probe_radius_jitter = probe_radius_jitter
+        self.probe_radius_jitter_dist = probe_radius_jitter_dist
         if num_probe < 1:
             raise ValueError(
                 f"num_probe must be >= 1, got {num_probe}. "
@@ -703,6 +714,32 @@ class PolyStepOptimizer(SerializationMixin):
         self.cost_batch_size = cost_batch_size
         self.amortize_steps = max(1, amortize_steps)
         self.amortize_ema = amortize_ema
+
+        # Jitter and the amortization heuristics are mutually exclusive, and this is
+        # the one place every caller routes through, so enforce it here rather than
+        # leaving each experiment config to remember. Jitter makes the per-step cost a
+        # noisy estimate of the same quantity; adaptive probes read that noise as a
+        # moved particle, cost-row reuse would mix rows measured at different radii
+        # (the radius guard in _step_monolithic already refuses, so reuse silently
+        # buys nothing), and amortized OT reads it as non-monotone progress and coasts
+        # on a stale direction.
+        if self.probe_radius_jitter > 0.0:
+            disabled = []
+            if self._adaptive_probes:
+                self._adaptive_probes = False
+                if self._adaptive_probes_explicit:
+                    disabled.append("adaptive_probes")
+            if self.amortize_steps > 1:
+                self.amortize_steps = 1
+                disabled.append("amortize_steps")
+            if disabled:
+                warnings.warn(
+                    f"probe_radius_jitter={self.probe_radius_jitter} disables "
+                    f"{', '.join(disabled)}: jitter makes the per-step cost a noisy "
+                    f"estimate, which those heuristics read as progress. Set "
+                    f"probe_radius_jitter=0.0 to keep them.",
+                    stacklevel=2,
+                )
 
         # SNN-like models lose accuracy badly under a shrinking step_radius: the
         # discrete spike landscape is too chaotic. Warn on that combination.
@@ -1431,22 +1468,48 @@ class PolyStepOptimizer(SerializationMixin):
             return self.probe_radius.at(iteration)
         return self.probe_radius
 
-    def _apply_probe_radius_jitter(self, probe_r: float) -> float:
-        """Apply per-step uniform multiplicative jitter to the probe radius.
+    def _sample_jitter(self, eta_max: float) -> float:
+        """Draw eta from the probe-radius jitter density on (-eta_max, eta_max).
 
-        Samples ``eta ~ Uniform[-eta_max, +eta_max]`` and returns
-        ``probe_r * (1 + eta)``. When ``probe_radius_jitter == 0`` (default)
-        this is a no-op and consumes no random state.
+        ``smooth`` (default) draws from the standard mollifier
+        ``q(t) ~ exp(-1/(1 - t^2))`` on ``|t| < 1``, rescaled to ``eta_max``. The
+        convergence analysis needs a C-infinity density: with a uniform jitter
+        the score of the induced probe kernel picks up Dirac terms at the two
+        boundary radii, the smoothed surrogate is only Lipschitz rather than
+        smooth, and the gradient identity the descent inequality relies on does
+        not hold. ``uniform`` is kept for comparison against that analysis.
+        """
+        gen = self._generator
+        device = gen.device if gen is not None else None
+
+        def rand(n: int) -> torch.Tensor:
+            return torch.rand((n,), device=device, generator=gen)
+
+        if self.probe_radius_jitter_dist == "uniform":
+            return float((2.0 * rand(1).item() - 1.0) * eta_max)
+
+        # Rejection sampling against the peak density exp(-1) at t = 0.
+        # Acceptance is ~60%, so a batch of 16 leaves negligible tail risk.
+        for _ in range(8):
+            t = 2.0 * rand(16) - 1.0
+            dens = torch.exp(-1.0 / (1.0 - t * t))
+            accept = rand(16) * math.exp(-1.0) < dens
+            hit = torch.nonzero(accept, as_tuple=False)
+            if hit.numel() > 0:
+                return float(t[hit[0, 0]].item() * eta_max)
+        return 0.0  # ponytail: astronomically unlikely; fall back to no jitter
+
+    def _apply_probe_radius_jitter(self, probe_r: float) -> float:
+        """Apply per-step multiplicative jitter to the probe radius.
+
+        Returns ``probe_r * (1 + eta)``. When ``probe_radius_jitter == 0`` this
+        is a no-op and consumes no random state, which disables the transversality
+        and smoothness properties the convergence analysis assumes.
         """
         eta_max = float(self.probe_radius_jitter)
         if eta_max <= 0.0:
             return probe_r
-        if self._generator is not None:
-            device = self._generator.device
-            eta = torch.empty((1,), device=device).uniform_(-eta_max, eta_max, generator=self._generator).item()
-        else:
-            eta = float(torch.empty((1,)).uniform_(-eta_max, eta_max).item())
-        return float(probe_r) * (1.0 + eta)
+        return float(probe_r) * (1.0 + self._sample_jitter(eta_max))
 
     def _get_ent_epsilon(self, iteration: int) -> Optional[float]:
         """Resolve ent_epsilon at current iteration."""

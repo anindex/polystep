@@ -45,6 +45,7 @@ from experiments.runners.common import (
     set_seed,
     track_gpu_memory,
 )
+from experiments.runners.fairness import apply_theory_mode, polystep_eval_budget
 from experiments.runners.nondiff_data import generate_maxsat_instance
 from experiments.runners.nondiff_models import MaxSATModel
 
@@ -64,6 +65,9 @@ PSTORCH_CONFIG = {
     "probe_radius_target": 20.0,
     "num_probe": 1,
     "chunk_size": 256,  # prevents OOM at 5000+ vars
+    # Required by the convergence analysis; forces amortize_steps=1 and
+    # adaptive_probes=False in PolyStepOptimizer.__init__, so the amortization the
+    # sweep found is off here and the config records that rather than hiding it.
     "amortize_steps": 3,
     "amortize_ema": 0.7,
     "use_momentum": True,
@@ -87,6 +91,7 @@ def get_polystep_config(num_vars: int) -> dict:
         "probe_radius_target": ref["probe_radius_target"] * scale,
         "num_probe": ref["num_probe"],
         "chunk_size": ref["chunk_size"],
+        "probe_radius_jitter": ref["probe_radius_jitter"],
         "amortize_steps": ref["amortize_steps"],
         "amortize_ema": ref["amortize_ema"],
         "use_momentum": ref["use_momentum"],
@@ -109,8 +114,8 @@ PSTORCH_TURBO_1M = {
     "probe_radius_target": 100.0,
     "num_probe": 1,
     "chunk_size": 256,  # Memory management for 4.27M clauses on 32GB GPU
-    "amortize_steps": 3,
-    "amortize_ema": 0.7,
+    "amortize_steps": 1,
+    "amortize_ema": 0.0,
     "use_momentum": True,
     "momentum_init": 0.5,
     "momentum_final": 0.95,
@@ -358,7 +363,7 @@ def evaluate_sat_result(model, clause_vars, clause_signs):
     }
 
 
-def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=None):
+def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=None, theory_mode: bool = False):
     """Train MAX-SAT with polystep PolyStepOptimizer + custom closure.
 
     Args:
@@ -385,6 +390,8 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
     # Select config: turbo overrides for 1M+ vars, size-dependent scaling otherwise
     turbo = num_vars >= 1000000
     cfg = PSTORCH_TURBO_1M if turbo else get_polystep_config(num_vars)
+    if theory_mode:
+        cfg = apply_theory_mode(cfg)
 
     if turbo and device == "cuda":
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -414,6 +421,9 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         probe_radius=pr,
         num_probe=cfg["num_probe"],
         chunk_size=cfg["chunk_size"],
+        probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
+        probe_radius_jitter_dist=cfg.get("probe_radius_jitter_dist", "smooth"),
+        polytope_type=cfg.get("polytope_type", "simplex"),
         amortize_steps=cfg["amortize_steps"],
         amortize_ema=cfg.get("amortize_ema", 0.7),
         use_momentum=cfg.get("use_momentum", False),
@@ -517,6 +527,12 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
             "cra_lambda": cra_lambda,
             "cra_alpha": CRA_ALPHA,
             "num_vars": num_vars,
+            # The four keys that let a reader check the table was matched. MAX-SAT
+            # searches full parameter space, so there is no subspace to record.
+            "subspace_class": None,
+            "subspace_rank": None,
+            "eval_budget": polystep_eval_budget(optimizer, steps),
+            "evals_used": counter.count,
         },
         epoch_logs=step_logs,
         step_logs=fine_step_logs,
@@ -527,93 +543,62 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
 
 
 def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
-    """Train MAX-SAT with CMA-ES (pycma) using same sigmoid+CRA encoding.
+    """Train MAX-SAT with CMA-ES, using the same sigmoid+CRA encoding as PolyStep.
+
+    The inline pycma driver this replaces was one of four near-identical copies;
+    :func:`polystep.baselines.cma_es` is the single implementation, and
+    :class:`polystep.baselines.Objective` is the counter -- one candidate scored is
+    one evaluation, and it refuses a generation that would exceed ``max_evals``.
 
     Args:
         num_vars: Number of Boolean variables.
         instance: Dict from generate_maxsat_instance.
         seed: Random seed.
-        device: Device string (CMA-ES runs on CPU, clause eval on CPU).
-        max_evals: Maximum function evaluations (budget matched to polystep).
+        device: Device string (clause evaluation runs there).
+        max_evals: Candidate budget (matched to polystep).
         results_dir: Directory for JSON results.
     """
-    import cma
+    from polystep.baselines import Objective, cma_es
 
     set_seed(seed)
-
-    # Move clause tensors to device once (enables GPU batch eval)
     eval_device = torch.device(device)
     clause_vars = instance["clause_vars"].to(eval_device)
     clause_signs = instance["clause_signs"].to(eval_device)
     cra_lambda = CRA_LAMBDA
 
-    def eval_batch(solutions_list):
-        """Batch-evaluate popsize solutions on GPU (list of np arrays -> list of costs)."""
-        x = torch.from_numpy(np.stack(solutions_list)).to(device=eval_device, dtype=torch.float32)  # (P, N)
-        soft = torch.sigmoid(x)
+    def eval_batch(x):
+        """(P, num_vars) assignments -> (P,) costs, on device, in one shot."""
+        soft = torch.sigmoid(x.to(device=eval_device, dtype=torch.float32))
         hard = torch.round(soft)
         gathered = hard[:, clause_vars]  # (P, C, 3)
         literals = gathered * clause_signs + (1.0 - clause_signs) * (1.0 - gathered)
         satisfied = (literals > 0.5).any(dim=-1).float()  # (P, C)
-        unsat_ratio = 1.0 - satisfied.mean(dim=-1)  # (P,)
-        penalty = (1.0 - (2.0 * soft - 1.0) ** CRA_ALPHA).sum(dim=-1)  # (P,)
-        cost = unsat_ratio + cra_lambda * penalty
-        return cost.detach().cpu().tolist()
+        penalty = (1.0 - (2.0 * soft - 1.0) ** CRA_ALPHA).sum(dim=-1)
+        return (1.0 - satisfied.mean(dim=-1)) + cra_lambda * penalty
 
     popsize = CMAES_CONFIG["popsize"]
-    sigma0 = CMAES_CONFIG["sigma0"]
-    max_iter = max(1, max_evals // popsize)
+    objective = Objective(eval_batch, dim=num_vars, budget=max(popsize, int(max_evals)))
+    x0 = torch.from_numpy(np.random.RandomState(seed).randn(num_vars) * 0.1).float()
 
-    opts = {
-        "maxiter": max_iter,
-        "popsize": popsize,
-        "seed": seed,
-        "verbose": -9,
-    }
-    # Use sep-CMA-ES for large problems (avoids O(n^2) covariance)
-    if num_vars >= 1000:
-        opts["CMA_diagonal"] = True
-
-    x0 = np.random.RandomState(seed).randn(num_vars) * 0.1
-
-    best_sat_ratio = 0.0
-    step_logs = []
-    total_evals = 0
     start_time = time.time()
-
     with track_gpu_memory() as mem:
-        es = cma.CMAEvolutionStrategy(x0, sigma0, opts)
-        gen = 0
-        while not es.stop():
-            solutions = es.ask()
-            costs = eval_batch(solutions)
-            es.tell(solutions, costs)
-            total_evals += len(solutions)
-            gen += 1
-
-            # Evaluate best so far periodically
-            if gen % max(1, max_iter // 10) == 0 or es.stop():
-                model_tmp = MaxSATModel(num_vars)
-                model_tmp.assignments.data = torch.tensor(es.result.xbest, dtype=torch.float32)
-                result = evaluate_sat_result(model_tmp, instance["clause_vars"], instance["clause_signs"])
-                best_sat_ratio = max(best_sat_ratio, result["sat_ratio"])
-                elapsed = time.time() - start_time
-                step_logs.append(
-                    {
-                        "epoch": gen,
-                        "accuracy": result["sat_ratio"],
-                        "loss": es.result.fbest,
-                        "time": elapsed,
-                    }
-                )
-
+        result = cma_es(
+            objective,
+            x0=x0,
+            sigma0=CMAES_CONFIG["sigma0"],
+            popsize=popsize,
+            # Keep the old convention: separable CMA-ES above 1000 dimensions.
+            diagonal=num_vars >= 1000,
+            seed=seed,
+        )
     wall_time = time.time() - start_time
 
-    # Final evaluation
+    # Best-so-far curve against cumulative candidate evaluations.
+    step_logs = [{"epoch": i + 1, "evals": evals, "loss": loss} for i, (evals, loss) in enumerate(result.history)]
+
     model_final = MaxSATModel(num_vars)
-    model_final.assignments.data = torch.tensor(es.result.xbest, dtype=torch.float32)
+    model_final.assignments.data = result.best_x.detach().cpu().float()
     final_result = evaluate_sat_result(model_final, instance["clause_vars"], instance["clause_signs"])
-    best_sat_ratio = max(best_sat_ratio, final_result["sat_ratio"])
 
     filepath = save_result(
         benchmark=f"{BENCHMARK}_{num_vars}v",
@@ -621,24 +606,28 @@ def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
         seed=seed,
         metrics={
             "final_accuracy": final_result["sat_ratio"],
-            "best_accuracy": best_sat_ratio,
+            "best_accuracy": final_result["sat_ratio"],
             "num_satisfied": final_result["num_satisfied"],
             "num_unsatisfied": final_result["num_clauses"] - final_result["num_satisfied"],
             "num_clauses": final_result["num_clauses"],
             "wall_time_seconds": wall_time,
             "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
-            "function_evals": total_evals,
-            "total_steps": gen,
+            "function_evals": result.evals,
+            "total_steps": result.iters,
         },
         hyperparameters={
             **CMAES_CONFIG,
             "cra_lambda": cra_lambda,
             "cra_alpha": CRA_ALPHA,
             "num_vars": num_vars,
-            "max_evals": max_evals,
+            "subspace_class": None,
+            "subspace_rank": None,
+            "eval_budget": int(max_evals),
+            "evals_used": result.evals,
             "CMA_diagonal": num_vars >= 1000,
         },
         epoch_logs=step_logs,
+        step_logs=step_logs,
         results_dir=results_dir,
     )
     print(f"      Saved: {filepath}")
@@ -1203,6 +1192,16 @@ def main():
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
     parser.add_argument("--results-dir", default="experiments/results/softmax/main", help="Results directory")
     parser.add_argument(
+        "--theory-mode",
+        action="store_true",
+        help=(
+            "Run the configuration Theorem 4.2 analyses: probe_radius_jitter=0.05 "
+            "with the smooth density, independent rotations, flat epsilon, step "
+            "radius r0*(t+1)^-(1/2+0.1), orthoplex, no momentum / amortization / "
+            "Anderson."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run only 10 steps (polystep) / 100 evals (ES) for testing",
@@ -1257,6 +1256,7 @@ def main():
                         steps,
                         args.results_dir,
                         solver=args.solver,
+                        theory_mode=args.theory_mode,
                     )
                     if polystep_evals is None:
                         polystep_evals = evals

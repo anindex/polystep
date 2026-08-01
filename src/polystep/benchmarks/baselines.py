@@ -154,6 +154,8 @@ def train_cmaes(
     train_labels: Tensor,
     test_data: Tensor,
     test_labels: Tensor,
+    val_data: Optional[Tensor] = None,
+    val_labels: Optional[Tensor] = None,
     generations: int = 200,
     popsize: int = 16,
     stdev_init: float = 0.5,
@@ -172,8 +174,14 @@ def train_cmaes(
         model: PyTorch model to optimize.
         train_data: Training data tensor, shape (N, ...).
         train_labels: Training labels tensor, shape (N,).
-        test_data: Test data tensor, shape (M, ...).
+        test_data: Test data tensor, shape (M, ...). Evaluated once, at
+            the end, on the selected solution when val data is given.
         test_labels: Test labels tensor, shape (M,).
+        val_data: Held-out validation data used to select the reported
+            solution. When given, ``best_accuracy`` is a validation
+            number and the test set is not touched during the search.
+            When None the legacy (test-selected) behavior is kept.
+        val_labels: Labels for ``val_data``.
         generations: Number of CMA-ES generations.
         popsize: Population size.
         stdev_init: Initial standard deviation.
@@ -229,12 +237,18 @@ def train_cmaes(
     test_data_t = test_data.to(device)
     test_labels_t = test_labels.to(device)
 
+    # Selection split: validation when supplied, test otherwise (legacy).
+    use_val = val_data is not None and val_labels is not None
+    sel_data_t = val_data.to(device) if use_val else test_data_t
+    sel_labels_t = val_labels.to(device) if use_val else test_labels_t
+
     # Training loop
     epoch_logs = []
     best_test_acc = 0.0
     # final_accuracy reports this: selecting by test accuracy is test-set selection,
     # and polystep reports its actual final model. best_test_acc stays separate.
     last_solution = None
+    best_solution = None
     start_time = time.time()
 
     # Build the eval model once and reuse across calls; rebuilding it on
@@ -243,8 +257,8 @@ def train_cmaes(
     eval_model = type(model)(*model_init_args).to(device)
     eval_model.eval()
 
-    def evaluate_on_test(solution) -> float:
-        """Evaluate ``solution`` on the full test set."""
+    def evaluate_solution(solution, data_t, labels_t) -> float:
+        """Evaluate ``solution`` on a full split."""
         if solution is None:
             return 0.0
         values = solution.values if hasattr(solution, "values") else solution
@@ -262,15 +276,19 @@ def train_cmaes(
         eval_batch_size = 512
 
         with torch.no_grad():
-            for i in range(0, len(test_data_t), eval_batch_size):
-                batch_data = test_data_t[i : i + eval_batch_size]
-                batch_labels = test_labels_t[i : i + eval_batch_size]
+            for i in range(0, len(data_t), eval_batch_size):
+                batch_data = data_t[i : i + eval_batch_size]
+                batch_labels = labels_t[i : i + eval_batch_size]
                 outputs = eval_model(batch_data)
                 preds = outputs.argmax(dim=-1)
                 correct += (preds == batch_labels).sum().item()
                 total += len(batch_labels)
 
         return correct / total if total > 0 else 0.0
+
+    def evaluate_on_test(solution) -> float:
+        """Evaluate ``solution`` on the full test set."""
+        return evaluate_solution(solution, test_data_t, test_labels_t)
 
     for gen in range(generations):
         # New batch per generation, shared within it. See _evaluate.
@@ -286,9 +304,13 @@ def train_cmaes(
         if (gen + 1) % log_interval == 0 or gen == generations - 1:
             pop_best_sol = status.get("pop_best", None)
             if pop_best_sol is not None:
-                test_acc = evaluate_on_test(pop_best_sol)
+                # `test_acc` is the selection split's accuracy: val when one
+                # was supplied, test only in the legacy path.
+                test_acc = evaluate_solution(pop_best_sol, sel_data_t, sel_labels_t)
                 last_solution = pop_best_sol.clone() if hasattr(pop_best_sol, "clone") else pop_best_sol
-                best_test_acc = max(best_test_acc, test_acc)
+                if test_acc > best_test_acc:
+                    best_test_acc = test_acc
+                    best_solution = last_solution
             else:
                 test_acc = 0.0
 
@@ -297,7 +319,7 @@ def train_cmaes(
                     "epoch": gen + 1,
                     "generation": gen + 1,
                     "accuracy": test_acc,
-                    "test_accuracy": test_acc,
+                    ("val_accuracy" if use_val else "test_accuracy"): test_acc,
                     "pop_best_fitness": pop_best_fitness,
                     "mean_fitness": mean_fitness,
                     "loss": -pop_best_fitness,
@@ -316,8 +338,10 @@ def train_cmaes(
     elapsed = time.time() - start_time
     total_evals = generations * popsize
 
-    # On the last solution, not the test-best one.
-    final_test_acc = evaluate_on_test(last_solution) if last_solution is not None else 0.0
+    # With a val split: the val-selected solution, scored on test exactly once.
+    # Without one: the last solution, never the test-best one.
+    selected = best_solution if use_val else last_solution
+    final_test_acc = evaluate_on_test(selected) if selected is not None else 0.0
 
     peak_memory = 0.0
     if device == "cuda" and torch.cuda.is_available():

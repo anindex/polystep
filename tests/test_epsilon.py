@@ -267,3 +267,18 @@ class TestDefaults:
         pe = ProgressiveEpsilon()
         pe.update(n_iters=n_iters, max_iterations=100, converged=True)
         assert pe.at() == pytest.approx(expected)
+
+
+def test_power_decay_is_square_summable_but_not_summable():
+    """r_t = r_0 (t+1)^-(1/2+gamma): the schedule the convergence analysis assumes."""
+    from polystep.epsilon import PowerDecay
+
+    s = PowerDecay(init=2.0, gamma=0.1)
+    assert s.at(None) == s.at(0) == 2.0
+    assert s.at(1) == pytest.approx(2.0 * 2**-0.6)
+    # Decreasing, positive, and floored when asked.
+    vals = [s.at(t) for t in range(50)]
+    assert all(a > b > 0 for a, b in zip(vals, vals[1:]))
+    assert PowerDecay(init=2.0, gamma=0.1, target=1.0).at(1000) == 1.0
+    with pytest.raises(ValueError):
+        PowerDecay(init=1.0, gamma=0.0)

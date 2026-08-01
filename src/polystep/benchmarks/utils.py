@@ -15,6 +15,7 @@ import math
 import os
 import pickle
 import platform
+import random
 import struct as pystruct
 import tempfile
 import tarfile
@@ -28,6 +29,34 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Re-seed numpy/random inside a DataLoader worker process.
+
+    torch seeds each worker itself; numpy and ``random`` are left on the
+    parent's state, which makes any augmentation drawing from them
+    depend on worker scheduling.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def seeded_loader_kwargs(seed: Optional[int] = None) -> Dict[str, Any]:
+    """DataLoader kwargs that pin shuffle order and worker RNG to ``seed``.
+
+    Pass as ``DataLoader(..., **seeded_loader_kwargs(seed))``. Harmless on
+    non-shuffled loaders: the generator is simply unused.
+
+    ``seed=None`` snapshots the current global torch seed, so the shuffle
+    order still differs per experiment seed (as it did when the loader
+    drew from the global RNG) but no longer depends on how much of that
+    RNG the rest of the process consumed first.
+    """
+    generator = torch.Generator()
+    generator.manual_seed(torch.initial_seed() if seed is None else seed)
+    return {"generator": generator, "worker_init_fn": _seed_worker}
 
 
 def _default_data_dir(name: str) -> str:
@@ -126,8 +155,8 @@ def get_mnist_loaders(
     train_ds = TensorDataset(torch.from_numpy(train_images), torch.from_numpy(train_labels))
     test_ds = TensorDataset(torch.from_numpy(test_images), torch.from_numpy(test_labels))
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, **seeded_loader_kwargs())
+    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0, **seeded_loader_kwargs())
     return train_loader, test_loader
 
 
@@ -220,8 +249,8 @@ def get_cifar10_loaders(
         torch.from_numpy(test_labels),
     )
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, **seeded_loader_kwargs())
+    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0, **seeded_loader_kwargs())
     return train_loader, test_loader
 
 

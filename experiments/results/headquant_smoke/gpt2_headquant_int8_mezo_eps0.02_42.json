@@ -1,0 +1,74 @@
+{
+  "benchmark": "gpt2_headquant_int8",
+  "method": "mezo_eps0.02",
+  "seed": 42,
+  "timestamp": "2026-08-01T07:58:24Z",
+  "environment": {
+    "torch_version": "2.13.0+cu130",
+    "python_version": "3.14.0",
+    "platform": "Linux",
+    "platform_release": "7.0.0-28-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 50.42
+  },
+  "hyperparameters": {
+    "variant": "int8",
+    "head": "QuantizedLinear",
+    "backprop_sees_the_weights": false,
+    "trainable_params": 1538,
+    "backbone_params": 124439808,
+    "mode": "head_only_quantized",
+    "subspace_class": null,
+    "subspace_rank": null,
+    "subspace_dim": 1538,
+    "eval_budget": 20000,
+    "batch_size": 64,
+    "max_train": 5000,
+    "eps": 0.02,
+    "lr": 0.01,
+    "gradient_based": false,
+    "best_train_batch_loss": 0.18516014516353607
+  },
+  "metrics": {
+    "final_accuracy": 0.600917398929596,
+    "best_accuracy": 0.628000020980835,
+    "test_accuracy_at_selected": 0.600917398929596,
+    "wall_time_seconds": 248.3972098827362,
+    "peak_gpu_memory_mb": 50.42,
+    "function_evals": 20000,
+    "total_steps": 10000,
+    "best_val_accuracy": 0.628000020980835,
+    "eval_budget": 20000,
+    "evals_used": 20000,
+    "flat_generation_fraction": 0.0,
+    "flat_pair_fraction": 0.0,
+    "mean_unique_loss_fraction": 1.0,
+    "generations": 10000
+  },
+  "epoch_logs": [],
+  "step_logs": [
+    {
+      "evals": 5000,
+      "val_accuracy": 0.5320000052452087,
+      "wall_time": 61.46624517440796
+    },
+    {
+      "evals": 10000,
+      "val_accuracy": 0.5800000429153442,
+      "wall_time": 123.32675051689148
+    },
+    {
+      "evals": 15000,
+      "val_accuracy": 0.6100000143051147,
+      "wall_time": 185.85223126411438
+    },
+    {
+      "evals": 20000,
+      "val_accuracy": 0.628000020980835,
+      "wall_time": 248.38304352760315
+    }
+  ],
+  "leaked": false
+}

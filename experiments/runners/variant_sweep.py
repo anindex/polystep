@@ -17,9 +17,16 @@ Design constraints (from the review that motivated this runner):
   - softmax vs sinkhorn are only compared in full space, where the vertex
     marginal binds; the column-marginal violation is logged as the separator.
 
+A baseline gets the same treatment through ``--baseline``: its own small
+hyperparameter grid (``fairness.TUNING_GRID``), the same env budget per
+configuration, and the tuning cost written to ``tuning_cost.json`` so the paper can
+state "PolyStep was tuned over N configurations x B evaluations, each baseline over
+M x B" instead of comparing a swept method against a hardcoded dict.
+
 Run:
     python experiments/runners/variant_sweep.py --dry-run
     python experiments/runners/variant_sweep.py --stage all --seeds 42 123 456 789 1337 --device cuda
+    python experiments/runners/variant_sweep.py --baseline spsa --envs sphere --dry-run
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ import torch
 import torch.nn as nn
 
 from polystep import PolyStepOptimizer
+from polystep.baselines import METHODS
 from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.cost_nn import NNCostEvaluator
@@ -51,6 +59,8 @@ from polystep.hybrid_subspace import HybridSubspace
 from polystep.objectives.synthetic import Ackley, Rastrigin, Rosenbrock, Sphere
 from polystep.subspace import LinearSubspace
 from polystep.transform import ParamLayout
+
+from experiments.runners.fairness import TUNING_GRID, make_subspace, run_baseline, tuning_configs, tuning_cost
 
 SEEDS = [42, 123, 456, 789, 1337]
 DEFAULT_RESULTS_DIR = os.path.join(
@@ -712,6 +722,114 @@ def run_one(env: Env, cfg: Config, seed: int, device: str):
     }
 
 
+# Rank the baselines share with PolyStep's representation axis, and the probe radius
+# `baseline_kwargs` gives PolyStep, so the grids are centred on the same scale.
+BASELINE_RANK = 8
+BASELINE_PROBE_SCALE = 1.5
+
+
+def run_baseline_one(env: Env, method: str, hp: dict, name: str, seed: int, device: str):
+    """One baseline configuration on one env, at the env's eval budget.
+
+    Same budget, same subspace and same probe scale as the PolyStep configs above,
+    so the two sweeps are comparable config-for-config.
+    """
+    torch.manual_seed(seed)
+    model, closure, quality_fn = env.build(device)
+    layout = ParamLayout.from_module(model)
+    subspace = make_subspace(layout, rank=BASELINE_RANK, seed=seed, method=method) if env.subspace_ok else None
+    t0 = time.perf_counter()
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    out = run_baseline(
+        method,
+        model=model,
+        layout=layout,
+        loss_batch=closure,
+        budget=env.budget,
+        val_fn=quality_fn,
+        test_fn=quality_fn,
+        mode=env.metric_mode,
+        seed=seed,
+        subspace=subspace,
+        subspace_rank=BASELINE_RANK if subspace is not None else None,
+        hp=hp,
+        probe_scale=BASELINE_PROBE_SCALE,
+        quality_key=env.quality_name,
+    )
+    key = f"val_{env.quality_name}"
+    curve = [(pt["evals"], pt[key]) for pt in out["step_logs"]]
+    return {
+        "benchmark": env.name,
+        "method": f"{method}:{name}",
+        "axis": method,
+        "variant": name,
+        "seed": seed,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "metric_mode": env.metric_mode,
+        "quality_name": env.quality_name,
+        "metrics": {
+            "final_quality": curve[-1][1] if curve else float("nan"),
+            "best_quality": _best(env.metric_mode, curve, env.budget),
+            "auc": _auc(env.metric_mode, curve, env.budget),
+            "function_evals": out["metrics"]["function_evals"],
+            "total_steps": out["metrics"]["total_steps"],
+            "wall_time_seconds": time.perf_counter() - t0,
+            "peak_gpu_memory_mb": (torch.cuda.max_memory_allocated() / 1e6) if device == "cuda" else 0.0,
+            "mean_n_iters": 0.0,
+            "mean_marginal_viol": 0.0,
+        },
+        "diagnostics": {
+            "solver": method,
+            "dead": False,
+            "dead_reasons": [],
+            **{k: out["hyperparameters"][k] for k in ("subspace_class", "subspace_rank", "eval_budget", "evals_used")},
+        },
+        "curve": curve,
+    }
+
+
+def sweep_baseline(method: str, envs, seeds, device: str, results_dir: str) -> dict:
+    """Sweep one baseline over ``TUNING_GRID[method]`` and return its tuning cost."""
+    per_env = {}
+    for env in envs:
+        cfgs = tuning_configs(method, probe_scale=BASELINE_PROBE_SCALE, seed=seeds[0])
+        print(f"[{env.name}] {method}: {len(cfgs)} configs x {len(seeds)} seeds (budget={env.budget} evals)")
+        for i, hp in enumerate(cfgs):
+            name = "_".join(f"{k}{v:g}" for k, v in sorted(TUNING_GRID[method][i].items()))
+            for seed in seeds:
+                try:
+                    rec = run_baseline_one(env, method, hp, name, seed, device)
+                except Exception as e:
+                    print(f"  ERROR {env.name}/{method}:{name}/seed{seed}: {type(e).__name__}: {e}")
+                    continue
+                path = os.path.join(results_dir, f"{env.name}_{method}_{name}_{seed}.json")
+                with open(path, "w") as f:
+                    json.dump(rec, f, indent=2)
+                m = rec["metrics"]
+                print(
+                    f"  {method:14s} {name:22s} seed={seed} best={m['best_quality']:.4f} "
+                    f"evals={m['function_evals']} t={m['wall_time_seconds']:.1f}s"
+                )
+        per_env[env.name] = tuning_cost(method, env.budget, seeds=len(seeds))
+    return per_env
+
+
+def polystep_tuning_cost(envs, stage: str, seeds) -> dict:
+    """What the PolyStep sweep costs, in the same units, for the same table."""
+    out = {}
+    for env in envs:
+        n = len(configs_for(env, stage))
+        out[env.name] = {
+            "method": "polystep",
+            "configs": n,
+            "seeds_per_config": len(seeds),
+            "evals_per_config": env.budget,
+            "tuning_evals": n * len(seeds) * env.budget,
+        }
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--envs", nargs="+", default=["fast"], help="env names, or 'fast' / 'all'")
@@ -720,12 +838,33 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
     ap.add_argument("--dry-run", action="store_true", help="1 seed, tiny budget, fast smoke")
+    ap.add_argument(
+        "--baseline",
+        # TUNING_GRID also carries PolyStep's own grid, which is not a baseline.
+        choices=sorted(set(TUNING_GRID) & set(METHODS)),
+        default=None,
+        help="Sweep this gradient-free baseline over its own grid instead of the PolyStep variants.",
+    )
     args = ap.parse_args()
 
     scale = 0.02 if args.dry_run else 1.0
     seeds = [args.seeds[0]] if args.dry_run else args.seeds
     envs = build_envs(args.envs, scale)
     os.makedirs(args.results_dir, exist_ok=True)
+
+    cost_path = os.path.join(args.results_dir, "tuning_cost.json")
+    costs = json.load(open(cost_path)) if os.path.exists(cost_path) else {}
+
+    if args.baseline:
+        costs[args.baseline] = sweep_baseline(args.baseline, envs, seeds, args.device, args.results_dir)
+        with open(cost_path, "w") as f:
+            json.dump(costs, f, indent=2)
+        print(f"\nwrote tuning cost for {args.baseline} to {cost_path}")
+        return
+
+    costs["polystep"] = polystep_tuning_cost(envs, args.stage, seeds)
+    with open(cost_path, "w") as f:
+        json.dump(costs, f, indent=2)
 
     total = 0
     dead_total = 0

@@ -84,6 +84,7 @@ def train_openai_es(
     model: nn.Module,
     train_loader: DataLoader,
     test_loader: DataLoader,
+    val_loader: Optional[DataLoader] = None,
     loss_fn: nn.Module = None,
     sigma: float = 0.02,
     lr: float = 0.01,
@@ -114,7 +115,12 @@ def train_openai_es(
     Args:
         model: PyTorch model to train.
         train_loader: Training data loader (cycles through batches).
-        test_loader: Test data loader for accuracy evaluation.
+        test_loader: Test data loader. Evaluated once, at the end, on the
+            selected parameter vector when ``val_loader`` is given.
+        val_loader: Held-out validation loader used to pick the reported
+            parameter vector. When given, ``best_accuracy`` is a
+            validation number and the test set is not touched during
+            training. When None the legacy (test-selected) behavior is kept.
         loss_fn: Loss function. Defaults to CrossEntropyLoss.
         sigma: Noise standard deviation (exploration radius).
         lr: Learning rate for parameter update.
@@ -176,7 +182,12 @@ def train_openai_es(
 
     epoch_logs: List[Dict[str, Any]] = []
     best_accuracy = 0.0
+    best_params = None
     start_time = time.time()
+
+    # Selection runs on the validation split when there is one; the test
+    # set is then scored once, at the end, on the selected parameters.
+    selection_loader = val_loader if val_loader is not None else test_loader
 
     # Pre-allocate reusable buffers to avoid 500K+ tensor allocations
     epsilon = torch.empty(population_size, n_params)  # CPU noise matrix
@@ -245,17 +256,21 @@ def train_openai_es(
                     eval_result = eval_fn(model)
                     log_entry.update(eval_result)
                 else:
-                    test_acc = evaluate_accuracy(model, test_loader, device=device)
-                    if test_acc > best_accuracy:
-                        best_accuracy = test_acc
-                    log_entry["accuracy"] = test_acc
+                    selection_acc = evaluate_accuracy(model, selection_loader, device=device)
+                    if selection_acc > best_accuracy:
+                        best_accuracy = selection_acc
+                        if val_loader is not None:
+                            best_params = params.clone()
+                    log_entry["accuracy"] = selection_acc
 
                 epoch_logs.append(log_entry)
 
     wall_time = time.time() - start_time
     if eval_fn is None:
+        if best_params is not None:
+            set_flat_params(model, best_params)
         final_accuracy = evaluate_accuracy(model, test_loader, device=device)
-        if final_accuracy > best_accuracy:
+        if val_loader is None and final_accuracy > best_accuracy:
             best_accuracy = final_accuracy
     else:
         final_accuracy = best_accuracy  # Caller handles regression metrics separately
@@ -278,6 +293,7 @@ def train_openai_es(
         "metrics": {
             "final_accuracy": final_accuracy,
             "best_accuracy": best_accuracy,
+            "test_accuracy_at_selected": final_accuracy,
             "wall_time_seconds": wall_time,
             "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
             "function_evals": function_evals,

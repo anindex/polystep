@@ -15,9 +15,11 @@ JSON schema per run:
         "timestamp": str (ISO 8601),
         "environment": dict,
         "hyperparameters": dict,
+        "leaked": bool,
         "metrics": {
             "final_accuracy": float,
             "best_accuracy": float,
+            "test_accuracy_at_selected": float,  # headline metric
             "wall_time_seconds": float,
             "peak_gpu_memory_mb": float,
             "function_evals": int,
@@ -36,11 +38,25 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch
+# cuBLAS reads this once, when the CUDA context is created, so it has to be set
+# before anything touches CUDA. Setting it at import time of this module is the
+# only place that holds for every runner, since they all import it before they
+# build a model. ``setdefault`` leaves an operator-supplied value alone.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+# OpenMP spin-wait is the single worst per-step cost PolyStep has on a busy box.
+# At torch.set_num_threads == nproc the pool threads and the main thread
+# oversubscribe: docs/performance.md measures 171-6688 ms/step at 24 threads
+# against 74 ms at 22, and PASSIVE brings a 6631 ms case back to 150 ms. Both
+# must be set before torch initializes its thread pool, hence import time.
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
+import torch  # noqa: E402
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from polystep.benchmarks.utils import (
+    seeded_loader_kwargs,
     BenchmarkResult,
     get_environment_info as _base_get_environment_info,
     get_mnist_loaders as _base_get_mnist_loaders,
@@ -133,6 +149,7 @@ def save_result(
     epoch_logs: Optional[List[Dict[str, Any]]] = None,
     step_logs: Optional[List[Dict[str, Any]]] = None,
     results_dir: Optional[str] = None,
+    leaked: bool = False,
 ) -> str:
     """Save a single experiment run result to JSON.
 
@@ -146,6 +163,10 @@ def save_result(
         metrics: Dict with at least:
             - final_accuracy (float)
             - best_accuracy (float)
+            - test_accuracy_at_selected (float): the headline metric --
+              test accuracy of the checkpoint chosen on the validation
+              split. Defaults to ``final_accuracy``, which every runner
+              computes on the selected checkpoint right before saving.
             - wall_time_seconds (float)
             - peak_gpu_memory_mb (float)
             - function_evals (int)
@@ -157,6 +178,11 @@ def save_result(
             tracking. Each entry should have 'step', 'epoch', and relevant
             metrics (accuracy/mse, loss, wall_time).
         results_dir: Directory to save results. Defaults to experiments/results/.
+        leaked: True when the run selected its reported checkpoint on the
+            test set (``--allow-test-leakage``). Stamped into the JSON as
+            ``"leaked": true``; ``aggregate_results.py`` refuses to read
+            any file carrying that stamp, so a leaked run cannot become a
+            paper number by accident.
 
     Returns:
         Path to the saved JSON file.
@@ -176,6 +202,12 @@ def save_result(
     if missing:
         raise ValueError(f"Missing required metric keys: {missing}")
 
+    metrics = dict(metrics)
+    # The headline metric. Runners that do val-based selection pass it
+    # explicitly; for the rest final_accuracy is the same number, because
+    # they evaluate the selected checkpoint on test as their last act.
+    metrics.setdefault("test_accuracy_at_selected", metrics["final_accuracy"])
+
     if results_dir is None:
         results_dir = _DEFAULT_RESULTS_DIR
     os.makedirs(results_dir, exist_ok=True)
@@ -186,6 +218,7 @@ def save_result(
     result_metrics = {
         "final_accuracy": float(metrics["final_accuracy"]),
         "best_accuracy": float(metrics["best_accuracy"]),
+        "test_accuracy_at_selected": float(metrics["test_accuracy_at_selected"]),
         "wall_time_seconds": float(metrics["wall_time_seconds"]),
         "peak_gpu_memory_mb": float(metrics["peak_gpu_memory_mb"]),
         "function_evals": int(metrics["function_evals"]),
@@ -206,13 +239,17 @@ def save_result(
         "metrics": result_metrics,
         "epoch_logs": epoch_logs or [],
         "step_logs": step_logs or [],
+        "leaked": bool(leaked),
     }
 
     filename = f"{benchmark}_{method}_{seed}.json"
     filepath = os.path.join(results_dir, filename)
 
     with open(filepath, "w") as f:
-        json.dump(result, f, indent=2)
+        # default=str so a scheduler object in `hyperparameters` (CosineEpsilon,
+        # PowerDecay) serializes as its dataclass repr, which names its parameters,
+        # instead of aborting the run after the training is already done.
+        json.dump(result, f, indent=2, default=str)
 
     return filepath
 
@@ -326,10 +363,55 @@ def get_loss_fn(benchmark: str) -> nn.Module:
     return nn.CrossEntropyLoss()
 
 
+def pin_threads() -> None:
+    """Keep the intra-op pool clear of the core count.
+
+    ``torch.set_num_threads(nproc)`` is the default and is the worst setting
+    available, not merely suboptimal: at the core count the pool and the main
+    thread oversubscribe and OpenMP spin-wait dominates PolyStep's many small
+    forwards. docs/performance.md measures a mid-range count as ~2x faster than
+    one thread and up to ~80x faster than the default on a busy box. Two below
+    ``nproc`` is the measured sweet spot; ``POLYSTEP_THREADS`` overrides.
+    """
+    requested = os.environ.get("POLYSTEP_THREADS")
+    if requested is not None:
+        n = int(requested)
+    else:
+        n = max(1, (os.cpu_count() or 4) - 2)
+    torch.set_num_threads(n)
+
+
+def set_deterministic(warn_only: bool = True) -> None:
+    """Pin every knob that makes a CUDA run drift between repeats.
+
+    Covers what seeding alone does not: deterministic kernel selection,
+    the cuBLAS workspace (see ``CUBLAS_WORKSPACE_CONFIG`` at the top of
+    this module -- it must be set before the CUDA context exists, so it
+    is set at import time, not here), and TF32, whose reduced mantissa
+    turns identical inputs into different sums depending on which kernel
+    the autotuner picked.
+
+    ``warn_only=True`` because a few ops used by the experiments have no
+    deterministic CUDA implementation; see ``docs/determinism.md``.
+
+    Args:
+        warn_only: Passed to ``torch.use_deterministic_algorithms``.
+            Set False to make a non-deterministic op raise instead.
+    """
+    torch.use_deterministic_algorithms(True, warn_only=warn_only)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # TF32 off: it is on by default on Ampere+ and silently changes both
+    # the numbers and their run-to-run stability.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+
 def set_seed(seed: int) -> None:
     """Set random seeds for reproducibility.
 
-    Sets seeds for Python random, NumPy, PyTorch CPU, and PyTorch CUDA.
+    Sets seeds for Python random, NumPy, PyTorch CPU, and PyTorch CUDA,
+    then calls :func:`set_deterministic` and :func:`pin_threads`.
 
     Args:
         seed: The random seed value.
@@ -342,9 +424,8 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    if torch.cuda.is_available():
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    set_deterministic()
+    pin_threads()
 
 
 def make_train_val_split(
@@ -396,6 +477,7 @@ def make_train_val_split(
         shuffle=shuffle_train,
         num_workers=num_workers,
         pin_memory=getattr(train_loader, "pin_memory", False),
+        **seeded_loader_kwargs(seed),
     )
     val_loader = DataLoader(
         val_subset,
@@ -403,6 +485,7 @@ def make_train_val_split(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=getattr(train_loader, "pin_memory", False),
+        **seeded_loader_kwargs(seed),
     )
     return new_train_loader, val_loader
 
@@ -468,8 +551,8 @@ def load_fashion_mnist(
     )
     train_ds = datasets.FashionMNIST(fmnist_dir, train=True, download=True, transform=transform)
     test_ds = datasets.FashionMNIST(fmnist_dir, train=False, download=True, transform=transform)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, **seeded_loader_kwargs())
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0, **seeded_loader_kwargs())
     return train_loader, test_loader
 
 
@@ -571,6 +654,7 @@ def load_dvs_gesture(
         shuffle=True,
         num_workers=0,
         collate_fn=collate_fn,
+        **seeded_loader_kwargs(),
     )
     test_loader = DataLoader(
         test_ds,
@@ -578,6 +662,7 @@ def load_dvs_gesture(
         shuffle=False,
         num_workers=0,
         collate_fn=collate_fn,
+        **seeded_loader_kwargs(),
     )
     return train_loader, test_loader
 
@@ -652,6 +737,7 @@ def load_nmnist(
         shuffle=True,
         num_workers=0,
         collate_fn=collate_fn,
+        **seeded_loader_kwargs(),
     )
     test_loader = DataLoader(
         test_ds,
@@ -659,6 +745,7 @@ def load_nmnist(
         shuffle=False,
         num_workers=0,
         collate_fn=collate_fn,
+        **seeded_loader_kwargs(),
     )
     return train_loader, test_loader
 
@@ -760,6 +847,7 @@ def load_shd(
         shuffle=True,
         num_workers=0,
         collate_fn=_shd_collate_fn,
+        **seeded_loader_kwargs(),
     )
     test_loader = DataLoader(
         test_ds,
@@ -767,6 +855,7 @@ def load_shd(
         shuffle=False,
         num_workers=0,
         collate_fn=_shd_collate_fn,
+        **seeded_loader_kwargs(),
     )
     return train_loader, test_loader
 
