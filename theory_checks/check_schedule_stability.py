@@ -113,14 +113,36 @@ def check_growth_exponent_is_zero():
     T, n_runs = 2500, 12
     ts = np.arange(1, T + 1)
     print("(1) excursion ||x_t - x*||: a free random walk would fit exponent 1/2")
-    print(f"  {'schedule':>34} {'fitted exponent':>16}")
+    print(f"  {'schedule':>34} {'fitted exponent':>16} {'excursion/r_s eps':>18}")
     for name, sched in (("flat r_s = 0.1", lambda t: 0.1),
                         ("decaying r_s (condition (v))", lambda t: (t + 1) ** (-0.6))):
         runs = np.array([run(sched, T, 300 + i) for i in range(n_runs)])
         rms = np.sqrt((runs**2).mean(axis=0))
         slope = fit_exponent(ts, rms)
-        print(f"  {name:>34} {slope:16.3f}")
+        # A one-sided bound on the slope would also be satisfied by an optimizer
+        # that never moves, so require the trajectory to be alive: the excursion
+        # must stay on the r_s eps scale rather than collapsing to zero.
+        alive = rms[-T // 3:].mean() / (0.1 * EPS)
+        print(f"  {name:>34} {slope:16.3f} {alive:14.3f}")
         assert slope < 0.12, (name, slope)
+        assert alive > 0.05, (name, alive)
+
+
+def anisotropic_amplitude(r_s, hess, T=2500, n_runs=6, base=400):
+    """Stationary excursion under a non-isotropic quadratic, where the regime bites."""
+    verts = orthoplex(DP)
+    out = []
+    for i in range(n_runs):
+        rng = np.random.default_rng(base + i)
+        g = rng.standard_normal(DP)
+        x = 0.5 * R_P * EPS * g / np.linalg.norm(g)
+        tail = []
+        for t in range(T):
+            x = x + step(x, r_s, EPS, verts, rng, hess)
+            if t > T // 3:
+                tail.append(np.linalg.norm(x))
+        out.append(np.sqrt(np.mean(np.array(tail) ** 2)))
+    return float(np.mean(out))
 
 
 def check_amplitude_is_proportional_to_step():
@@ -136,6 +158,22 @@ def check_amplitude_is_proportional_to_step():
           f"ratio spread {ratios.max() / ratios.min():.4f}x (theory 1)")
     assert abs(slope - 1.0) < 0.05, slope
     assert ratios.max() / ratios.min() < 1.05, ratios
+
+    # Honest caveat: for an ISOTROPIC quadratic this constancy is close to forced.
+    # The v-dependent part of the cost is 4 r_p eps <x, R v> plus a term identical
+    # for every unit vertex, so the winning vertex depends on x only through xhat at
+    # every scale, not merely below the probe radius.  The claim has content only
+    # where the curvature term varies with v, so re-run the sweep anisotropically:
+    # there the ratio is constant inside the stated regime and departs outside it.
+    hess = np.diag([1.0, 3.0, 10.0, 30.0])
+    inside = np.array([anisotropic_amplitude(r, hess) / (r * EPS) for r in (0.025, 0.05, 0.1)])
+    outside = np.array([anisotropic_amplitude(r, hess) / (r * EPS) for r in (1.0, 2.0)])
+    print(f"  anisotropic H: ratios {np.array2string(inside, precision=3)} for "
+          f"excursion << r_p eps, {np.array2string(outside, precision=3)} once it is not")
+    assert inside.max() / inside.min() < 1.1, inside
+    assert outside.max() < 0.85 * inside.mean(), (outside, inside.mean())
+    print("  -> the proportionality is a statement about the small-excursion regime,")
+    print("     and it fails outside it, so the constancy above is not a rescaling.")
 
 
 def check_ratio_to_basin_does_not_vanish():
@@ -170,7 +208,13 @@ def check_drift_is_negative():
 
 
 def check_envelope_alone_permits_a_random_walk():
-    """Same envelope, no drift: exponent 1/2.  This is why the old argument failed."""
+    """Same envelope, no drift: exponent 1/2.  This is why the old argument failed.
+
+    This one is a CONSTRUCTION, not a measurement: an i.i.d. fixed-length walk has
+    exponent 1/2 by the central limit theorem, and the assertion only confirms the
+    simulation is faithful.  Its role is to show that the displacement envelope --
+    which this process satisfies exactly -- does not by itself imply confinement.
+    """
     T, n_runs = 2500, 12
     r_s = 0.1
     verts = orthoplex(DP)

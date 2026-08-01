@@ -324,10 +324,23 @@ def check_straddle_term_is_linear_not_quadratic():
         ratios.append(second / first)
         print(f"  eps={e:5.3f}  avg(pi_D)={first:.4f}  avg(pi_D^2)={second:.4f}  "
               f"ratio={second / first:.3f}")
-    print("  -> the ratio is flat and far from avg(pi_D) itself, so squaring the average")
-    print("     would understate the term by an order of magnitude in eps.")
+    print("  -> the ratio is flat in eps and stays near 1, which is the indicator")
+    print("     signature.  A genuine per-step probability would give ratio = avg(pi_D)")
+    print("     itself, which falls with eps; that is the discriminating comparison.")
+    firsts = [occupancy_moments(e)[0] for e in (0.2, 0.1, 0.05)]
+    for e, r, f in zip((0.2, 0.1, 0.05), ratios, firsts):
+        print(f"  eps={e:5.3f}  measured ratio {r:.3f}  vs {f:.3f} if pi_D were a probability")
     assert min(ratios) > 0.6, ratios
     assert max(ratios) - min(ratios) < 0.1, ratios
+    # The point of the check: the gap between the measured ratio and avg(pi_D) must
+    # WIDEN as eps falls.  If pi_D were a genuine small per-step probability the two
+    # would coincide at every eps and the quadratic form would be right after all;
+    # instead the ratio is pinned near 1 while avg(pi_D) falls linearly.
+    gaps = [r / f for r, f in zip(ratios, firsts)]
+    print(f"  ratio / avg(pi_D) = {np.array2string(np.array(gaps), precision=2)} "
+          f"at eps = 0.2, 0.1, 0.05: widening, as the indicator reading requires")
+    assert gaps[0] < gaps[1] < gaps[2], gaps
+    assert gaps[-1] > 4.0, gaps
 
 
 def check_epsilon_exchange_rate():
