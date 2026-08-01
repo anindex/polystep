@@ -307,7 +307,9 @@ def run_polystep_cartpole(
                         "time": time.time() - start,
                         "step_wall_time": step_wall,
                         "candidates_evaluated": counted.count,
-                        "env_steps_cumulative": getattr(evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon),
+                        "env_steps_cumulative": getattr(
+                            evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon
+                        ),
                     }
                 )
                 print(
@@ -774,7 +776,9 @@ def run_polystep_gym(
                         "time": time.time() - start,
                         "step_wall_time": step_wall,
                         "candidates_evaluated": counted.count,
-                        "env_steps_cumulative": getattr(evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon),
+                        "env_steps_cumulative": getattr(
+                            evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon
+                        ),
                     }
                 )
                 print(
