@@ -1,0 +1,118 @@
+{
+  "benchmark": "gpt2_headquant_smooth",
+  "method": "mezo",
+  "seed": 42,
+  "timestamp": "2026-08-01T11:04:17Z",
+  "environment": {
+    "torch_version": "2.13.0+cu130",
+    "python_version": "3.14.0",
+    "platform": "Linux",
+    "platform_release": "7.0.0-28-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 78.32
+  },
+  "hyperparameters": {
+    "variant": "smooth",
+    "head": "Linear",
+    "backprop_sees_the_weights": true,
+    "backprop_sees_the_bias": true,
+    "partially_differentiable_control": false,
+    "tuning": {
+      "grid_point": {
+        "lr": 0.003,
+        "eps": 0.5
+      },
+      "tuned": false,
+      "role": "sweep_trial",
+      "sweep": null
+    },
+    "trainable_params": 1538,
+    "backbone_params": 124439808,
+    "mode": "head_only_quantized",
+    "subspace_class": null,
+    "subspace_rank": null,
+    "subspace_dim": 1538,
+    "subspace_dim_shared": 1538,
+    "subspace_dim_matched": true,
+    "matched_on": "rank+dimension (nothing is projected here)",
+    "eval_budget": 100000,
+    "batch_size": 64,
+    "max_train": 5000,
+    "eps": 0.006374730673318458,
+    "lr": 0.003,
+    "gradient_based": false,
+    "best_train_batch_loss": 0.8689104318618774
+  },
+  "metrics": {
+    "final_accuracy": NaN,
+    "best_accuracy": 0.5520000457763672,
+    "test_accuracy_at_selected": NaN,
+    "wall_time_seconds": 40.852283239364624,
+    "peak_gpu_memory_mb": 78.32,
+    "function_evals": 100000,
+    "total_steps": 50000,
+    "best_val_accuracy": 0.5520000457763672,
+    "eval_budget": 100000,
+    "evals_used": 100000,
+    "flat_generation_fraction": 4e-05,
+    "flat_pair_fraction": 4e-05,
+    "mean_unique_loss_fraction": 1.0,
+    "generations": 50000
+  },
+  "epoch_logs": [],
+  "step_logs": [
+    {
+      "evals": 10000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 3.8420748710632324
+    },
+    {
+      "evals": 20000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 7.94903039932251
+    },
+    {
+      "evals": 30000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 12.031025648117065
+    },
+    {
+      "evals": 40000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 16.108896255493164
+    },
+    {
+      "evals": 50000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 20.43488121032715
+    },
+    {
+      "evals": 60000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 24.694169998168945
+    },
+    {
+      "evals": 70000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 28.989811897277832
+    },
+    {
+      "evals": 80000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 33.55184459686279
+    },
+    {
+      "evals": 90000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 37.13562631607056
+    },
+    {
+      "evals": 100000,
+      "val_accuracy": 0.5520000457763672,
+      "wall_time": 40.85134744644165
+    }
+  ],
+  "leaked": false
+}

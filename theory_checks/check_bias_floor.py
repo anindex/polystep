@@ -1,16 +1,27 @@
 #!/usr/bin/env sage -python
-"""The two probe-side terms of the bias floor in the convergence theorem.
+"""The bias floor in the convergence theorem: its algebra and its two probe terms.
 
-The descent inequality does not drive the smoothed gradient to zero; it drives it
-to a floor
+The descent inequality does not drive the smoothed gradient to zero.  Writing the
+expected displacement as -r_s eps (c grad + e), descent fails once
+||grad|| <= ||e||/c, so the floor in SQUARED-gradient units is
 
-    B = O(r_p^3)            softmax linearization remainder
-      + O(J * pi_D / delta) probes straddling the discontinuity set
-      + O(delta * Lambda)   block-coordinate coupling
+    B = (||e|| / c)^2,      c = r_p lambdabar E[1+eta] / d_p,
 
-This script checks the first two, the ones that involve the probe law.  Both
-predictions depend on the step constant c, so both are re-derived here on the
-CORRECTED constant established in ``check_stein_constant.py``:
+and the three sources of e give
+
+    B = O(d_p^2 r_p^4)              softmax linearization remainder, e1 = O(r_p^3)
+      + Theta(d_p^2 eps^2 / L_D^2)  probes straddling D,             e2 = O(pi_D)
+      + O(delta^4 Lambda_3^2)       block-coordinate coupling,       e3 = c O(delta^2 Lambda_3)
+
+The coupling term is the one that is easy to get wrong.  ``G - grad L_delta`` is a
+discrepancy between two GRADIENT fields, so it enters the displacement already
+multiplied by c and the c cancels when the floor is formed -- leaving no d_p and no
+r_p beyond the delta.  ``check_floor_algebra`` below pins all three symbolically so
+the paper and this file cannot drift apart again; the numerical sections then
+measure e1 and e2 against the real probe law.
+
+Both probe-side predictions depend on the step constant c, so both are re-derived
+here on the CORRECTED constant established in ``check_stein_constant.py``:
 
     c = E[s] / (d_p tau) = r_p eps / (2 d_p tau),      s = r_p lambda_k (1+eta) eps,
 
@@ -46,6 +57,7 @@ is imported from that script so the two cannot drift apart.
 """
 
 import numpy as np
+import sympy as sp
 
 from check_stein_constant import ETA_MAX, LAM, haar_so, moments, orthoplex
 
@@ -89,6 +101,51 @@ def smooth_loss(x):
     check_stein_constant.py measures separately.
     """
     return x @ G + 0.5 * np.einsum("...i,ij,...j->...", x, HESS, x)
+
+
+# --- (0) the floor algebra, symbolically ---------------------------------------
+
+
+def check_floor_algebra():
+    """Each floor term is (e_i / c)^2.  Pin the three exponents symbolically.
+
+    The failure this guards against is real: an earlier draft printed the coupling
+    term as O(d_p^2 delta^2 Lambda_3^2), which is wrong in both the d_p factor and
+    the eps exponent, and the appendix carried the un-squared displacement error
+    under the same name B.
+    """
+    r_p, eps, d_p, lam, L_D, Lam3 = sp.symbols(
+        "r_p eps d_p lambdabar L_D Lambda_3", positive=True
+    )
+    delta = r_p * lam * eps                        # E[1+eta] = 1
+    c = r_p * lam / d_p
+
+    sources = {
+        "linearization": r_p**3,                   # absolute error in step units
+        "straddle": delta / L_D,                   # pi_D x maximal step norm 1
+        "coupling": c * delta**2 * Lam3,           # a gradient error, hence carries c
+    }
+    expected = {
+        "linearization": d_p**2 * r_p**4 / lam**2,
+        "straddle": d_p**2 * eps**2 / L_D**2,
+        "coupling": delta**4 * Lam3**2,
+    }
+
+    print("\n(0) floor algebra: B_i = (e_i / c)^2")
+    for name, e in sources.items():
+        got = sp.simplify(sp.expand((e / c) ** 2))
+        want = sp.simplify(sp.expand(expected[name]))
+        print(f"  {name:14s} {got}")
+        assert sp.simplify(got - want) == 0, (name, got, want)
+
+    # The coupling term must be free of d_p: the c that scales the gradient error
+    # is the same c the floor divides by.
+    assert d_p not in sp.simplify((sources["coupling"] / c) ** 2).free_symbols
+    # Linearization and coupling both vanish as r_p -> 0; straddle does not.
+    for name in ("linearization", "coupling"):
+        assert sp.limit(expected[name], r_p, 0) == 0, name
+    assert sp.simplify(sp.diff(expected["straddle"], r_p)) == 0
+    print("  linearization and coupling vanish with r_p; straddle carries no r_p at all")
 
 
 # --- (1) the softmax step tracks -c grad Lmix, with an O(r_p^3) remainder ------
@@ -231,6 +288,7 @@ def check_straddle_probability():
 
 
 def demo():
+    check_floor_algebra()
     check_linearization_remainder()
     check_straddle_probability()
 

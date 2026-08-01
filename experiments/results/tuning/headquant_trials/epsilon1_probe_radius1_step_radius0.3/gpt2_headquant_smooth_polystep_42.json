@@ -1,0 +1,117 @@
+{
+  "benchmark": "gpt2_headquant_smooth",
+  "method": "polystep",
+  "seed": 42,
+  "timestamp": "2026-08-01T09:55:05Z",
+  "environment": {
+    "torch_version": "2.13.0+cu130",
+    "python_version": "3.14.0",
+    "platform": "Linux",
+    "platform_release": "7.0.0-28-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 81.72
+  },
+  "hyperparameters": {
+    "variant": "smooth",
+    "head": "Linear",
+    "backprop_sees_the_weights": true,
+    "backprop_sees_the_bias": true,
+    "partially_differentiable_control": false,
+    "tuning": {
+      "grid_point": {
+        "epsilon": 1.0,
+        "step_radius": 0.3,
+        "probe_radius": 1.0
+      },
+      "tuned": false,
+      "role": "sweep_trial",
+      "sweep": null
+    },
+    "trainable_params": 1538,
+    "backbone_params": 124439808,
+    "mode": "head_only_quantized",
+    "subspace_class": null,
+    "subspace_rank": null,
+    "subspace_dim": 1538,
+    "subspace_dim_shared": 1538,
+    "subspace_dim_matched": true,
+    "matched_on": "rank+dimension (nothing is projected here)",
+    "eval_budget": 100000,
+    "batch_size": 64,
+    "max_train": 5000,
+    "epsilon_init": 5.0,
+    "epsilon_target": 0.5,
+    "step_radius_init": 0.6,
+    "step_radius_target": 0.15,
+    "probe_radius_init": 2.0,
+    "probe_radius_target": 0.5,
+    "num_probe": 1,
+    "sinkhorn_max_iters": 50,
+    "use_momentum": true,
+    "momentum_init": 0.5,
+    "momentum_final": 0.9,
+    "gradient_based": false
+  },
+  "metrics": {
+    "final_accuracy": NaN,
+    "best_accuracy": 0.5580000281333923,
+    "test_accuracy_at_selected": NaN,
+    "wall_time_seconds": 1.8023574352264404,
+    "peak_gpu_memory_mb": 81.72,
+    "function_evals": 101508,
+    "total_steps": 44,
+    "best_val_accuracy": 0.5580000281333923,
+    "eval_budget": 100000,
+    "evals_used": 101508,
+    "flat_generation_fraction": 0.0,
+    "flat_pair_fraction": null,
+    "mean_unique_loss_fraction": 0.9982661465106198,
+    "generations": 44
+  },
+  "epoch_logs": [],
+  "step_logs": [
+    {
+      "evals": 11535,
+      "val_accuracy": 0.5580000281333923,
+      "wall_time": 0.2425220012664795
+    },
+    {
+      "evals": 23070,
+      "val_accuracy": 0.5580000281333923,
+      "wall_time": 0.4430270195007324
+    },
+    {
+      "evals": 34605,
+      "val_accuracy": 0.5580000281333923,
+      "wall_time": 0.6656143665313721
+    },
+    {
+      "evals": 46140,
+      "val_accuracy": 0.44600000977516174,
+      "wall_time": 0.8554284572601318
+    },
+    {
+      "evals": 57675,
+      "val_accuracy": 0.5580000281333923,
+      "wall_time": 1.0764877796173096
+    },
+    {
+      "evals": 69210,
+      "val_accuracy": 0.5540000200271606,
+      "wall_time": 1.2961878776550293
+    },
+    {
+      "evals": 80745,
+      "val_accuracy": 0.4580000340938568,
+      "wall_time": 1.4960126876831055
+    },
+    {
+      "evals": 92280,
+      "val_accuracy": 0.44200003147125244,
+      "wall_time": 1.6748039722442627
+    }
+  ],
+  "leaked": false
+}

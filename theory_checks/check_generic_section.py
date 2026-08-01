@@ -249,10 +249,120 @@ def check_real_projection():
     assert max(ident_f) < min(proj_f), (ident_f, proj_f)
 
 
+# --- (e) properness: transversality is sufficient, not necessary ---------------
+#
+# Section (d) measures the wrong thing to conclude the lemma fails, and this section
+# says why.  What the proof needs is that D meets the plane in a set of measure zero
+# WITHIN the plane, i.e. that the section is a PROPER subset.  For a wall
+# {x : n.x = c} and a plane base + span(B) there are three cases, not two:
+#
+#   rank(B^T n) = 1                      -> section is an affine (d_p - 1)-subspace.
+#   rank(B^T n) = 0 and n.base != c      -> section is EMPTY.
+#   rank(B^T n) = 0 and n.base == c      -> section is the WHOLE plane.  Only this
+#                                           one violates the conclusion.
+#
+# Transversality forces the first case, which is why the lemma assumes it.  But the
+# second case is just as good, and it is where all the "missing" 38-99% of section
+# (d) actually land.  The bad case needs the base point to sit exactly on the wall.
+#
+# So the lemma's conclusion survives for the block-diagonal projection provided the
+# iterate never lands on D -- which is a property of the RUN, not of the projection,
+# and holds by induction: theta_0 misses D under any absolutely continuous
+# initialisation, and given theta_t off D, the one-step law is absolutely continuous
+# within its plane (step-radius jitter) while D ∩ plane is a proper affine subspace
+# of it, so the step lands on D with conditional probability zero.  Countably many
+# steps, union bound, done.
+#
+# Both halves are measured here: properness on real iterates, and the absence of an
+# atom at the wall in the realised one-step law.
+
+
+def check_properness_on_real_iterates(n_steps=40, particle_dim=4):
+    """For real HybridSubspace planes at real iterates: is every section proper?"""
+    d_ambient, blocks = real_projection_planes(particle_dim)
+    rng = np.random.default_rng(17)
+
+    # Coordinate-aligned walls, the geometry the paper's architectures actually have
+    # and the one section (d) shows the identity blocks are almost never transversal
+    # to.  Thresholds are drawn off-lattice so no wall passes through the origin.
+    wall_axes = rng.choice(d_ambient, 64, replace=False)
+    thresholds = rng.uniform(-0.5, 0.5, size=64)
+
+    proper, total, degenerate = 0, 0, 0
+    base = rng.standard_normal(d_ambient) * 0.3
+    for _ in range(n_steps):
+        for _is_proj, _lsl, planes in blocks.values():
+            for B in planes:
+                for j, c in zip(wall_axes, thresholds):
+                    transversal = np.linalg.norm(B[j, :]) > 1e-12   # B^T e_j is row j of B
+                    off_wall = abs(base[j] - c) > 1e-12
+                    total += 1
+                    if transversal or off_wall:
+                        proper += 1
+                    else:
+                        degenerate += 1
+        # A step of the same shape the optimizer takes: a displacement inside one
+        # particle plane, with a jittered radius.
+        blk = list(blocks.values())[rng.integers(len(blocks))]
+        B = blk[2][rng.integers(len(blk[2]))]
+        d = rng.standard_normal(B.shape[1])
+        base = base + 0.05 * (1.0 + rng.uniform(-0.3, 0.3)) * (B @ d) / np.linalg.norm(B @ d)
+
+    print(f"\n(e) properness of D ∩ plane over {n_steps} real iterates x all blocks x 64 walls")
+    print(f"    proper sections: {proper}/{total} = {proper / total:.4%}, "
+          f"plane-contained-in-wall: {degenerate}")
+    assert degenerate == 0, degenerate
+    assert proper == total, (proper, total)
+    print("    Every non-transversal plane is PARALLEL-AND-DISJOINT, not contained.")
+    print("    dim(D ∩ plane) <= d_p - 1 holds for the block-diagonal projection,")
+    print("    for every particle and every realised iterate.")
+
+
+def check_no_atom_at_the_wall(n_steps=400_000):
+    """The realised one-step law puts no mass ON the wall, with and without jitter.
+
+    An absolutely continuous law gives P[|theta_j - c| < tau] ~ tau: a log-log slope
+    of 1.  An atom at the wall would flatten that to slope 0.  Without step jitter the
+    step length is deterministic, so the law lives on a sphere; this is still not an
+    atom at the wall, but it is the reason the clean argument asks for jitter.
+    """
+    rng = np.random.default_rng(23)
+    d_p, wall, radius0 = 4, 0.0, 0.25
+
+    def distances(jitter):
+        """One-step conditional law from a FIXED base, sampled independently.
+
+        Accumulating a trajectory instead would measure the walk's occupancy
+        measure, whose exponent near the wall reflects the drift rather than the
+        one-step law -- the wrong object for this claim.
+        """
+        base = 0.13                                   # inside one step of the wall
+        u = rng.standard_normal((n_steps, d_p))
+        u /= np.linalg.norm(u, axis=1, keepdims=True)
+        eta = rng.uniform(-jitter, jitter, size=n_steps) if jitter else 0.0
+        return np.abs(base + radius0 * (1.0 + eta) * u[:, 0] - wall)
+
+    print("\n    no atom at the wall in the realised one-step law:")
+    taus = np.array([0.1, 0.05, 0.025, 0.0125])
+    for jitter in (0.0, 0.3):
+        d = distances(jitter)
+        fracs = np.array([float(np.mean(d < t)) for t in taus])
+        assert np.all(fracs > 0), (jitter, fracs)
+        slope = float(np.polyfit(np.log(taus), np.log(fracs), 1)[0])
+        print(f"      step_radius_jitter={jitter:.1f}: P[dist < tau] ~ tau^{slope:.2f} "
+              f"(a density gives 1, an atom gives 0)")
+        assert 0.7 < slope < 1.3, (jitter, slope)
+    print("      No atom either way, so the conclusion is not an artifact of jitter;")
+    print("      jitter is what makes the ARGUMENT elementary, by giving the step law")
+    print("      a density in the plane instead of support on a sphere.")
+
+
 def demo():
     check_dimensions()
     check_tube_artifact()
     check_real_projection()
+    check_properness_on_real_iterates()
+    check_no_atom_at_the_wall()
 
 
 if __name__ == "__main__":

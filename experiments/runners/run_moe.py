@@ -147,6 +147,7 @@ def _build_polystep(model, seed, total_steps, cfg):
         chunk_size=cfg["chunk_size"],
         probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
         probe_radius_jitter_dist=cfg.get("probe_radius_jitter_dist", "smooth"),
+        step_radius_jitter=cfg.get("step_radius_jitter", 0.0),
         polytope_type=cfg.get("polytope_type", "simplex"),
         amortize_steps=cfg.get("amortize_steps", 1),
         amortize_ema=cfg.get("amortize_ema", 0.0),

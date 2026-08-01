@@ -492,6 +492,7 @@ def run_polystep(
         chunk_size=cfg.get("chunk_size", 1024),
         probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
         probe_radius_jitter_dist=cfg.get("probe_radius_jitter_dist", "smooth"),
+        step_radius_jitter=cfg.get("step_radius_jitter", 0.0),
         polytope_type=cfg.get("polytope_type", "simplex"),
         adaptive_probes=cfg.get("adaptive_probes", None),
         amortize_steps=cfg.get("amortize_steps", 1),
@@ -702,6 +703,7 @@ def _fair_eval_budget(seed, device, train_loader, epochs, cfg, solver="softmax")
         num_probe=cfg["num_probe"],
         subspace=subspace,
         probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
+        step_radius_jitter=cfg.get("step_radius_jitter", 0.0),
         polytope_type=cfg.get("polytope_type", "simplex"),
         solver=solver,
     )

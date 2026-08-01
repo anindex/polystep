@@ -248,9 +248,60 @@ def check_step_constant():
     assert 2.5 < slope < 3.5, slope
 
 
+# --- the plateau freeze: a consequence of the same antipodal symmetry ------------
+
+
+def check_constant_row_freeze():
+    """On a constant cost row the barycentric step is EXACTLY zero, for every
+    centered polytope and every rotation.
+
+    The step is sum_v T_v R v_v.  A constant row makes the softmax weights uniform,
+    T_v = a_i / V, so the step is (a_i / V) R (sum_v v_v), and every polytope
+    PolyStep provides is centered: sum_v v_v = 0.  The rotation factors out, so no
+    choice of rotation law escapes it -- in particular biased rotation does not,
+    even though it makes E[R] != 0.
+
+    This is the same symmetry that makes sum_v (Rv)(Rv)^T = 2I hold POINTWISE for
+    the orthoplex rather than only in expectation.  One symmetry, one strength, one
+    limitation.
+    """
+    from polystep.geometry import POLYTOPE_MAP
+
+    rng = np.random.default_rng(0)
+    print("\nconstant-row step, by polytope (a plateau wider than the probe reach)")
+    for name, fn in POLYTOPE_MAP.items():
+        for dp in (2, 4, 8):
+            verts = fn(dp).numpy().astype(float)
+            vsum = float(np.linalg.norm(verts.sum(axis=0)))
+            V = verts.shape[0]
+            R = haar_so(500, dp, rng)
+            # Uniform weights: what a constant cost row produces at any temperature.
+            step = np.einsum("nij,vj->nvi", R, verts).mean(axis=1)
+            worst = float(np.linalg.norm(step, axis=1).max())
+            # The identity, not a magnitude: |step| = |sum_v v_v| / V for every R,
+            # because the rotation factors out of the sum. Asserting this rather than
+            # "step is small" keeps the check honest about the simplex generator,
+            # which centres only to float32 precision.
+            assert abs(worst - vsum / V) < 1e-12, (name, dp, worst, vsum / V)
+            assert vsum < 1e-6, (name, dp, vsum)     # every provided polytope is centered
+            print(f"  {name:10s} d_p={dp}  |sum_v v_v|={vsum:.1e}  "
+                  f"max|step| over rotations = {worst:.2e}  (= |sum_v v_v|/V)")
+
+    # Biased rotation does not help: the sum factors through R.
+    dp = 4
+    verts = POLYTOPE_MAP["orthoplex"](dp).numpy().astype(float)
+    biased = haar_so(200, dp, rng)
+    biased[:, :, 0] = np.abs(biased[:, :, 0])          # a crude E[R] != 0 bias
+    step = np.einsum("nij,vj->nvi", biased, verts).mean(axis=1)
+    assert float(np.linalg.norm(step, axis=1).max()) < 1e-12
+    print("  biased rotation (E[R] != 0) does not move a constant row either: "
+          "sum_v R v_v = R sum_v v_v = 0")
+
+
 def demo():
     check_matrix_identity()
     check_step_constant()
+    check_constant_row_freeze()
 
 
 if __name__ == "__main__":

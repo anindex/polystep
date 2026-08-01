@@ -424,6 +424,14 @@ class PolyStepOptimizer(SerializationMixin):
         # theory-mode config disables those heuristics.
         probe_radius_jitter: float = 0.0,
         probe_radius_jitter_dist: str = "smooth",
+        # Radius jitter on the STEP radius, drawn independently from the same
+        # density. This is what makes the one-step law of the iterate absolutely
+        # continuous within its plane rather than concentrated on a sphere; the
+        # piecewise-constant hitting-time bound and the "iterates avoid the
+        # discontinuity set" argument both need it. Same default and the same
+        # reason as ``probe_radius_jitter``: it perturbs the amortization
+        # heuristics, and theory mode turns those off.
+        step_radius_jitter: float = 0.0,
         num_probe: int = 1,
         # Adaptive probe count: reduce K during exploitation.
         # None means "on wherever implemented"; see the class docstring.
@@ -651,6 +659,12 @@ class PolyStepOptimizer(SerializationMixin):
             )
         self.probe_radius_jitter = probe_radius_jitter
         self.probe_radius_jitter_dist = probe_radius_jitter_dist
+        if not (0.0 <= step_radius_jitter < 1.0):
+            raise ValueError(
+                f"step_radius_jitter must be in [0, 1), got {step_radius_jitter}. "
+                f"Values >= 1 risk a negative effective step radius."
+            )
+        self.step_radius_jitter = step_radius_jitter
         if num_probe < 1:
             raise ValueError(
                 f"num_probe must be >= 1, got {num_probe}. "
@@ -1510,6 +1524,24 @@ class PolyStepOptimizer(SerializationMixin):
         if eta_max <= 0.0:
             return probe_r
         return float(probe_r) * (1.0 + self._sample_jitter(eta_max))
+
+    def _apply_particle_step_jitter(self, X: "torch.Tensor", X_bary: "torch.Tensor") -> "torch.Tensor":
+        """Scale each particle's displacement by its own ``1 + eta_i``.
+
+        Returns ``X + (1 + eta) * (X_bary - X)`` with ``eta`` drawn independently
+        per particle. Independence is the point: it is what gives the joint step a
+        density on the search subspace rather than on a lower-dimensional manifold
+        inside it. No-op when ``step_radius_jitter == 0``.
+        """
+        eta_max = float(self.step_radius_jitter)
+        if eta_max <= 0.0:
+            return X_bary
+        etas = torch.tensor(
+            [self._sample_jitter(eta_max) for _ in range(X.shape[0])],
+            device=X_bary.device,
+            dtype=X_bary.dtype,
+        ).unsqueeze(-1)
+        return X + (1.0 + etas) * (X_bary - X)
 
     def _get_ent_epsilon(self, iteration: int) -> Optional[float]:
         """Resolve ent_epsilon at current iteration."""

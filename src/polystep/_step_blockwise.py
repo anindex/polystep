@@ -168,6 +168,9 @@ def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X
         ot_result = opt.solver.solve(**kwargs)
         X_new_block = opt._compiled.barycentric_projection(ot_result.matrix, X_vertices)
 
+    # Per-particle step-radius jitter; no-op when step_radius_jitter == 0.
+    X_new_block = opt._apply_particle_step_jitter(block_X, X_new_block)
+
     descent = (X_new_block - block_X).detach()
     ess, rho = solver_health(ot_result.matrix, descent, step_r)
     return _BlockOutcome(

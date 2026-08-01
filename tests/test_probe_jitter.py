@@ -88,3 +88,82 @@ def test_no_jitter_leaves_the_heuristics_alone():
     opt = _optimizer(probe_radius_jitter=0.0, amortize_steps=3, adaptive_probes=True, seed=0)
     assert opt.amortize_steps == 3
     assert opt._adaptive_probes is True
+
+
+# --- Step-radius jitter: absolute continuity of the one-step law -------------------
+#
+# Probe jitter randomizes where the cost row is measured.  Step jitter randomizes how
+# far the iterate moves, which is a different property: without it the displacement
+# has a deterministic length, so the one-step law sits on a sphere -- a Lebesgue-null
+# subset of the probe plane.  Cor. 4.12 needs a volume there, and the argument that
+# the iterate never lands on the discontinuity set is cleaner with one.
+
+
+def test_step_jitter_is_a_noop_at_zero():
+    opt = _optimizer(step_radius_jitter=0.0, seed=2)
+    X = torch.zeros(3, 4)
+    X_bary = torch.ones(3, 4)
+    assert torch.equal(opt._apply_particle_step_jitter(X, X_bary), X_bary)
+
+
+def test_step_jitter_rejects_out_of_range():
+    for bad in (-0.1, 1.0, 2.5):
+        try:
+            _optimizer(step_radius_jitter=bad)
+        except ValueError as exc:
+            assert "step_radius_jitter" in str(exc)
+        else:
+            raise AssertionError(f"expected ValueError for {bad}")
+
+
+def test_step_jitter_spreads_the_displacement_length():
+    """Without jitter every step has the same length; with it, a spread of lengths.
+
+    This is the property the analysis uses, so it is the property worth asserting:
+    the displacement norms must not collapse onto a single value.
+    """
+    from polystep.cost_nn import NNCostEvaluator
+
+    def norms(step_jitter):
+        torch.manual_seed(0)
+        model = torch.nn.Linear(6, 3)
+        opt = PolyStepOptimizer(
+            model,
+            epsilon=0.5,
+            step_radius=1.0,
+            step_radius_jitter=step_jitter,
+            seed=11,
+        )
+        evaluator = NNCostEvaluator(model, loss_fn=torch.nn.MSELoss())
+        inputs = torch.randn(8, 6)
+        target = torch.randn(8, 3)
+
+        def closure(batched_params, _i=inputs, _t=target):
+            return evaluator.evaluate(batched_params, _i, _t)
+
+        out = []
+        for _ in range(12):
+            before = torch.cat([p.detach().flatten().clone() for p in model.parameters()])
+            opt.step(closure)
+            after = torch.cat([p.detach().flatten() for p in model.parameters()])
+            out.append(float((after - before).norm()))
+        return torch.tensor(out)
+
+    jittered = norms(0.3)
+    # A degenerate sampler would return a constant; the jitter must actually vary.
+    assert jittered.std().item() > 0.0
+    assert (jittered > 0).all()
+
+
+def test_step_jitter_is_drawn_per_particle():
+    """One shared eta would leave the joint step on a lower-dimensional manifold.
+
+    Independence across particles is exactly what gives the joint one-step law a
+    density on the search subspace, so it is the property to assert.
+    """
+    opt = _optimizer(step_radius_jitter=0.4, seed=5)
+    X = torch.zeros(6, 3)
+    X_bary = torch.ones(6, 3)
+    scales = (opt._apply_particle_step_jitter(X, X_bary) - X)[:, 0]
+    assert scales.std().item() > 0.0, scales
+    assert len(set(scales.tolist())) > 1, scales

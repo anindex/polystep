@@ -385,13 +385,19 @@ def load_selection(experiment: str, showcase: str, method: str, path: str = DEFA
 #: gamma in ``r_t = r_0 (t+1)^-(1/2+gamma)``.
 THEORY_GAMMA = 0.1
 #: The jitter the convergence analysis needs; 0 breaks the transversality argument.
+#: Applied to BOTH radii. Probe jitter makes the probe cloud absolutely continuous
+#: within its plane (Lemma "smooth kernel"); step jitter makes the realised
+#: displacement diffuse, which is what Lemma "blockwise section" uses to show the
+#: iterate never lands on the discontinuity set. Setting only the first leaves the
+#: analysed configuration missing a hypothesis it is supposed to satisfy.
 THEORY_JITTER = 0.05
 
 
 def apply_theory_mode(cfg: dict) -> dict:
     """Rewrite a tuned PolyStep config into the one Theorem 4.2 analyses.
 
-    Exactly: jitter ``0.05`` with the smooth mollifier density, independently sampled
+    Exactly: jitter ``0.05`` on the probe AND step radii with the smooth mollifier
+    density, independently sampled
     rotations (no biased rotation), a flat epsilon, the decaying step radius
     ``r_0 (t+1)^-(1/2+gamma)``, an orthoplex, and none of the acceleration -- no
     momentum, no amortized OT, no Anderson. The subspace stays ``HybridSubspace``;
@@ -428,6 +434,7 @@ def apply_theory_mode(cfg: dict) -> dict:
     out["probe_radius"] = cfg.get("probe_radius", cfg.get("probe_radius_target", 1.0))
     out["probe_radius_jitter"] = THEORY_JITTER
     out["probe_radius_jitter_dist"] = "smooth"
+    out["step_radius_jitter"] = THEORY_JITTER
     out["polytope_type"] = "orthoplex"
     out["biased_rotation"] = False
     out["use_momentum"] = False

@@ -1,0 +1,117 @@
+{
+  "benchmark": "gpt2_headquant_binary",
+  "method": "polystep",
+  "seed": 42,
+  "timestamp": "2026-08-01T09:54:54Z",
+  "environment": {
+    "torch_version": "2.13.0+cu130",
+    "python_version": "3.14.0",
+    "platform": "Linux",
+    "platform_release": "7.0.0-28-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 93.47
+  },
+  "hyperparameters": {
+    "variant": "binary",
+    "head": "BinaryLinear",
+    "backprop_sees_the_weights": false,
+    "backprop_sees_the_bias": true,
+    "partially_differentiable_control": true,
+    "tuning": {
+      "grid_point": {
+        "epsilon": 1.0,
+        "step_radius": 1.0,
+        "probe_radius": 3.0
+      },
+      "tuned": false,
+      "role": "sweep_trial",
+      "sweep": null
+    },
+    "trainable_params": 1538,
+    "backbone_params": 124439808,
+    "mode": "head_only_quantized",
+    "subspace_class": null,
+    "subspace_rank": null,
+    "subspace_dim": 1538,
+    "subspace_dim_shared": 1538,
+    "subspace_dim_matched": true,
+    "matched_on": "rank+dimension (nothing is projected here)",
+    "eval_budget": 100000,
+    "batch_size": 64,
+    "max_train": 5000,
+    "epsilon_init": 5.0,
+    "epsilon_target": 0.5,
+    "step_radius_init": 2.0,
+    "step_radius_target": 0.5,
+    "probe_radius_init": 6.0,
+    "probe_radius_target": 1.5,
+    "num_probe": 1,
+    "sinkhorn_max_iters": 50,
+    "use_momentum": true,
+    "momentum_init": 0.5,
+    "momentum_final": 0.9,
+    "gradient_based": false
+  },
+  "metrics": {
+    "final_accuracy": NaN,
+    "best_accuracy": 0.7720000147819519,
+    "test_accuracy_at_selected": NaN,
+    "wall_time_seconds": 1.894559383392334,
+    "peak_gpu_memory_mb": 93.47,
+    "function_evals": 101508,
+    "total_steps": 44,
+    "best_val_accuracy": 0.7720000147819519,
+    "eval_budget": 100000,
+    "evals_used": 101508,
+    "flat_generation_fraction": 0.0,
+    "flat_pair_fraction": null,
+    "mean_unique_loss_fraction": 0.6211530125704378,
+    "generations": 44
+  },
+  "epoch_logs": [],
+  "step_logs": [
+    {
+      "evals": 11535,
+      "val_accuracy": 0.5580000281333923,
+      "wall_time": 0.24681353569030762
+    },
+    {
+      "evals": 23070,
+      "val_accuracy": 0.628000020980835,
+      "wall_time": 0.47098422050476074
+    },
+    {
+      "evals": 34605,
+      "val_accuracy": 0.6940000057220459,
+      "wall_time": 0.6791572570800781
+    },
+    {
+      "evals": 46140,
+      "val_accuracy": 0.7020000219345093,
+      "wall_time": 0.8747694492340088
+    },
+    {
+      "evals": 57675,
+      "val_accuracy": 0.7400000095367432,
+      "wall_time": 1.0927889347076416
+    },
+    {
+      "evals": 69210,
+      "val_accuracy": 0.7440000176429749,
+      "wall_time": 1.3189959526062012
+    },
+    {
+      "evals": 80745,
+      "val_accuracy": 0.7720000147819519,
+      "wall_time": 1.5259459018707275
+    },
+    {
+      "evals": 92280,
+      "val_accuracy": 0.7400000095367432,
+      "wall_time": 1.7368357181549072
+    }
+  ],
+  "leaked": false
+}
