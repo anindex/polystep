@@ -1,5 +1,5 @@
 #!/usr/bin/env sage -python
-"""A3: the smoothing kernel is an annulus, not a ball, so Flaxman's identity does
+"""The smoothing kernel is an annulus, not a ball, so Flaxman's identity does
 not transfer -- and the jitter density decides whether L_eps is smooth at all.
 
 PolyStep's probe law is: direction R v uniform on the unit sphere (R Haar on
@@ -13,7 +13,7 @@ and the correct gradient identity is the score-function form
     grad L_eps(theta) = -E_{u ~ p}[ L(theta + u) * grad log p(u) ],
     grad log p(u)     = ( q'(rho)/q(rho) - (dp-1)/rho ) * u/rho,   rho = |u|.
 
-Two consequences the appendix currently gets wrong:
+Two consequences, both of which an earlier form of the appendix had wrong:
 
   * The cited identity, Flaxman et al. Lem. 2.1, is the *uniform-ball* statement
     grad E_ball[L] = (d/eps) E_sphere[L u].  It is a divergence-theorem boundary
@@ -49,8 +49,8 @@ radius law is a MIXTURE of K jittered annuli and the score is the mixture's:
     q_mix(rho) = (1/K) sum_k qhat(rho/(r_p lam_k eps) - 1) / (r_p lam_k eps),
     grad log p(u) = ( q_mix'(rho)/q_mix(rho) - (dp-1)/rho ) u/rho.
 
-The single-annulus form the appendix used to display is the K=1, lambda=1 special
-case, and it is wrong twice over: it misses the mixture and it misses the factor
+The single-annulus form is the K=1, lambda=1 special case, and taking it for the
+realised kernel is wrong twice over: it misses the mixture and it misses the factor
 lambda_k inside the radius derivative.  ``check_mixture_score`` tests the mixture
 form for K in {1, 3, 5}; ``check_single_annulus_form_is_undefined_on_the_mixture``
 shows the displayed form is not merely less general -- its density vanishes on
@@ -114,8 +114,8 @@ def lambdas(K):
 def sample_probes(n, rng, lam=None):
     """u = r_p lambda_k (1 + eta) eps * (unit direction), k uniform over the scales.
 
-    ``lam=None`` is the single-annulus special case lambda = 1 that the appendix
-    used to display; pass ``lambdas(K)`` for the kernel the optimizer realises.
+    ``lam=None`` is the single-annulus special case lambda = 1; pass ``lambdas(K)``
+    for the kernel the optimizer realises.
     """
     lam = np.array([1.0]) if lam is None else np.asarray(lam)
     g = rng.standard_normal((n, DP))

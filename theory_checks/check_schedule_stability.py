@@ -1,5 +1,5 @@
 #!/usr/bin/env sage -python
-"""A7: the stable-schedules claim, proved from the drift instead of the envelope.
+"""The stable-schedules claim, proved from the drift instead of the envelope.
 
 The corollary used to argue from the displacement ENVELOPE of the fragility
 proposition,

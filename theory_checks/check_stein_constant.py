@@ -1,5 +1,5 @@
 #!/usr/bin/env sage -python
-"""A6: the orthoplex Stein constant, and the step constant it is supposed to give.
+"""The orthoplex Stein constant, and the step constant it is supposed to give.
 
 Appendix (Lemma "Softmax barycentric step approximates the smoothed gradient")
 claims the expected barycentric step equals

@@ -1,5 +1,5 @@
 #!/usr/bin/env sage -python
-"""A2: generic linear sections of the discontinuity set.
+"""Generic linear sections of the discontinuity set.
 
 The convergence proof needs the probes to miss the discontinuity set D almost
 surely.  Probes for one particle live in a d_p-dimensional affine plane inside

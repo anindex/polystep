@@ -1,5 +1,5 @@
 #!/usr/bin/env sage -python
-"""A5: what randomized smoothing can and cannot deliver on a discontinuous loss.
+"""What randomized smoothing can and cannot deliver on a discontinuous loss.
 
 Let L_eps be the polytope-smoothed surrogate at radius eps.  Two scalings decide
 the shape of the convergence theorem:
