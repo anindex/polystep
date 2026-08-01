@@ -1,0 +1,394 @@
+{
+  "benchmark": "snn",
+  "method": "openai_es",
+  "seed": 123,
+  "timestamp": "2026-08-01T13:26:10Z",
+  "environment": {
+    "torch_version": "2.13.0+cu130",
+    "python_version": "3.14.0",
+    "platform": "Linux",
+    "platform_release": "7.0.0-28-generic",
+    "cuda_version": "13.0",
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "gpu_count": 1,
+    "peak_gpu_memory_mb": 153.88
+  },
+  "hyperparameters": {
+    "sigma": 1.0,
+    "lr": 0.01,
+    "popsize": 32,
+    "shaping": "rank",
+    "seed": 123,
+    "subspace_class": "HybridSubspace",
+    "subspace_rank": 4,
+    "eval_budget": 15540660,
+    "evals_used": 15540640,
+    "probe_scale": 1.0,
+    "fair": true
+  },
+  "metrics": {
+    "final_accuracy": 0.3034,
+    "best_accuracy": 0.29533333333333334,
+    "test_accuracy_at_selected": 0.3034,
+    "wall_time_seconds": 5551.669122695923,
+    "peak_gpu_memory_mb": 161.352704,
+    "function_evals": 15540640,
+    "total_steps": 485645,
+    "best_val_accuracy": 0.29533333333333334
+  },
+  "epoch_logs": [
+    {
+      "evals": 621632,
+      "val_accuracy": 0.18366666666666667,
+      "test_accuracy": 0.1886,
+      "loss": 2.2457175254821777,
+      "wall_time": 90.12523865699768
+    },
+    {
+      "evals": 1243264,
+      "val_accuracy": 0.21483333333333332,
+      "test_accuracy": 0.2155,
+      "loss": 2.194681167602539,
+      "wall_time": 265.33039927482605
+    },
+    {
+      "evals": 1864896,
+      "val_accuracy": 0.25883333333333336,
+      "test_accuracy": 0.2603,
+      "loss": 2.12518572807312,
+      "wall_time": 421.16634726524353
+    },
+    {
+      "evals": 2486528,
+      "val_accuracy": 0.283,
+      "test_accuracy": 0.2878,
+      "loss": 2.110382556915283,
+      "wall_time": 654.3220705986023
+    },
+    {
+      "evals": 3108160,
+      "val_accuracy": 0.282,
+      "test_accuracy": 0.2855,
+      "loss": 2.1086981296539307,
+      "wall_time": 950.7499630451202
+    },
+    {
+      "evals": 3729792,
+      "val_accuracy": 0.2605,
+      "test_accuracy": 0.2679,
+      "loss": 2.1040563583374023,
+      "wall_time": 1288.2514402866364
+    },
+    {
+      "evals": 4351424,
+      "val_accuracy": 0.2605,
+      "test_accuracy": 0.2679,
+      "loss": 2.1040563583374023,
+      "wall_time": 1572.6014964580536
+    },
+    {
+      "evals": 4973056,
+      "val_accuracy": 0.2605,
+      "test_accuracy": 0.2679,
+      "loss": 2.1040563583374023,
+      "wall_time": 1846.590764760971
+    },
+    {
+      "evals": 5594688,
+      "val_accuracy": 0.2843333333333333,
+      "test_accuracy": 0.2907,
+      "loss": 2.1033077239990234,
+      "wall_time": 2113.937602996826
+    },
+    {
+      "evals": 6216320,
+      "val_accuracy": 0.2843333333333333,
+      "test_accuracy": 0.2907,
+      "loss": 2.1033077239990234,
+      "wall_time": 2273.438530445099
+    },
+    {
+      "evals": 6837952,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 2441.1945481300354
+    },
+    {
+      "evals": 7459584,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 2627.4660975933075
+    },
+    {
+      "evals": 8081216,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 2838.934354543686
+    },
+    {
+      "evals": 8702848,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 3067.6501111984253
+    },
+    {
+      "evals": 9324480,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 3297.5475652217865
+    },
+    {
+      "evals": 9946112,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 3494.815906047821
+    },
+    {
+      "evals": 10567744,
+      "val_accuracy": 0.29533333333333334,
+      "test_accuracy": 0.3034,
+      "loss": 2.1020264625549316,
+      "wall_time": 3709.397355079651
+    },
+    {
+      "evals": 11189376,
+      "val_accuracy": 0.28883333333333333,
+      "test_accuracy": 0.296,
+      "loss": 2.0992653369903564,
+      "wall_time": 3938.643933534622
+    },
+    {
+      "evals": 11811008,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 4148.459347009659
+    },
+    {
+      "evals": 12432640,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 4335.813772201538
+    },
+    {
+      "evals": 13054272,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 4565.046538591385
+    },
+    {
+      "evals": 13675904,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 4801.05882692337
+    },
+    {
+      "evals": 14297536,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 5058.050587654114
+    },
+    {
+      "evals": 14919168,
+      "val_accuracy": 0.29433333333333334,
+      "test_accuracy": 0.302,
+      "loss": 2.09865140914917,
+      "wall_time": 5336.827693462372
+    },
+    {
+      "evals": 15540640,
+      "val_accuracy": 0.29433333333333334,
+      "test_accuracy": 0.302,
+      "loss": 2.09865140914917,
+      "wall_time": 5551.514840602875
+    }
+  ],
+  "step_logs": [
+    {
+      "evals": 621632,
+      "val_accuracy": 0.18366666666666667,
+      "test_accuracy": 0.1886,
+      "loss": 2.2457175254821777,
+      "wall_time": 90.12523865699768
+    },
+    {
+      "evals": 1243264,
+      "val_accuracy": 0.21483333333333332,
+      "test_accuracy": 0.2155,
+      "loss": 2.194681167602539,
+      "wall_time": 265.33039927482605
+    },
+    {
+      "evals": 1864896,
+      "val_accuracy": 0.25883333333333336,
+      "test_accuracy": 0.2603,
+      "loss": 2.12518572807312,
+      "wall_time": 421.16634726524353
+    },
+    {
+      "evals": 2486528,
+      "val_accuracy": 0.283,
+      "test_accuracy": 0.2878,
+      "loss": 2.110382556915283,
+      "wall_time": 654.3220705986023
+    },
+    {
+      "evals": 3108160,
+      "val_accuracy": 0.282,
+      "test_accuracy": 0.2855,
+      "loss": 2.1086981296539307,
+      "wall_time": 950.7499630451202
+    },
+    {
+      "evals": 3729792,
+      "val_accuracy": 0.2605,
+      "test_accuracy": 0.2679,
+      "loss": 2.1040563583374023,
+      "wall_time": 1288.2514402866364
+    },
+    {
+      "evals": 4351424,
+      "val_accuracy": 0.2605,
+      "test_accuracy": 0.2679,
+      "loss": 2.1040563583374023,
+      "wall_time": 1572.6014964580536
+    },
+    {
+      "evals": 4973056,
+      "val_accuracy": 0.2605,
+      "test_accuracy": 0.2679,
+      "loss": 2.1040563583374023,
+      "wall_time": 1846.590764760971
+    },
+    {
+      "evals": 5594688,
+      "val_accuracy": 0.2843333333333333,
+      "test_accuracy": 0.2907,
+      "loss": 2.1033077239990234,
+      "wall_time": 2113.937602996826
+    },
+    {
+      "evals": 6216320,
+      "val_accuracy": 0.2843333333333333,
+      "test_accuracy": 0.2907,
+      "loss": 2.1033077239990234,
+      "wall_time": 2273.438530445099
+    },
+    {
+      "evals": 6837952,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 2441.1945481300354
+    },
+    {
+      "evals": 7459584,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 2627.4660975933075
+    },
+    {
+      "evals": 8081216,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 2838.934354543686
+    },
+    {
+      "evals": 8702848,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 3067.6501111984253
+    },
+    {
+      "evals": 9324480,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 3297.5475652217865
+    },
+    {
+      "evals": 9946112,
+      "val_accuracy": 0.2886666666666667,
+      "test_accuracy": 0.2998,
+      "loss": 2.1020901203155518,
+      "wall_time": 3494.815906047821
+    },
+    {
+      "evals": 10567744,
+      "val_accuracy": 0.29533333333333334,
+      "test_accuracy": 0.3034,
+      "loss": 2.1020264625549316,
+      "wall_time": 3709.397355079651
+    },
+    {
+      "evals": 11189376,
+      "val_accuracy": 0.28883333333333333,
+      "test_accuracy": 0.296,
+      "loss": 2.0992653369903564,
+      "wall_time": 3938.643933534622
+    },
+    {
+      "evals": 11811008,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 4148.459347009659
+    },
+    {
+      "evals": 12432640,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 4335.813772201538
+    },
+    {
+      "evals": 13054272,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 4565.046538591385
+    },
+    {
+      "evals": 13675904,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 4801.05882692337
+    },
+    {
+      "evals": 14297536,
+      "val_accuracy": 0.2945,
+      "test_accuracy": 0.3001,
+      "loss": 2.099107503890991,
+      "wall_time": 5058.050587654114
+    },
+    {
+      "evals": 14919168,
+      "val_accuracy": 0.29433333333333334,
+      "test_accuracy": 0.302,
+      "loss": 2.09865140914917,
+      "wall_time": 5336.827693462372
+    },
+    {
+      "evals": 15540640,
+      "val_accuracy": 0.29433333333333334,
+      "test_accuracy": 0.302,
+      "loss": 2.09865140914917,
+      "wall_time": 5551.514840602875
+    }
+  ],
+  "leaked": false
+}

@@ -89,16 +89,22 @@ def _seed_global_rng():
 def _torch_threads(request):
     """Give ``slow`` tests a multi-threaded but unsaturated pool, pin everything else.
 
+    Restores the count after EVERY test, not only the slow ones. A test that calls
+    into ``experiments.runners.common.set_seed`` gets ``pin_threads`` with it, which
+    widens the intra-op pool to ``nproc - 2`` and leaves it there. A wide pool
+    changes the reduction order of every float sum that follows, which is enough to
+    push a tight-tolerance Sinkhorn solve past its convergence threshold: two tests
+    in unrelated files failed under full-suite ordering while passing in isolation.
+
     Switching the count back and forth does not leave the pool degraded.
     """
-    if "slow" not in request.keywords:
-        yield
-        return
-    torch.set_num_threads(_SLOW_TEST_THREADS)
+    want = _SLOW_TEST_THREADS if "slow" in request.keywords else _FAST_TEST_THREADS
+    torch.set_num_threads(want)
     try:
         yield
     finally:
-        torch.set_num_threads(_FAST_TEST_THREADS)
+        if torch.get_num_threads() != want:
+            torch.set_num_threads(want)
 
 
 @pytest.fixture

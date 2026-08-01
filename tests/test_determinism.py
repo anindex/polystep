@@ -22,6 +22,9 @@ def _restore_global_determinism_flags():
 
     Without this, whichever xdist worker picks up this file leaves every
     later test in it running under different kernel selection rules.
+
+    The thread count is restored by conftest's ``_torch_threads``, which every
+    test routes through; these tests call ``set_seed`` and so widen the pool.
     """
     saved = (
         torch.are_deterministic_algorithms_enabled(),
