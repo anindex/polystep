@@ -1,5 +1,12 @@
 # Experiment Index
 
+> **These numbers are pre-revision and are not the numbers to cite.** They were
+> produced before the test-set leaks were closed and before the matched-budget
+> protocol landed, so several are optimistic. Regenerate from
+> `experiments/results/revision/` once the grid drains. The revision tracker in the
+> paper repository (`REBUTTAL.md`) records which numbers are settled and which are
+> still pending.
+
 Expected results per experiment. All runners default to the honest protocol (val-selected
 checkpoints) and 5 seeds `{42, 123, 456, 789, 1337}`; numbers are mean +/- std across
 them and vary slightly with hardware and PyTorch version.
