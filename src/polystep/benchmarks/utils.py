@@ -11,6 +11,7 @@ falls back to pure-PyTorch LIF neurons, which are non-differentiable either way.
 from __future__ import annotations
 
 import gzip
+import math
 import os
 import pickle
 import platform
@@ -495,7 +496,15 @@ class SpikingNet(nn.Module):
         # bit-identical to the T calls it replaces. Temporal input keeps its per-timestep
         # call: one (T*B, F) GEMM blocks differently from T (B, F) ones, and the LIF
         # threshold turns that ULP into a whole spike.
-        if x.dim() >= 3 and x.shape[0] == self.num_steps:
+        # Feature count first: on shape alone a static batch of num_steps images looks
+        # like a T x 1 x F sequence, and the size test read it as temporal.
+        _static_features = x.dim() >= 2 and math.prod(x.shape[1:]) == self.input_dim
+        if _static_features:
+            batch = x.shape[0]
+            num_steps = self.num_steps
+            x_seq = None
+            cur_seq = self.fc1(x.reshape(batch, -1)).unsqueeze(0).expand(num_steps, -1, -1)
+        elif x.dim() >= 3 and x.shape[0] == self.num_steps:
             # Temporal format: (num_steps, batch, ...)
             num_steps = x.shape[0]
             batch = x.shape[1]

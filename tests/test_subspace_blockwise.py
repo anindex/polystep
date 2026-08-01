@@ -205,14 +205,22 @@ class TestCombinedModeStep:
         assert any(not torch.allclose(a, b) for a, b in zip(params_before, simple_model.parameters()))
 
     def test_block_duals_updated(self, simple_model, simple_closure):
-        """Test that per-block dual potentials are updated after step."""
-        subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
+        """Per-block dual potentials are populated after a step by a solver that has them.
 
+        Pinned to sinkhorn: under the default softmax there are no duals at all, so
+        every slot stays None and the assertions below never run. rotation_interval=0
+        for the same reason: a basis change invalidates them right after the solve.
+        """
+        subspace = AdaptiveSubspace.auto_from_params(
+            simple_model, compression_target=0.5, max_rank=16, rotation_interval=0
+        )
+
+        kwargs = {**_FAST_OPT_KWARGS, "solver": "sinkhorn"}
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
             block_strategy="per_layer",
-            **_FAST_OPT_KWARGS,
+            **kwargs,
         )
 
         # Initially None
@@ -232,6 +240,8 @@ class TestCombinedModeStep:
             assert (f is None) == (g is None)
             if f is not None:
                 assert torch.isfinite(f).all() and torch.isfinite(g).all()
+        # Sinkhorn has duals, so at least one block must carry a pair.
+        assert any(f is not None for f, _ in optimizer._state.block_duals)
 
 
 @pytest.mark.timeout(180)
@@ -465,3 +475,23 @@ def test_blockwise_keeps_the_displacement_history_in_full_space():
     assert hist_full is not None, "block-wise step kept no full-space history"
     assert hist_full.shape[1] == full_dim
     assert hist_full[: opt.state.displacement_history_count].abs().sum() > 0
+
+
+def test_blockwise_sanitizes_before_averaging_probes_like_the_monolithic_driver():
+    """Averaging first let one non-finite probe carry its whole vertex to the penalty.
+
+    The two drivers then built different cost matrices from identical evaluations, and
+    nothing in the suite ran both.
+    """
+    from polystep._step_blockwise import _cost_from_losses
+
+    # One particle, two vertices, three probes. Vertex 0's middle probe is +inf.
+    losses = torch.tensor([1.0, float("inf"), 1.0, 2.0, 2.0, 2.0])
+    cost = _cost_from_losses(losses, P=1, V=2, K=3)
+
+    assert torch.isfinite(cost).all()
+    # Penalty is 2 * max|finite| + 1 = 5. Vertex 0 must come back as a blend of its two
+    # finite probes and that penalty, not as the penalty itself, which is what averaging
+    # an inf first would give.
+    assert 1.0 < cost[0, 0].item() < 5.0
+    assert cost[0, 0].item() == pytest.approx((1.0 + 5.0 + 1.0) / 3)

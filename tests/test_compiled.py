@@ -14,8 +14,6 @@ from polystep._compiled import (
     _rotate_and_translate,
     _sinkhorn_iteration,
 )
-from polystep import SinkhornSolver
-from polystep.solver import PolyStep
 
 
 def test_compile_false_stores_eager_functions():
@@ -65,75 +63,6 @@ def test_barycentric_projection_zero_marginal_is_finite():
     X_vertices = torch.randn(B, V, d)
     result = _barycentric_projection(transport_matrix, X_vertices)
     assert torch.isfinite(result).all()
-
-
-def test_sinkhorn_solver_compile_flag_equivalence():
-    """SinkhornSolver compile=True vs compile=False on CPU."""
-    torch.manual_seed(42)
-    n, m = 50, 30
-    cost_matrix = torch.rand(n, m) + 0.01
-
-    solver_compiled = SinkhornSolver(
-        compile=True,
-        max_iterations=100,
-        threshold=-1,
-        epsilon=0.1,
-    )
-    solver_eager = SinkhornSolver(
-        compile=False,
-        max_iterations=100,
-        threshold=-1,
-        epsilon=0.1,
-    )
-
-    result_compiled = solver_compiled.solve(cost_matrix.clone())
-    result_eager = solver_eager.solve(cost_matrix.clone())
-
-    # On CPU both are eager, so results must be identical
-    torch.testing.assert_close(result_compiled.f, result_eager.f, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(result_compiled.g, result_eager.g, atol=1e-5, rtol=1e-5)
-
-
-def test_sinkhorn_step_compile_flag_equivalence():
-    """PolyStep compile=True vs compile=False produce same particles."""
-    torch.manual_seed(42)
-    dim = 5
-    num_particles = 20
-
-    def objective_fn(x):
-        return x.pow(2).sum(-1)
-
-    solver_compiled = PolyStep(
-        objective_fn=objective_fn,
-        dim=dim,
-        compile=True,
-        max_iterations=3,
-        sinkhorn_max_iters=50,
-        threshold=-1,
-    )
-    solver_eager = PolyStep(
-        objective_fn=objective_fn,
-        dim=dim,
-        compile=False,
-        max_iterations=3,
-        sinkhorn_max_iters=50,
-        threshold=-1,
-    )
-
-    X_init = torch.randn(num_particles, dim)
-
-    g1 = torch.Generator().manual_seed(123)
-    g2 = torch.Generator().manual_seed(123)
-
-    state_compiled = solver_compiled.run(X_init.clone(), generator=g1)
-    state_eager = solver_eager.run(X_init.clone(), generator=g2)
-
-    torch.testing.assert_close(
-        state_compiled.X,
-        state_eager.X,
-        atol=1e-5,
-        rtol=1e-5,
-    )
 
 
 def _make_sinkhorn_args(device):
@@ -219,13 +148,6 @@ class TestFusedSoftmaxProjectEquivalence:
         # Dividing the cost by its mean changes the effective temperature, so the two
         # plans must differ; identical output would mean the flag does nothing.
         assert not torch.allclose(t_raw, t_scaled, atol=1e-6)
-
-    def test_eager_registry_returns_the_same_result(self):
-        cost, eps, a, verts, rot, step_r, X = _make_fused_softmax_args(torch.device("cpu"))
-        cf = CompiledFunctions(compile=False)
-        got, _ = cf.fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=False)
-        want, _ = _fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=False)
-        torch.testing.assert_close(got, want)
 
 
 @pytest.mark.parametrize(

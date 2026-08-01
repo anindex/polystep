@@ -69,9 +69,11 @@ class AbsorbMixin:
     def absorb(self, base_sd, flat_subspace):
         """Fold the perturbation into the base weights.
 
-        Returns ``(new_base_sd, zeroed_subspace_vector)``.
+        Returns ``(new_base_sd, zeroed_subspace_vector)``. Merged over ``base_sd``:
+        ``apply_perturbation`` builds from the specs alone, so buffers would disappear.
         """
-        return self.apply_perturbation(base_sd, flat_subspace), torch.zeros_like(flat_subspace)
+        updated = self.apply_perturbation(base_sd, flat_subspace)
+        return {**base_sd, **updated}, torch.zeros_like(flat_subspace)
 
 
 class ProjectedAbsorbMixin:
@@ -80,9 +82,11 @@ class ProjectedAbsorbMixin:
     def absorb(self, projection, base_sd, flat_subspace):
         """Fold the perturbation into the base weights.
 
-        Returns ``(new_base_sd, zeroed_subspace_vector)``.
+        Returns ``(new_base_sd, zeroed_subspace_vector)``; see :class:`AbsorbMixin` on
+        the merge.
         """
-        return self.apply_perturbation(projection, base_sd, flat_subspace), torch.zeros_like(flat_subspace)
+        updated = self.apply_perturbation(projection, base_sd, flat_subspace)
+        return {**base_sd, **updated}, torch.zeros_like(flat_subspace)
 
 
 class SvdRatioMixin:
@@ -440,10 +444,12 @@ class LinearSubspace(AbsorbMixin):
     ) -> LinearSubspace:
         """Create a LinearSubspace with fixed rank from a ParamLayout.
 
-        Uses the SAME formula as LowRankSubspace for num_coords per layer:
-        num_coords = d_out * effective_rank + effective_rank * d_in.
-        This makes subspace_dim identical, so switching between the two
-        is a drop-in replacement.
+        Uses the same formula as LowRankSubspace for num_coords per layer,
+        ``d_out * effective_rank + effective_rank * d_in``, capped at ``num_params``.
+        The cap is where the two diverge: LowRankSubspace is bilinear, so B and A are
+        both coordinates and it can exceed the layer's size; a projection cannot, since
+        a wide one is rank deficient and amplifies by ``sqrt(num_params / num_coords)``.
+        On layers below the cap the two dimensions agree.
 
         Args:
             layout: ParamLayout describing the model's parameter structure.
@@ -463,9 +469,10 @@ class LinearSubspace(AbsorbMixin):
                 d_out = shape[0]
                 d_in = math.prod(shape[1:])
                 effective_rank = min(rank, d_in, d_out)
-                # Same formula as LowRankSubspace for drop-in compatibility
-                num_coords = d_out * effective_rank + effective_rank * d_in
                 num_params = math.prod(shape)
+                # Capped at num_params: a wide projection has gain sqrt(num_params/num_coords)
+                # where the radii assume 1, and its dense matrix outgrows the layer.
+                num_coords = min(d_out * effective_rank + effective_rank * d_in, num_params)
                 specs.append(
                     ProjectionSpec(
                         entry_key=entry.key,
@@ -545,8 +552,9 @@ class LinearSubspace(AbsorbMixin):
                 min_dim = min(d_in, d_out)
                 auto_rank = max(min_rank, min(max_rank, min_dim // compression_ratio))
                 effective_rank = min(auto_rank, d_in, d_out)
-                num_coords = d_out * effective_rank + effective_rank * d_in
                 num_params = math.prod(shape)
+                # Capped at num_params for the same reason as from_layout above.
+                num_coords = min(d_out * effective_rank + effective_rank * d_in, num_params)
                 specs.append(
                     ProjectionSpec(
                         entry_key=entry.key,

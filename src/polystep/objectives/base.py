@@ -34,7 +34,8 @@ class ObjectiveFn(abc.ABC):
         self.dim = dim
         self.bounds = bounds
         self.optimizers = optimizers
-        self.optimal_value = optimal_value
+        # Flip with the cost, or regret = cost - optimal_value never reaches 0.
+        self.optimal_value = -optimal_value if (negate and optimal_value is not None) else optimal_value
         self.noise_std = noise_std
         self.negate = negate
 
@@ -59,12 +60,14 @@ class ObjectiveFn(abc.ABC):
         """
         cost = self.evaluate(X)
         if self.noise_std is not None and self.noise_std > 0.0:
-            noise = torch.empty_like(cost).normal_(
+            # normal_ needs the generator on the tensor's device, so draw there and move.
+            draw_device = generator.device if generator is not None else cost.device
+            noise = torch.empty(cost.shape, dtype=cost.dtype, device=draw_device).normal_(
                 mean=0.0,
                 std=float(self.noise_std),
                 generator=generator,
             )
-            cost = cost + noise
+            cost = cost + noise.to(cost.device)
         if self.negate:
             return -cost
         return cost

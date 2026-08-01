@@ -252,8 +252,12 @@ class TestParticleDimAdaptiveProbes:
             loss = opt.step(closure)
             assert torch.isfinite(torch.tensor(loss))
 
-        # After 3 steps, rank should have transitioned to 4 at step 2
+        # The transition itself, not just that three steps ran: the iteration count is
+        # the same whether or not the schedule ever fired.
         assert opt.state.iteration_count == 3
+        assert opt._applied_rank == 4, "the stage at step 2 never applied"
+        assert opt.subspace.subspace_dim > subspace.subspace_dim, "rank 4 must widen the subspace"
+        assert opt.state.X.reshape(-1).numel() >= opt.subspace.subspace_dim
 
     def test_adaptive_probes_integration(self):
         """adaptive_probes=True runs 5 steps without error."""

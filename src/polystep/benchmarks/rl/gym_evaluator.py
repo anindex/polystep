@@ -129,6 +129,9 @@ class GymVectorEvaluator:
         self.env_id = str(env_id)
         self.rollouts_per_candidate = int(rollouts_per_candidate)
         self.device = torch.device(device)
+        # Real steps taken: episodes terminate early, so candidates * rollouts * horizon
+        # overcounts by up to ~8x and shifts every sample-efficiency curve.
+        self.env_steps = 0
         # Probe env for spec metadata.
         probe = gym.make(self.env_id)
         self.obs_dim = int(np.prod(probe.observation_space.shape))
@@ -185,10 +188,10 @@ class GymVectorEvaluator:
         N = n_candidates
         self._ensure_venv(N)
 
-        # Per-env seed: deterministic per (step, env_index) so candidates share CRN
-        # within a step and seeds rotate across steps.
+        # Flat env index i is candidate i//R, rollout i%R, so keying on i%R gives every
+        # candidate the same R initial states. Keyed on i, fitness confounds with luck.
         base_seed = int(seed) + 1009 * int(step)
-        seeds = [base_seed + i for i in range(N * R)]
+        seeds = [base_seed + (i % R) for i in range(N * R)]
         obs_np, _ = self._venv.reset(seed=seeds)
 
         # State tensors (on CPU then move to device per step for policy inference).
@@ -226,6 +229,7 @@ class GymVectorEvaluator:
         else:
             successes = lengths >= float(self.horizon)
 
+        self.env_steps += int(lengths.sum().item())
         return GymRolloutResult(
             returns=returns.to(self.device),
             lengths=lengths.to(self.device),
@@ -288,8 +292,10 @@ def random_policy_baseline(
         if not active.any():
             break
     venv.close()
+    # "Survived to horizon", as GymVectorEvaluator defaults to. ``(~active).mean()``
+    # counted truncation as success, so every policy reported 1.0.
     return {
         "mean_return": float(returns.mean()),
-        "success_rate": float((~active).mean()),
+        "success_rate": float((lengths >= float(horizon)).mean()),
         "episode_length": float(lengths.mean()),
     }

@@ -218,16 +218,18 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             Orthogonal matrix of shape (rows, cols).
         """
         # QR of the tall (rows, cols) matrix dominates the per-step cost, so keep it on
-        # the GPU when the target is CUDA. bf16 QR is unsupported: decompose in fp32.
+        # the GPU when the target is CUDA. Half precision has no QR kernel, so
+        # decomposition_dtype upcasts those and leaves fp64 alone.
         target_device = torch.device(device)
         qr_device = target_device if target_device.type == "cuda" else torch.device("cpu")
-        Z = _draw_basis_gaussian(rows, cols, qr_device, torch.float32, generator)
+        compute_dtype = decomposition_dtype(dtype)
+        Z = _draw_basis_gaussian(rows, cols, qr_device, compute_dtype, generator)
         P, R = thin_qr(Z)
         # Fix sign ambiguity: positive diagonal in R (replace zeros with 1).
         d = torch.sign(torch.diagonal(R))
         d[d == 0] = 1.0
         P = (P * d)[:, :cols]  # slice in case QR returned a full square Q
-        if dtype != torch.float32:
+        if dtype != compute_dtype:
             P = P.to(dtype=dtype)
         if P.device != target_device:
             P = P.to(device=target_device)

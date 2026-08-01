@@ -151,22 +151,24 @@ typical optimization workloads. Projecting models at or above GPT-2 124M scale t
   a module class name) emits a `UserWarning`: the combination collapses SNN accuracy from
   ~93% to 10-47%. Pass a flat float.
 - The fast candidate evaluators only run when the optimizer holds the evaluator and its
-  data. `train()` calls `register_evaluator` on every batch; a hand-rolled loop calling
-  `step(closure)` must do the same, or the fused in-place, factored and delta paths stay
-  unused.
+  data, so a hand-rolled loop must call `register_evaluator` per batch as `train()` does.
+  See [`docs/performance.md`](docs/performance.md).
 - `adaptive_probes` reuse is all or nothing on the configuration. A candidate is the
   whole parameter vector with one particle row replaced, so every row of the cost matrix
   depends on every particle's position and one moving particle invalidates all of them.
   Reuse therefore saves forwards only once the whole configuration has settled, which in
-  practice means near convergence. `train()` passes a per-batch `objective_token`, so on
-  a minibatch objective it saves nothing at all and only the bookkeeping remains.
-- `multifidelity_screen` needs a cheap `screen_closure` from the caller,
-  `screen_fidelity/num_probe + screen_keep_ratio < 1`, and either
-`polytope_type='orthoplex'` or a selection solver (`min_cost_greedy`, `top_k_mean`),
-whose screen ranks vertices directly and so needs no antithetic pairing. Outside that it
-warns and does not run. The default simplex therefore does not screen. It also only pays
-off in wall-clock when the per-sample cost dominates: measured 0.66x at batch 64 and
-1.12x at batch 8192 on CPU.
+  practice means near convergence. It also needs an `objective_token`, the only way to
+  assert the objective is stationary. `train()` passes a per-batch token, so it saves
+  nothing there.
+- `trust_region` and `use_adaptive_radius` scale the same `step_radius` in opposite
+  directions, and only the second reaches `probe_radius`. Enabling both warns; pick one.
+- `train()` rejects `trust_region`: its ratio compares a prediction made on one minibatch
+  against the loss on the next, so it never adapted. Drive `optimizer.step()` on a fixed
+  batch instead.
+- `multifidelity_screen` warns and does not run outside a narrow set of conditions, which
+  the default simplex does not meet, and pays off in wall-clock only when the per-sample
+  cost dominates. Conditions and measurements in
+  [`docs/performance.md`](docs/performance.md).
 - The CMA scalings read like errors and are not. `trace_scale=n` and the `pdim` factor on
   rank-mu compensate for evolution paths fed unit-normalized innovations, so `E||p_c||^2`
   is about 1 rather than `n`.
@@ -202,7 +204,7 @@ No result files ship for these; they are recorded here, not in
 ### Asymmetric baseline comparisons
 
 - **MAX-SAT 1M SLS comparison** (`run_sls` in `experiments/runners/run_maxsat.py`): the
-  SLS heuristic is an in-repo Python WalkSAT, single seed, 50K flips at 1M vars. polystep
+  SLS heuristic is an in-repo Python WalkSAT, single seed, 50K flips at 1M vars. PolyStep
   receives `STEP_BUDGETS * popsize` evals; SLS receives only flip budget. **Not a fair
   comparison** to a tuned production solver.
 - **SNN Adam-surrogate baseline**: the surrogate-gradient baseline reported in the paper

@@ -30,6 +30,18 @@ if TYPE_CHECKING:
 _MIN_BATCHED_CANDIDATES = 8
 
 
+def _is_vmap_error(e: BaseException) -> bool:
+    """Whether an exception came from the vmap transform rather than the model.
+
+    A bare "batched" would also match an error in the user's forward and demote it to the
+    ~N-times-slower loop, hiding it. Match functorch's own markers: "batched tensor" is
+    the BatchedTensor repr, "vmap"/"functorch"/"torch.func" name the transform, and
+    "randomness" is its op guard for a forward that draws its own noise.
+    """
+    msg = str(e).lower()
+    return any(k in msg for k in ("vmap", "functorch", "torch.func", "batched tensor", "randomness"))
+
+
 def auto_detect_chunk_size(
     model: nn.Module,
     safety_factor: float = 2.0,
@@ -281,6 +293,12 @@ class NNCostEvaluator:
             self._use_inplace = use_inplace
         else:
             self._use_inplace = self._batched_footprint_exceeds_free_memory(model)
+        # An explicit True also means "run the real forward". A forward that reads state
+        # functional_call cannot substitute (a weight repacked at build time, a numpy
+        # reconstruction, anything held by object reference) scores every candidate the
+        # same on the stateless paths. Auto-detection only judges memory, so it does not
+        # disqualify them.
+        self._inplace_forced = use_inplace is True
 
         # The in-place path is a Python loop of N sequential forwards, so it is
         # launch-bound, which is what CUDA graphs fix, and it is the only path the flag
@@ -457,16 +475,8 @@ class NNCostEvaluator:
             try:
                 result = self._evaluate_vmap(stacked_params, inputs, targets)
             except Exception as e:
-                # Only catch vmap/functorch errors; re-raise real bugs. A bare
-                # "batched" would also match a user-forward error and demote it to
-                # the ~N-times-slower loop, hiding it. Match functorch's own markers:
-                # "batched tensor" is the BatchedTensor repr, "vmap"/"functorch"/
-                # "torch.func" name the transform, "randomness" is its op guard.
-                msg = str(e).lower()
-                is_vmap_issue = any(
-                    k in msg for k in ("vmap", "functorch", "torch.func", "batched tensor", "randomness")
-                )
-                if not is_vmap_issue:
+                # Only catch vmap/functorch errors; re-raise real bugs.
+                if not _is_vmap_error(e):
                     raise
                 if not self._warned:
                     warnings.warn(
@@ -1141,6 +1151,10 @@ class BatchedLinearEvaluator:
         model_param_keys = {n for n, _ in model.named_parameters(remove_duplicate=False)}
         if not model_param_keys.issubset(linear_param_keys):
             return None
+        # Every path built on this plan pins one param dtype, so a mixed-dtype model
+        # raises. Hybrid and Factored allow those; vmap handles them, so decline.
+        if len({p.dtype for p in model.parameters() if p.is_floating_point()}) > 1:
+            return None
         return cls(model, loss_fn, layer_keys, loss_kind)
 
     @torch.inference_mode()
@@ -1258,27 +1272,33 @@ class SiteVmapEvaluator:
         """Decline only where the caller's own vmap path is already unusable.
 
         A tied weight puts one flat position under two module paths, so replacing a
-        single entry would apply half the perturbation.
+        single entry would apply half the perturbation. An explicit ``use_inplace=True``
+        also declines: this path scores through ``functional_call``, not the real forward.
         """
-        if evaluator._vmap_failed or layout.shared_groups:
+        if evaluator._vmap_failed or evaluator._inplace_forced or layout.shared_groups:
             return None
         return cls(
             evaluator.model, evaluator.loss_fn, layout, evaluator._buffers, evaluator.per_sample, owner=evaluator
         )
 
+    def _retired(self) -> bool:
+        """Whether a vmap failure has permanently sent this path back to the dense one."""
+        return self._owner is not None and self._owner._vmap_failed
+
     def resolve_site(self, offsets: torch.Tensor, pdim: int, span=None):
         """The one layout entry this chunk perturbs, or None to use the dense path."""
+        if self._retired():
+            return None
         return _resolve_layout_entry(self, offsets, pdim, span)
 
-    @staticmethod
-    def resolve_spec(subspace, lo: int, hi: int, sub_dim: int):
+    def resolve_spec(self, subspace, lo: int, hi: int, sub_dim: int):
         """The per-layer spec owning coordinates ``[lo, hi)``, or None if they straddle.
 
         A per-layer subspace gives each parameter its own coordinate block, so a run
         inside one block moves exactly one parameter and the rest stay shared.
         Coordinates past ``sub_dim`` are particle padding with nothing behind them.
         """
-        if hi > sub_dim:
+        if hi > sub_dim or self._retired():
             return None
         for spec in subspace.specs:
             if spec.flat_start <= lo and hi <= spec.flat_end:
@@ -1286,30 +1306,46 @@ class SiteVmapEvaluator:
         return None
 
     @torch.inference_mode()
-    def evaluate_subspace(self, projections, bary_sd, spec, dcoords, inputs, targets=None):
+    def evaluate_subspace(self, projections, bary_sd, spec, col_start, dcoords, inputs, targets=None):
         """Losses for candidates that offset one spec's coordinates from the barycentre.
+
+        Every candidate in group ``g`` moves the same ``pdim`` coordinates, so only the
+        columns ``[col_start + g*pdim, col_start + (g+1)*pdim)`` of the projection reach
+        the output. Batching that column run per group turns the correction into a bmm
+        costing ``O(n * pdim * num_params)`` instead of the ``O(n * num_coords *
+        num_params)`` a dense coordinate row would pay.
 
         Args:
             projections: Per-layer projections, keyed by entry.
             bary_sd: Parameters at the current coordinates, shared across candidates.
             spec: The one layer whose coordinates every candidate perturbs.
-            dcoords: ``(n, spec.num_coords)`` coordinate offset from the barycentre.
-                An offset, not an absolute position: ``bary_sd`` already carries the
-                barycentre, so adding the full coordinates would count it twice.
+            col_start: First coordinate of the chunk's run, relative to the spec.
+            dcoords: ``(n_groups, n_cand, pdim)`` offset from the barycentre. An offset,
+                not an absolute position: ``bary_sd`` already carries the barycentre.
             inputs: Input batch, shared across candidates.
             targets: Optional targets, shared across candidates.
         """
         base = bary_sd[spec.entry_key]
-        if spec.is_projected:
-            P = projections[spec.entry_key]
-            if isinstance(P, SparseRandomProjection):
-                # project() takes the whole batch; a per-candidate loop gives the same
-                # numbers for more time.
-                delta = P.project(dcoords)
-            else:
-                delta = dcoords.to(P.dtype) @ P.t()
+        n_groups, n_cand, pdim = dcoords.shape
+        n = n_groups * n_cand
+        n_cols = n_groups * pdim
+        P = projections[spec.entry_key] if spec.is_projected else None
+
+        if isinstance(P, torch.Tensor):
+            # P is (num_params, num_coords). .t() before the split so groups lead.
+            blk = P.narrow(1, col_start, n_cols).t().reshape(n_groups, pdim, -1)
+            delta = torch.bmm(dcoords.to(blk.dtype), blk).reshape(n, -1)
         else:
-            delta = dcoords
+            # Sparse projections and unprojected specs take a full-width coordinate row.
+            wide = dcoords.new_zeros(n, spec.flat_end - spec.flat_start)
+            cols = torch.arange(col_start, col_start + n_cols, device=dcoords.device)
+            wide.scatter_(
+                1,
+                cols.reshape(n_groups, 1, pdim).expand(n_groups, n_cand, pdim).reshape(n, pdim),
+                dcoords.reshape(n, pdim),
+            )
+            delta = P.project(wide) if P is not None else wide
+
         site = (base.reshape(1, -1) + delta.to(base.dtype)).reshape(-1, *base.shape)
         return self._vmap_over_site(spec.entry_key, bary_sd, site, inputs, targets)
 
@@ -1354,6 +1390,12 @@ class SiteVmapEvaluator:
         if cast_to is not None and inputs.is_floating_point() and inputs.dtype != cast_to:
             inputs = self._owner.cast_inputs(inputs, cast_to) if self._owner is not None else inputs.to(cast_to)
 
+        # The step calls this directly, so NNCostEvaluator.evaluate's eval-mode frame
+        # never runs and a train-mode model would score some chunks with dropout live.
+        was_training = model.training
+        if was_training:
+            model.eval()
+
         def single_eval(site_param, inputs, targets):
             output = functional_call(model, {**shared, key: site_param}, (inputs,))
             loss = loss_fn(output, targets) if targets is not None else loss_fn(output)
@@ -1371,7 +1413,29 @@ class SiteVmapEvaluator:
         # No autocast frame: under vmap it casts activations but not a Conv2d bias, so
         # a conv model raises "Input type (BFloat16) and bias type (float)".
         # candidate_autocast covers the paths NNCostEvaluator.evaluate dispatches to.
-        return vmap(single_eval, in_dims=(0, None, None))(site, inputs, targets)
+        try:
+            return vmap(single_eval, in_dims=(0, None, None))(site, inputs, targets)
+        except Exception as e:
+            # The step calls this directly, so NNCostEvaluator.evaluate's fallback never
+            # sees the failure and the run dies instead of degrading. Usual cause: a
+            # forward that draws its own randomness, which vmap's default
+            # randomness="error" rejects. "different" is not a substitute, it changes the
+            # numbers. Score this chunk in a loop; resolve_site and resolve_spec then
+            # decline every later chunk.
+            if not _is_vmap_error(e):
+                raise
+            if self._owner is not None:
+                self._owner._vmap_failed = True
+            warnings.warn(
+                f"vmap failed on the site-aware path for {type(model).__name__}: {e}. "
+                "Falling back to a sequential loop; later chunks use the dense path.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return torch.stack([single_eval(site[i], inputs, targets) for i in range(site.shape[0])])
+        finally:
+            if was_training:
+                model.train()
 
 
 class SparseDeltaEvaluator:

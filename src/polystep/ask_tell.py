@@ -33,7 +33,8 @@ class PolyStepES:
         epsilon: Entropic OT temperature for the softmax weighting.
         step_radius: Geometric step size along the polytope directions.
         solver: OT solver instance. Defaults to :class:`SoftmaxSolver`; pass a
-            :class:`SinkhornSolver` for the full entropic-OT plan.
+            :class:`SinkhornSolver` for the full entropic-OT plan. A solver passed here
+            keeps its own ``epsilon``; the ``epsilon`` argument drives only the default.
         scale_cost: Cost-matrix scaling passed to the solver ("mean", "max_cost",
             a float divisor, or None).
         x0: Initial position(s), shape ``(dim,)`` or ``(num_particles, dim)``.
@@ -74,6 +75,9 @@ class PolyStepES:
             device = x0.device if isinstance(x0, torch.Tensor) else "cpu"
         self.device = torch.device(device)
         self.dtype = dtype
+        # A caller-supplied solver keeps its own temperature; only the default one is
+        # driven by self.epsilon.
+        self._own_solver = solver is None
         self.solver = solver if solver is not None else SoftmaxSolver(epsilon=epsilon)
         if isinstance(self.solver, SinkhornSolver) and num_particles == 1:
             warnings.warn(
@@ -133,7 +137,8 @@ class PolyStepES:
         cost = torch.as_tensor(fitness, device=self.device, dtype=self.dtype).reshape(
             self.num_particles, self.num_vertices
         )
-        self.solver.epsilon = self.epsilon
+        if self._own_solver:
+            self.solver.epsilon = self.epsilon
         # The solver defaults the source marginal to uniform 1/P, so passing None
         # skips its host-syncing user-marginal validation on this per-step path.
         transport = self.solver.solve(cost, scale_cost=self.scale_cost).matrix
@@ -141,9 +146,9 @@ class PolyStepES:
         if torch.isfinite(X_new).all():
             self.X = X_new
 
-        # nan_to_num first: one NaN fitness makes torch.min return NaN and no
-        # finite candidate is ever recorded as best.
-        flat_cost = torch.nan_to_num(cost.reshape(-1), nan=float("inf"))
+        # Both ends: NaN makes torch.min return NaN, and -inf wins forever because
+        # nothing compares below it.
+        flat_cost = torch.nan_to_num(cost.reshape(-1), nan=float("inf"), neginf=float("inf"))
         fmin, idx = torch.min(flat_cost, dim=0)
         if fmin.item() < self.best_fitness:
             self.best_fitness = fmin.item()

@@ -70,6 +70,16 @@ def _mixed_entry_dtypes(layout: "ParamLayout") -> "Optional[Dict[str, torch.dtyp
     return dtypes if len(floats) > 1 else None
 
 
+def _require_positive_rank(rank: int, name: str) -> None:
+    """Reject a rank of zero, which yields a spec with no coordinates.
+
+    QR of an ``(n, 0)`` and the ``(1, 0) x (0, n)`` addmm both succeed, so every
+    reconstruction adds exactly zeros and the layer never moves.
+    """
+    if rank < 1:
+        raise ValueError(f"{name} must be >= 1, got {rank}.")
+
+
 def _require_tall(spec: "LayerProjectionSpec") -> None:
     """Every spec builder caps ``num_coords`` at ``num_params``.
 
@@ -261,6 +271,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             layout = ParamLayout.from_module(model)
             hybrid = HybridSubspace.from_layout(layout, rank=8)
         """
+        _require_positive_rank(rank, "rank")
         specs = []
         offset = 0
 
@@ -356,6 +367,8 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             layout = ParamLayout.from_module(model)
             hybrid = HybridSubspace.auto_from_layout(layout, min_rank=4, max_rank=64)
         """
+        _require_positive_rank(min_rank, "min_rank")
+        _require_positive_rank(max_rank, "max_rank")
         specs = []
         offset = 0
 
@@ -841,16 +854,25 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         Works for a single candidate ``(subspace_dim,)`` and for a batch
         ``(N, subspace_dim)``; the dense specs are contiguous in the common case,
         so this is one view rather than a per-layer gather.
+
+        Cast to the fused block's dtype: coordinates carry the layout's dominant dtype
+        over every entry, the block fuses the majority dtype among projected dense specs
+        alone, and on a mixed-dtype model those disagree.
         """
         first_start = self._fused_dense_specs[0][0].flat_start
         last_end = self._fused_dense_specs[-1][0].flat_end
         total = sum(s.num_coords for s, _ in self._fused_dense_specs)
         if last_end - first_start == total:
-            return flat_subspace[..., first_start:last_end]
-        return torch.cat(
-            [flat_subspace[..., s.flat_start : s.flat_end] for s, _ in self._fused_dense_specs],
-            dim=-1,
-        )
+            coords = flat_subspace[..., first_start:last_end]
+        else:
+            coords = torch.cat(
+                [flat_subspace[..., s.flat_start : s.flat_end] for s, _ in self._fused_dense_specs],
+                dim=-1,
+            )
+        fused_P = getattr(self, "_fused_P", None)
+        if fused_P is not None and coords.dtype != fused_P.dtype:
+            coords = coords.to(fused_P.dtype)
+        return coords
 
     def prepare_inplace(self, base_sd: Dict[str, torch.Tensor]) -> None:
         """Cache the concatenated dense base row for a run of in-place candidates.

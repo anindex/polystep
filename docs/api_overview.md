@@ -254,7 +254,7 @@ optimizer = PolyStepOptimizer(model,
 | `polytope_type` | `'simplex'` | `'orthoplex'`, `'simplex'`, `'cube'`. The simplex is the minimum positive spanning set, so a step costs `k+1` evaluations instead of `2k`. Features that read the orthoplex's antithetic vertex pairing need `'orthoplex'` |
 | `compile` | False | Compiles the geometry and solver kernels. Off by default because ablations showed no end-to-end gain against the JIT warm-up cost; also a no-op on CPU. For forward-pass compilation see `compile_evaluator` / `compile_forward` |
 | `chunk_size` | None | Estimated from the tensors a step allocates; set it only to override |
-| `adaptive_probes` | True (monolithic) | Reuses the cached cost matrix while the configuration has not moved |
+| `adaptive_probes` | True (monolithic) | Reuses the cached cost matrix while the configuration has not moved. Needs `objective_token` |
 | `adaptive_num_probe` | monolithic and `num_probe > 1` | Drops to K=1 once the last OT-step costs are strictly decreasing |
 | `subspace` | None | Use `HybridSubspace` for large models |
 | `block_strategy` | `'monolithic'` | `'per_layer'` for memory efficiency |
@@ -311,9 +311,8 @@ the rotation-bias and quadratic-model steering state.
 
 Each step costs `num_particles * num_vertices * num_probe` forward passes.
 
-Before tuning anything else, hand the optimizer the evaluator. `train()` does it per
-batch; a hand-rolled loop must do the same, or the only route to the objective is
-`closure()` and the fused in-place, factored and sparse-delta evaluators never run:
+Before tuning anything else, hand the optimizer the evaluator, per batch, as `train()`
+does. Without it the fast evaluators never run:
 
 ```python
 evaluator = NNCostEvaluator(model, loss_fn)
@@ -328,9 +327,10 @@ Two options then cut the count itself:
 - `adaptive_probes=True` (default under `block_strategy='monolithic'`) reuses the whole
   cached cost matrix while the configuration has not moved. It is all or nothing: a
   candidate is the parameter vector with one particle row replaced, so every row of the
-  matrix depends on every particle's position. It saves forwards only once the
-  configuration settles, and nothing at all on a minibatch objective, where `train()`
-  invalidates the cache each batch through `objective_token`.
+  matrix depends on every particle's position. Reuse also requires an `objective_token`,
+  since that is the only assertion that the objective is stationary; pass
+  `objective_token=0` for a full-batch run. `train()` passes a per-batch token, so on a
+  minibatch objective nothing is reused.
 - `multifidelity_screen=True` ranks every direction on a `screen_fidelity` slice of the
   batch, then spends the full fidelity only on the top `screen_keep_ratio` directions
   (both signs of each, so the orthoplex stays antithetic). Dropped vertices keep their

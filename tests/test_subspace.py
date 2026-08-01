@@ -234,7 +234,14 @@ def test_subspace_solver_integration():
 
 class TestLinearSubspaceFromLayout:
     def test_from_layout_linear(self):
-        """from_layout creates correct specs and matches LowRankSubspace subspace_dim."""
+        """from_layout creates correct specs and tracks LowRankSubspace where it can.
+
+        The two agree per layer except where the low-rank formula asks for more
+        coordinates than the layer has parameters. LowRankSubspace can afford that (B and
+        A are both coordinates, so it is bilinear); a LinearSubspace cannot, because a
+        wide (num_params, num_coords) projection is rank deficient and its gain is
+        sqrt(num_params / num_coords) rather than the 1 the step radii assume.
+        """
         model = SimpleMLP()
         layout = ParamLayout.from_module(model)
         lin_sub = LinearSubspace.from_layout(layout, rank=4, seed=42)
@@ -242,8 +249,13 @@ class TestLinearSubspaceFromLayout:
 
         # Same number of specs
         assert len(lin_sub.specs) == len(lr_sub.specs)
-        # Same subspace_dim (drop-in compatible)
-        assert lin_sub.subspace_dim == lr_sub.subspace_dim
+        # Never wider than the layer itself, and never wider than the low-rank formula.
+        assert lin_sub.subspace_dim <= lr_sub.subspace_dim
+        for spec in lin_sub.specs:
+            assert spec.num_coords <= spec.num_params, spec.entry_key
+        # SimpleMLP's (2, 16) head is exactly the capped case: 2*4 + 4*16 = 72 > 32.
+        capped = [s for s in lin_sub.specs if s.num_coords == s.num_params and len(s.original_shape) >= 2]
+        assert capped, "this fixture must exercise the cap, or the test proves nothing"
         assert lin_sub.subspace_dim > 0
         assert lin_sub.subspace_dim < layout.total_params
 
@@ -269,7 +281,10 @@ class TestLinearSubspaceFromLayout:
         lin_sub = LinearSubspace.auto_from_layout(layout, seed=42)
         lr_sub = LowRankSubspace.auto_from_layout(layout)
 
-        assert lin_sub.subspace_dim == lr_sub.subspace_dim
+        # See test_from_layout_linear on why this is <= rather than ==.
+        assert lin_sub.subspace_dim <= lr_sub.subspace_dim
+        for spec in lin_sub.specs:
+            assert spec.num_coords <= spec.num_params, spec.entry_key
         assert lin_sub.subspace_dim > 0
         assert lin_sub.subspace_dim < layout.total_params
 

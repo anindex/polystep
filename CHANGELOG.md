@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.10.1 - 2026-08-01
+
+### Fixed
+
+- `adaptive_probes` reused the previous batch's cost matrix unless the caller passed
+  `objective_token`, which is now required for reuse. Pass `objective_token=0` for a
+  stationary full-batch objective.
+- `block_group_size < 1` produced no blocks and wrote zeros over every parameter.
+- A scheduled `epsilon` reaching 0 froze the run; a negative one made the optimizer
+  ascend. Both are rejected when the schedule resolves.
+- The multi-fidelity screen gave `top_k_mean` mass on vertices never scored at full
+  fidelity: `keep_v` capped at `k` where the solver needs at least `k`.
+- A closure returning a scalar broadcast over every candidate, so the step was zero.
+- `HybridSubspace(rank=0)` gave a spec with no coordinates and froze those layers.
+- Blockwise averaged probes before sanitizing, so it disagreed with the monolithic
+  driver whenever one probe was non-finite.
+- `load_state_dict` aliased the checkpoint's tensors, so running the optimizer mutated
+  the loaded dict. `SparseRandomProjection` is rebuilt rather than stored by reference,
+  and a control key missing from an older format no longer overwrites the live value.
+- `absorb` dropped buffers from `base_params`.
+- Newton refinement scored against the post-momentum position, double-counting momentum.
+- `LinearSubspace` left `num_coords` uncapped, giving a rank-deficient projection and,
+  at high rank, an allocation larger than the layer.
+- The adaptive-radius controller read the probe mean, which grows with the radius it
+  scales. It now uses the min-over-vertices estimator the trust region uses.
+- `PolyStepES` overwrote a caller-supplied solver's `epsilon`, and a `-inf` fitness held
+  `best_solution` permanently.
+- `train()` rejects a model the optimizer was not built on, rejects `trust_region`
+  (which it silently pinned at 1.0), and restores the caller's train mode.
+- CMA covariance adaptation raises on a sparse projection instead of updating state that
+  reaches nothing. `SparseRandomProjection` warns when a basis reaches under half the
+  parameters.
+
+Crashes: blockwise buffer overrun at `chunk_size < V*K`; mixed-dtype models on the fused,
+factored and delta paths; `resync_from_model` after a dtype or device change; zero-numel
+parameters under `per_layer`; a seeded CPU generator with a CUDA point; a fully masked
+attention row.
+
+### Performance
+
+- The subspace site path built a dense coordinate matrix with `particle_dim` nonzeros per
+  row. It is block-diagonal by particle group, so it is now a per-group `bmm`: 53-96x on
+  that matmul, 2.4x on a ConvNet step at `subspace_dim=3630`.
+- `SiteVmapEvaluator` runs under blockwise, which previously materialized every candidate
+  on conv, normalization, attention and custom-forward models: 40x on a ConvNet.
+- Blockwise caches its index buffers instead of rebuilding them per block per step.
+- `train()` scores its tracked loss on the same subsample the candidates used.
+- Counting the quadratic model's centre evaluations against the forward budget drops the
+  measured `orthoplex` margin in `docs/performance.md` from 2.0x to 1.7x.
+
 ## 0.10.0 - 2026-07-30
 
 New default polytope, four site-aware evaluation paths, and a pass over fast-path

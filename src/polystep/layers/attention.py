@@ -34,6 +34,9 @@ class VmapSafeMultiHeadAttention(nn.Module):
     matrix multiplications that work correctly under torch.vmap.
 
     Limitations vs nn.MultiheadAttention:
+        - Returns the output tensor alone, not ``(output, weights)``. ``out, _ = attn(...)``
+          raises for most batch sizes and, at ``batch_size == 2``, silently unpacks the
+          batch dimension into two tensors instead.
         - No built-in causal masking (pass attn_mask manually)
         - Assumes batch-first layout: (batch, seq, embed_dim)
         - No add_bias_kv or add_zero_attn support
@@ -220,8 +223,10 @@ class VmapSafeMultiHeadAttention(nn.Module):
             # True means padding, so we mask with -inf
             scores = scores.masked_fill(padding_mask, float("-inf"))
 
-        # Softmax and dropout
-        attn_weights = F.softmax(scores, dim=-1)
+        # Softmax of an all -inf row is NaN, which spreads through the value mix.
+        fully_masked = torch.isneginf(scores).all(dim=-1, keepdim=True)
+        attn_weights = F.softmax(scores.masked_fill(fully_masked, 0.0), dim=-1)
+        attn_weights = attn_weights.masked_fill(fully_masked, 0.0)
         attn_weights = self.attn_dropout(attn_weights)
 
         # Apply attention to values: (batch, num_heads, seq_q, head_dim)

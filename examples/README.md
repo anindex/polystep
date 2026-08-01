@@ -1,13 +1,14 @@
 # Examples
 
 Run in order. Every example pins a thread count, because torch's default of `nproc`
-collapses: `03` runs 2.1 s on one thread against 427 s on 24. All pin 1 except `07`,
-whose own objective is wide enough to pay for the pool (11.3 s to 4.1 s at 8).
-`POLYSTEP_THREADS` overrides. See [`../docs/performance.md`](../docs/performance.md).
+collapses: `03` runs 2.1 s on one thread against 427 s on 24. All pin 1 except `07`.
+`POLYSTEP_THREADS` overrides. Measurements in
+[`../docs/performance.md`](../docs/performance.md).
 
 `02`, `04`, `05`, `06`, `10` and `11` use CUDA when present and fall back to CPU. `01`,
 `03`, `07`, `08` and `09` stay on CPU: their objectives are small enough that
-kernel-launch overhead outweighs the device (`03` measured 3.0 s CPU against 4.7 s CUDA).
+kernel-launch overhead outweighs the device (`03` measured 4.7 s on CUDA against 2.1 s
+on one CPU thread).
 `03` still takes `--device cuda`.
 
 Times below are indicative, from one GPU box. `05`, `06`, `10` and `11` take
@@ -16,12 +17,8 @@ Times below are indicative, from one GPU box. `05`, `06`, `10` and `11` take
 Optional dependencies (matplotlib, gymnasium, pysat) are checked before use, so a missing
 one skips the figure or the render instead of failing after the work is done.
 
-Two levers set the wall-clock in 05, 10 and 11. `amortize_steps` runs momentum steps that
-evaluate nothing between OT steps, cutting forward passes by roughly its value; it spends
-step budget rather than work, so a step-starved run needs a smaller batch to pay for it
-(example 11 halves its batch). Subspace rank cuts candidates per step: it helps the CNN,
-whose descent direction is low-rank, and costs the MLP accuracy. Both have a sharp,
-seed-dependent cliff just past the shipped settings, tabulated in
+Two levers set the wall-clock in 05, 10 and 11: `amortize_steps` and subspace rank. Both
+have a sharp, seed-dependent cliff just past the shipped settings, tabulated in
 [`../docs/performance.md`](../docs/performance.md).
 
 Examples 10 and 11 train a convolutional net and a transformer. Neither fits the

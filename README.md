@@ -43,7 +43,7 @@ From source:
 pip install -e .                      # core library (torch only)
 pip install -e ".[examples]"          # + numpy, torchvision, matplotlib, Pillow, gymnasium, python-sat
 pip install -e ".[dev]"               # + numpy, pytest (+ plugins), ruff
-pip install -e ".[experiments]"       # + pandas, cma, evotorch, snntorch, datasets (paper reproduction)
+pip install -e ".[experiments]"       # + numpy, pandas, python-sat, torchvision, cma, evotorch, snntorch, datasets, gymnasium
 pip install -e ".[rl]"                # + gymnasium[box2d], stable-baselines3 (Box2D envs)
 ```
 
@@ -205,7 +205,7 @@ marks the best method on each row; a dash means the run is not in this release.
 
 | Task | PolyStep | Adam | Architecture |
 |------|---------|------|--------------|
-| MNIST | **96.0% ± 0.1** | 97.9% ± 0.0 | 2-layer MLP (101K) |
+| MNIST | 96.0% ± 0.1 | **97.9% ± 0.0** | 2-layer MLP (101K) |
 | ETTh1 timeseries | **MSE 0.121 ± 0.004** | MSE 0.187 | LSTM (23K) |
 
 ### SNN memory scaling (forward-only vs. BPTT)

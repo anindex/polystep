@@ -215,9 +215,13 @@ class TestAdaptiveRadius:
             radius_min=0.5,
             radius_max=3.0,
         )
+        seen = []
         for _ in range(20):
             opt.step(closure)
+            seen.append(opt.state.radius_multiplier)
         assert 0.5 <= opt.state.radius_multiplier <= 3.0
+        # A controller pinned at 1.0 satisfies the bounds without ever adapting.
+        assert any(m != 1.0 for m in seen), "the radius multiplier never moved"
 
 
 class TestIntegration:
@@ -378,11 +382,11 @@ class TestAdaptiveProbes:
             calls["n"] += batched_params[next(iter(batched_params))].shape[0]
             return closure(batched_params)
 
-        opt.step(counting)
+        opt.step(counting, objective_token="stationary")
         opt._prev_X = opt.state.X.clone()
 
         calls["n"] = 0
-        opt.step(counting)
+        opt.step(counting, objective_token="stationary")
         assert calls["n"] == 0, "an unmoved configuration must spend no forwards"
 
     @pytest.mark.parametrize("block_strategy,expected", [("monolithic", True), ("per_layer", False)])
@@ -485,11 +489,11 @@ class TestAdaptiveProbes:
             call_counts.append(batched_params[next(iter(batched_params))].shape[0])
             return base_closure(batched_params)
 
-        opt.step(counting_closure)  # no previous cost matrix, so no reuse is possible
+        opt.step(counting_closure, objective_token="stationary")  # no cached matrix yet
         step1_evals = sum(call_counts)
         call_counts.clear()
 
-        opt.step(counting_closure)
+        opt.step(counting_closure, objective_token="stationary")
         step2_evals = sum(call_counts)
 
         if reuses:

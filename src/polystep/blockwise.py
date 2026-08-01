@@ -72,6 +72,9 @@ def create_per_layer_blocks(
         num_params = entry.numel
         padded = num_params + (-num_params % particle_dim)
         num_particles = padded // particle_dim
+        if num_particles == 0:
+            # A (0, V) cost matrix divides by zero in the uniform marginal.
+            continue
         blocks.append(
             BlockConfig(
                 name=entry.key,
@@ -116,6 +119,9 @@ def create_grouped_blocks(
         num_params = sum(e.numel for e in group_entries)
         padded = num_params + (-num_params % particle_dim)
         num_particles = padded // particle_dim
+        if num_particles == 0:
+            # See create_per_layer_blocks: an all-zero-numel group has nothing to search.
+            continue
         blocks.append(
             BlockConfig(
                 name=f"block_{g_start}_{g_end}",

@@ -267,7 +267,14 @@ class TestVmapSafeLSTM:
             out, _ = torch.func.functional_call(lstm, params_dict, (x,))
             return out
 
-        batched_params = {k: v.unsqueeze(0).expand(num_models, *v.shape).clone() for k, v in params.items()}
+        # Distinct rows, not clones of one: identical parameters make the output the
+        # same whether or not vmap honours the candidate axis, so a mapping that ignored
+        # it would pass on shape alone.
+        gen = torch.Generator().manual_seed(0)
+        batched_params = {
+            k: v.unsqueeze(0).expand(num_models, *v.shape) + 0.1 * torch.randn(num_models, *v.shape, generator=gen)
+            for k, v in params.items()
+        }
 
         # Input with batch dimension: (batch, seq, input)
         # The module expects 3D input, so we keep the batch dim
@@ -279,6 +286,12 @@ class TestVmapSafeLSTM:
         # Output: (num_models, batch, seq, hidden)
         expected = (num_models, batch, 10, 64)
         assert out.shape == expected, f"Expected {expected}, got {out.shape}"
+
+        # Every row must equal the loop it replaces, and no two rows may agree.
+        for i in range(num_models):
+            row = forward_fn({k: v[i] for k, v in batched_params.items()}, x)
+            torch.testing.assert_close(out[i], row, atol=1e-5, rtol=1e-5)
+        assert not torch.allclose(out[0], out[1], atol=1e-6)
 
 
 def test_attention_lstm_pipeline():

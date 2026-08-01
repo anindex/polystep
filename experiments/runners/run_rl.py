@@ -307,7 +307,7 @@ def run_polystep_cartpole(
                         "time": time.time() - start,
                         "step_wall_time": step_wall,
                         "candidates_evaluated": counted.count,
-                        "env_steps_cumulative": counted.count * rollouts_per_candidate * horizon,
+                        "env_steps_cumulative": getattr(evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon),
                     }
                 )
                 print(
@@ -333,7 +333,7 @@ def run_polystep_cartpole(
         peak_gpu_memory_mb=mem["peak_gpu_memory_mb"],
         function_evals=counted.count,
         total_steps=total_steps,
-        rl_env_steps=counted.count * rollouts_per_candidate * horizon,
+        rl_env_steps=getattr(evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon),
         success_rate=final_summary["success_rate"],
         episode_length=final_summary["episode_length"],
         best_success_rate=best_summary.get("success_rate", 0.0),
@@ -774,7 +774,7 @@ def run_polystep_gym(
                         "time": time.time() - start,
                         "step_wall_time": step_wall,
                         "candidates_evaluated": counted.count,
-                        "env_steps_cumulative": counted.count * rollouts_per_candidate * horizon,
+                        "env_steps_cumulative": getattr(evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon),
                     }
                 )
                 print(
@@ -800,7 +800,7 @@ def run_polystep_gym(
         peak_gpu_memory_mb=mem["peak_gpu_memory_mb"],
         function_evals=counted.count,
         total_steps=total_steps,
-        rl_env_steps=counted.count * rollouts_per_candidate * horizon,
+        rl_env_steps=getattr(evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon),
         success_rate=final_summary["success_rate"],
         episode_length=final_summary["episode_length"],
         best_success_rate=best_summary.get("success_rate", 0.0),

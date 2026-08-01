@@ -129,6 +129,8 @@ class CartPoleEvaluator:
         self.rollouts_per_candidate = int(rollouts_per_candidate)
         self.horizon = int(horizon)
         self.device = torch.device(device)
+        # See GymVectorEvaluator.env_steps.
+        self.env_steps = 0
 
     def rollout_stacked_params(
         self,
@@ -178,6 +180,8 @@ class CartPoleEvaluator:
                 break
 
         successes = active  # survived all horizon steps
+        # Real environment steps taken; see GymVectorEvaluator.env_steps.
+        self.env_steps += int(lengths.sum().item())
         return CartPoleRolloutResult(returns=returns, lengths=lengths, successes=successes)
 
     def loss_for_stacked_params(

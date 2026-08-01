@@ -225,13 +225,13 @@ def test_adaptive_probes_reuses_rotation_for_stagnant_particles():
     closure = make_closure(opt)
 
     # First step cannot reuse (no history yet) but stores the rotations.
-    opt.step(closure)
+    opt.step(closure, objective_token="stationary")
     assert opt._prev_rot_mats is not None
     rot_after_first = opt._prev_rot_mats.clone()
 
     # Second step: all particles stagnant, so rotations (and cost rows) are
     # reused unchanged rather than resampled.
-    opt.step(closure)
+    opt.step(closure, objective_token="stationary")
     torch.testing.assert_close(opt._prev_rot_mats, rot_after_first)
     assert torch.isfinite(opt._state.X).all()
 
@@ -449,10 +449,17 @@ def test_screen_keeps_enough_vertices_for_top_k_mean():
     for _ in range(2):
         opt.step(closure, screen_closure=screen)
 
-    # V = pdim + 1 = 5 on the default simplex; keep_ratio 0.1 would round to 1, below
-    # the solver's default k = 3.
+    # V = pdim + 1 = 5 on the default simplex; keep_ratio 0.1 rounds to 1, below the
+    # solver's default k = 3. The floor has to lift it back to k, or the solver hands
+    # mass a/k to vertices carrying only the sanitize penalty.
     assert torch.isfinite(opt.state.X).all()
     assert opt.solver.k == 3
+
+    # The transport row is the observable: every vertex holding mass must be one the
+    # screen kept, so a row can never spread over more than k_eff of them.
+    V = opt._polytope_vertices.shape[0]
+    keep_v = min(V, max(1, int(round(V * opt.screen_keep_ratio)), min(opt.solver.k, V)))
+    assert keep_v >= min(opt.solver.k, V), f"keep_v={keep_v} < k_eff={min(opt.solver.k, V)}"
 
 
 def test_default_polytope_is_the_minimal_positive_spanning_set():

@@ -16,7 +16,7 @@ from .costs import compute_cost_matrix
 from .epsilon import feed_solver_stats, LinearEpsilon
 from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
 from .solvers import SinkhornSolver, SoftmaxSolver
-from .solvers._shared import sanitize_cost, solver_health
+from .solvers._shared import solver_health
 
 
 @dataclass
@@ -375,10 +375,8 @@ class PolyStep:
                 chunk_size=self.chunk_size,
             )
 
-        # Sanitize cost matrix before OT solve. Use the shared branch-free
-        # helper (no host sync, FP32 promotion, clamped penalty) rather than an
-        # inline copy that .item()-synced and could overflow the penalty to inf.
-        cost_matrix = sanitize_cost(cost_matrix)
+        # No sanitize here: prepare_cost does it, and a second pass would derive its
+        # penalty from the already-penalized matrix.
 
         ent_eps = self._get_ent_epsilon(iteration)
         ot_epsilon = ent_eps if ent_eps is not None else current_eps

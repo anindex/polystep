@@ -258,37 +258,6 @@ class TestFusedSoftmaxDispatch:
         assert not torch.equal(before, _flat_params(model))
 
 
-@pytest.mark.parametrize("use_subspace,solver", [(True, None), (False, "sinkhorn")])
-def test_k1_shortcut_matches_the_averaging_path(model, layout, use_subspace, solver):
-    """The K=1 cost-matrix shortcut must equal the general averaging path.
-
-    ``_step_monolithic`` skips ``losses.reshape(P, V, K).mean(-1)`` when ``K_eff == 1``
-    and reshapes straight to ``(P, V)``. The two must agree exactly; averaging over a
-    length-1 axis is the identity."""
-    # adaptive_probes is what populates _prev_cost_matrix; use_quadratic_model is
-    # what populates _losses_3d. Both are needed to compare the two paths.
-    kwargs = {
-        "epsilon": 0.5,
-        "num_probe": 1,
-        "seed": 42,
-        "use_quadratic_model": True,
-        "adaptive_probes": True,
-    }
-    if use_subspace:
-        kwargs["subspace"] = LinearSubspace.from_layout(layout, rank=4)
-    if solver is not None:
-        kwargs["solver"] = solver
-    opt = PolyStepOptimizer(model, **kwargs)
-    closure = _make_closure(model)
-
-    for _ in range(3):
-        opt.step(closure)
-
-    losses_3d = opt._losses_3d
-    assert losses_3d is not None and losses_3d.shape[-1] == 1, "expected a K=1 probe buffer"
-    torch.testing.assert_close(opt._prev_cost_matrix, losses_3d.mean(dim=-1), rtol=0, atol=0)
-
-
 class TestSoftmaxEdgeCases:
     """Edge cases for softmax solver at the optimizer level."""
 

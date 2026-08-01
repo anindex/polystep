@@ -52,7 +52,8 @@ def step_momentum(opt, closure: Callable) -> float:
         opt._sync_model()
         prev_cost = state.costs[-1] if state.costs else float("inf")
         state.costs.append(prev_cost)
-        state.linear_convergence.append(True)
+        # No solve ran; True reads as "converged" to an early-stop callback.
+        state.linear_convergence.append(False)
         state.displacement_sqnorms.append(0.0)
         state.record_solver_health(evals=0)
         state.iteration_count += 1
@@ -71,7 +72,7 @@ def step_momentum(opt, closure: Callable) -> float:
 
     disp_sqnorm = torch.mean(torch.sum((state.X - X_old) ** 2, dim=-1)).item()
     state.costs.append(cost)
-    state.linear_convergence.append(True)
+    state.linear_convergence.append(False)
     state.displacement_sqnorms.append(disp_sqnorm)
     # No OT solve and no forwards, so ess/rho carry forward.
     state.record_solver_health(evals=0)

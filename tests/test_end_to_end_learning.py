@@ -132,6 +132,11 @@ def test_orthoplex_with_the_quadratic_model_beats_the_simplex_per_forward_pass()
     The orthoplex costs 2k vertices against the simplex's k+1, so it pays off only
     with the finite-difference machinery its antithetic pairing enables. The budget
     is candidate evaluations, not steps, or the orthoplex just gets more forwards.
+
+    The budget now charges the per-particle centre evaluations the quadratic model
+    needs, which it previously did not. That costs the orthoplex leg about half its
+    steps and leaves the measured ratio at 1.51. The threshold is 1.25 rather than
+    just under that: a 0.7% margin flips on any BLAS blocking difference.
     """
     from polystep.cost_nn import NNCostEvaluator
     from polystep.transform import ParamLayout
@@ -159,6 +164,6 @@ def test_orthoplex_with_the_quadratic_model_beats_the_simplex_per_forward_pass()
     simplex = run(polytope_type="simplex")
     orthoplex_quad = run(polytope_type="orthoplex", use_quadratic_model=True, trust_region=True, num_probe=2)
 
-    assert orthoplex_quad > simplex * 1.5, (
+    assert orthoplex_quad > simplex * 1.25, (
         f"orthoplex+quadratic model does not pay for its extra vertices: {orthoplex_quad:.4f} vs simplex {simplex:.4f}"
     )

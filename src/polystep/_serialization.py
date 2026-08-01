@@ -18,6 +18,8 @@ _STATE_DICT_FORMAT = 3
 # Optimizer attributes outside SolverState that steer the *next* step. Every one of
 # these is read before it is written on a step, so dropping it changes the resumed
 # trajectory.
+_SPARSE_TAG = "__sparse_projection__"
+
 _CONTROL_STATE_KEYS = (
     "_amortize_counter",
     "_transport_direction_ema",
@@ -40,6 +42,9 @@ _CONTROL_STATE_KEYS = (
     "_newton_direction",
     "_loss_decreasing_count",
     "_prev_objective_token",
+    # Which estimator _prev_pre_step_loss came from. Without it a resume can compare a
+    # centre-based baseline against the min-over-vertices proxy.
+    "_prev_loss_from_center",
     # Which rank the restored X and projections belong to.
     "_applied_rank",
 )
@@ -78,9 +83,21 @@ class SerializationMixin:
         resume is bit-exact for every configuration.
         """
 
+        from .projection import SparseRandomProjection
+
         def _ser(v):
             if isinstance(v, torch.Tensor):
                 return v.detach().to("cpu").clone()
+            if isinstance(v, SparseRandomProjection):
+                # A pure function of these four numbers; by reference it would keep CUDA
+                # storage in the file and mutate after the save.
+                return {
+                    _SPARSE_TAG: True,
+                    "full_dim": v.full_dim,
+                    "subspace_dim": v.subspace_dim,
+                    "density": v.density,
+                    "seed": v.seed,
+                }
             if isinstance(v, dict):
                 return {k: _ser(x) for k, x in v.items()}
             if isinstance(v, (list, tuple)):
@@ -143,9 +160,20 @@ class SerializationMixin:
         if saved_rank is not None and saved_rank != self._applied_rank and self.subspace is not None:
             self._transition_rank(saved_rank)
 
+        from .projection import SparseRandomProjection
+
         def _de(v):
             if isinstance(v, torch.Tensor):
-                return v.to(device)
+                # clone: a same-device .to() returns the checkpoint's own tensor, which
+                # displacement_history then writes in place.
+                return v.to(device).clone()
+            if isinstance(v, dict) and v.get(_SPARSE_TAG):
+                return SparseRandomProjection(
+                    full_dim=v["full_dim"],
+                    subspace_dim=v["subspace_dim"],
+                    density=v["density"],
+                    seed=v["seed"],
+                )
             if isinstance(v, dict):
                 return {k: _de(x) for k, x in v.items()}
             if isinstance(v, (list, tuple)):
@@ -177,7 +205,10 @@ class SerializationMixin:
             self._transport_direction_ema = None
         else:
             for name in _CONTROL_STATE_KEYS:
-                setattr(self, name, _de(control.get(name)))
+                # `in`, not .get(): an older format missing a key would write None over
+                # the live value, and a None _applied_rank fires a spurious transition.
+                if name in control:
+                    setattr(self, name, _de(control[name]))
             self._ot_step_costs.clear()
             self._ot_step_costs.extend(control.get("_ot_step_costs", []))
             if fmt < 3:

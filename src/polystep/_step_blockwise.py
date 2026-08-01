@@ -75,6 +75,16 @@ def _resolve_geometry(opt, state, iteration):
     return current_eps, ent_eps if ent_eps is not None else current_eps, step_r, probe_r
 
 
+def _max_group(polytopes, probes) -> int:
+    """The widest ``V * K`` candidate group over every block.
+
+    Group width is per block; the candidate buffer is allocated once per sweep.
+    """
+    if not polytopes:
+        return 1
+    return max(p.shape[0] for p in polytopes) * probes.numel()
+
+
 def _prepare_probes(opt, state, block, block_X, polytopes, block_idx, probes, step_r, probe_r, descent_dirs):
     """Rotate the block's polytope, place its vertices and probe points."""
     device, dtype = block_X.device, block_X.dtype
@@ -108,9 +118,14 @@ def _chunk_indices(global_indices, V, K):
 
 
 def _cost_from_losses(losses, P, V, K):
-    """Average the probe axis away, then make the matrix safe for the solver."""
-    cost_matrix = losses.reshape(P, V) if K == 1 else losses.reshape(P, V, K).mean(dim=-1)
-    return sanitize_cost(cost_matrix)
+    """Make the losses safe for the solver, then average the probe axis away.
+
+    Sanitize first, matching the monolithic driver: averaging first lets one non-finite
+    probe carry its whole vertex to the penalty, where sanitizing first keeps the signal
+    from the probes that did evaluate.
+    """
+    safe = sanitize_cost(losses)
+    return safe.reshape(P, V) if K == 1 else safe.reshape(P, V, K).mean(dim=-1)
 
 
 def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon, evals):
@@ -172,6 +187,25 @@ def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X
     )
 
 
+def _index_buffers(opt, total_evals: int, D: int, device):
+    """Cached ``(arange(total_evals), arange(D))`` for a block sweep.
+
+    The monolithic driver keeps its index tensors across steps; blockwise rebuilt them
+    once per block per step. Both are read-only, so one buffer per size is enough.
+    """
+    cache = getattr(opt, "_block_index_buffers", None)
+    if cache is None or cache[0] != device:
+        cache = opt._block_index_buffers = (device, {}, {})
+    _, evals_cache, dim_cache = cache
+    idx = evals_cache.get(total_evals)
+    if idx is None:
+        idx = evals_cache[total_evals] = torch.arange(total_evals, device=device)
+    off = dim_cache.get(D)
+    if off is None:
+        off = dim_cache[D] = torch.arange(D, device=device)
+    return idx, off
+
+
 def _delta_context(opt, attr: str = "_sparse_delta_evaluator"):
     """The delta evaluator and the batch it scores against, or ``None`` for the
     materializing path.
@@ -206,7 +240,8 @@ def _finish_step(opt, state, X, X_new_full, blocks, outcomes, iteration, current
 
     nan_reverted = False
     if not torch.isfinite(state.X).all():
-        state.X = X.clone()
+        # Back to the pre-step point, or to the origin when that was non-finite too.
+        state.X = X.clone() if torch.isfinite(X).all() else torch.zeros_like(X)
         state.block_duals = [(None, None) for _ in blocks]
         if opt.use_momentum and state.velocity is not None:
             state.velocity = torch.zeros_like(state.velocity)
@@ -317,9 +352,16 @@ def step_blockwise(opt, closure: Callable) -> float:
     # Budget the chunk on elements, like the monolithic path; a fixed chunk OOMs
     # on large models.
     chunk = opt.chunk_size or max(1, (1 << 26) // max(1, total_flat_size))
+    # The delta path rounds its stride up to a whole V*K group, which exceeds chunk when
+    # chunk is smaller, so the buffer covers the widest group.
+    chunk = max(chunk, _max_group(opt._block_polytopes, probes))
 
     sparse_delta, fused_inputs, fused_targets = _delta_context(opt)
-    base_sd = opt.layout.unflatten(X) if sparse_delta is not None else None
+    # No assumption about the module set, so it covers the blocks the Linear-only
+    # sparse delta declines (conv, norm, attention, custom).
+    site_vmap = getattr(opt, "_site_vmap_evaluator", None) if fused_inputs is not None else None
+    site_owner = sparse_delta if sparse_delta is not None else site_vmap
+    base_sd = opt.layout.unflatten(X) if site_owner is not None else None
     pdim_arange = torch.arange(opt._particle_dim, device=device)
 
     # Candidates are written straight into layout order, so there is one buffer rather
@@ -348,8 +390,7 @@ def step_blockwise(opt, closure: Callable) -> float:
         P, V, K, D = X_probe.shape
         total_evals = P * V * K
         losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
-        all_indices = torch.arange(total_evals, device=device)
-        d_offsets = torch.arange(D, device=device)
+        all_indices, d_offsets = _index_buffers(opt, total_evals, D, device)
 
         # The delta path scores a whole particle's group at once, so a chunk holds
         # whole groups: a ragged one would split a group across two calls.
@@ -359,21 +400,27 @@ def step_blockwise(opt, closure: Callable) -> float:
         # is arithmetic rather than a device read. A grouped block can straddle two
         # entries, so it keeps the dense path.
         entry = opt.layout.entries[block.leaf_indices[0]] if len(block.leaf_indices) == 1 else None
-        block_chunk = max(group, (chunk // group) * group) if sparse_delta is not None and entry else chunk
+        block_chunk = max(group, (chunk // group) * group) if site_owner is not None and entry else chunk
 
         for chunk_start in range(0, total_evals, block_chunk):
             chunk_end = min(chunk_start + block_chunk, total_evals)
             width = chunk_end - chunk_start
             i_idx, v_idx, k_idx = _chunk_indices(all_indices[chunk_start:chunk_end], V, K)
 
-            if entry is not None and sparse_delta is not None:
+            if entry is not None and site_owner is not None:
                 offsets = entry.offset + i_idx * D
                 span = (entry.offset + (chunk_start // group) * D, entry.offset + ((chunk_end - 1) // group) * D + D)
-                site = sparse_delta.resolve_site(offsets, D, span)
+                owner = site_owner
+                site = owner.resolve_site(offsets, D, span)
+                if site is None and site_vmap is not None and owner is not site_vmap:
+                    # The sparse-delta correction is confined to Linear layers; the
+                    # site-aware vmap still shares the graph ahead of any entry.
+                    owner = site_vmap
+                    site = owner.resolve_site(offsets, D, span)
                 if site is not None:
-                    losses[chunk_start:chunk_end] = sparse_delta.evaluate(
+                    losses[chunk_start:chunk_end] = owner.evaluate(
                         base_sd,
-                        site.key,
+                        site if owner is site_vmap else site.key,
                         offsets[::group].unsqueeze(1) + pdim_arange - site.offset,
                         X_probe[i_idx, v_idx, k_idx].reshape(width // group, group, D),
                         fused_inputs,
@@ -455,6 +502,8 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     # A chunk costs the coordinate buffer plus one full weight set per candidate, since
     # any chunk the delta path declines falls back to reconstruct_batch.
     chunk = opt.chunk_size or max(1, (1 << 26) // max(1, sub_dim + opt.layout.total_params))
+    # See step_blockwise: the dense fallback inherits the group-rounded stride.
+    chunk = max(chunk, _max_group(opt._subspace_block_polytopes, probes))
 
     # A candidate perturbs one particle's coordinate run, so a run that sits inside one
     # layer's coordinate block moves only that layer's weight. The barycentre weights it
@@ -498,8 +547,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
         P, V, K, D = X_probe.shape
         total_evals = P * V * K
         losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
-        all_indices = torch.arange(total_evals, device=device)
-        d_offsets = torch.arange(D, device=device)
+        all_indices, d_offsets = _index_buffers(opt, total_evals, D, device)
 
         # The delta path scores a whole particle's group at once, so a chunk holds
         # whole groups: a ragged one would split a group across two calls.

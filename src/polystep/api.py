@@ -135,6 +135,17 @@ def train(
     Returns:
         The same model object (mutated in-place by the optimizer).
     """
+    if getattr(optimizer, "model", model) is not model:
+        raise ValueError("train() got a different model than the optimizer was built on.")
+    if getattr(optimizer, "trust_region", False):
+        # The optimizer clears the pending pair on every objective_token change, so the
+        # multiplier would sit at 1.0 for the whole run with no warning.
+        raise ValueError(
+            "trust_region is not supported by train(): its ratio compares a prediction "
+            "against the loss on the next batch, which is a different objective. "
+            "Drop trust_region, or drive optimizer.step() on a fixed batch."
+        )
+    was_training = model.training
     evaluator = NNCostEvaluator(
         model,
         loss_fn=loss_fn,
@@ -211,10 +222,12 @@ def train(
                 # ot_cost averages probe points around the pre-step weights, so it does not
                 # measure the weights the model now holds. restore_best keyed on it would
                 # snapshot the cheapest probe cloud. Costs one forward per 2*d*K probes.
+                # On cost_inputs, the slice the candidates were ranked on: the full batch
+                # is the step's most expensive forward under cost_batch_size.
                 if callbacks or config.restore_best:
-                    with torch.no_grad():
-                        output = model(inputs)
-                        train_loss = loss_fn(output, targets).item()
+                    with torch.inference_mode():
+                        output = model(cost_inputs)
+                        train_loss = loss_fn(output, cost_targets).item()
                 else:
                     # Nothing reads a per-step loss: skip the forward and its host sync.
                     train_loss = ot_cost
@@ -268,18 +281,20 @@ def train(
             for cb in callbacks:
                 cb.on_epoch_end(epoch_metrics)
 
-        # Restore the best-seen weights (load_state_dict copies in place, keeping dtype/device).
-        # The optimizer still holds the particle state of the LAST step, so re-anchor it on
-        # the restored weights; otherwise the next step() ends in _sync_model and writes the
-        # last-step weights straight back over the restored ones.
+    finally:
+        # Restore the best-seen weights (load_state_dict copies in place, keeping
+        # dtype/device). The optimizer still holds the particle state of the LAST step, so
+        # re-anchor it on the restored weights; otherwise the next step() ends in
+        # _sync_model and writes the last-step weights straight back over the restored
+        # ones. In finally, so a crash still leaves the best weights.
         if config.restore_best and best_state is not None:
             model.load_state_dict(best_state)
             optimizer.resync_from_model()
-
-    finally:
         # finally: an exception from the loss, optimizer or a callback would
         # otherwise leave the last batch alive on the optimizer for its lifetime.
         optimizer.release_evaluator()
+        # NNCostEvaluator switched to eval so candidates score against frozen statistics.
+        model.train(was_training)
 
     return model
 
@@ -292,6 +307,8 @@ class LoggingCallback(TrainCallback):
     """
 
     def __init__(self, log_every: int = 10):
+        if log_every < 1:
+            raise ValueError(f"log_every must be >= 1, got {log_every}.")
         self.log_every = log_every
 
     def on_step_end(self, metrics: dict) -> bool:

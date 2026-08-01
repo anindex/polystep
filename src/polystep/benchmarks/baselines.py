@@ -81,6 +81,7 @@ if _HAS_EVOTORCH:
             self._batch_size = batch_size
             self._fitness_fn = fitness_fn
             self._device_str = device
+            self._batch_indices = None
 
             super().__init__(
                 objective_sense="max",  # Maximize accuracy
@@ -113,8 +114,11 @@ if _HAS_EVOTORCH:
 
             batch_size = min(self._batch_size, len(self._train_data))
 
-            # Sample a random batch for fitness evaluation
-            indices = torch.randperm(len(self._train_data), device=device)[:batch_size]
+            # One batch per generation, shared by the population: a fresh draw per
+            # candidate would rank it on different data, unlike polystep's fixed closure.
+            if self._batch_indices is None or len(self._batch_indices) != batch_size:
+                self._batch_indices = torch.randperm(len(self._train_data), device=device)[:batch_size]
+            indices = self._batch_indices
             batch_data = self._train_data[indices]
             batch_labels = self._train_labels[indices]
 
@@ -228,7 +232,9 @@ def train_cmaes(
     # Training loop
     epoch_logs = []
     best_test_acc = 0.0
-    best_solution = None
+    # final_accuracy reports this: selecting by test accuracy is test-set selection,
+    # and polystep reports its actual final model. best_test_acc stays separate.
+    last_solution = None
     start_time = time.time()
 
     # Build the eval model once and reuse across calls; rebuilding it on
@@ -267,6 +273,8 @@ def train_cmaes(
         return correct / total if total > 0 else 0.0
 
     for gen in range(generations):
+        # New batch per generation, shared within it. See _evaluate.
+        problem._batch_indices = None
         searcher.step()
 
         status = searcher.status
@@ -279,9 +287,8 @@ def train_cmaes(
             pop_best_sol = status.get("pop_best", None)
             if pop_best_sol is not None:
                 test_acc = evaluate_on_test(pop_best_sol)
-                if test_acc > best_test_acc:
-                    best_test_acc = test_acc
-                    best_solution = pop_best_sol.clone() if hasattr(pop_best_sol, "clone") else pop_best_sol
+                last_solution = pop_best_sol.clone() if hasattr(pop_best_sol, "clone") else pop_best_sol
+                best_test_acc = max(best_test_acc, test_acc)
             else:
                 test_acc = 0.0
 
@@ -309,8 +316,8 @@ def train_cmaes(
     elapsed = time.time() - start_time
     total_evals = generations * popsize
 
-    # Final evaluation
-    final_test_acc = evaluate_on_test(best_solution) if best_solution is not None else best_test_acc
+    # On the last solution, not the test-best one.
+    final_test_acc = evaluate_on_test(last_solution) if last_solution is not None else 0.0
 
     peak_memory = 0.0
     if device == "cuda" and torch.cuda.is_available():

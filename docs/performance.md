@@ -44,15 +44,19 @@ reduction (`experiments/scripts/bench_polytope.py`):
 | `simplex` (default) | 0.079 | 260 |
 | `orthoplex` alone | 0.066 | 195 |
 | `orthoplex` + `multifidelity_screen` | 0.064 | 260 |
-| `orthoplex` + `use_quadratic_model` + `trust_region` | **0.156** | 173 |
+| `orthoplex` + `use_quadratic_model` + `trust_region` | **0.132** | 143 |
 
-The orthoplex alone loses. Paired with the quadratic model it wins 2.0x per forward pass,
+The orthoplex alone loses. Paired with the quadratic model it wins 1.7x per forward pass,
 so the default stays `simplex` and the configuration worth reaching for is:
 
 ```python
 PolyStepOptimizer(model, polytope_type='orthoplex',
                   use_quadratic_model=True, trust_region=True, num_probe=1)
 ```
+
+The table row was measured at `num_probe=2`; `num_probe=1` is the cheaper setting for the
+same result, for the reason below. The budget charges the per-particle centre evaluations
+the quadratic model needs.
 
 That result is a full-space 20-32-3 MLP and it does not transfer to a subspace run. The
 same three flags on `examples/05` (784-128-10, `HybridSubspace(rank=8)`) gave 30.9 s /
@@ -135,6 +139,17 @@ tensor, so batching only that tensor makes the graph ahead of it run once.
 `forward`. It picks up the models the delta paths decline outright and the chunks they
 decline individually. It declines tied weights.
 
+It runs under `block_strategy='per_layer'` and `'grouped'` too, where the Linear-only
+`SparseDeltaEvaluator` is the only other option: a small conv net went 38.6 to 1.0 s per
+step (40x), with an identical cost matrix.
+
+In subspace mode the correction for a chunk is `dcoords @ P.t()`. Only `particle_dim`
+coordinates per candidate are nonzero, and they sit in one column block per particle
+group, so it is a per-group `bmm` rather than a dense product against the whole layer
+block. That is `spec_width / particle_dim` fewer FLOPs: 53-96x on the matmul at layer
+widths 552 and 1064, and 2.4x on a whole ConvNet step at `subspace_dim=3630`. The gain
+scales with `subspace_dim`, so at `max_subspace_dim=256` it is within noise.
+
 ## Chunks break where the parameters do
 
 A site-aware path needs every candidate in a chunk to perturb the same parameter. Sized
@@ -192,21 +207,11 @@ forward, where conversion would change the model rather than speed it up.
 
 ## Custom layers on the fast paths
 
-The plan accepts a fixed set of `torch.nn` layers. A custom layer gets in by declaring
-arithmetic the library cannot infer, so both declarations are opt-in and probed at build
-time.
+`polystep_elementwise` and `polystep_weight_transform` put a custom layer on the batched
+paths; [`api_overview.md`](api_overview.md) has the contracts and the syntax.
 
-`polystep_elementwise = True` says `module(x)[i] == module(x[i])`: no parameters,
-buffers, Python state or in-place writes, shape and dtype preserving, deterministic,
-callable at 2-D and 3-D. Continuity is not required. The delta path computes
-`module(a + d) - module(a)`, an exact finite difference, so a step function is reproduced
-exactly while a smooth `LayerNorm` would be silently wrong. `try_build` probes a sample
-tensor and declines softmax, layer norm and per-tensor quantizers.
-
-`polystep_weight_transform` says the forward is exactly `x @ Q(weight).t() + Qb(bias)`
-with `Q` elementwise. The bmm path transforms the stacked weight once; the sparse-delta
-path uses the effective delta `Q(w + d) - Q(w)`. Assuming the correction is linear in the
-perturbation is right for a plain Linear and wrong by O(1) for a sign transform:
+The delta path uses the effective delta `Q(w + d) - Q(w)`, not a correction linear in the
+perturbation. The difference is nothing for a plain Linear and O(1) for a sign transform:
 
 | path | max abs error vs true per-candidate forward |
 |---|---|
@@ -265,7 +270,7 @@ Every step draws one Haar rotation per particle, and `subspace_particle_dim` def
 reflections cost `d-1` sequential launches whatever the batch, and batched `geqrf` scales
 with the batch, so each wins on one side of a crossover:
 
-| shape | `torch.linalg.qr` | Householder | |
+| shape | `torch.linalg.qr` | Householder | faster |
 |---|---|---|---|
 | (1, 8, 8) CPU | 0.007 ms | 0.148 ms | QR 23x |
 | (1, 129, 129) CPU | 0.219 ms | 2.869 ms | QR 13x |

@@ -598,16 +598,31 @@ def test_default_rotation_interval_no_warning(model):
 
 
 class TestStructuredProjection:
-    def test_random_mode_backward_compat(self, layout):
-        """projection_mode='random' (default) produces same projections as before."""
-        hybrid_default = HybridSubspace.from_layout(layout, rank=4)
-        hybrid_random = HybridSubspace.from_layout(layout, rank=4)
+    def test_the_seed_alone_fixes_the_projection(self, layout):
+        """Two builds agree at one seed and differ at another.
 
-        proj_default = hybrid_default.init_projections(torch.device("cpu"), torch.float32)
-        proj_random = hybrid_random.init_projections(torch.device("cpu"), torch.float32)
+        This used to compare two byte-identical ``from_layout(layout, rank=4)`` calls
+        against a ``projection_mode='random'`` parameter that does not exist, so any
+        change to projection generation kept it green.
+        """
+        same_a = HybridSubspace.from_layout(layout, rank=4, seed=7).init_projections(torch.device("cpu"), torch.float32)
+        same_b = HybridSubspace.from_layout(layout, rank=4, seed=7).init_projections(torch.device("cpu"), torch.float32)
+        other = HybridSubspace.from_layout(layout, rank=4, seed=8).init_projections(torch.device("cpu"), torch.float32)
 
-        for key in proj_default:
-            torch.testing.assert_close(proj_default[key], proj_random[key])
+        projected = [k for k, v in same_a.items() if isinstance(v, torch.Tensor) and v.numel() > 1]
+        assert projected, "the fixture must produce a dense projection"
+        for key in projected:
+            torch.testing.assert_close(same_a[key], same_b[key])
+        assert any(not torch.equal(same_a[k], other[k]) for k in projected), "the seed must matter"
+
+    def test_a_projection_is_orthonormal(self, layout):
+        """The step radii assume gain 1, which only a column-orthonormal basis gives."""
+        proj = HybridSubspace.from_layout(layout, rank=4, seed=7).init_projections(torch.device("cpu"), torch.float32)
+        for key, P in proj.items():
+            if not isinstance(P, torch.Tensor) or P.dim() != 2 or P.shape[1] < 2:
+                continue
+            gram = P.t() @ P
+            torch.testing.assert_close(gram, torch.eye(P.shape[1]), atol=1e-4, rtol=0), key
 
 
 class TestMaxSubspaceDim:

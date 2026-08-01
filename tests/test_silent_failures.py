@@ -203,6 +203,19 @@ def test_adaptive_probes_do_not_reuse_costs_across_objectives():
 
 
 def test_adaptive_probes_still_reuse_for_a_stationary_objective():
+    """A caller asserts stationarity by passing an objective_token that does not change."""
+    torch.manual_seed(0)
+    opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, adaptive_probes=True, adaptive_probes_threshold=1e9)
+    calls = [0]
+
+    opt.step(_constant_closure(1.0, calls), objective_token="full-batch")
+    calls[0] = 0
+    opt.step(_constant_closure(1.0, calls), objective_token="full-batch")
+    assert calls[0] == 0
+
+
+def test_adaptive_probes_do_not_reuse_without_an_objective_token():
+    """A minibatch loop that passes no token would score this batch with the last one's costs."""
     torch.manual_seed(0)
     opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, adaptive_probes=True, adaptive_probes_threshold=1e9)
     calls = [0]
@@ -210,7 +223,7 @@ def test_adaptive_probes_still_reuse_for_a_stationary_objective():
     opt.step(_constant_closure(1.0, calls))
     calls[0] = 0
     opt.step(_constant_closure(1.0, calls))
-    assert calls[0] == 0
+    assert calls[0] > 0
 
 
 def test_adaptive_probes_reuse_cannot_latch_on_a_drifting_particle():
@@ -556,3 +569,171 @@ def test_sparse_projection_ignores_default_device():
         torch.set_default_device("cpu")
 
     assert projection._indices.shape == (2, projection.nnz)
+
+
+def _batch(n=6, d=4, c=3, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(n, d, generator=g), torch.randint(0, c, (n,), generator=g)
+
+
+class TestAuditSilentFailures:
+    """Each of these returned a plausible finite loss while measuring nothing."""
+
+    def test_a_scalar_closure_is_rejected_instead_of_broadcasting(self):
+        """It broadcast over the slice: every candidate scored alike, so the step was 0."""
+        torch.manual_seed(0)
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0)
+        with pytest.raises(ValueError, match="one loss per candidate"):
+            opt.step(lambda bp: torch.tensor(3.0))
+
+    @pytest.mark.parametrize("target", [0.0, -0.1])
+    def test_a_schedule_resolving_to_a_nonpositive_epsilon_is_rejected(self, target):
+        """Zero froze the run through NaN reversion; negative made it ascend."""
+        from polystep.epsilon import LinearEpsilon
+
+        torch.manual_seed(0)
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, epsilon=LinearEpsilon(init=1.0, target=target, decay=10.0))
+        with pytest.raises(ValueError, match="epsilon must resolve to > 0"):
+            for _ in range(4):
+                opt.step(_constant_closure(1.0, [0]))
+
+    def test_an_all_nonfinite_cost_matrix_is_reported(self):
+        """Sanitize maps it to a constant, giving a uniform plan and a fabricated 1.0."""
+        torch.manual_seed(0)
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0)
+
+        def nan_closure(bp):
+            n = next(iter(bp.values())).shape[0]
+            return torch.full((n,), float("nan"))
+
+        with pytest.warns(RuntimeWarning, match="carries no ranking information"):
+            opt.step(nan_closure)
+
+    def test_a_rank_zero_subspace_is_rejected(self):
+        """num_coords=0 made every reconstruction add exactly zeros, silently."""
+        layout = ParamLayout.from_module(nn.Sequential(nn.Linear(6, 5)))
+        with pytest.raises(ValueError, match="rank must be >= 1"):
+            HybridSubspace.from_layout(layout, rank=0)
+
+    def test_train_rejects_a_model_the_optimizer_was_not_built_on(self):
+        """Candidates scored one model while steps were written into the other."""
+        from torch.utils.data import DataLoader, TensorDataset
+
+        from polystep.api import TrainConfig, train
+
+        a, b = nn.Linear(4, 2), nn.Linear(4, 2)
+        loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
+        with pytest.raises(ValueError, match="different model"):
+            train(b, loader, nn.CrossEntropyLoss(), PolyStepOptimizer(a, seed=0), TrainConfig(epochs=1))
+
+    def test_train_rejects_trust_region_instead_of_silently_pinning_it(self):
+        """The changing objective_token cleared the pending pair before it was ever used."""
+        from torch.utils.data import DataLoader, TensorDataset
+
+        from polystep.api import TrainConfig, train
+
+        model = nn.Linear(4, 2)
+        loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
+        opt = PolyStepOptimizer(model, seed=0, trust_region=True, polytope_type="orthoplex")
+        with pytest.raises(ValueError, match="trust_region is not supported"):
+            train(model, loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=1))
+
+    def test_train_leaves_the_model_in_the_mode_it_was_handed(self):
+        """The evaluator switches to eval to freeze statistics; nothing switched back."""
+        from torch.utils.data import DataLoader, TensorDataset
+
+        from polystep.api import TrainConfig, train
+
+        model = nn.Linear(4, 2)
+        model.train()
+        loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
+        train(model, loader, nn.CrossEntropyLoss(), PolyStepOptimizer(model, seed=0), TrainConfig(epochs=1))
+        assert model.training
+
+    def test_an_absorb_keeps_the_buffers_the_caller_anchored_on(self):
+        """apply_perturbation builds from specs alone, so buffers vanished on absorb."""
+        layout = ParamLayout.from_module(nn.Sequential(nn.Linear(6, 5)))
+        sub = HybridSubspace.from_layout(layout, rank=2)
+        proj = sub.init_projections(torch.device("cpu"), torch.float32)
+        base = {"0.weight": torch.zeros(5, 6), "0.bias": torch.zeros(5), "running_thing": torch.ones(3)}
+        new_base, _ = sub.absorb(proj, base, torch.zeros(sub.subspace_dim))
+        assert "running_thing" in new_base
+
+    def test_load_state_dict_does_not_alias_the_checkpoint(self):
+        """A same-device .to() returned the saved tensor, which the step then mutated."""
+        torch.manual_seed(0)
+        model = nn.Linear(4, 2)
+        opt = PolyStepOptimizer(model, seed=0)
+        opt.step(_constant_closure(1.0, [0]))
+        sd = opt.state_dict()
+        before = sd["solver_state"]["X"].clone()
+
+        other = PolyStepOptimizer(nn.Linear(4, 2), seed=0)
+        other.load_state_dict(sd)
+        other.state.X.add_(5.0)
+        torch.testing.assert_close(sd["solver_state"]["X"], before)
+
+    def test_a_missing_control_key_does_not_clobber_the_live_value(self):
+        """An older format restored _applied_rank as None, firing a spurious transition."""
+        torch.manual_seed(0)
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0)
+        opt.step(_constant_closure(1.0, [0]))
+        sd = opt.state_dict()
+        sd["control"].pop("_applied_rank", None)
+        opt._applied_rank = 7
+        opt.load_state_dict(sd)
+        assert opt._applied_rank == 7
+
+    def test_covariance_adaptation_is_rejected_on_a_sparse_projection(self):
+        """C_diag, p_c and p_sigma updated every step and reached nothing."""
+        from polystep.adaptive_subspace import AdaptiveSubspace
+        from polystep.cma_subspace import CMAAdaptiveSubspace
+
+        model = nn.Sequential(nn.Linear(200, 60), nn.Linear(60, 10))
+        full = sum(p.numel() for p in model.parameters())
+        sub = CMAAdaptiveSubspace(base=AdaptiveSubspace(full_dim=full, subspace_dim=16))
+        with pytest.raises(ValueError, match="dense projection"):
+            PolyStepOptimizer(model, subspace=sub, projection_type="sparse", use_covariance_adaptation=True, seed=0)
+
+    def test_a_user_supplied_solver_keeps_its_own_temperature(self):
+        """tell() overwrote it with PolyStepES.epsilon on every call."""
+        from polystep.ask_tell import PolyStepES
+
+        es = PolyStepES(dim=3, num_particles=2, solver=SoftmaxSolver(epsilon=0.01), seed=0)
+        es.ask()
+        es.tell(torch.rand(es.popsize))
+        assert es.solver.epsilon == 0.01
+
+    def test_a_neginf_fitness_does_not_capture_best_forever(self):
+        """It survived nan_to_num, won torch.min, and nothing could ever beat it."""
+        from polystep.ask_tell import PolyStepES
+
+        es = PolyStepES(dim=3, num_particles=2, seed=0)
+        f = torch.full((es.popsize,), float("-inf"))
+        es.ask()
+        es.tell(f)
+        assert math.isfinite(es.best_fitness) or es.best_fitness == float("inf")
+
+    def test_a_negative_kl_penalty_is_rejected_at_solve_time(self):
+        """A finite negative lam gave alpha<0 and took the softmax-limit branch."""
+        from polystep.solvers import KLSoftmaxSolver
+
+        solver = KLSoftmaxSolver(epsilon=0.1, lam=1.0)
+        solver.lam = -0.05
+        with pytest.raises(ValueError, match="lam must be >= 0"):
+            solver.solve(torch.rand(3, 4))
+
+    def test_a_negated_objective_negates_its_optimum(self):
+        """Regret of cost - optimal_value was off by 2*optimal_value."""
+        from polystep.objectives.synthetic import Rastrigin
+
+        plain, flipped = Rastrigin(dim=2), Rastrigin(dim=2, negate=True)
+        assert flipped.optimal_value == -plain.optimal_value
+
+    def test_an_amortized_step_does_not_report_convergence(self):
+        """It ran no solve, so True read as 'converged' to an early-stop callback."""
+        torch.manual_seed(0)
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, amortize_steps=2)
+        for _ in range(3):
+            opt.step(_constant_closure(1.0, [0]))
+        assert not all(opt.state.linear_convergence)

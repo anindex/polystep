@@ -108,6 +108,10 @@ class KLSoftmaxSolver:
         # Re-validate: epsilon is a mutable field that schedulers rewrite between
         # solves, so __post_init__ is not enough (the sibling solvers do the same).
         validate_positive(self.epsilon, "epsilon", "the entropic temperature")
+        # lam is mutable too. A finite negative one gives alpha < 0, which takes the
+        # softmax-limit branch instead of raising, and lam == -epsilon divides by zero.
+        if self.lam < 0:
+            raise ValueError(f"lam must be >= 0, got {self.lam!r}.")
         if not math.isfinite(self.lam) and self.lam != float("inf"):
             raise ValueError(f"lam must be a non-negative number or +inf, got {self.lam!r}.")
         C, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, "KLSoftmaxSolver")

@@ -53,6 +53,10 @@ class Rosenbrock(ObjectiveFn):
         negate: bool = False,
         bounds: Optional[torch.Tensor] = None,
     ):
+        if dim < 2:
+            # The sum runs over consecutive pairs, so dim=1 is empty and evaluate()
+            # returns 0 everywhere rather than the banana.
+            raise ValueError(f"Rosenbrock needs dim >= 2, got {dim}.")
         if bounds is None:
             bounds = torch.tensor([[-5.0, 5.0]] * dim)
         optimizers = torch.ones(1, dim)

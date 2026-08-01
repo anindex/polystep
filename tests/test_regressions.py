@@ -1051,3 +1051,79 @@ class TestNaNRevertRestoresState:
         torch.testing.assert_close(opt.state.C_diag, torch.ones_like(opt.state.C_diag))
         assert torch.count_nonzero(opt.state.p_c) == 0
         assert torch.count_nonzero(opt.state.p_sigma) == 0
+
+
+class TestAuditCrashes:
+    """Configurations that raised, or wrote garbage, deep inside a step."""
+
+    @pytest.mark.parametrize(
+        "build,match",
+        [
+            (
+                lambda: PolyStepOptimizer(nn.Linear(4, 2), block_strategy="grouped", block_group_size=-1),
+                "block_group_size",
+            ),
+            (lambda: PolyStepOptimizer(nn.Linear(4, 2), chunk_size=-1), "chunk_size"),
+            (lambda: _rosenbrock(dim=1), "dim >= 2"),
+            (lambda: _lstm_with_extra_state(), "initial h and c"),
+        ],
+        ids=["block_group_size", "chunk_size", "rosenbrock_dim", "lstm_state"],
+    )
+    def test_a_degenerate_argument_is_rejected(self, build, match):
+        """Each silently produced a no-op: no blocks, an empty chunk range, the zero
+        function, or a dropped LSTM layer."""
+        with pytest.raises(ValueError, match=match):
+            build()
+
+    def test_a_zero_numel_parameter_does_not_become_a_zero_particle_block(self):
+        """Its (0, V) cost matrix divided by zero in the marginal, or gave a NaN mean."""
+        from polystep.blockwise import create_per_layer_blocks
+
+        model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 0))
+        blocks = create_per_layer_blocks(ParamLayout.from_module(model), particle_dim=2)
+        assert blocks, "the non-empty layer must still get a block"
+        assert all(b.num_particles > 0 for b in blocks)
+
+    def test_a_chunk_narrower_than_a_candidate_group_does_not_overrun_the_buffer(self):
+        """The dense fallback inherits the delta path's group-rounded stride."""
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 3))
+        opt = PolyStepOptimizer(model, block_strategy="per_layer", chunk_size=1, epsilon=0.5, seed=0, solver="softmax")
+        inputs, targets = torch.randn(4, 6), torch.randint(0, 3, (4,))
+        ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+        opt.register_evaluator(ev, inputs, targets)
+        opt.step(lambda bp: ev.evaluate(bp, inputs, targets))
+        assert torch.isfinite(opt.state.X).all()
+
+    def test_a_fully_masked_attention_row_does_not_return_nan(self):
+        """Softmax of an all -inf row is NaN, which spread through the value mix."""
+        from polystep.layers.attention import VmapSafeMultiHeadAttention
+
+        torch.manual_seed(0)
+        attn = VmapSafeMultiHeadAttention(embed_dim=8, num_heads=2)
+        x = torch.randn(2, 3, 8)
+        mask = torch.zeros(2, 3, dtype=torch.bool)
+        mask[1] = True  # every key of the second sequence is padding
+        assert torch.isfinite(attn(x, x, x, key_padding_mask=mask)).all()
+
+    def test_a_seeded_cpu_generator_drives_a_noisy_objective_on_any_device(self):
+        """normal_ needs the generator on the tensor's device; the docs show a CPU one."""
+        from polystep.objectives.synthetic import Sphere
+
+        fn = Sphere(dim=3, noise_std=0.5)
+        gen = torch.Generator().manual_seed(7)
+        assert torch.isfinite(fn(torch.zeros(4, 3), generator=gen)).all()
+
+
+def _rosenbrock(dim):
+    from polystep.objectives.synthetic import Rosenbrock
+
+    return Rosenbrock(dim=dim)
+
+
+def _lstm_with_extra_state():
+    from polystep.layers.rnn import VmapSafeLSTM
+
+    lstm = VmapSafeLSTM(input_size=4, hidden_size=3, num_layers=1)
+    h = torch.zeros(2, 5, 3)
+    return lstm(torch.randn(5, 2, 4), (h, h.clone()))

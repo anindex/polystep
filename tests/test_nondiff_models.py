@@ -157,6 +157,10 @@ def test_ste_passes_gradient_to_every_weight(build, input_shape):
     for name, p in model.named_parameters():
         assert p.grad is not None, name
         assert p.grad.shape == p.shape, name
+        # An all-zero gradient reaches the parameter and teaches it nothing, which is
+        # exactly the saturation the STE exists to avoid.
+        assert torch.isfinite(p.grad).all(), name
+        assert p.grad.abs().max() > 0, name
 
 
 def test_forward_shape_and_gradient():

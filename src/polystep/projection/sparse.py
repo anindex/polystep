@@ -88,6 +88,20 @@ class SparseRandomProjection:
         # Compute nnz per column (at least 1)
         self._nnz_per_col = max(1, int(self.density * full_dim))
 
+        # A row is missed by every column with probability (1 - nnz/full_dim)**subspace_dim,
+        # and an untouched row is frozen for as long as the basis stands.
+        if full_dim > 0 and subspace_dim > 0:
+            covered = 1.0 - (1.0 - self._nnz_per_col / full_dim) ** subspace_dim
+            if covered < 0.5:
+                warnings.warn(
+                    f"SparseRandomProjection: this basis reaches only {covered:.1%} of the "
+                    f"{full_dim} parameters, so the rest cannot move while it stands. "
+                    f"Raise density (currently {self.density:.2e}) or subspace_dim "
+                    f"(currently {subspace_dim}); coverage is "
+                    f"1 - (1 - density)**subspace_dim.",
+                    stacklevel=2,
+                )
+
         # Lazy initialization: indices and values created on first use
         self._indices: Optional[torch.Tensor] = None
         self._values: Optional[torch.Tensor] = None

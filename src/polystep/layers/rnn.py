@@ -106,7 +106,11 @@ class VmapSafeLSTM(nn.Module):
     """Multi-layer LSTM using explicit gate computations for vmap compatibility.
 
     This implementation wraps multiple VmapSafeLSTMCell layers to provide
-    a drop-in replacement for nn.LSTM that works under torch.vmap.
+    a replacement for nn.LSTM that works under torch.vmap.
+
+    One signature difference: ``VmapSafeLSTMCell`` returns ``(h, (h, c))`` where
+    ``nn.LSTMCell`` returns ``(h, c)``, so ``h, c = cell(x, (h, c))`` binds ``c`` to a
+    nested tuple and fails further downstream.
 
     Limitations vs nn.LSTM:
         - No bidirectional support
@@ -221,6 +225,11 @@ class VmapSafeLSTM(nn.Module):
             ]
         else:
             h, c = state
+            expected = (self.num_layers, batch_size, self.hidden_size)
+            if tuple(h.shape) != expected or tuple(c.shape) != expected:
+                raise ValueError(
+                    f"initial h and c must both have shape {expected}, got {tuple(h.shape)} and {tuple(c.shape)}."
+                )
             # Split stacked tensor into list of per-layer states
             h_list = [h[i] for i in range(self.num_layers)]
             c_list = [c[i] for i in range(self.num_layers)]

@@ -312,6 +312,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # the last position, so slow drift cannot reset the budget.
     _can_reuse = (
         opt._adaptive_probes
+        # Reuse is sound only for a stationary objective, and the token is the caller's
+        # only way to assert that.
+        and opt._prev_objective_token is not None
         and opt._prev_cost_matrix is not None
         and opt._prev_cost_matrix.shape == (P, V)
         and opt._prev_rot_mats is not None
@@ -621,18 +624,13 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                     _spec = _subspace_site.resolve_spec(state.subspace, _g0 * pdim, _g1 * pdim, _sub_dim)
                     if _spec is not None:
                         # An offset from the barycentre, which _bary_sd already carries.
-                        _dcoords = probe_src.new_zeros(chunk_size_actual, _spec.flat_end - _spec.flat_start)
-                        _cols = (
-                            torch.arange(_g0, _g1, device=device).unsqueeze(1) * pdim + _pdim_arange
-                        ).repeat_interleave(_group, dim=0).reshape(chunk_size_actual, pdim) - _spec.flat_start
-                        _dcoords.scatter_(
-                            1, _cols, (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(chunk_size_actual, pdim)
-                        )
+                        _d = (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(_g1 - _g0, _group, pdim)
                         out[chunk_start:chunk_end] = _subspace_site.evaluate_subspace(
                             state.hybrid_projections,
                             _bary_sd,
                             _spec,
-                            _dcoords,
+                            _g0 * pdim - _spec.flat_start,
+                            _d,
                             fused_inputs,
                             fused_targets,
                         ).to(out.dtype)
@@ -713,12 +711,19 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                     chunk_params = opt.layout.batch_unflatten(flat_for_layout)
                     chunk_losses = closure_fn(chunk_params)
 
+                if chunk_losses.shape != (chunk_end - chunk_start,):
+                    raise ValueError(
+                        f"the closure must return one loss per candidate, shape "
+                        f"({chunk_end - chunk_start},), got {tuple(chunk_losses.shape)}."
+                    )
                 out[chunk_start:chunk_end] = chunk_losses.to(out.dtype)
 
             # Over every candidate at once, not per chunk: the penalty is
             # 2*max|finite|+1 of what it is handed, so a per-chunk one could rank an
             # infeasible vertex above an expensive-but-legal vertex from another chunk.
             if sanitize:
+                # Device-side, folded into the diagnostics sync at the end of the step.
+                opt._all_nonfinite = ~torch.isfinite(out).any()
                 out.copy_(sanitize_cost(out))
             return out
 
@@ -747,9 +752,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             keep_mask = torch.zeros(P_active, V, dtype=torch.bool, device=device)
             if _selection_solver:
                 # Selection rules need no antithetic pairing, hence no orthoplex here.
-                # TopKMeanSolver averages min(k, V) vertices, so keeping fewer would feed
-                # it screen-ineligible entries carrying the sanitize penalty.
-                keep_v = max(1, min(V, int(round(V * opt.screen_keep_ratio))), min(getattr(opt.solver, "k", 1), V))
+                # A floor at k, not a cap: dropped vertices sanitize from +inf back to a
+                # finite penalty, so TopKMeanSolver would average ones never scored.
+                keep_v = min(V, max(1, int(round(V * opt.screen_keep_ratio)), min(getattr(opt.solver, "k", 1), V)))
                 keep_idx = torch.topk(screen_cost, keep_v, dim=1, largest=False).indices
                 keep_mask.scatter_(1, keep_idx, True)
             else:
@@ -823,6 +828,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                         X.new_empty(P, dtype=_loss_dtype),
                         probes_src=X.reshape(P, 1, 1, -1),
                     ).detach()
+                    _evals_this_step += P
         else:
             losses_3d_full = losses.reshape(P, V, K_eff)
             cost_matrix = losses_3d_full.mean(dim=-1)  # (P, V)
@@ -1045,7 +1051,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         from .quadratic_model import apply_newton_refinement
 
         X_refined = apply_newton_refinement(
-            X_bary=state.X,
+            # X_bary, not state.X: the accept test scores X_bary - X_current as the pure
+            # OT step, so passing the post-momentum position double-counts momentum.
+            X_bary=X_bary,
             losses_3d=opt._losses_3d,
             scales=probes,
             probe_radius=probe_r,
@@ -1172,31 +1180,55 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
 
     # One transfer for all three: read separately they cost three device syncs a step,
     # and only the cost mean is needed before the step ends.
-    _cost_mean, _ess, _rho = torch.stack([cost_matrix.mean(), _ess_tensor, _rho_tensor]).tolist()
+    _nonfinite = getattr(opt, "_all_nonfinite", None)
+    _cost_mean, _ess, _rho, _all_nonfinite, _progress = torch.stack(
+        [
+            cost_matrix.mean(),
+            _ess_tensor,
+            _rho_tensor,
+            _nonfinite.to(cost_matrix.dtype) if _nonfinite is not None else cost_matrix.new_zeros(()),
+            # The radius controller's signal: mean over particles of each particle's best
+            # vertex. The full-matrix mean grows with probe_r, which that controller
+            # scales, so it would partly measure its own last move.
+            cost_matrix.min(dim=1).values.mean(),
+        ]
+    ).tolist()
+    if _all_nonfinite and not getattr(opt, "_nonfinite_warned", False):
+        opt._nonfinite_warned = True
+        warnings.warn(
+            "every candidate evaluated to NaN or inf this step, so the cost matrix "
+            "carries no ranking information: the plan is uniform, the step is exactly "
+            "zero, and the reported cost is the sanitize penalty rather than a loss.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     # evals is candidate evaluations this step, net of probe reuse and screening.
     # Multiply by the batch size for sample-forwards.
     state.record_solver_health(_ess, _rho, _evals_this_step)
     # Tracked unconditionally: absorb_mode="stagnation" reads this counter, which
     # use_adaptive_radius (default False) does not gate.
-    _prev_loss_for_radius = state.prev_loss
-    state.stagnation_count, state.prev_loss = update_stagnation(
-        _cost_mean,
-        state.prev_loss,
-        state.stagnation_count,
-        stagnation_threshold=opt.stagnation_threshold,
-    )
-    if opt.use_adaptive_radius:
-        state.radius_multiplier, state.stagnation_count = update_radius_multiplier(
-            _cost_mean,
-            _prev_loss_for_radius,
+    # A reuse step re-reports the cached cost, so rel_change is 0 and the counter would
+    # climb on a step that measured nothing.
+    if not _can_reuse:
+        _prev_loss_for_radius = state.prev_loss
+        state.stagnation_count, state.prev_loss = update_stagnation(
+            _progress,
+            state.prev_loss,
             state.stagnation_count,
-            state.radius_multiplier,
-            stagnation_patience=opt.stagnation_patience,
-            radius_increase=opt.radius_increase,
-            radius_decrease=opt.radius_decrease,
-            radius_min=opt.radius_min,
-            radius_max=opt.radius_max,
+            stagnation_threshold=opt.stagnation_threshold,
         )
+        if opt.use_adaptive_radius:
+            state.radius_multiplier, state.stagnation_count = update_radius_multiplier(
+                _progress,
+                _prev_loss_for_radius,
+                state.stagnation_count,
+                state.radius_multiplier,
+                stagnation_patience=opt.stagnation_patience,
+                radius_increase=opt.radius_increase,
+                radius_decrease=opt.radius_decrease,
+                radius_min=opt.radius_min,
+                radius_max=opt.radius_max,
+            )
 
     _nan_reverted = False
     if not torch.isfinite(state.X).all():

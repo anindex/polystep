@@ -153,6 +153,8 @@ class TopKMeanSolver:
         # entries would hand real mass to forbidden directions. Drop those picks and
         # spread the row's mass over what is left, so the row still sums to a. A row
         # with nothing feasible keeps its picks rather than losing its mass.
+        # From the caller's matrix: sanitize maps +inf to a finite penalty, so this is the
+        # only place the mask survives. The screen keeps keep_v >= k_eff regardless.
         feasible = ~(torch.isnan(cost_matrix) | (cost_matrix == float("inf")))
         keep = feasible.gather(1, topk_indices)
         keep = keep | ~keep.any(dim=1, keepdim=True)
