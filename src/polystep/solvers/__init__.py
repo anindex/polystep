@@ -1,16 +1,4 @@
-"""Solver abstraction layer for polystep.
-
-Pluggable solver implementations for the polytope step optimizer:
-
-- ``SolverResult``: shared result dataclass.
-- ``SinkhornSolver``: full-rank log-domain entropic OT solver.
-- ``SinkhornResult``: result with dual potentials.
-- ``SoftmaxSolver``: one-sided softmax weighting.
-- ``KLSoftmaxSolver``: KL-penalized interpolation between softmax and
-  Sinkhorn.
-- ``TemperedSoftmaxSolver``: softmax with a fixed temperature.
-- ``MinCostGreedySolver`` / ``TopKMeanSolver``: simple non-OT baselines.
-"""
+"""Solvers for the polytope step optimizer."""
 
 from .base import SolverResult
 from .greedy import MinCostGreedySolver, TopKMeanSolver

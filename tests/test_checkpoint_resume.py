@@ -1,7 +1,4 @@
-"""Tests for optimizer checkpoint/resume and the restore_best training guard.
-
-Both decide what the caller gets back from a run, and both shipped in 0.8.0 untested.
-"""
+"""Tests for optimizer checkpoint/resume and the restore_best training guard."""
 
 import copy
 import math
@@ -100,20 +97,26 @@ class TestStateDictRoundTrip:
         [
             pytest.param({"amortize_steps": 3, "use_momentum": True}, id="amortize"),
             pytest.param({"adaptive_probes": True}, id="adaptive_probes"),
-            pytest.param({"trust_region": True, "use_quadratic_model": True, "num_probe": 2}, id="trust_region"),
+            pytest.param(
+                # orthoplex, or the constructor disables both and this tests nothing.
+                {
+                    "trust_region": True,
+                    "use_quadratic_model": True,
+                    "num_probe": 2,
+                    "polytope_type": "orthoplex",
+                },
+                id="trust_region",
+            ),
             pytest.param({"hybrid": True}, id="hybrid_subspace"),
+            pytest.param({"probe_radius_jitter": 0.2}, id="probe_jitter"),
+            pytest.param({"cma": True, "use_covariance_adaptation": True}, id="cma_covariance"),
         ],
     )
     def test_resume_is_exact_for_stateful_features(self, kwargs):
-        """Features whose state lives outside SolverState still resume bit-exactly.
-
-        Each of these kept optimizer-owned state (amortization phase, probe reuse
-        caches, the trust-region prediction pair, the fused hybrid basis) that
-        state_dict did not capture, so a resumed run diverged from an
-        uninterrupted one.
-        """
+        """Features whose state lives outside SolverState still resume bit-exactly."""
         kwargs = dict(kwargs)
         hybrid = kwargs.pop("hybrid", False)
+        cma = kwargs.pop("cma", False)
 
         def build():
             model, closure = _model_and_closure(seed=2)
@@ -123,6 +126,10 @@ class TestStateDictRoundTrip:
                 from polystep.transform import ParamLayout
 
                 subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4, seed=3)
+            if cma:
+                from polystep.cma_subspace import CMAAdaptiveSubspace
+
+                subspace = CMAAdaptiveSubspace.auto_from_params(model)
             opt = PolyStepOptimizer(
                 model,
                 subspace=subspace,
@@ -162,7 +169,7 @@ class TestStateDictRoundTrip:
             opt.load_state_dict(sd)
 
     def test_accepts_fields_a_newer_schema_dropped(self):
-        """0.10.0 removed ``sigma``/``use_csa``; a 0.9.0 checkpoint must still load."""
+        """A checkpoint carrying the dropped ``sigma``/``use_csa`` fields must still load."""
         model, closure = _model_and_closure()
         opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10)
         opt.step(closure)
@@ -364,9 +371,8 @@ class TestAbsorbAlignedActive:
 
 
 def test_rank_schedule_stage_zero_applies_before_the_first_step():
-    """``RankSchedule.at(0)`` was only checked after the OT solve and after
-    ``iteration_count`` advanced, so the entire first sweep ran at whatever rank the
-    supplied subspace carried, contradicting the documented contract.
+    """``RankSchedule.at(0)`` must apply before the first step, not after the
+    first OT solve advances ``iteration_count``.
     """
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(8, 12), nn.Tanh(), nn.Linear(12, 3))
@@ -386,9 +392,8 @@ def test_rank_schedule_stage_zero_applies_before_the_first_step():
 
 
 def test_resume_across_a_rank_transition():
-    """``state_dict`` carries no subspace object and used to omit ``_applied_rank``,
-    so loading a post-transition checkpoint into an optimizer built at the starting
-    rank restored wide coordinates into a narrow subspace and the next step raised.
+    """A checkpoint taken after a rank transition must restore ``_applied_rank``,
+    so wide coordinates do not land in a narrow subspace.
     """
     schedule = RankSchedule(stages=[(0, 1), (2, 2)])
     inputs, targets = torch.randn(16, 8), torch.randn(16, 3)
@@ -418,3 +423,35 @@ def test_resume_across_a_rank_transition():
     actual = resumed.step(closure_for(resumed_model))
 
     assert actual == pytest.approx(expected, abs=1e-9)
+
+
+def test_a_pre_format_4_cma_checkpoint_warns_instead_of_resuming_silently():
+    """Format 3 carries no sampling-projection cache, so the resumed run samples from a
+    projection its saved coordinates were never measured under."""
+    import copy
+
+    from polystep.adaptive_subspace import AdaptiveSubspace
+    from polystep.cma_subspace import CMAAdaptiveSubspace
+
+    torch.manual_seed(0)
+
+    def build():
+        m = nn.Sequential(nn.Linear(8, 6), nn.ReLU(), nn.Linear(6, 4))
+        sub = CMAAdaptiveSubspace.from_adaptive_subspace(AdaptiveSubspace.auto_from_params(m, min_rank=8, max_rank=8))
+        return m, PolyStepOptimizer(m, subspace=sub, use_covariance_adaptation=True, seed=0, compile=False)
+
+    def closure(bp):
+        v = next(iter(bp.values()))
+        return v.reshape(v.shape[0], -1).pow(2).sum(1)
+
+    _, saved = build()
+    for _ in range(3):
+        saved.step(closure)
+    legacy = copy.deepcopy(saved.state_dict())
+    legacy["format"] = 3
+    for key in ("_sampling_proj_src", "_sampling_C_diag"):
+        legacy["control"].pop(key, None)
+
+    _, resumed = build()
+    with pytest.warns(UserWarning, match="pre-format-4 checkpoint"):
+        resumed.load_state_dict(legacy)

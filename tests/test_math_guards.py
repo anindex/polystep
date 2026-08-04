@@ -6,10 +6,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from polystep._compiled import _barycentric_projection, _rotate_and_translate
 from polystep.cma import compute_cma_hyperparameters, update_covariance_diagonal, update_evolution_path_sigma
+from polystep.geometry import get_orthoplex_vertices
 from polystep.solver import PolyStep
 from polystep.solvers import MinCostGreedySolver, SinkhornSolver, SoftmaxSolver
-from polystep.solvers._shared import exp_plan
+from polystep.solvers._shared import exp_plan, sanitize_cost
 from polystep import PolyStepOptimizer
 
 
@@ -82,6 +84,39 @@ def test_greedy_leaves_an_all_infeasible_row_where_it_is():
     torch.testing.assert_close(T[1], torch.tensor([0.5, 0.0]))
 
 
+def test_a_zero_transport_row_leaves_the_particle_where_it_is():
+    """An underflowed row must not move the particle to the coordinate origin."""
+    torch.manual_seed(0)
+    X = torch.randn(2, 8)
+    rot = torch.linalg.qr(torch.randn(2, 8, 8))[0]
+    X_vertices, _ = _rotate_and_translate(rot, get_orthoplex_vertices(8), X, 0.5)
+
+    torch.testing.assert_close(_barycentric_projection(torch.zeros(2, 16), X_vertices), X)
+
+    # Over-relaxed Sinkhorn reaches this from the public API.
+    T = (
+        SinkhornSolver(epsilon=1e-3, max_iterations=1, threshold=0.0, omega=1.9)
+        .solve(torch.rand(2, 16) * 10, init_f=torch.tensor([-1e4, 0.0]), init_g=torch.zeros(16))
+        .matrix
+    )
+    dead = T.sum(dim=1) == 0
+    assert dead.any(), "expected an underflowed transport row"
+    torch.testing.assert_close(_barycentric_projection(T, X_vertices)[dead], X[dead])
+
+
+def test_every_nonfinite_cost_ranks_below_every_finite_one():
+    """-inf is a diverged evaluation, not a free optimum."""
+    C = torch.tensor([[0.0, float("-inf"), 1.0]])
+    sanitized = sanitize_cost(C)
+    assert sanitized[0, 1] > sanitized[0, 0], "-inf tied with a finite cost"
+    assert MinCostGreedySolver(epsilon=0.1).solve(cost_matrix=C).matrix.argmax().item() == 0
+
+    # Nothing finite means no ranking, which is what the step's warning promises.
+    allbad = torch.full((1, 3), float("nan"))
+    allbad[0, 0] = float("-inf")
+    assert sanitize_cost(allbad).unique().numel() == 1
+
+
 def test_a_negative_probe_radius_is_rejected():
     model = nn.Sequential(nn.Linear(2, 2))
     with pytest.raises(ValueError, match="probe_radius must be > 0"):
@@ -91,11 +126,16 @@ def test_a_negative_probe_radius_is_rejected():
 
 
 def test_single_particle_polystep_swaps_in_the_softmax_solver():
+    """The substitution follows the state, so states of different sizes can coexist."""
     solver = PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2)
-    assert isinstance(solver.sinkhorn_solver, SinkhornSolver)
     with pytest.warns(UserWarning, match="Single particle"):
-        solver.init_state(torch.zeros(2))
-    assert isinstance(solver.sinkhorn_solver, SoftmaxSolver)
+        one = solver.init_state(torch.zeros(2))
+    assert isinstance(solver._solver_for(one), SoftmaxSolver)
+
+    many = solver.init_state(torch.zeros(8, 2))
+    assert isinstance(solver._solver_for(many), SinkhornSolver)
+    # The one-particle state still gets the softmax after the second init_state.
+    assert isinstance(solver._solver_for(one), SoftmaxSolver)
 
 
 def test_single_particle_polystep_actually_descends():

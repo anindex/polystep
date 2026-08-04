@@ -1,20 +1,6 @@
-"""Shared entry-point preparation for the OT / weighting solvers.
+"""Shared preamble for the OT / weighting solvers: promote half precision to FP32, sanitize costs, align marginals and warm-start duals."""
 
-Every log-sum-exp / softmax solver needs the same preamble before it can run:
-promote half precision to FP32 (BF16's 7 mantissa bits collapse the row-max
-trick once the cost spread exceeds ~15 nats), replace non-finite costs with a
-finite penalty, default and device/dtype-align the marginals, and coerce
-warm-start duals onto the cost tensor. Centralizing it keeps the variants from
-drifting apart (e.g. one solver gaining FP32 promotion while another silently
-NaNs on the same input).
-
-Design note - no per-step host syncs: ``sanitize_cost`` is branch-free (no
-``.item()`` / ``.all()`` in a Python ``if``), and ``align_marginal`` /
-``align_dual`` only move tensors (``.to`` is a no-op when already aligned).
-Value checks that would force a device->host sync are intentionally omitted so
-the hot path (a fresh solve every optimizer step) stays GPU-resident.
-"""
-
+import contextlib
 import math
 import warnings
 from typing import Optional
@@ -25,12 +11,7 @@ from .base import SolverResult
 
 
 def validate_positive(value: float, name: str, context: str = "") -> None:
-    """Raise ValueError unless ``value > 0`` (a plain Python-float check).
-
-    Solvers store their temperature (``epsilon`` / ``tau``) as a mutable
-    attribute that schedules overwrite per step, so this is re-checked inside
-    ``solve()`` rather than only at construction.
-    """
+    """Raise ValueError unless ``value > 0``."""
     if not value > 0:
         msg = f"{name} must be > 0, got {value}."
         if context:
@@ -39,13 +20,7 @@ def validate_positive(value: float, name: str, context: str = "") -> None:
 
 
 def solver_health(transport: torch.Tensor, displacement: torch.Tensor, step_radius: float):
-    """``(ess, rho)`` as 0-dim tensors, the two OT health numbers.
-
-    ``ess`` is the effective sample size over the transport weights divided by the
-    vertex count, so it is 1.0 when the weights are uniform and the barycenter is a
-    plain mean. ``rho = ||Delta|| / step_radius`` is how far the barycenter moved as a
-    fraction of the step radius. Left unreduced so the caller can batch the device sync.
-    """
+    """Return ``(ess, rho)``, the two OT health numbers, as 0-dim tensors."""
     w = transport / transport.sum(dim=1, keepdim=True).clamp(min=1e-12)
     ess = (1.0 / (w * w).sum(dim=1).clamp(min=1e-12)).mean() / transport.shape[1]
     rho = (displacement.norm(dim=1) / max(step_radius, 1e-12)).mean()
@@ -53,60 +28,39 @@ def solver_health(transport: torch.Tensor, displacement: torch.Tensor, step_radi
 
 
 def decomposition_dtype(dtype: torch.dtype) -> torch.dtype:
-    """FP32 for half precision: no QR or SVD backend has a half-precision kernel.
-
-    CPU LAPACK raises ``not implemented for 'Half'`` and cuSOLVER has no geqrf/gesvd
-    for either half type, so every decomposition site upcasts and casts back.
-    """
+    """FP32 for half precision: no QR/SVD backend has a half-precision kernel."""
     return torch.float32 if dtype in (torch.bfloat16, torch.float16) else dtype
 
 
-def thin_qr(matrix: torch.Tensor):
-    """Reduced QR, pinned to one thread on CPU.
-
-    LAPACK spreads a tall-thin QR over every core and the synchronization dominates at
-    subspace shapes, costing orders of magnitude over the single-threaded run. CUDA
-    tensors skip the pinning. The thread count is restored before returning.
-    """
-    if matrix.device.type != "cpu":
-        return torch.linalg.qr(matrix, mode="reduced")
-    prev = torch.get_num_threads()
-    if prev == 1:
-        return torch.linalg.qr(matrix, mode="reduced")
-    torch.set_num_threads(1)
+@contextlib.contextmanager
+def single_thread_cpu(device: torch.device):
+    """Run a CPU decomposition on one thread, restoring the count after."""
+    prev = torch.get_num_threads() if device.type == "cpu" else 1
+    if prev != 1:
+        torch.set_num_threads(1)
     try:
-        return torch.linalg.qr(matrix, mode="reduced")
+        yield
     finally:
-        torch.set_num_threads(prev)
+        if prev != 1:
+            torch.set_num_threads(prev)
+
+
+def thin_qr(matrix: torch.Tensor):
+    """Reduced QR, pinned to one CPU thread."""
+    with single_thread_cpu(matrix.device):
+        return torch.linalg.qr(matrix, mode="reduced")
 
 
 def loss_buffer_dtype(particle_dtype: torch.dtype) -> torch.dtype:
-    """Accumulation dtype for probe losses.
-
-    Half precision is promoted to FP32 for log-sum-exp stability, but FP64 is kept:
-    a double objective whose probe costs differ below FP32 resolution collapses to a
-    constant cost matrix, and the particle stops moving.
-    """
+    """Accumulation dtype for probe losses: FP32 for half precision, keeps FP64."""
     return particle_dtype if particle_dtype == torch.float64 else torch.float32
 
 
 def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
-    """Promote half precision to FP32 and replace non-finite costs, on-device.
+    """Promote half precision to FP32 and replace non-finite costs on-device.
 
-    A hard-constraint ``+inf`` or an upstream NaN becomes ``2 * max|finite| + 1`` so the
-    masked vertex ranks below every finite one without sending ``-C/eps`` to ``-inf`` and
-    NaN-ing the whole row. ``-inf`` is the opposite case: for a minimization it is the
-    best possible value, so it maps to the finite minimum instead of the penalty.
-    Branch-free: no host sync on the finite path. How strongly the masked vertex is
-    suppressed depends on epsilon and the cost scale, which are not visible here.
-
-    The penalty is relative to the finite scale, not an absolute floor. An absolute
-    floor of 1e6 survives into the ``'mean'`` and ``'max_cost'`` reductions in
-    :func:`~polystep.costs.scale_cost_matrix`, which run after this, and divides every
-    real cost difference down to ~1e-6 of the scale, flattening the plan to uniform for
-    that step. With no finite entry the scale collapses to ``max_finite = 0``, so
-    ``+inf`` and NaN map to 1 and ``-inf`` to 0: an all-``+inf`` matrix comes out
-    constant (the uniform plan), a mixed one still ranks ``-inf`` best.
+    Every non-finite cost is invalid, ``-inf`` included, and becomes ``2*max|finite| + 1``,
+    below every finite one. ``ask_tell.tell`` and ``baselines.core`` read ``-inf`` the same way.
     """
     if cost_matrix.dtype in (torch.bfloat16, torch.float16):
         cost_matrix = cost_matrix.to(torch.float32)
@@ -114,14 +68,9 @@ def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
         return cost_matrix
     finite = torch.isfinite(cost_matrix)
     max_finite = torch.where(finite, cost_matrix, cost_matrix.new_zeros(())).abs().amax()
-    # Clamp: near dtype max, 2 * max_finite + 1 overflows and the +inf we came to
-    # remove survives.
+    # Clamp: near dtype max, 2*max_finite + 1 overflows and the +inf survives.
     penalty = (max_finite * 2.0 + 1.0).clamp(max=torch.finfo(cost_matrix.dtype).max)
-    # Fill non-finite slots with a value no smaller than any finite entry so the
-    # reduction returns the finite minimum.
-    min_finite = torch.where(finite, cost_matrix, max_finite).amin()
-    replacement = torch.where(cost_matrix == float("-inf"), min_finite, penalty)
-    return torch.where(finite, cost_matrix, replacement)
+    return torch.where(finite, cost_matrix, penalty)
 
 
 def exp_plan(f: torch.Tensor, g: torch.Tensor, C: torch.Tensor, eps: float) -> torch.Tensor:
@@ -136,27 +85,14 @@ def exp_plan(f: torch.Tensor, g: torch.Tensor, C: torch.Tensor, eps: float) -> t
 
 
 def recenter_cost(cost_matrix: torch.Tensor):
-    """Subtract the per-matrix minimum so ``|C|`` stays bounded.
-
-    The entropic-OT plan is invariant to a constant shift of the cost:
-    ``softmax(-C/eps)`` is shift-invariant, and a shift only translates the
-    dual potentials, leaving the plan ``P`` unchanged. Keeping ``min(C)=0``
-    preserves FP32 precision in the log-sum-exp and the ``exp((f+g-C)/eps)``
-    reconstruction when ``|C|`` is much larger than ``eps``, and removes the
-    ``+inf`` logit that would NaN a softmax at tiny ``eps``.
-
-    Returns ``(shifted_cost, shift)`` with ``shift = C.min()``. Add
-    ``shift * a.sum()`` back to any reported ``<C, P>`` or dual value (plan
-    mass ``sum(P)`` equals ``a.sum()``). One reduction, no host sync.
-    """
+    """Subtract the per-matrix minimum so min(C)=0. The plan is shift-invariant, and this keeps the log-sum-exp in FP32 range."""
     if cost_matrix.numel() == 0:
         return cost_matrix, cost_matrix.new_zeros(())
     shift = cost_matrix.amin()
     return cost_matrix - shift, shift
 
 
-# Below this ratio of temperature to max|C|, -C/temperature saturates before any
-# row-max subtraction can help. Empirical for FP32 and BF16.
+# Below this ratio of temperature to max|C|, -C/temperature saturates.
 TINY_TEMPERATURE_RATIO = 1e-6
 
 
@@ -174,11 +110,7 @@ def validate_cost_shape(cost_matrix: torch.Tensor, solver: str) -> tuple[int, in
 
 
 def warn_tiny_temperature(solver_obj, temperature: float, C: torch.Tensor, solver: str, name: str) -> None:
-    """Warn once per new sharpest temperature when ``-C/temperature`` will saturate.
-
-    Only fires on a decrease, so the reduction (which host-syncs) stays off the hot
-    path when the schedule is flat or rising.
-    """
+    """Warn once per new sharpest temperature when ``-C/temperature`` will saturate."""
     seen = getattr(solver_obj, "_min_temperature_checked", None)
     if seen is not None and temperature >= seen:
         return
@@ -200,17 +132,7 @@ def align_marginal(
     dtype: torch.dtype,
     name: str = "a",
 ) -> torch.Tensor:
-    """Return a length-``n`` marginal on ``(device, dtype)``.
-
-    ``None`` -> uniform ``1/n``. A provided marginal is moved onto the cost
-    tensor (a no-op when already aligned), shape-checked, and value-checked
-    (finite, nonnegative, positive total mass) so a malformed marginal fails
-    loudly instead of being silently clamped to an infeasible plan before the
-    ``log``. The value checks host-sync, so they run *only* on the user-supplied
-    path: the integrated optimizer passes ``a=None`` for its uniform marginal
-    (see :func:`solver.PolyStep.init_state`), keeping the per-step solve
-    sync-free.
-    """
+    """Return a length-``n`` marginal on ``(device, dtype)``; ``None`` becomes uniform 1/n."""
     if a is None:
         return torch.full((n,), 1.0 / n, device=device, dtype=dtype)
     a = a.to(device=device, dtype=dtype)
@@ -232,12 +154,7 @@ def align_dual(
     dtype: torch.dtype,
     name: str = "init",
 ) -> Optional[torch.Tensor]:
-    """Move a warm-start dual onto ``(device, dtype)``, or ``None`` on mismatch.
-
-    Returns a fresh (cloned) tensor the caller may mutate in place, or ``None``
-    when the shape does not match (caller falls back to a zero init, after a
-    warning). The ``.to`` is a no-op when the dual is already aligned.
-    """
+    """Move a warm-start dual onto ``(device, dtype)``, or ``None`` on a shape mismatch."""
     if init is None:
         return None
     if init.shape != (n,):
@@ -250,15 +167,7 @@ def align_dual(
 
 
 def prepare_cost(cost_matrix, a, scale_cost, solver: str):
-    """Shared solver preamble: validate, sanitize, align, recenter, scale.
-
-    Recenter before scaling. The plan is invariant to a constant cost shift but
-    'mean'/'max_cost' are not, so scaling first would tie the temperature to the
-    arbitrary absolute loss level. ``min(C) = 0`` also keeps the log-sum-exp in
-    FP32 range and removes the ``+inf`` logit that NaNs a softmax at tiny epsilon.
-
-    Returns ``(C, a, cost_shift, cost_scale)``.
-    """
+    """Shared solver preamble: validate, sanitize, align, recenter, then scale. Recenter before scaling so mean/max scaling is shift-invariant."""
     from ..costs import resolve_cost_scale
 
     rows, _ = validate_cost_shape(cost_matrix, solver)
@@ -270,11 +179,7 @@ def prepare_cost(cost_matrix, a, scale_cost, solver: str):
 
 
 def solve_softmax(solver_obj, cost_matrix, a, temperature: float, scale_cost, solver: str, name: str):
-    """One-sided softmax solve, shared by ``SoftmaxSolver`` and ``TemperedSoftmaxSolver``.
-
-    ``name`` is the attribute the temperature came from, so the validation and the
-    warning name the parameter the caller actually set.
-    """
+    """One-sided softmax solve, shared by ``SoftmaxSolver`` and ``TemperedSoftmaxSolver``."""
     validate_positive(temperature, name, f"{name} is the temperature in softmax(-C/{name}).")
     C, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, solver)
     warn_tiny_temperature(solver_obj, temperature, C, solver, name)
@@ -291,13 +196,7 @@ def solve_softmax(solver_obj, cost_matrix, a, temperature: float, scale_cost, so
 
 
 def softmax_plan(C, a, temperature: float, cost_shift, cost_scale):
-    """``(transport, ent_cost)`` for the one-sided softmax plan.
-
-    Shifts per row before dividing: ``torch.softmax`` subtracts the row max only
-    after the division, so at a small temperature a row sitting above the global
-    minimum sends every logit to -inf and comes back NaN. Pinned outside autocast
-    so an outer mixed-precision region cannot downcast the logits.
-    """
+    """Return ``(transport, ent_cost)`` for the one-sided softmax plan. Shifts per row before dividing so softmax does not return NaN at tiny temperatures."""
     with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
         W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / temperature, dim=-1)
         transport = W * a.to(W.dtype).unsqueeze(-1)

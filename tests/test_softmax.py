@@ -1,14 +1,5 @@
-"""Numerical contract of the Softmax solver.
-
-It is on the critical path for every reported number, so this file checks:
-
-- numerical safety of ``softmax(-C/eps)`` under FP32 / BF16
-- identical-row behavior (uniform output, no NaN)
-- source-marginal preservation under FP32 / BF16
-- a non-uniform target marginal ``b`` triggers a warning
-- a tiny epsilon (relative to ``max|C|``) triggers a warning
-- ``scale_cost`` does not mutate the caller's tensor in place
-- the result-reporting runners explicitly pin ``solver=softmax``
+"""Numerical contract of the Softmax solver: overflow safety, marginals,
+warnings, no caller-tensor mutation, and the runner solver pin.
 """
 
 from __future__ import annotations
@@ -27,12 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_softmax_overflow_grid(cost_grid, dtype):
-    """No NaN / Inf for any combination of cost-range x epsilon.
-
-    PyTorch's softmax subtracts the row-max internally; this test asserts
-    the property holds even at the small-eps regime where -C/eps blows up
-    before max-subtraction kicks in.
-    """
+    """No NaN / Inf for any combination of cost-range x epsilon."""
     P, V = 16, 32
     torch.manual_seed(0)
     base = torch.randn(P, V, dtype=dtype)
@@ -53,12 +39,7 @@ def test_softmax_overflow_grid(cost_grid, dtype):
 
 
 def test_softmax_identical_row_returns_uniform():
-    """When every cost in a row equals 5.0, softmax must return 1/V uniformly.
-
-    Some implementations return NaN here when subtracting max=5 then dividing
-    by exp(0)=1 produces 0/0; PyTorch handles this correctly via the
-    subtract-max trick, but this test confirms it explicitly.
-    """
+    """An identical cost row must return a uniform 1/V row, not NaN."""
     P, V = 4, 8
     C = torch.full((P, V), 5.0)
     solver = SoftmaxSolver(epsilon=0.1)
@@ -76,11 +57,7 @@ def test_softmax_identical_row_returns_uniform():
 
 @pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-6), (torch.bfloat16, 5e-3)])
 def test_softmax_source_marginal_preserved(dtype, tol):
-    """transport.sum(-1) must equal source marginal `a` exactly within dtype tol.
-
-    This is the property that lets callers replace Sinkhorn with softmax
-    in subspace mode without rebuilding their barycentric projection step.
-    """
+    """transport.sum(-1) must equal the source marginal ``a`` within dtype tol."""
     P, V = 8, 16
     torch.manual_seed(0)
     C = torch.randn(P, V, dtype=dtype)
@@ -96,16 +73,12 @@ def test_softmax_source_marginal_preserved(dtype, tol):
 
 
 def test_softmax_warns_on_nonuniform_b():
-    """Softmax solver does not enforce target marginal b; a non-uniform b
-    that the caller passes in is silently ignored. The solver warns
-    so the user knows their constraint has no effect.
-    """
+    """Softmax cannot enforce a non-uniform target marginal ``b``; it must warn."""
     P, V = 4, 8
     torch.manual_seed(0)
     C = torch.randn(P, V)
     solver = SoftmaxSolver(epsilon=0.5)
 
-    # Non-uniform b that softmax cannot enforce.
     b_nonuniform = torch.tensor([0.5, 0.1, 0.05, 0.05, 0.1, 0.05, 0.1, 0.05])
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -118,11 +91,7 @@ def test_softmax_warns_on_nonuniform_b():
 
 
 def test_softmax_warns_on_tiny_epsilon():
-    """epsilon = 1e-30 is technically positive (passes existing
-    `epsilon <= 0` validation) but produces -C/eps overflow in any
-    realistic cost matrix. The solver warns whenever
-    `eps < 1e-6 * cost_max`.
-    """
+    """The solver must warn when eps < 1e-6 * cost_max, where -C/eps overflows."""
     P, V = 4, 8
     torch.manual_seed(0)
     C = torch.randn(P, V) * 10.0  # cost_max ~ 30
@@ -139,10 +108,7 @@ def test_softmax_warns_on_tiny_epsilon():
 
 
 def test_softmax_does_not_mutate_caller_cost_matrix():
-    """If the caller reuses a cost matrix across multiple solve() calls
-    (for example, A/B testing a few epsilons on the same probe data), the
-    solver must not mutate it via scale_cost_matrix.
-    """
+    """solve() must not mutate the caller's cost matrix when scale_cost is set."""
     P, V = 4, 8
     torch.manual_seed(0)
     C = torch.randn(P, V)
@@ -156,28 +122,24 @@ def test_softmax_does_not_mutate_caller_cost_matrix():
     )
 
 
-SOLVER_PINNED_RUNNERS = (
-    ("experiments/runners/run_moe.py", '"softmax"'),
-    ("experiments/runners/run_elevation.py", '"softmax"'),
-    ("experiments/runners/run_maxsat_softmax_scaling.py", "'softmax'"),
-)
+def test_runner_pins_softmax_solver(require_experiments):
+    """Result-reporting runners must pin softmax, not inherit auto-selection.
 
-
-@pytest.mark.parametrize("relpath,literal", SOLVER_PINNED_RUNNERS)
-def test_runner_pins_softmax_solver(relpath, literal, require_experiments):
-    """The result-reporting runners must pin ``solver='softmax'`` explicitly.
-
-    Without the pin they inherit the auto-selection rule (subspace picks softmax,
-    otherwise sinkhorn), so a config change would quietly rerun them on a different
-    solver than the published numbers.
+    The gallery runners pin it through ``fairness.build_polystep``; MAX-SAT scaling
+    builds its own optimizer and carries the literal.
     """
-    path = REPO_ROOT / relpath
-    src = path.read_text()
-    pattern = re.compile(rf"solver\s*=\s*{re.escape(literal)}")
-    assert pattern.search(src), (
-        f"{relpath} does not pin solver={literal}; "
-        f"these runners must hard-code softmax to avoid solver auto-selection drift."
-    )
+    import inspect
+
+    from experiments.runners.fairness import build_polystep
+
+    assert inspect.signature(build_polystep).parameters["solver"].default == "softmax"
+    for relpath in ("experiments/runners/run_moe.py", "experiments/runners/run_elevation.py"):
+        src = (REPO_ROOT / relpath).read_text()
+        assert not re.search(r"build_polystep\([^)]*solver\s*=", src), (
+            f"{relpath} overrides the pinned solver on a build_polystep call"
+        )
+    scaling = (REPO_ROOT / "experiments/runners/run_maxsat_softmax_scaling.py").read_text()
+    assert re.search(r"solver\s*=\s*'softmax'", scaling)
 
 
 @pytest.mark.parametrize("eps", [0.0, -0.1])

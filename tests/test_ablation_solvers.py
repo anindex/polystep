@@ -1,8 +1,4 @@
-"""Tests for ablation solver classes: MinCostGreedy, TopKMean, TemperedSoftmax.
-
-Validates transport matrix properties, shape consistency, and integration
-with PolyStepOptimizer's solver selection.
-"""
+"""Tests for the ablation solvers MinCostGreedy, TopKMean, and TemperedSoftmax."""
 
 import pytest
 import torch
@@ -48,9 +44,7 @@ class TestMinCostGreedySolver:
 
         for i in range(4):
             min_col = cost_matrix[i].argmin().item()
-            # Only the argmin column should be non-zero
             assert T[i, min_col].item() == pytest.approx(source_marginal[i].item(), abs=1e-7)
-            # All other columns should be zero
             mask = torch.ones(6, dtype=torch.bool)
             mask[min_col] = False
             assert T[i, mask].sum().item() == pytest.approx(0.0, abs=1e-10)
@@ -105,23 +99,18 @@ class TestTopKMeanSolver:
 
     def test_v_less_than_k(self):
         """When V < k, should use all V vertices gracefully."""
-        C = torch.rand(3, 2)  # Only 2 vertices, k=3
+        C = torch.rand(3, 2)
         a = torch.ones(3) / 3
         solver = TopKMeanSolver(k=3)
         result = solver.solve(C, a=a)
 
-        # Should use all 2 vertices
         T = result.matrix
         for i in range(3):
             assert (T[i] > 0).sum().item() == 2
         assert torch.allclose(T.sum(dim=1), a, atol=1e-7)
 
     def test_masked_vertices_get_no_mass(self):
-        """sanitize_cost only guarantees a rank, which topk does not respect.
-
-        With fewer than k finite entries the penalty slots won top-k places and took
-        real mass, so the step moved toward directions marked forbidden.
-        """
+        """Masked (inf) vertices must get no mass even with fewer than k finite entries."""
         inf = float("inf")
         C = torch.tensor([[1.0, inf, inf, inf], [1.0, 2.0, inf, 3.0]])
         a = torch.tensor([0.5, 0.5])
@@ -132,7 +121,7 @@ class TestTopKMeanSolver:
         torch.testing.assert_close(T.sum(dim=1), a)
 
     def test_a_fully_masked_row_keeps_its_mass(self):
-        """No feasible vertex leaves nowhere better to put the row's mass."""
+        """A fully masked row keeps its mass."""
         T = TopKMeanSolver(k=2).solve(torch.full((1, 4), float("inf"))).matrix
         assert T.sum().item() == pytest.approx(1.0)
 
@@ -163,7 +152,6 @@ class TestTemperedSoftmaxSolver:
         solver2 = TemperedSoftmaxSolver(epsilon=99.0, tau=1.0)
         r1 = solver1.solve(cost_matrix, a=source_marginal)
         r2 = solver2.solve(cost_matrix, a=source_marginal)
-        # Same tau -> same result regardless of epsilon
         assert torch.allclose(r1.matrix, r2.matrix, atol=1e-7)
 
     def test_different_tau_different_result(self, cost_matrix, source_marginal):
@@ -255,7 +243,6 @@ class TestSolverSelection:
             solver=solver_name,
             epsilon=1.0,
         )
-        # Verify correct solver type
         from polystep.solvers import (
             SoftmaxSolver,
             SinkhornSolver,

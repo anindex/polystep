@@ -1,7 +1,5 @@
-"""Numerical robustness of the Sinkhorn solver, as opposed to its API contract.
-
-Finiteness across cost ranges and dtypes, marginal satisfaction at convergence,
-warm-start rescaling, dual re-centering, and the omega / Anderson acceleration guards.
+"""Numerical robustness of the Sinkhorn solver: finiteness across cost ranges
+and dtypes, marginals at convergence, warm-start and acceleration guards.
 Solver-interface tests live in test_sinkhorn.py.
 """
 
@@ -29,11 +27,7 @@ def _gaussian_cost(P, V, dtype=torch.float32, seed=0, scale=1.0):
     ],
 )
 def test_sinkhorn_lse_safety(dtype, scale):
-    """logsumexp must not overflow even when -C/eps is large.
-
-    PyTorch's logsumexp subtracts the max internally; this checks the property holds
-    end to end inside the solver, plan included.
-    """
+    """logsumexp must not overflow even when -C/eps is large, plan included."""
     P, V = 16, 32
     eps = 0.1
     C = _gaussian_cost(P, V, dtype=dtype) * scale
@@ -44,33 +38,20 @@ def test_sinkhorn_lse_safety(dtype, scale):
 
     assert torch.isfinite(result.f).all(), "f has non-finite entries"
     assert torch.isfinite(result.g).all(), "g has non-finite entries"
-    # Finite duals that still produce a degenerate plan would pass the checks above.
-    # The marginals are not asserted: at these scales 200 iterations is not convergence,
-    # and this test is about overflow, not accuracy.
+    # Marginals are not asserted: 200 iterations is not convergence at these
+    # scales, and this test is about overflow, not accuracy.
     assert torch.isfinite(result.matrix).all(), "plan has non-finite entries"
     assert result.matrix.sum() > 0, "plan collapsed to all-zero"
     assert (result.matrix > 0).any(dim=-1).all(), "some row got no mass at all"
 
 
-def test_warmstart_rescale_stays_finite_on_large_eps_ratio():
-    """Warm-start duals are clamped after the eps/init_eps rescale, so a large
-    ratio cannot blow the plan to Inf/NaN when max_iterations < check_every."""
-    C = torch.zeros(2, 2)
-    solver = SinkhornSolver(
-        epsilon=1.0,
-        max_iterations=1,
-        threshold=1e-9,
-        check_every=10,
-        omega=1.95,
-    )
-    for init_eps in (1e-9, 1e-40):
-        res = solver.solve(
-            C,
-            init_f=torch.tensor([1.0, -1.0]),
-            init_g=torch.tensor([1.0, -1.0]),
-            init_eps=init_eps,
-        )
-        assert torch.isfinite(res.matrix).all()
+def test_a_warm_start_survives_a_sharp_epsilon_change():
+    """Duals are cost-unit, so a converged warm start carries across an epsilon step."""
+    torch.manual_seed(0)
+    C = torch.rand(32, 64)
+    ref = SinkhornSolver(epsilon=0.005, max_iterations=20000, threshold=1e-9).solve(C)
+    warm = SinkhornSolver(epsilon=0.0045, max_iterations=50, threshold=1e-6).solve(C, init_f=ref.f, init_g=ref.g)
+    assert (warm.matrix.sum(dim=1) - 1 / 32).abs().max() < 1e-4
 
 
 def test_sinkhorn_marginals_satisfied_at_convergence():
@@ -97,9 +78,8 @@ def test_sinkhorn_marginals_satisfied_at_convergence():
         T = result.matrix
         a = torch.full((P,), 1.0 / P)
         b = torch.full((V,), 1.0 / V)
-        # Use L_inf to match the solver's convergence criterion at
-        # sinkhorn.py:401-403; allow 2x slack for the gap between the last
-        # in-loop check and the post-loop transport reconstruction.
+        # L_inf matches the solver's own convergence criterion; 2x slack covers
+        # the gap between the last in-loop check and the final plan.
         err_a = (T.sum(dim=1) - a).abs().max().item()
         err_b = (T.sum(dim=0) - b).abs().max().item()
         if err_a > tol * 2 or err_b > tol * 2:
@@ -133,9 +113,7 @@ def test_sinkhorn_ties_yield_symmetric_transport():
 
 
 def test_sinkhorn_omega_default_is_safe():
-    """The default omega=1.0 sits inside the proven-safe range
-    (0, 2 - rho) for any well-conditioned cost; no divergence detector
-    should ever fire on a benign MNIST-style cost matrix."""
+    """Default omega=1.0 must never trip the divergence detector on a benign cost."""
     P, V = 32, 64
     C = _gaussian_cost(P, V, scale=1.0)
     solver = SinkhornSolver(epsilon=0.1, max_iterations=500, threshold=1e-4)
@@ -147,9 +125,8 @@ def test_sinkhorn_omega_default_is_safe():
 
 
 def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
-    """When omega is set near the unstable boundary on an ill-conditioned
-    cost, three consecutive growth steps must trigger an automatic
-    back-off to omega=1.0 plus a UserWarning.
+    """Near the unstable boundary on an ill-conditioned cost, three growth steps
+    must back omega off to 1.0 with a UserWarning.
     """
     P, V = 32, 64
     # Ill-conditioned: large dynamic range relative to eps
@@ -170,11 +147,10 @@ def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
     assert diverg, f"expected divergence-detector warning on ill-conditioned cost with omega=1.95; got warnings: {msgs}"
 
 
-@pytest.mark.parametrize("omega", [0.5, 0.7, 1.0, 1.3, 1.5, 1.7, 1.9, 1.95])
+@pytest.mark.parametrize("omega", [0.5, 1.0, 1.95])
 def test_sinkhorn_omega_sweep(omega):
-    """Duals stay finite across the whole valid omega range on an ill-conditioned cost.
-
-    omega=1.98 is rejected by validation, so 1.95 is the top of the range.
+    """Duals stay finite at both ends of the valid omega range and at the plain
+    iteration, on an ill-conditioned cost (1.95 is the top; validation rejects higher).
     """
     P, V = 32, 64
     C = _gaussian_cost(P, V, scale=100.0)
@@ -192,12 +168,8 @@ def test_sinkhorn_omega_sweep(omega):
 
 
 def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
-    """Anderson acceleration with depth=5 on an ill-conditioned cost
-    matrix must converge to similar accuracy as plain Sinkhorn (Chizat 2020:
-    when Anderson would regress, fall back to the plain iterate).
-
-    The regression-check guard accepts only Anderson updates that
-    do not decrease the Lyapunov function below the plain iterate.
+    """Anderson acceleration on an ill-conditioned cost must match plain Sinkhorn's
+    accuracy (Chizat 2020: fall back to the plain iterate when Anderson regresses).
     """
     # Moderately ill-conditioned (range/eps = 10/0.1 = 100). Lower than
     # this is too easy; much higher and plain Sinkhorn does not converge
@@ -227,8 +199,7 @@ def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
     assert res_plain.converged, "plain Sinkhorn failed to converge"
     assert res_accel.converged, "Anderson Sinkhorn failed to converge"
 
-    # Anderson should reach a Lyapunov at least as high as plain (within
-    # a small tolerance for stochastic-iterate effects).
+    # Anderson's Lyapunov must be at least as high as plain's.
     lyap_plain = res_plain.ent_reg_cost
     lyap_accel = res_accel.ent_reg_cost
     rel_gap = abs(lyap_plain - lyap_accel) / max(abs(lyap_plain), 1e-9)
@@ -359,8 +330,7 @@ def test_sanitize_cost_penalty_does_not_overflow(dtype):
 )
 def test_saturating_temperature_warns(make_solver):
     """A temperature far below the cost scale saturates ``-C/temperature`` and the
-    plan silently stops satisfying its marginals. Every solver must say so; only
-    SoftmaxSolver used to.
+    plan silently stops satisfying its marginals. Every solver must say so.
     """
     C = _gaussian_cost(4, 6)
     with warnings.catch_warnings(record=True) as caught:

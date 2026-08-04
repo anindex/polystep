@@ -1,11 +1,5 @@
-"""Regressions for defects that returned a plausible but wrong answer.
-
-None of these ever raised. A reported OT cost off by a factor of the cost scale, a
-resume that drifted, an absorb that re-fired every step, a cost row reused across
-minibatches, an fp64 objective truncated to fp32: each looked like a working run.
-Every test here fails on the code as it stood before its fix.
-
-Defects that raise, or that produce a malformed result, live in
+"""Regressions for defects that returned a plausible but wrong answer without
+raising. Defects that raise or produce a malformed result live in
 test_regressions.py.
 """
 
@@ -39,7 +33,7 @@ def _small_model():
 
 @pytest.mark.parametrize("scale_cost", [None, "mean", "max_cost", 2.0])
 def test_sinkhorn_ent_reg_cost_is_in_the_caller_frame(scale_cost):
-    """``cost_scale`` was rebound to the warm-start clamp before the frame was undone."""
+    """``ent_reg_cost`` is reported in the caller's frame, not the scaled one."""
     C = torch.tensor([[0.0, 3.0, 1.0, 2.0], [2.0, 0.0, 4.0, 1.0], [1.0, 2.0, 0.0, 3.0]])
     solver = SinkhornSolver(epsilon=0.5, max_iterations=5000, threshold=1e-13)
     result = solver.solve(cost_matrix=C.clone(), scale_cost=scale_cost)
@@ -54,7 +48,7 @@ def test_sinkhorn_ent_reg_cost_is_in_the_caller_frame(scale_cost):
 
 
 def test_greedy_reports_cost_in_the_caller_frame():
-    """Greedy scaled the cost but never multiplied the divisor back."""
+    """Greedy reports its cost in the caller's frame even when scaling."""
     C = torch.tensor([[0.0, 4.0], [6.0, 2.0]])
     plain = MinCostGreedySolver().solve(cost_matrix=C.clone())
     scaled = MinCostGreedySolver().solve(cost_matrix=C.clone(), scale_cost="max_cost")
@@ -64,7 +58,7 @@ def test_greedy_reports_cost_in_the_caller_frame():
 
 
 def test_softmax_row_above_global_minimum_does_not_underflow_to_nan():
-    """Global recentring left row 2's logits at -inf, so the row came back NaN."""
+    """A row above the global minimum must not come back NaN."""
     C = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -135,7 +129,7 @@ def test_format_2_checkpoint_still_loads_but_warns():
 
 
 def test_stagnation_absorb_does_not_fire_every_step():
-    """The counter kept climbing past absorb_patience, so the basis was redrawn forever."""
+    """The stagnation counter must reset after each absorb, not fire every step."""
     torch.manual_seed(0)
     model = nn.Linear(8, 4)
     subspace = HybridSubspace.from_layout(
@@ -154,7 +148,7 @@ def test_stagnation_absorb_does_not_fire_every_step():
 
 
 def test_resync_from_model_forces_the_next_step_to_evaluate():
-    """An amortized step coasted along the stale EMA direction, moving fresh weights."""
+    """resync_from_model must clear the amortized state so the next step evaluates."""
     torch.manual_seed(0)
     model = nn.Linear(4, 2)
     opt = PolyStepOptimizer(model, seed=0, amortize_steps=2)
@@ -169,8 +163,8 @@ def test_resync_from_model_forces_the_next_step_to_evaluate():
         for p in model.parameters():
             p.fill_(7.0)
     opt.resync_from_model()
-    # Both have to clear, or the next step coasts along a direction measured at the
-    # old anchor and writes over the weights the caller just set.
+    # Both must clear, or the next step coasts along a direction measured at the
+    # old anchor.
     assert opt._transport_direction_ema is None
     assert opt._amortize_counter == 0
 
@@ -227,11 +221,8 @@ def test_adaptive_probes_do_not_reuse_without_an_objective_token():
 
 
 def test_adaptive_probes_reuse_cannot_latch_on_a_drifting_particle():
-    """Drift is measured from the cached matrix, not from the previous step.
-
-    A step small enough to pass the threshold used to re-anchor the comparison at the
-    new position, re-arming the gate every step: the particles marched indefinitely on
-    one cost matrix, reporting a frozen loss and never evaluating the closure again.
+    """Drift is measured from the cached matrix, not from the previous step, so
+    many small steps must eventually trip the reuse gate.
     """
     torch.manual_seed(0)
     model = nn.Linear(8, 4)
@@ -256,7 +247,7 @@ def test_amortized_step_invalidates_the_reuse_cache():
 
 
 def test_blockwise_biased_rotation_runs_under_bfloat16():
-    """torch.det on a bf16 matrix raised NotImplementedError on the second step."""
+    """Block-wise biased rotation must run under bfloat16 mixed precision."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(8, 6), nn.ReLU(), nn.Linear(6, 4))
     opt = PolyStepOptimizer(model, seed=0, mixed_precision=True, block_strategy="per_layer", biased_rotation=True)
@@ -609,6 +600,21 @@ class TestAuditSilentFailures:
         with pytest.warns(RuntimeWarning, match="carries no ranking information"):
             opt.step(nan_closure)
 
+    def test_blockwise_reports_an_all_nonfinite_sweep_too(self):
+        """The sanitize penalty must not be reported as a finite loss with convergence."""
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
+        opt = PolyStepOptimizer(model, block_strategy="per_layer", seed=0)
+
+        def nan_closure(bp):
+            n = next(iter(bp.values())).shape[0]
+            return torch.full((n,), float("nan"))
+
+        with pytest.warns(RuntimeWarning, match="carries no ranking information"):
+            opt.step(nan_closure)
+        assert opt.state.costs[-1] == float("inf")
+        assert opt.state.linear_convergence[-1] is False
+
     def test_a_rank_zero_subspace_is_rejected(self):
         """num_coords=0 made every reconstruction add exactly zeros, silently."""
         layout = ParamLayout.from_module(nn.Sequential(nn.Linear(6, 5)))
@@ -686,12 +692,11 @@ class TestAuditSilentFailures:
 
     def test_covariance_adaptation_is_rejected_on_a_sparse_projection(self):
         """C_diag, p_c and p_sigma updated every step and reached nothing."""
-        from polystep.adaptive_subspace import AdaptiveSubspace
         from polystep.cma_subspace import CMAAdaptiveSubspace
 
         model = nn.Sequential(nn.Linear(200, 60), nn.Linear(60, 10))
         full = sum(p.numel() for p in model.parameters())
-        sub = CMAAdaptiveSubspace(base=AdaptiveSubspace(full_dim=full, subspace_dim=16))
+        sub = CMAAdaptiveSubspace(full_dim=full, subspace_dim=16)
         with pytest.raises(ValueError, match="dense projection"):
             PolyStepOptimizer(model, subspace=sub, projection_type="sparse", use_covariance_adaptation=True, seed=0)
 

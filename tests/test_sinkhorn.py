@@ -8,12 +8,7 @@ from polystep.solvers import SinkhornSolver
 
 class TestSinkhornSolver:
     def test_small_epsilon_near_deterministic(self):
-        """Small epsilon pushes transport toward deterministic (near one-hot rows).
-
-        With uniform marginals, each row sums to 1/n. A near-deterministic plan
-        concentrates mass on one column per row, so max entry ~ 1/n and the ratio
-        max / (row_sum) -> 1.  We verify max(row) / sum(row) > 0.9 for each row.
-        """
+        """Small epsilon pushes transport toward near one-hot rows."""
         torch.manual_seed(42)
         n = 5
         C = torch.rand(n, n)
@@ -36,7 +31,7 @@ class TestSinkhornSolver:
         """Identity cost matrix should produce near-diagonal transport plan."""
         torch.manual_seed(42)
         n = 5
-        C = torch.eye(n) * 0.0  # Zero on diagonal, we need off-diagonal penalty
+        C = torch.eye(n) * 0.0
         C = 1.0 - torch.eye(n)  # 0 on diagonal, 1 off-diagonal
 
         solver = SinkhornSolver(
@@ -58,7 +53,7 @@ class TestSinkhornSolver:
     def test_scale_cost_mean(self):
         """Scale cost='mean' should still produce valid marginals for large costs."""
         torch.manual_seed(42)
-        C = torch.rand(5, 5) * 100  # Large costs
+        C = torch.rand(5, 5) * 100
 
         solver = SinkhornSolver(
             epsilon=0.1,
@@ -130,7 +125,6 @@ class TestOverrelaxation:
         )
         assert solver.omega == 1.0
 
-        # Verify valid transport plan
         P = result.matrix
         a = torch.ones(10) / 10
         assert torch.allclose(P.sum(dim=1), a, atol=1e-4)
@@ -143,11 +137,7 @@ class TestOverrelaxation:
         ],
     )
     def test_omega_overrelaxed(self, seed, n, cost_scale, omega):
-        """omega in (1, 1.5] converges in fewer iterations than omega=1.0 on a non-trivial cost matrix.
-
-        Overrelaxation is most beneficial for larger problems with wider cost ranges
-        where standard Sinkhorn needs more iterations.
-        """
+        """omega in (1, 1.5] converges in fewer iterations than omega=1.0."""
         torch.manual_seed(seed)
         C = torch.rand(n, n) * cost_scale  # Wider cost range makes standard Sinkhorn work harder
 
@@ -221,7 +211,7 @@ class TestOverrelaxation:
 
 
 class TestAndersonAcceleration:
-    """Tests for Anderson acceleration in Sinkhorn solver (convergence acceleration)."""
+    """Anderson acceleration: same fixed point, finite on near-singular costs."""
 
     @pytest.mark.parametrize(
         "override, shape, max_iterations",
@@ -233,10 +223,7 @@ class TestAndersonAcceleration:
         ],
     )
     def test_acceleration_knobs_reach_the_same_fixed_point(self, override, shape, max_iterations):
-        """Acceleration may change the path to the optimum, never the optimum.
-
-        Every override is off-default, so the two solvers really do differ.
-        """
+        """Acceleration may change the path to the optimum, never the optimum."""
         torch.manual_seed(42)
         n, m = shape
         C = torch.rand(n, m)
@@ -252,11 +239,7 @@ class TestAndersonAcceleration:
 
     @pytest.mark.parametrize("noise", [1e-4, 1e-6])
     def test_anderson_near_singular_no_nan(self, noise):
-        """Anderson acceleration on near-singular cost matrices produces finite results.
-
-        Tests the hardened lstsq guard: alpha norm bound and combined-result
-        finiteness check prevent ill-conditioned solves from corrupting duals.
-        """
+        """Anderson on near-singular costs must stay finite (the lstsq guard bounds alpha)."""
         torch.manual_seed(42)
         n = 12
         # Near-singular cost matrix: rank-1 outer product with tiny perturbation

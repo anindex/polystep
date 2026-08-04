@@ -1,8 +1,4 @@
-"""Cost matrix computation for Sinkhorn Step.
-
-Wraps an objective function into a cost matrix by evaluating it at
-probe points and averaging over the probe dimension.
-"""
+"""Cost matrix computation for Sinkhorn Step."""
 
 import math
 from typing import Callable, Optional, Union
@@ -15,23 +11,10 @@ def compute_cost_matrix(
     X_probe: torch.Tensor,
     chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Compute the cost matrix by evaluating objective at probe points.
-
-    Evaluates the objective function on all probe points and averages
-    over the probe dimension to get a (batch, num_vertices) cost matrix.
-
-    Args:
-        objective_fn: Function mapping (..., dim) -> (...) costs.
-        X_probe: Probe array of shape (batch, num_vertices, num_probe, dim).
-        chunk_size: If set, evaluate in chunks to limit memory.
-
-    Returns:
-        Cost matrix of shape (batch, num_vertices).
-    """
+    """Evaluate the objective at probe points and average over the probe dimension."""
     batch, num_verts, num_probe, dim = X_probe.shape
 
     if chunk_size is not None and chunk_size > 0:
-        # Chunked evaluation for memory efficiency
         flat_X = X_probe.reshape(-1, dim)
         N = flat_X.shape[0]
 
@@ -47,7 +30,7 @@ def compute_cost_matrix(
         raw_costs_flat = objective_fn(flat_X)
 
     raw_costs = raw_costs_flat.reshape(batch, num_verts, num_probe)
-    cost_matrix = raw_costs.mean(dim=-1)  # (batch, num_vertices)
+    cost_matrix = raw_costs.mean(dim=-1)
 
     return cost_matrix
 
@@ -56,23 +39,10 @@ def resolve_cost_scale(
     cost_matrix: torch.Tensor,
     scale_cost: Optional[Union[str, float]] = None,
 ) -> torch.Tensor:
-    """Resolve the divisor ``scale_cost`` selects for this cost matrix.
+    """Return the divisor ``scale_cost`` selects, as a 0-d tensor.
 
-    Returned as a 0-d tensor on the cost matrix's device so callers can divide
-    and later multiply back without a host sync. ``None`` resolves to 1.
-
-    The data-dependent modes ('mean', 'max_cost') are *not* shift-invariant, so
-    callers must recenter with :func:`~polystep.solvers._shared.recenter_cost`
-    first. Otherwise adding a constant to every cost changes the divisor, hence
-    the effective temperature, and the entropic plan moves: even though the
-    plan is mathematically invariant to that shift.
-
-    Args:
-        cost_matrix: Cost matrix, already recentered by the caller.
-        scale_cost: Scaling strategy ('mean', 'max_cost', a float, or None).
-
-    Returns:
-        0-d tensor holding the divisor.
+    Data-dependent modes ('mean', 'max_cost') are not shift-invariant, so recenter
+    the cost first; otherwise a constant offset changes the effective temperature.
     """
     if scale_cost is None:
         return cost_matrix.new_ones(())
@@ -99,15 +69,7 @@ def scale_cost_matrix(
 ) -> torch.Tensor:
     """Apply cost scaling to a cost matrix.
 
-    Thin wrapper over :func:`resolve_cost_scale`. Recenter before calling this
-    with a data-dependent mode; see that function for why.
-
-    Args:
-        cost_matrix: Cost matrix.
-        scale_cost: Scaling strategy ('mean', 'max_cost', or float).
-
-    Returns:
-        Scaled cost matrix.
+    Recenter before calling with a data-dependent mode; see ``resolve_cost_scale``.
     """
     if scale_cost is None:
         return cost_matrix

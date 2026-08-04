@@ -1,10 +1,7 @@
 """Correctness tests for `polystep.solvers.kl_softmax.KLSoftmaxSolver`.
 
-This solver implements a one-sided KL-penalized entropic OT that
-interpolates between the softmax solver (`lam=0`) and the full
-Sinkhorn solver (`lam=inf`). Tests cover the limit recoveries,
-intermediate marginal interpolation, NaN-safety at small epsilon,
-and monotonic convergence of the marginal error.
+Covers the lam=0 / lam=inf limit recoveries, intermediate marginal
+interpolation, NaN-safety at small epsilon, and monotone convergence.
 """
 
 from __future__ import annotations
@@ -33,10 +30,8 @@ def test_lam_zero_recovers_softmax_row_marginals() -> None:
     softmax = SoftmaxSolver(epsilon=eps)
     res_kl = klsolver.solve(C, a=a, b=b)
     res_sm = softmax.solve(C, a=a, b=None)
-    # Row marginals must equal `a` in both
     torch.testing.assert_close(res_kl.matrix.sum(dim=1), a, atol=1e-5, rtol=0)
     torch.testing.assert_close(res_sm.matrix.sum(dim=1), a, atol=1e-5, rtol=0)
-    # Transport matrices match elementwise to ~1e-4
     torch.testing.assert_close(res_kl.matrix, res_sm.matrix, atol=1e-4, rtol=1e-4)
 
 
@@ -47,11 +42,9 @@ def test_lam_huge_recovers_sinkhorn_full_marginals() -> None:
     sink = SinkhornSolver(epsilon=eps, max_iterations=2000, threshold=1e-8)
     res_kl = kl.solve(C, a=a, b=b)
     res_sk = sink.solve(C, a=a, b=b)
-    # Both should satisfy BOTH marginals
     torch.testing.assert_close(res_kl.matrix.sum(dim=1), a, atol=1e-3, rtol=0)
     torch.testing.assert_close(res_kl.matrix.sum(dim=0), b, atol=1e-3, rtol=0)
     torch.testing.assert_close(res_sk.matrix.sum(dim=0), b, atol=1e-5, rtol=0)
-    # Transport matrices match to ~1e-3
     torch.testing.assert_close(res_kl.matrix, res_sk.matrix, atol=1e-3, rtol=1e-3)
 
 
@@ -67,7 +60,6 @@ def test_intermediate_lam_decreases_kl_to_target() -> None:
         # KL(col_sums || b)
         kl_val = (col_sums * (col_sums.clamp(min=1e-30).log() - b.log())).sum().item()
         kls.append(kl_val)
-    # Strictly non-increasing within numerical noise
     for i in range(len(kls) - 1):
         assert kls[i + 1] <= kls[i] + 1e-6, f"KL not monotone: {kls}"
 
@@ -84,8 +76,6 @@ def test_intermediate_lam_softens_column_constraint() -> None:
     err_one = (kl_one.matrix.sum(dim=0) - b).abs().max().item()
     err_huge = (kl_huge.matrix.sum(dim=0) - b).abs().max().item()
 
-    # Stricter constraint as lam grows: the column-marginal error must
-    # be (weakly) monotone non-increasing in lam.
     assert err_huge <= err_one <= err_zero, (
         f"column-marginal error should be non-increasing in lam, "
         f"got err_zero={err_zero:.3e} err_one={err_one:.3e} "
@@ -116,7 +106,6 @@ def test_validation_invalid_constructor_args_raise(kwargs) -> None:
 def test_default_uniform_marginals_when_a_b_none() -> None:
     C = torch.rand(6, 4)
     res = KLSoftmaxSolver(epsilon=0.1, lam=1.0).solve(C)
-    # Default a uniform -> row sums uniform 1/6
     torch.testing.assert_close(
         res.matrix.sum(dim=1),
         torch.full((6,), 1.0 / 6),
@@ -145,9 +134,8 @@ def test_inf_lam_treated_as_full_sinkhorn() -> None:
 @pytest.mark.parametrize("lam", [0.0, 1.0, 10.0, float("inf")])
 @pytest.mark.parametrize("iters", [1, 2, 50])
 def test_row_marginal_is_exact_at_any_iteration_count(lam, iters) -> None:
-    """P1 == a is the one hard constraint this solver enforces, so it cannot wait for
-    convergence. Building the plan from the loop's stale f missed it by 90% at one
-    iteration."""
+    """P1 == a is the one hard constraint this solver enforces, so it must hold at
+    every iteration count rather than waiting for convergence."""
     torch.manual_seed(0)
     n, m = 6, 5
     a = torch.full((n,), 1.0 / n)
@@ -165,12 +153,8 @@ def test_optimizer_wires_lam_through() -> None:
 
 
 def test_the_limits_inherit_the_guards_of_the_solver_they_become() -> None:
-    """lam=inf is balanced Sinkhorn and lam=0 is the one-shot softmax.
-
-    Both guards tested the solver class, so neither limit was caught: an infinite-lam
-    single-particle run froze silently, and a zero-lam run drove ProgressiveEpsilon off
-    a permanent one-iteration solve.
-    """
+    """lam=inf is balanced Sinkhorn and lam=0 is the one-shot softmax, so each limit
+    must inherit that solver's optimizer-side guards."""
     from polystep.epsilon import ProgressiveEpsilon
     from polystep.optimizer import PolyStepOptimizer
 
@@ -222,9 +206,9 @@ def test_convergence_is_measured_on_the_dual_step_not_its_magnitude():
 
 
 def test_denormal_lam_takes_the_softmax_closed_form():
-    """Below fp32's smallest normal the damped g-update underflows to exactly zero, so the
-    residual's ``/alpha`` normalization is 0/0 = nan and never compares <= threshold. The
-    solver would burn every iteration and report converged=False on a correct plan."""
+    """Below fp32's smallest normal the damped g-update underflows to zero, making the
+    residual's ``/alpha`` normalization 0/0 = nan, so the solver must take the softmax
+    closed form instead."""
     solver = KLSoftmaxSolver(epsilon=0.1, lam=1e-300, max_iterations=2000)
     result = solver.solve(torch.rand(16, 8))
     assert result.converged and result.n_iters < 10, (result.converged, result.n_iters)
@@ -232,17 +216,14 @@ def test_denormal_lam_takes_the_softmax_closed_form():
 
 
 def test_fp64_resolves_an_alpha_an_fp32_bound_would_flatten():
-    """The softmax-limit cutoff follows the working dtype, not a hardcoded fp32 one.
-
-    ``alpha = lam / (lam + eps) ~ 1e-39`` is denormal in fp32 but an ordinary fp64 number,
-    so an fp64 solve must run the damped iteration and return a non-zero ``g`` rather than
-    the ``lam = 0`` closed form.
-    """
+    """The softmax-limit cutoff follows the working dtype: alpha = lam/(lam+eps) ~ 1e-39
+    is denormal in fp32 but ordinary in fp64, so an fp64 solve must run the damped
+    iteration and return a non-zero ``g``."""
     C = torch.tensor([[0.0, 1.0, 2.0], [2.0, 0.0, 1.0]], dtype=torch.float64)
     result = KLSoftmaxSolver(epsilon=0.1, lam=1e-40, max_iterations=2000).solve(C)
     assert result.converged
     assert result.g.abs().max() > 0, "fp64 must resolve the KL damping, not flatten it to the softmax limit"
-    # fp32 keeps the old behaviour: the same alpha is denormal there.
+    # fp32 takes the closed form: the same alpha is denormal there.
     fp32 = KLSoftmaxSolver(epsilon=0.1, lam=1e-40, max_iterations=2000).solve(C.float())
     assert fp32.converged and fp32.n_iters < 10
     torch.testing.assert_close(fp32.g, torch.zeros_like(fp32.g))
