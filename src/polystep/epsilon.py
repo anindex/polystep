@@ -1,20 +1,19 @@
-"""Epsilon schedulers for entropic regularization decay.
-
-High epsilon gives a smooth, diffuse transport plan that is easy to solve; low epsilon
-gives a sharp one closer to exact OT but harder numerically. Annealing high to low is
-coarse-to-fine.
-
-- ``LinearEpsilon``: ``eps_t = max(init - decay * t, target)``.
-- ``CosineEpsilon``: cosine annealing, optional SGDR-style warm restarts.
-- ``ProgressiveEpsilon``: driven by Sinkhorn convergence rather than by ``t``, after
-  ProgOT (Kassraie et al., NeurIPS 2024, arXiv:2406.05061).
-- ``PowerDecay``: ``r_t = init * (t + 1)^-(1/2 + gamma)``, the step-radius schedule
-  Theorem 4.2 assumes.
-"""
+"""Epsilon schedulers for entropic regularization decay."""
 
 import math
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+def resolve_radius(radius, iteration: int, epsilon: float) -> float:
+    """The physical radius at ``iteration``: a scalar is ``radius * epsilon``, a schedule is its own value."""
+    base = radius.at(iteration) if hasattr(radius, "at") else radius
+    return float(base) * radius_epsilon_factor(radius, epsilon)
+
+
+def radius_epsilon_factor(radius, epsilon: float) -> float:
+    """``1.0`` for a scheduled radius, ``epsilon`` for a scalar one. Keep the existing multiplication order."""
+    return 1.0 if hasattr(radius, "at") else float(epsilon)
 
 
 @dataclass
@@ -26,8 +25,7 @@ class LinearEpsilon:
     decay: float = 0.01
 
     def __post_init__(self) -> None:
-        # A negative decay grows epsilon without bound: the plan flattens to uniform, the
-        # step becomes the mean of the polytope vertices, and training stalls with no error.
+        # A negative decay grows epsilon without bound and stalls training.
         if self.decay < 0:
             raise ValueError(f"decay must be >= 0, got {self.decay}")
 
@@ -41,19 +39,7 @@ class LinearEpsilon:
 
 @dataclass
 class PowerDecay:
-    """``r(t) = max(init * (t + 1) ** -(0.5 + gamma), target)``.
-
-    The step-radius schedule the convergence analysis assumes: square-summable but
-    not summable, which is what makes the noise term vanish while the iterates can
-    still travel an unbounded distance. ``gamma`` around 0.1 is the usual choice.
-    Same ``at(iteration)`` interface as the epsilon schedulers, so it drops into
-    ``PolyStepOptimizer(step_radius=...)`` unchanged.
-
-    Attributes:
-        init: ``r_0``.
-        gamma: Extra decay beyond ``t^-1/2``; must be > 0 for square-summability.
-        target: Floor, so a long run does not shrink the step into fp32 noise.
-    """
+    """``r(t) = max(init * (t + 1) ** -(0.5 + gamma), target)``, the step-radius schedule the convergence analysis assumes."""
 
     init: float = 1.0
     gamma: float = 0.1
@@ -70,17 +56,7 @@ class PowerDecay:
 
 @dataclass
 class ProgressiveEpsilon:
-    """Epsilon driven by Sinkhorn convergence, after ProgOT (arXiv:2406.05061).
-
-    A fast solve sharpens the plan by decreasing epsilon; a slow or failed one raises it
-    to stay solvable. ``at()`` ignores its ``iteration`` argument, matching
-    ``LinearEpsilon``'s interface; the optimizer calls ``update()`` after each solve.
-
-    Attributes:
-        fast_threshold: ``n_iters/max_iterations`` below this decreases epsilon.
-        slow_threshold: the same ratio above this increases it.
-        ema_alpha: smoothing on the change; 0 none, 1 freezes epsilon.
-    """
+    """Epsilon driven by Sinkhorn convergence, after ProgOT (arXiv:2406.05061)."""
 
     init: float = 1.0
     target: float = 0.01
@@ -91,7 +67,7 @@ class ProgressiveEpsilon:
     slow_threshold: float = 0.5
     ema_alpha: float = 0.7
 
-    # Internal state (not part of constructor signature for users)
+    # Internal state (not part of constructor signature for users).
     _current: float = field(init=False, repr=False)
     _smoothed: float = field(init=False, repr=False)
 
@@ -121,11 +97,8 @@ class ProgressiveEpsilon:
 def feed_solver_stats(scheduler, solver, n_iters: int, converged: bool) -> None:
     """Feed a solve's stats to ``scheduler``; no-op for schedulers that ignore them.
 
-    Called by every step driver, so ``ProgressiveEpsilon`` advances in monolithic,
-    block-wise and standalone ``PolyStep`` runs alike.
-
-    Skipped at ``threshold <= 0``: fixed-iteration Sinkhorn always reports converged
-    with ``n_iters == max_iterations``, a ratio of 1.0, which would raise epsilon to
+    Skipped at ``threshold <= 0``: fixed-iteration Sinkhorn always reports converged with
+    ``n_iters == max_iterations``, a ratio of 1.0, which would raise epsilon to
     ``max_epsilon`` every step.
     """
     if not isinstance(scheduler, ProgressiveEpsilon) or getattr(solver, "threshold", 1.0) <= 0:
@@ -139,17 +112,7 @@ def feed_solver_stats(scheduler, solver, n_iters: int, converged: bool) -> None:
 
 @dataclass
 class CosineEpsilon:
-    """``epsilon(t) = target + 0.5 * (init - target) * (1 + cos(pi * t / T))``.
-
-    Holds epsilon high through the middle of the run and drops it late, where linear
-    decay is already at the floor.
-
-    Attributes:
-        decay: infers ``T = (init - target) / decay`` when ``total_steps`` is unset,
-            so a ``LinearEpsilon`` config transfers unchanged.
-        total_steps: explicit ``T``, overriding that inference.
-        restart_mult: SGDR period multiplier; 1.0 disables warm restarts.
-    """
+    """``epsilon(t) = target + 0.5 * (init - target) * (1 + cos(pi * t / T))``."""
 
     target: float = 1e-3
     init: float = 1.0
@@ -161,8 +124,7 @@ class CosineEpsilon:
         if iteration is None:
             return self.init
 
-        # ceil, not truncation: a fractional ratio (the defaults give 99.9) would
-        # otherwise reach the floor one step before the LinearEpsilon it transfers from.
+        # ceil, not truncation, so the floor lands where LinearEpsilon's would.
         T = (
             self.total_steps
             if self.total_steps > 0
@@ -170,8 +132,7 @@ class CosineEpsilon:
         )
 
         if self.restart_mult > 1.0:
-            # Walk to the current restart period. Bounded: a restart_mult near 1.0 or a
-            # tiny period would otherwise loop unbounded.
+            # Walk to the current restart period; the bound stops a near-1.0 restart_mult looping forever.
             period = T
             t = iteration
             max_restarts = 100
@@ -186,8 +147,7 @@ class CosineEpsilon:
             T_local = T
             t_local = min(iteration, T)
 
-        # Clamp so a maxed-out restart loop can't push cos past pi (which would
-        # drift epsilon outside [target, init]).
+        # Clamp so the restart loop can't push cos past pi.
         t_local = min(max(t_local, 0), T_local)
         cos_val = math.cos(math.pi * t_local / max(T_local, 1))
         return self.target + 0.5 * (self.init - self.target) * (1.0 + cos_val)

@@ -1,8 +1,9 @@
 """The trust-region ratio test runs wherever the finite-difference model exists.
 
-Its inputs are ``use_quadratic_model`` and the orthoplex. Curvature comes from the
-regression at ``num_probe >= 2`` and from a shared ``f(X)`` at ``num_probe == 1``, so
-the multiplier must move in both, with or without ``biased_rotation``.
+Its input is ``use_quadratic_model``. Curvature comes from a regression across probe
+scales, which needs the orthoplex's antipodal pairs, or from a shared ``f(X)`` at
+``num_probe == 1``, which works on any polytope. The multiplier must move in both,
+with or without ``biased_rotation``.
 """
 
 import warnings
@@ -85,12 +86,53 @@ def test_trust_region_runs_at_num_probe_one_via_the_shared_centre():
     assert opt._center_loss is not None and opt._center_loss.shape == (opt._state.X.shape[0],)
 
 
-def test_trust_region_stays_off_on_the_simplex():
-    """The FD extractors read the orthoplex's antithetic ordering."""
+def test_trust_region_runs_on_the_simplex_at_num_probe_one():
+    """The gradient is a closed form on any centred tight frame, and the shared f(X)
+    gives tr(H)/d, so d+1 vertices carry the model the orthoplex needed 2d for."""
     torch.manual_seed(0)
     model = _model()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    opt = PolyStepOptimizer(
+        model,
+        max_iterations=50,
+        epsilon=0.1,
+        num_probe=1,
+        polytope_type="simplex",
+        trust_region=True,
+        compile=False,
+        seed=0,
+    )
+    _run(opt, _closure(model))
+
+    mults = opt._state.trust_region_multipliers
+    assert len(mults) > 0, "trust_region recorded no ratio test on the simplex"
+    assert len(set(mults)) > 1, "trust_region multiplier never changed"
+    assert all(0.1 <= m <= 3.0 for m in mults)
+
+
+def test_trust_region_warns_when_amortization_makes_it_inert():
+    """Momentum steps drop the pending prediction, so the ratio test never runs."""
+    torch.manual_seed(0)
+    model = _model()
+    with pytest.warns(UserWarning, match="trust_region never updates"):
+        opt = PolyStepOptimizer(
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            num_probe=1,
+            trust_region=True,
+            amortize_steps=5,
+            compile=False,
+            seed=0,
+        )
+    _run(opt, _closure(model))
+    assert len(opt._state.trust_region_multipliers) == 0
+
+
+def test_the_simplex_model_needs_the_shared_centre():
+    """At num_probe >= 2 there is no centre and no antipodal pairs, so nothing to read."""
+    torch.manual_seed(0)
+    model = _model()
+    with pytest.warns(UserWarning, match="num_probe=1"):
         opt = PolyStepOptimizer(
             model,
             max_iterations=50,
@@ -105,6 +147,33 @@ def test_trust_region_stays_off_on_the_simplex():
     assert len(opt._state.trust_region_multipliers) == 0
 
 
+def test_a_probe_reuse_step_does_not_move_the_trust_region():
+    """Reuse re-reports the cached loss, so the ratio would be 0 against a live prediction."""
+    torch.manual_seed(0)
+    model = _model()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt = PolyStepOptimizer(
+            model,
+            max_iterations=50,
+            epsilon=0.1,
+            num_probe=1,
+            polytope_type="orthoplex",
+            trust_region=True,
+            adaptive_probes=True,
+            adaptive_probes_threshold=1e9,
+            compile=False,
+            seed=0,
+        )
+    closure = _closure(model)
+    opt.step(closure, objective_token=0)
+    before, evals = opt._trust_region_multiplier, opt.candidate_evals
+    opt.step(closure, objective_token=0)
+
+    assert opt.candidate_evals == evals, "expected a reuse step, got fresh evaluations"
+    assert opt._trust_region_multiplier == before
+
+
 @pytest.mark.parametrize(
     "pred, actual, radius, expected, why",
     [
@@ -114,7 +183,7 @@ def test_trust_region_stays_off_on_the_simplex():
         (-1.0, -1.0, 2.5, 3.0, "expansion saturates at max_radius"),
         (-1.0, -0.1, 0.15, 0.1, "shrink saturates at min_radius"),
         (-1.0, -0.5, 1.0, 1.0, "between the thresholds the radius holds"),
-        (1.0, 1.0, 1.0, 1.0, "an accurate but worsening step must not expand"),
+        (1.0, 1.0, 1.0, 0.5, "predicted a rise and the loss rose: shrink, never hold"),
         (1e-12, 1.0, 1.7, 1.7, "a degenerate prediction leaves the radius alone"),
     ],
 )
@@ -131,7 +200,7 @@ def test_trust_region_branches_and_clamps(pred, actual, radius, expected, why):
 
 
 def test_kl_marginal_violation_matches_the_generalized_kl():
-    """last_marginal_violation feeds Theorem 4.1 reporting and has no other check."""
+    """last_marginal_violation is reported to callers and has no other check."""
     from polystep.solvers.kl_softmax import KLSoftmaxSolver
 
     C = torch.rand(5, 7, generator=torch.Generator().manual_seed(0))
@@ -182,3 +251,32 @@ def test_centred_hessian_matches_the_regression_on_a_quadratic():
     # One scale is enough for the centred form and not for the regression.
     one = losses[:, :, :1]
     torch.testing.assert_close(extract_fd_hessian_diag_centered(one, scales[:1], r, pdim, L0), H, rtol=1e-4, atol=1e-4)
+
+
+def test_the_centre_evaluation_is_charged_once_not_once_per_particle():
+    """f(X) is one forward, however many particles read it.
+
+    A centre candidate is X with one row rewritten to the value already there,
+    so every particle's centre is the same point and the same number. Evaluating
+    one per particle billed P-1 forwards that computed nothing, and the budget
+    column is what the paper matches methods on.
+    """
+    torch.manual_seed(0)
+    model = _model()
+    opt = PolyStepOptimizer(
+        model,
+        max_iterations=50,
+        polytope_type="orthoplex",
+        use_quadratic_model=True,
+        trust_region=True,
+        num_probe=1,
+        epsilon=0.1,
+        seed=7,
+        compile=False,
+    )
+    opt.step(_closure(model))
+
+    P, pdim = opt.state.X.shape
+    assert opt._center_loss.shape == (P,)
+    assert float(opt._center_loss.max() - opt._center_loss.min()) == 0.0
+    assert opt.candidate_evals == P * (2 * pdim) + 1

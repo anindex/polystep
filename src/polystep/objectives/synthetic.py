@@ -9,12 +9,7 @@ from .base import ObjectiveFn
 
 
 class Ackley(ObjectiveFn):
-    """Ackley test function.
-
-    f(x) = -a*exp(-b*sqrt(1/d * sum(x_i^2))) - exp(1/d * sum(cos(c*x_i))) + a + e
-
-    Global minimum at x = 0 with f(x) = 0.
-    """
+    """Ackley function; global minimum at x = 0 with f(x) = 0."""
 
     def __init__(
         self,
@@ -54,8 +49,7 @@ class Rosenbrock(ObjectiveFn):
         bounds: Optional[torch.Tensor] = None,
     ):
         if dim < 2:
-            # The sum runs over consecutive pairs, so dim=1 is empty and evaluate()
-            # returns 0 everywhere rather than the banana.
+            # The pair sum is empty at dim=1, so evaluate() would return 0 everywhere.
             raise ValueError(f"Rosenbrock needs dim >= 2, got {dim}.")
         if bounds is None:
             bounds = torch.tensor([[-5.0, 5.0]] * dim)
@@ -211,12 +205,7 @@ class Branin(ObjectiveFn):
 
 
 class Sphere(ObjectiveFn):
-    """Sphere function. Global minimum at x = 0 with f(x) = 0.
-
-    f(x) = sum(x_i^2)
-
-    The simplest convex test function, useful as a baseline.
-    """
+    """Sphere function. Global minimum at x = 0 with f(x) = 0."""
 
     def __init__(
         self,

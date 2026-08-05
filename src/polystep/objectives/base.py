@@ -7,20 +7,7 @@ import torch
 
 
 class ObjectiveFn(abc.ABC):
-    """Base class for optimization objectives.
-
-    Attributes:
-        dim: Dimensionality of the problem.
-        bounds: Search space bounds of shape ``(dim, 2)`` as
-            ``[(min, max), ...]``.
-        optimizers: Known global optimizer locations of shape
-            ``(num_opts, dim)``.
-        optimal_value: Known global optimum value.
-        noise_std: Standard deviation of additive Gaussian observation noise.
-            ``None`` or ``0`` disables noise.
-        negate: If ``True``, negate the output (turn a maximization problem
-            into a minimization problem).
-    """
+    """Base class for optimization objectives."""
 
     def __init__(
         self,
@@ -34,7 +21,7 @@ class ObjectiveFn(abc.ABC):
         self.dim = dim
         self.bounds = bounds
         self.optimizers = optimizers
-        # Flip with the cost, or regret = cost - optimal_value never reaches 0.
+        # Negate flips optimal_value too, or regret never reaches 0.
         self.optimal_value = -optimal_value if (negate and optimal_value is not None) else optimal_value
         self.noise_std = noise_std
         self.negate = negate
@@ -49,15 +36,7 @@ class ObjectiveFn(abc.ABC):
         X: torch.Tensor,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        """Compute the final cost, applying noise and negation if configured.
-
-        Args:
-            X: Input points of shape ``(..., dim)``.
-            generator: Optional ``torch.Generator`` for reproducible noise.
-
-        Returns:
-            Cost values of shape ``(...)``.
-        """
+        """Apply noise and negation, returning the final cost."""
         cost = self.evaluate(X)
         if self.noise_std is not None and self.noise_std > 0.0:
             # normal_ needs the generator on the tensor's device, so draw there and move.

@@ -54,7 +54,7 @@ class TestApplyMomentum:
         X1, v1 = apply_momentum(X0, torch.tensor([[1.0, 0.0]]), torch.zeros_like(X0), beta=0.5)
         assert torch.allclose(v1, torch.tensor([[1.0, 0.0]]))
 
-        # displacement = [2,0] - [1,0] = [1,0], so v2 = 0.5 * [1,0] + [1,0]
+        # v2 = 0.5 * [1,0] + [1,0]
         _, v2 = apply_momentum(X1, torch.tensor([[2.0, 0.0]]), v1, beta=0.5)
         assert torch.allclose(v2, torch.tensor([[1.5, 0.0]]))
 
@@ -68,15 +68,14 @@ class TestApplyMomentum:
 
 
 # (kwargs, expected subset of the (radius_multiplier, stagnation_count, prev_loss) return).
-# The radius grows on stagnation and decays on improvement, which is deliberately the
-# opposite of a trust region; see update_radius_multiplier.
+# The radius grows on stagnation and decays on improvement, the opposite of a trust
+# region; see update_radius_multiplier.
 _RADIUS_CASES = [
     ("a tiny relative change counts as stagnation", dict(current_loss=1.0, prev_loss=1.0 + 1e-6), {"sc": 1}),
     ("a large change resets the counter", dict(current_loss=0.5, prev_loss=1.0, stagnation_count=5), {"sc": 0}),
     # Straddle the threshold: the counter must turn over within a factor of two of it,
-    # or absorb_mode='stagnation' fires on a run that is still descending.
-    # These cases leave the tuning knobs at their defaults on purpose, so a changed
-    # default shows up here rather than silently shifting every run.
+    # or absorb_mode='stagnation' fires on a run that is still descending. Defaults are
+    # left in place so a changed default shows up here.
     (
         "just under the default threshold still stagnates",
         dict(current_loss=1.0, prev_loss=1.0 + 0.9e-4, stagnation_count=3),

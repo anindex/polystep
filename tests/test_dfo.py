@@ -1,6 +1,5 @@
-"""Derivative-free machinery: the finite-difference quadratic model, the Newton and
-trust-region steps built on it, probe reuse, the multi-fidelity screen, and the polytope
-each of them needs."""
+"""Derivative-free machinery: FD quadratic model, Newton and trust-region steps, probe
+reuse, and the multi-fidelity screen."""
 
 import warnings
 
@@ -29,8 +28,8 @@ def _make_model_and_closure():
     return model, make_closure
 
 
-def test_fd_gradient_rotation_stores_direction():
-    """With use_quadratic_model=True, polytope_type="orthoplex", optimizer should store FD gradient direction."""
+def test_fd_gradient_replaces_the_ot_descent_direction():
+    """Under the quadratic model the stored direction is the FD gradient, not the OT step."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
         model,
@@ -42,30 +41,10 @@ def test_fd_gradient_rotation_stores_direction():
         max_iterations=2,
         seed=42,
     )
-    closure = make_closure(opt)
-    opt.step(closure)
+    opt.step(make_closure(opt))
 
-    # FD gradient direction should be stored (replaces OT descent direction)
-    assert opt._prev_descent_direction is not None
-    assert opt._prev_descent_direction.shape[1] == 2  # pdim
-
-
-def test_fd_gradient_rotation_produces_finite_direction():
-    """FD gradient rotation should produce finite, non-zero directions."""
-    model, make_closure = _make_model_and_closure()
-    opt = PolyStepOptimizer(
-        model,
-        particle_dim=2,
-        epsilon=0.5,
-        biased_rotation=True,
-        use_quadratic_model=True,
-        polytope_type="orthoplex",
-        max_iterations=2,
-        seed=42,
-    )
-    closure = make_closure(opt)
-    opt.step(closure)
     dir_ = opt._prev_descent_direction
+    assert dir_ is not None and dir_.shape[1] == 2
     assert torch.isfinite(dir_).all()
     assert torch.norm(dir_).item() > 1e-8
 
@@ -111,11 +90,11 @@ def test_newton_momentum_uses_fd_direction():
     )
     closure = make_closure(opt)
 
-    # Step 1: full OT - extracts FD gradient + Hessian, computes Newton direction
+    # Step 1: full OT step computes the Newton direction from FD data
     opt.step(closure)
-    assert opt._newton_direction is not None  # Newton direction computed from FD data
+    assert opt._newton_direction is not None
 
-    # Step 2: momentum - should use Newton direction (not just EMA transport)
+    # Step 2: momentum step uses the Newton direction, not just EMA transport
     opt.step(closure)
     assert opt._state.displacement_sqnorms[-1] > 0, "momentum step did not move"
 
@@ -138,17 +117,14 @@ def test_newton_momentum_fallback_without_qm():
     closure = make_closure(opt)
     opt.step(closure)
     assert opt._transport_direction_ema is not None
-    # No Newton direction when QM disabled
     assert opt._newton_direction is None
 
 
 def test_trust_region_expands_on_accurate_prediction():
     """A correct improvement prediction must not shrink the trust region.
 
-    The ratio uses negative = improvement; feeding the wrong sign made an
-    accurate improving step read as a failure and collapse the radius to the
-    floor. An expansion (multiplier > 1.0) is only reachable when the
-    signs agree.
+    The ratio uses negative = improvement; an expansion (multiplier > 1.0) is only
+    reachable when the signs agree.
     """
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
@@ -188,8 +164,8 @@ def test_newton_refinement_invalidates_warmstart_duals():
     base.step(make_closure(base))
     assert base._state.f is not None
 
-    # Same solver, but refinement moves particles after the solve, so the duals
-    # encode old positions and must be cleared instead of kept.
+    # Refinement moves particles after the solve, so the solve's duals encode old
+    # positions and must be cleared instead of kept.
     model2, make_closure2 = _make_model_and_closure()
     ref = PolyStepOptimizer(
         model2,
@@ -206,6 +182,30 @@ def test_newton_refinement_invalidates_warmstart_duals():
     ref.step(make_closure2(ref))
     assert ref._state.f is None
     assert ref._state.g is None
+
+
+def test_newton_refinement_reconciles_the_momentum_velocity():
+    """Refinement replaces the post-momentum position, so velocity must track the realized move."""
+    model, make_closure = _make_model_and_closure()
+    opt = PolyStepOptimizer(
+        model,
+        particle_dim=2,
+        epsilon=0.5,
+        solver="softmax",
+        use_quadratic_model=True,
+        polytope_type="orthoplex",
+        newton_refinement=True,
+        use_momentum=True,
+        velocity_lr=1.0,
+        num_probe=3,
+        max_iterations=3,
+        seed=42,
+    )
+    X_before = opt._state.X.clone()
+    opt.step(make_closure(opt))
+    realized = opt._state.X - X_before
+    assert realized.abs().max() > 0, "the step did not move"
+    torch.testing.assert_close(opt._state.velocity, realized)
 
 
 def test_adaptive_probes_reuses_rotation_for_stagnant_particles():
@@ -229,19 +229,17 @@ def test_adaptive_probes_reuses_rotation_for_stagnant_particles():
     assert opt._prev_rot_mats is not None
     rot_after_first = opt._prev_rot_mats.clone()
 
-    # Second step: all particles stagnant, so rotations (and cost rows) are
-    # reused unchanged rather than resampled.
+    # Second step: all particles stagnant, so rotations are reused unchanged.
     opt.step(closure, objective_token="stationary")
     torch.testing.assert_close(opt._prev_rot_mats, rot_after_first)
     assert torch.isfinite(opt._state.X).all()
 
 
 def test_multifidelity_screening_keeps_descending():
-    """Storing the raw (not dampened) cost stops a one-way ratchet that would
-    lock out directions, so the loss keeps dropping over many steps.
+    """Storing the raw (not dampened) cost avoids a one-way ratchet that would lock
+    out directions, so the loss keeps dropping over many steps.
 
-    The screen runs only when step() is handed a cheap closure and the polytope is an
-    orthoplex, so both are set up here and the saving is asserted below.
+    The screen runs only with a cheap closure and an orthoplex polytope.
     """
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
@@ -269,8 +267,7 @@ def test_multifidelity_screening_keeps_descending():
     losses = [opt.step(closure, screen_closure=screen) for _ in range(20)]
     assert all(torch.isfinite(torch.tensor(loss)) for loss in losses)
     assert opt._last_screen_savings > 0, "the screen ran no cheaper than the dense path"
-    # The ratchet this guards would leave the loss flat,
-    # which a bare `< losses[0]` would not catch.
+    # A bare `< losses[0]` would pass on a flat loss, so require a real drop.
     assert min(losses) < losses[0] * 0.80, f"loss barely moved: {losses[0]:.4f} -> {min(losses):.4f}"
 
 
@@ -287,31 +284,35 @@ def test_multifidelity_off_by_default():
     assert not opt.multifidelity_screen
 
 
-def test_multifidelity_screening_skipped_for_non_orthoplex():
-    """The contrast ranking needs the orthoplex's +/- pairs, so it must not run without
-    them. On a simplex V = pdim + 1, and the pair indexing would read the wrong vertex."""
-    model, make_closure = _make_model_and_closure()
-    with pytest.warns(UserWarning, match="antithetic vertex ordering"):
-        opt = PolyStepOptimizer(
-            model,
-            particle_dim=4,
-            epsilon=0.5,
-            polytope_type="simplex",
-            multifidelity_screen=True,
-            screen_keep_ratio=0.5,
-            num_probe=5,
-            max_iterations=2,
-            seed=42,
-        )
-    closure = make_closure(opt)
-    opt.step(closure)
-    # The second step is where screening would fire on an orthoplex.
-    opt.step(closure)
+def test_screen_ranks_by_deviation_from_the_row_mean_on_a_simplex():
+    """sum_v v = 0, so a vertex at the row mean moves the barycentre by nothing.
 
-    assert opt._last_screen_savings == 0.0, (
-        f"screening ran on a simplex polytope and reported {opt._last_screen_savings} savings; "
-        "the orthoplex-specific +/- pair indexing does not apply there"
+    Deviation from the mean is what the antithetic contrast measures, written for a
+    frame with no partner to subtract, so the screen needs no orthoplex.
+    """
+    model, _ = _make_model_and_closure()
+    x, y = torch.randn(64, 4), torch.randn(64, 2)
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    opt = PolyStepOptimizer(
+        model,
+        particle_dim=4,
+        epsilon=0.5,
+        polytope_type="simplex",
+        multifidelity_screen=True,
+        screen_keep_ratio=0.5,
+        screen_fidelity=0.25,
+        num_probe=3,
+        max_iterations=2,
+        seed=42,
     )
+
+    def closure(bp, _x=x, _y=y):
+        return ev.evaluate(bp, _x, _y)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the "screen did not run" warning would fail here
+        opt.step(closure, screen_closure=opt.screen_closure_from(closure, x, y))
+    assert opt._last_screen_savings > 0
 
 
 def test_all_dfo_features_compose():
@@ -321,12 +322,10 @@ def test_all_dfo_features_compose():
         model,
         particle_dim=2,
         epsilon=0.5,
-        # All DFO features enabled
         use_quadratic_model=True,
         polytope_type="orthoplex",
         trust_region=True,
         biased_rotation=True,
-        # Step amortization
         amortize_steps=3,
         amortize_ema=0.7,
         num_probe=3,
@@ -335,7 +334,7 @@ def test_all_dfo_features_compose():
     )
     closure = make_closure(opt)
 
-    # Run 10 steps (3+ full OT cycles with amortization)
+    # 10 steps = 3+ full OT cycles with amortization
     losses = []
     for _ in range(10):
         loss = opt.step(closure)
@@ -450,13 +449,11 @@ def test_screen_keeps_enough_vertices_for_top_k_mean():
         opt.step(closure, screen_closure=screen)
 
     # V = pdim + 1 = 5 on the default simplex; keep_ratio 0.1 rounds to 1, below the
-    # solver's default k = 3. The floor has to lift it back to k, or the solver hands
-    # mass a/k to vertices carrying only the sanitize penalty.
+    # solver's default k = 3. The floor has to lift it back to k.
     assert torch.isfinite(opt.state.X).all()
     assert opt.solver.k == 3
 
-    # The transport row is the observable: every vertex holding mass must be one the
-    # screen kept, so a row can never spread over more than k_eff of them.
+    # Every vertex holding transport mass must be one the screen kept.
     V = opt._polytope_vertices.shape[0]
     keep_v = min(V, max(1, int(round(V * opt.screen_keep_ratio)), min(opt.solver.k, V)))
     assert keep_v >= min(opt.solver.k, V), f"keep_v={keep_v} < k_eff={min(opt.solver.k, V)}"
@@ -470,14 +467,19 @@ def test_default_polytope_is_the_minimal_positive_spanning_set():
     assert opt._polytope_vertices.shape[0] == 5
 
 
-def test_orthoplex_dependent_features_warn_on_the_default_polytope():
-    """These read the orthoplex's antithetic ordering; on a simplex they are inert."""
+def test_only_newton_refinement_still_needs_the_orthoplex():
+    """The gradient and curvature are closed forms on any centred tight frame."""
     model, _ = _make_model_and_closure()
     with pytest.warns(UserWarning, match="antithetic vertex ordering"):
+        PolyStepOptimizer(model, particle_dim=4, seed=0, num_probe=1, newton_refinement=True)
+
+    # Off the orthoplex the curvature comes from the shared f(X), which needs num_probe=1.
+    with pytest.warns(UserWarning, match="num_probe=1"):
         PolyStepOptimizer(model, particle_dim=4, seed=0, num_probe=3, use_quadratic_model=True)
-    # A selection solver's screen ranks vertices directly, so it needs no pairing.
+
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        PolyStepOptimizer(model, particle_dim=4, seed=0, num_probe=1, use_quadratic_model=True, trust_region=True)
         PolyStepOptimizer(
             model, particle_dim=4, seed=0, num_probe=3, solver="min_cost_greedy", multifidelity_screen=True
         )
@@ -486,10 +488,8 @@ def test_orthoplex_dependent_features_warn_on_the_default_polytope():
 def test_screen_places_full_fidelity_values_at_the_kept_positions():
     """The screen must not disturb the values it did evaluate at full fidelity.
 
-    Everything downstream reads the assembled vector as a cost matrix. The kept entries
-    have to arrive unchanged and at the right index, or the OT solve ranks vertices by an
-    artefact of the assembly rather than by cost. The imputation of dropped entries is
-    checked separately by test_screen_masks_dropped_vertices_only_for_selection_solvers.
+    Kept entries must arrive unchanged at the right index, or the OT solve ranks
+    vertices by an artefact of the assembly rather than by cost.
     """
     from polystep._step_monolithic import _fill_screened_losses
 
@@ -512,3 +512,40 @@ def test_screen_places_full_fidelity_values_at_the_kept_positions():
         dropped = torch.ones(P * V * K, dtype=torch.bool)
         dropped[sel_idx] = False
         assert not torch.isin(out[dropped], kept).any(), "a dropped slot holds a kept vertex's value"
+
+
+def test_a_2d_cube_is_not_treated_as_an_orthoplex():
+    """cube at pdim=2 also has 4 vertices, but its halves are not antipodal.
+
+    Inferring the geometry from the vertex count read L(v0)-L(v2) as a central
+    difference: cosine to the true descent fell from 1.0 to 0.29, first sign flipped.
+    """
+    torch.manual_seed(0)
+    model = nn.Linear(2, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+    target = torch.tensor([[-0.5, 1.0]])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt = PolyStepOptimizer(
+            model,
+            particle_dim=2,
+            polytope_type="cube",
+            use_quadratic_model=True,
+            biased_rotation=True,
+            num_probe=1,
+            epsilon=0.5,
+            probe_radius=0.05,
+            step_radius=0.1,
+            seed=0,
+        )
+
+    def closure(bp):
+        w = bp["weight"].reshape(bp["weight"].shape[0], -1)
+        return ((w - target) ** 2).sum(dim=1)
+
+    opt.step(closure)
+
+    # Descent from zero weights is -grad = 2 * target, recovered exactly on a quadratic.
+    torch.testing.assert_close(opt._prev_descent_direction[0], 2.0 * target[0], rtol=1e-4, atol=1e-4)

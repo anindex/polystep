@@ -1,12 +1,4 @@
-"""PolyStep as a standard ask/tell optimizer.
-
-Exposes the Sinkhorn Step update behind the ``ask``/``tell`` interface used by
-evolution-strategy libraries (evosax, NeuroEvoBench, CMA-ES). ``ask`` returns
-candidate points (rotated polytope vertices around each particle) for the caller
-to evaluate; ``tell`` takes their fitness (lower is better), builds the cost
-matrix, and applies one softmax-weighted barycentric step. PolyStep is then a
-drop-in gradient-free optimizer comparable to any ES.
-"""
+"""PolyStep behind the ask/tell interface used by evolution-strategy libraries."""
 
 from __future__ import annotations
 
@@ -28,13 +20,13 @@ class PolyStepES:
 
     Args:
         dim: Dimensionality of a solution vector.
-        num_particles: Number of independent particles (each proposes a
-            polytope of candidates). Population size is ``num_particles * 2 * dim``.
-        epsilon: Entropic OT temperature for the softmax weighting.
+        num_particles: Number of independent particles. Population size is
+            ``num_particles * 2 * dim``.
+        epsilon: Entropic OT temperature (drives the default solver only).
         step_radius: Geometric step size along the polytope directions.
-        solver: OT solver instance. Defaults to :class:`SoftmaxSolver`; pass a
-            :class:`SinkhornSolver` for the full entropic-OT plan. A solver passed here
-            keeps its own ``epsilon``; the ``epsilon`` argument drives only the default.
+        solver: OT solver. Defaults to :class:`SoftmaxSolver`; pass a
+            :class:`SinkhornSolver` for the full entropic-OT plan. A caller-supplied
+            solver keeps its own ``epsilon``.
         scale_cost: Cost-matrix scaling passed to the solver ("mean", "max_cost",
             a float divisor, or None).
         x0: Initial position(s), shape ``(dim,)`` or ``(num_particles, dim)``.
@@ -69,14 +61,12 @@ class PolyStepES:
         self.epsilon = epsilon
         self.step_radius = step_radius
         self.scale_cost = scale_cost
-        # Follow x0 when the caller did not say: handing a CUDA x0 to CPU internals
-        # fails later inside the step with a device-mismatch on the polytope template.
+        # A CUDA x0 on CPU internals would fail later with a device mismatch.
         if device is None:
             device = x0.device if isinstance(x0, torch.Tensor) else "cpu"
         self.device = torch.device(device)
         self.dtype = dtype
-        # A caller-supplied solver keeps its own temperature; only the default one is
-        # driven by self.epsilon.
+        # Only the default solver is driven by self.epsilon.
         self._own_solver = solver is None
         self.solver = solver if solver is not None else SoftmaxSolver(epsilon=epsilon)
         if isinstance(self.solver, SinkhornSolver) and num_particles == 1:
@@ -91,7 +81,7 @@ class PolyStepES:
         if seed is not None:
             self.generator.manual_seed(seed)
 
-        self.vertices = get_orthoplex_vertices(dim, device=self.device, dtype=dtype)  # (2d, d)
+        self.vertices = get_orthoplex_vertices(dim, device=self.device, dtype=dtype)
         self.num_vertices = self.vertices.shape[0]
 
         if x0 is None:
@@ -139,15 +129,13 @@ class PolyStepES:
         )
         if self._own_solver:
             self.solver.epsilon = self.epsilon
-        # The solver defaults the source marginal to uniform 1/P, so passing None
-        # skips its host-syncing user-marginal validation on this per-step path.
+        # None skips the solver's host-syncing marginal validation on this per-step path.
         transport = self.solver.solve(cost, scale_cost=self.scale_cost).matrix
         X_new = _barycentric_projection(transport, self._pending)
         if torch.isfinite(X_new).all():
             self.X = X_new
 
-        # Both ends: NaN makes torch.min return NaN, and -inf wins forever because
-        # nothing compares below it.
+        # NaN and -inf would poison torch.min, so map both to +inf first.
         flat_cost = torch.nan_to_num(cost.reshape(-1), nan=float("inf"), neginf=float("inf"))
         fmin, idx = torch.min(flat_cost, dim=0)
         if fmin.item() < self.best_fitness:
@@ -162,11 +150,7 @@ def minimize(
     steps: int = 200,
     **kwargs,
 ) -> PolyStepES:
-    """Minimize a batched black-box ``fn: (popsize, dim) -> (popsize,)``.
-
-    Runs ``steps`` ask/tell rounds and returns the optimizer, whose
-    ``best_solution`` / ``best_fitness`` / ``mean`` hold the result.
-    """
+    """Minimize a batched black-box ``fn: (popsize, dim) -> (popsize,)`` for ``steps`` ask/tell rounds."""
     es = PolyStepES(dim, **kwargs)
     for _ in range(steps):
         candidates = es.ask()

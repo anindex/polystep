@@ -52,7 +52,6 @@ class TestPolytopes:
         dim = 4
         verts = get_simplex_vertices(dim, radius=1.0)
 
-        # Compute all pairwise distances
         n_verts = verts.shape[0]
         dists = []
         for i in range(n_verts):
@@ -61,7 +60,6 @@ class TestPolytopes:
                 dists.append(d.item())
 
         dists_t = torch.tensor(dists)
-        # All distances should be approximately equal
         assert torch.allclose(dists_t, dists_t[0] * torch.ones_like(dists_t), atol=1e-5), (
             f"Distance range: [{dists_t.min():.6f}, {dists_t.max():.6f}]"
         )
@@ -84,14 +82,13 @@ class TestRotations:
 
     @pytest.mark.parametrize("dim", [3, 5, 8])
     def test_rotation_matches_reference_qr_sampler(self, dim):
-        """The Householder subgroup sampler is distributionally identical to
-        Mezzadri sign-corrected QR, which it replaced for speed.
+        """The Householder subgroup sampler must match Mezzadri sign-corrected QR
+        distributionally, not just in moments.
 
         Moments alone would pass on samplers that are merely orthogonal, so
         compare full distributions: a two-sample KS statistic on ``tr(R)`` and on
         individual entries, against an old-vs-old control drawn from the
-        reference sampler itself. A biased sampler separates from the reference
-        while the control does not.
+        reference sampler itself.
         """
         n = 20000
 
@@ -137,9 +134,8 @@ class TestRotations:
         R = get_random_rotation_matrices(batch=n, dim=d, generator=gen)
         assert R.shape == (n, d, d)
 
-        # Empirical E[R_ij] -> 0 (Haar first moment). Std of mean over
-        # n samples is ~ sqrt(1/d) / sqrt(n); at n=8000, d=8 a 6-sigma
-        # upper bound is below 0.02.
+        # Empirical E[R_ij] -> 0 (Haar first moment). At n=8000, d=8 a 6-sigma
+        # upper bound on the mean is below 0.02.
         mean = R.mean(dim=0)
         assert mean.abs().max().item() < 0.02, f"E[R_ij] not centered: max |mean| = {mean.abs().max().item():.4f}"
 
@@ -188,7 +184,7 @@ def test_rotation_matrix_2d_against_known_angles(theta, expected):
 
 
 def test_small_batch_takes_qr_and_stays_haar_on_so():
-    """At or below ``_QR_MAX_BATCH`` one batched QR replaces the reflection loop.
+    """At or below ``_QR_MAX_BATCH`` one batched QR takes over from the reflection loop.
 
     The substitute has to be the same distribution, not merely orthogonal: assert it
     reproduces the Mezzadri sampler this file already uses as ground truth, and that it

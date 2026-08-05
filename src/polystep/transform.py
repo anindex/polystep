@@ -1,9 +1,4 @@
-"""Parameter-particle transformation utilities.
-
-Converts between nn.Module state_dict and flat particle arrays,
-handling padding, shared parameter deduplication, and reconstruction
-via ParamLayout metadata.
-"""
+"""Parameter-particle transformation utilities."""
 
 from __future__ import annotations
 
@@ -22,25 +17,14 @@ logger = logging.getLogger(__name__)
 
 
 def create_generator(seed: int, device: torch.device) -> torch.Generator:
-    """Create a seeded ``torch.Generator`` on the given device.
-
-    Args:
-        seed: Integer seed for reproducibility.
-        device: Device for the generator (must match tensors it will generate).
-
-    Returns:
-        Seeded ``torch.Generator``.
-    """
+    """Create a seeded ``torch.Generator`` on the given device."""
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     return gen
 
 
 def _element_span(tensor: torch.Tensor) -> Tuple[int, int]:
-    """Half-open byte range this tensor can touch in its storage.
-
-    From strides, so a strided view reports its extent rather than its element count.
-    """
+    """Half-open byte range this tensor can touch in its storage, from strides."""
     esize = tensor.element_size()
     start = tensor.storage_offset() * esize
     reach = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())) * esize
@@ -49,18 +33,7 @@ def _element_span(tensor: torch.Tensor) -> Tuple[int, int]:
 
 @dataclass(frozen=True)
 class ParamEntry:
-    """Metadata for a single parameter/buffer in the layout.
-
-    Attributes:
-        key: state_dict key (e.g., "fc1.weight").
-        shape: Original tensor shape.
-        dtype: Original tensor dtype.
-        offset: Element offset in the flat (deduplicated) array.
-        numel: Number of elements.
-        requires_grad: Whether the tensor requires gradient.
-        module_path: Parent module path (e.g., "fc1" for "fc1.weight").
-        shared_with: Keys sharing the same storage (empty for non-shared).
-    """
+    """Metadata for a single parameter/buffer in the layout."""
 
     key: str
     shape: Tuple[int, ...]
@@ -74,22 +47,7 @@ class ParamEntry:
 
 @dataclass(frozen=True)
 class ParamLayout:
-    """Frozen layout describing how to flatten/unflatten nn.Module parameters.
-
-    Created once via ``from_module()`` and reused for every flatten/unflatten
-    call. Stores per-entry metadata, deduplication info for shared parameters,
-    and padding/dtype information.
-
-    Attributes:
-        entries: Per-parameter metadata (only canonical/first-seen entries).
-        total_params: Total element count (deduplicated).
-        padded_size: Total after padding to ``particle_dim`` alignment.
-        particle_dim: Number of elements per particle row (default 2).
-        dominant_dtype: Most common dtype by element count.
-        shared_groups: Tuples of keys sharing the same storage.
-            The first key in each group is the canonical one stored in entries.
-        _all_keys: All state_dict keys in original order (for unflatten).
-    """
+    """Frozen layout describing how to flatten/unflatten nn.Module parameters; created once via ``from_module()``."""
 
     entries: Tuple[ParamEntry, ...]
     total_params: int
@@ -105,20 +63,7 @@ class ParamLayout:
         model: nn.Module,
         particle_dim: int = 2,
     ) -> ParamLayout:
-        """Create a ``ParamLayout`` from any ``nn.Module``.
-
-        Uses ``model.state_dict()`` to enumerate all parameters and buffers.
-        Shared tensors (same ``data_ptr()``) are deduplicated: only the first
-        occurrence is stored in *entries*; sharing relationships are recorded
-        in *shared_groups*.
-
-        Args:
-            model: Any PyTorch module.
-            particle_dim: Number of elements per particle row.
-
-        Returns:
-            Frozen ``ParamLayout`` ready for ``flatten()`` / ``unflatten()``.
-        """
+        """Create a ``ParamLayout`` from any ``nn.Module``; shared tensors are deduplicated."""
         sd = model.state_dict()
 
         if len(sd) == 0:
@@ -132,17 +77,13 @@ class ParamLayout:
                 _all_keys=(),
             )
 
-        # Pass 1: shared storage, keyed on the storage rather than the first element's
-        # address. Two views at different offsets have different data_ptr(), so a
-        # data_ptr key calls them independent and both then write the same bytes.
+        # Key shared storage on the storage, not data_ptr: views at different offsets would look independent and write the same bytes twice.
         seen_storage: dict[int, list[tuple[str, int, int, tuple]]] = {}
         canonical_entries: list[ParamEntry] = []
         shared_map: dict[str, list[str]] = {}  # canonical_key -> [alias keys]
         offset = 0
 
-        # Also collect data_ptrs of trainable params so shared aliases
-        # (e.g., tied weights) can be detected even if they appear under
-        # a different name in state_dict.
+        # Collect trainable data_ptrs so tied weights are detected under a different name too.
         param_grad = {}
         trainable_ptrs: set[int] = set()
         for name, param in model.named_parameters():
@@ -153,10 +94,8 @@ class ParamLayout:
         all_keys: list[str] = []
 
         for key, tensor in sd.items():
-            # Only trainable parameters belong in the particle array: the evaluator
-            # holds buffers frozen, so a BatchNorm running stat placed here would drift
-            # with no signal behind it. Tied params can appear under a name absent from
-            # named_parameters(), so fall back to data_ptr for those.
+            # Only trainable params belong here: buffers are frozen, and a running stat would drift with no signal.
+            # Tied params may be absent from named_parameters(), so fall back to data_ptr.
             requires_grad = param_grad.get(key, False)
             is_trainable_alias = tensor.data_ptr() in trainable_ptrs
             if not requires_grad and not is_trainable_alias:
@@ -173,10 +112,7 @@ class ParamLayout:
                 for canonical_key, c_start, c_stop, canonical_view in group:
                     if stop <= c_start or c_stop <= start:
                         continue  # disjoint slices of one buffer stay independent
-                    # Only an identical view is a tie: unflatten writes the canonical
-                    # tensor to every alias. Stride and offset matter as much as shape -
-                    # a square weight and its transpose match on pointer and shape, and
-                    # merging them silently transposes one of the two.
+                    # Only an identical view is a tie: a weight and its transpose match on pointer and shape, and merging would transpose one.
                     if view != canonical_view:
                         raise ValueError(
                             f"{key!r} and {canonical_key!r} share storage but are different views "
@@ -209,14 +145,11 @@ class ParamLayout:
         total_params = offset
 
         shared_groups: list[Tuple[str, ...]] = []
-        # Also update entries with shared_with info
         updated_entries: list[ParamEntry] = []
         for entry in canonical_entries:
             if entry.key in shared_map:
                 aliases = tuple(shared_map[entry.key])
                 shared_groups.append(aliases)
-                # Replace entry with shared_with populated
-                # shared_with contains alias keys (excluding the canonical one)
                 entry = ParamEntry(
                     key=entry.key,
                     shape=entry.shape,
@@ -229,8 +162,7 @@ class ParamLayout:
                 )
             updated_entries.append(entry)
 
-        # Log the dedup, or a shared embedding leaves an unexplained gap between the
-        # model's parameter count and the layout's.
+        # Log the dedup, or a shared embedding leaves an unexplained parameter-count gap.
         if shared_groups:
             tied_summary = ", ".join(f"{group[0]} <- {{{', '.join(group[1:])}}}" for group in shared_groups)
             logger.info(
@@ -238,13 +170,11 @@ class ParamLayout:
                 tied_summary,
             )
 
-        # Determine dominant dtype
         dtype_counts: dict[torch.dtype, int] = {}
         for entry in updated_entries:
             dtype_counts[entry.dtype] = dtype_counts.get(entry.dtype, 0) + entry.numel
         dominant_dtype = max(dtype_counts, key=dtype_counts.get) if dtype_counts else torch.float32
 
-        # Padding
         padded_size = total_params + ((-total_params) % particle_dim) if total_params > 0 else 0
 
         return cls(
@@ -258,22 +188,7 @@ class ParamLayout:
         )
 
     def batch_unflatten(self, particles_batch: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Convert N particle vectors to stacked param dicts for vmap.
-
-        Each key maps to a tensor with an extra leading batch dimension. Tied weights
-        appear once, under the canonical key: ``functional_call`` propagates a canonical
-        value to every name tied to it and rejects a dict that names both, and the
-        in-place path writes the one shared ``Parameter`` that both modules hold.
-        Use :meth:`unflatten` when the alias keys are needed, as ``load_state_dict`` does.
-
-        Args:
-            particles_batch: Tensor of shape ``(N, rows, particle_dim)`` or
-                ``(N, flat_size)``. The last dimensions are flattened internally.
-
-        Returns:
-            Dict ``{key: tensor of shape (N, *original_shape)}`` suitable for
-            ``torch.vmap`` over dimension 0.
-        """
+        """Convert N particle vectors to stacked param dicts for vmap; tied weights appear once, under the canonical key."""
         if self.total_params == 0:
             return {}
 
@@ -284,8 +199,7 @@ class ParamLayout:
         for entry in self.entries:
             param = flat[:, entry.offset : entry.offset + entry.numel]
             param = param.reshape(N, *entry.shape)
-            # Only cast if this entry's dtype differs from dominant_dtype
-            # (avoids a no-op .to() kernel launch per entry).
+            # Only cast when the dtype differs, to skip a no-op .to() kernel.
             if entry.dtype != self.dominant_dtype:
                 param = param.to(entry.dtype)
             stacked[entry.key] = param
@@ -293,18 +207,7 @@ class ParamLayout:
         return stacked
 
     def flatten(self, model: nn.Module) -> torch.Tensor:
-        """Flatten model state_dict to a 2D particle tensor.
-
-        Each entry (deduplicated) is cast to ``dominant_dtype``, concatenated,
-        padded, and reshaped to ``(N, particle_dim)``.
-
-        Args:
-            model: Module whose state_dict matches this layout.
-
-        Returns:
-            Tensor of shape ``(N, particle_dim)`` where
-            ``N * particle_dim >= total_params``.
-        """
+        """Flatten a model state_dict to a 2D particle tensor."""
         if self.total_params == 0:
             return torch.zeros(0, self.particle_dim, dtype=self.dominant_dtype)
 
@@ -323,19 +226,7 @@ class ParamLayout:
         return raveled.reshape(-1, self.particle_dim)
 
     def unflatten(self, particles: torch.Tensor) -> OrderedDict:
-        """Reconstruct a state_dict from a particle tensor.
-
-        Reverses ``flatten()``: slices the flat array by offset/numel,
-        reshapes to original shape, casts back to original dtype, and
-        handles shared parameters by assigning the canonical tensor to
-        all alias keys.
-
-        Args:
-            particles: Tensor of shape ``(N, particle_dim)``.
-
-        Returns:
-            ``OrderedDict`` compatible with ``model.load_state_dict()``.
-        """
+        """Reconstruct a state_dict from a particle tensor, assigning shared params to all alias keys."""
         if self.total_params == 0:
             return OrderedDict()
 
@@ -347,7 +238,6 @@ class ParamLayout:
             param = param.reshape(entry.shape).to(entry.dtype)
             reconstructed[entry.key] = param
 
-            # Shared parameters: assign the same tensor to alias keys
             for alias_key in entry.shared_with:
                 reconstructed[alias_key] = param
 

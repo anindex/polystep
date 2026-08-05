@@ -40,11 +40,8 @@ class TestCosineEpsilon:
         assert s.at(500) == pytest.approx(0.2), "past the horizon the value must clamp, not wrap"
 
     def test_inferred_horizon_matches_linear_on_a_fractional_ratio(self):
-        """``(init - target) / decay`` need not be integral; truncating it ends early.
-
-        Defaults give 99.9, and ``int()`` made the cosine reach the floor at t=99 while
-        the LinearEpsilon it claims to transfer from first floors at t=100.
-        """
+        """``(init - target) / decay`` need not be integral; truncating it ends the
+        cosine before the LinearEpsilon it transfers from reaches the floor."""
         cos = CosineEpsilon(init=1.0, decay=0.01, target=1e-3)
         lin = LinearEpsilon(init=1.0, decay=0.01, target=1e-3)
         first_floor = next(t for t in range(200) if lin.at(t) == pytest.approx(lin.target))
@@ -115,7 +112,6 @@ class TestProgressiveEpsilon:
             decrease_factor=0.5,
             ema_alpha=0.0,
         )
-        # Repeatedly decrease
         for _ in range(100):
             pe.update(n_iters=1, max_iterations=1000, converged=True)
         assert pe.at() >= 0.01
@@ -129,7 +125,6 @@ class TestProgressiveEpsilon:
             increase_factor=2.0,
             ema_alpha=0.0,
         )
-        # Repeatedly increase
         for _ in range(100):
             pe.update(n_iters=999, max_iterations=1000, converged=False)
         assert pe.at() <= 5.0
@@ -147,7 +142,6 @@ class TestProgressiveEpsilon:
             ema_alpha=0.7,  # heavy smoothing
         )
         values = [pe.at()]
-        # Alternate fast and slow convergence
         for i in range(10):
             if i % 2 == 0:
                 pe.update(n_iters=1, max_iterations=1000, converged=True)  # fast
@@ -155,11 +149,8 @@ class TestProgressiveEpsilon:
                 pe.update(n_iters=999, max_iterations=1000, converged=False)  # slow
             values.append(pe.at())
 
-        # With heavy EMA smoothing, changes between consecutive steps
-        # should be relatively small (smoothed, not jumping wildly)
+        # EMA=0.7 caps each step at 30% of the raw change, so steps stay small.
         max_change = max(abs(values[i + 1] - values[i]) for i in range(len(values) - 1))
-        # Without EMA, changes would be large (0.8x or 1.5x swings)
-        # With EMA=0.7, each step changes by at most 30% of the raw change
         assert max_change < 0.5, (
             f"EMA smoothing failed: max step change = {max_change:.4f}, values = {[f'{v:.4f}' for v in values]}"
         )
@@ -191,12 +182,8 @@ class TestProgressiveEpsilonIsDrivenByEveryStepDriver:
         return seen
 
     def test_scheduler_passed_as_epsilon_is_driven(self):
-        """``epsilon=ProgressiveEpsilon(...)`` must advance, not just ``auto_epsilon=True``.
-
-        The optimizer drove only the scheduler it built itself, so a user-supplied one
-        stayed frozen at ``init`` for the whole run with no warning, while the standalone
-        ``PolyStep`` solver drove the same object correctly.
-        """
+        """A user-supplied ``epsilon=ProgressiveEpsilon(...)`` must advance, not just
+        the one built by ``auto_epsilon=True``."""
         seen = self._run(auto_epsilon=False, epsilon=ProgressiveEpsilon(init=1.0, target=0.01, max_epsilon=5.0))
         assert len(set(seen)) > 1, f"epsilon pinned at {seen[0]}"
 
@@ -276,9 +263,61 @@ def test_power_decay_is_square_summable_but_not_summable():
     s = PowerDecay(init=2.0, gamma=0.1)
     assert s.at(None) == s.at(0) == 2.0
     assert s.at(1) == pytest.approx(2.0 * 2**-0.6)
-    # Decreasing, positive, and floored when asked.
     vals = [s.at(t) for t in range(50)]
     assert all(a > b > 0 for a, b in zip(vals, vals[1:]))
     assert PowerDecay(init=2.0, gamma=0.1, target=1.0).at(1000) == 1.0
     with pytest.raises(ValueError):
         PowerDecay(init=1.0, gamma=0.0)
+
+
+class TestRadiusEpsilonSemantics:
+    """A scalar radius is a multiplier on epsilon; a scheduled one is a distance.
+
+    Both entry points must apply this rule the same way.
+    """
+
+    def test_scalar_radius_is_a_multiplier_on_epsilon(self):
+        from polystep.epsilon import radius_epsilon_factor, resolve_radius
+
+        assert resolve_radius(2.0, 0, 0.5) == 1.0
+        assert resolve_radius(2.0, 999, 0.5) == 1.0  # no iteration dependence
+        assert radius_epsilon_factor(2.0, 0.5) == 0.5
+
+    def test_scheduled_radius_is_the_physical_distance(self):
+        from polystep.epsilon import radius_epsilon_factor, resolve_radius
+
+        sched = CosineEpsilon(init=32.0, target=8.0, decay=(32.0 - 8.0) / 100)
+        assert resolve_radius(sched, 0, 0.5) == 32.0
+        assert resolve_radius(sched, 10**6, 0.5) == pytest.approx(8.0)
+        assert radius_epsilon_factor(sched, 0.5) == 1.0
+        # Epsilon must not enter: a different temperature gives the same distance.
+        assert resolve_radius(sched, 7, 0.5) == resolve_radius(sched, 7, 50.0)
+
+    @pytest.mark.parametrize("radius", [2.0, CosineEpsilon(init=4.0, target=1.0, decay=0.03)])
+    def test_both_entry_points_agree(self, radius):
+        """PolyStepOptimizer's expression and PolyStep's must give the same distance."""
+        from polystep.epsilon import radius_epsilon_factor, resolve_radius
+
+        eps, iteration = 0.5, 13
+        resolved = radius.at(iteration) if hasattr(radius, "at") else radius
+        optimizer_side = resolved * radius_epsilon_factor(radius, eps) * 1.0
+        solver_side = resolve_radius(radius, iteration, eps)
+        assert optimizer_side == solver_side
+
+    def test_solver_accepts_a_scheduled_radius_without_raising(self):
+        """A scheduled radius must not raise a TypeError in the solver."""
+        import torch
+
+        from polystep.solver import PolyStep
+
+        solver = PolyStep.create(
+            lambda x: (x**2).sum(dim=-1),
+            dim=2,
+            epsilon=0.5,
+            step_radius=CosineEpsilon(init=1.0, target=0.25, decay=0.05),
+            probe_radius=CosineEpsilon(init=2.0, target=0.5, decay=0.05),
+            max_iterations=3,
+        )
+        state = solver.run(torch.zeros(4, 2))
+        assert len(state.costs) == 3
+        assert all(c == c for c in state.costs)  # no NaN

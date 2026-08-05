@@ -1,11 +1,4 @@
-"""Block-wise step methods: per-block and subspace+block OT solves.
-
-Both modes run the same sweep: split the particles into blocks, and for each block
-sample a polytope, score its probes, solve a small OT problem and move the block to
-the barycentre. They differ only in what a candidate is (a full-model configuration
-with one block row replaced, or a subspace coordinate vector) and in the basis
-maintenance that follows the sweep, so the shared parts live in the helpers here.
-"""
+"""Block-wise step methods: per-block and subspace+block OT solves."""
 
 from __future__ import annotations
 
@@ -26,17 +19,20 @@ from .blockwise import (
 )
 from .costs import scale_cost_matrix
 from .solvers._shared import loss_buffer_dtype, recenter_cost, sanitize_cost, solver_health
-from .epsilon import feed_solver_stats
+from .epsilon import feed_solver_stats, radius_epsilon_factor
 from .dynamics import (
     apply_momentum,
     compute_momentum_coefficient,
-    update_radius_multiplier,
-    update_stagnation,
 )
 from .geometry import apply_biased_rotation, get_random_rotation_matrices
-from .solvers import SinkhornSolver
 from .solvers.base import SolverResult
-from ._step_core import invalidate_for_basis_change
+from ._step_core import (
+    invalidate_for_basis_change,
+    record_saturation,
+    update_amortized_direction,
+    update_stagnation_and_radius,
+    warn_all_nonfinite,
+)
 from ._step_monolithic import _rotation_due, maintain_per_layer_subspace, record_displacement
 
 logger = logging.getLogger(__name__)
@@ -55,31 +51,24 @@ class _BlockOutcome:
     evals: int
     converged: bool
     n_iters: int
-    # Candidates behind this block's means. Blocks differ in particle count, so a plain
-    # average over blocks lets a one-particle block outvote a 500-particle one.
+    # Candidate count behind this block's means; a plain average would let a one-particle block outvote a 500-particle one.
     weight: int
 
 
 def _resolve_geometry(opt, state, iteration):
-    """Epsilon, OT epsilon and the two radii for this step.
-
-    Scheduled radii carry their own magnitude, so they bypass the epsilon multiply.
-    """
+    """Epsilon, OT epsilon and the two radii for this step."""
     current_eps = opt._get_epsilon(iteration)
     radius_mult = state.radius_multiplier if opt.use_adaptive_radius else 1.0
-    step_r = opt._get_step_radius(iteration) * (1.0 if hasattr(opt.step_radius, "at") else current_eps) * radius_mult
-    probe_r = opt._get_probe_radius(iteration) * (1.0 if hasattr(opt.probe_radius, "at") else current_eps) * radius_mult
-    # Thm. 4.2 condition (iv); no-op when probe_radius_jitter == 0.
+    step_r = opt._get_step_radius(iteration) * radius_epsilon_factor(opt.step_radius, current_eps) * radius_mult
+    probe_r = opt._get_probe_radius(iteration) * radius_epsilon_factor(opt.probe_radius, current_eps) * radius_mult
+    # Probe-radius jitter; no-op when probe_radius_jitter == 0.
     probe_r = opt._apply_probe_radius_jitter(probe_r)
     ent_eps = opt._get_ent_epsilon(iteration)
     return current_eps, ent_eps if ent_eps is not None else current_eps, step_r, probe_r
 
 
 def _max_group(polytopes, probes) -> int:
-    """The widest ``V * K`` candidate group over every block.
-
-    Group width is per block; the candidate buffer is allocated once per sweep.
-    """
+    """The widest ``V * K`` candidate group over every block."""
     if not polytopes:
         return 1
     return max(p.shape[0] for p in polytopes) * probes.numel()
@@ -117,15 +106,42 @@ def _chunk_indices(global_indices, V, K):
     return i_idx, vk // K, vk % K
 
 
-def _cost_from_losses(losses, P, V, K):
-    """Make the losses safe for the solver, then average the probe axis away.
-
-    Sanitize first, matching the monolithic driver: averaging first lets one non-finite
-    probe carry its whole vertex to the penalty, where sanitizing first keeps the signal
-    from the probes that did evaluate.
-    """
+def _cost_from_losses(opt, losses, P, V, K):
+    """Sanitize the losses, average the probe axis away, record an all-non-finite block."""
+    flag = ~torch.isfinite(losses).any()
+    seen = opt._all_nonfinite
+    opt._all_nonfinite = flag if seen is None else seen & flag
     safe = sanitize_cost(losses)
     return safe.reshape(P, V) if K == 1 else safe.reshape(P, V, K).mean(dim=-1)
+
+
+def _block_loop_setup(opt, X_probe, device):
+    """``(P, V, K, D, total_evals, losses, all_indices, d_offsets, group)`` for one block."""
+    P, V, K, D = X_probe.shape
+    total_evals = P * V * K
+    # Counted here because the site-aware evaluators bypass the closure.
+    opt.candidate_evals += int(total_evals)
+    losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
+    all_indices, d_offsets = _index_buffers(opt, total_evals, D, device)
+    # The delta path scores a whole particle's group at once, so a chunk holds whole groups.
+    return P, V, K, D, total_evals, losses, all_indices, d_offsets, V * K
+
+
+def _finish_block(opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon):
+    """Cost matrix and OT solve for one block."""
+    return _solve_block(
+        opt,
+        state,
+        block_idx,
+        _cost_from_losses(opt, losses, P, V, K),
+        block_X,
+        verts,
+        rot_mats,
+        X_vertices,
+        step_r,
+        ot_epsilon,
+        P * V * K,
+    )
 
 
 def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon, evals):
@@ -135,8 +151,7 @@ def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X
     opt.solver.epsilon = ot_epsilon
 
     if opt._use_fused_softmax:
-        # Only the fused kernel reads the marginal; barycentric_projection normalises
-        # by the realised row sum.
+        # Only the fused kernel reads the marginal; the projection normalises by the realised row sum.
         block_a = torch.ones(P_block, device=device, dtype=dtype) / P_block
         scaled_cost = scale_cost_matrix(recenter_cost(cost_matrix)[0], opt.scale_cost)
         X_new_block, transport_matrix = opt._compiled.fused_softmax_project(
@@ -159,14 +174,12 @@ def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X
                 init_f = init_f + opt._dual_momentum_beta * (init_f - ppf)
                 init_g = init_g + opt._dual_momentum_beta * (init_g - ppg)
 
-        # a defaults to uniform 1/P_block inside the solver; pass None to skip the
-        # host-syncing user-marginal validation.
+        # a defaults to uniform 1/P_block inside the solver; pass None to skip host-sync validation.
         kwargs = dict(cost_matrix=cost_matrix, init_f=init_f, init_g=init_g, scale_cost=opt.scale_cost)
-        if isinstance(opt.solver, SinkhornSolver) and state.last_solve_eps is not None:
-            # Rescale warm-started duals when the epsilon schedule moves.
-            kwargs["init_eps"] = state.last_solve_eps
         ot_result = opt.solver.solve(**kwargs)
         X_new_block = opt._compiled.barycentric_projection(ot_result.matrix, X_vertices)
+
+    record_saturation(opt, state, ot_result.matrix, step_r)
 
     # Per-particle step-radius jitter; no-op when step_radius_jitter == 0.
     X_new_block = opt._apply_particle_step_jitter(block_X, X_new_block)
@@ -191,11 +204,7 @@ def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X
 
 
 def _index_buffers(opt, total_evals: int, D: int, device):
-    """Cached ``(arange(total_evals), arange(D))`` for a block sweep.
-
-    The monolithic driver keeps its index tensors across steps; blockwise rebuilt them
-    once per block per step. Both are read-only, so one buffer per size is enough.
-    """
+    """Cached ``(arange(total_evals), arange(D))`` for a block sweep."""
     cache = getattr(opt, "_block_index_buffers", None)
     if cache is None or cache[0] != device:
         cache = opt._block_index_buffers = (device, {}, {})
@@ -210,12 +219,7 @@ def _index_buffers(opt, total_evals: int, D: int, device):
 
 
 def _delta_context(opt, attr: str = "_sparse_delta_evaluator"):
-    """The delta evaluator and the batch it scores against, or ``None`` for the
-    materializing path.
-
-    Both need the batch the caller registered: the evaluators score a model directly
-    rather than going through the closure, so without it there is nothing to score.
-    """
+    """The delta evaluator and the batch it scores against, or ``None`` for the materializing path."""
     fused_inputs = getattr(opt, "_fused_inputs", None)
     if fused_inputs is None:
         return None, None, None
@@ -256,48 +260,42 @@ def _finish_step(opt, state, X, X_new_full, blocks, outcomes, iteration, current
             state._prev_prev_block_duals = None
         if opt.biased_rotation:
             opt._prev_block_descent_directions = None
+        # A reverted X with poisoned sqrt(C_diag) can't recover; keep in step with the monolithic revert.
+        if opt.use_covariance_adaptation:
+            if state.p_c is not None:
+                state.p_c = torch.zeros_like(state.p_c)
+            if state.p_sigma is not None:
+                state.p_sigma = torch.zeros_like(state.p_sigma)
+            if state.C_diag is not None:
+                state.C_diag = torch.ones_like(state.C_diag)
         nan_reverted = True
 
-    if opt.amortize_steps > 1:
-        if nan_reverted:
-            opt._transport_direction_ema = None
-        else:
-            # The pure OT move, taken before momentum. Reading state.X would fold in
-            # beta * velocity, which the next cheap step re-applies on top of its own.
-            raw_direction = (X_new_full - X).detach()
-            alpha = opt.amortize_ema
-            if opt._transport_direction_ema is None:
-                opt._transport_direction_ema = raw_direction
-            else:
-                opt._transport_direction_ema = alpha * opt._transport_direction_ema + (1.0 - alpha) * raw_direction
+    # The pure OT move, before momentum; state.X would fold in beta * velocity.
+    update_amortized_direction(opt, (X_new_full - X).detach(), nan_reverted)
 
     # One host transfer per reduction, weighted by candidate count.
     _w = torch.tensor([float(o.weight) for o in outcomes], device=outcomes[0].model_loss.device if outcomes else None)
     _w = _w / _w.sum().clamp(min=1.0)
-    avg_model_loss = (torch.stack([o.model_loss for o in outcomes]) * _w).sum().item() if outcomes else 0.0
-    # Tracked unconditionally: absorb_mode="stagnation" reads this counter, which
-    # use_adaptive_radius (default False) does not gate.
-    prev_loss_for_radius = state.prev_loss
-    state.stagnation_count, state.prev_loss = update_stagnation(
-        avg_model_loss, state.prev_loss, state.stagnation_count, stagnation_threshold=opt.stagnation_threshold
-    )
-    if opt.use_adaptive_radius:
-        state.radius_multiplier, state.stagnation_count = update_radius_multiplier(
-            avg_model_loss,
-            prev_loss_for_radius,
-            state.stagnation_count,
-            state.radius_multiplier,
-            stagnation_patience=opt.stagnation_patience,
-            radius_increase=opt.radius_increase,
-            radius_decrease=opt.radius_decrease,
-            radius_min=opt.radius_min,
-            radius_max=opt.radius_max,
-        )
+    _nonfinite = opt._all_nonfinite
+    if outcomes:
+        avg_model_loss, _all_nonfinite = torch.stack(
+            [
+                (torch.stack([o.model_loss for o in outcomes]).to(_w.dtype) * _w).sum(),
+                _nonfinite.to(_w.dtype) if _nonfinite is not None else _w.new_zeros(()),
+            ]
+        ).tolist()
+    else:
+        avg_model_loss, _all_nonfinite = 0.0, 0.0
+    if _all_nonfinite:
+        # Every block's cost is the sanitize penalty, so it is not a loss.
+        avg_model_loss = float("inf")
+        warn_all_nonfinite(opt)
+    # Tracked unconditionally: absorb_mode="stagnation" reads this counter.
+    update_stagnation_and_radius(opt, state, avg_model_loss)
 
-    # From the realised move: the per-block descents ran before momentum, so they
-    # describe a move other than the one taken.
+    # From the realised move; per-block descents ran before momentum.
     state.costs.append(avg_model_loss)
-    all_converged = all(o.converged for o in outcomes)
+    all_converged = all(o.converged for o in outcomes) and not _all_nonfinite
     state.linear_convergence.append(all_converged)
     # One update for the whole sweep: the slowest block sets the pace.
     feed_solver_stats(
@@ -311,8 +309,9 @@ def _finish_step(opt, state, X, X_new_full, blocks, outcomes, iteration, current
     )
     state.iteration_count += 1
 
-    # Stale NaN-causing duals must not overwrite the clean reset above.
-    if not nan_reverted:
+    # Stale NaN-causing duals must not overwrite the clean reset above. An all-non-finite
+    # sweep solved a fabricated flat matrix, so its duals are not a warm start either.
+    if not nan_reverted and not _all_nonfinite:
         if opt._dual_momentum_beta > 0.0:
             state._prev_prev_block_duals = (
                 [
@@ -329,13 +328,10 @@ def _finish_step(opt, state, X, X_new_full, blocks, outcomes, iteration, current
 
 
 def step_blockwise(opt, closure: Callable) -> float:
-    """Per-block OT solve with full-model closure calls.
-
-    Each block gets its own polytope, rotation and OT solve in ``particle_dim`` space.
-    A candidate is the full configuration with one probed row of one block replaced,
-    evaluated in chunks to bound memory.
-    """
+    """Per-block OT solve with full-model closure calls."""
     state = opt._state
+    # Cleared per step, or a stale flag would read as this step's verdict.
+    opt._all_nonfinite = None
     X = state.X  # (total_particles, particle_dim)
     iteration = state.iteration_count
     device = X.device
@@ -343,8 +339,7 @@ def step_blockwise(opt, closure: Callable) -> float:
 
     current_eps, ot_epsilon, step_r, probe_r = _resolve_geometry(opt, state, iteration)
 
-    # Per-layer blocks pad each entry independently, so their offsets differ from
-    # ParamLayout, which concatenates every entry and pads once at the end.
+    # Per-layer blocks pad each entry independently, so offsets differ from ParamLayout, which pads once at the end.
     total_flat_size = sum(b.flat_end - b.flat_start for b in blocks)
     block_flat = layout_flat_to_block_flat(X.reshape(-1), blocks, opt.layout)
     all_block_particles = split_particles(block_flat.reshape(-1, opt._particle_dim), blocks)
@@ -352,24 +347,19 @@ def step_blockwise(opt, closure: Callable) -> float:
     if opt._probes.device != device or opt._probes.dtype != X.dtype:
         opt._probes = opt._probes.to(device=device, dtype=X.dtype)
     probes = opt._probes
-    # Budget the chunk on elements, like the monolithic path; a fixed chunk OOMs
-    # on large models.
+    # Budget the chunk on elements; a fixed chunk OOMs on large models.
     chunk = opt.chunk_size or max(1, (1 << 26) // max(1, total_flat_size))
-    # The delta path rounds its stride up to a whole V*K group, which exceeds chunk when
-    # chunk is smaller, so the buffer covers the widest group.
+    # The delta path rounds its stride up to a whole V*K group, so the buffer covers the widest group.
     chunk = max(chunk, _max_group(opt._block_polytopes, probes))
 
     sparse_delta, fused_inputs, fused_targets = _delta_context(opt)
-    # No assumption about the module set, so it covers the blocks the Linear-only
-    # sparse delta declines (conv, norm, attention, custom).
+    # Covers the blocks the Linear-only sparse delta declines (conv, norm, attention, custom).
     site_vmap = getattr(opt, "_site_vmap_evaluator", None) if fused_inputs is not None else None
     site_owner = sparse_delta if sparse_delta is not None else site_vmap
     base_sd = opt.layout.unflatten(X) if site_owner is not None else None
     pdim_arange = torch.arange(opt._particle_dim, device=device)
 
-    # Candidates are written straight into layout order, so there is one buffer rather
-    # than a block-order build plus a permutation copy per chunk. The trailing column
-    # absorbs per-block padding, which has no layout counterpart.
+    # Candidates are written straight into layout order; the trailing column absorbs per-block padding.
     base_layout = blocks_to_layout_flat(
         reassemble_blocks(all_block_particles, blocks, total_flat_size), blocks, opt.layout
     )
@@ -390,18 +380,8 @@ def step_blockwise(opt, closure: Callable) -> float:
             opt, state, block, block_X, opt._block_polytopes, block_idx, probes, step_r, probe_r, descent_dirs
         )
 
-        P, V, K, D = X_probe.shape
-        total_evals = P * V * K
-        losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
-        all_indices, d_offsets = _index_buffers(opt, total_evals, D, device)
-
-        # The delta path scores a whole particle's group at once, so a chunk holds
-        # whole groups: a ragged one would split a group across two calls.
-        group = V * K
-        # A single-entry block maps block position to layout position by a constant
-        # shift, so the run a candidate perturbs stays contiguous and its layout offset
-        # is arithmetic rather than a device read. A grouped block can straddle two
-        # entries, so it keeps the dense path.
+        P, V, K, D, total_evals, losses, all_indices, d_offsets, group = _block_loop_setup(opt, X_probe, device)
+        # A single-entry block maps block to layout by a constant shift; a grouped block can straddle entries, so it keeps the dense path.
         entry = opt.layout.entries[block.leaf_indices[0]] if len(block.leaf_indices) == 1 else None
         block_chunk = max(group, (chunk // group) * group) if site_owner is not None and entry else chunk
 
@@ -416,8 +396,7 @@ def step_blockwise(opt, closure: Callable) -> float:
                 owner = site_owner
                 site = owner.resolve_site(offsets, D, span)
                 if site is None and site_vmap is not None and owner is not site_vmap:
-                    # The sparse-delta correction is confined to Linear layers; the
-                    # site-aware vmap still shares the graph ahead of any entry.
+                    # The sparse-delta correction is confined to Linear layers; vmap shares the graph ahead of any entry.
                     owner = site_vmap
                     site = owner.resolve_site(offsets, D, span)
                 if site is not None:
@@ -433,28 +412,16 @@ def step_blockwise(opt, closure: Callable) -> float:
 
             batch = batch_buf[:width]
             batch[:, : opt.layout.padded_size].copy_(base_layout)
-            # All D coordinates of the probed row in one scatter, mapped to layout
-            # columns; a per-coordinate loop costs a host sync each.
+            # All D coordinates of the probed row in one scatter; a per-coordinate loop costs a host sync each.
             col_idx = layout_columns[(block.flat_start + i_idx * D).unsqueeze(1) + d_offsets]
             batch.scatter_(1, col_idx, X_probe[i_idx, v_idx, k_idx])
 
             chunk_losses = closure(opt.layout.batch_unflatten(batch[:, : opt.layout.padded_size]))
             losses[chunk_start:chunk_end] = chunk_losses.to(losses.dtype)
 
-        cost_matrix = _cost_from_losses(losses, P, V, K)
         outcomes.append(
-            _solve_block(
-                opt,
-                state,
-                block_idx,
-                cost_matrix,
-                block_X,
-                verts,
-                rot_mats,
-                X_vertices,
-                step_r,
-                ot_epsilon,
-                total_evals,
+            _finish_block(
+                opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon
             )
         )
 
@@ -467,19 +434,10 @@ def step_blockwise(opt, closure: Callable) -> float:
 
 
 def step_subspace_blockwise(opt, closure: Callable) -> float:
-    """Per-block OT in subspace coordinates.
-
-    A global projection compresses the full parameters to subspace coordinates, and
-    the blocks partition those coordinates into independent OT solves. The forward
-    count is unchanged: an orthoplex spends ``2 * subspace_dim * K`` evaluations
-    either way.
-
-    Cost evaluation stays global. Each probe perturbs one block's coordinates, the
-    projection reconstructs the full parameters, and the whole model is evaluated, so
-    cross-block interaction is captured. Absorption and rotation are synchronised: a
-    single basis serves every block, so it is folded and redrawn once per sweep.
-    """
+    """Per-block OT in subspace coordinates."""
     state = opt._state
+    # Cleared per step, or a stale flag would read as this step's verdict.
+    opt._all_nonfinite = None
     X = state.X  # (num_sub_particles, subspace_particle_dim)
     iteration = state.iteration_count
     device = X.device
@@ -488,13 +446,12 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
     current_eps, ot_epsilon, step_r, probe_r = _resolve_geometry(opt, state, iteration)
 
-    # Cache the coord-to-param projection before any rotation below, so the probes
-    # and the closing _sync_model share one basis.
+    # Cache the coord-to-param projection so probes and the closing _sync_model share one basis.
     opt._update_sampling_projection()
     proj_used = opt._sampling_projection if opt._sampling_projection is not None else state.projection
 
     pre_step_sub_coords = None
-    if opt._adaptive or opt._cma_subspace or opt._per_layer_projections:
+    if opt._adaptive or opt._per_layer_projections:
         pre_step_sub_coords = X.reshape(-1)[:sub_dim].clone()
 
     all_block_particles = split_subspace_to_blocks(X.reshape(-1)[:sub_dim], blocks)
@@ -502,15 +459,12 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     if opt._probes.device != device or opt._probes.dtype != X.dtype:
         opt._probes = opt._probes.to(device=device, dtype=X.dtype)
     probes = opt._probes
-    # A chunk costs the coordinate buffer plus one full weight set per candidate, since
-    # any chunk the delta path declines falls back to reconstruct_batch.
+    # A chunk costs the coordinate buffer plus one full weight set per candidate.
     chunk = opt.chunk_size or max(1, (1 << 26) // max(1, sub_dim + opt.layout.total_params))
     # See step_blockwise: the dense fallback inherits the group-rounded stride.
     chunk = max(chunk, _max_group(opt._subspace_block_polytopes, probes))
 
-    # A candidate perturbs one particle's coordinate run, so a run that sits inside one
-    # layer's coordinate block moves only that layer's weight. The barycentre weights it
-    # corrects against are reconstructed once per sweep rather than once per candidate.
+    # A run inside one layer's coordinate block moves only that layer's weight; the barycentre weights are reconstructed once per sweep.
     subspace_delta, fused_inputs, fused_targets = _delta_context(opt, "_subspace_delta_evaluator")
     if not opt._hybrid:
         subspace_delta = None
@@ -521,8 +475,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     )
 
     base_subspace = reassemble_blocks_to_subspace(all_block_particles, blocks, sub_dim)
-    # One trailing scratch column absorbs writes for the padded tail of the last
-    # block, so the scatter needs no validity mask and no host sync.
+    # One trailing scratch column absorbs padded-tail writes, so the scatter needs no mask.
     batch_buf = base_subspace.new_empty((chunk, sub_dim + 1))
 
     _reset_dual_momentum_on_epsilon_jump(state, ot_epsilon)
@@ -547,14 +500,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             descent_dirs,
         )
 
-        P, V, K, D = X_probe.shape
-        total_evals = P * V * K
-        losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
-        all_indices, d_offsets = _index_buffers(opt, total_evals, D, device)
-
-        # The delta path scores a whole particle's group at once, so a chunk holds
-        # whole groups: a ragged one would split a group across two calls.
-        group = V * K
+        P, V, K, D, total_evals, losses, all_indices, d_offsets, group = _block_loop_setup(opt, X_probe, device)
         block_chunk = max(group, (chunk // group) * group) if subspace_delta is not None else chunk
 
         for chunk_start in range(0, total_evals, block_chunk):
@@ -563,8 +509,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             i_idx, v_idx, k_idx = _chunk_indices(all_indices[chunk_start:chunk_end], V, K)
 
             if subspace_delta is not None:
-                # This chunk covers whole groups, so its coordinate span follows from
-                # arithmetic with no read back from the device.
+                # Whole groups, so the coordinate span follows from arithmetic with no device read.
                 g0, g1 = chunk_start // group, chunk_end // group
                 lo = block.flat_start + g0 * D
                 spec = subspace_delta.resolve_site(state.subspace, lo, block.flat_start + g1 * D, sub_dim)
@@ -593,20 +538,9 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
             chunk_losses = closure(_reconstruct(opt, state, proj_used, coords))
             losses[chunk_start:chunk_end] = chunk_losses.to(losses.dtype)
 
-        cost_matrix = _cost_from_losses(losses, P, V, K)
         outcomes.append(
-            _solve_block(
-                opt,
-                state,
-                block_idx,
-                cost_matrix,
-                block_X,
-                verts,
-                rot_mats,
-                X_vertices,
-                step_r,
-                ot_epsilon,
-                total_evals,
+            _finish_block(
+                opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon
             )
         )
 
@@ -627,7 +561,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
 
 def _reconstruct(opt, state, proj_used, coords):
     """Full parameters for a batch of subspace coordinate vectors."""
-    if opt._adaptive or opt._cma_subspace:
+    if opt._adaptive:
         return state.subspace.reconstruct_batch(proj_used, state.base_params, coords)
     if opt._per_layer_projections:
         return state.subspace.reconstruct_batch(state.hybrid_projections, state.base_params, coords)
@@ -635,20 +569,14 @@ def _reconstruct(opt, state, proj_used, coords):
 
 
 def _maintain_subspace(opt, state, blocks, avg_model_loss, pre_step_sub_coords) -> None:
-    """Displacement tracking, absorption and rotation after a subspace sweep.
-
-    CMAAdaptiveSubspace wraps AdaptiveSubspace by composition, not inheritance, so it
-    is tested separately or CMA runs never rotate or absorb. A per-layer subspace
-    keeps its basis in ``hybrid_projections`` rather than ``state.projection``, so it
-    takes the second branch.
-    """
+    """Displacement tracking, absorption and rotation after a subspace sweep."""
     if opt._per_layer_projections:
         if pre_step_sub_coords is not None and maintain_per_layer_subspace(
             opt, state, avg_model_loss, pre_step_sub_coords
         ):
             state.block_duals = [(None, None) for _ in blocks]
         return
-    if not (opt._adaptive or opt._cma_subspace):
+    if not opt._adaptive:
         return
 
     from .projection import SparseRandomProjection
@@ -680,19 +608,18 @@ def _maintain_subspace(opt, state, blocks, avg_model_loss, pre_step_sub_coords) 
         state.displacement_history_count = 0
         invalidate_for_basis_change(opt, state)
         state.absorb_count += 1
-        # Clear the stagnation counter, else absorb_mode='stagnation' stays triggered
-        # on a plateau and redraws the basis every step. The absorb re-anchors the
-        # origin, so the old loss history no longer applies.
+        # Clear the stagnation counter, else a plateau redraws the basis every step.
         state.stagnation_count = 0
         state.prev_loss = avg_model_loss
-        if opt._cma_subspace and opt.use_covariance_adaptation:
+        if opt.use_covariance_adaptation:
             state.p_c = torch.zeros_like(state.p_c)
             state.p_sigma = torch.zeros_like(state.p_sigma)
             state.C_diag = torch.ones_like(state.C_diag)
+    elif opt.use_covariance_adaptation:
+        # A diagonal covariance does not stay diagonal under rotation, so hold the basis between absorbs.
+        pass
     elif _rotation_due(adaptive_sub, state.iteration_count):
-        # Re-anchor the origin before rotating. The represented point is
-        # base + P @ coords, so replacing P while coords are non-zero moves the
-        # weights with no evaluation behind it.
+        # Re-anchor the origin before rotating: replacing P with non-zero coords would move the weights unevaluated.
         state.base_params, _ = adaptive_sub.absorb(
             proj_used, state.base_params, state.X.reshape(-1)[: adaptive_sub.subspace_dim]
         )
@@ -704,8 +631,7 @@ def _maintain_subspace(opt, state, blocks, avg_model_loss, pre_step_sub_coords) 
                 seed=state.projection.seed + state.iteration_count,
             )
         else:
-            # Full-space history: each entry keeps the basis it was measured in
-            # instead of being reprojected through whichever one is current.
+            # Full-space history: each entry keeps its original basis.
             hist: Optional[torch.Tensor] = (
                 state.displacement_history_full[: state.displacement_history_count]
                 if state.displacement_history_count > 0 and state.displacement_history_full is not None
