@@ -41,7 +41,6 @@ class TestInitProjection:
         P = adaptive_sub.init_projection()
         assert P.shape == (adaptive_sub.full_dim, adaptive_sub.subspace_dim)
 
-        # Orthogonality check: P.T @ P should be close to identity
         PtP = P.T @ P
         eye = torch.eye(adaptive_sub.subspace_dim)
         assert torch.allclose(PtP, eye, atol=1e-4), (
@@ -89,12 +88,10 @@ def test_rotate_random_produces_orthogonal_basis(adaptive_sub):
     P_old = sub.init_projection(generator=torch.Generator().manual_seed(0))
     P_new = sub.rotate(P_old, step=5, total_steps=100, generator=torch.Generator().manual_seed(99))
 
-    # Orthogonality
     PtP = P_new.T @ P_new
     eye = torch.eye(sub.subspace_dim)
     assert torch.allclose(PtP, eye, atol=1e-4)
 
-    # Different from old
     assert not torch.allclose(P_old, P_new, atol=1e-3), "Rotated P should differ from original"
 
 
@@ -136,8 +133,7 @@ class TestRotateDisplacement:
         P_new = sub.rotate(P, step=5, total_steps=100, displacement_history=disp)
         assert P_new.dtype == torch.bfloat16
         assert P_new.shape == (sub.full_dim, sub.subspace_dim)
-        # The contract is orthonormal columns, not just the right box of numbers:
-        # a bf16 QR that silently degraded would still pass a shape check.
+        # The contract is orthonormal columns; a degraded bf16 QR still passes a shape check.
         gram = P_new.float().T @ P_new.float()
         assert torch.allclose(gram, torch.eye(sub.subspace_dim), atol=5e-2), gram.diagonal()[:4]
 
@@ -196,8 +192,7 @@ class TestRotateDisplacement:
 
         P = sub.init_projection(generator=torch.Generator().manual_seed(0))
 
-        # Create displacement history with a strong dominant direction
-        # All rows point mostly in the same direction in subspace
+        # Displacement history with one strong dominant direction.
         torch.manual_seed(42)
         dominant_dir = torch.randn(subspace_dim)
         dominant_dir = dominant_dir / dominant_dir.norm()
@@ -207,7 +202,6 @@ class TestRotateDisplacement:
             noise = torch.randn(subspace_dim) * 0.01
             disp_history[i] = dominant_dir * 10.0 + noise
 
-        # Project dominant direction to full space
         dominant_full = P @ dominant_dir
         dominant_full = dominant_full / dominant_full.norm()
 
@@ -215,8 +209,7 @@ class TestRotateDisplacement:
             P, step=50, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(99)
         )
 
-        # The new P should have at least one column correlated with the
-        # projected dominant direction. Check max absolute dot product.
+        # The new basis must have a column aligned with the dominant direction.
         dot_products = (P_new.T @ dominant_full).abs()
         max_dot = dot_products.max().item()
 
@@ -228,11 +221,7 @@ class TestRotateDisplacement:
         )
 
     def test_svd_ratio_zero_keeps_no_displacement_direction(self):
-        """``svd_ratio_init`` defaults to 0, which must mean none.
-
-        A ``max(1, ...)`` floor forced the top singular vector in at the documented
-        default, so the basis was never fully random.
-        """
+        """``svd_ratio_init=0`` must keep the basis fully random, with no singular vector forced in."""
         sub = AdaptiveSubspace(
             full_dim=100, subspace_dim=20, rotation_mode="displacement", svd_ratio_init=0.0, svd_ratio_final=0.0
         )
@@ -267,11 +256,7 @@ def test_svd_ratio_at_start(step, total, expected):
 
 
 def _absorb_schedules(**kwargs):
-    """One subspace per class, all sharing the absorb schedule under test.
-
-    All four delegate to ``subspace.absorb_due``; before that they carried four copies of
-    the same logic, and only two of them were tested.
-    """
+    """One subspace per class, all sharing the absorb schedule under test."""
     from polystep.cma_subspace import CMAAdaptiveSubspace
     from polystep.factored_subspace import FactoredSubspace
     from polystep.hybrid_subspace import HybridSubspace
@@ -356,17 +341,12 @@ class TestFactoryMethods:
 
 
 def test_displacement_mode_productivity():
-    """Displacement mode converges better than random on a controlled quadratic.
-
-    This validates that incorporating SVD directions from displacement
-    history actually helps optimization, not just that it runs correctly.
-    """
+    """Displacement mode must beat random on a controlled quadratic (final cost or AUC)."""
     torch.manual_seed(42)
     full_dim = 100
     subspace_dim = 20
     num_steps = 30
 
-    # Define a simple quadratic objective: f(x) = ||Ax - b||^2
     A = torch.randn(full_dim, full_dim)
     b = torch.randn(full_dim)
 
@@ -388,18 +368,15 @@ def test_displacement_mode_productivity():
         gen = torch.Generator().manual_seed(seed)
         P = sub.init_projection(generator=gen)
 
-        # Start from zero
         x_base = torch.zeros(full_dim)
         costs = []
         disp_history_list = []
 
         for step in range(num_steps):
-            # Generate candidate perturbations in subspace
             gen_step = torch.Generator().manual_seed(seed + step * 1000)
             num_candidates = 50
             candidates = torch.randn(num_candidates, subspace_dim, generator=gen_step) * 0.5
 
-            # Evaluate all candidates
             best_cost = float("inf")
             best_coords = torch.zeros(subspace_dim)
             for j in range(num_candidates):
@@ -411,35 +388,30 @@ def test_displacement_mode_productivity():
 
             costs.append(best_cost)
 
-            # Update base
             displacement = P @ best_coords
             x_base = x_base + displacement
 
-            # Track displacement in subspace coords for next rotation
+            # Track displacement for the next rotation.
             disp_history_list.append(best_coords.clone())
             if len(disp_history_list) > sub.displacement_history_size:
                 disp_history_list.pop(0)
 
-            # Rotate projection for next step
             disp_tensor = torch.stack(disp_history_list) if disp_history_list else None
             gen_rot = torch.Generator().manual_seed(seed + step * 2000 + 1)
             P = sub.rotate(P, step=step, total_steps=num_steps, displacement_history=disp_tensor, generator=gen_rot)
 
         return costs
 
-    # Run both modes with same seed
     costs_displacement = run_optimization("displacement", seed=42)
     costs_random = run_optimization("random", seed=42)
 
-    # Displacement mode should achieve lower final cost OR converge faster
     final_disp = costs_displacement[-1]
     final_rand = costs_random[-1]
 
-    # Also check area under curve (lower = faster convergence)
+    # Area under curve: lower means faster convergence.
     auc_disp = sum(costs_displacement)
     auc_rand = sum(costs_random)
 
-    # At least one criterion should hold: lower final cost OR lower AUC
     displacement_wins = (final_disp < final_rand) or (auc_disp < auc_rand)
     assert displacement_wins, (
         f"Displacement mode did not outperform random.\n"
@@ -459,14 +431,14 @@ def test_cuda_generator_creates_cpu_fallback():
     )
     P = sub.init_projection(generator=torch.Generator().manual_seed(0))
     cuda_gen = torch.Generator(device="cuda").manual_seed(42)
-    # Should not warn - silently creates CPU generator from CUDA seed
+    # Must not warn: a CPU generator is derived from the CUDA seed.
     P_rotated = sub.rotate(P, step=0, total_steps=100, generator=cuda_gen)
     assert P_rotated.shape == P.shape
     assert torch.isfinite(P_rotated).all()
 
 
-def test_randomized_svd_branch_keeps_the_uncentered_displacement_direction():
-    """pca_lowrank centers by default; the SVD branch does not. Both must agree."""
+def test_rotation_keeps_the_uncentered_displacement_direction():
+    """Rotation must not centre the history; the offset IS the direction to keep."""
     full_dim, sub_dim, history_len = 200, 8, 16
     sub = AdaptiveSubspace(
         full_dim=full_dim,
@@ -483,10 +455,11 @@ def test_randomized_svd_branch_keeps_the_uncentered_displacement_direction():
     noise = torch.randn(history_len, full_dim, generator=torch.Generator().manual_seed(1)) * 1e-3
     history = offset.unsqueeze(0) + noise
 
-    # generator=None takes the randomized branch, a generator takes the full SVD.
-    P_random_branch = sub.rotate(projection, 0, 10, history, generator=None, history_is_full=True)
-    alignment = (P_random_branch.T @ offset).abs().max()
-    assert alignment > 0.9, f"randomized branch lost the dominant direction: {alignment:.3f}"
+    # Seeded and unseeded both take the exact SVD; neither may centre.
+    for gen in (None, torch.Generator().manual_seed(3)):
+        rotated = sub.rotate(projection, 0, 10, history, generator=gen, history_is_full=True)
+        alignment = (rotated.T @ offset).abs().max()
+        assert alignment > 0.9, f"rotation lost the dominant direction: {alignment:.3f}"
 
 
 @pytest.mark.parametrize("interval, expected_rotations", [(1, 4), (2, 2), (0, 0)])

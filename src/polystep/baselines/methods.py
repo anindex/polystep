@@ -1,21 +1,4 @@
-"""Gradient-free baselines over the shared :class:`~polystep.baselines.core.Objective`.
-
-Every method has the same shape::
-
-    result = method(objective, x0=None, **hyperparameters)
-
-and the same stopping rule: loop while the objective can still afford one more
-iteration. None of them can overspend, because the objective refuses.
-
-Sources
--------
-- :func:`openai_es`     ported from ``experiments/baselines/openai_es.py``
-- :func:`spsa`          ported from ``experiments/baselines/spsa.py``
-- :func:`cma_es`        pycma, replacing the four inline copies in ``experiments/runners/``
-- :func:`random_search` trivial, new: the subspace-only control
-- :func:`eggroll`       from arXiv:2511.16652 (Sarkar et al.), Alg. 1 / Eq. 6 / App. H.2
-- :func:`mezo`          from arXiv:2305.17333 (Malladi et al. 2023), Alg. 1
-"""
+"""Gradient-free baselines over the shared Objective."""
 
 from __future__ import annotations
 
@@ -37,6 +20,36 @@ def _init(obj: Objective, x0: Optional[torch.Tensor]) -> torch.Tensor:
     if x.numel() != obj.dim:
         raise ValueError(f"x0 has {x.numel()} entries, objective dim is {obj.dim}.")
     return x
+
+
+#: Cap on retained trace points; entries hold device tensors, so thinning keeps memory bounded.
+_HISTORY_CAP = 4096
+
+
+class _Trace(list):
+    """Trace that thins itself geometrically instead of growing without bound."""
+
+    __slots__ = ("stride",)
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.stride = 1
+
+    def record(self, obj: Objective, k: int) -> None:
+        if k % self.stride:
+            return
+        self.append((obj.evals, obj.best_loss_t))
+        if len(self) > _HISTORY_CAP:
+            del self[1::2]
+            self.stride *= 2
+
+
+def _record(history, obj: Objective, k: int) -> None:
+    """Append a trace point, thinning if ``history`` is a :class:`_Trace`."""
+    if isinstance(history, _Trace):
+        history.record(obj, k)
+    else:
+        history.append((obj.evals, obj.best_loss_t))
 
 
 def _result(name: str, obj: Objective, x: torch.Tensor, iters: int, history) -> Result:
@@ -75,22 +88,7 @@ def openai_es(
     shaping: str = "rank",
     seed: int = 0,
 ) -> Result:
-    """OpenAI Evolution Strategy (Salimans et al. 2017, arXiv:1703.03864).
-
-    Antithetic sampling and fitness shaping, ported from
-    ``experiments/baselines/openai_es.py``. Costs ``popsize`` evaluations per
-    generation.
-
-    Args:
-        obj: The objective.
-        x0: Start point, default zeros.
-        sigma: Probe radius (noise std).
-        lr: Step size on the estimated gradient.
-        popsize: Perturbations per generation; must be even when ``antithetic``.
-        antithetic: Mirror half the population for variance reduction.
-        shaping: ``"rank"`` (Salimans) or ``"zscore"``.
-        seed: Noise seed.
-    """
+    """OpenAI Evolution Strategy (Salimans et al. 2017, arXiv:1703.03864). Antithetic sampling and fitness shaping; costs ``popsize`` evaluations per generation."""
     if popsize < 2:
         raise ValueError(f"popsize must be >= 2, got {popsize}.")
     if antithetic and popsize % 2:
@@ -99,7 +97,7 @@ def openai_es(
     x = _init(obj, x0)
     gen = torch.Generator(device=x.device).manual_seed(seed)
     half = popsize // 2 if antithetic else popsize
-    history, it = [], 0
+    history, it = _Trace(), 0
 
     while obj.remaining >= popsize:
         eps = torch.randn(half, obj.dim, generator=gen, device=x.device, dtype=x.dtype)
@@ -108,8 +106,9 @@ def openai_es(
         losses = obj(x + sigma * eps)
         # g = (1 / (pop * sigma)) * eps^T @ utilities; ascent on utility = descent on loss.
         x = x + (lr / (popsize * sigma)) * (eps.t() @ _shaped(losses, shaping))
+        obj.iterate = x
         it += 1
-        history.append((obj.evals, obj.best_loss_t))
+        _record(history, obj, it)
 
     return _result("openai_es", obj, x, it, history)
 
@@ -125,27 +124,12 @@ def spsa(
     gamma: float = 0.101,
     seed: int = 0,
 ) -> Result:
-    """SPSA (Spall 1992). Two evaluations per iteration, whatever the dimension.
-
-    Ported from ``experiments/baselines/spsa.py``; gains follow Spall's
-    finite-sample recommendations ``a_k = a / (A + k)^alpha``,
-    ``c_k = c / k^gamma``.
-
-    Args:
-        obj: The objective.
-        x0: Start point, default zeros.
-        a: Step-size gain.
-        c: Probe radius gain.
-        A: Stability constant, default 10% of the affordable iterations.
-        alpha: Step-size decay exponent.
-        gamma: Probe decay exponent (must stay below ``alpha``).
-        seed: Perturbation seed.
-    """
+    """SPSA (Spall 1992). Two evaluations per iteration; gains follow Spall's ``a_k = a/(A+k)^alpha``, ``c_k = c/k^gamma``."""
     x = _init(obj, x0)
     if A is None:
         A = 0.1 * (obj.budget // 2)
     gen = torch.Generator(device=x.device).manual_seed(seed)
-    history, k = [], 0
+    history, k = _Trace(), 0
 
     while obj.remaining >= 2:
         k += 1
@@ -154,9 +138,10 @@ def spsa(
         # Bernoulli +-1.
         delta = torch.randint(0, 2, (obj.dim,), generator=gen, device=x.device, dtype=x.dtype) * 2 - 1
         losses = obj(torch.stack([x + c_k * delta, x - c_k * delta]))
-        # g_hat_i = (L+ - L-) / (2 c_k delta_i), and 1/delta_i == delta_i for +-1.
-        x = x - (a_k * (losses[0] - losses[1]).item() / (2.0 * c_k)) * delta
-        history.append((obj.evals, obj.best_loss_t))
+        # g_hat_i = (L+ - L-) / (2 c_k delta_i); keep the scalar a 0-dim tensor to avoid a sync per step.
+        x = x - (a_k / (2.0 * c_k)) * (losses[0] - losses[1]) * delta
+        obj.iterate = x
+        _record(history, obj, k)
 
     return _result("spsa", obj, x, k, history)
 
@@ -170,25 +155,10 @@ def mezo(
     weight_decay: float = 0.0,
     seed: int = 0,
 ) -> Result:
-    """MeZO: memory-efficient zeroth-order SGD (Malladi et al. 2023, arXiv:2305.17333).
-
-    Two evaluations per step, like SPSA, but with Gaussian ``z`` and constant
-    gains. The defining trick is memory: ``z`` is never stored, only the per-step
-    seed is, and ``z`` is regenerated on demand. This implementation keeps that
-    property -- ``z`` is dropped before the evaluation and regenerated from the
-    same seed for the update.
-
-    Args:
-        obj: The objective.
-        x0: Start point, default zeros.
-        eps: Probe radius.
-        lr: Step size.
-        weight_decay: Decoupled L2, as in the paper's SGD variant.
-        seed: Seed for the per-step seed stream.
-    """
+    """MeZO: memory-efficient zeroth-order SGD (Malladi et al. 2023, arXiv:2305.17333). Two evaluations per step; z is regenerated from its seed instead of stored."""
     x = _init(obj, x0)
     seeds = torch.Generator(device="cpu").manual_seed(seed)
-    history, k = [], 0
+    history, k = _Trace(), 0
 
     def z_from(step_seed: int) -> torch.Tensor:
         g = torch.Generator(device=x.device).manual_seed(step_seed)
@@ -198,15 +168,17 @@ def mezo(
         step_seed = int(torch.randint(0, 2**31 - 1, (1,), generator=seeds).item())
         z = z_from(step_seed)
         candidates = torch.stack([x + eps * z, x - eps * z])
-        del z  # regenerated below; never held across the evaluation
+        del z  # regenerated below; never held across the evaluation.
         losses = obj(candidates)
-        projected_grad = (losses[0] - losses[1]).item() / (2.0 * eps)
+        # 0-dim tensor, not a float: see the note in spsa.
+        projected_grad = (losses[0] - losses[1]) / (2.0 * eps)
         z = z_from(step_seed)
         if weight_decay:
             x = x * (1.0 - lr * weight_decay)
         x = x - (lr * projected_grad) * z
+        obj.iterate = x
         k += 1
-        history.append((obj.evals, obj.best_loss_t))
+        _record(history, obj, k)
 
     return _result("mezo", obj, x, k, history)
 
@@ -218,31 +190,22 @@ def random_search(
     sigma: float = 0.1,
     seed: int = 0,
 ) -> Result:
-    """Random search: one random direction per step, accepted if the loss drops.
-
-    The control for "how much of the gain is the subspace representation rather
-    than the update rule": hand this the same :class:`Objective` as PolyStep and
-    the only thing that differs is the update. One evaluation per step, plus one
-    to score the starting point.
-
-    Args:
-        obj: The objective.
-        x0: Start point, default zeros.
-        sigma: Probe radius.
-        seed: Direction seed.
-    """
+    """Random search: one random direction per step, accepted if the loss drops."""
     x = _init(obj, x0)
     gen = torch.Generator(device=x.device).manual_seed(seed)
-    fx = obj(x.unsqueeze(0))[0].item()
-    history, k = [(obj.evals, obj.best_loss_t)], 0
+    fx = obj(x.unsqueeze(0))[0]
+    history, k = _Trace([(obj.evals, obj.best_loss_t)]), 0
 
     while obj.remaining >= 1:
         cand = x + sigma * torch.randn(obj.dim, generator=gen, device=x.device, dtype=x.dtype)
-        f = obj(cand.unsqueeze(0))[0].item()
-        if f < fx:
-            x, fx = cand, f
+        f = obj(cand.unsqueeze(0))[0]
+        # Accept-on-improvement, resolved on-device to avoid a sync per candidate.
+        better = f < fx
+        x = torch.where(better, cand, x)
+        obj.iterate = x
+        fx = torch.where(better, f, fx)
         k += 1
-        history.append((obj.evals, obj.best_loss_t))
+        _record(history, obj, k)
 
     return _result("random_search", obj, x, k, history)
 
@@ -256,13 +219,7 @@ def _lowrank_noise(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """``n`` flat perturbations built from per-matrix ``E = A B^T / sqrt(r)``.
-
-    arXiv:2511.16652 Sec. 4.1: ``A in R^(m x r)``, ``B in R^(n x r)`` i.i.d.
-    zero-mean unit-variance, the ``1/sqrt(r)`` keeping ``Var(E)`` bounded in ``r``.
-    1D entries (biases, norms) have no matrix structure to factor and get a dense
-    Gaussian, matching how ``FactoredSubspace`` treats them.
-    """
+    """Build ``n`` flat perturbations from per-matrix ``E = A B^T / sqrt(r)`` (arXiv:2511.16652 Sec. 4.1); 1D entries get a dense Gaussian."""
     out = torch.empty(n, dim, device=device, dtype=dtype)
     off = 0
     for shape in shapes:
@@ -291,38 +248,14 @@ def eggroll(
     shaping: str = "sign",
     seed: int = 0,
 ) -> Result:
-    """EGGROLL: low-rank evolution strategies (Sarkar et al., arXiv:2511.16652).
-
-    Per worker, ``E_i = A_i B_i^T / sqrt(r)`` with ``A_i in R^(m x r)``,
-    ``B_i in R^(n x r)``; fitness at ``M + sigma E_i``; the mean moves along
-    ``(alpha / N) sum_i E_i f_i`` (Eq. 6), which is full-rank once ``N r`` exceeds
-    ``min(m, n)`` even though every perturbation is rank ``r``. Effective at
-    ``r = 1``. Population sampled in antithetic pairs, so ``popsize`` must be even.
-
-    Where the matrices are comes from :attr:`Objective.shapes`. Inside a
-    ``HybridSubspace`` the coordinates are unstructured, so the perturbations are
-    dense Gaussians and this degenerates to plain ES on the coordinates -- see the
-    README.
-
-    Args:
-        obj: The objective.
-        x0: Start point, default zeros.
-        sigma: Probe radius. The paper notes the linearisation needs ``o(d^-1/2)``.
-        lr: Step size; the paper absorbs ``1/sigma`` into it.
-        rank: Perturbation rank ``r``, clipped per entry to ``min(m, n)``.
-        popsize: Candidates per generation (``popsize / 2`` antithetic pairs).
-        shaping: ``"sign"`` is the paper's antithetic-pair shaping
-            ``sign(s+ - s-)`` (App. H.2); ``"rank"``/``"zscore"`` shape the whole
-            population instead, matching :func:`openai_es`.
-        seed: Noise seed.
-    """
+    """EGGROLL: low-rank evolution strategies (Sarkar et al., arXiv:2511.16652). Each perturbation is ``E = A B^T / sqrt(r)``; the population is sampled in antithetic pairs."""
     if popsize < 2 or popsize % 2:
         raise ValueError(f"popsize must be even and >= 2, got {popsize}.")
 
     x = _init(obj, x0)
     gen = torch.Generator(device=x.device).manual_seed(seed)
     pairs = popsize // 2
-    history, it = [], 0
+    history, it = _Trace(), 0
 
     while obj.remaining >= popsize:
         E = _lowrank_noise(obj.shapes, rank, pairs, obj.dim, gen, x.device, x.dtype)
@@ -336,8 +269,9 @@ def eggroll(
             u = _shaped(losses, shaping)
             w = u[:pairs] - u[pairs:]
         x = x + (lr / pairs) * (E.t() @ w)
+        obj.iterate = x
         it += 1
-        history.append((obj.evals, obj.best_loss_t))
+        _record(history, obj, it)
 
     return _result("eggroll", obj, x, it, history)
 
@@ -349,30 +283,10 @@ def cma_es(
     sigma0: float = 0.5,
     popsize: Optional[int] = None,
     diagonal: Optional[bool] = None,
+    max_popsize: int = 256,
     seed: int = 0,
 ) -> Result:
-    """CMA-ES via pycma (Hansen & Ostermeier 2001).
-
-    The one implementation, replacing the four inline copies in
-    ``run_elevation.py``, ``run_moe.py``, ``run_timeseries.py`` and
-    ``run_maxsat.py``. Keeps their convention of switching to the diagonal
-    (separable) variant above 1000 dimensions, where the full covariance is
-    ``O(d^2)``.
-
-    May stop before the budget is spent: pycma's own convergence criteria still
-    apply. ``result.evals`` reports what was actually used.
-
-    Args:
-        obj: The objective.
-        x0: Start point, default zeros.
-        sigma0: Initial step size.
-        popsize: Population size; ``None`` lets pycma pick ``4 + 3 ln d``.
-        diagonal: Force the separable variant. ``None`` picks it for ``dim >= 1000``.
-        seed: Seed.
-
-    Raises:
-        ImportError: If pycma is not installed (``pip install cma``).
-    """
+    """CMA-ES via pycma (Hansen & Ostermeier 2001). Uses the diagonal variant above 1000 dimensions; may stop before the budget on pycma's own criteria."""
     try:
         import cma
         import numpy as np
@@ -391,19 +305,45 @@ def cma_es(
         "verbose": -9,
         "CMA_diagonal": bool(diagonal),
     }
-    es = cma.CMAEvolutionStrategy(x.double().tolist(), sigma0, {k: v for k, v in opts.items() if v is not None})
-    history, it = [], 0
 
-    while obj.remaining >= es.popsize and not es.stop():
-        solutions = es.ask()
-        # pycma hands back a list of numpy rows; stack once rather than per row.
-        X = torch.from_numpy(np.asarray(solutions)).to(device=x.device, dtype=x.dtype)
-        es.tell(solutions, obj(X).tolist())
-        it += 1
-        history.append((obj.evals, obj.best_loss_t))
+    def _make(mean, sigma, pop):
+        o = dict(opts)
+        if pop is not None:
+            o["popsize"] = pop
+        return cma.CMAEvolutionStrategy(mean, sigma, {k: v for k, v in o.items() if v is not None})
 
-    x = torch.tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
-    return _result("cma_es", obj, x, it, history)
+    es = _make(x.double().tolist(), sigma0, popsize)
+    history, it = _Trace(), 0
+    best = torch.tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
+
+    # IPOP restarts (Auger & Hansen 2005): pycma stops early on its own criteria, so double the population and resume from the incumbent on each stop.
+    restarts = 0
+    while obj.remaining >= es.popsize:
+        while obj.remaining >= es.popsize and not es.stop():
+            solutions = es.ask()
+            # pycma hands back a list of numpy rows; stack once rather than per row.
+            X = torch.from_numpy(np.asarray(solutions)).to(device=x.device, dtype=x.dtype)
+            es.tell(solutions, obj(X).tolist())
+            # pycma's distribution mean.
+            obj.iterate = torch.as_tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
+            it += 1
+            _record(history, obj, it)
+
+        best = torch.tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
+        if obj.remaining < es.popsize:
+            break
+        restarts += 1
+        # Budget cap stops a spin; max_popsize cap stops the doubling from exhausting GPU memory.
+        pop = min(int(es.popsize) * 2, max_popsize, max(2, int(obj.remaining)))
+        if pop <= es.popsize:
+            # At the ceiling: restart at the same population to spend the remaining budget.
+            pop = min(int(es.popsize), max(2, int(obj.remaining)))
+            if pop < 2:
+                break
+        es = _make(best.double().tolist(), sigma0, pop)
+
+    obj.iterate = best
+    return _result("cma_es", obj, best, it, history)
 
 
 #: Name -> method, for runners that select a baseline by string.

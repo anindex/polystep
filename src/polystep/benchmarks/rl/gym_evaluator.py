@@ -1,22 +1,4 @@
-"""Generic vectorized Gymnasium evaluator for stacked MLP policies.
-
-Wraps any discrete-action Gymnasium environment via ``SyncVectorEnv`` and
-evaluates ``N`` stacked candidate policies in parallel by running ``N * R``
-parallel envs and dispatching each env to its assigned candidate. The API
-mirrors :class:`polystep.benchmarks.rl.cartpole.CartPoleEvaluator` so it can be
-dropped into the same training loop in ``experiments/runners/run_rl.py``.
-
-Notes
------
-- Works with any Gymnasium ``Discrete``-action environment whose observation
-  space is a ``Box`` (or anything yielding a fixed-size ``ndarray``).
-- For analytic, fully GPU-vectorizable envs (e.g. CartPole), prefer the
-  task-specific evaluator; this class is the right choice when you need
-  Gymnasium's exact dynamics or there is no analytic form.
-- Uses CRN (common random numbers): every candidate sees the same per-(step,
-  rollout) seed in a given outer iteration, so evaluations within a step
-  differ only by the policy.
-"""
+"""Generic vectorized Gymnasium evaluator for stacked MLP policies."""
 
 from __future__ import annotations
 
@@ -27,6 +9,14 @@ import numpy as np
 import torch
 
 from .policies import count_stacked_candidates
+
+#: Envs whose episode ends when the goal is reached, so "success" is finishing
+#: *before* the horizon rather than surviving to it.
+_GOAL_REACHING = ("acrobot", "mountaincar")
+
+
+def _is_goal_reaching(env_id: str) -> bool:
+    return any(k in env_id.lower() for k in _GOAL_REACHING)
 
 
 @dataclass
@@ -53,15 +43,7 @@ def _batched_mlp_logits(
     stacked_params: Dict[str, torch.Tensor],
     activation: str = "tanh",
 ) -> torch.Tensor:
-    """Apply N stacked policies to obs of shape (N, R, obs_dim).
-
-    ``activation`` selects the inner activation between linear layers:
-
-    - ``"tanh"`` - standard :class:`DiscreteMLPPolicy`.
-    - ``"int8"`` - per-tensor symmetric INT8 quantize/dequantize (no STE).
-    - ``"binary"`` - ``sign(x)`` activation (no STE).
-    - ``"float32"`` - identity.
-    """
+    """Apply N stacked policies to obs of shape (N, R, obs_dim)."""
 
     x = obs  # (N, R, obs_dim)
     linear_indices = sorted(int(k.split(".")[1]) for k in stacked_params if k.endswith(".weight"))
@@ -87,32 +69,7 @@ def _batched_mlp_logits(
 
 
 class GymVectorEvaluator:
-    """Vectorized evaluator for stacked discrete-action MLP policies on any Gymnasium env.
-
-    Parameters
-    ----------
-    env_id:
-        Gymnasium env identifier (e.g. ``"Acrobot-v1"``, ``"LunarLander-v3"``).
-    rollouts_per_candidate:
-        Number of parallel episodes per candidate (``R``).
-    horizon:
-        Maximum steps per episode. Defaults to the env's ``spec.max_episode_steps``.
-    device:
-        Device for policy forward passes. Env stays on CPU.
-    success_fn:
-        Optional callable ``(returns: Tensor (N,R), lengths: Tensor (N,R)) ->
-        Tensor[bool] (N,R)`` mapping per-episode return and length to a
-        "success" flag for logging. Defaults to "survived to ``horizon``"
-        (i.e., ``lengths == horizon``), which is correct for fixed-horizon
-        balancing tasks like CartPole. For environments where "success"
-        means reaching a goal in less than ``horizon`` steps (e.g.,
-        Acrobot, MountainCar), pass a custom ``success_fn``.
-    activation:
-        Inner activation between linear layers. ``"tanh"`` (default) for the
-        standard :class:`DiscreteMLPPolicy`; ``"int8"`` / ``"binary"`` /
-        ``"float32"`` for the non-differentiable variants used to motivate
-        gradient-free training (see :class:`NonDiffMLPPolicy`).
-    """
+    """Vectorized evaluator for stacked discrete-action MLP policies on any Gymnasium env."""
 
     def __init__(
         self,
@@ -129,8 +86,7 @@ class GymVectorEvaluator:
         self.env_id = str(env_id)
         self.rollouts_per_candidate = int(rollouts_per_candidate)
         self.device = torch.device(device)
-        # Real steps taken: episodes terminate early, so candidates * rollouts * horizon
-        # overcounts by up to ~8x and shifts every sample-efficiency curve.
+        # Real steps taken, since episodes terminate early.
         self.env_steps = 0
         # Probe env for spec metadata.
         probe = gym.make(self.env_id)
@@ -145,6 +101,13 @@ class GymVectorEvaluator:
         probe.close()
         self.horizon = int(horizon) if horizon is not None else int(spec_horizon)
         self.action_type = "discrete"
+        # Goal-reaching envs terminate early on success, so the "survived to horizon" default would invert them; default per env instead.
+        if success_fn is None and _is_goal_reaching(self.env_id):
+            horizon_ = float(self.horizon)
+
+            def success_fn(returns, lengths):
+                return lengths < horizon_
+
         self.success_fn = success_fn
         self.activation = str(activation)
         # Cache vector env across calls; lazily (re)created when n_candidates changes.
@@ -188,13 +151,12 @@ class GymVectorEvaluator:
         N = n_candidates
         self._ensure_venv(N)
 
-        # Flat env index i is candidate i//R, rollout i%R, so keying on i%R gives every
-        # candidate the same R initial states. Keyed on i, fitness confounds with luck.
+        # Key on rollout index so every candidate sees the same initial states.
         base_seed = int(seed) + 1009 * int(step)
         seeds = [base_seed + (i % R) for i in range(N * R)]
         obs_np, _ = self._venv.reset(seed=seeds)
 
-        # State tensors (on CPU then move to device per step for policy inference).
+        # State tensors, on CPU then moved to device per step for policy inference.
         returns = torch.zeros(N, R, dtype=torch.float32)
         lengths = torch.zeros(N, R, dtype=torch.float32)
         active = np.ones(N * R, dtype=bool)
@@ -216,14 +178,12 @@ class GymVectorEvaluator:
             returns += torch.from_numpy(rew_active.reshape(N, R))
             lengths += torch.from_numpy(r_active.reshape(N, R))
 
-            # Mark envs that just terminated as inactive going forward; further
-            # rewards from auto-reset are masked out by the `active` flag.
+            # Mask out rewards from auto-reset after termination.
             active = active & ~done_np
             if not active.any():
                 break
 
-        # The default "survived to horizon" suits fixed-horizon balancing (CartPole)
-        # and is wrong for goal-reaching tasks. Pass ``success_fn`` for those.
+        # Default "survived to horizon" suits fixed-horizon tasks; pass success_fn for goal-reaching.
         if self.success_fn is not None:
             successes = self.success_fn(returns, lengths)
         else:
@@ -292,8 +252,7 @@ def random_policy_baseline(
         if not active.any():
             break
     venv.close()
-    # "Survived to horizon", as GymVectorEvaluator defaults to. ``(~active).mean()``
-    # counted truncation as success, so every policy reported 1.0.
+    # "Survived to horizon", matching GymVectorEvaluator's default.
     return {
         "mean_return": float(returns.mean()),
         "success_rate": float((lengths >= float(horizon)).mean()),

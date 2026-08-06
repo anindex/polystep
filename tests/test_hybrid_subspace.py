@@ -44,31 +44,23 @@ class TestHybridFromLayout:
         """from_layout creates LayerProjectionSpecs matching layout entries."""
         hybrid = HybridSubspace.from_layout(layout, rank=4)
 
-        # Should have one spec per layout entry
         assert len(hybrid.specs) == len(layout.entries)
 
-        # Each spec should have correct entry_key
         spec_keys = [s.entry_key for s in hybrid.specs]
         entry_keys = [e.key for e in layout.entries]
         assert spec_keys == entry_keys
 
-        # Specs should be contiguous
         prev_end = 0
         for spec in hybrid.specs:
             assert spec.flat_start == prev_end
             assert spec.flat_end > spec.flat_start
             prev_end = spec.flat_end
 
-        # Total subspace dim should equal sum of num_coords
         total = sum(s.num_coords for s in hybrid.specs)
         assert hybrid.subspace_dim == total
 
     def test_from_layout_2d_params_are_projected(self, layout):
-        """2D+ params are projected unless the rank saturates the layer.
-
-        ``num_coords`` is capped at ``num_params``. At the cap the projection would be
-        the identity, so the spec carries the parameter directly instead.
-        """
+        """2D+ params are projected only when the rank does not saturate the layer."""
         hybrid = HybridSubspace.from_layout(layout, rank=4)
 
         for spec, entry in zip(hybrid.specs, layout.entries):
@@ -96,10 +88,8 @@ class TestHybridAutoFromLayout:
             max_rank=16,
         )
 
-        # Should have one spec per layout entry
         assert len(hybrid.specs) == len(layout.entries)
 
-        # Compression ratio should be > 0 and <= 1
         assert hybrid.compression_ratio > 0
         assert hybrid.compression_ratio <= 1.0
 
@@ -108,14 +98,12 @@ class TestHybridAutoFromLayout:
         hybrid_fixed = HybridSubspace.from_layout(layout, rank=16)
         hybrid_auto = HybridSubspace.auto_from_layout(layout, max_rank=4)
 
-        # Auto with max_rank=4 should be smaller than fixed rank=16
         assert hybrid_auto.subspace_dim <= hybrid_fixed.subspace_dim
 
 
 class TestHybridInitProjections:
     def test_init_projections_creates_correct_shapes(self, hybrid_sub):
-        """init_projections creates one projection per projected spec; 1D params
-        add coords directly and get no (O(n^2)) projection matrix."""
+        """One projection per projected spec; unprojected 1D params get none."""
         projections = hybrid_sub.init_projections(torch.device("cpu"), torch.float32)
 
         projected = [s for s in hybrid_sub.specs if s.is_projected]
@@ -135,21 +123,19 @@ class TestHybridInitProjections:
             if spec.is_projected:
                 P = projections[spec.entry_key]
                 if spec.num_params >= spec.num_coords:
-                    # QR path: columns should have unit norm
                     col_norms = torch.norm(P, dim=0)
                     assert torch.allclose(col_norms, torch.ones_like(col_norms), atol=1e-5), (
                         f"QR columns should have unit norm, got {col_norms}"
                     )
                 else:
-                    # Scaled Gaussian fallback
                     expected_std = 1.0 / (spec.num_coords**0.5)
                     actual_std = P.std().item()
                     assert abs(actual_std - expected_std) < 0.1 * expected_std
 
 
 def test_apply_inplace_updates_noncontiguous_param(model, hybrid_sub):
-    """A non-contiguous param.data makes reshape(1,-1) a copy, so an out= write
-    would be lost. apply_perturbation_inplace must still modify the parameter."""
+    """Non-contiguous param.data makes reshape a copy; apply_perturbation_inplace
+    must still modify the parameter in place."""
     p = dict(model.named_parameters())["fc1.weight"]
     p.data = p.data.t().contiguous().t()  # (10, 20) non-contiguous view
     assert not p.data.is_contiguous()
@@ -163,14 +149,8 @@ def test_apply_inplace_updates_noncontiguous_param(model, hybrid_sub):
 
 
 def test_apply_perturbation_is_affine_and_local(model, hybrid_sub):
-    """The two properties the reconstruction rests on, neither restating the body.
-
-    Replaying ``base + (P @ chunk).reshape(...)`` here would reproduce a sign or
-    reshape error in the test as faithfully as in the code. Superposition and locality
-    are what the rest of the library assumes and are independent of how the map is
-    written: the OT step adds displacements in coordinate space and expects the
-    parameter change to add the same way, and each coordinate block owns one entry.
-    """
+    """Pins superposition and locality: parameter deltas add in coordinate space,
+    and each coordinate block moves only its own entry."""
     projections = hybrid_sub.init_projections(torch.device("cpu"), torch.float32)
     base_sd = model.state_dict()
     gen = torch.Generator().manual_seed(42)
@@ -183,8 +163,7 @@ def test_apply_perturbation_is_affine_and_local(model, hybrid_sub):
 
     d1, d2, dsum = delta(c1), delta(c2), delta(c1 + c2)
     for key in dsum:
-        # atol dominates: the deltas are ~1e-2 and the two routes accumulate the same
-        # products in a different order.
+        # atol dominates: deltas are ~1e-2, accumulated in different order on the two routes.
         torch.testing.assert_close(dsum[key], d1[key] + d2[key], rtol=1e-4, atol=1e-6)
 
     for spec in hybrid_sub.specs:
@@ -209,7 +188,6 @@ def test_rotate_random_produces_different_projections(hybrid_sub):
     projections = hybrid.init_projections(torch.device("cpu"), torch.float32)
     new_projections = hybrid.rotate_all(projections, step=1, total_steps=100)
 
-    # At least one projection should be different
     any_different = False
     for key in projections:
         if not torch.allclose(projections[key], new_projections[key], atol=1e-3):
@@ -220,9 +198,8 @@ def test_rotate_random_produces_different_projections(hybrid_sub):
 
 @pytest.mark.filterwarnings("ignore:HybridSubspace works best:UserWarning")
 def test_rotate_all_holds_the_seeded_basis_at_step_zero(hybrid_sub):
-    """Step 0 is the freshly seeded basis; rotating it discards a draw nothing was
-    evaluated against. Matches FactoredSubspace.rotate_all, which returns the same object
-    to signal 'nothing changed'."""
+    """Step 0 returns the seeded basis unchanged; rotating it would discard a draw
+    nothing was evaluated against."""
     hybrid = HybridSubspace(
         specs=hybrid_sub.specs,
         subspace_dim=hybrid_sub.subspace_dim,
@@ -238,7 +215,7 @@ def test_rotate_all_holds_the_seeded_basis_at_step_zero(hybrid_sub):
 class TestHybridRotateDisplacement:
     def test_rotate_displacement_with_history(self, hybrid_sub):
         """Displacement rotation with non-zero history produces new projections."""
-        # Need rotation_interval=1 to actually trigger rotation
+        # rotation_interval=1 so rotation fires
         hybrid = HybridSubspace(
             specs=hybrid_sub.specs,
             subspace_dim=hybrid_sub.subspace_dim,
@@ -259,7 +236,6 @@ class TestHybridRotateDisplacement:
             displacement_history=disp_history,
         )
 
-        # Should produce different projections
         any_different = False
         for key in projections:
             if hybrid.specs[list(projections.keys()).index(key)].is_projected:
@@ -269,8 +245,8 @@ class TestHybridRotateDisplacement:
         assert any_different
 
     def test_a_wide_spec_is_rejected_by_both_projection_paths(self, hybrid_sub):
-        """No builder produces num_coords > num_params, and neither path can serve one:
-        QR would silently drop columns and a Gaussian would move at the wrong scale."""
+        """num_coords > num_params must be rejected: QR would silently drop columns
+        and a Gaussian would move at the wrong scale."""
         spec = LayerProjectionSpec(
             entry_key="w",
             original_shape=(3, 7),
@@ -321,7 +297,7 @@ class TestHybridRotateDisplacement:
 
     def test_rotate_displacement_zero_history_falls_back(self, hybrid_sub):
         """Zero displacement history falls back to random rotation."""
-        # Need rotation_interval=1 to actually trigger rotation
+        # rotation_interval=1 so rotation fires
         hybrid = HybridSubspace(
             specs=hybrid_sub.specs,
             subspace_dim=hybrid_sub.subspace_dim,
@@ -340,7 +316,6 @@ class TestHybridRotateDisplacement:
             displacement_history=disp_history,
         )
 
-        # Should still produce different projections (random fallback)
         any_different = False
         for key in projections:
             if hybrid.specs[list(projections.keys()).index(key)].is_projected:
@@ -378,7 +353,6 @@ class TestCreateHybridBlocks:
         for block in blocks:
             assert block.particle_dim == particle_dim
             assert block.num_particles > 0
-            # Each block's flat size should be num_particles * particle_dim
             assert block.flat_end - block.flat_start == block.num_particles * particle_dim
 
 
@@ -466,7 +440,6 @@ class TestRankTransition:
             compile=False,
         )
 
-        # Simple dummy closure
         target = torch.randn(5)
 
         def closure(batched_params):
@@ -476,7 +449,6 @@ class TestRankTransition:
             losses = torch.zeros(N)
             for i in range(N):
                 x = torch.randn(1, 10)
-                # Simple forward using first linear layer weight
                 w1 = batched_params["0.weight"][i]
                 b1 = batched_params["0.bias"][i]
                 w2 = batched_params["2.weight"][i]
@@ -486,33 +458,22 @@ class TestRankTransition:
                 losses[i] = ((out - target) ** 2).mean()
             return losses
 
-        # Steps 1-2: rank=2 (subspace_dim unchanged)
         initial_subspace_dim = optimizer.subspace.subspace_dim
         for _ in range(2):
             optimizer.step(closure)
         assert optimizer.subspace.subspace_dim == initial_subspace_dim
 
-        # Step 3: triggers rank transition to 4
         optimizer.step(closure)
-        # After transition, subspace_dim should increase (rank=4 > rank=2)
         assert optimizer.subspace.subspace_dim > initial_subspace_dim
-        # After transition, duals should be reset
         assert optimizer.state.f is None
         assert optimizer.state.g is None
 
-        # Step 4: still rank=4, verify it runs without error
         optimizer.step(closure)
 
     def test_transition_fires_once_per_stage(self):
-        """Within a stage the subspace must survive untouched.
-
-        A transition absorbs, rebuilds the basis and zeroes the particles, so one per
-        step throws away all progress inside the subspace. ``subspace_dim`` cannot see
-        this: rebuilding at the same rank reproduces the same dimension.
-
-        Stage 0 is applied by the constructor, so the first sweep already runs at the
-        scheduled rank; only later stages fire from inside ``step()``.
-        """
+        """Pins that a rank transition fires once per stage, not per step. A rebuild
+        keeps subspace_dim unchanged, so only the transition hook can see it. Stage 0
+        is applied by the constructor; later stages fire from step()."""
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 5))
         layout = ParamLayout.from_module(model)
@@ -548,24 +509,6 @@ class TestRankTransition:
             opt.step(closure)
         assert ranks == [4], f"rebuilt inside a stage, got {ranks}"
 
-    def test_rank_schedule_none_default(self):
-        """PolyStepOptimizer with rank_schedule=None works as before."""
-        torch.manual_seed(42)
-        model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 5))
-        layout = ParamLayout.from_module(model)
-        subspace = HybridSubspace.from_layout(layout, rank=2, rotation_interval=0)
-
-        from polystep import PolyStepOptimizer
-
-        optimizer = PolyStepOptimizer(
-            model,
-            subspace=subspace,
-            rank_schedule=None,
-            epsilon=0.1,
-            compile=False,
-        )
-        assert optimizer._rank_schedule is None
-
     def test_rank_schedule_requires_subspace(self):
         """ValueError when rank_schedule is provided without subspace."""
         torch.manual_seed(42)
@@ -599,12 +542,8 @@ def test_default_rotation_interval_no_warning(model):
 
 class TestStructuredProjection:
     def test_the_seed_alone_fixes_the_projection(self, layout):
-        """Two builds agree at one seed and differ at another.
-
-        This used to compare two byte-identical ``from_layout(layout, rank=4)`` calls
-        against a ``projection_mode='random'`` parameter that does not exist, so any
-        change to projection generation kept it green.
-        """
+        """The seed alone fixes the projection: same seed reproduces it, a
+        different seed changes it."""
         same_a = HybridSubspace.from_layout(layout, rank=4, seed=7).init_projections(torch.device("cpu"), torch.float32)
         same_b = HybridSubspace.from_layout(layout, rank=4, seed=7).init_projections(torch.device("cpu"), torch.float32)
         other = HybridSubspace.from_layout(layout, rank=4, seed=8).init_projections(torch.device("cpu"), torch.float32)
@@ -671,7 +610,6 @@ class TestMaxSubspaceDim:
         layout = ParamLayout.from_module(model)
         h_full = HybridSubspace.from_layout(layout, rank=4)
         h_cap = HybridSubspace.from_layout(layout, rank=4, max_subspace_dim=h_full.subspace_dim // 2)
-        # Each projected layer's fraction of total should be approximately preserved
         for s_full, s_cap in zip(h_full.specs, h_cap.specs):
             if s_full.num_coords > 1:
                 frac_full = s_full.num_coords / h_full.subspace_dim
@@ -703,12 +641,8 @@ class TestHybridReconstructionProperties:
     1D-pass-through identity, and tied-weight deduplication."""
 
     def test_exact_reconstruction_at_saturation(self):
-        """At ``r >= min(d_in, d_out)`` every target delta is reachable exactly.
-
-        The uncapped formula gives ``num_coords = 4*4 + 4*4 = 32`` against
-        ``num_params = 16``. A (16, 32) projection cannot have orthonormal columns, so
-        it is capped at 16 and the coordinates become the delta itself.
-        """
+        """At ``r >= min(d_in, d_out)`` the width caps at num_params and coordinates
+        become the delta itself, so every target delta is reachable exactly."""
         model = nn.Linear(4, 4, bias=False)
         layout = ParamLayout.from_module(model, particle_dim=2)
         hybrid = HybridSubspace.from_layout(layout, rank=4, seed=0)
@@ -727,10 +661,8 @@ class TestHybridReconstructionProperties:
         assert torch.equal(perturbed[spec.entry_key], target_delta)
 
     def test_bias_pass_through_is_identity(self):
-        """Biases (1D params) carry ``is_projected=False`` and one coord
-        per element, so a per-element coord write must appear verbatim
-        in the perturbed bias.
-        """
+        """Biases pass through with one coord per element, so a coord write must
+        appear verbatim in the perturbed bias."""
         model = nn.Linear(4, 8, bias=True)
         layout = ParamLayout.from_module(model, particle_dim=2)
         hybrid = HybridSubspace.from_layout(layout, rank=4, seed=0)
@@ -807,12 +739,9 @@ def test_rank_schedule_applies_its_first_stage():
 
 
 def test_rotation_clears_the_coordinate_displacement_history():
-    """``displacement_history`` holds subspace coordinates, so it is only meaningful
-    under the basis that measured it. The rotate branch swapped the basis without
-    clearing it, and the next displacement rotation read those rows through the new
-    projections, deriving directions nothing had been measured along. The absorb
-    branch always cleared them.
-    """
+    """displacement_history holds coordinates in the old basis, so a rotation must
+    clear it; otherwise the next displacement rotation reads stale rows through the
+    new projections."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(8, 12), nn.Tanh(), nn.Linear(12, 3))
     subspace = HybridSubspace.from_layout(

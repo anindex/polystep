@@ -1,25 +1,15 @@
-"""Benchmark utilities shared by the experiment runners.
-
-MNIST and CIFAR-10 loaders that read the raw archives instead of pulling in
-torchvision, the MLP and SNN architectures the paper uses, accuracy evaluation, and
-environment capture for the result JSON.
-
-The SNN path uses snnTorch when installed (``pip install snntorch``) and otherwise
-falls back to pure-PyTorch LIF neurons, which are non-differentiable either way.
-"""
+"""Shared benchmark utilities: MNIST loaders, MLP/SNN models, accuracy evaluation, environment capture."""
 
 from __future__ import annotations
 
 import gzip
 import math
 import os
-import pickle
 import platform
 import random
 import struct as pystruct
 import tempfile
-import tarfile
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import urlretrieve
 
@@ -32,44 +22,22 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 def _seed_worker(worker_id: int) -> None:
-    """Re-seed numpy/random inside a DataLoader worker process.
-
-    torch seeds each worker itself; numpy and ``random`` are left on the
-    parent's state, which makes any augmentation drawing from them
-    depend on worker scheduling.
-    """
+    """Re-seed numpy/random inside a DataLoader worker."""
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
 
 def seeded_loader_kwargs(seed: Optional[int] = None) -> Dict[str, Any]:
-    """DataLoader kwargs that pin shuffle order and worker RNG to ``seed``.
-
-    Pass as ``DataLoader(..., **seeded_loader_kwargs(seed))``. Harmless on
-    non-shuffled loaders: the generator is simply unused.
-
-    ``seed=None`` snapshots the current global torch seed, so the shuffle
-    order still differs per experiment seed (as it did when the loader
-    drew from the global RNG) but no longer depends on how much of that
-    RNG the rest of the process consumed first.
-    """
+    """DataLoader kwargs that pin shuffle order and worker RNG to a seed."""
     generator = torch.Generator()
     generator.manual_seed(torch.initial_seed() if seed is None else seed)
     return {"generator": generator, "worker_init_fn": _seed_worker}
 
 
 def _default_data_dir(name: str) -> str:
-    """Default download location for a dataset, under the platform temp dir.
-
-    Hardcoding "/tmp/..." makes these defaults unusable on Windows, which the package
-    does not otherwise exclude.
-    """
+    """Default download location under the platform temp dir."""
     return os.path.join(tempfile.gettempdir(), name)
-
-
-# Benchmark validation seeds. The published experiments use 5 seeds, set in
-# experiments/runners/common.py.
 
 
 MNIST_URL = "https://storage.googleapis.com/cvdf-datasets/mnist/"
@@ -120,18 +88,7 @@ def get_mnist_loaders(
     max_train: int = 0,
     max_test: int = 0,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Load MNIST train/test as PyTorch DataLoaders.
-
-    Args:
-        data_dir: Directory to store/load MNIST data
-        batch_size: Batch size for training
-        normalize: Whether to normalize with MNIST mean/std
-        max_train: Maximum training samples (0=full dataset)
-        max_test: Maximum test samples (0=full dataset)
-
-    Returns:
-        Tuple of (train_loader, test_loader)
-    """
+    """Load MNIST train/test as PyTorch DataLoaders."""
     data_dir = data_dir or _default_data_dir("mnist")
     _download_mnist(data_dir)
 
@@ -160,109 +117,8 @@ def get_mnist_loaders(
     return train_loader, test_loader
 
 
-CIFAR10_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
-CIFAR10_FILENAME = "cifar-10-python.tar.gz"
-
-
-def _download_cifar10(data_dir: str) -> None:
-    """Download CIFAR-10 dataset if not already present."""
-    os.makedirs(data_dir, exist_ok=True)
-    tar_path = os.path.join(data_dir, CIFAR10_FILENAME)
-    extracted_dir = os.path.join(data_dir, "cifar-10-batches-py")
-
-    if not os.path.exists(extracted_dir):
-        download_file(CIFAR10_URL, tar_path)
-        print(f"  Extracting {CIFAR10_FILENAME}...")
-        with tarfile.open(tar_path, "r:gz") as tar:
-            tar.extractall(data_dir)
-
-
-def _load_cifar10_batch(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load a single CIFAR-10 batch file."""
-    with open(filepath, "rb") as f:
-        batch = pickle.load(f, encoding="bytes")
-    # Data is stored as (num_samples, 3072) where 3072 = 3*32*32
-    # Reshape to (num_samples, 3, 32, 32)
-    images = batch[b"data"].reshape(-1, 3, 32, 32).astype(np.float32) / 255.0
-    labels = np.array(batch[b"labels"], dtype=np.int64)
-    return images, labels
-
-
-def get_cifar10_loaders(
-    data_dir: Optional[str] = None,
-    batch_size: int = 512,
-    normalize: bool = True,
-    max_train: int = 0,
-    max_test: int = 0,
-) -> Tuple[DataLoader, DataLoader]:
-    """Load CIFAR-10 train/test as PyTorch DataLoaders.
-
-    Args:
-        data_dir: Directory to store/load CIFAR-10 data
-        batch_size: Batch size for training
-        normalize: Whether to normalize with CIFAR-10 mean/std
-        max_train: Maximum training samples (0=full dataset)
-        max_test: Maximum test samples (0=full dataset)
-
-    Returns:
-        Tuple of (train_loader, test_loader)
-    """
-    data_dir = data_dir or _default_data_dir("cifar10")
-    _download_cifar10(data_dir)
-
-    batch_dir = os.path.join(data_dir, "cifar-10-batches-py")
-
-    train_images_list = []
-    train_labels_list = []
-    for i in range(1, 6):
-        batch_path = os.path.join(batch_dir, f"data_batch_{i}")
-        images, labels = _load_cifar10_batch(batch_path)
-        train_images_list.append(images)
-        train_labels_list.append(labels)
-
-    train_images = np.concatenate(train_images_list, axis=0)
-    train_labels = np.concatenate(train_labels_list, axis=0)
-
-    test_path = os.path.join(batch_dir, "test_batch")
-    test_images, test_labels = _load_cifar10_batch(test_path)
-
-    if normalize:
-        # CIFAR-10 normalization values (per channel)
-        mean = np.array([0.4914, 0.4822, 0.4465]).reshape(1, 3, 1, 1)
-        std = np.array([0.2470, 0.2435, 0.2616]).reshape(1, 3, 1, 1)
-        train_images = (train_images - mean) / std
-        test_images = (test_images - mean) / std
-
-    if max_train > 0:
-        train_images = train_images[:max_train]
-        train_labels = train_labels[:max_train]
-    if max_test > 0:
-        test_images = test_images[:max_test]
-        test_labels = test_labels[:max_test]
-
-    train_ds = TensorDataset(
-        torch.from_numpy(train_images.astype(np.float32)),
-        torch.from_numpy(train_labels),
-    )
-    test_ds = TensorDataset(
-        torch.from_numpy(test_images.astype(np.float32)),
-        torch.from_numpy(test_labels),
-    )
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, **seeded_loader_kwargs())
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0, **seeded_loader_kwargs())
-    return train_loader, test_loader
-
-
 class MNISTNet(nn.Sequential):
-    """Two-layer MLP for MNIST: 784 -> hidden -> 10, ~101K params at hidden=128.
-
-    An ``nn.Sequential`` subclass, not a plain ``nn.Module``: every batched
-    evaluator checks ``type(model).forward is nn.Sequential.forward`` before it will
-    build a plan, so an identical hand-written ``forward`` silently opts the model out
-    of the bmm and subspace-delta paths. The ``OrderedDict`` keeps the ``fc1``/``fc2``
-    state_dict keys.
-    """
+    """Two-layer MLP for MNIST: 784 -> hidden -> 10. An nn.Sequential subclass, as the batched evaluators require."""
 
     def __init__(self, hidden: int = 128):
         super().__init__(
@@ -277,48 +133,9 @@ class MNISTNet(nn.Sequential):
         )
 
 
-class CIFAR10Net(nn.Module):
-    """Standard small CNN for CIFAR-10 classification (vmap-compatible).
-
-    Architecture: 3xConv2d + MaxPool -> FC(128) -> FC(10)
-    No BatchNorm (incompatible with vmap). ~189K parameters.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 4 * 4, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.features(x))
-
-
 @torch.no_grad()
 def evaluate_accuracy(model: nn.Module, dataloader: DataLoader) -> float:
-    """Compute classification accuracy on a DataLoader.
-
-    Args:
-        model: The model to evaluate
-        dataloader: DataLoader with (inputs, labels) or (inputs, attention_mask, labels)
-
-    Returns:
-        Accuracy as a float between 0 and 1
-    """
+    """Compute classification accuracy on a DataLoader."""
     model.eval()
     device = next(model.parameters()).device
     correct = 0
@@ -349,21 +166,7 @@ def evaluate_accuracy(model: nn.Module, dataloader: DataLoader) -> float:
 
 @dataclass
 class BenchmarkResult:
-    """Single optimizer run result.
-
-    Attributes:
-        optimizer: Name of the optimizer (e.g., 'polystep', 'adam', 'cmaes')
-        seed: Random seed used
-        final_accuracy: Accuracy at end of training
-        best_accuracy: Best accuracy achieved during training
-        final_loss: Loss at end of training (None for optimizers that don't compute loss)
-        wall_time_seconds: Total wall clock time in seconds
-        peak_gpu_memory_mb: Peak GPU memory usage in MB
-        total_steps: Total optimization steps/iterations
-        function_evals: Total function evaluations (steps * popsize for ES)
-        convergence_epoch: Epoch when target accuracy first reached (None if never)
-        epoch_logs: List of per-epoch metrics dicts
-    """
+    """Single optimizer run result."""
 
     optimizer: str
     seed: int
@@ -377,17 +180,9 @@ class BenchmarkResult:
     convergence_epoch: Optional[int]
     epoch_logs: List[Dict[str, Any]] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return asdict(self)
-
 
 def get_environment_info() -> Dict[str, Any]:
-    """Collect environment info for reproducibility.
-
-    Returns:
-        Dict with torch_version, cuda_version, gpu_model, python_version, platform
-    """
+    """Collect environment info for reproducibility."""
     info = {
         "torch_version": torch.__version__,
         "python_version": platform.python_version(),
@@ -417,16 +212,7 @@ except ImportError:
 
 
 class LIFNeuron(nn.Module):
-    """Leaky Integrate-and-Fire neuron with hard threshold spike.
-
-    This is truly non-differentiable: the spike function has zero
-    gradient almost everywhere, making backpropagation useless.
-    polystep sidesteps this entirely with gradient-free optimization.
-
-    Args:
-        beta: Membrane decay factor (0 < beta < 1). Higher values = longer memory.
-        threshold: Spike threshold for membrane potential.
-    """
+    """Leaky integrate-and-fire neuron with a hard threshold spike; non-differentiable."""
 
     def __init__(self, beta: float = 0.95, threshold: float = 1.0):
         super().__init__()
@@ -434,51 +220,16 @@ class LIFNeuron(nn.Module):
         self.threshold = threshold
 
     def forward(self, x: torch.Tensor, mem: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One timestep of LIF dynamics.
-
-        Args:
-            x: Input current, shape (batch, features).
-            mem: Membrane potential, shape (batch, features).
-
-        Returns:
-            (spike, new_mem): Binary spikes and updated membrane.
-        """
+        """One timestep of LIF dynamics."""
         mem = self.beta * mem + x
-        # This is THE non-differentiable operation: d(spike)/d(mem) = 0
-        # almost everywhere. Backpropagation gives zero gradients through
-        # this line. polystep never differentiates through it.
+        # Non-differentiable: d(spike)/d(mem) = 0 almost everywhere.
         spike = (mem >= self.threshold).float()
-        mem = mem * (1.0 - spike)  # Reset after spike
+        mem = mem * (1.0 - spike)
         return spike, mem
 
 
 class SpikingNet(nn.Module):
-    """SNN with LIF neurons for classification.
-
-    Uses snnTorch.Leaky if available, falls back to pure PyTorch LIF neurons.
-
-    Architecture: Linear -> LIF -> Linear -> LIF
-    Output: mean spike rate over num_steps timesteps.
-
-    Why gradient-free for SNNs?
-        SNNs use hard threshold spikes: d(spike)/d(membrane) = 0.
-        Backpropagation gives zero gradients through spikes.
-        Surrogate gradients are an approximation hack.
-        polystep needs NO gradients: only forward passes!
-
-    Args:
-        input_dim: Input dimension (flattened).
-        hidden: Number of hidden neurons.
-        output: Number of output classes.
-        beta: Membrane decay factor (0.9-0.99 typical).
-        num_steps: Number of timesteps for spike integration.
-        use_snntorch: Use snnTorch if available (default: True).
-
-    Example:
-        >>> model = SpikingNet(input_dim=32*32*2, hidden=128, output=10, num_steps=25)
-        >>> x = torch.randn(32, 25, 2, 32, 32)  # (batch, time, polarity, H, W)
-        >>> out = model(x)  # (batch, output) spike rates
-    """
+    """SNN with LIF neurons; uses snnTorch.Leaky when available, else pure PyTorch LIF."""
 
     def __init__(
         self,
@@ -508,25 +259,8 @@ class SpikingNet(nn.Module):
             self.lif2 = LIFNeuron(beta=beta)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: process spike data over multiple timesteps.
-
-        Supports two input formats:
-        1. Temporal spike data: (num_steps, batch, ...) or (batch, num_steps, ...)
-        2. Static input: (batch, ...) - presented at each timestep
-
-        Args:
-            x: Input tensor. If temporal, shape is (time, batch, ...) or (batch, time, ...)
-               If static, shape is (batch, input_dim) or (batch, channels, H, W).
-
-        Returns:
-            Spike rates, shape (batch, output_dim). Values in [0, 1].
-        """
-        # Static input is constant in time, so fc1 runs once and broadcasts, which is
-        # bit-identical to the T calls it replaces. Temporal input keeps its per-timestep
-        # call: one (T*B, F) GEMM blocks differently from T (B, F) ones, and the LIF
-        # threshold turns that ULP into a whole spike.
-        # Feature count first: on shape alone a static batch of num_steps images looks
-        # like a T x 1 x F sequence, and the size test read it as temporal.
+        """Forward pass over timesteps; supports temporal and static inputs."""
+        # Static input broadcasts one fc1 call (bit-identical to per-timestep); temporal input keeps per-timestep calls. Check feature count first: a static batch of num_steps images looks temporal on shape alone.
         _static_features = x.dim() >= 2 and math.prod(x.shape[1:]) == self.input_dim
         if _static_features:
             batch = x.shape[0]

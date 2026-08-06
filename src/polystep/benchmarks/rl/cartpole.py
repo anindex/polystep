@@ -1,12 +1,4 @@
-"""Vectorized CartPole-v1 evaluator for PolyStep RL benchmarks.
-
-Pure analytic dynamics - no Gymnasium dependency at evaluation time. The
-dynamics, thresholds, and initial state distribution match Gymnasium's
-``CartPole-v1`` exactly so SB3 baselines trained on the Gym env transfer.
-
-Reward: +1 per step while alive; episode terminates when ``|x| > 2.4`` or
-``|theta| > 12 deg``. Max horizon 500 ⇒ max return 500.
-"""
+"""Vectorized CartPole-v1 evaluator with pure analytic dynamics (no Gymnasium)."""
 
 from __future__ import annotations
 
@@ -46,16 +38,7 @@ def sample_initial_states(num: int, *, seed: int, device: str | torch.device = "
 
 
 def cartpole_step(states: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Vectorized CartPole transition.
-
-    Args:
-        states: ``(N, 4)`` float tensor [x, x_dot, theta, theta_dot].
-        actions: ``(N,)`` long tensor in {0, 1}.
-
-    Returns:
-        ``(next_states, reward, done)`` where reward is +1 (alive) and ``done``
-        flags physically-terminated episodes.
-    """
+    """Vectorized CartPole transition."""
 
     x = states[..., 0]
     x_dot = states[..., 1]
@@ -156,11 +139,9 @@ class CartPoleEvaluator:
         returns = torch.zeros(n_candidates, R, device=self.device)
         lengths = torch.zeros(n_candidates, R, device=self.device)
         active = torch.ones(n_candidates, R, dtype=torch.bool, device=self.device)
-        # Send stacked params to device.
         sp = {k: v.to(self.device) for k, v in stacked_params.items()}
 
-        # Check ``active.any()`` every ``early_stop_check`` steps to amortize the sync.
-        # Dead envs stop accumulating reward, so the extra iterations are free.
+        # Check active.any() every early_stop_check steps to amortize the sync.
         early_stop_check = max(1, self.horizon // 8)
         for t in range(self.horizon):
             logits = _batched_mlp_logits(states, sp, n_candidates, R)  # (N, R, 2)

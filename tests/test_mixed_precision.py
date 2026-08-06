@@ -61,7 +61,6 @@ class TestMixedPrecisionStep:
             compile=False,
         )
 
-        # Verify model is BF16
         assert next(model.parameters()).dtype == torch.bfloat16
 
         def closure(batched_params):
@@ -80,7 +79,6 @@ class TestMixedPrecisionStep:
             model.train()
             return losses
 
-        # Should not raise
         cost = opt.step(closure)
         assert isinstance(cost, float)
         assert not torch.isnan(torch.tensor(cost))
@@ -95,9 +93,9 @@ class TestMixedPrecisionStep:
             compile=False,
         )
 
-        # Observe what the solver returns, not a value the test computes itself. The
-        # previous version called sanitize_cost inside the patch and asserted on that,
-        # so it passed even if the solver iterated entirely in BF16.
+        # Observe what the solver returns, not a value the test computes itself:
+        # asserting on a locally sanitized copy would pass even if the solver
+        # iterated entirely in BF16.
         captured = {}
         original_solve = opt.solver.solve
 
@@ -136,13 +134,11 @@ class TestMixedPrecisionStep:
 
 def test_projection_dtype_matches_model():
     """Projection matrix dtype matches model dtype for memory savings."""
-    # Without mixed precision
     model1 = nn.Linear(100, 50)
     subspace1 = AdaptiveSubspace(full_dim=100 * 50 + 50, subspace_dim=32)
     opt1 = PolyStepOptimizer(model1, subspace=subspace1, mixed_precision=False, compile=False)
     assert opt1.state.projection.dtype == torch.float32
 
-    # With mixed precision
     model2 = nn.Linear(100, 50)
     subspace2 = AdaptiveSubspace(full_dim=100 * 50 + 50, subspace_dim=32)
     opt2 = PolyStepOptimizer(model2, subspace=subspace2, mixed_precision=True, compile=False)
@@ -166,8 +162,7 @@ class TestProjectionDtype:
 
     def test_cma_subspace_projection_dtype(self):
         """CMAAdaptiveSubspace passes dtype through."""
-        base = AdaptiveSubspace(full_dim=100, subspace_dim=16)
-        cma = CMAAdaptiveSubspace(base)
+        cma = CMAAdaptiveSubspace(full_dim=100, subspace_dim=16)
 
         projection_fp32 = cma.init_projection(dtype=torch.float32)
         assert projection_fp32.dtype == torch.float32
@@ -177,12 +172,8 @@ class TestProjectionDtype:
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_displacement_rotation_runs_in_half_precision(self, dtype):
-        """CPU LAPACK has no half QR or SVD, so the decomposition must run in fp32.
-
-        The guards covered bf16 only, so fp16 raised
-        ``"linalg_svd_cpu" not implemented for 'Half'`` on the first rotation with
-        history, which the default rotation_mode reaches on step 1.
-        """
+        """CPU LAPACK has no half QR or SVD, so the decomposition must run in fp32
+        for both bf16 and fp16 inputs."""
         model = nn.Sequential(nn.Linear(16, 12), nn.Linear(12, 4))
         layout = ParamLayout.from_module(model)
         full_dim = sum(p.numel() for p in model.parameters())
@@ -272,9 +263,8 @@ def test_no_nans_in_normal_training():
         compile=False,
     )
 
-    # Drawn once, outside the closure. Redrawing per call gave every candidate in a
-    # step a different objective, so the cost matrix ranked noise rather than
-    # vertices and the step direction was meaningless.
+    # Drawn once outside the closure: redrawing per call would give every candidate
+    # in a step a different objective and the cost matrix would rank noise.
     gen = torch.Generator().manual_seed(0)
     x = torch.randn(8, 8, generator=gen)
     target = torch.randn(8, 4, generator=gen)
@@ -375,11 +365,8 @@ def _run_mixed_precision_steps(solver: str, n_steps: int = 3, model=None) -> flo
 
 @pytest.mark.parametrize("solver", ["softmax", "sinkhorn"])
 def test_optimizer_mixed_precision_step(solver):
-    """End-to-end mixed_precision=True must run on CPU with HybridSubspace.
-
-    ``loss == loss`` rules out NaN and nothing else, so an inf or a frozen optimizer
-    passed it. The parameters have to move and the loss has to stay in range.
-    """
+    """End-to-end mixed_precision=True must run on CPU with HybridSubspace: the
+    parameters have to move and the loss has to stay in range, not merely be non-NaN."""
     model = nn.Sequential(nn.Flatten(), nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 3))
     before = [p.detach().clone() for p in model.parameters()]
     loss = _run_mixed_precision_steps(solver, model=model)
@@ -391,20 +378,12 @@ def test_optimizer_mixed_precision_step(solver):
     assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters())), "the model never moved"
 
 
-if __name__ == "__main__":
-    for name, fn in list(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            fn()
-            print(f"ok: {name}")
+def test_cma_subspace_is_rejected_on_a_mixed_dtype_model():
+    """One global projection holds every parameter at the dominant dtype, CMA included.
 
-
-def test_mixed_dtype_model_runs_in_subspace_mode():
-    """Coordinates carry the layout's dominant dtype while each projection carries
-    its own parameter's, so an FP64 minority parameter mixed dtypes in the matmul
-    and raised. The minority parameter must also keep its dtype.
+    CMA is an AdaptiveSubspace, so the guard covers it.
     """
-    from polystep.hybrid_subspace import HybridSubspace
-    from polystep.subspace import LinearSubspace
+    from polystep.cma_subspace import CMAAdaptiveSubspace
 
     class MixedDtype(nn.Module):
         def __init__(self):
@@ -415,7 +394,29 @@ def test_mixed_dtype_model_runs_in_subspace_mode():
         def forward(self, x):
             return x @ self.big
 
-    for build in (LinearSubspace.from_layout, HybridSubspace.from_layout):
+    model = MixedDtype()
+    full = sum(p.numel() for p in model.parameters())
+    sub = CMAAdaptiveSubspace(full_dim=full, subspace_dim=16)
+    with pytest.raises(ValueError, match="mixes parameter dtypes"):
+        PolyStepOptimizer(model, subspace=sub, compile=False, seed=0)
+
+
+def test_mixed_dtype_model_runs_in_subspace_mode():
+    """Coordinates carry the layout's dominant dtype while each projection carries its
+    own parameter's, so a minority FP64 parameter must not mix dtypes in the
+    reconstruction matmul or lose its dtype."""
+    from polystep.hybrid_subspace import HybridSubspace
+
+    class MixedDtype(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.big = nn.Parameter(torch.randn(20, 20))
+            self.small = nn.Parameter(torch.randn(4, 4, dtype=torch.float64))
+
+        def forward(self, x):
+            return x @ self.big
+
+    for build in (HybridSubspace.from_layout,):
         torch.manual_seed(0)
         model = MixedDtype()
         subspace = build(ParamLayout.from_module(model), rank=2)
@@ -435,15 +436,11 @@ def test_mixed_dtype_model_runs_in_subspace_mode():
 
 
 def test_mixed_dtype_model_computing_in_both_dtypes():
-    """A model whose forward actually runs in two dtypes, not just holding an unused one.
-
-    Coordinates carry the layout's dominant dtype, so each per-entry projection has to be
-    built at its own parameter's or the reconstruction matmul mixes Double and Float. The
-    site-aware evaluator must also stop casting inputs to the perturbed layer's dtype: the
-    input reaches the fp32 layer first.
-    """
+    """A model whose forward runs in two dtypes, not just holding an unused one. Each
+    per-entry projection must be built at its own parameter's dtype or the
+    reconstruction matmul mixes Double and Float, and the evaluator must not cast
+    inputs to the perturbed layer's dtype."""
     from polystep.hybrid_subspace import HybridSubspace
-    from polystep.subspace import LinearSubspace, LowRankSubspace
     from polystep.cost_nn import NNCostEvaluator
 
     class Mixed(nn.Module):
@@ -460,8 +457,6 @@ def test_mixed_dtype_model_computing_in_both_dtypes():
         lambda lo: HybridSubspace.from_layout(
             lo, rank=2, rotation_interval=1, rotation_mode="displacement", absorb_mode="periodic", absorb_interval=2
         ),
-        lambda lo: LinearSubspace.from_layout(lo, rank=2),
-        lambda lo: LowRankSubspace.from_layout(lo, rank=2),
     ]
     for build in builders:
         torch.manual_seed(0)

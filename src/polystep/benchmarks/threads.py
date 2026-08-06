@@ -1,14 +1,4 @@
-"""Measure step time against ``torch.set_num_threads`` on this machine.
-
-PyTorch sizes the intra-op pool to the core count, which is where PolyStep is slowest:
-a step is thousands of small forwards, so the OpenMP barrier is hit constantly and the
-spin-wait dominates once the pool and the main thread oversubscribe.
-
-Each thread count runs in a fresh subprocess, since the pool cannot be resized
-meaningfully after the first parallel region.
-
-Run with ``python -m polystep.benchmarks.threads``.
-"""
+"""Measure step time against ``torch.set_num_threads``. Run with ``python -m polystep.benchmarks.threads``."""
 
 from __future__ import annotations
 

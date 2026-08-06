@@ -1,28 +1,6 @@
 """Low-rank subspace whose candidates never materialize a weight.
 
-A 2D parameter ``W`` of shape ``(d_out, d_in)`` is perturbed by ``dW = A @ B``, with
-``B`` a fixed random matrix with orthonormal rows and the coordinates being ``A``.
-``B`` is fixed within a rotation epoch, so ``dW`` is linear in the coordinates and
-absorb, displacement history and rotation work as for :class:`HybridSubspace`.
-
-For an input ``x``::
-
-    x (W + A B)^T  =  x W^T  +  (x B^T) A^T
-
-so ``N`` candidates need one GEMM against the shared base weight plus a rank-``r``
-correction each, costing ``O(batch * r * (d_in + d_out))``.
-:class:`~polystep.cost_nn.FactoredEvaluator` does this;
-:meth:`reconstruct_batch` is the materializing fallback for other models.
-
-Orthonormal rows in ``B`` give ``||A @ B||_F == ||A||_F``, matching the unit-gain
-convention :class:`HybridSubspace` uses for tall layers, so step radii carry over.
-
-Cheaper per step than :class:`HybridSubspace` but lower per-step progress: ``dW``
-is confined to the ``rank`` input directions ``B`` spans. See ``docs/performance.md``
-for the trade-off.
-
-Reference: arXiv:2511.16652, which also requires a perturbation scale of
-``o(d^-1/2)`` for the linearization to hold.
+``dW = A @ B`` with ``B`` fixed random orthonormal rows; see arXiv:2511.16652.
 """
 
 from __future__ import annotations
@@ -41,22 +19,10 @@ from .hybrid_subspace import LayerProjectionSpec, _stable_entry_seed
 
 @dataclass(frozen=True)
 class FactoredSubspace(ProjectedAbsorbMixin):
-    """Per-layer low-rank subspace whose coordinates are the ``A`` factors.
+    """Per-layer low-rank subspace whose coordinates are the ``A`` factors."""
 
-    Args:
-        specs: One :class:`LayerProjectionSpec` per parameter entry. For projected
-            entries ``num_coords == d_out * rank``; 1D entries pass through unprojected.
-        subspace_dim: Total coordinate count.
-        compression_ratio: ``subspace_dim / total_params``.
-        seed: Base seed for the fixed ``B`` factors.
-        ranks: Effective rank per entry key.
-        rotation_interval: Redraw ``B`` every N steps. ``0`` (default) holds the basis
-            fixed, matching :class:`HybridSubspace`.
-        absorb_mode: ``"stagnation"`` or ``"periodic"``.
-        absorb_patience: Stagnation steps before an absorb.
-        absorb_interval: Step interval for ``absorb_mode="periodic"``.
-        displacement_history_size: Rolling displacement buffer length.
-    """
+    #: Coordinate blocks are (d_out, rank) matrices, so the low-rank sampler factors over them.
+    coords_are_factored = True
 
     specs: Tuple[LayerProjectionSpec, ...]
     subspace_dim: int
@@ -78,17 +44,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         seed: int = 0,
         **kwargs,
     ) -> "FactoredSubspace":
-        """Build specs from a :class:`~polystep.transform.ParamLayout`.
-
-        Args:
-            layout: Source layout.
-            rank: Requested rank per projected entry, clipped to ``min(d_in, d_out)``.
-            seed: Base seed for the fixed ``B`` factors.
-            **kwargs: Forwarded to the constructor (``rotation_interval``, ``absorb_*``).
-
-        Returns:
-            A :class:`FactoredSubspace` covering every entry in ``layout``.
-        """
+        """Build specs from a ParamLayout."""
         specs = []
         ranks: Dict[str, int] = {}
         offset = 0
@@ -103,8 +59,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
                 ranks[entry.key] = r
                 projected = True
             else:
-                # 1D params (bias, LayerNorm) are cheap and carry no matrix structure
-                # to factor; perturb them directly, as HybridSubspace does.
+                # 1D params have no matrix structure to factor; perturb them directly.
                 num_coords = entry.numel
                 projected = False
 
@@ -135,9 +90,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
     def _make_b(self, spec: LayerProjectionSpec, device, dtype, step: int) -> torch.Tensor:
         """Fixed ``(rank, d_in)`` factor with orthonormal rows, from a stable seed.
 
-        Generated on CPU in fp32 so the same seed gives the same factor on CPU and
-        CUDA, then moved. QR of a ``(d_in, rank)`` Gaussian gives orthonormal columns;
-        transposing yields orthonormal rows, hence ``||A @ B||_F == ||A||_F``.
+        Drawn on CPU in fp32 so the seed is portable across devices.
         """
         r = self.ranks[spec.entry_key]
         d_in = spec.num_params // spec.original_shape[0]
@@ -158,14 +111,10 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         total_steps: Optional[int] = None,
         displacement_history: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Redraw every ``B`` on the rotation interval, else return ``projections``.
-
-        Returning the same object signals "nothing changed" to the caller, which uses
-        identity to decide whether to drop warm-started duals.
-        """
+        """Redraw every ``B`` on the rotation interval; returning the same object means nothing changed."""
         if self.rotation_interval <= 0 or step <= 0 or step % self.rotation_interval != 0:
             return projections
-        # Empty when every parameter is a vector: nothing is projected, nothing to redraw.
+        # Empty when nothing is projected.
         if not projections:
             return projections
         device = next(iter(projections.values())).device
@@ -183,10 +132,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         )
 
     def _delta(self, spec: LayerProjectionSpec, B: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        """``dW`` for one entry from its coordinate slice.
-
-        ``coords`` is ``(..., num_coords)``; the result is ``(..., num_params)``.
-        """
+        """``dW`` for one entry from its coordinate slice."""
         if not spec.is_projected:
             return coords
         d_out = spec.original_shape[0]
@@ -217,11 +163,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         base_sd: Dict[str, torch.Tensor],
         flat_subspace_batch: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Materialize ``{key: (N, *shape)}``.
-
-        Only used for models :class:`~polystep.cost_nn.FactoredEvaluator` cannot handle.
-        This subspace exists to avoid this call.
-        """
+        """Materialize ``{key: (N, *shape)}``; only a fallback for models FactoredEvaluator cannot handle."""
         N = flat_subspace_batch.shape[0]
         out = {}
         for spec in self.specs:

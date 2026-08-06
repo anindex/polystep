@@ -21,8 +21,8 @@ pytest.importorskip("cma", reason="pycma drives the CMA-ES baseline")
 DIM = 12
 BUDGET = 640
 
-# Hyperparameters tuned only enough that each method makes progress on the quadratic
-# below within BUDGET evaluations; they are not defaults anyone should copy.
+# Hyperparameters tuned only enough that each method makes progress on the
+# quadratic below within BUDGET evaluations; not defaults anyone should copy.
 HYPERPARAMS = {
     "openai_es": dict(sigma=0.3, lr=1.0, popsize=16),
     "spsa": dict(a=0.5, c=0.1),

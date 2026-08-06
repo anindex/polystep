@@ -10,13 +10,7 @@ import torch.nn as nn
 
 
 class DiscreteMLPPolicy(nn.Sequential):
-    """MLP policy for discrete-action direct policy search.
-
-    An ``nn.Sequential`` subclass rather than a wrapper around one: the batched and
-    delta evaluators require ``type(model).forward is nn.Sequential.forward``, and a
-    one-line ``forward`` that just calls ``self.net`` fails that check and sends every
-    candidate through vmap. The ``OrderedDict`` keeps the ``net.*`` state_dict keys.
-    """
+    """MLP policy for discrete-action direct policy search. An nn.Sequential subclass, as the batched evaluators require."""
 
     def __init__(self, obs_dim: int, hidden: int, action_dim: int):
         super().__init__(
@@ -36,13 +30,7 @@ class DiscreteMLPPolicy(nn.Sequential):
 
 
 def _quantize_int8_per_tensor(x: torch.Tensor) -> torch.Tensor:
-    """Per-tensor symmetric INT8 quantize/dequantize (no STE).
-
-    Forward: ``q = round(x / scale) * scale`` where ``scale = max|x| / 127``.
-    The ``round`` op has zero gradient (PyTorch returns 0), so backprop through
-    this layer produces a degenerate signal, which is what this exposes as
-    a failure mode for PPO/DQN.
-    """
+    """Per-tensor symmetric INT8 quantize/dequantize (no STE)."""
 
     if x.numel() == 0:
         return x
@@ -54,20 +42,7 @@ def _quantize_int8_per_tensor(x: torch.Tensor) -> torch.Tensor:
 
 
 class NonDiffActivation(nn.Module):
-    """Non-differentiable activation layer.
-
-    Variants
-    --------
-    ``"int8"``  : Per-tensor symmetric INT8 quantize/dequantize via ``round``.
-    ``"binary"``: ``sign(x)`` activation (collapses to {-1, +1}).
-    ``"float32"``: Identity (sanity-check baseline).
-
-    None of the variants implement straight-through estimation (STE). Backprop
-    through ``round`` yields zero gradient and through ``sign`` yields zero
-    almost everywhere; PPO/DQN trained on a policy containing this layer
-    therefore receive no useful gradient past the non-diff op and stagnate at
-    random performance.
-    """
+    """Non-differentiable activation layer: "int8", "binary", or "float32"; no straight-through estimation."""
 
     def __init__(self, mode: str = "binary"):
         super().__init__()
@@ -75,9 +50,7 @@ class NonDiffActivation(nn.Module):
         if mode not in {"float32", "int8", "binary"}:
             raise ValueError(f"NonDiffActivation mode must be float32/int8/binary; got {mode!r}")
         self.mode = mode
-        # sign() and identity are coordinatewise, so the batched evaluators can carry a
-        # delta through them. int8 scales by the whole tensor's amax, which couples
-        # every output to every input, and must stay on the vmap path.
+        # sign() and identity are coordinatewise; int8 couples every output to every input and stays on the vmap path.
         self.polystep_elementwise = mode != "int8"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -90,19 +63,7 @@ class NonDiffActivation(nn.Module):
 
 
 class NonDiffMLPPolicy(nn.Sequential):
-    """Discrete-action MLP policy with a non-differentiable activation layer.
-
-    Topology: ``Linear(obs_dim, hidden) -> NonDiffActivation(mode) -> Linear(hidden, action_dim)``.
-
-    Compared to :class:`DiscreteMLPPolicy` the only change is the inner Tanh
-    being replaced by a non-diff op. PolyStep treats the policy as a black box
-    and is unaffected; gradient methods (PPO, DQN) collapse because no useful
-    gradient flows through the non-diff op (no STE).
-
-    Subclasses ``nn.Sequential`` for the reason :class:`DiscreteMLPPolicy` does. The
-    ``net`` child stays because the parameters are addressed as ``net.0.weight`` in
-    ``gym_evaluator._batched_mlp_logits``; ``try_build`` walks one level of nesting.
-    """
+    """Discrete-action MLP policy with a non-differentiable activation layer instead of Tanh."""
 
     def __init__(self, obs_dim: int, hidden: int, action_dim: int, *, mode: str = "binary"):
         mode = str(mode).lower()
@@ -130,11 +91,7 @@ def stack_module_params(
     noise_scale: float = 0.0,
     seed: int | None = None,
 ) -> Dict[str, torch.Tensor]:
-    """Repeat a module's parameters along a candidate dimension.
-
-    The returned dictionary matches the closure contract expected by
-    ``PolyStepOptimizer.step``: each parameter has shape ``(N, *param.shape)``.
-    """
+    """Repeat a module's parameters along a candidate dimension."""
 
     generator = None
     if seed is not None:

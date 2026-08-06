@@ -1,9 +1,4 @@
-"""Integration tests for CMAAdaptiveSubspace and optimizer CMA integration.
-
-Tests verify that the CMA-ES wrapper works correctly with AdaptiveSubspace,
-that the optimizer properly integrates CMA features, and that OT-bias
-rotation mode functions as expected.
-"""
+"""Integration tests for CMAAdaptiveSubspace and optimizer CMA integration."""
 
 import math
 
@@ -14,7 +9,6 @@ import torch.nn as nn
 from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.optimizer import PolyStepOptimizer
-from polystep.solver import SolverState
 
 
 @pytest.fixture
@@ -38,10 +32,9 @@ def cma_adaptive_subspace(simple_model):
 
 class TestCMAAdaptiveSubspace:
     def test_from_adaptive_subspace_factory(self, base_adaptive_subspace):
-        """from_adaptive_subspace wraps base correctly."""
+        """from_adaptive_subspace carries every field of the source across."""
         cma_sub = CMAAdaptiveSubspace.from_adaptive_subspace(base_adaptive_subspace)
 
-        assert cma_sub.base is base_adaptive_subspace
         assert cma_sub.full_dim == base_adaptive_subspace.full_dim
         assert cma_sub.subspace_dim == base_adaptive_subspace.subspace_dim
 
@@ -60,62 +53,35 @@ class TestCMAAdaptiveSubspace:
         expected_mu_eff = max(1.0, base_adaptive_subspace.subspace_dim / 4.0)
         assert cma_sub.mu_eff == pytest.approx(expected_mu_eff)
 
-    def test_delegated_properties(self, base_adaptive_subspace):
-        """Properties delegate to base AdaptiveSubspace."""
-        cma_sub = CMAAdaptiveSubspace.from_adaptive_subspace(base_adaptive_subspace)
-
-        assert cma_sub.full_dim == base_adaptive_subspace.full_dim
-        assert cma_sub.subspace_dim == base_adaptive_subspace.subspace_dim
-        assert cma_sub.compression_ratio == base_adaptive_subspace.compression_ratio
-        assert cma_sub.rotation_mode == base_adaptive_subspace.rotation_mode
-
-    def test_init_projection_delegated(self, cma_adaptive_subspace):
-        """init_projection delegates to base and returns correct shape."""
+    def test_init_projection_is_orthonormal(self, cma_adaptive_subspace):
+        """The inherited projection keeps its shape and orthonormality."""
         gen = torch.Generator().manual_seed(42)
         P = cma_adaptive_subspace.init_projection(generator=gen)
 
         assert P.shape == (cma_adaptive_subspace.full_dim, cma_adaptive_subspace.subspace_dim)
-        # Check orthogonality
         PtP = P.T @ P
         eye = torch.eye(cma_adaptive_subspace.subspace_dim)
         assert torch.allclose(PtP, eye, atol=1e-4)
 
-    def test_init_cma_state_shapes(self, cma_adaptive_subspace):
-        """init_cma_state returns tensors with correct shapes."""
-        cma_state = cma_adaptive_subspace.init_cma_state()
-
+    def test_init_cma_state(self, cma_adaptive_subspace):
+        """Zero evolution paths, isotropic covariance, at the requested device and dtype."""
         sub_dim = cma_adaptive_subspace.subspace_dim
-        assert cma_state["p_c"].shape == (sub_dim,)
-        assert cma_state["p_sigma"].shape == (sub_dim,)
-        assert cma_state["C_diag"].shape == (sub_dim,)
-
-    def test_init_cma_state_initial_values(self, cma_adaptive_subspace):
-        """init_cma_state returns correct initial values."""
-        cma_state = cma_adaptive_subspace.init_cma_state()
-
-        # p_c and p_sigma start at zero
-        assert torch.all(cma_state["p_c"] == 0)
-        assert torch.all(cma_state["p_sigma"] == 0)
-        # C_diag starts at one (isotropic)
-        assert torch.all(cma_state["C_diag"] == 1)
-
-    def test_init_cma_state_device_dtype(self, cma_adaptive_subspace):
-        """init_cma_state respects device and dtype arguments."""
         cma_state = cma_adaptive_subspace.init_cma_state(device="cpu", dtype=torch.float64)
 
-        assert cma_state["p_c"].device.type == "cpu"
-        assert cma_state["p_c"].dtype == torch.float64
+        for key, expected in (("p_c", 0.0), ("p_sigma", 0.0), ("C_diag", 1.0)):
+            assert cma_state[key].shape == (sub_dim,)
+            assert torch.all(cma_state[key] == expected), key
+            assert cma_state[key].device.type == "cpu"
+            assert cma_state[key].dtype == torch.float64
 
     def test_apply_covariance_scaling(self, cma_adaptive_subspace):
         """apply_covariance_scaling scales projection columns by sqrt(C_diag)."""
         gen = torch.Generator().manual_seed(42)
         P = cma_adaptive_subspace.init_projection(generator=gen)
 
-        # C_diag = 4 -> sqrt = 2, columns should be scaled by 2
         C_diag = torch.ones(cma_adaptive_subspace.subspace_dim) * 4.0
         P_scaled = cma_adaptive_subspace.apply_covariance_scaling(P, C_diag)
 
-        # P_scaled = P * sqrt(C_diag) = P * 2
         expected = P * 2.0
         assert torch.allclose(P_scaled, expected, atol=1e-6)
 
@@ -124,7 +90,6 @@ class TestCMAAdaptiveSubspace:
 
         Without the clamp a collapsed coordinate scales the projection to zero and the
         search direction disappears; a diverged one scales it past the trust region.
-        Only in-range values were exercised before.
         """
         sub = cma_adaptive_subspace
         gen = torch.Generator().manual_seed(42)
@@ -145,7 +110,7 @@ class TestCMAAdaptiveSubspace:
         one and the covariance never adapts."""
         sub = cma_adaptive_subspace
         assert (sub.cov_min, sub.cov_max) == (1e-6, 1e6)
-        direct = CMAAdaptiveSubspace(base=sub.base)
+        direct = CMAAdaptiveSubspace(full_dim=sub.full_dim, subspace_dim=sub.subspace_dim)
         assert (direct.cov_min, direct.cov_max) == (1e-6, 1e6)
         P = sub.init_projection(generator=torch.Generator().manual_seed(0))
         torch.testing.assert_close(sub.apply_covariance_scaling(P, torch.ones(sub.subspace_dim)), P)
@@ -171,6 +136,26 @@ class TestOptimizerCMAIntegration:
 
         assert opt.use_covariance_adaptation is False
 
+    def test_cma_is_disabled_outside_the_monolithic_step(self, simple_model):
+        """Blockwise never adapts the covariance, so it must not claim to.
+
+        The blockwise step rotates the basis on schedule; a C_diag learned in the
+        old basis would index the wrong axes after that rotation. The constructor
+        is what makes the combination unreachable, so it is what this pins.
+        """
+        cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
+
+        with pytest.warns(UserWarning, match="block_strategy='monolithic'"):
+            opt = PolyStepOptimizer(
+                simple_model,
+                subspace=cma_sub,
+                use_covariance_adaptation=True,
+                block_strategy="per_layer",
+                compile=False,
+            )
+
+        assert opt.use_covariance_adaptation is False
+
     def test_optimizer_initializes_cma_state(self, simple_model):
         """Optimizer initializes CMA state when covariance adaptation is enabled."""
         cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
@@ -187,22 +172,6 @@ class TestOptimizerCMAIntegration:
         assert state.C_diag is not None
         assert state.generation == 0
 
-    def test_optimizer_cma_state_shapes(self, simple_model):
-        """CMA state tensors have correct shapes."""
-        cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
-        opt = PolyStepOptimizer(
-            simple_model,
-            subspace=cma_sub,
-            use_covariance_adaptation=True,
-            compile=False,
-        )
-
-        state = opt.state
-        sub_dim = cma_sub.subspace_dim
-        assert state.p_c.shape == (sub_dim,)
-        assert state.p_sigma.shape == (sub_dim,)
-        assert state.C_diag.shape == (sub_dim,)
-
     def test_optimizer_stores_cma_params(self, simple_model):
         """Optimizer stores CMA hyperparameters for step function."""
         cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
@@ -213,7 +182,6 @@ class TestOptimizerCMAIntegration:
             compile=False,
         )
 
-        # CMA params should be stored
         assert opt._cma_params is not None
         assert "c_sigma" in opt._cma_params
         assert "c_c" in opt._cma_params
@@ -234,13 +202,11 @@ class TestOptimizerCMAIntegration:
             compile=False,
         )
 
-        # Create a simple closure
         inputs = torch.randn(8, 20)
         targets = torch.randn(8, 5)
         loss_fn = nn.MSELoss()
 
         def closure(batched_params):
-            # Simplified: just compute a scalar loss per config
             N = list(batched_params.values())[0].shape[0]
             losses = []
             for i in range(N):
@@ -254,14 +220,10 @@ class TestOptimizerCMAIntegration:
         state_before = opt.state
         gen_before = state_before.generation
 
-        # Run one step
         opt.step(closure)
 
         state_after = opt.state
-        # Generation should increment
         assert state_after.generation == gen_before + 1
-        # p_sigma may change (unless displacement is exactly zero)
-        # Just verify no errors occurred
 
     def test_covariance_adaptation_rank_mu_updates_C_diag(self, simple_model):
         """Rank-mu builds C_diag from transport-weighted vertex variance, so the
@@ -298,20 +260,6 @@ class TestOptimizerCMAIntegration:
         assert (C <= opt._cma_params["cov_max"]).all()
         assert not torch.allclose(C, C0)
 
-    def test_cma_disabled_for_blockwise(self, simple_model):
-        """CMA sampling and updates are monolithic-only; a block strategy warns
-        and disables the flags instead of silently no-op adapting."""
-        cma_sub = CMAAdaptiveSubspace.auto_from_params(simple_model)
-        with pytest.warns(UserWarning, match="block_strategy='monolithic'"):
-            opt = PolyStepOptimizer(
-                simple_model,
-                subspace=cma_sub,
-                block_strategy="per_layer",
-                use_covariance_adaptation=True,
-                compile=False,
-            )
-        assert opt.use_covariance_adaptation is False
-
     def test_covariance_adaptation_scales_sampling_projection(self, simple_model):
         """With use_covariance_adaptation on, the coord->param projection is the
         base projection scaled by sqrt(C_diag), so the learned covariance shapes
@@ -341,27 +289,15 @@ class TestOptimizerCMAIntegration:
         assert opt._sampling_projection is state.projection
 
 
-def test_cma_fields_default_none():
-    """CMA fields default to None/default values."""
-    X = torch.randn(10, 2)
-    state = SolverState(X=X)
-
-    assert state.p_c is None
-    assert state.p_sigma is None
-    assert state.C_diag is None
-    assert state.generation == 0
-
-
 def test_explicit_hyperparameters_are_not_discarded():
     """A rate passed to the constructor must survive into the step's _cma_params."""
     import torch.nn as nn
 
-    from polystep.adaptive_subspace import AdaptiveSubspace
     from polystep.optimizer import PolyStepOptimizer
 
     model = nn.Sequential(nn.Linear(8, 6), nn.ReLU(), nn.Linear(6, 4))
-    base = AdaptiveSubspace(full_dim=sum(p.numel() for p in model.parameters()), subspace_dim=8)
-    sub = CMAAdaptiveSubspace(base=base, c_sigma=0.5, c_1=0.25)
+    full = sum(p.numel() for p in model.parameters())
+    sub = CMAAdaptiveSubspace(full_dim=full, subspace_dim=8, c_sigma=0.5, c_1=0.25)
 
     # Setting one rate must not leave the others at their derive-me sentinel.
     assert sub.c_c > 0 and sub.c_mu > 0

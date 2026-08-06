@@ -1,8 +1,4 @@
-"""Unit tests for vmap-safe layers.
-
-Tests VmapSafeMultiHeadAttention, VmapSafeLSTMCell, and VmapSafeLSTM
-for correctness and vmap compatibility.
-"""
+"""Unit tests for the vmap-safe layers: correctness and vmap compatibility."""
 
 import pytest
 import torch
@@ -21,28 +17,22 @@ class TestVmapSafeMultiHeadAttention:
         """Create a test attention module."""
         return VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4)
 
-    @pytest.mark.parametrize("num_heads", [1, 2, 4, 8])
-    def test_attention_output_shape_follows_the_query(self, num_heads):
-        """Self- and cross-attention: the output takes the query's sequence length."""
+    def test_cross_attention_takes_the_query_length(self, attn):
+        """The upstream comparison below is self-attention only; cross-attention has to
+        keep the query's sequence length, and the gradient has to reach the projections."""
         torch.manual_seed(0)
-        attn = VmapSafeMultiHeadAttention(embed_dim=64, num_heads=num_heads)
-        x = torch.randn(4, 20, 64)
-        assert attn(x, x, x).shape == (4, 20, 64)
-
         query, key = torch.randn(2, 5, 64), torch.randn(2, 15, 64)
-        assert attn(query, key, key).shape == (2, 5, 64)
+        out = attn(query, key, key)
+        assert out.shape == (2, 5, 64)
 
-        attn(x, x, x).sum().backward()
-        assert attn.W_q.weight.grad is not None
+        out.sum().backward()
+        assert attn.W_q.weight.grad.abs().max() > 0
 
     @pytest.mark.parametrize("num_heads", [1, 4])
     def test_attention_matches_upstream_mha(self, num_heads):
-        """The class is a drop-in for nn.MultiheadAttention, so the values must agree.
-
-        Replaying the projections, scale and softmax here would reuse the module's own
-        ``scale`` and cancel an error in it; the upstream module is an independent
-        oracle for the scaling, the head split and the output projection alike.
-        """
+        """The class is a drop-in for nn.MultiheadAttention, so the values must agree;
+        the upstream module is an independent oracle for the scaling, head split, and
+        output projection."""
         torch.manual_seed(0)
         embed = 32
         reference = nn.MultiheadAttention(embed, num_heads, batch_first=True)
@@ -62,11 +52,8 @@ class TestVmapSafeMultiHeadAttention:
         torch.testing.assert_close(ours(query, key, key), expected, rtol=1e-5, atol=1e-6)
 
     def test_a_causal_mask_hides_later_positions(self, attn):
-        """Shape alone cannot see a mask that is silently dropped.
-
-        Under a causal mask, position i attends only to 0..i, so changing the tail of
-        the sequence must leave the earlier outputs bit-identical.
-        """
+        """Under a causal mask, position i attends only to 0..i, so changing the tail
+        of the sequence must leave the earlier outputs bit-identical."""
         torch.manual_seed(0)
         seq_len = 10
         x = torch.randn(2, seq_len, 64)
@@ -92,8 +79,7 @@ class TestVmapSafeMultiHeadAttention:
         out = attn(x, x, x, key_padding_mask=key_padding_mask)
         assert out.shape == (2, 10, 64)
 
-        # Rewrite only the padded keys of row 1. Row 1's output must be unchanged, and
-        # row 0, which masks nothing, must move because its own keys moved.
+        # Row 1 masks keys 7+ so its output must not move; row 0 masks nothing, so it must.
         perturbed = x.clone()
         perturbed[1, 7:] = torch.randn(3, 64)
         perturbed[0, 7:] = torch.randn(3, 64)
@@ -110,11 +96,8 @@ class TestVmapSafeMultiHeadAttention:
     @pytest.mark.parametrize("num_models,batch", [(5, 1), (3, 4)])
     def test_attention_vmap(self, num_models, batch):
         """nn.MultiheadAttention fails under vmap on mask validation; this must not.
-
-        Each model instance gets its own weights, and every row is checked against the
-        same call made on its own: identical weights would let a vmap that ignored the
-        parameter axis pass.
-        """
+        Each instance gets distinct weights and is checked against its own call:
+        identical weights would let a vmap that ignored the parameter axis pass."""
         torch.manual_seed(0)
         attn = VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4)
         attn.eval()
@@ -152,9 +135,7 @@ class TestVmapSafeLSTMCell:
 
     def test_lstm_cell_vmap(self):
         """nn.LSTM fails under vmap on CuDNN .data access; this cell must not.
-
-        Distinct weights per instance, each row checked against its own call.
-        """
+        Distinct weights per instance, each row checked against its own call."""
         torch.manual_seed(0)
         cell = VmapSafeLSTMCell(input_size=32, hidden_size=64)
         params = dict(cell.named_parameters())
@@ -190,15 +171,7 @@ class TestVmapSafeLSTM:
         c0 = torch.randn(2, 4, 64)
         out, (h_n, c_n) = lstm(x, (h0, c0))
         assert out.shape == (4, 10, 64)
-        # Final states should differ from initial
         assert not torch.allclose(h_n, h0)
-
-    @pytest.mark.parametrize("num_layers", [1, 2, 3, 4])
-    def test_lstm_multi_layer(self, num_layers):
-        lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=num_layers)
-        out, (h_n, c_n) = lstm(torch.randn(4, 10, 32))
-        assert out.shape == (4, 10, 64)
-        assert h_n.shape == c_n.shape == (num_layers, 4, 64)
 
     def test_lstm_with_dropout(self):
         """Test LSTM with dropout between layers."""
@@ -207,16 +180,12 @@ class TestVmapSafeLSTM:
         x = torch.randn(4, 10, 32)
         out1, _ = lstm(x)
         out2, _ = lstm(x)
-        # With dropout, two forward passes should differ
-        # (small chance they're equal, but very unlikely with dropout=0.5)
+        # Two train-mode passes differ with dropout=0.5 (equality is possible but unlikely).
         assert not torch.allclose(out1, out2)
 
     def test_lstm_differentiable(self, lstm):
-        """Gradients must reach every layer with real magnitude.
-
-        ``grad is not None`` alone passes on an all-zero gradient, which is what a
-        broken chain through the gates would produce.
-        """
+        """Gradients must reach every layer with real magnitude; ``grad is not None``
+        alone would pass on the all-zero gradient a broken gate chain produces."""
         out, _ = lstm(torch.randn(4, 10, 32))
         out.sum().backward()
         for i, cell in enumerate(lstm.cells):
@@ -226,11 +195,8 @@ class TestVmapSafeLSTM:
 
     @pytest.mark.parametrize("num_layers", [1, 2])
     def test_lstm_matches_upstream_nn_lstm(self, num_layers):
-        """The class is a drop-in for nn.LSTM, so it has to compute the same thing.
-
-        Shape checks would pass on ``torch.zeros(shape)``; this pins the recurrence,
-        the gate order and the layer stacking against the reference implementation.
-        """
+        """The class is a drop-in for nn.LSTM, so it has to compute the same thing;
+        this pins the recurrence, gate order, and layer stacking against the reference."""
         torch.manual_seed(0)
         reference = nn.LSTM(input_size=8, hidden_size=6, num_layers=num_layers, batch_first=True)
         ours = VmapSafeLSTM(input_size=8, hidden_size=6, num_layers=num_layers)
@@ -253,11 +219,9 @@ class TestVmapSafeLSTM:
 
     @pytest.mark.parametrize("num_models,batch", [(5, 1), (3, 4)])
     def test_lstm_vmap(self, num_models, batch):
-        """The reason this class exists: nn.LSTM fails under vmap on CuDNN .data access.
-
-        vmap over params, broadcast over the input: a batch of model instances scored on
-        the same data, which is what a PolyStep candidate sweep does.
-        """
+        """nn.LSTM fails under vmap on CuDNN .data access. vmap over params, broadcast
+        over the input: a batch of model instances scored on the same data, which is
+        what a PolyStep candidate sweep does."""
         device = "cpu"
         lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=2).to(device)
 
@@ -267,40 +231,24 @@ class TestVmapSafeLSTM:
             out, _ = torch.func.functional_call(lstm, params_dict, (x,))
             return out
 
-        # Distinct rows, not clones of one: identical parameters make the output the
-        # same whether or not vmap honours the candidate axis, so a mapping that ignored
-        # it would pass on shape alone.
+        # Distinct rows, not clones: with identical parameters a vmap that ignored the
+        # candidate axis would still pass.
         gen = torch.Generator().manual_seed(0)
         batched_params = {
             k: v.unsqueeze(0).expand(num_models, *v.shape) + 0.1 * torch.randn(num_models, *v.shape, generator=gen)
             for k, v in params.items()
         }
 
-        # Input with batch dimension: (batch, seq, input)
-        # The module expects 3D input, so we keep the batch dim
         x = torch.randn(batch, 10, 32, device=device)
 
         vmapped = torch.vmap(forward_fn, in_dims=(0, None))
         out = vmapped(batched_params, x)
 
-        # Output: (num_models, batch, seq, hidden)
         expected = (num_models, batch, 10, 64)
         assert out.shape == expected, f"Expected {expected}, got {out.shape}"
 
-        # Every row must equal the loop it replaces, and no two rows may agree.
+        # Each row must match its own call, and no two rows may agree.
         for i in range(num_models):
             row = forward_fn({k: v[i] for k, v in batched_params.items()}, x)
             torch.testing.assert_close(out[i], row, atol=1e-5, rtol=1e-5)
         assert not torch.allclose(out[0], out[1], atol=1e-6)
-
-
-def test_attention_lstm_pipeline():
-    """Test attention followed by LSTM."""
-    attn = VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4)
-    lstm = VmapSafeLSTM(input_size=64, hidden_size=128, num_layers=1)
-
-    x = torch.randn(4, 10, 64)
-    attn_out = attn(x, x, x)
-    lstm_out, _ = lstm(attn_out)
-
-    assert lstm_out.shape == (4, 10, 128)

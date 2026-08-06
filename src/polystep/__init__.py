@@ -37,9 +37,6 @@ __all__ = [
     "CompiledFunctions",
     "try_compile",
     # Subspace
-    "FactorSpec",
-    "LowRankSubspace",
-    "LinearSubspace",
     "ProjectionSpec",
     "AdaptiveSubspace",
     "CMAAdaptiveSubspace",
@@ -113,7 +110,7 @@ from .cost_nn import NNCostEvaluator, auto_detect_chunk_size
 
 from ._compiled import CompiledFunctions, try_compile
 
-from .subspace import FactorSpec, LowRankSubspace, LinearSubspace, ProjectionSpec
+from .subspace import ProjectionSpec
 
 from .adaptive_subspace import AdaptiveSubspace
 

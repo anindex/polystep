@@ -1,9 +1,7 @@
 """Probe-radius jitter: the smooth density the convergence analysis assumes.
 
-The analysis needs the jitter density to be C-infinity and compactly supported.
-The mollifier q(t) ~ exp(-1/(1-t^2)) is; a uniform density is not, and the
-difference shows up as Dirac terms in the score of the induced probe kernel.
-These tests check support, smooth-vs-uniform shape, and reproducibility.
+The analysis needs the density C-infinity and compactly supported; the mollifier
+q(t) ~ exp(-1/(1-t^2)) qualifies, a uniform density does not.
 """
 
 import math
@@ -20,27 +18,9 @@ def _optimizer(**kw):
 
 def test_jitter_respects_support():
     opt = _optimizer(probe_radius_jitter=0.3, seed=0)
-    etas = [opt._sample_jitter(0.3) for _ in range(500)]
-    assert all(abs(e) < 0.3 for e in etas)
-    assert max(abs(e) for e in etas) > 0.05  # not degenerate
-
-
-def test_smooth_density_concentrates_more_than_uniform():
-    """The mollifier puts more mass near zero and vanishes at the boundary."""
-    smooth = _optimizer(probe_radius_jitter=0.9, probe_radius_jitter_dist="smooth", seed=1)
-    uniform = _optimizer(probe_radius_jitter=0.9, probe_radius_jitter_dist="uniform", seed=1)
-
-    n = 4000
-    s = torch.tensor([smooth._sample_jitter(1.0) for _ in range(n)])
-    u = torch.tensor([uniform._sample_jitter(1.0) for _ in range(n)])
-
-    # Uniform on [-1,1] has std 1/sqrt(3) ~ 0.577; the mollifier is tighter.
-    assert s.std().item() < u.std().item()
-    assert abs(u.std().item() - 1 / math.sqrt(3)) < 0.03
-
-    # The mollifier vanishes to infinite order at +-1, so the extreme tail is empty.
-    assert (s.abs() > 0.97).sum().item() == 0
-    assert (u.abs() > 0.97).sum().item() > 0
+    etas = opt._sample_jitter_batch(0.3, 500)
+    assert etas.abs().max().item() < 0.3
+    assert etas.abs().max().item() > 0.05  # not degenerate
 
 
 def test_zero_jitter_is_a_noop():
@@ -49,8 +29,8 @@ def test_zero_jitter_is_a_noop():
 
 
 def test_jitter_is_seed_reproducible():
-    a = [_optimizer(probe_radius_jitter=0.2, seed=7)._sample_jitter(0.2) for _ in range(1)]
-    b = [_optimizer(probe_radius_jitter=0.2, seed=7)._sample_jitter(0.2) for _ in range(1)]
+    a = [_optimizer(probe_radius_jitter=0.2, seed=7)._sample_jitter_pooled(0.2) for _ in range(1)]
+    b = [_optimizer(probe_radius_jitter=0.2, seed=7)._sample_jitter_pooled(0.2) for _ in range(1)]
     assert a == b
 
 
@@ -65,11 +45,8 @@ def test_invalid_distribution_rejected():
 
 # --- Jitter is exclusive with the amortization heuristics -------------------------
 #
-# Jitter makes the per-step cost a noisy estimate of the same quantity. Adaptive
-# probes read that noise as a moved particle, cost-row reuse would mix rows measured
-# at different radii, and amortized OT reads it as non-monotone progress and coasts
-# on a stale direction. The constructor is the one place every caller routes through,
-# so it enforces the exclusion there instead of leaving each config to remember.
+# Jitter noise reads as particle movement to the reuse and amortization heuristics,
+# so the constructor turns them off instead of leaving each config to remember.
 
 
 def test_jitter_disables_amortization_and_adaptive_probes():
@@ -92,11 +69,8 @@ def test_no_jitter_leaves_the_heuristics_alone():
 
 # --- Step-radius jitter: absolute continuity of the one-step law -------------------
 #
-# Probe jitter randomizes where the cost row is measured.  Step jitter randomizes how
-# far the iterate moves, which is a different property: without it the displacement
-# has a deterministic length, so the one-step law sits on a sphere -- a Lebesgue-null
-# subset of the probe plane.  Cor. 4.12 needs a volume there, and the argument that
-# the iterate never lands on the discontinuity set is cleaner with one.
+# Without jitter the displacement has deterministic length, so the one-step law sits
+# on a Lebesgue-null sphere; Cor. 4.12 needs a volume there.
 
 
 def test_step_jitter_is_a_noop_at_zero():
@@ -117,11 +91,7 @@ def test_step_jitter_rejects_out_of_range():
 
 
 def test_step_jitter_spreads_the_displacement_length():
-    """Without jitter every step has the same length; with it, a spread of lengths.
-
-    This is the property the analysis uses, so it is the property worth asserting:
-    the displacement norms must not collapse onto a single value.
-    """
+    """Without jitter every step has the same length; with it, a spread of lengths."""
     from polystep.cost_nn import NNCostEvaluator
 
     def norms(step_jitter):
@@ -156,14 +126,32 @@ def test_step_jitter_spreads_the_displacement_length():
 
 
 def test_step_jitter_is_drawn_per_particle():
-    """One shared eta would leave the joint step on a lower-dimensional manifold.
-
-    Independence across particles is exactly what gives the joint one-step law a
-    density on the search subspace, so it is the property to assert.
-    """
+    """One shared eta would leave the joint step on a lower-dimensional manifold."""
     opt = _optimizer(step_radius_jitter=0.4, seed=5)
     X = torch.zeros(6, 3)
     X_bary = torch.ones(6, 3)
     scales = (opt._apply_particle_step_jitter(X, X_bary) - X)[:, 0]
     assert scales.std().item() > 0.0, scales
     assert len(set(scales.tolist())) > 1, scales
+
+
+def test_the_jitter_sampler_draws_the_law_lemma_4_3_assumes():
+    """Mollifier tighter than uniform, tail empty at +-1, symmetric about zero."""
+    n = 20_000
+    smooth = _optimizer(probe_radius_jitter=0.9, probe_radius_jitter_dist="smooth", seed=3)
+    uniform = _optimizer(probe_radius_jitter=0.9, probe_radius_jitter_dist="uniform", seed=3)
+
+    s = smooth._sample_jitter_batch(1.0, n)
+    u = uniform._sample_jitter_batch(1.0, n)
+
+    assert s.shape == (n,) and u.shape == (n,)
+    assert s.abs().max().item() < 1.0 and u.abs().max().item() < 1.0
+    assert s.abs().max().item() > 0.05
+    assert s.std().item() < u.std().item()
+    assert abs(u.std().item() - 1 / math.sqrt(3)) < 0.02
+    # The mollifier vanishes to infinite order at +-1; uniform does not.
+    assert (s.abs() > 0.97).sum().item() == 0
+    assert (u.abs() > 0.97).sum().item() > 0
+    # Symmetric about zero, so E[1+eta] = 1 and the radius is unbiased.
+    assert abs(s.mean().item()) < 0.02
+    assert abs(u.mean().item()) < 0.02

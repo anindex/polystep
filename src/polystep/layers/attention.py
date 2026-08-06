@@ -1,21 +1,4 @@
-"""Vmap-compatible multi-head attention.
-
-A drop-in replacement for ``nn.MultiheadAttention`` that uses an
-explicit ``torch.matmul`` path instead of
-``F.scaled_dot_product_attention``. The hand-rolled path sidesteps the
-SDPA mask-validation issues reported under ``torch.vmap`` (PyTorch
-issue #151558 and related) and works the same way on every PyTorch
-build supported by this project.
-
-Example:
-    >>> import torch
-    >>> from polystep.layers import VmapSafeMultiHeadAttention
-    >>> attn = VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4)
-    >>> x = torch.randn(2, 10, 64)  # (batch, seq, embed)
-    >>> out = attn(x, x, x)  # self-attention
-    >>> out.shape
-    torch.Size([2, 10, 64])
-"""
+"""Vmap-compatible multi-head attention using explicit matmul instead of SDPA (issue #151558)."""
 
 import math
 import warnings
@@ -27,44 +10,10 @@ import torch.nn.functional as F
 
 
 class VmapSafeMultiHeadAttention(nn.Module):
-    """Multi-head attention using explicit matmul operations for vmap compatibility.
+    """Multi-head attention via explicit matmul, vmap-safe.
 
-    This implementation avoids F.scaled_dot_product_attention which has known
-    vmap mask validation bugs (PyTorch Issue #151558). Instead, it uses explicit
-    matrix multiplications that work correctly under torch.vmap.
-
-    Limitations vs nn.MultiheadAttention:
-        - Returns the output tensor alone, not ``(output, weights)``. ``out, _ = attn(...)``
-          raises for most batch sizes and, at ``batch_size == 2``, silently unpacks the
-          batch dimension into two tensors instead.
-        - No built-in causal masking (pass attn_mask manually)
-        - Assumes batch-first layout: (batch, seq, embed_dim)
-        - No add_bias_kv or add_zero_attn support
-        - kdim/vdim must equal embed_dim (no cross-attention with different dims)
-
-    Args:
-        embed_dim: Total dimension of the model (must be divisible by num_heads).
-        num_heads: Number of parallel attention heads.
-        dropout: Dropout probability on attention weights. Default: 0.0.
-        bias: Whether to add bias to projection layers. Default: True.
-
-    Input shapes:
-        - query: ``(batch, seq_q, embed_dim)``
-        - key: ``(batch, seq_k, embed_dim)``
-        - value: ``(batch, seq_k, embed_dim)``
-        - attn_mask: ``(seq_q, seq_k)``, ``(batch, seq_q, seq_k)``, or
-          ``(batch, num_heads, seq_q, seq_k)`` (float additive or bool)
-        - key_padding_mask: ``(batch, seq_k)`` bool, ``True`` = padding
-
-    Output shape:
-        - (batch, seq_q, embed_dim)
-
-    Example:
-        >>> attn = VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4)
-        >>> x = torch.randn(2, 10, 64)
-        >>> out = attn(x, x, x)  # self-attention
-        >>> out.shape
-        torch.Size([2, 10, 64])
+    Returns only the output tensor, not ``(output, weights)``. No built-in causal
+    mask; kdim/vdim must equal embed_dim.
     """
 
     def __init__(
@@ -73,8 +22,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         bias: bool = True,
-        # Mirror nn.MultiheadAttention's signature so unsupported features raise
-        # NotImplementedError rather than an unexpected-keyword TypeError.
+        # Mirror nn.MultiheadAttention's signature so unsupported kwargs raise a clear error.
         add_bias_kv: bool = False,
         add_zero_attn: bool = False,
         kdim: Optional[int] = None,
@@ -123,16 +71,12 @@ class VmapSafeMultiHeadAttention(nn.Module):
                 stacklevel=2,
             )
 
-        # Separate projections for Q, K, V (not combined like GPT-2)
-        # This makes vmap over parameters cleaner
         self.W_q = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.W_k = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.W_v = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-        # Output projection
         self.W_o = nn.Linear(embed_dim, embed_dim, bias=bias)
 
-        # Dropout for attention weights
         self.attn_dropout = nn.Dropout(dropout)
 
     def forward(
@@ -147,30 +91,9 @@ class VmapSafeMultiHeadAttention(nn.Module):
     ) -> torch.Tensor:
         """Compute multi-head attention.
 
-        Args:
-            query: Query tensor of shape ``(batch, seq_q, embed_dim)``.
-            key: Key tensor of shape ``(batch, seq_k, embed_dim)``.
-            value: Value tensor of shape ``(batch, seq_k, embed_dim)``.
-            attn_mask: Attention mask. Accepted shapes (matching
-                ``nn.MultiheadAttention``):
-                ``(seq_q, seq_k)``, ``(batch, seq_q, seq_k)``, or
-                ``(batch, num_heads, seq_q, seq_k)``. Float masks are added
-                to attention scores before softmax (use ``-inf`` for hard
-                masking). Bool masks are interpreted upstream-style: ``True``
-                positions are masked out.
-            key_padding_mask: Boolean mask of shape ``(batch, seq_k)`` where
-                ``True`` marks padding positions.
-            need_weights: Not supported. Returning attention weights from
-                inside ``vmap`` requires extra reshapes that defeat the
-                kernel fusion this layer is here to enable.
-            is_causal: Not supported. Pass an explicit triangular
-                ``attn_mask`` instead.
-
-        Returns:
-            Output tensor of shape (batch, seq_q, embed_dim).
+        attn_mask is float (additive) or bool (True = masked), in 2D, 3D, or 4D,
+        matching ``nn.MultiheadAttention``. Returns ``(batch, seq_q, embed_dim)``.
         """
-        # Reject unsupported forward kwargs up front so the failure
-        # mode is loud, not "wrong but plausible-looking output".
         if need_weights:
             raise NotImplementedError(
                 "VmapSafeMultiHeadAttention does not support need_weights=True. See LIMITATIONS.md."
@@ -184,28 +107,21 @@ class VmapSafeMultiHeadAttention(nn.Module):
         batch_size, seq_q, _ = query.shape
         seq_k = key.shape[1]
 
-        # Project Q, K, V: (batch, seq, embed_dim) -> (batch, seq, embed_dim)
         Q = self.W_q(query)
         K = self.W_k(key)
         V = self.W_v(value)
 
-        # Reshape to (batch, num_heads, seq, head_dim)
         Q = Q.view(batch_size, seq_q, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(batch_size, seq_k, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_k, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Compute attention scores: (batch, num_heads, seq_q, seq_k)
-        # Q @ K.T = (batch, num_heads, seq_q, head_dim) @ (batch, num_heads, head_dim, seq_k)
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
-        # Bool masks fill with -inf, matching ``nn.MultiheadAttention``. Float masks
-        # are additive: -inf to mask, finite values for soft biases.
+        # Bool masks fill with -inf; float masks add.
         if attn_mask is not None:
             if attn_mask.dim() == 2:
-                # (seq_q, seq_k) -> (1, 1, seq_q, seq_k)
                 attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
             elif attn_mask.dim() == 3:
-                # (batch, seq_q, seq_k) -> (batch, 1, seq_q, seq_k)
                 attn_mask = attn_mask.unsqueeze(1)
             elif attn_mask.dim() != 4:
                 raise ValueError(
@@ -218,9 +134,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
                 scores = scores + attn_mask
 
         if key_padding_mask is not None:
-            # (batch, seq_k) -> (batch, 1, 1, seq_k)
             padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            # True means padding, so we mask with -inf
             scores = scores.masked_fill(padding_mask, float("-inf"))
 
         # Softmax of an all -inf row is NaN, which spreads through the value mix.
@@ -229,15 +143,11 @@ class VmapSafeMultiHeadAttention(nn.Module):
         attn_weights = attn_weights.masked_fill(fully_masked, 0.0)
         attn_weights = self.attn_dropout(attn_weights)
 
-        # Apply attention to values: (batch, num_heads, seq_q, head_dim)
         context = torch.matmul(attn_weights, V)
 
-        # Reshape back: (batch, num_heads, seq_q, head_dim) -> (batch, seq_q, embed_dim)
-        # reshape, not .contiguous().view(): the latter copies once per candidate
-        # under vmap.
+        # reshape, not .contiguous().view(): the latter copies once per candidate under vmap.
         context = context.transpose(1, 2).reshape(batch_size, seq_q, self.embed_dim)
 
-        # Output projection
         output = self.W_o(context)
 
         return output

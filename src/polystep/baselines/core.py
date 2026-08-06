@@ -1,34 +1,9 @@
-"""Shared protocol for the gradient-free baselines.
-
-Everything here exists so the baselines and PolyStep can be handed the *same*
-search space, the same probe radius, the same minibatch stream and the same
-evaluation counter.
-
-One evaluation = one candidate scored
--------------------------------------
-:class:`Objective` counts rows. A method that scores a population of 32 spends
-32, whether it did so in one vmapped call or 32 python calls. This replaces the
-three incompatible semantics in ``experiments/``:
-``FunctionEvalCounter`` (closure calls), ``CountingClosure`` (``losses.shape[0]``,
-the only one that already agreed with this) and ``sgd_baseline`` (samples).
-
-One call = one generation = one minibatch
------------------------------------------
-Every method calls the objective once per iteration with its whole population.
-A stochastic ``fn`` should therefore draw its minibatch per call, which gives
-every candidate in a generation the same data, as PolyStep's closure does.
-
-Subspace
---------
-:meth:`Objective.from_subspace` puts the search in a
-:class:`~polystep.hybrid_subspace.HybridSubspace`'s projected coordinates:
-``dim`` becomes ``subspace_dim`` and candidates are reconstructed into full
-parameters before the loss sees them. Nothing else in a method changes.
-"""
+"""Shared protocol for the gradient-free baselines."""
 
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -38,27 +13,12 @@ __all__ = ["BudgetExhausted", "Objective", "Result", "centered_rank", "zscore"]
 
 
 class BudgetExhausted(RuntimeError):
-    """A candidate batch would have exceeded the evaluation budget.
-
-    Methods loop on :attr:`Objective.remaining` and stop before this fires; it
-    is the backstop that makes "never more than ``budget``" true even if a
-    method's own bookkeeping is wrong.
-    """
+    """Raised when a candidate batch would exceed the evaluation budget."""
 
 
 @dataclass
 class Result:
-    """Outcome of one baseline run.
-
-    Attributes:
-        method: Method name.
-        x: Final iterate (the method's own estimate, e.g. the ES mean).
-        best_x: Best candidate ever evaluated.
-        best_loss: Its loss.
-        evals: Candidates evaluated. Always ``<= Objective.budget``.
-        iters: Iterations/generations completed.
-        history: ``(evals, best_loss)`` after each iteration.
-    """
+    """Outcome of one baseline run."""
 
     method: str
     x: torch.Tensor
@@ -69,20 +29,17 @@ class Result:
     history: List[Tuple[int, float]] = field(default_factory=list)
 
 
-class Objective:
-    """A budgeted, optionally projected black-box objective.
+def _coord_shape(spec, factored: bool) -> Tuple[int, ...]:
+    """Shape of one layer's coordinate block: ``(d_out, rank)`` for factored, flat otherwise."""
+    if factored and getattr(spec, "is_projected", False):
+        rows = spec.original_shape[0]
+        if rows > 0 and spec.num_coords % rows == 0:
+            return (rows, spec.num_coords // rows)
+    return (spec.num_coords,)
 
-    Args:
-        fn: ``(N, dim) -> (N,)`` losses, lower is better. Called once per
-            generation with the whole population.
-        dim: Search-space dimension.
-        budget: Total candidates the run may evaluate.
-        shapes: How ``dim`` decomposes into parameter tensors. Only EGGROLL
-            reads this, to know where the matrices are. Defaults to one flat
-            ``(dim,)`` block.
-        subspace: The subspace the coordinates live in, when there is one.
-            Informational; :meth:`from_subspace` does the wiring.
-    """
+
+class Objective:
+    """A budgeted, optionally projected black-box objective."""
 
     def __init__(
         self,
@@ -92,6 +49,7 @@ class Objective:
         *,
         shapes: Optional[Sequence[Sequence[int]]] = None,
         subspace: object = None,
+        deadline_s: Optional[float] = None,
     ):
         if dim < 1:
             raise ValueError(f"dim must be >= 1, got {dim}.")
@@ -101,6 +59,8 @@ class Objective:
         self.dim = int(dim)
         self.budget = int(budget)
         self.subspace = subspace
+        self.deadline_s = None if deadline_s is None else float(deadline_s)
+        self._t0: Optional[float] = None
         self.shapes: Tuple[Tuple[int, ...], ...] = (
             tuple(tuple(int(d) for d in s) for s in shapes) if shapes else ((self.dim,),)
         )
@@ -108,14 +68,11 @@ class Objective:
         if covered != self.dim:
             raise ValueError(f"shapes cover {covered} entries but dim is {self.dim}.")
         self.evals = 0
-        # Best-so-far is tracked ON DEVICE. Materializing it per call costs two
-        # host syncs, which measured 6.17 ms against 0.49 ms for the loss itself:
-        # 93% of wall-clock would be this bookkeeping. Worse, the cost is per
-        # *call*, so it scales with generation count and silently flatters
-        # whichever method batches more candidates per call. Read `best_loss` at
-        # the end of a run; use `best_loss_t` inside a loop.
+        # Best-so-far is tracked on-device to avoid per-call host syncs. Read best_loss once at the end; use best_loss_t in a loop.
         self._best_loss_t: Optional[torch.Tensor] = None
         self._best_x_t: Optional[torch.Tensor] = None
+        #: The method's own current iterate. This is NOT best_x: for a population method, best_x is a sampled candidate displaced from the mean. Score both and select on validation.
+        self.iterate: Optional[torch.Tensor] = None
 
     @classmethod
     def from_subspace(
@@ -127,22 +84,9 @@ class Objective:
         *,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
+        deadline_s: Optional[float] = None,
     ) -> "Objective":
-        """Search in a subspace's projected coordinates.
-
-        Args:
-            subspace: A :class:`~polystep.hybrid_subspace.HybridSubspace` (or any
-                object with ``specs``/``subspace_dim``/``init_projections``/
-                ``reconstruct_batch``, e.g. ``FactoredSubspace``).
-            base_sd: Base parameters the perturbation is added to.
-            loss_batch: ``{key: (N, *shape)} -> (N,)`` losses.
-            budget: Candidate budget.
-            device: Device for the projection matrices. Defaults to ``base_sd``'s.
-            dtype: Dtype for the projection matrices.
-
-        Returns:
-            An :class:`Objective` of dimension ``subspace.subspace_dim``.
-        """
+        """Search in a subspace's projected coordinates."""
         if device is None:
             device = next(iter(base_sd.values())).device
         projections = subspace.init_projections(device, dtype)
@@ -150,11 +94,10 @@ class Objective:
         def fn(coords: torch.Tensor) -> torch.Tensor:
             return loss_batch(subspace.reconstruct_batch(projections, base_sd, coords))
 
-        # Coordinates carry no matrix structure (HybridSubspace's projection is a QR'd
-        # Gaussian), so each layer's chunk is one flat block. EGGROLL degenerates to
-        # dense Gaussian ES here; see the README note.
-        shapes = tuple((spec.num_coords,) for spec in subspace.specs)
-        return cls(fn, subspace.subspace_dim, budget, shapes=shapes, subspace=subspace)
+        # shapes tells EGGROLL's low-rank sampler where the matrix structure is in coordinate space: flat for HybridSubspace, (d_out, r) for FactoredSubspace.
+        factored = bool(getattr(subspace, "coords_are_factored", False))
+        shapes = tuple(_coord_shape(spec, factored) for spec in subspace.specs)
+        return cls(fn, subspace.subspace_dim, budget, shapes=shapes, subspace=subspace, deadline_s=deadline_s)
 
     @classmethod
     def from_layout(
@@ -162,36 +105,61 @@ class Objective:
         layout,
         fn: Callable[[torch.Tensor], torch.Tensor],
         budget: int,
+        *,
+        deadline_s: Optional[float] = None,
     ) -> "Objective":
-        """Search in full flat parameter space, keeping the per-tensor shapes.
+        """Search in flat parameter space, keeping the per-tensor shapes."""
+        return cls(
+            fn,
+            layout.total_params,
+            budget,
+            shapes=tuple(e.shape for e in layout.entries),
+            deadline_s=deadline_s,
+        )
 
-        Args:
-            layout: A :class:`~polystep.transform.ParamLayout`.
-            fn: ``(N, total_params) -> (N,)`` losses over flat parameter vectors.
-            budget: Candidate budget.
-        """
-        return cls(fn, layout.total_params, budget, shapes=tuple(e.shape for e in layout.entries))
+    @property
+    def elapsed_s(self) -> float:
+        """Seconds since the first call. Zero before the run starts."""
+        return 0.0 if self._t0 is None else time.perf_counter() - self._t0
+
+    @property
+    def out_of_time(self) -> bool:
+        """True once a wall-clock deadline has passed."""
+        return self.deadline_s is not None and self.elapsed_s >= self.deadline_s
 
     @property
     def remaining(self) -> int:
-        """Candidates still affordable."""
+        """Candidates still affordable, under whichever budget binds first."""
+        if self.out_of_time:
+            return 0
         return self.budget - self.evals
 
     def __call__(self, X: torch.Tensor) -> torch.Tensor:
         """Score ``(N, dim)`` candidates, charging ``N`` to the budget."""
+        if self._t0 is None:
+            self._t0 = time.perf_counter()
         X = X.reshape(-1, X.shape[-1]) if X.dim() > 1 else X.reshape(1, -1)
         n = X.shape[0]
         if X.shape[1] != self.dim:
             raise ValueError(f"candidates have width {X.shape[1]}, expected {self.dim}.")
         if n > self.remaining:
+            if self.out_of_time:
+                raise BudgetExhausted(
+                    f"wall-clock deadline of {self.deadline_s:.0f}s passed at {self.elapsed_s:.0f}s "
+                    f"after {self.evals} candidates."
+                )
             raise BudgetExhausted(f"{n} candidates requested, {self.remaining} of {self.budget} left.")
         losses = torch.as_tensor(self._fn(X)).reshape(n)
         self.evals += n
         # NaN would win argmin, -inf would win forever.
         finite = torch.nan_to_num(losses.detach(), nan=float("inf"), neginf=float("inf"))
-        i = finite.argmin()                       # device tensor: no sync
-        cand_loss = finite[i]
-        cand_x = X[i].detach()
+        # Take the value by reduction and the row by a device-side gather: indexing with argmin's result would sync.
+        # The loss may be computed on a different device than the search space; normalize once here so scalars follow the candidates.
+        if finite.device != X.device:
+            finite = finite.to(X.device)
+        i = finite.argmin()
+        cand_loss = finite.amin()
+        cand_x = X.index_select(0, i.view(1)).squeeze(0).detach()
         if self._best_loss_t is None:
             self._best_loss_t = cand_loss.clone()
             self._best_x_t = cand_x.clone()
@@ -199,7 +167,8 @@ class Objective:
             better = cand_loss < self._best_loss_t
             self._best_loss_t = torch.where(better, cand_loss, self._best_loss_t)
             self._best_x_t = torch.where(better, cand_x, self._best_x_t)
-        return losses
+        # Return losses on the candidates' device; methods combine them with state that lives there.
+        return losses.to(X.device) if losses.device != X.device else losses
 
     @property
     def best_loss_t(self) -> torch.Tensor:
