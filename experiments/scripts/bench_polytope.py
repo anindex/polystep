@@ -28,6 +28,14 @@ CONFIGS = {
     "orthoplex + use_quadratic_model + trust_region": dict(
         polytope_type="orthoplex", use_quadratic_model=True, trust_region=True, num_probe=2
     ),
+    "orthoplex + use_quadratic_model + trust_region, K=1": dict(
+        polytope_type="orthoplex", use_quadratic_model=True, trust_region=True, num_probe=1
+    ),
+    # The closed-form gradient holds on any centred tight frame, so the model runs here
+    # too, on d+1 vertices instead of 2d. Curvature is the trace, from the shared f(X).
+    "simplex + use_quadratic_model + trust_region": dict(
+        polytope_type="simplex", use_quadratic_model=True, trust_region=True, num_probe=1
+    ),
 }
 
 

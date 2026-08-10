@@ -1,25 +1,10 @@
 #!/usr/bin/env python
-"""Run all methods and seeds for non-differentiable showcase elevation experiments.
+"""Run all methods and seeds for the non-differentiable showcases (snn, int8, argmax, staircase).
 
-Elevates 4 existing non-differentiable showcases (SNN/LIF, int8-quantized,
-argmax hard attention, staircase activation) from synthetic demos to
-publishable experiments with 5-seed rigor and 4 baselines.
-
-Methods:
-  - polystep: PolyStepOptimizer with HybridSubspace on non-diff models
-  - adam: Adam on smooth model variant (accuracy ceiling)
-  - the six gradient-free baselines from ``polystep.baselines``: cma_es, openai_es,
-    spsa, mezo, random_search, eggroll
-
-``--fair`` gives every gradient-free method the same subspace, the same candidate
-budget derived from PolyStep, and the same probe radius; ``--theory-mode`` runs the
-configuration Theorem 4.2 analyses. See ``experiments/runners/fairness.py``.
-
-Showcases:
-  - snn: Spiking Neural Network with hard-threshold LIF neurons (MNIST)
-  - int8: Int8 weight quantization via round() (MNIST)
-  - argmax: Argmax hard attention routing over 8 slots (Fashion-MNIST)
-  - staircase: Piecewise-constant staircase activation (MNIST)
+Methods: polystep (HybridSubspace on the non-diff models), adam on a smooth
+variant, and the six gradient-free baselines from ``polystep.baselines``.
+``--fair`` gives every gradient-free method the same subspace, budget, and probe
+radius; ``--theory-mode`` runs the unaccelerated reference configuration.
 
 Results saved as: experiments/results/softmax/main/{showcase}_{method}_{seed}.json
 """
@@ -28,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 import sys
 import time
@@ -40,7 +26,9 @@ import torch
 import torch.nn as nn
 
 from experiments.runners.common import (
+    METHOD_ALIASES,
     SEEDS,
+    reseed_loaders,
     evaluate_accuracy,
     load_mnist,
     load_fashion_mnist,
@@ -61,15 +49,24 @@ from experiments.runners.nondiff_models import (
 )
 from experiments.baselines.sgd_baseline import train_sgd
 from experiments.runners.fairness import (
+    build_polystep,
     FAIR_METHODS,
+    TestSplitTripwire,
+    apply_point,
+    apply_polystep_multipliers,
     apply_theory_mode,
+    load_selection,
     make_subspace,
     minibatch_loss,
+    matched_budget,
     polystep_eval_budget,
     probe_scale_of,
     run_baseline,
     subspace_tag,
 )
+
+#: tune_polystep.py writes here, not the shared baseline selection file.
+POLYSTEP_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "polystep_selected.json")
 
 
 SHOWCASE_CONFIGS = {
@@ -100,14 +97,14 @@ SHOWCASE_CONFIGS = {
 }
 
 
-EPOCHS_PSTORCH = 30  # SNN needs more epochs; softmax solver is fast enough
-EPOCHS_PSTORCH_NONSNN = 30  # Int8/Argmax/Staircase
+EPOCHS_POLYSTEP = 30  # SNN needs more epochs; softmax solver is fast enough
+EPOCHS_POLYSTEP_NONSNN = 30
 EPOCHS_ADAM = 30
 ADAM_LR = 0.001
 
-# Free-running (non-fair) candidate budgets, preserving what the previous ad-hoc
-# implementations spent: ES 10000 gen x 50 pop, CMA-ES 10000 gen x 16 pop, SPSA 50000
-# iters x 2. `--fair` replaces all of these with one budget derived from PolyStep.
+# Free-running (non-fair) candidate budgets: ES 10000 gen x 50 pop, CMA-ES 10000
+# gen x 16 pop, SPSA 50000 iters x 2. `--fair` replaces all of these with one
+# budget derived from PolyStep.
 LEGACY_BUDGETS = {
     "openai_es": 500_000,
     "eggroll": 500_000,
@@ -117,10 +114,9 @@ LEGACY_BUDGETS = {
     "random_search": 100_000,
 }
 
-PSTORCH_CONFIGS = {
-    # SNN: Best sweep config = sm_sr2 (93.28% at 20ep, beats 40ep production)
-    # FLAT eps/sr/pr - CosineEpsilon scheduling DESTROYS SNN (collapse to 10-47%)
-    # biased_rotation + absorb_interval=20 = key levers for spiking landscape stability
+POLYSTEP_CONFIGS = {
+    # SNN: flat eps/sr/pr; cosine scheduling collapses SNN accuracy, and
+    # biased_rotation + absorb_interval=20 stabilize the spiking landscape.
     "snn": {
         "epsilon": 0.5,
         "step_radius": 2.0,
@@ -133,9 +129,8 @@ PSTORCH_CONFIGS = {
         "absorb_interval": 20,
         "biased_rotation": True,
     },
-    # INT8: Best sweep config = rank8 (97.18% at 20ep, beats 40ep production)
-    # CosineEpsilon scheduling works well on quantization plateaus
-    # rank=8 is the dominant lever (+1.08% over rank=4)
+    # INT8: cosine schedules work well on quantization plateaus; rank=8 is the
+    # dominant lever.
     "int8": {
         "epsilon_init": 5.0,
         "epsilon_target": 0.3,
@@ -153,8 +148,7 @@ PSTORCH_CONFIGS = {
         "momentum_init": 0.3,
         "momentum_final": 0.5,
     },
-    # Argmax: Best sweep config = rank8 (87.08% at 20ep, beats 40ep production)
-    # Same CosineEpsilon strategy as INT8 but NO momentum (sweep: no_mom=84.71% < rank8=87.08%)
+    # Argmax: same cosine strategy as INT8, but no momentum.
     "argmax": {
         "epsilon_init": 5.0,
         "epsilon_target": 0.3,
@@ -169,9 +163,8 @@ PSTORCH_CONFIGS = {
         "rotation_interval": 0,
         "absorb_interval": 0,
     },
-    # Staircase: Retuned from sr64->16 which degraded after epoch 11
-    # Gentler cosine targets (64->32, eps 5->1) eliminate late-epoch degradation
-    # 15ep tune: cosine_64_32=91.96%/91.10% vs cosine_64_16=91.80%/89.15%
+    # Staircase: gentle cosine targets (sr 64->32, eps 5->1) avoid late-epoch
+    # degradation.
     "staircase": {
         "epsilon_init": 5.0,
         "epsilon_target": 1.0,
@@ -200,6 +193,9 @@ def _load_split(showcase_name, seed, audit_no_leakage):
     val_loader = None
     if audit_no_leakage:
         train_loader, val_loader = make_train_val_split(train_loader, val_frac=0.1, seed=seed)
+    # Rewind the shuffle generators, or the Nth run in a process sees the Nth
+    # minibatch stream and a reported seed only reproduces in a fresh interpreter.
+    reseed_loaders(seed, train_loader, val_loader, test_loader)
     return train_loader, val_loader, test_loader
 
 
@@ -208,67 +204,14 @@ def _epochs_for(showcase_name, cfg, dry_run):
         return 1
     if "epochs" in cfg:
         return cfg["epochs"]
-    return EPOCHS_PSTORCH if showcase_name == "snn" else EPOCHS_PSTORCH_NONSNN
-
-
-def _build_polystep(model, seed, total_steps, cfg):
-    """Build the subspace and optimizer from ``cfg``.
-
-    Shared by the training run and by ``fair_eval_budget``, which needs the built
-    optimizer to know how many candidates a step costs.
-    """
-    from polystep.optimizer import PolyStepOptimizer
-    from polystep.epsilon import CosineEpsilon
-    from polystep.transform import ParamLayout
-
-    def sched(key, flat_default):
-        # Scheduled when the config carries both endpoints; flat otherwise, which is
-        # also what --theory-mode leaves behind.
-        if f"{key}_init" not in cfg:
-            return cfg.get(key, flat_default)
-        init, target = cfg[f"{key}_init"], cfg[f"{key}_target"]
-        return CosineEpsilon(init=init, target=target, decay=(init - target) / max(1, total_steps))
-
-    layout = ParamLayout.from_module(model)
-    subspace = make_subspace(
-        layout,
-        rank=cfg["rank"],
-        seed=seed,
-        rotation_mode="random",
-        rotation_interval=cfg["rotation_interval"],
-        absorb_mode="periodic",
-        absorb_interval=cfg["absorb_interval"],
-    )
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=False,
-        seed=seed,
-        epsilon=sched("epsilon", 0.5),
-        step_radius=sched("step_radius", 1.0),
-        probe_radius=sched("probe_radius", 1.0),
-        num_probe=cfg["num_probe"],
-        subspace=subspace,
-        chunk_size=cfg["chunk_size"],
-        probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
-        probe_radius_jitter_dist=cfg.get("probe_radius_jitter_dist", "smooth"),
-        step_radius_jitter=cfg.get("step_radius_jitter", 0.0),
-        polytope_type=cfg.get("polytope_type", "simplex"),
-        amortize_steps=cfg.get("amortize_steps", 1),
-        amortize_ema=cfg.get("amortize_ema", 0.0),
-        use_momentum=cfg.get("use_momentum", False),
-        momentum_init=cfg.get("momentum_init", 0.5),
-        momentum_final=cfg.get("momentum_final", 0.95),
-        biased_rotation=cfg.get("biased_rotation", False),
-        solver="softmax",
-    )
-    return layout, subspace, optimizer
+    return EPOCHS_POLYSTEP if showcase_name == "snn" else EPOCHS_POLYSTEP_NONSNN
 
 
 def fair_eval_budget(showcase_name, seed, device, train_loader, epochs, cfg):
     """The shared candidate budget: what PolyStep spends over ``epochs`` epochs."""
     set_seed(seed)
     model = SHOWCASE_CONFIGS[showcase_name]["model_fn"]().to(device)
-    _, _, opt = _build_polystep(model, seed, epochs * len(train_loader), cfg)
+    _, _, opt = build_polystep(model, seed, epochs * len(train_loader), cfg)
     return polystep_eval_budget(opt, epochs * len(train_loader))
 
 
@@ -281,19 +224,38 @@ def run_polystep(
     audit_no_leakage: bool = True,
     fair: bool = False,
     theory_mode: bool = False,
+    tuning: bool = False,
 ):
     """Train non-diff model with polystep PolyStepOptimizer + HybridSubspace.
 
-    By default, best-checkpoint selection uses a held-out validation
-    split (honest protocol). Set ``audit_no_leakage=False`` to revert
-    to legacy test-set selection.
+    Best-checkpoint selection uses a held-out validation split;
+    ``audit_no_leakage=False`` selects on the test set. ``tuning=True`` skips the
+    selection file and swaps the test split for ``TestSplitTripwire`` so a sweep
+    that reads test raises.
     """
     from polystep.cost_nn import NNCostEvaluator
 
     config = SHOWCASE_CONFIGS[showcase_name]
-    polystep_cfg = PSTORCH_CONFIGS[showcase_name]
+    polystep_cfg = POLYSTEP_CONFIGS[showcase_name]
+    # PolyStep reads its own sweep selection the same way the baselines read
+    # theirs; theory mode reads it too and then overrides the analysed knobs on
+    # top, so the gap it feeds is measured with everything else at the tuned values.
+    polystep_tuned_name, polystep_tuned_prov = None, None
+    if not tuning:
+        selected, polystep_tuned_prov = load_selection(
+            "gallery", showcase_name, "polystep", path=POLYSTEP_SELECTION_PATH
+        )
+        if selected:
+            polystep_cfg = apply_polystep_multipliers(polystep_cfg, selected["point"])
+            polystep_tuned_name = selected["name"]
+            print(f"    tuned: {selected['name']} (val={selected['val']:.4f})")
     if theory_mode:
         polystep_cfg = apply_theory_mode(polystep_cfg)
+    # Sweep a PolyStep knob without a flag, e.g. POLYSTEP_CFG_OVERRIDE='{"rank":4,"epochs":58}',
+    # e.g. to retune rank against step count at a fixed evaluation budget.
+    _cfg_override = os.environ.get("POLYSTEP_CFG_OVERRIDE")
+    if _cfg_override:
+        polystep_cfg = {**polystep_cfg, **json.loads(_cfg_override)}
     epochs = _epochs_for(showcase_name, polystep_cfg, dry_run)
 
     set_seed(seed)
@@ -301,10 +263,14 @@ def run_polystep(
     loss_fn = nn.CrossEntropyLoss()
 
     train_loader, val_loader, test_loader = _load_split(showcase_name, seed, audit_no_leakage)
+    if tuning:
+        if val_loader is None:
+            raise ValueError("tuning=True needs a validation split to select on")
+        test_loader = TestSplitTripwire()
     selection_loader = val_loader if val_loader is not None else test_loader
 
     total_steps = epochs * len(train_loader)
-    layout, subspace, optimizer = _build_polystep(model, seed, total_steps, polystep_cfg)
+    layout, subspace, optimizer = build_polystep(model, seed, total_steps, polystep_cfg)
     eval_budget = polystep_eval_budget(optimizer, total_steps)
 
     import copy
@@ -313,8 +279,13 @@ def run_polystep(
         model,
         loss_fn=loss_fn,
         compile_vmap=polystep_cfg.get("compile_evaluator", False),
-        compile_forward=polystep_cfg.get("compile_forward", False),
+        # Not False: the evaluator default None means "auto-enable wherever the
+        # in-place path runs".
+        compile_forward=polystep_cfg.get("compile_forward"),
     )
+    # NOT registered: the site-aware / delta evaluator path register_evaluator
+    # switches on is slower for these models; the cost is the delta path, not the
+    # registration itself.
     epoch_logs = []
     step_logs = []
     best_accuracy = 0.0
@@ -334,11 +305,12 @@ def run_polystep(
                 data, targets = data.to(device), targets.to(device)
 
                 def closure(batched_params, _data=data, _targets=targets):
-                    nonlocal fwd_pass_count
-                    fwd_pass_count += next(iter(batched_params.values())).shape[0]
                     return evaluator.evaluate(batched_params, _data, _targets)
 
                 optimizer.step(closure)
+                # Read from the optimizer, not the closure: a registered fast path
+                # never calls the closure, so counting there would undercount.
+                fwd_pass_count = optimizer.candidate_evals
 
                 with torch.no_grad():
                     output = model(data)
@@ -348,29 +320,24 @@ def run_polystep(
                 epoch_loss += loss
                 step_count += 1
 
-                # Per-20-step fine-grained tracking
+                # Per-20-step tracking on the selection split: the x-axis of the
+                # accuracy-vs-evaluations figure; nothing selects on it, so the test
+                # set stays untouched.
                 if step_count % 20 == 0:
-                    step_test_acc = evaluate_accuracy(model, test_loader, device=device)
                     step_logs.append(
                         {
                             "step": step_count,
                             "epoch": epoch + 1,
-                            # Cumulative candidate evaluations: the x-axis of the
-                            # accuracy-vs-evaluations figure, shared with the baselines.
+                            # Cumulative candidate evaluations, shared with the baselines.
                             "evals": fwd_pass_count,
-                            "test_accuracy": step_test_acc,
+                            "val_accuracy": evaluate_accuracy(model, selection_loader, device=device),
                             "loss": loss,
                             "wall_time": time.time() - start_time,
                         }
                     )
 
             train_acc = epoch_correct / max(epoch_total, 1)
-            test_acc = evaluate_accuracy(model, test_loader, device=device)
-            selection_acc = (
-                evaluate_accuracy(model, selection_loader, device=device)
-                if selection_loader is not test_loader
-                else test_acc
-            )
+            selection_acc = evaluate_accuracy(model, selection_loader, device=device)
             if selection_acc > best_accuracy:
                 best_accuracy = selection_acc
                 best_state_dict = copy.deepcopy(model.state_dict())
@@ -380,27 +347,24 @@ def run_polystep(
             epoch_logs.append(
                 {
                     "epoch": epoch + 1,
-                    "accuracy": test_acc,
+                    "accuracy": selection_acc,
                     "train_accuracy": train_acc,
-                    "test_accuracy": test_acc,
+                    "val_accuracy": selection_acc,
                     "loss": avg_loss,
                     "time": epoch_time,
                     "wall_time": time.time() - start_time,
                 }
             )
             print(
-                f"    Epoch {epoch + 1}/{epochs} | train={train_acc * 100:.1f}% | test={test_acc * 100:.1f}% | loss={avg_loss:.4f}"
+                f"    Epoch {epoch + 1}/{epochs} | train={train_acc * 100:.1f}% | val={selection_acc * 100:.1f}% | loss={avg_loss:.4f}"
             )
 
     wall_time = time.time() - start_time
-    # The epoch loop already scored (and, if better, saved) the final
-    # weights on the selection split. Re-scoring them on *test* here and
-    # letting that overwrite best_accuracy/best_state_dict was a test peek
-    # that survived audit_no_leakage=True.
-    last_epoch_acc = test_acc
+    # Test is read exactly once per run, here, on the validation-selected weights.
+    last_epoch_acc = selection_acc
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
-    final_acc = evaluate_accuracy(model, test_loader, device=device)
+    final_acc = float("nan") if tuning else evaluate_accuracy(model, test_loader, device=device)
 
     filepath = save_result(
         benchmark=showcase_name,
@@ -424,6 +388,11 @@ def run_polystep(
             "eval_budget": eval_budget,
             "evals_used": fwd_pass_count,
             "fair": fair,
+            # Symmetric with the baseline runner, so a reader can check both sides
+            # were tuned and at what cost; None means the run used the transplanted
+            # default.
+            "tuned": polystep_tuned_name,
+            "tuning_provenance": polystep_tuned_prov,
         },
         epoch_logs=epoch_logs,
         step_logs=step_logs,
@@ -481,22 +450,20 @@ def run_gradient_free(
     theory_mode: bool = False,
     budget: int = None,
 ):
-    """Run one ``polystep.baselines`` method on a non-differentiable showcase.
-
-    Replaces the inline pycma copy and the two ``experiments/baselines`` wrappers,
-    which each counted evaluations differently and searched full parameter space
-    while PolyStep searched a subspace.
-    """
+    """Run one ``polystep.baselines`` method on a non-differentiable showcase."""
     from polystep.cost_nn import NNCostEvaluator
     from polystep.transform import ParamLayout
 
     config = SHOWCASE_CONFIGS[showcase_name]
-    cfg = PSTORCH_CONFIGS[showcase_name]
+    cfg = POLYSTEP_CONFIGS[showcase_name]
     if theory_mode:
         cfg = apply_theory_mode(cfg)
     epochs = _epochs_for(showcase_name, cfg, dry_run)
+    match_axis = "evals"
+    deadline_s = None
     if dry_run and budget is None:
         budget = 2000
+        match_axis = "dry-run"
 
     set_seed(seed)
     model = config["model_fn"]().to(device)
@@ -506,13 +473,33 @@ def run_gradient_free(
     subspace = None
     if fair:
         subspace = make_subspace(layout, rank=cfg["rank"], seed=seed, method=method)
+        # The dimension every method searches. EGGROLL alone gets FactoredSubspace,
+        # which is smaller by construction; recording the gap shows the table is
+        # matched on rank, not dimension.
+        shared_dim = make_subspace(layout, rank=cfg["rank"], seed=seed, method="polystep").subspace_dim
         if budget is None:
             budget = fair_eval_budget(showcase_name, seed, device, train_loader, epochs, cfg)
+            budget, match_axis, deadline_s = matched_budget(
+                method,
+                showcase=showcase_name,
+                seed=seed,
+                polystep_steps=epochs * len(train_loader),
+                eval_budget=budget,
+                results_dir=results_dir,
+            )
     if budget is None:
         budget = LEGACY_BUDGETS[method]
+        match_axis = "legacy"
 
     loss_batch = minibatch_loss(NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss()), train_loader, device)
     selection_loader = val_loader if val_loader is not None else test_loader
+
+    # The config tune_gallery.py picked on validation, or None if nothing was swept.
+    selected, provenance = load_selection("gallery", showcase_name, method)
+    probe_scale = probe_scale_of(cfg, dim=subspace.subspace_dim if subspace else layout.total_params)
+    hp = apply_point({}, selected["point"], probe_scale) if selected else None
+    if selected:
+        print(f"    tuned: {selected['name']} (val={selected['val']:.4f})")
 
     out = run_baseline(
         method,
@@ -526,9 +513,18 @@ def run_gradient_free(
         seed=seed,
         subspace=subspace,
         subspace_rank=cfg["rank"] if fair else None,
-        probe_scale=probe_scale_of(cfg),
+        shared_subspace_dim=shared_dim if fair else None,
+        hp=hp,
+        probe_scale=probe_scale,
+        deadline_s=deadline_s,
     )
     out["hyperparameters"]["fair"] = fair
+    out["hyperparameters"]["tuned"] = selected["name"] if selected else None
+    out["hyperparameters"]["tuning_provenance"] = provenance
+    # Which axis this cell was budgeted on: step-matched and eval-matched arms
+    # belong in different tables.
+    out["hyperparameters"]["match_axis"] = match_axis
+    out["hyperparameters"]["polystep_steps"] = epochs * len(train_loader)
     filepath = save_result(
         benchmark=showcase_name,
         method=method,
@@ -544,8 +540,6 @@ def run_gradient_free(
 # the one shared runner.
 METHOD_RUNNERS = {"polystep": run_polystep, "adam": run_adam}
 ALL_METHODS = ("polystep", "adam", *FAIR_METHODS)
-#: The old name for cma_es, kept so existing result files and scripts still resolve.
-ALIASES = {"cmaes": "cma_es"}
 
 
 def main():
@@ -614,13 +608,38 @@ def main():
         "--theory-mode",
         action="store_true",
         help=(
-            "Run the configuration Theorem 4.2 analyses: probe_radius_jitter=0.05 "
+            "Run the unaccelerated reference configuration: probe_radius_jitter=0.05 "
             "with the smooth density, independent rotations, flat epsilon, step "
             "radius r0*(t+1)^-(1/2+0.1), orthoplex, HybridSubspace, no momentum / "
             "amortization / Anderson."
         ),
     )
     parser.add_argument("--budget", type=int, default=None, help="Override the candidate budget (smoke runs)")
+    parser.add_argument(
+        "--probe-radius",
+        type=float,
+        default=None,
+        help=(
+            "Override probe_radius in POLYSTEP_CONFIGS. Sets the probe reach "
+            "r_p*eps, which is the width a plateau must stay under for a probe "
+            "than for the step to be nonzero. Used by the escape sweep."
+        ),
+    )
+    parser.add_argument(
+        "--probe-jitter",
+        type=float,
+        default=None,
+        help="Override probe_radius_jitter (eta_max). Escape sweep knob.",
+    )
+    parser.add_argument(
+        "--step-jitter",
+        type=float,
+        default=None,
+        help=(
+            "Override step_radius_jitter. Cor. 4.15 condition (iii) needs it "
+            "for the one-step law to have a density on an annulus. Escape sweep knob."
+        ),
+    )
     parser.add_argument(
         "--step-radius",
         type=float,
@@ -646,22 +665,48 @@ def main():
     print(f"  Device: {args.device}")
     if args.dry_run:
         print("  Mode: DRY RUN (minimal epochs/generations)")
+    # Overrides apply only to the showcases actually being run; applying them to
+    # every POLYSTEP_CONFIGS entry would force one radius on benchmarks tuned to
+    # different ones.
+    _targets = [sc for sc in args.showcases if sc in POLYSTEP_CONFIGS]
+
+    def _override_radius(key, value):
+        """Set a radius on the flat key or on both schedule endpoints.
+
+        ``sched`` ignores the flat key whenever ``{key}_init`` is present, so
+        writing only the flat key is a silent no-op on cosine-scheduled benchmarks.
+        """
+        for sc in _targets:
+            cfg = POLYSTEP_CONFIGS[sc]
+            if f"{key}_init" in cfg:
+                cfg[f"{key}_init"] = value
+                cfg[f"{key}_target"] = value
+            else:
+                cfg[key] = value
+
     if args.step_radius is not None:
         print(f"  Step radius override: {args.step_radius}")
-        for sc in PSTORCH_CONFIGS:
-            cfg = PSTORCH_CONFIGS[sc]
-            if "step_radius_init" in cfg:
-                cfg["step_radius_init"] = args.step_radius
-                cfg["step_radius_target"] = args.step_radius
-            else:
-                cfg["step_radius"] = args.step_radius
+        _override_radius("step_radius", args.step_radius)
     if args.epochs_polystep is not None:
-        global EPOCHS_PSTORCH, EPOCHS_PSTORCH_NONSNN
-        EPOCHS_PSTORCH = args.epochs_polystep
-        EPOCHS_PSTORCH_NONSNN = args.epochs_polystep
+        global EPOCHS_POLYSTEP, EPOCHS_POLYSTEP_NONSNN
+        EPOCHS_POLYSTEP = args.epochs_polystep
+        EPOCHS_POLYSTEP_NONSNN = args.epochs_polystep
         print(f"  polystep epochs override: {args.epochs_polystep}")
+    if args.probe_radius is not None:
+        print(f"  probe_radius override: {args.probe_radius}")
+        _override_radius("probe_radius", args.probe_radius)
+    # The jitters are read by cfg.get, not through sched, so the flat key is correct.
+    for flag, key in (
+        (args.probe_jitter, "probe_radius_jitter"),
+        (args.step_jitter, "step_radius_jitter"),
+    ):
+        if flag is not None:
+            for sc in _targets:
+                POLYSTEP_CONFIGS[sc][key] = flag
+            print(f"  {key} override: {flag}")
     print()
 
+    failures: list = []
     for showcase_name in args.showcases:
         if showcase_name not in SHOWCASE_CONFIGS:
             print(f"Unknown showcase: {showcase_name}")
@@ -670,7 +715,7 @@ def main():
         print(f"=== {showcase_name} ===")
 
         for method in args.methods:
-            method = ALIASES.get(method, method)
+            method = METHOD_ALIASES.get(method, method)
             gradient_free = method in FAIR_METHODS
             runner = METHOD_RUNNERS.get(method)
             if runner is None and not gradient_free:
@@ -705,6 +750,7 @@ def main():
                 except Exception as e:
                     print(f"    ERROR: {method} seed={seed} failed: {e}")
                     traceback.print_exc()
+                    failures.append((showcase_name, method, seed, repr(e)))
                 finally:
                     # Prevent CUDA memory accumulation across sequential runs
                     gc.collect()
@@ -713,8 +759,17 @@ def main():
 
         print()
 
-    print("Done. Results in experiments/results/softmax/main/")
+    print(f"Done. Results in {args.results_dir}")
+    # Non-zero on any swallowed failure so the launcher does not read a half-run
+    # grid as complete; the per-run except stays so one bad cell does not lose the
+    # rest.
+    if failures:
+        print(f"\n{len(failures)} run(s) failed:")
+        for showcase, method, seed, err in failures:
+            print(f"  {showcase}/{method} seed={seed}: {err}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

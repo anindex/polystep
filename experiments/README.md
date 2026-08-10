@@ -21,11 +21,9 @@ Paper reproduction harness for PolyStep.
 | ETTh1 timeseries | `runners/run_timeseries.py` | - |
 | RL policy search | `runners/run_rl.py` | - |
 | GPT-2 fine-tune | `runners/run_gpt2_finetune.py` | - |
-| OT vs Softmax ablation | `runners/ablation_ot_vs_softmax.py` | - |
-| Ablation grid | `runners/run_fill_ablation_grid.py` | - |
 
 ## Layout
 
 `runners/` experiment scripts, `baselines/` (Adam, OpenAI-ES, SPSA, and ProbSAT/SLS for
-MAX-SAT; CMA-ES lives in `polystep.benchmarks.baselines`), `scripts/` aggregation and
+MAX-SAT; CMA-ES lives in `polystep.baselines`), `scripts/` aggregation and
 microbenchmarks, `results/` result JSON.

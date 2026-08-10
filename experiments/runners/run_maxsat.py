@@ -1,28 +1,9 @@
 #!/usr/bin/env python
-"""Run all methods and seeds for MAX-SAT benchmark.
+"""Run the MAX-SAT benchmark: polystep vs CMA-ES, OpenAI-ES, RC2, SLS, probSAT.
 
-Experiments run polystep on random 3-SAT instances at scaling variable counts
-(100, 500, 1000, 5000), comparing against CMA-ES, OpenAI-ES, RC2 exact
-solver, and stochastic local search (SLS) reference solver.
-
-Methods:
-  - polystep: PolyStepOptimizer with custom MAX-SAT closure (no NNCostEvaluator)
-  - cmaes: pycma CMA-ES with same sigmoid+CRA encoding
-  - openai_es: Antithetic OpenAI-ES with same encoding
-  - rc2: PySAT RC2 exact solver (timeout-bounded for 500+ vars)
-  - sls: WalkSAT-style stochastic local search
-
-Each method uses the same continuous relaxation: sigmoid(assignments) with CRA
-penalty to encourage {0, 1} solutions. Budgets are step-matched, not eval-matched:
-ES methods get (polystep_steps * popsize) function evaluations, so polystep, which
-evaluates many polytope vertices and probes per step, uses far more evaluations.
-
-Results are saved as JSON: experiments/results/softmax/main/maxsat_{method}_{seed}.json
-
-Usage:
-    python experiments/runners/run_maxsat.py
-    python experiments/runners/run_maxsat.py --sizes 100 500 --methods polystep cmaes
-    python experiments/runners/run_maxsat.py --sizes 100 --methods polystep --seeds 42 --dry-run
+Random 3-SAT instances at scaling variable counts. All methods share the
+sigmoid+CRA relaxation; ES budgets are step-matched (polystep_steps * popsize).
+Results are saved as experiments/results/softmax/main/maxsat_{method}_{seed}.json.
 """
 
 from __future__ import annotations
@@ -33,7 +14,6 @@ import os
 import sys
 import time
 
-# Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
@@ -52,11 +32,10 @@ from experiments.runners.nondiff_models import MaxSATModel
 
 BENCHMARK = "maxsat"
 VARIABLE_SIZES = [100, 500, 1000, 5000, 20000, 100000, 1000000]
-INSTANCE_SEED = 42  # Fixed instance per size, optimizer seeds vary
+INSTANCE_SEED = 42  # fixed instance per size; optimizer seeds vary
 
-# Best configuration for MAX-SAT
-# Softmax solver with num_probe=1 (single-pass, no Sinkhorn iterations)
-PSTORCH_CONFIG = {
+# Softmax solver with num_probe=1 (single-pass, no Sinkhorn iterations).
+POLYSTEP_CONFIG = {
     "epsilon_init": 5.0,
     "epsilon_target": 0.5,
     "step_radius_init": 3000.0,
@@ -65,9 +44,10 @@ PSTORCH_CONFIG = {
     "probe_radius_target": 20.0,
     "num_probe": 1,
     "chunk_size": 256,  # prevents OOM at 5000+ vars
-    # Required by the convergence analysis; forces amortize_steps=1 and
-    # adaptive_probes=False in PolyStepOptimizer.__init__, so the amortization the
-    # sweep found is off here and the config records that rather than hiding it.
+    # Stated, not defaulted: this value decides whether condition (iv) of the
+    # convergence theorem holds, so the config has to say it out loud.
+    "probe_radius_jitter": 0.0,
+    # Required by the convergence analysis.
     "amortize_steps": 3,
     "amortize_ema": 0.7,
     "use_momentum": True,
@@ -80,7 +60,7 @@ def get_polystep_config(num_vars: int) -> dict:
     """Return size-dependent polystep config using sqrt-scaling from 100K reference."""
     import math
 
-    ref = PSTORCH_CONFIG
+    ref = POLYSTEP_CONFIG
     scale = math.sqrt(num_vars / 100_000)
     return {
         "epsilon_init": ref["epsilon_init"],
@@ -100,12 +80,9 @@ def get_polystep_config(num_vars: int) -> dict:
     }
 
 
-# 1M+ extension: delta evaluation with inverted index.
-# At 1M vars, full closure eval is too expensive (4.5 min/step). Delta evaluation
-# builds a CSR inverted index (variable -> clause list), then only re-evaluates
-# ~1664 affected clauses per chunk instead of 4.27M.
-# Tuned: eps 5->0.5, sr 5000->1000, pr 500->100 (from hyperparameter search)
-PSTORCH_TURBO_1M = {
+# 1M+ config: delta evaluation via a CSR inverted index (variable -> clause
+# list) re-evaluates only the clauses touched by the perturbed variables.
+POLYSTEP_TURBO_1M = {
     "epsilon_init": 5.0,
     "epsilon_target": 0.5,
     "step_radius_init": 5000.0,
@@ -113,7 +90,7 @@ PSTORCH_TURBO_1M = {
     "probe_radius_init": 500.0,
     "probe_radius_target": 100.0,
     "num_probe": 1,
-    "chunk_size": 256,  # Memory management for 4.27M clauses on 32GB GPU
+    "chunk_size": 256,  # keeps 4.27M clauses within GPU memory
     "amortize_steps": 1,
     "amortize_ema": 0.0,
     "use_momentum": True,
@@ -121,34 +98,25 @@ PSTORCH_TURBO_1M = {
     "momentum_final": 0.95,
     "mixed_precision": False,
     "clause_sample_size": 25_000,  # only used by non-delta fallback path
-    "particle_dim": 2,  # 500K particles x 4 vertices = 2M configs
+    "particle_dim": 2,
 }
 
-# Step budgets scale with problem size
-# Step budgets: tuned to near-convergence per size.
-# 20K converges at ~1000 steps (97.8%); extra steps yield <0.3pp over 4000 more steps.
-# 100K at 1000 steps is still climbing (~96.2%), but per-step cost (6.4s) makes more
-# steps impractical. 1M uses delta eval; increased to 200 steps for potential gain.
-# Step budgets: 1000 steps for ALL sizes (production runs)
+# Step budgets per problem size.
 STEP_BUDGETS = {100: 1000, 500: 1000, 1000: 1000, 5000: 1000, 20000: 1000, 100000: 1000, 1000000: 500}
 
-# CRA penalty disabled: ablation shows no measurable effect on polystep
-# (polystep navigates the piecewise-constant round() landscape directly via OT)
+# CRA penalty disabled: no measurable effect on polystep (it navigates the
+# piecewise-constant round() landscape directly).
 CRA_LAMBDA = 0.0
 CRA_ALPHA = 2
 
-# CMA-ES config (pycma)
 CMAES_CONFIG = {"popsize": 50, "sigma0": 1.0}
 
-# OpenAI-ES config
 OPENAI_ES_CONFIG = {"popsize": 50, "sigma": 1.0, "lr": 0.1}
 
-# RC2 timeout in seconds per instance
 RC2_TIMEOUT = 60
 
-# SLS max flips (scales with problem size, see _sls_max_flips())
 SLS_MAX_FLIPS = 100000
-SLS_MAX_FLIPS_1M = 50000  # Reduced from 500K so SLS at 1M completes in reasonable time
+SLS_MAX_FLIPS_1M = 50000  # small enough that SLS at 1M vars finishes in reasonable time
 
 
 class CountingClosure:
@@ -170,23 +138,11 @@ class CountingClosure:
 def make_sat_closure(
     clause_vars, clause_signs, cra_lambda=0.0, cra_alpha=2, clause_sample_size=0, model=None, particle_dim=2
 ):
-    """Create polystep-compatible closure for MAX-SAT optimization.
+    """Create a polystep-compatible MAX-SAT closure: stacked_params dict -> (N,) costs.
 
-    Args:
-        clause_vars: (C, 3) long tensor of variable indices.
-        clause_signs: (C, 3) float tensor (1.0=positive, 0.0=negated).
-        cra_lambda: CRA penalty weight (0.0 by default - ablation shows no effect).
-        cra_alpha: CRA penalty exponent.
-        clause_sample_size: If > 0, sample this many clauses per step (stochastic).
-            Ignored when model is provided (delta evaluation uses full clause set).
-        model: MaxSATModel reference for delta evaluation (optional).
-            When provided, uses inverted index to only re-evaluate clauses
-            affected by the perturbed variables (~1664 per chunk vs 4.27M).
-        particle_dim: Particle dimension for delta evaluation (default 2).
-
-    Returns:
-        Closure: stacked_params dict -> (N,) costs tensor.
-        Closure has a .resample() method (call once per optimizer step).
+    With clause_sample_size > 0 a random clause subset is evaluated per step; with
+    model given, delta evaluation uses an inverted index over the full clause set.
+    The closure has a .resample() method to call once per optimizer step.
     """
     total_clauses = clause_vars.shape[0]
     num_vars = clause_vars.max().item() + 1
@@ -212,8 +168,8 @@ def make_sat_closure(
         var_offsets = var_offsets.to(clause_vars.device)
         var_clause_list = var_clause_list.to(clause_vars.device)
 
-    # Mutable state
     state = {}
+
     if use_sampling and not use_delta:
         idx = torch.randint(total_clauses, (clause_sample_size,), device=clause_vars.device)
         state["cv"] = clause_vars[idx]
@@ -232,7 +188,6 @@ def make_sat_closure(
                 state["base_raw"] = base_raw.clone()
                 base_soft = torch.sigmoid(base_raw)
                 state["base_hard"] = torch.round(base_soft)
-                # Evaluate base over ALL clauses
                 g = state["base_hard"][clause_vars]  # (C, 3)
                 lits = g * clause_signs + (1.0 - clause_signs) * (1.0 - g)
                 state["base_clause_sat"] = (lits > 0.5).any(dim=-1)  # (C,) bool
@@ -275,7 +230,6 @@ def make_sat_closure(
         min_var = all_diff.min().item()
         max_var = all_diff.max().item()
 
-        # Look up affected clauses via inverted index (CSR)
         start = var_offsets[min_var].item()
         end = var_offsets[max_var + 1].item()
         affected_idx = var_clause_list[start:end].unique()
@@ -389,24 +343,29 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
 
     # Select config: turbo overrides for 1M+ vars, size-dependent scaling otherwise
     turbo = num_vars >= 1000000
-    cfg = PSTORCH_TURBO_1M if turbo else get_polystep_config(num_vars)
+    cfg = POLYSTEP_TURBO_1M if turbo else get_polystep_config(num_vars)
     if theory_mode:
         cfg = apply_theory_mode(cfg)
 
     if turbo and device == "cuda":
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    # Build CosineEpsilon schedules for epsilon, step_radius, probe_radius
+    # Build CosineEpsilon schedules for epsilon, step_radius, probe_radius.
+    # Keyword, not positional: CosineEpsilon declares `target` before `init`, so the
+    # positional form ran every one of these schedules backwards -- a logged
+    # `epsilon: 5 -> 0.5` executed as 0.5 at step 0 and 5.0 from step 1 on.
     eps = (
-        CosineEpsilon(cfg["epsilon_init"], cfg["epsilon_target"]) if "epsilon_init" in cfg else cfg.get("epsilon", 3.0)
+        CosineEpsilon(init=cfg["epsilon_init"], target=cfg["epsilon_target"])
+        if "epsilon_init" in cfg
+        else cfg.get("epsilon", 3.0)
     )
     sr = (
-        CosineEpsilon(cfg["step_radius_init"], cfg["step_radius_target"])
+        CosineEpsilon(init=cfg["step_radius_init"], target=cfg["step_radius_target"])
         if "step_radius_init" in cfg
         else cfg.get("step_radius", 500.0)
     )
     pr = (
-        CosineEpsilon(cfg["probe_radius_init"], cfg["probe_radius_target"])
+        CosineEpsilon(init=cfg["probe_radius_init"], target=cfg["probe_radius_target"])
         if "probe_radius_init" in cfg
         else cfg.get("probe_radius", 50.0)
     )
@@ -579,7 +538,10 @@ def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
 
     popsize = CMAES_CONFIG["popsize"]
     objective = Objective(eval_batch, dim=num_vars, budget=max(popsize, int(max_evals)))
-    x0 = torch.from_numpy(np.random.RandomState(seed).randn(num_vars) * 0.1).float()
+    # On the evaluation device: the closure computes there, and a CPU x0 makes every
+    # generation round-trip the candidate batch across PCIe as well as forcing the
+    # Objective to move the losses back.
+    x0 = torch.from_numpy(np.random.RandomState(seed).randn(num_vars) * 0.1).float().to(eval_device)
 
     start_time = time.time()
     with track_gpu_memory() as mem:
@@ -761,12 +723,6 @@ def run_openai_es(num_vars, instance, seed, device, max_evals, results_dir):
         results_dir=results_dir,
     )
     print(f"      Saved: {filepath}")
-
-
-class _RC2Timeout(Exception):
-    """Raised when RC2 exceeds timeout."""
-
-    pass
 
 
 def _rc2_worker(clauses_list, num_clauses, result_queue):
@@ -1193,10 +1149,15 @@ def main():
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
     parser.add_argument("--results-dir", default="experiments/results/softmax/main", help="Results directory")
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run cells whose result file already exists (default: skip them).",
+    )
+    parser.add_argument(
         "--theory-mode",
         action="store_true",
         help=(
-            "Run the configuration Theorem 4.2 analyses: probe_radius_jitter=0.05 "
+            "Run the unaccelerated reference configuration: probe_radius_jitter=0.05 "
             "with the smooth density, independent rotations, flat epsilon, step "
             "radius r0*(t+1)^-(1/2+0.1), orthoplex, no momentum / amortization / "
             "Anderson."
@@ -1212,6 +1173,15 @@ def main():
         choices=["softmax", "sinkhorn"],
         default="softmax",
         help="Solver backend (default: softmax, matching sweep config).",
+    )
+    parser.add_argument(
+        "--es-eval-budget",
+        type=int,
+        default=None,
+        help="Override the evolution-strategy candidate-evaluation budget. The default is "
+        "step-matched (polystep_steps * popsize), which at 100,000 variables gives the ES "
+        "arms 50,000 evaluations against PolyStep's 50,100,000. Set this to PolyStep's own "
+        "budget to separate the effect of dimension from the effect of budget.",
     )
     args = parser.parse_args()
 
@@ -1244,7 +1214,7 @@ def main():
                     args.results_dir,
                     f"{BENCHMARK}_{num_vars}v_polystep_{seed}.json",
                 )
-                if os.path.exists(output_file):
+                if os.path.exists(output_file) and not args.force:
                     print(f"  Skipping polystep seed={seed} (result exists)")
                     continue
                 print(f"  Running polystep seed={seed} ({steps} steps)...")
@@ -1280,6 +1250,9 @@ def main():
         # fairest comparison since each step represents one optimization update.
         es_popsize = CMAES_CONFIG["popsize"]
         es_budget = 100 if args.dry_run else steps * es_popsize
+        if args.es_eval_budget is not None and not args.dry_run:
+            es_budget = int(args.es_eval_budget)
+            print(f"    ES eval budget overridden: {es_budget:,} (step-matched default was {steps * es_popsize:,})")
         # Also track polystep eval count for reporting
         if polystep_evals is None:
             import json as _json
@@ -1311,7 +1284,7 @@ def main():
                     args.results_dir,
                     f"{BENCHMARK}_{num_vars}v_cmaes_{seed}.json",
                 )
-                if os.path.exists(output_file):
+                if os.path.exists(output_file) and not args.force:
                     print(f"  Skipping cmaes seed={seed} (result exists)")
                     continue
                 print(f"  Running cmaes seed={seed} (budget={max_evals} evals)...")
@@ -1342,7 +1315,7 @@ def main():
                     args.results_dir,
                     f"{BENCHMARK}_{num_vars}v_openai_es_{seed}.json",
                 )
-                if os.path.exists(output_file):
+                if os.path.exists(output_file) and not args.force:
                     print(f"  Skipping openai_es seed={seed} (result exists)")
                     continue
                 print(f"  Running openai_es seed={seed} (budget={max_evals} evals)...")
@@ -1372,7 +1345,7 @@ def main():
                 print("  Skipping rc2 at 1M+ vars (guaranteed timeout)")
             else:
                 output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{num_vars}v_rc2_0.json")
-                if os.path.exists(output_file):
+                if os.path.exists(output_file) and not args.force:
                     print("  Skipping rc2 (result exists)")
                 else:
                     timeout = 5 if args.dry_run else RC2_TIMEOUT
@@ -1385,7 +1358,7 @@ def main():
         # Run SLS reference (deterministic)
         if "sls" in args.methods:
             output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{num_vars}v_sls_0.json")
-            if os.path.exists(output_file):
+            if os.path.exists(output_file) and not args.force:
                 print("  Skipping sls (result exists)")
             else:
                 flips = 1000 if args.dry_run else SLS_MAX_FLIPS_1M if num_vars >= 1000000 else SLS_MAX_FLIPS
@@ -1398,7 +1371,7 @@ def main():
         # Run probSAT reference (production SLS)
         if "probsat" in args.methods:
             output_file = os.path.join(args.results_dir, f"{BENCHMARK}_{num_vars}v_probsat_0.json")
-            if os.path.exists(output_file):
+            if os.path.exists(output_file) and not args.force:
                 print("  Skipping probsat (result exists)")
             else:
                 flips = 10000 if args.dry_run else PROBSAT_MAX_FLIPS_1M if num_vars >= 1000000 else PROBSAT_MAX_FLIPS
@@ -1410,8 +1383,9 @@ def main():
 
         print()
 
-    print("Done. Results in experiments/results/softmax/main/maxsat_*.json")
+    print(f"Done. Results in {args.results_dir}/maxsat_*.json")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

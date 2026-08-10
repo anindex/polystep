@@ -1,12 +1,7 @@
 """Aggregate per-run JSON experiment results into pandas DataFrames.
 
-Reads JSON files from experiments/results/ (produced by experiments/runners/common.py::save_result)
-and produces summary DataFrames with mean/std per (benchmark, method) group.
-
-Functions:
-    load_single_result(path) -> dict: Load one JSON, extract flat metrics.
-    aggregate_results(results_dir, benchmark) -> pd.DataFrame: Summary stats.
-    get_epoch_curves(results_dir, benchmark) -> dict: Per-method convergence curves.
+Reads JSON files from experiments/results/ and produces summary DataFrames with
+mean/std per (benchmark, method) group.
 
 CLI usage:
     python experiments/scripts/aggregate_results.py experiments/results/
@@ -19,7 +14,7 @@ import glob
 import json
 import os
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -27,31 +22,18 @@ import pandas as pd
 class LeakedResultError(RuntimeError):
     """Raised when a result file is stamped ``"leaked": true``.
 
-    Deliberately not caught by the aggregation loop: a run whose
-    checkpoint was picked on the test set must fail loudly rather than be
-    skipped with a warning and silently dropped from the mean.
+    Deliberately not caught by the aggregation loop: a run whose checkpoint was
+    picked on the test set must fail loudly, not be skipped with a warning.
     """
 
 
 def load_single_result(path: str) -> Dict[str, Any]:
     """Load a single JSON result file and extract key fields into a flat dict.
 
-    Extracts top-level identifiers (benchmark, method, seed) and flattens
-    the metrics dict into the top level. Preserves epoch_logs for convergence
-    curve plotting.
-
-    Args:
-        path: Path to a JSON result file.
-
-    Returns:
-        Flat dict with keys: benchmark, method, seed, test_accuracy_at_selected,
-        final_accuracy, best_accuracy, wall_time_seconds, peak_gpu_memory_mb,
-        function_evals, total_steps, epoch_logs, source_file.
+    Flattens the metrics dict into the top level and preserves epoch_logs for
+    convergence curve plotting.
 
     Raises:
-        FileNotFoundError: If path does not exist.
-        json.JSONDecodeError: If file is not valid JSON.
-        KeyError: If required keys are missing from the JSON.
         LeakedResultError: If the run was produced with --allow-test-leakage.
     """
     with open(path, "r") as f:
@@ -70,11 +52,16 @@ def load_single_result(path: str) -> Dict[str, Any]:
         "benchmark": data["benchmark"],
         "method": data["method"],
         "seed": data["seed"],
-        # Headline metric: test accuracy of the val-selected checkpoint.
-        # Pre-2026 result files predate the key; for those, final_accuracy is
-        # the closest honest number (best_accuracy was max-over-epochs test).
+        # Headline metric: test accuracy of the val-selected checkpoint. Older
+        # result files lack the key; final_accuracy is the fallback (best_accuracy
+        # was max-over-epochs test).
         "test_accuracy_at_selected": metrics.get("test_accuracy_at_selected", metrics.get("final_accuracy", 0.0)),
         "final_accuracy": metrics.get("final_accuracy", 0.0),
+        # Distinguishes "solved nothing" from "no metric recorded"; a missing
+        # final_accuracy defaults to 0.0 above and is otherwise indistinguishable.
+        "has_final_accuracy": "final_accuracy" in metrics,
+        # Written by the MAX-SAT exact solvers when they hit their wall clock.
+        "timed_out": (data.get("hyperparameters") or {}).get("timed_out"),
         "best_accuracy": metrics.get("best_accuracy", 0.0),
         "final_mse": metrics.get("final_mse"),
         "best_mse": metrics.get("best_mse"),
@@ -83,6 +70,12 @@ def load_single_result(path: str) -> Dict[str, Any]:
         "function_evals": metrics.get("function_evals", 0),
         "total_steps": metrics.get("total_steps", 0),
         "epoch_logs": data.get("epoch_logs", []),
+        "step_logs": data.get("step_logs", []),
+        # Which budget this cell was matched on: evals, steps, wallclock, or None for
+        # PolyStep and Adam, which set the budget rather than receive one.
+        "rl_env_steps": metrics.get("rl_env_steps"),
+        "match_axis": (data.get("hyperparameters") or {}).get("match_axis"),
+        "deadline_s": (data.get("hyperparameters") or {}).get("deadline_s"),
         "source_file": os.path.basename(path),
     }
 
@@ -95,24 +88,9 @@ def aggregate_results(
 ) -> pd.DataFrame:
     """Read all JSON result files and produce a summary DataFrame.
 
-    Loads all matching JSON files, creates a per-run DataFrame, then
-    computes grouped summary statistics per (benchmark, method).
-
-    Summary columns:
-        - benchmark, method
-        - mean_accuracy, std_accuracy (from test_accuracy_at_selected)
-        - mean_time, std_time (from wall_time_seconds)
-        - mean_memory (from peak_gpu_memory_mb)
-        - mean_func_evals (from function_evals)
-        - n_runs (count of seeds)
-
-    Args:
-        results_dir: Directory containing JSON result files.
-        benchmark: Optional benchmark name to filter by. If None, loads all.
-
-    Returns:
-        pd.DataFrame with one row per (benchmark, method) group.
-        Empty DataFrame (with correct columns) if no results found.
+    One row per (benchmark, method) group with mean/std accuracy, MSE, time,
+    memory, function evals and seed count. Empty DataFrame (with correct columns)
+    if no results found.
 
     Raises:
         LeakedResultError: If any result file is stamped ``"leaked": true``.
@@ -131,7 +109,6 @@ def aggregate_results(
         "n_runs",
     ]
 
-    # Find matching JSON files
     if benchmark:
         pattern = os.path.join(results_dir, f"{benchmark}_*.json")
     else:
@@ -142,7 +119,6 @@ def aggregate_results(
     if not json_files:
         return pd.DataFrame(columns=summary_columns)
 
-    # Load all results into flat dicts
     rows = []
     for path in json_files:
         try:
@@ -155,7 +131,6 @@ def aggregate_results(
     if not rows:
         return pd.DataFrame(columns=summary_columns)
 
-    # Create per-run DataFrame (drop epoch_logs for aggregation)
     per_run_cols = [
         "benchmark",
         "method",
@@ -172,13 +147,12 @@ def aggregate_results(
     ]
     df_runs = pd.DataFrame([{k: r[k] for k in per_run_cols} for r in rows])
 
-    # Group by (benchmark, method) and compute summary stats
     grouped = df_runs.groupby(["benchmark", "method"], sort=True)
 
     summary_rows = []
     for (bm, method), group in grouped:
-        # MSE-aware aggregation: regression benchmarks (mse populated) report
-        # mean/std MSE; classification benchmarks report mean/std accuracy.
+        # Regression benchmarks (mse populated) report mean/std MSE;
+        # classification benchmarks report mean/std accuracy.
         mse_vals = group["best_mse"].dropna()
         has_mse = len(mse_vals) > 0
         summary_rows.append(
@@ -202,56 +176,6 @@ def aggregate_results(
     return pd.DataFrame(summary_rows, columns=summary_columns)
 
 
-def get_epoch_curves(
-    results_dir: str,
-    benchmark: str,
-) -> Dict[str, List[List[Tuple[int, float]]]]:
-    """Extract per-method convergence curves for plotting.
-
-    Returns a dict mapping method name to a list of per-seed accuracy curves.
-    Each curve is a list of (epoch, accuracy) tuples from epoch_logs.
-
-    Args:
-        results_dir: Directory containing JSON result files.
-        benchmark: Benchmark name to filter by.
-
-    Returns:
-        Dict mapping method -> list of curves.
-        Each curve is a list of (epoch, accuracy) tuples.
-        Empty dict if no results found.
-    """
-    pattern = os.path.join(results_dir, f"{benchmark}_*.json")
-    json_files = sorted(glob.glob(pattern))
-
-    if not json_files:
-        return {}
-
-    curves: Dict[str, List[List[Tuple[int, float]]]] = {}
-
-    for path in json_files:
-        try:
-            result = load_single_result(path)
-        except (json.JSONDecodeError, KeyError, FileNotFoundError):
-            continue
-
-        method = result["method"]
-        epoch_logs = result["epoch_logs"]
-
-        if method not in curves:
-            curves[method] = []
-
-        # Extract (epoch, accuracy) from each log entry
-        curve = []
-        for entry in epoch_logs:
-            epoch = entry.get("epoch", 0)
-            accuracy = entry.get("accuracy", 0.0)
-            curve.append((epoch, accuracy))
-
-        curves[method].append(curve)
-
-    return curves
-
-
 def main() -> None:
     """CLI entry point: aggregate results and print summary."""
     if len(sys.argv) < 2:
@@ -260,11 +184,17 @@ def main() -> None:
 
     results_dir = sys.argv[1]
     benchmark = None
+    out_prefix = None
 
     if "--benchmark" in sys.argv:
         idx = sys.argv.index("--benchmark")
         if idx + 1 < len(sys.argv):
             benchmark = sys.argv[idx + 1]
+
+    if "--write" in sys.argv:
+        idx = sys.argv.index("--write")
+        if idx + 1 < len(sys.argv):
+            out_prefix = sys.argv[idx + 1]
 
     if not os.path.isdir(results_dir):
         print(f"Error: {results_dir} is not a directory", file=sys.stderr)
@@ -274,12 +204,48 @@ def main() -> None:
 
     if df.empty:
         print("No results found.")
-    else:
-        # Configure pandas display for readable output
-        pd.set_option("display.max_columns", None)
-        pd.set_option("display.width", 120)
-        pd.set_option("display.float_format", "{:.4f}".format)
-        print(df.to_string(index=False))
+        return
+
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 120)
+    pd.set_option("display.float_format", "{:.4f}".format)
+    print(df.to_string(index=False))
+
+    if out_prefix is None:
+        return
+
+    # Write both the aggregate and the per-seed rows, so the paper's numbers have
+    # a regenerable artifact on disk behind them.
+    summary_path = f"{out_prefix}_summary.csv"
+    per_seed_path = f"{out_prefix}_per_seed.csv"
+    os.makedirs(os.path.dirname(os.path.abspath(summary_path)) or ".", exist_ok=True)
+    df.to_csv(summary_path, index=False)
+
+    # Same population as the summary above: directly in ``results_dir``, filtered
+    # by ``--benchmark``, skipping files that will not parse. Recursing would pull
+    # in theory-mode runs and tuning trials that share the headline
+    # ``{benchmark}_{method}_{seed}`` filename pattern.
+    rows: List[Dict[str, Any]] = []
+    pattern = os.path.join(results_dir, f"{benchmark}_*.json") if benchmark else os.path.join(results_dir, "*.json")
+    for path in sorted(glob.glob(pattern)):
+        try:
+            rec = load_single_result(path)
+        except (json.JSONDecodeError, KeyError, FileNotFoundError, AttributeError, TypeError) as e:
+            print(f"Warning: skipping {path}: {e}", file=sys.stderr)
+            continue
+        rec.pop("epoch_logs", None)
+        rec["source_file"] = os.path.relpath(path, results_dir)
+        rows.append(rec)
+    per_seed = pd.DataFrame(rows)
+    per_seed.to_csv(per_seed_path, index=False)
+    if len(per_seed) != int(df["n_runs"].sum()):
+        print(
+            f"Warning: per-seed rows ({len(per_seed)}) != summary n_runs ({int(df['n_runs'].sum())})",
+            file=sys.stderr,
+        )
+
+    print(f"\nwrote {summary_path} ({len(df)} groups)")
+    print(f"wrote {per_seed_path} ({len(per_seed)} runs, no file stamped leaked)")
 
 
 if __name__ == "__main__":

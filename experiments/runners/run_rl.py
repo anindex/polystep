@@ -1,9 +1,7 @@
 #!/usr/bin/env python
-"""Run focused RL benchmarks for PolyStep paper experiments.
+"""Run the RL benchmarks: CartPole-v1, Acrobot-v1, and hardened variants.
 
-Covers CartPole-v1 (analytic + Gym), Acrobot-v1, and the hardened (quantized
-obs + bucketed reward) variants. PolyStep, OpenAI-ES, SB3 PPO/DQN, and a
-uniform random baseline are supported per env.
+PolyStep, OpenAI-ES, SB3 PPO/DQN, and a uniform random baseline per env.
 """
 
 from __future__ import annotations
@@ -61,18 +59,16 @@ class CountingClosure:
         return losses
 
 
-# Multi-seed eval offsets used by multi_seed_summary() to produce CIs on the
-# final reported return without adding measurable wall time.
+# Eval-seed offsets for multi_seed_summary()'s final-return confidence intervals.
 _FINAL_EVAL_SEED_OFFSETS = (20_000, 30_000, 40_000)
 
 
 def multi_seed_summary(
     evaluator, stacked_params, *, seed: int, step: int, offsets: tuple[int, ...] = _FINAL_EVAL_SEED_OFFSETS
 ) -> dict:
-    """Average evaluator.summarize_stacked_params across several deterministic eval seeds.
+    """Average evaluator.summarize_stacked_params over several deterministic eval seeds.
 
-    Returns a dict with all original summary keys plus *_std variants for
-    mean_return / success_rate / episode_length / fall_rate when present.
+    Returns the summary keys plus *_std variants when present.
     """
     import statistics as _st
 
@@ -103,8 +99,8 @@ def _sb3_periodic_eval_callback(
 ):
     """Build an SB3 callback that runs deterministic eval every total/n_eval_points steps.
 
-    Records a per-eval curve (env_steps_cumulative, mean_return) so PolyStep and SB3 share
-    a comparable X-axis. Returns (callback, curve_list).
+    Returns (callback, curve); the curve records (env_steps_cumulative, mean_return)
+    so PolyStep and SB3 share a comparable X-axis.
     """
     from stable_baselines3.common.callbacks import BaseCallback
     import numpy as np
@@ -150,14 +146,11 @@ def _sb3_periodic_eval_callback(
             self._eval_idx += 1
 
         def _on_step(self) -> bool:
-            # Step-0 anchor: emit one eval at num_timesteps == 0 (first call).
+            # Step-0 anchor: emit one eval on the first call, patched to env_steps=0.
             if not self._did_step0:
                 self._did_step0 = True
-                # Save current num_timesteps which will be small but not 0 (at least 1
-                # env step has occurred). Force x-coord to 0 for a true anchor.
                 _saved_idx = self._eval_idx
                 self._run_eval()
-                # Patch the just-appended record to env_steps=0.
                 if curve:
                     curve[-1]["env_steps_cumulative"] = 0
                     curve[-1]["time"] = 0.0
@@ -171,10 +164,6 @@ def _sb3_periodic_eval_callback(
     return _PeriodicEval(), curve
 
 
-def _cartpole_normalized_score(mean_return: float) -> float:
-    return max(0.0, min(1.0, normalize_score(mean_return, random_return=22.0, reference_return=500.0)))
-
-
 CARTPOLE_POLYSTEP_FINAL_CONFIG: dict[str, Any] = {
     "steps": 200,
     "rollouts_per_candidate": 32,
@@ -185,213 +174,12 @@ CARTPOLE_POLYSTEP_FINAL_CONFIG: dict[str, Any] = {
     "epsilon_target": 0.3,
     "step_radius": 0.1,
     "probe_radius": 1.5,
-    # Required by the convergence analysis; forces amortize_steps=1 and
-    # adaptive_probes=False in PolyStepOptimizer.__init__, so the amortization the
-    # sweep found is off here and the config records that rather than hiding it.
-
+    # Required by the convergence analysis; forces amortize_steps=1 in
+    # PolyStepOptimizer.__init__.
     "amortize_steps": 1,
     "max_subspace_dim": 24,
     "selected_from": "hyperparameter sweep",
 }
-
-
-def run_polystep_cartpole(
-    *,
-    seed: int,
-    device: str = "cpu",
-    steps: int = 100,
-    rollouts_per_candidate: int = 32,
-    horizon: int = CARTPOLE_HORIZON,
-    hidden: int = 16,
-    results_dir: str | None = None,
-    subspace_rank: int = 4,
-    epsilon_init: float = 1.0,
-    epsilon_target: float = 0.3,
-    step_radius: float = 0.1,
-    probe_radius: float = 0.4,
-    probe_radius_jitter: float = 0.0,
-    amortize_steps: int = 1,
-    max_subspace_dim: int | None = None,
-    method: str = "polystep",
-    theory_mode: bool = False,
-) -> int:
-    """Run PolyStep direct policy search on CartPole-v1.
-
-    ``theory_mode`` selects the configuration Theorem 4.2 assumes; see
-    :func:`experiments.runners.fairness.apply_theory_mode`.
-    """
-
-    set_seed(seed)
-    model = DiscreteMLPPolicy(
-        obs_dim=CARTPOLE_OBS_DIM,
-        hidden=hidden,
-        action_dim=CARTPOLE_ACTION_DIM,
-    ).to(device)
-    param_count = sum(p.numel() for p in model.parameters())
-    evaluator = CartPoleEvaluator(
-        rollouts_per_candidate=rollouts_per_candidate,
-        horizon=horizon,
-        device=device,
-    )
-    layout = ParamLayout.from_module(model)
-    subspace = HybridSubspace.from_layout(layout, rank=subspace_rank, max_subspace_dim=max_subspace_dim)
-    total_steps = max(1, int(steps))
-    print(
-        f"  [CartPole] hidden={hidden} params={param_count} subspace_dim={subspace.subspace_dim} rank={subspace_rank}"
-    )
-
-    optimizer = PolyStepOptimizer(
-        model,
-        solver="softmax",
-        subspace=subspace,
-        # Theory mode: flat epsilon and the decaying step radius the analysis needs.
-        epsilon=epsilon_target
-        if theory_mode
-        else CosineEpsilon(
-            init=epsilon_init,
-            target=epsilon_target,
-            decay=(epsilon_init - epsilon_target) / total_steps,
-        ),
-        step_radius=PowerDecay(init=step_radius, gamma=THEORY_GAMMA) if theory_mode else step_radius,
-        probe_radius=probe_radius,
-        probe_radius_jitter=THEORY_JITTER if theory_mode else probe_radius_jitter,
-        probe_radius_jitter_dist="smooth",
-        step_radius_jitter=THEORY_JITTER if theory_mode else 0.0,
-        polytope_type="orthoplex" if theory_mode else "simplex",
-        num_probe=1,
-        amortize_steps=1 if theory_mode else amortize_steps,
-        chunk_size=256,
-        seed=seed,
-    )
-
-    step_logs: List[Dict[str, Any]] = []
-    best_return = float("-inf")
-    best_summary: Dict[str, float] = {}
-    start = time.time()
-    eval_interval = 1
-
-    def closure(stacked_params):
-        step = optimizer.state.iteration_count if optimizer.state is not None else len(step_logs)
-        return evaluator.loss_for_stacked_params(stacked_params, seed=seed, step=step)
-
-    counted = CountingClosure(closure)
-
-    # Step-0 anchor.
-    init_summary = evaluator.summarize_stacked_params(
-        stack_module_params(model, 1),
-        seed=seed + 10_000,
-        step=0,
-    )
-    step_logs.append(
-        {
-            "step": 0,
-            "epoch": 0,
-            "accuracy": _cartpole_normalized_score(init_summary["mean_return"]),
-            "mean_return": init_summary["mean_return"],
-            "success_rate": init_summary["success_rate"],
-            "episode_length": init_summary["episode_length"],
-            "loss": -init_summary["mean_return"],
-            "time": 0.0,
-            "step_wall_time": 0.0,
-            "candidates_evaluated": 0,
-            "env_steps_cumulative": 0,
-        }
-    )
-
-    with track_gpu_memory() as mem:
-        for step in range(1, total_steps + 1):
-            step_start = time.time()
-            optimizer.step(counted)
-            step_wall = time.time() - step_start
-
-            if step == 1 or step == total_steps or step % eval_interval == 0:
-                summary = evaluator.summarize_stacked_params(
-                    stack_module_params(model, 1),
-                    seed=seed + 10_000,
-                    step=0,
-                )
-                mean_return = summary["mean_return"]
-                if mean_return > best_return:
-                    best_return = mean_return
-                    best_summary = summary
-                step_logs.append(
-                    {
-                        "step": step,
-                        "epoch": step,
-                        "accuracy": _cartpole_normalized_score(mean_return),
-                        "mean_return": mean_return,
-                        "success_rate": summary["success_rate"],
-                        "episode_length": summary["episode_length"],
-                        "loss": -mean_return,
-                        "time": time.time() - start,
-                        "step_wall_time": step_wall,
-                        "candidates_evaluated": counted.count,
-                        "env_steps_cumulative": getattr(
-                            evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon
-                        ),
-                    }
-                )
-                print(
-                    f"  [CartPole step {step}/{total_steps}] return={mean_return:.1f} "
-                    f"success={summary['success_rate']:.3f} best={best_return:.1f} "
-                    f"wall={time.time() - start:.0f}s"
-                )
-
-    final_summary = multi_seed_summary(
-        evaluator,
-        stack_module_params(model, 1),
-        seed=seed,
-        step=total_steps,
-    )
-    best_return = max(best_return, final_summary["mean_return"])
-    if not best_summary:
-        best_summary = final_summary
-    metrics = build_rl_metrics(
-        final_return=final_summary["mean_return"],
-        best_return=best_return,
-        normalized_score=_cartpole_normalized_score(final_summary["mean_return"]),
-        wall_time_seconds=time.time() - start,
-        peak_gpu_memory_mb=mem["peak_gpu_memory_mb"],
-        function_evals=counted.count,
-        total_steps=total_steps,
-        rl_env_steps=getattr(evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon),
-        success_rate=final_summary["success_rate"],
-        episode_length=final_summary["episode_length"],
-        best_success_rate=best_summary.get("success_rate", 0.0),
-    )
-    metrics["final_return_std"] = final_summary.get("mean_return_std", 0.0)
-    metrics["final_eval_seeds"] = final_summary.get("_n_eval_seeds", 1)
-    epoch_logs = [
-        {"epoch": row["step"], "accuracy": row["accuracy"], "loss": row["loss"], "time": row["time"]}
-        for row in step_logs
-    ]
-    save_result(
-        benchmark="cartpole",
-        method=method,
-        seed=seed,
-        metrics=metrics,
-        hyperparameters={
-            "hidden": hidden,
-            "steps": total_steps,
-            "rollouts_per_candidate": rollouts_per_candidate,
-            "horizon": horizon,
-            "subspace_rank": subspace_rank,
-            "epsilon_init": epsilon_init,
-            "epsilon_target": epsilon_target,
-            "step_radius": step_radius,
-            "probe_radius": probe_radius,
-            "probe_radius_jitter": THEORY_JITTER if theory_mode else probe_radius_jitter,
-            "amortize_steps": 1 if theory_mode else amortize_steps,
-            "theory_mode": theory_mode,
-            "max_subspace_dim": max_subspace_dim,
-            "param_count": param_count,
-            "subspace_dim": subspace.subspace_dim,
-        },
-        epoch_logs=epoch_logs,
-        step_logs=step_logs,
-        results_dir=results_dir or DEFAULT_RESULTS_DIR,
-    )
-    return counted.count
 
 
 def run_random_cartpole(
@@ -408,10 +196,11 @@ def run_random_cartpole(
     metrics = build_rl_metrics(
         final_return=summary["mean_return"],
         best_return=summary["mean_return"],
-        normalized_score=_cartpole_normalized_score(summary["mean_return"]),
+        normalized_score=_gym_normalized_score("cartpole", summary["mean_return"]),
         wall_time_seconds=time.time() - start,
         peak_gpu_memory_mb=0.0,
-        function_evals=1,
+        # One policy, evaluated over `eval_episodes` rollouts.
+        function_evals=int(eval_episodes),
         total_steps=1,
         rl_env_steps=eval_episodes * horizon,
         success_rate=summary["success_rate"],
@@ -427,107 +216,10 @@ def run_random_cartpole(
     )
 
 
-def run_sb3_cartpole(
-    *,
-    method: str,
-    seed: int,
-    total_timesteps: int = 50_000,
-    eval_episodes: int = 50,
-    results_dir: str | None = None,
-    net_arch: tuple[int, ...] = (16,),
-) -> None:
-    """Stable-Baselines3 DQN/PPO baseline on CartPole-v1.
-
-    net_arch defaults to (16,) to match PolyStep's DiscreteMLPPolicy(hidden=16).
-    """
-
-    try:
-        from stable_baselines3 import DQN, PPO
-    except ImportError as exc:
-        raise ImportError("stable-baselines3 is required for CartPole dqn/ppo baselines") from exc
-    try:
-        import gymnasium as gym
-    except ImportError as exc:
-        raise ImportError("gymnasium is required for CartPole baselines") from exc
-    import numpy as np
-
-    algo_cls = {"dqn": DQN, "ppo": PPO}.get(method)
-    if algo_cls is None:
-        raise ValueError(f"Unsupported SB3 CartPole method: {method}")
-
-    start = time.time()
-    env = gym.make("CartPole-v1")
-    env.reset(seed=seed)
-    policy_kwargs = {"net_arch": list(net_arch)}
-    # Force CPU: small MLP, SB3 recommends CPU for non-CNN policies.
-    model = algo_cls("MlpPolicy", env, seed=seed, verbose=0, policy_kwargs=policy_kwargs, device="cpu")
-    param_count = sum(p.numel() for p in model.policy.parameters())
-
-    def _eval_env_factory():
-        return gym.make("CartPole-v1")
-
-    cb, curve = _sb3_periodic_eval_callback(
-        _eval_env_factory,
-        n_eval_episodes=min(20, eval_episodes),
-        n_eval_points=80,
-        total_timesteps=int(total_timesteps),
-        eval_seed_base=int(seed),
-    )
-    model.learn(total_timesteps=int(total_timesteps), callback=cb)
-
-    eval_env = gym.make("CartPole-v1")
-    returns: list[float] = []
-    lengths: list[int] = []
-    for ep in range(int(eval_episodes)):
-        obs, _ = eval_env.reset(seed=seed + 40_000 + ep)
-        total = 0.0
-        length = 0
-        for _ in range(CARTPOLE_HORIZON):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, term, trunc, _ = eval_env.step(int(action))
-            total += float(reward)
-            length += 1
-            if term or trunc:
-                break
-        returns.append(total)
-        lengths.append(length)
-    eval_env.close()
-    env.close()
-
-    mean_return = float(np.mean(returns)) if returns else 0.0
-    best_return = max([mean_return] + [c["mean_return"] for c in curve], default=mean_return)
-    metrics = build_rl_metrics(
-        final_return=mean_return,
-        best_return=best_return,
-        normalized_score=_cartpole_normalized_score(mean_return),
-        wall_time_seconds=time.time() - start,
-        peak_gpu_memory_mb=0.0,
-        function_evals=int(total_timesteps),
-        total_steps=int(total_timesteps),
-        rl_env_steps=int(total_timesteps) + int(eval_episodes) * CARTPOLE_HORIZON,
-        success_rate=float(sum(1 for length in lengths if length >= CARTPOLE_HORIZON) / max(1, len(lengths))),
-        episode_length=float(np.mean(lengths)) if lengths else 0.0,
-    )
-    save_result(
-        "cartpole",
-        method,
-        seed,
-        metrics,
-        {
-            "total_timesteps": int(total_timesteps),
-            "eval_episodes": int(eval_episodes),
-            "net_arch": list(net_arch),
-            "param_count": int(param_count),
-        },
-        epoch_logs=[{"epoch": c["epoch"], "accuracy": 0.0, "loss": c["loss"], "time": c["time"]} for c in curve],
-        step_logs=curve,
-        results_dir=results_dir or DEFAULT_RESULTS_DIR,
-    )
-
-
 def _run_cartpole_polystep_full(*, seed: int, device: str, results_dir: str, args) -> None:
     config = CARTPOLE_POLYSTEP_FINAL_CONFIG.copy()
-    run_polystep_cartpole(
+    run_polystep_gym(
+        env_short="cartpole",
         seed=seed,
         device=device,
         steps=args.steps or config["steps"],
@@ -567,7 +259,6 @@ GYM_ENV_REGISTRY: dict[str, dict[str, Any]] = {
             "step_radius": 0.1,
             "probe_radius": 1.5,
             # Jitter forces amortize_steps=1; see PolyStepOptimizer.__init__.
-
             "amortize_steps": 1,
             "max_subspace_dim": 24,
         },
@@ -590,7 +281,6 @@ GYM_ENV_REGISTRY: dict[str, dict[str, Any]] = {
             "epsilon_target": 0.3,
             "step_radius": 0.1,
             "probe_radius": 2.0,
-
             "amortize_steps": 1,
             "max_subspace_dim": 24,
         },
@@ -610,9 +300,8 @@ def _register_hardened_envs_if_needed() -> None:
 
 _register_hardened_envs_if_needed()
 
-# Hardened-env entries inherit hidden / rollouts / polystep-config from their
-# vanilla parents but adjust scoring anchors (random/reference returns drop
-# under bucketed sparse reward).
+# Hardened entries inherit the vanilla parent config but use lower scoring
+# anchors (bucketed sparse reward).
 _HARDENED_OVERRIDES = {
     "cartpole_hard": dict(env_id="CartPoleHard-v1", random_return=18.0, reference_return=475.0),
     "acrobot_hard": dict(env_id="AcrobotHard-v1", random_return=-500.0, reference_return=-90.0),
@@ -662,11 +351,11 @@ def run_polystep_gym(
     theory_mode: bool = False,
     nondiff_mode: str = "float32",
 ) -> int:
-    """Run PolyStep direct policy search on a generic discrete-action Gym env.
+    """Run PolyStep direct policy search on a discrete-action Gym env.
 
-    ``nondiff_mode`` ∈ {``"float32"``, ``"int8"``, ``"binary"``} swaps the inner
-    activation for the corresponding non-differentiable op. PolyStep is unaffected
-    (it sees only forward losses); PPO/DQN trained with the same mode collapse.
+    ``nondiff_mode`` in {"float32", "int8", "binary"} swaps the inner activation
+    for the non-differentiable op; PolyStep sees only forward losses, PPO/DQN collapse.
+    Float32 CartPole runs on the analytic vectorized evaluator, which needs no gym.
     """
 
     from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
@@ -709,13 +398,20 @@ def run_polystep_gym(
         ).to(device)
         eval_activation = nondiff_mode
     param_count = sum(p.numel() for p in model.parameters())
-    evaluator = GymVectorEvaluator(
-        env_id,
-        rollouts_per_candidate=rollouts_per_candidate,
-        horizon=horizon,
-        device=device,
-        activation=eval_activation,
-    )
+    if env_short == "cartpole" and nondiff_mode == "float32":
+        evaluator = CartPoleEvaluator(
+            rollouts_per_candidate=rollouts_per_candidate,
+            horizon=horizon,
+            device=device,
+        )
+    else:
+        evaluator = GymVectorEvaluator(
+            env_id,
+            rollouts_per_candidate=rollouts_per_candidate,
+            horizon=horizon,
+            device=device,
+            activation=eval_activation,
+        )
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
         layout,
@@ -740,7 +436,10 @@ def run_polystep_gym(
             target=epsilon_target,
             decay=(epsilon_init - epsilon_target) / total_steps,
         ),
-        step_radius=PowerDecay(init=step_radius, gamma=THEORY_GAMMA) if theory_mode else step_radius,
+        # PowerDecay is a schedule (read as the physical radius); a bare float is a
+        # multiplier on epsilon. Theory mode runs flat epsilon = epsilon_target, so
+        # that is the factor to fold in.
+        step_radius=(PowerDecay(init=step_radius * epsilon_target, gamma=THEORY_GAMMA) if theory_mode else step_radius),
         probe_radius=probe_radius,
         probe_radius_jitter=THEORY_JITTER if theory_mode else probe_radius_jitter,
         probe_radius_jitter_dist="smooth",
@@ -881,7 +580,8 @@ def run_polystep_gym(
         step_logs=step_logs,
         results_dir=results_dir or DEFAULT_RESULTS_DIR,
     )
-    evaluator.close()
+    if hasattr(evaluator, "close"):
+        evaluator.close()
     return counted.count
 
 
@@ -914,7 +614,8 @@ def run_random_gym(
         normalized_score=_gym_normalized_score(env_short, summary["mean_return"]),
         wall_time_seconds=time.time() - start,
         peak_gpu_memory_mb=0.0,
-        function_evals=1,
+        # One policy, evaluated over `eval_episodes` rollouts.
+        function_evals=int(eval_episodes),
         total_steps=1,
         rl_env_steps=int(eval_episodes) * horizon,
         success_rate=summary["success_rate"],
@@ -944,8 +645,16 @@ def run_sb3_gym(
     eval_episodes: int = 50,
     results_dir: str | None = None,
     net_arch: tuple[int, ...] | None = None,
+    nondiff_mode: str | None = None,
 ) -> None:
-    """Stable-Baselines3 DQN/PPO baseline on a generic Gym env."""
+    """Stable-Baselines3 DQN/PPO baseline on a Gym env.
+
+    With ``nondiff_mode`` set, the op is applied at every hidden activation (SB3
+    ``activation_fn``) and around every output head, so backprop returns zero gradient
+    (no STE) and every trainable linear stagnates at init. The architecture becomes two
+    hidden layers, so a non-diff activation sits between every pair of them, and the run
+    is logged under ``f"{method}_nondiff_{mode}"``.
+    """
 
     try:
         from stable_baselines3 import DQN, PPO
@@ -970,7 +679,14 @@ def run_sb3_gym(
     start = time.time()
     env = gym.make(env_id)
     env.reset(seed=seed)
-    policy_kwargs = {"net_arch": list(net_arch)}
+    if nondiff_mode is None:
+        policy_kwargs = {"net_arch": list(net_arch)}
+    else:
+        hidden = int(net_arch[0])
+        policy_kwargs = {
+            "net_arch": [hidden, hidden],
+            "activation_fn": _make_nondiff_activation_fn(nondiff_mode),
+        }
     model = algo_cls(
         "MlpPolicy",
         env,
@@ -979,6 +695,8 @@ def run_sb3_gym(
         policy_kwargs=policy_kwargs,
         device="cpu",
     )
+    if nondiff_mode is not None:
+        _apply_nondiff_to_sb3_policy(model, method, nondiff_mode)
     param_count = sum(p.numel() for p in model.policy.parameters())
 
     def _eval_env_factory():
@@ -1020,7 +738,10 @@ def run_sb3_gym(
         normalized_score=_gym_normalized_score(env_short, mean_return),
         wall_time_seconds=time.time() - start,
         peak_gpu_memory_mb=0.0,
-        function_evals=int(total_timesteps),
+        # SB3 is gradient-based and evaluates no candidates: function_evals counts
+        # candidates everywhere else, so it stays NaN and the timestep count is
+        # kept under its own key.
+        function_evals=float("nan"),
         total_steps=int(total_timesteps),
         rl_env_steps=int(total_timesteps) + int(eval_episodes) * horizon,
         success_rate=float(sum(1 for length in lengths if length >= horizon) / max(1, len(lengths))),
@@ -1028,15 +749,16 @@ def run_sb3_gym(
     )
     save_result(
         env_short,
-        method,
+        method if nondiff_mode is None else f"{method}_nondiff_{nondiff_mode}",
         seed,
         metrics,
         {
             "env_id": env_id,
             "total_timesteps": int(total_timesteps),
             "eval_episodes": int(eval_episodes),
-            "net_arch": list(net_arch),
+            "net_arch": list(policy_kwargs["net_arch"]),
             "param_count": int(param_count),
+            **({} if nondiff_mode is None else {"nondiff_mode": nondiff_mode}),
         },
         epoch_logs=[{"epoch": c["epoch"], "accuracy": 0.0, "loss": c["loss"], "time": c["time"]} for c in curve],
         step_logs=curve,
@@ -1100,130 +822,6 @@ def _apply_nondiff_to_sb3_policy(model, method: str, mode: str) -> None:
             model.q_net_target.q_net = _wrap_module_output_with_nondiff(model.q_net_target.q_net, mode)
 
 
-def run_sb3_gym_nondiff(
-    *,
-    env_short: str,
-    method: str,
-    seed: int,
-    total_timesteps: int,
-    nondiff_mode: str = "binary",
-    eval_episodes: int = 50,
-    results_dir: str | None = None,
-    features_dim: int | None = None,
-) -> None:
-    """SB3 PPO/DQN baseline trained through a fully non-differentiable policy.
-
-    The non-diff op is applied at *every* hidden activation (via SB3
-    ``activation_fn``) **and** wrapped around every output head (action_net /
-    value_net for PPO; q_net / q_net_target for DQN). Backprop through any of
-    these returns zero gradient (no STE), so all trainable linears stagnate at
-    init. Logged under ``method = f"{method}_nondiff_{mode}"``.
-    """
-
-    try:
-        from stable_baselines3 import DQN, PPO
-    except ImportError as exc:
-        raise ImportError("stable-baselines3 is required for SB3 non-diff baselines") from exc
-    import gymnasium as gym
-
-    cfg = GYM_ENV_REGISTRY[env_short]
-    env_id = cfg["env_id"]
-    horizon = int(cfg["horizon"])
-    hidden = int(features_dim) if features_dim is not None else int(cfg["hidden"])
-
-    algo_cls = {"dqn": DQN, "ppo": PPO}.get(method)
-    if algo_cls is None:
-        raise ValueError(f"Unsupported SB3 method: {method}")
-
-    activation_fn = _make_nondiff_activation_fn(nondiff_mode)
-
-    start = time.time()
-    env = gym.make(env_id)
-    env.reset(seed=seed)
-    # Two-hidden-layer architecture so multiple non-diff activations sit
-    # between every pair of trainable linears (single-hidden would leave the
-    # input-Linear's weights still trainable through one non-diff hop).
-    policy_kwargs = {
-        "net_arch": [hidden, hidden],
-        "activation_fn": activation_fn,
-    }
-    model = algo_cls(
-        "MlpPolicy",
-        env,
-        seed=seed,
-        verbose=0,
-        policy_kwargs=policy_kwargs,
-        device="cpu",
-    )
-    _apply_nondiff_to_sb3_policy(model, method, nondiff_mode)
-    param_count = sum(p.numel() for p in model.policy.parameters())
-
-    def _eval_env_factory():
-        return gym.make(env_id)
-
-    cb, curve = _sb3_periodic_eval_callback(
-        _eval_env_factory,
-        n_eval_episodes=min(20, eval_episodes),
-        n_eval_points=80,
-        total_timesteps=int(total_timesteps),
-        eval_seed_base=int(seed),
-    )
-    model.learn(total_timesteps=int(total_timesteps), callback=cb)
-
-    eval_env = gym.make(env_id)
-    returns: list[float] = []
-    lengths: list[int] = []
-    for ep in range(int(eval_episodes)):
-        obs, _ = eval_env.reset(seed=seed + 40_000 + ep)
-        total = 0.0
-        length = 0
-        for _ in range(horizon):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, term, trunc, _ = eval_env.step(int(action))
-            total += float(reward)
-            length += 1
-            if term or trunc:
-                break
-        returns.append(total)
-        lengths.append(length)
-    eval_env.close()
-    env.close()
-
-    import numpy as _np
-
-    mean_return = float(_np.mean(returns)) if returns else 0.0
-    best_return = max([mean_return] + [c["mean_return"] for c in curve], default=mean_return)
-    metrics = build_rl_metrics(
-        final_return=mean_return,
-        best_return=best_return,
-        normalized_score=_gym_normalized_score(env_short, mean_return),
-        wall_time_seconds=time.time() - start,
-        peak_gpu_memory_mb=0.0,
-        function_evals=int(total_timesteps),
-        total_steps=int(total_timesteps),
-        rl_env_steps=int(total_timesteps) + int(eval_episodes) * horizon,
-        success_rate=float(sum(1 for length in lengths if length >= horizon) / max(1, len(lengths))),
-        episode_length=float(_np.mean(lengths)) if lengths else 0.0,
-    )
-    save_result(
-        env_short,
-        f"{method}_nondiff_{nondiff_mode}",
-        seed,
-        metrics,
-        {
-            "env_id": env_id,
-            "total_timesteps": int(total_timesteps),
-            "eval_episodes": int(eval_episodes),
-            "hidden": hidden,
-            "param_count": int(param_count),
-            "nondiff_mode": nondiff_mode,
-        },
-        epoch_logs=[{"epoch": c["epoch"], "accuracy": 0.0, "loss": c["loss"], "time": c["time"]} for c in curve],
-        step_logs=curve,
-        results_dir=results_dir or DEFAULT_RESULTS_DIR,
-    )
-
-
 def run_es_gym(
     *,
     env_short: str,
@@ -1242,14 +840,8 @@ def run_es_gym(
 ) -> None:
     """Hand-rolled OpenAI-ES baseline (antithetic sampling, rank centering, cosine sigma decay).
 
-    Evaluates the whole population in parallel via :class:`GymVectorEvaluator`'s
-    stacked-params interface. This is the *fair* gradient-free reference: like
-    PolyStep it cannot exploit gradients, so a PolyStep win over ES isolates the
-    benefit of OT-guided steps over plain Gaussian smoothing.
-
-    ``nondiff_mode`` ∈ {``"float32"``, ``"int8"``, ``"binary"``}: ES is gradient-free
-    so handles non-diff policies natively; included for completeness in the
-    non-diff sweep.
+    Evaluates the population in parallel via GymVectorEvaluator's stacked-params
+    interface; ``nondiff_mode`` swaps the policy activation for a non-diff op.
     """
 
     from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
@@ -1510,7 +1102,7 @@ def main() -> None:
         "--theory-mode",
         action="store_true",
         help=(
-            "Run the configuration Theorem 4.2 analyses: probe_radius_jitter=0.05 "
+            "Run the unaccelerated reference configuration: probe_radius_jitter=0.05 "
             "with the smooth density, independent rotations, flat epsilon, step "
             "radius r0*(t+1)^-(1/2+0.1), orthoplex, HybridSubspace, no momentum / "
             "amortization / Anderson."
@@ -1524,10 +1116,32 @@ def main() -> None:
         "handle int8/binary natively; PPO/DQN under int8/binary collapse "
         "(no STE) - used to motivate gradient-free training.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run cells whose result file already exists (default: skip them).",
+    )
     args = parser.parse_args()
+
+    def _done(method: str, seed: int) -> bool:
+        """True when this cell's result file already exists.
+
+        Every other runner skips a finished cell and takes ``--force`` to override; this
+        one re-ran unconditionally, which is why the launcher had to list its jobs last
+        and could not resume them. The suffix mirrors how the writers name their files:
+        ``{env}_{method}[_nondiff_{mode}]_{seed}.json``.
+        """
+        suffix = "" if args.nondiff_mode in (None, "float32") else f"_nondiff_{args.nondiff_mode}"
+        path = os.path.join(args.results_dir, f"{args.env}_{method}{suffix}_{seed}.json")
+        return os.path.exists(path)
 
     for seed in args.seeds:
         for method in args.methods:
+            if not args.force and _done(method, seed):
+                print(
+                    f"[skip] {args.env}/{method}{'' if args.nondiff_mode in (None, 'float32') else '/' + args.nondiff_mode} seed={seed} (exists)"
+                )
+                continue
             print(f"\n{'=' * 60}")
             print(f"[{args.mode}] env={args.env}  method={method}  seed={seed}")
             print(f"{'=' * 60}")
@@ -1560,7 +1174,7 @@ def main() -> None:
                     elif method in {"dqn", "ppo"}:
                         cfg = GYM_ENV_REGISTRY["cartpole"]
                         total_timesteps = cfg["sb3_total_timesteps"][args.mode]
-                        run_sb3_gym_nondiff(
+                        run_sb3_gym(
                             env_short="cartpole",
                             method=method,
                             seed=seed,
@@ -1586,7 +1200,8 @@ def main() -> None:
                         results_dir=args.results_dir,
                     )
                 elif method in {"dqn", "ppo"}:
-                    run_sb3_cartpole(
+                    run_sb3_gym(
+                        env_short="cartpole",
                         method=method,
                         seed=seed,
                         total_timesteps=10_000 if args.mode == "sweep" else 1_000_000,
@@ -1638,7 +1253,7 @@ def main() -> None:
                             results_dir=args.results_dir,
                         )
                     else:
-                        run_sb3_gym_nondiff(
+                        run_sb3_gym(
                             env_short=env_short,
                             method=method,
                             seed=seed,
@@ -1649,4 +1264,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

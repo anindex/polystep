@@ -1,25 +1,19 @@
-"""Backend x architecture matrix for PolyStep's per-step candidate-forward eval.
+"""Backend x architecture matrix for the per-step candidate-forward evaluation.
 
-The per-step cost is P*V*K forward passes. On a launch-bound net (many tiny
-sequential kernels, e.g. an SNN's T-step recurrence) the lever is not FLOPs but
-kernel-launch / CPU-dispatch overhead. This benchmark measures, across
-architectures that actually route through vmap/in-place (NOT the pure-MLP bmm
-fast path), how each evaluator backend moves wall-clock:
+Covers the architectures that route through vmap or in-place, not the pure-MLP bmm
+fast path:
 
   eager_vmap             vmap + functional_call, no compile          (baseline)
-  compiled_vmap_default  torch.compile(mode="default"): FUSION only  (no CUDA graphs)
+  compiled_vmap_default  torch.compile(mode="default"): fusion only  (no CUDA graphs)
   inplace_eager          sequential .data-swap loop, eager forward
-  inplace_graph          compile_forward: torch.compile(reduce-overhead) = CUDA
-                         graphs on the forward+loss, replayed per candidate
+  inplace_graph          compile_forward: torch.compile(reduce-overhead), CUDA
+                         graphs on the forward and loss, replayed per candidate
 
-Honest reporting (the review's asks): wall-clock median + IQR, speedup vs
-eager_vmap, and the ACTUAL backend used (compile can silently fall back). Never
-forward count. The expected result is a GRADIENT, not a universal number:
-recurrent/launch-bound nets (SNN) win big from CUDA graphs; feedforward MLP/CNN
-become FLOP/bandwidth-bound and win modestly.
+Reports median wall-clock and IQR, speedup against eager_vmap, and the backend that
+actually ran, since compile can fall back silently. Run on GPU, from the repository
+root.
 
-Run FOREGROUND on GPU:
-  PY=/home/anindex/polystep/.venv/bin/python; $PY experiments/scripts/bench_forward_backends.py
+    python experiments/scripts/bench_forward_backends.py
 """
 
 from __future__ import annotations
@@ -28,13 +22,12 @@ import statistics
 import sys
 import time
 
-sys.path.insert(0, "/home/anindex/polystep")
+sys.path.insert(0, ".")
 import torch
 import torch.nn as nn
 from torch.func import functional_call, vmap
 
 from experiments.runners.nondiff_models import (
-    BinaryCIFAR10Net,
     DiscreteAttentionNet,
     HardMoENet,
     SpikingMNISTNet,
@@ -45,16 +38,14 @@ from polystep.cost_nn import NNCostEvaluator
 MODELS = [
     ("SpikingMNISTNet (recurrent, T=15)", lambda: SpikingMNISTNet(num_steps=15), (784,), 10),
     ("DiscreteAttentionNet (MLP+argmax)", lambda: DiscreteAttentionNet(), (784,), 10),
-    ("BinaryCIFAR10Net (CNN)", lambda: BinaryCIFAR10Net(), (3, 32, 32), 10),
     ("HardMoENet (MLP+hard-gate)", lambda: HardMoENet(), (784,), 20),
 ]
 
 BATCH = 128
 N_CAND = 128  # representative candidate chunk (P*V*K)
 WARMUP = 50
-# Sub-millisecond sweeps are noisy: use a per-call time budget so cheap backends
-# get many more reps. Pin GPU clocks (nvidia-smi -lgc) for stable numbers; these
-# medians are illustrative, not paper-grade.
+# Sub-millisecond sweeps are noisy: a per-call time budget gives cheap backends
+# many more reps. Pin GPU clocks (nvidia-smi -lgc) for stable numbers.
 MIN_REPS = 60
 TIME_BUDGET_S = 1.5
 
@@ -113,9 +104,9 @@ def _build_vmap_ro(model, loss_fn):
     """torch.compile(reduce-overhead) on the vmapped fn.
 
     With chunk_size=None (no chunking) there is no chunk-concat, so CUDA graphs
-    on the whole N-candidate sweep may capture: one graph, N candidates. This
-    is what the evaluator's compile_vmap deliberately does NOT do (it ships
-    mode="default"). Tested raw here to see if it beats fusion on launch-bound nets.
+    on the whole N-candidate sweep may capture: one graph, N candidates. The
+    evaluator's compile_vmap deliberately ships mode="default" instead; tested
+    raw here against fusion on launch-bound nets.
     """
     buffers = dict(model.named_buffers())
 
@@ -163,7 +154,7 @@ def run_model(name, build, in_shape, n_classes, seeds=(0, 1, 2)):
 
         for kind in BACKENDS:
             if kind == "compiled_vmap_reduce_overhead":
-                # The missing-cell experiment: CUDA graphs on the vmapped sweep.
+                # CUDA graphs on the vmapped sweep.
                 try:
                     fn = _build_vmap_ro(model, loss_fn)
                     with torch.inference_mode():
@@ -171,8 +162,7 @@ def run_model(name, build, in_shape, n_classes, seeds=(0, 1, 2)):
                         losses = fn(stacked, x, y)
                     ok = torch.unique(losses).numel() > N_CAND // 2
                     per_backend[kind].append(med if ok else float("inf"))
-                    # RO on the vmapped path measures ~= fusion -> CUDA graphs do not
-                    # capture/benefit the already-amortized sweep (see docs).
+                    # CUDA graphs do not benefit the already vmap-amortized sweep.
                     used[kind] = "vmap+reduce-overhead" if ok else "vmap+RO STALE (rejected)"
                 except Exception as e:  # noqa: BLE001
                     per_backend[kind].append(float("inf"))
@@ -181,7 +171,7 @@ def run_model(name, build, in_shape, n_classes, seeds=(0, 1, 2)):
                 continue
             ev = _make_ev(model, loss_fn, kind)
             # Guard: these models must NOT hit the pure-MLP bmm fast path, else the
-            # benchmark would silently bypass compile and lie.
+            # benchmark silently bypasses compile.
             assert ev._batched_linear is None, f"{name} hit BatchedLinearEvaluator: bmm bypass"
             with torch.inference_mode():
                 med, iqr = _time(lambda: ev.evaluate(stacked, x, y))

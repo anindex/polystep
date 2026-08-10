@@ -1,54 +1,26 @@
 """Shared experiment utilities for paper experiments.
 
-Provides seed management, result saving (JSON), environment info collection,
-accuracy evaluation, parameter flattening, GPU memory tracking, and dataset
-loading (MNIST, CIFAR-10, DVS-Gesture, N-MNIST, SHD via Tonic).
-
-All experiment runner scripts import from this module to ensure consistent
-result format and reproducibility across benchmarks.
-
-JSON schema per run:
-    {
-        "benchmark": str,
-        "method": str,
-        "seed": int,
-        "timestamp": str (ISO 8601),
-        "environment": dict,
-        "hyperparameters": dict,
-        "leaked": bool,
-        "metrics": {
-            "final_accuracy": float,
-            "best_accuracy": float,
-            "test_accuracy_at_selected": float,  # headline metric
-            "wall_time_seconds": float,
-            "peak_gpu_memory_mb": float,
-            "function_evals": int,
-            "total_steps": int,
-        },
-        "epoch_logs": [{"epoch": int, "accuracy": float, "loss": float, "time": float}],
-    }
+Seed management, result saving (JSON), environment info, accuracy evaluation,
+parameter flattening, GPU memory tracking, and dataset loading (MNIST,
+DVS-Gesture, N-MNIST, SHD via Tonic).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-# cuBLAS reads this once, when the CUDA context is created, so it has to be set
-# before anything touches CUDA. Setting it at import time of this module is the
-# only place that holds for every runner, since they all import it before they
-# build a model. ``setdefault`` leaves an operator-supplied value alone.
+# cuBLAS reads this once, when the CUDA context is created, so it must be set at
+# import time before anything touches CUDA. setdefault preserves an
+# operator-supplied value.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-# OpenMP spin-wait is the single worst per-step cost PolyStep has on a busy box.
-# At torch.set_num_threads == nproc the pool threads and the main thread
-# oversubscribe: docs/performance.md measures 171-6688 ms/step at 24 threads
-# against 74 ms at 22, and PASSIVE brings a 6631 ms case back to 150 ms. Both
-# must be set before torch initializes its thread pool, hence import time.
+# OpenMP spin-wait dominates per-step cost when the thread pool and the main
+# thread oversubscribe; PASSIVE avoids it. Must be set before torch initializes
+# its thread pool, hence import time.
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
 import torch  # noqa: E402
@@ -60,9 +32,7 @@ from polystep.benchmarks.utils import (
     BenchmarkResult,
     get_environment_info as _base_get_environment_info,
     get_mnist_loaders as _base_get_mnist_loaders,
-    get_cifar10_loaders as _base_get_cifar10_loaders,
     MNISTNet,
-    CIFAR10Net,
 )
 
 
@@ -79,6 +49,9 @@ except ImportError:
 
 SEEDS: List[int] = [42, 123, 456, 789, 1337]
 
+#: `run_maxsat.py` writes `cmaes`; every other runner writes `cma_es`. Readers accept both.
+METHOD_ALIASES = {"cmaes": "cma_es"}
+
 
 _DEFAULT_RESULTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -89,19 +62,10 @@ _DEFAULT_RESULTS_DIR = os.path.join(
 
 
 def get_environment_info() -> Dict[str, Any]:
-    """Collect environment info for reproducibility.
-
-    Wraps polystep.benchmarks.utils.get_environment_info() and adds
-    peak GPU memory tracking via torch.cuda.max_memory_allocated().
-
-    Returns:
-        Dict with torch_version, cuda_version, gpu_model, python_version,
-        platform, and peak_gpu_memory_mb (if CUDA available).
-    """
+    """Environment info for reproducibility, plus peak GPU memory in MB."""
     info = _base_get_environment_info()
 
     if torch.cuda.is_available():
-        # Record current peak GPU memory in MB
         peak_bytes = torch.cuda.max_memory_allocated()
         info["peak_gpu_memory_mb"] = round(peak_bytes / (1024 * 1024), 2)
     else:
@@ -112,18 +76,9 @@ def get_environment_info() -> Dict[str, Any]:
 
 @contextmanager
 def track_gpu_memory():
-    """Context manager that records peak GPU memory usage.
+    """Record peak GPU memory usage of the wrapped block.
 
-    Resets CUDA memory stats on entry, records peak allocation on exit.
-    Yields a dict that will be populated with 'peak_gpu_memory_mb' on exit.
-
-    Usage::
-
-        with track_gpu_memory() as mem:
-            # ... run training ...
-        print(f"Peak GPU: {mem['peak_gpu_memory_mb']:.1f} MB")
-
-    If CUDA is not available, peak_gpu_memory_mb will be 0.0.
+    Yields a dict populated with 'peak_gpu_memory_mb' on exit (0.0 without CUDA).
     """
     result: Dict[str, float] = {"peak_gpu_memory_mb": 0.0}
 
@@ -151,44 +106,10 @@ def save_result(
     results_dir: Optional[str] = None,
     leaked: bool = False,
 ) -> str:
-    """Save a single experiment run result to JSON.
+    """Save a single experiment run result to JSON as {benchmark}_{method}_{seed}.json.
 
-    File naming convention: {benchmark}_{method}_{seed}.json
-    Saved to experiments/results/ by default.
-
-    Args:
-        benchmark: Benchmark name (e.g., 'mnist', 'dvs_gesture').
-        method: Method name (e.g., 'polystep', 'cmaes', 'sgd').
-        seed: Random seed used for this run.
-        metrics: Dict with at least:
-            - final_accuracy (float)
-            - best_accuracy (float)
-            - test_accuracy_at_selected (float): the headline metric --
-              test accuracy of the checkpoint chosen on the validation
-              split. Defaults to ``final_accuracy``, which every runner
-              computes on the selected checkpoint right before saving.
-            - wall_time_seconds (float)
-            - peak_gpu_memory_mb (float)
-            - function_evals (int)
-            - total_steps (int)
-        hyperparameters: Optional dict of hyperparameters used.
-        epoch_logs: Optional list of per-epoch metric dicts, each with
-            at minimum 'epoch', 'accuracy', 'loss', 'time' keys.
-        step_logs: Optional list of per-N-step metric dicts for fine-grained
-            tracking. Each entry should have 'step', 'epoch', and relevant
-            metrics (accuracy/mse, loss, wall_time).
-        results_dir: Directory to save results. Defaults to experiments/results/.
-        leaked: True when the run selected its reported checkpoint on the
-            test set (``--allow-test-leakage``). Stamped into the JSON as
-            ``"leaked": true``; ``aggregate_results.py`` refuses to read
-            any file carrying that stamp, so a leaked run cannot become a
-            paper number by accident.
-
-    Returns:
-        Path to the saved JSON file.
-
-    Raises:
-        ValueError: If required metric keys are missing.
+    ``leaked=True`` stamps runs that selected on the test set; the aggregator
+    refuses those files. Raises ValueError if required metric keys are missing.
     """
     required_keys = {
         "final_accuracy",
@@ -203,9 +124,8 @@ def save_result(
         raise ValueError(f"Missing required metric keys: {missing}")
 
     metrics = dict(metrics)
-    # The headline metric. Runners that do val-based selection pass it
-    # explicitly; for the rest final_accuracy is the same number, because
-    # they evaluate the selected checkpoint on test as their last act.
+    # Headline metric; runners evaluate the selected checkpoint on test as their
+    # last act, so final_accuracy is the same number when not passed explicitly.
     metrics.setdefault("test_accuracy_at_selected", metrics["final_accuracy"])
 
     if results_dir is None:
@@ -214,17 +134,17 @@ def save_result(
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Build metrics dict: required keys first, then any extras
     result_metrics = {
         "final_accuracy": float(metrics["final_accuracy"]),
         "best_accuracy": float(metrics["best_accuracy"]),
         "test_accuracy_at_selected": float(metrics["test_accuracy_at_selected"]),
         "wall_time_seconds": float(metrics["wall_time_seconds"]),
         "peak_gpu_memory_mb": float(metrics["peak_gpu_memory_mb"]),
-        "function_evals": int(metrics["function_evals"]),
+        # None passes through: gradient baselines (Adam, PPO, DQN) evaluate no
+        # candidates, recorded as null rather than an invented count.
+        "function_evals": (None if metrics["function_evals"] is None else int(metrics["function_evals"])),
         "total_steps": int(metrics["total_steps"]),
     }
-    # Preserve extra keys beyond standard metrics
     for k, v in metrics.items():
         if k not in result_metrics:
             result_metrics[k] = v
@@ -246,9 +166,8 @@ def save_result(
     filepath = os.path.join(results_dir, filename)
 
     with open(filepath, "w") as f:
-        # default=str so a scheduler object in `hyperparameters` (CosineEpsilon,
-        # PowerDecay) serializes as its dataclass repr, which names its parameters,
-        # instead of aborting the run after the training is already done.
+        # default=str serializes scheduler objects in `hyperparameters` as their
+        # dataclass repr instead of aborting the run after training is done.
         json.dump(result, f, indent=2, default=str)
 
     return filepath
@@ -260,23 +179,10 @@ def evaluate_accuracy(
     test_loader: DataLoader,
     device: Optional[torch.device] = None,
 ) -> float:
-    """Evaluate classification accuracy on a test DataLoader.
+    """Classification accuracy on a test DataLoader.
 
-    Handles both regular models and SNN models:
-    - Regular models: output logits of shape (batch, num_classes).
-    - SNN models: accumulate spike outputs across timesteps. Detected
-      by checking if model has a 'num_steps' attribute.
-
-    Also handles SST-2 style 3-element batches (input_ids, attention_mask, labels).
-
-    Args:
-        model: The model to evaluate.
-        test_loader: DataLoader yielding (inputs, labels) or
-            (input_ids, attention_mask, labels).
-        device: Device to evaluate on. If None, inferred from model parameters.
-
-    Returns:
-        Accuracy as a float in [0, 1].
+    SNN models (those with a 'num_steps' attribute) accumulate spikes across
+    timesteps; SST-2 style 3-element batches are also handled.
     """
     if device is None:
         try:
@@ -305,8 +211,7 @@ def evaluate_accuracy(
             raise ValueError(f"Unexpected batch format with {len(batch)} elements")
 
         preds = outputs.argmax(dim=-1)
-        # Guard: if preds and targets shapes differ, this is a regression
-        # task where classification accuracy is meaningless - return 0.0.
+        # Regression task: classification accuracy is meaningless, return 0.0.
         if preds.shape != targets.shape:
             model.train()
             return 0.0
@@ -318,28 +223,12 @@ def evaluate_accuracy(
 
 
 def load_flat_params(model: nn.Module) -> torch.Tensor:
-    """Flatten all model parameters into a single 1D tensor.
-
-    Args:
-        model: The model whose parameters to flatten.
-
-    Returns:
-        1D tensor containing all parameters concatenated.
-    """
+    """Flatten all model parameters into a single 1D tensor."""
     return torch.cat([p.data.reshape(-1) for p in model.parameters()])
 
 
 def set_flat_params(model: nn.Module, flat_params: torch.Tensor) -> None:
-    """Set model parameters from a flat 1D tensor.
-
-    Args:
-        model: The model whose parameters to set.
-        flat_params: 1D tensor with the same total number of elements
-            as model parameters.
-
-    Raises:
-        ValueError: If flat_params size doesn't match model parameter count.
-    """
+    """Set model parameters from a flat 1D tensor. Raises ValueError on size mismatch."""
     total_params = sum(p.numel() for p in model.parameters())
     if flat_params.numel() != total_params:
         raise ValueError(f"flat_params has {flat_params.numel()} elements, but model has {total_params} parameters")
@@ -352,26 +241,16 @@ def set_flat_params(model: nn.Module, flat_params: torch.Tensor) -> None:
 
 
 def get_loss_fn(benchmark: str) -> nn.Module:
-    """Get the standard loss function for a benchmark.
-
-    Args:
-        benchmark: Benchmark name (e.g., 'mnist', 'cifar10', 'dvs_gesture').
-
-    Returns:
-        Loss module (CrossEntropyLoss for all current benchmarks).
-    """
+    """CrossEntropyLoss, the standard loss for all current benchmarks."""
     return nn.CrossEntropyLoss()
 
 
 def pin_threads() -> None:
     """Keep the intra-op pool clear of the core count.
 
-    ``torch.set_num_threads(nproc)`` is the default and is the worst setting
-    available, not merely suboptimal: at the core count the pool and the main
-    thread oversubscribe and OpenMP spin-wait dominates PolyStep's many small
-    forwards. docs/performance.md measures a mid-range count as ~2x faster than
-    one thread and up to ~80x faster than the default on a busy box. Two below
-    ``nproc`` is the measured sweet spot; ``POLYSTEP_THREADS`` overrides.
+    At the full core count the pool and the main thread oversubscribe and OpenMP
+    spin-wait dominates PolyStep's many small forwards; two below nproc avoids
+    it. ``POLYSTEP_THREADS`` overrides.
     """
     requested = os.environ.get("POLYSTEP_THREADS")
     if requested is not None:
@@ -384,37 +263,39 @@ def pin_threads() -> None:
 def set_deterministic(warn_only: bool = True) -> None:
     """Pin every knob that makes a CUDA run drift between repeats.
 
-    Covers what seeding alone does not: deterministic kernel selection,
-    the cuBLAS workspace (see ``CUBLAS_WORKSPACE_CONFIG`` at the top of
-    this module -- it must be set before the CUDA context exists, so it
-    is set at import time, not here), and TF32, whose reduced mantissa
-    turns identical inputs into different sums depending on which kernel
-    the autotuner picked.
-
-    ``warn_only=True`` because a few ops used by the experiments have no
-    deterministic CUDA implementation; see ``docs/determinism.md``.
-
-    Args:
-        warn_only: Passed to ``torch.use_deterministic_algorithms``.
-            Set False to make a non-deterministic op raise instead.
+    Deterministic kernel selection, the cuBLAS workspace (set at import time),
+    and TF32 off, whose reduced mantissa makes sums kernel-dependent.
+    ``warn_only=True`` because a few experiment ops have no deterministic CUDA
+    implementation; see ``docs/determinism.md``.
     """
     torch.use_deterministic_algorithms(True, warn_only=warn_only)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    # TF32 off: it is on by default on Ampere+ and silently changes both
-    # the numbers and their run-to-run stability.
+    # TF32 off: on by default on Ampere+, silently changes results and their
+    # run-to-run stability.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
 
+def reseed_loaders(seed: int, *loaders) -> None:
+    """Rewind each DataLoader's shuffle generator to ``seed``.
+
+    A loader's generator advances with each epoch, so without this the minibatch
+    stream differs between the first and later runs in one process, and
+    ``set_seed`` cannot fix it because the loader does not draw from the global
+    RNG. Call after ``set_seed``, before each run that consumes the loaders.
+    """
+    for loader in loaders:
+        g = getattr(loader, "generator", None)
+        if g is not None:
+            g.manual_seed(seed)
+
+
 def set_seed(seed: int) -> None:
-    """Set random seeds for reproducibility.
+    """Seed Python, NumPy, and PyTorch (CPU and CUDA) for reproducibility.
 
-    Sets seeds for Python random, NumPy, PyTorch CPU, and PyTorch CUDA,
-    then calls :func:`set_deterministic` and :func:`pin_threads`.
-
-    Args:
-        seed: The random seed value.
+    Also applies deterministic algorithms and thread pinning. Does not touch
+    DataLoader shuffle generators; see :func:`reseed_loaders`.
     """
     import random
     import numpy as np
@@ -436,24 +317,9 @@ def make_train_val_split(
 ) -> Tuple[DataLoader, DataLoader]:
     """Carve a deterministic validation subset out of a train DataLoader.
 
-    Use this to drive ``best_state_dict`` selection without peeking at
-    the test set. Returns a ``(new_train_loader, val_loader)`` pair where:
-
-    - ``val_loader`` is a deterministic random subset of size
-      ``val_frac * len(train_dataset)`` (seed-controlled), held out
-      from training.
-    - ``new_train_loader`` is the complement, with the same batch_size,
-      shuffle, and num_workers as the input loader.
-
-    Args:
-        train_loader: Original DataLoader covering the full training set.
-        val_frac: Fraction of the training set held out for validation.
-        seed: Random seed for the deterministic split.
-        val_batch_size: Batch size for the val_loader. Defaults to the
-            train loader's batch size.
-
-    Returns:
-        ``(new_train_loader, val_loader)``.
+    Returns ``(new_train_loader, val_loader)``: a seed-controlled held-out subset
+    of ``val_frac`` of the data and its complement, keeping the input loader's
+    batching settings.
     """
     dataset = train_loader.dataset
     n_total = len(dataset)
@@ -496,23 +362,7 @@ def load_mnist(
     max_train: int = 0,
     max_test: int = 0,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Load MNIST train/test as PyTorch DataLoaders.
-
-    Wraps ``polystep.benchmarks.utils.get_mnist_loaders()`` with a
-    default ``data_dir`` pointing to the repo-level ``data/`` directory
-    instead of ``/tmp/mnist``.
-
-    Args:
-        data_dir: Directory to store/load MNIST data. Defaults to
-            ``data/`` relative to the current working directory.
-        batch_size: Batch size for the training loader.
-        max_train: Maximum training samples (0 = full dataset, ~60K).
-        max_test: Maximum test samples (0 = full dataset, ~10K).
-
-    Returns:
-        Tuple of (train_loader, test_loader).
-        Data format: images (batch, 1, 28, 28), labels (batch,).
-    """
+    """MNIST train/test DataLoaders, stored under ``{data_dir}/mnist``."""
     mnist_dir = os.path.join(data_dir, "mnist")
     return _base_get_mnist_loaders(
         data_dir=mnist_dir,
@@ -527,19 +377,7 @@ def load_fashion_mnist(
     data_dir: str = "data/",
     batch_size: int = 512,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Load Fashion-MNIST train/test as PyTorch DataLoaders.
-
-    Similar to load_mnist but uses Fashion-MNIST dataset (10 classes:
-    T-shirt, Trouser, Pullover, etc.). Uses separate normalization stats.
-
-    Args:
-        data_dir: Directory to store/load Fashion-MNIST data.
-        batch_size: Batch size for the training loader.
-
-    Returns:
-        Tuple of (train_loader, test_loader).
-        Data format: images (batch, 1, 28, 28), labels (batch,).
-    """
+    """Fashion-MNIST train/test DataLoaders, with its own normalization stats."""
     from torchvision import datasets, transforms
 
     fmnist_dir = os.path.join(data_dir, "fashion_mnist")
@@ -556,55 +394,15 @@ def load_fashion_mnist(
     return train_loader, test_loader
 
 
-def load_cifar10(
-    data_dir: str = "data/",
-    batch_size: int = 256,
-) -> Tuple[DataLoader, DataLoader]:
-    """Load CIFAR-10 train/test as PyTorch DataLoaders.
-
-    Wraps ``polystep.benchmarks.utils.get_cifar10_loaders()`` with a
-    default ``data_dir`` pointing to the repo-level ``data/`` directory.
-
-    Args:
-        data_dir: Directory to store/load CIFAR-10 data.
-        batch_size: Batch size for the training loader.
-
-    Returns:
-        Tuple of (train_loader, test_loader).
-        Data format: images (batch, 3, 32, 32), labels (batch,).
-    """
-    cifar_dir = os.path.join(data_dir, "cifar10")
-    return _base_get_cifar10_loaders(
-        data_dir=cifar_dir,
-        batch_size=batch_size,
-        normalize=True,
-    )
-
-
 def load_dvs_gesture(
     data_dir: str = "data/",
     num_steps: int = 25,
     batch_size: int = 16,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Load DVS-Gesture dataset via Tonic.
+    """DVS-Gesture via Tonic (Denoise + ToFrame transforms).
 
-    Uses ``tonic.datasets.DVSGesture`` with Denoise + ToFrame transforms.
-    There is **no synthetic fallback**: if Tonic is not installed or the
-    dataset cannot be downloaded, a ``RuntimeError`` is raised with
-    instructions for manual resolution.
-
-    Args:
-        data_dir: Root directory for dataset storage. The DVS-Gesture
-            data will be placed under ``{data_dir}/dvs_gesture/``.
-        num_steps: Number of time bins for spike-to-frame conversion.
-        batch_size: Batch size for DataLoaders.
-
-    Returns:
-        Tuple of (train_loader, test_loader).
-        Data format: (batch, num_steps, 2, 128, 128), labels (batch,).
-
-    Raises:
-        RuntimeError: If Tonic is not installed or dataset loading fails.
+    No synthetic fallback: raises RuntimeError if Tonic is missing or loading
+    fails. Data format: (batch, num_steps, 2, 128, 128), labels (batch,).
     """
     if not _HAS_TONIC:
         raise RuntimeError(
@@ -672,24 +470,10 @@ def load_nmnist(
     num_steps: int = 25,
     batch_size: int = 64,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Load N-MNIST dataset via Tonic.
+    """N-MNIST via Tonic (Denoise + ToFrame transforms).
 
-    Uses ``tonic.datasets.NMNIST`` with Denoise + ToFrame transforms.
-    There is **no synthetic fallback**: raises ``RuntimeError`` if
-    Tonic is not installed or the dataset cannot be loaded.
-
-    Args:
-        data_dir: Root directory for dataset storage. The N-MNIST data
-            will be placed under ``{data_dir}/nmnist/``.
-        num_steps: Number of time bins for spike-to-frame conversion.
-        batch_size: Batch size for DataLoaders.
-
-    Returns:
-        Tuple of (train_loader, test_loader).
-        Data format: (batch, num_steps, 2, 34, 34), labels (batch,).
-
-    Raises:
-        RuntimeError: If Tonic is not installed or dataset loading fails.
+    No synthetic fallback: raises RuntimeError if Tonic is missing or loading
+    fails. Data format: (batch, num_steps, 2, 34, 34), labels (batch,).
     """
     if not _HAS_TONIC:
         raise RuntimeError(
@@ -751,12 +535,7 @@ def load_nmnist(
 
 
 class _ClampedToFrame:
-    """Wrapper around tonic.transforms.ToFrame that clamps event indices.
-
-    SHD dataset sometimes contains events with indices outside sensor_size
-    bounds (e.g., x=934 when sensor_size=(700,1,1)). This wrapper clamps
-    event coordinates before applying ToFrame to avoid IndexError.
-    """
+    """ToFrame wrapper that clamps out-of-bounds SHD event indices (else IndexError)."""
 
     def __init__(self, to_frame, sensor_size):
         self.to_frame = to_frame
@@ -793,25 +572,10 @@ def load_shd(
     num_steps: int = 100,
     batch_size: int = 64,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Load SHD (Spiking Heidelberg Digits) dataset via Tonic.
+    """SHD (Spiking Heidelberg Digits) via Tonic (ToFrame transform).
 
-    Uses ``tonic.datasets.SHD`` with ToFrame transform. There is **no
-    synthetic fallback**: raises ``RuntimeError`` if Tonic/h5py is
-    not installed or the dataset cannot be loaded.
-
-    Args:
-        data_dir: Root directory for dataset storage. The SHD data
-            will be placed under ``{data_dir}/shd/``.
-        num_steps: Number of time bins for spike-to-frame conversion.
-        batch_size: Batch size for DataLoaders.
-
-    Returns:
-        Tuple of (train_loader, test_loader).
-        Data format: (batch, num_steps, 700), labels (batch,).
-
-    Raises:
-        RuntimeError: If Tonic or h5py is not installed, or dataset
-            loading fails.
+    No synthetic fallback: raises RuntimeError if Tonic/h5py is missing or
+    loading fails. Data format: (batch, num_steps, 700), labels (batch,).
     """
     if not _HAS_TONIC:
         raise RuntimeError("SHD dataset not available. Install tonic and h5py (pip install tonic h5py).")
@@ -823,8 +587,7 @@ def load_shd(
         sensor_size=sensor_size,
         n_time_bins=num_steps,
     )
-    # Clamp event indices to sensor_size bounds (SHD has occasional
-    # out-of-bounds events that cause IndexError in ToFrame)
+    # Clamp event indices: SHD has occasional out-of-bounds events.
     transform = _ClampedToFrame(base_transform, sensor_size)
 
     try:
@@ -861,18 +624,11 @@ def load_shd(
 
 
 class FunctionEvalCounter:
-    """Wraps a loss function to count forward pass evaluations.
+    """Wraps a loss function to count forward-pass evaluations.
 
-    Each call to the counter increments count by 1 (counting forward passes,
-    not individual samples). This provides a fair comparison metric across
-    methods: polystep calls the closure once per step (with vmap batching
-    parameter perturbations internally), OpenAI-ES calls once per perturbation,
-    SPSA calls twice per iteration.
-
-    Usage:
-        counter = FunctionEvalCounter(nn.CrossEntropyLoss())
-        loss = counter(model_output, targets)
-        print(f"Forward passes: {counter.count}")
+    One count per call, not per sample, so methods with different batching
+    (polystep's vmapped closure, OpenAI-ES per perturbation, SPSA two per
+    iteration) compare fairly.
     """
 
     def __init__(self, loss_fn):
@@ -892,352 +648,6 @@ class FunctionEvalCounter:
         return self
 
 
-def run_experiment(
-    model_fn,
-    train_loader,
-    test_loader,
-    method="polystep",
-    benchmark="nondiff",
-    seeds=None,
-    device="cuda",
-    epochs=20,
-    method_config=None,
-    results_dir=None,
-    loss_fn=None,
-):
-    """Run experiment across all seeds, saving JSON results.
-
-    Unified runner for all methods. Creates a fresh model per seed via
-    model_fn(), trains with the specified method, evaluates accuracy,
-    tracks wall-clock time and function evaluations, saves JSON results.
-
-    Args:
-        model_fn: Callable returning a fresh nn.Module instance.
-        train_loader: Training DataLoader.
-        test_loader: Test DataLoader.
-        method: One of 'polystep', 'cmaes', 'openai_es', 'spsa', 'adam'.
-        benchmark: Benchmark name for JSON filename.
-        seeds: List of seeds (defaults to SEEDS = [42, 123, 456, 789, 1337]).
-        device: Device string ('cuda' or 'cpu').
-        epochs: Number of training epochs (for polystep and adam).
-        method_config: Dict of method-specific hyperparameters. Defaults
-            provided per method.
-        results_dir: Directory for JSON results (defaults to experiments/results/).
-        loss_fn: Loss function (defaults to CrossEntropyLoss). Pass custom
-            loss for non-standard problems (e.g., MAX-SAT loss).
-
-    Returns:
-        List of result file paths (one per seed).
-    """
-    if seeds is None:
-        seeds = SEEDS
-    if results_dir is None:
-        results_dir = _DEFAULT_RESULTS_DIR
-    if method_config is None:
-        method_config = {}
-
-    result_paths = []
-
-    for seed in seeds:
-        set_seed(seed)
-        model = model_fn()
-        model = model.to(device)
-
-        # Default loss function (fresh per seed unless user provided one)
-        current_loss_fn = loss_fn if loss_fn is not None else nn.CrossEntropyLoss()
-
-        start_time = time.time()
-
-        with track_gpu_memory() as mem:
-            if method == "adam":
-                result = _run_adam(
-                    model,
-                    train_loader,
-                    test_loader,
-                    current_loss_fn,
-                    epochs,
-                    device,
-                    seed,
-                    method_config,
-                )
-            elif method == "openai_es":
-                result = _run_openai_es(
-                    model,
-                    train_loader,
-                    test_loader,
-                    current_loss_fn,
-                    device,
-                    seed,
-                    method_config,
-                )
-            elif method == "spsa":
-                result = _run_spsa(
-                    model,
-                    train_loader,
-                    test_loader,
-                    current_loss_fn,
-                    device,
-                    seed,
-                    method_config,
-                )
-            elif method == "cmaes":
-                result = _run_cmaes(
-                    model,
-                    train_loader,
-                    test_loader,
-                    current_loss_fn,
-                    device,
-                    seed,
-                    method_config,
-                )
-            elif method == "polystep":
-                result = _run_polystep(
-                    model,
-                    train_loader,
-                    test_loader,
-                    current_loss_fn,
-                    epochs,
-                    device,
-                    seed,
-                    method_config,
-                )
-            else:
-                raise ValueError(f"Unknown method: {method}")
-
-        wall_time = time.time() - start_time
-
-        # Extract or compute metrics
-        metrics = result.get("metrics", {})
-        # Override wall_time with our own measurement (includes overhead)
-        metrics["wall_time_seconds"] = wall_time
-        # Fill in GPU memory from our tracker
-        metrics.setdefault("peak_gpu_memory_mb", mem["peak_gpu_memory_mb"])
-
-        filepath = save_result(
-            benchmark=benchmark,
-            method=method,
-            seed=seed,
-            metrics=metrics,
-            hyperparameters=result.get("hyperparameters", method_config),
-            epoch_logs=result.get("epoch_logs", []),
-            results_dir=results_dir,
-        )
-        result_paths.append(filepath)
-
-    return result_paths
-
-
-def _run_adam(model, train_loader, test_loader, loss_fn, epochs, device, seed, config):
-    """Dispatch to SGD baseline with Adam optimizer."""
-    from experiments.baselines.sgd_baseline import train_sgd
-
-    result = train_sgd(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        loss_fn=loss_fn,
-        optimizer_name="adam",
-        lr=config.get("lr", 0.001),
-        weight_decay=config.get("weight_decay", 0.0),
-        epochs=epochs,
-        device=device,
-        seed=seed,
-    )
-    return result
-
-
-def _run_openai_es(model, train_loader, test_loader, loss_fn, device, seed, config):
-    """Dispatch to OpenAI ES baseline."""
-    from experiments.baselines.openai_es import train_openai_es
-
-    result = train_openai_es(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        loss_fn=loss_fn,
-        sigma=config.get("sigma", 0.02),
-        lr=config.get("lr", 0.01),
-        population_size=config.get("population_size", 50),
-        generations=config.get("generations", 200),
-        lr_decay=config.get("lr_decay", False),
-        weight_decay=config.get("weight_decay", 0.0),
-        fitness_shaping=config.get("fitness_shaping", "zscore"),
-        device=device,
-        seed=seed,
-    )
-    return result
-
-
-def _run_spsa(model, train_loader, test_loader, loss_fn, device, seed, config):
-    """Dispatch to SPSA baseline."""
-    from experiments.baselines.spsa import train_spsa
-
-    result = train_spsa(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        loss_fn=loss_fn,
-        a=config.get("a", 0.1),
-        c=config.get("c", 0.1),
-        A=config.get("A", None),
-        alpha=config.get("alpha", 0.602),
-        gamma=config.get("gamma", 0.101),
-        max_iters=config.get("max_iters", 5000),
-        device=device,
-        seed=seed,
-    )
-    return result
-
-
-def _run_cmaes(model, train_loader, test_loader, loss_fn, device, seed, config):
-    """Dispatch to CMA-ES baseline (EvoTorch or pycma)."""
-    try:
-        from polystep.benchmarks.baselines import train_cmaes, has_evotorch
-    except ImportError:
-        raise RuntimeError("CMA-ES requires polystep.benchmarks.baselines. Install evotorch or pycma.")
-
-    if not has_evotorch():
-        raise RuntimeError("CMA-ES requires EvoTorch. Install with: pip install evotorch")
-
-    # Extract full dataset tensors from loaders
-    train_data_list, train_labels_list = [], []
-    for data, labels in train_loader:
-        train_data_list.append(data)
-        train_labels_list.append(labels)
-    train_data = torch.cat(train_data_list).to(device)
-    train_labels = torch.cat(train_labels_list).to(device)
-
-    test_data_list, test_labels_list = [], []
-    for data, labels in test_loader:
-        test_data_list.append(data)
-        test_labels_list.append(labels)
-    test_data = torch.cat(test_data_list).to(device)
-    test_labels = torch.cat(test_labels_list).to(device)
-
-    result = train_cmaes(
-        model=model,
-        train_data=train_data,
-        train_labels=train_labels,
-        test_data=test_data,
-        test_labels=test_labels,
-        generations=config.get("generations", 200),
-        popsize=config.get("popsize", 16),
-        stdev_init=config.get("stdev_init", 0.5),
-        device=device,
-        verbose=False,
-    )
-
-    return {
-        "metrics": {
-            "final_accuracy": result.final_accuracy,
-            "best_accuracy": result.best_accuracy,
-            "wall_time_seconds": 0.0,  # overridden by caller
-            "peak_gpu_memory_mb": 0.0,  # overridden by caller
-            "function_evals": result.function_evals,
-            "total_steps": result.total_steps,
-        },
-        "hyperparameters": config,
-        "epoch_logs": result.epoch_logs,
-    }
-
-
-def _run_polystep(model, train_loader, test_loader, loss_fn, epochs, device, seed, config):
-    """Run polystep PolyStepOptimizer inline training loop."""
-    from polystep.optimizer import PolyStepOptimizer
-    from polystep.cost_nn import NNCostEvaluator
-
-    solver = config.get("solver")
-    # The Sinkhorn accelerators only reach SinkhornSolver, so passing the defaults on a
-    # one-shot solver is inert and the optimizer says so.
-    sinkhorn_opts = (
-        {}
-        if solver not in (None, "sinkhorn")
-        else {
-            "anderson_depth": config.get("anderson_depth", 5),
-            "adaptive_omega": config.get("adaptive_omega", True),
-        }
-    )
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=config.get("compile", False),
-        seed=seed,
-        epsilon=config.get("epsilon", 0.5),
-        step_radius=config.get("step_radius", 2.0),
-        probe_radius=config.get("probe_radius", 1.0),
-        num_probe=config.get("num_probe", 3),
-        sinkhorn_max_iters=config.get("sinkhorn_max_iters", 50),
-        amortize_steps=config.get("amortize_steps", 2),
-        amortize_ema=config.get("amortize_ema", 0.7),
-        biased_rotation=config.get("biased_rotation", True),
-        solver=solver,
-        **sinkhorn_opts,
-    )
-
-    evaluator = NNCostEvaluator(
-        model,
-        loss_fn=loss_fn,
-        compile_vmap=config.get("compile_evaluator", False),
-        compile_forward=config.get("compile_forward", False),
-    )
-    epoch_logs = []
-    best_accuracy = 0.0
-    step_count = 0
-    fwd_pass_count = 0
-
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        epoch_start = time.time()
-
-        for data, targets in train_loader:
-            data, targets = data.to(device), targets.to(device)
-
-            def closure(batched_params, _data=data, _targets=targets):
-                nonlocal fwd_pass_count
-                fwd_pass_count += next(iter(batched_params.values())).shape[0]
-                return evaluator.evaluate(batched_params, _data, _targets)
-
-            optimizer.step(closure)
-
-            with torch.no_grad():
-                output = model(data)
-                loss = loss_fn(output, targets)
-                if hasattr(loss, "item"):
-                    epoch_loss += loss.item()
-                else:
-                    epoch_loss += float(loss)
-            step_count += 1
-
-        test_acc = evaluate_accuracy(model, test_loader, device=device)
-        best_accuracy = max(best_accuracy, test_acc)
-        epoch_time = time.time() - epoch_start
-        avg_loss = epoch_loss / max(len(train_loader), 1)
-
-        epoch_logs.append(
-            {
-                "epoch": epoch + 1,
-                "accuracy": test_acc,
-                "loss": avg_loss,
-                "time": epoch_time,
-            }
-        )
-
-    final_acc = evaluate_accuracy(model, test_loader, device=device)
-    best_accuracy = max(best_accuracy, final_acc)
-
-    return {
-        "metrics": {
-            "final_accuracy": final_acc,
-            "best_accuracy": best_accuracy,
-            "wall_time_seconds": 0.0,  # overridden by caller
-            "peak_gpu_memory_mb": 0.0,  # overridden by caller
-            "function_evals": fwd_pass_count,
-            "total_steps": step_count,
-        },
-        "hyperparameters": config,
-        "epoch_logs": epoch_logs,
-    }
-
-
 __all__ = [
     "SEEDS",
     "save_result",
@@ -1250,13 +660,10 @@ __all__ = [
     "set_seed",
     "BenchmarkResult",
     "MNISTNet",
-    "CIFAR10Net",
     "load_mnist",
     "load_fashion_mnist",
-    "load_cifar10",
     "load_dvs_gesture",
     "load_nmnist",
     "load_shd",
     "FunctionEvalCounter",
-    "run_experiment",
 ]

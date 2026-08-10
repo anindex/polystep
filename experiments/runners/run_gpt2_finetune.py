@@ -1,44 +1,10 @@
 #!/usr/bin/env python
-"""Run GPT-2 124M fine-tuning experiment on SST-2 with polystep.
+"""Fine-tune GPT-2 124M on SST-2 with polystep vs an Adam baseline.
 
-This experiment fine-tunes pretrained GPT-2 small (124M parameters) on SST-2
-binary sentiment classification using polystep's gradient-free optimizer with
-SparseRandomProjection, compared against an Adam baseline.
-
-Key technical components:
-1. Weight mapping from HuggingFace Conv1D-based GPT-2 to custom VmapSafe model
-   (Conv1D transpose + fused QKV split for VmapSafeMultiHeadAttention)
-2. GPT2Small with attention_mask support for padded SST-2 sequences
-3. SST-2 data loading with GPT-2 BPE tokenizer (50257 vocab)
-4. polystep fine-tuning with SparseRandomProjection (128-dim subspace)
-5. Adam baseline fine-tuning (lr=2e-5)
-6. Memory profiling comparing peak VRAM for both methods
-
-The weight loading correctness is verified by forward pass comparison against
-HuggingFace model (must match within 1e-4 tolerance).
-
-Matched tuning (``--head-quant``)
---------------------------------
-Every gradient-free method on the hard-quantized head is tuned the same way and at a
-recorded cost: nine configurations, one seed, one shared reduced evaluation budget,
-selected on the **validation split only**. ``--tune`` runs that sweep and writes the
-picks, the per-method tuning cost and the provenance to
-``experiments/results/tuning/selected_configs.json``; every subsequent run reads it
-back and stamps the provenance into its own result JSON, so a headline number always
-says which sweep chose its hyperparameters. ``--untuned`` reproduces the pre-sweep
-numbers. Adam is gradient-based, has no evaluation budget, and is not swept.
-
-The test split is not merely avoided during a sweep -- it is replaced by
-``fairness.TestSplitTripwire``, which raises if anything reads it.
-
-Usage:
-    python experiments/runners/run_gpt2_finetune.py --methods polystep adam
-    python experiments/runners/run_gpt2_finetune.py --methods polystep --steps 50
-    python experiments/runners/run_gpt2_finetune.py --measure-memory
-    python experiments/runners/run_gpt2_finetune.py --methods adam --seeds 42 123 456
-    python experiments/runners/run_gpt2_finetune.py --head-only --methods polystep adam
-    python experiments/runners/run_gpt2_finetune.py --head-quant --tune --seeds 42
-    python experiments/runners/run_gpt2_finetune.py --head-quant
+Covers full fine-tuning, head-only training, and the hard-quantized head
+comparison. ``--tune`` sweeps hyperparameters on the validation split only;
+during a sweep the test split is a ``fairness.TestSplitTripwire`` that raises
+if anything reads it.
 """
 
 from __future__ import annotations
@@ -51,7 +17,6 @@ import sys
 import time
 from typing import Optional
 
-# Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
@@ -77,24 +42,23 @@ from experiments.runners.fairness import (
 )
 from experiments.runners.nondiff_models import BinaryLinear, QuantizedLinear
 
-# Import VmapSafeMultiHeadAttention for GPT-2 model
 from polystep.layers import VmapSafeMultiHeadAttention
 
 
 BENCHMARK = "gpt2_finetune"
 
 GPT2_FINETUNE_CONFIG = {
-    "vocab_size": 50257,  # BPE vocabulary
-    "max_seq_len": 128,  # Reduced from 1024 for memory efficiency
-    "embed_dim": 768,  # d_model
-    "num_heads": 12,  # 64 per head
-    "num_layers": 12,  # Transformer blocks
-    "ff_dim": 3072,  # 4x expansion
-    "dropout": 0.0,  # Disable for vmap compatibility
-    "num_classes": 2,  # SST-2 binary sentiment classification
+    "vocab_size": 50257,
+    "max_seq_len": 128,
+    "embed_dim": 768,
+    "num_heads": 12,
+    "num_layers": 12,
+    "ff_dim": 3072,
+    "dropout": 0.0,  # 0 for vmap compatibility
+    "num_classes": 2,
 }
 
-PSTORCH_CONFIG = {
+POLYSTEP_CONFIG = {
     "subspace_dim": 128,
     "step_radius": 2.0,
     "probe_radius": 1.0,
@@ -111,14 +75,11 @@ ADAM_CONFIG = {
 
 NUM_STEPS = 100
 BATCH_SIZE = 8
-MAX_TRAIN = 5000  # Limit training samples for feasibility
+MAX_TRAIN = 5000
 MAX_SEQ_LEN = 128
 
-# Head-only fine-tuning configs (train classifier head only, freeze backbone)
-# CosineEpsilon scheduling: broader exploration early -> refinement
-# K=1 optimal (single probe, softmax solver auto-selected)
-# Momentum smooths trajectory on 1538-param landscape
-HEADONLY_PSTORCH_CONFIG = {
+# Head-only configs: freeze the backbone, train the classifier head only.
+HEADONLY_POLYSTEP_CONFIG = {
     "epsilon_init": 5.0,
     "epsilon_target": 0.5,
     "step_radius_init": 2.0,
@@ -126,7 +87,7 @@ HEADONLY_PSTORCH_CONFIG = {
     "probe_radius_init": 2.0,
     "probe_radius_target": 0.5,
     "num_probe": 1,
-    "chunk_size": None,  # Full-space, no chunking needed for 1538 params
+    "chunk_size": None,
     "sinkhorn_max_iters": 50,
     "use_momentum": True,
     "momentum_init": 0.5,
@@ -136,16 +97,12 @@ HEADONLY_ADAM_CONFIG = {
     "lr": 1e-3,
     "epochs": 3,
 }
-HEADONLY_EPOCHS = 50  # polystep epochs (not steps: small param count allows epoch-based training)
+HEADONLY_EPOCHS = 50  # epochs, not steps: 1538 params make epoch training cheap
 HEADONLY_BENCHMARK = "gpt2_headonly"
 
 
 class GPT2TransformerBlock(nn.Module):
-    """Single Transformer block with vmap-safe attention (GPT-2 style).
-
-    Uses VmapSafeMultiHeadAttention for compatibility with polystep's
-    vmap-based evaluation. Pre-norm style (GPT-2).
-    """
+    """Single pre-norm Transformer block using VmapSafeMultiHeadAttention."""
 
     def __init__(
         self,
@@ -158,7 +115,7 @@ class GPT2TransformerBlock(nn.Module):
         self.attention = VmapSafeMultiHeadAttention(embed_dim, num_heads, dropout)
         self.ff = nn.Sequential(
             nn.Linear(embed_dim, ff_dim),
-            nn.GELU(approximate="tanh"),  # GPT-2 uses gelu_new (tanh approximation)
+            nn.GELU(approximate="tanh"),  # GPT-2's gelu_new
             nn.Linear(ff_dim, embed_dim),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
         )
@@ -173,19 +130,15 @@ class GPT2TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         seq_len = x.shape[1]
 
-        # Causal attention mask (GPT-2 is a causal language model)
-        # Upper triangular of -inf prevents attending to future tokens
         causal_mask = torch.triu(
             torch.full((seq_len, seq_len), float("-inf"), device=x.device, dtype=x.dtype),
             diagonal=1,
         )
 
-        # Self-attention with residual (pre-norm)
         normed = self.norm1(x)
         attn_out = self.attention(normed, normed, normed, attn_mask=causal_mask)
         x = x + self.dropout_layer(attn_out)
 
-        # Feed-forward with residual (pre-norm)
         normed = self.norm2(x)
         ff_out = self.ff(normed)
         x = x + ff_out
@@ -194,12 +147,7 @@ class GPT2TransformerBlock(nn.Module):
 
 
 class GPT2Small(nn.Module):
-    """GPT-2 Small model (124M parameters) for classification.
-
-    Architecture: 12 layers, 768 embed_dim, 12 heads, 3072 FF dim, 50257 vocab.
-    Adapted for classification (masked mean pooling + linear head) instead of
-    language modeling. Supports attention_mask for padded sequences.
-    """
+    """GPT-2 Small (124M) with masked mean pooling and a linear classification head."""
 
     def __init__(
         self,
@@ -248,7 +196,6 @@ class GPT2Small(nn.Module):
 
         x = self.layer_norm(x)
 
-        # Masked mean pooling (ignore padding tokens)
         if attention_mask is not None:
             mask = attention_mask.unsqueeze(-1).float()  # [B, S, 1]
             x = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
@@ -260,19 +207,10 @@ class GPT2Small(nn.Module):
 
 
 def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
-    """Load pretrained GPT-2 weights into custom GPT2Small model.
+    """Load pretrained HuggingFace GPT-2 weights into GPT2Small.
 
-    Handles three key transformations:
-    1. Conv1D weight transpose: HF stores [in, out], nn.Linear stores [out, in]
-    2. Fused QKV split: c_attn [768, 2304] -> W_q/W_k/W_v [768, 768] each
-    3. Position embedding truncation: [1024, 768] -> [max_seq_len, 768]
-
-    Args:
-        model: Custom GPT2Small model to load weights into.
-        hf_model_name: HuggingFace model name (default: 'gpt2').
-
-    Returns:
-        dict: The weight mapping used for loading.
+    Handles Conv1D transposes (HF stores [in, out], nn.Linear [out, in]), the
+    fused QKV split, and position-embedding truncation to max_seq_len.
     """
     from transformers import GPT2Model as HF_GPT2
 
@@ -281,11 +219,9 @@ def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
 
     mapping = {}
 
-    # Embeddings
     mapping["token_embedding.weight"] = hf_sd["wte.weight"]  # [50257, 768]
     mapping["position_embedding.weight"] = hf_sd["wpe.weight"][: model.max_seq_len]  # truncate
 
-    # Final LayerNorm
     mapping["layer_norm.weight"] = hf_sd["ln_f.weight"]
     mapping["layer_norm.bias"] = hf_sd["ln_f.bias"]
 
@@ -332,53 +268,6 @@ def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
     gc.collect()
 
     return mapping
-
-
-def verify_forward_pass(custom_model: GPT2Small, hf_model_name: str = "gpt2") -> float:
-    """Verify weight loading by comparing hidden states with HuggingFace model.
-
-    Compares at the layer_norm output (before pooling/classifier) to isolate
-    the transformer stack comparison from classification-specific components.
-
-    Args:
-        custom_model: GPT2Small model with pretrained weights loaded.
-        hf_model_name: HuggingFace model name for reference.
-
-    Returns:
-        float: Maximum absolute difference between hidden states.
-
-    Raises:
-        AssertionError: If max difference exceeds 1e-4.
-    """
-    from transformers import GPT2Model as HF_GPT2
-
-    hf = HF_GPT2.from_pretrained(hf_model_name).eval()
-    custom_model.eval()
-
-    # Test input: "This movie is great" in GPT-2 BPE
-    input_ids = torch.tensor([[1212, 3807, 318, 1049]])
-
-    with torch.no_grad():
-        # HF output: last_hidden_state [1, 4, 768]
-        hf_out = hf(input_ids).last_hidden_state
-
-        # Custom model: extract pre-pooling hidden states
-        seq_len = input_ids.shape[1]
-        positions = torch.arange(seq_len).unsqueeze(0)
-        x = custom_model.token_embedding(input_ids) + custom_model.position_embedding(positions)
-        for layer in custom_model.layers:
-            x = layer(x)
-        custom_out = custom_model.layer_norm(x)  # [1, 4, 768]
-
-    max_diff = (hf_out - custom_out).abs().max().item()
-    print(f"Forward pass verification: max absolute difference = {max_diff:.8f}")
-
-    assert max_diff < 1e-4, f"Forward pass mismatch: max diff = {max_diff}"
-
-    del hf
-    gc.collect()
-
-    return max_diff
 
 
 def get_sst2_gpt2_loaders(
@@ -499,13 +388,13 @@ def run_polystep(
         seed=seed,
         subspace=subspace,
         projection_type="sparse",
-        step_radius=PSTORCH_CONFIG["step_radius"],
-        probe_radius=PSTORCH_CONFIG["probe_radius"],
-        epsilon=PSTORCH_CONFIG["epsilon"],
-        num_probe=PSTORCH_CONFIG["num_probe"],
-        chunk_size=PSTORCH_CONFIG["chunk_size"],
+        step_radius=POLYSTEP_CONFIG["step_radius"],
+        probe_radius=POLYSTEP_CONFIG["probe_radius"],
+        epsilon=POLYSTEP_CONFIG["epsilon"],
+        num_probe=POLYSTEP_CONFIG["num_probe"],
+        chunk_size=POLYSTEP_CONFIG["chunk_size"],
         compile=False,
-        sinkhorn_max_iters=PSTORCH_CONFIG["sinkhorn_max_iters"],
+        sinkhorn_max_iters=POLYSTEP_CONFIG["sinkhorn_max_iters"],
     )
 
     criterion = nn.CrossEntropyLoss()
@@ -620,11 +509,18 @@ def run_polystep(
             "batch_size": BATCH_SIZE,
             "max_seq_len": MAX_SEQ_LEN,
             "max_train": MAX_TRAIN,
-            **PSTORCH_CONFIG,
+            **POLYSTEP_CONFIG,
         },
         epoch_logs=epoch_logs,
         step_logs=step_logs,
         results_dir=results_dir,
+        # SST-2 publishes no test labels, so these four legacy arms select the best
+        # epoch and report it on the SAME split. That is a selection leak however
+        # conservative the arm (all four report negative results), so the run is
+        # stamped and the aggregator refuses to put it in a table. The head-quant
+        # family below has a real train/val/test split and a TestSplitTripwire, and
+        # is the GPT-2 experiment the paper reports.
+        leaked=True,
     )
     print(f"  Saved: {result_path}")
     print(f"  Final accuracy: {final_acc * 100:.1f}%, Best: {best_accuracy * 100:.1f}%")
@@ -739,6 +635,8 @@ def run_adam(
         },
         epoch_logs=epoch_logs,
         results_dir=results_dir,
+        # Selects and reports on the same split; stamped so the aggregator refuses it.
+        leaked=True,
     )
     print(f"  Saved: {result_path}")
     print(f"  Final accuracy: {final_acc * 100:.1f}%, Best: {best_accuracy * 100:.1f}%")
@@ -850,17 +748,21 @@ def run_headonly_polystep(
     assert trainable_params == 1538, f"Expected 1538 trainable params, got {trainable_params}"
 
     # Build CosineEpsilon schedules
-    cfg = HEADONLY_PSTORCH_CONFIG
+    cfg = HEADONLY_POLYSTEP_CONFIG
+    # Keyword, not positional: CosineEpsilon declares `target` before `init`, so the
+    # positional form ran these schedules backwards.
     eps = (
-        CosineEpsilon(cfg["epsilon_init"], cfg["epsilon_target"]) if "epsilon_init" in cfg else cfg.get("epsilon", 2.0)
+        CosineEpsilon(init=cfg["epsilon_init"], target=cfg["epsilon_target"])
+        if "epsilon_init" in cfg
+        else cfg.get("epsilon", 2.0)
     )
     sr = (
-        CosineEpsilon(cfg["step_radius_init"], cfg["step_radius_target"])
+        CosineEpsilon(init=cfg["step_radius_init"], target=cfg["step_radius_target"])
         if "step_radius_init" in cfg
         else cfg.get("step_radius", 1.0)
     )
     pr = (
-        CosineEpsilon(cfg["probe_radius_init"], cfg["probe_radius_target"])
+        CosineEpsilon(init=cfg["probe_radius_init"], target=cfg["probe_radius_target"])
         if "probe_radius_init" in cfg
         else cfg.get("probe_radius", 1.0)
     )
@@ -994,11 +896,13 @@ def run_headonly_polystep(
             "batch_size": BATCH_SIZE,
             "max_seq_len": MAX_SEQ_LEN,
             "max_train": MAX_TRAIN,
-            **HEADONLY_PSTORCH_CONFIG,
+            **HEADONLY_POLYSTEP_CONFIG,
         },
         epoch_logs=epoch_logs,
         step_logs=step_logs,
         results_dir=results_dir,
+        # Selects and reports on the same split; stamped so the aggregator refuses it.
+        leaked=True,
     )
     print(f"  Saved: {result_path}")
     print(f"  Final accuracy: {final_acc * 100:.1f}%, Best: {best_accuracy * 100:.1f}%")
@@ -1133,6 +1037,8 @@ def run_headonly_adam(
         },
         epoch_logs=epoch_logs,
         results_dir=results_dir,
+        # Selects and reports on the same split; stamped so the aggregator refuses it.
+        leaked=True,
     )
     print(f"  Saved: {result_path}")
     print(f"  Final accuracy: {final_acc * 100:.1f}%, Best: {best_accuracy * 100:.1f}%")
@@ -1201,7 +1107,7 @@ HEADQUANT_VARIANTS = {
     "smooth": (lambda: nn.Linear(768, 2), True, True),
 }
 
-HEADQUANT_PSTORCH_CONFIG = {
+HEADQUANT_POLYSTEP_CONFIG = {
     "epsilon_init": 5.0,
     "epsilon_target": 0.5,
     "step_radius_init": 2.0,
@@ -1455,7 +1361,7 @@ def run_headquant(
 
     # One probe scale for everybody, in the same units: PolyStep's probe radius is a
     # norm over all 1,538 coordinates, a baseline's sigma/eps is per-coordinate.
-    probe_scale = HEADQUANT_PSTORCH_CONFIG["probe_radius_target"] / math.sqrt(n_params)
+    probe_scale = HEADQUANT_POLYSTEP_CONFIG["probe_radius_target"] / math.sqrt(n_params)
     base_method = method.partition("_eps")[0]
     point, provenance = _headquant_resolve(variant, base_method, point, selection, untuned)
 
@@ -1500,7 +1406,7 @@ def run_headquant(
             from polystep.optimizer import PolyStepOptimizer
             from torch.func import functional_call, vmap
 
-            cfg = apply_polystep_multipliers(HEADQUANT_PSTORCH_CONFIG, point)
+            cfg = apply_polystep_multipliers(HEADQUANT_POLYSTEP_CONFIG, point)
             est_steps = max(1, int(budget / (1.125 * n_params)))
 
             def sched(key):
@@ -1525,7 +1431,12 @@ def run_headquant(
             evals = steps = 0
             next_probe = probe_every
 
-            while evals < budget:
+            # ponytail: per_step measured from the first step; a full step whose cost
+            # would cross the budget is not started, so PolyStep spends <= budget like
+            # the Objective-capped baselines instead of overshooting by one step.
+            per_step = None
+            while evals < budget and (per_step is None or evals + per_step <= budget):
+                before = evals
                 x, y = next(stream)
 
                 def closure(batched_params, _x=x, _y=y):
@@ -1539,6 +1450,7 @@ def run_headquant(
 
                 optimizer.step(closure)
                 steps += 1
+                per_step = evals - before
                 if evals >= next_probe:
                     next_probe = evals + probe_every
                     record(evals)
@@ -1577,6 +1489,16 @@ def run_headquant(
                     out = super().__call__(X)
                     if self.evals >= getattr(self, "_next", probe_every) and self.best_x is not None:
                         self._next = self.evals + probe_every
+                        # Score the method's own mean iterate as well as its best
+                        # sampled candidate, and let validation selection keep the
+                        # higher one -- the same rule run_baseline.probe applies. A
+                        # sampled candidate sits ~one probe radius from the mean a
+                        # population method actually maintains, so scoring best_x
+                        # alone understates MeZO/EGGROLL.
+                        it = getattr(self, "iterate", None)
+                        if it is not None:
+                            write(it)
+                            record(self.evals)
                         write(self.best_x)
                         record(self.evals)
                     return out
@@ -1593,7 +1515,13 @@ def run_headquant(
             if eps_str:
                 hyper["eps" if base_method == "mezo" else "sigma"] = float(eps_str)
             result = METHODS[base_method](obj, x0=torch.zeros(layout.total_params, device=device), seed=seed, **hyper)
-            if best["sd"] is None and obj.best_x is not None:
+            # Final scoring mirrors the periodic probe: mean iterate and best
+            # candidate both validate, selection keeps the higher.
+            final_it = getattr(obj, "iterate", None)
+            if final_it is not None:
+                write(final_it)
+                record(obj.evals)
+            if obj.best_x is not None:
                 write(obj.best_x)
                 record(obj.evals)
             evals, steps = obj.evals, result.iters
@@ -1693,7 +1621,7 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
     subspace = AdaptiveSubspace.auto_from_params(
         model,
         compression_target=0.001,
-        max_rank=PSTORCH_CONFIG["subspace_dim"],
+        max_rank=POLYSTEP_CONFIG["subspace_dim"],
     )
     object.__setattr__(subspace, "rotation_mode", "random")
 
@@ -1702,13 +1630,13 @@ def measure_memory(device: str = "cuda", batch_size: int = 8, max_seq_len: int =
         seed=42,
         subspace=subspace,
         projection_type="sparse",
-        step_radius=PSTORCH_CONFIG["step_radius"],
-        probe_radius=PSTORCH_CONFIG["probe_radius"],
-        epsilon=PSTORCH_CONFIG["epsilon"],
-        num_probe=PSTORCH_CONFIG["num_probe"],
-        chunk_size=PSTORCH_CONFIG["chunk_size"],
+        step_radius=POLYSTEP_CONFIG["step_radius"],
+        probe_radius=POLYSTEP_CONFIG["probe_radius"],
+        epsilon=POLYSTEP_CONFIG["epsilon"],
+        num_probe=POLYSTEP_CONFIG["num_probe"],
+        chunk_size=POLYSTEP_CONFIG["chunk_size"],
         compile=False,
-        sinkhorn_max_iters=PSTORCH_CONFIG["sinkhorn_max_iters"],
+        sinkhorn_max_iters=POLYSTEP_CONFIG["sinkhorn_max_iters"],
     )
 
     criterion = nn.CrossEntropyLoss()
@@ -1929,7 +1857,7 @@ def _write_headquant_selection(args, trials, budget, seed, methods, variants) ->
             "budget_per_config": budget,
             "headline_budget": args.eval_budget,
             "budget_reduction_factor": HEADQUANT_TUNE_DIVISOR,
-            "probe_scale": HEADQUANT_PSTORCH_CONFIG["probe_radius_target"] / math.sqrt(1538),
+            "probe_scale": HEADQUANT_POLYSTEP_CONFIG["probe_radius_target"] / math.sqrt(1538),
             "batch_size": HEADQUANT_BATCH,
             "methods_requested": wanted,
             "trials_per_method": done,
@@ -2022,8 +1950,8 @@ def main():
     parser.add_argument(
         "--subspace-dim",
         type=int,
-        default=PSTORCH_CONFIG["subspace_dim"],
-        help=f"Subspace dimensionality (default: {PSTORCH_CONFIG['subspace_dim']})",
+        default=POLYSTEP_CONFIG["subspace_dim"],
+        help=f"Subspace dimensionality (default: {POLYSTEP_CONFIG['subspace_dim']})",
     )
     parser.add_argument(
         "--results-dir",

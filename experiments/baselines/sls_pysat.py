@@ -23,10 +23,8 @@ Usage:
     result = run_sls_pysat(instance, wall_clock_seconds=60.0, seed=42)
     print(result["sat_ratio"])
 
-This is *not* wired into ``run_maxsat.py`` by default. We prefer
-explicit opt-in over silent baseline mutation: the existing
-``run_sls`` continues to drive ``run_all_paper.sh`` until a fair
-re-quantification is requested.
+Not wired into ``run_maxsat.py`` by default: opt in explicitly rather than
+mutating a baseline in place.
 """
 
 from __future__ import annotations
@@ -127,36 +125,3 @@ def _count_sat(clauses, assignment, num_vars):
                 sat += 1
                 break
     return sat
-
-
-def aggregate_sls_runs(
-    instance: Dict,
-    seeds: tuple = (42, 123, 456, 789, 1337),
-    wall_clock_seconds: float = 60.0,
-    solver_name: str = "g4",
-) -> Dict:
-    """Run the PySAT baseline across multiple seeds and aggregate.
-
-    A fair MAX-SAT comparison typically wants >= 10 seeds for the SAT
-    solver, but the default 5 here matches the rest of the polystep
-    experiments. Override ``seeds`` to extend.
-    """
-    runs = [
-        run_sls_pysat(
-            instance=instance,
-            wall_clock_seconds=wall_clock_seconds,
-            seed=seed,
-            solver_name=solver_name,
-        )
-        for seed in seeds
-    ]
-    sat_ratios = [r["sat_ratio"] for r in runs]
-    return {
-        "n_seeds": len(seeds),
-        "sat_ratio_mean": sum(sat_ratios) / len(sat_ratios),
-        "sat_ratio_min": min(sat_ratios),
-        "sat_ratio_max": max(sat_ratios),
-        "wall_clock_total_s": sum(r["wall_clock_s"] for r in runs),
-        "solver": solver_name,
-        "runs": runs,
-    }

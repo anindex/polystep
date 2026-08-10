@@ -1,27 +1,9 @@
 #!/usr/bin/env python
-"""Systematic variant sweep for PolyStep.
+"""Sweep PolyStep variants (solver, representation, blocks, schedules, geometry) over a small task suite.
 
-Runs one staged benchmark over the real behavior axes of the optimizer
-(solver, search representation, block strategy, adaptation flags, schedules,
-geometry) on a small task suite, and records enough diagnostics to tell which
-variants help, hurt, or do nothing.
-
-Design constraints (from the review that motivated this runner):
-  - Vehicle is PolyStepOptimizer.step(closure); the ask/tell path skips
-    subspace/CMA/momentum/radius so it cannot exercise the full surface.
-  - solver is always set explicitly (solver=None couples to the subspace).
-  - Configs are ranked by forward-eval budget, not step count, because
-    variants change evals per step.
-  - Every config runs a state-mutation self-check; a variant whose state never
-    changed is flagged dead and excluded from ranking, not silently ranked.
-  - softmax vs sinkhorn are only compared in full space, where the vertex
-    marginal binds; the column-marginal violation is logged as the separator.
-
-A baseline gets the same treatment through ``--baseline``: its own small
-hyperparameter grid (``fairness.TUNING_GRID``), the same env budget per
-configuration, and the tuning cost written to ``tuning_cost.json`` so the paper can
-state "PolyStep was tuned over N configurations x B evaluations, each baseline over
-M x B" instead of comparing a swept method against a hardcoded dict.
+Configs are ranked by forward-eval budget, not step count, and a state-mutation
+self-check flags variants whose state never changed. ``--baseline`` sweeps a
+gradient-free baseline over its own tuning grid at the same budgets.
 
 Run:
     python experiments/runners/variant_sweep.py --dry-run
@@ -57,7 +39,6 @@ from polystep.cost_nn import NNCostEvaluator
 from polystep.epsilon import CosineEpsilon, LinearEpsilon
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.objectives.synthetic import Ackley, Rastrigin, Rosenbrock, Sphere
-from polystep.subspace import LinearSubspace
 from polystep.transform import ParamLayout
 
 from experiments.runners.fairness import TUNING_GRID, make_subspace, run_baseline, tuning_configs, tuning_cost
@@ -116,9 +97,8 @@ class Env:
     max_steps: int = 8000  # step cap so eval-efficient configs stay bounded in wall-clock
     quality_name: str = "quality"
     subspace_ok: bool = True  # whether representation/block axes apply
-    # Subspace used by the baseline and by non-representation axes. None means the
-    # env runs full space (synthetic, sign_net); a subspace factory means the env
-    # needs compression to be practical (mnist).
+    # Subspace for the baseline and non-representation axes; None means the env
+    # runs full space.
     baseline_subspace: Optional[Callable] = None
 
 
@@ -148,9 +128,8 @@ def _synthetic_env(name, obj_cls, dim, x0_val, budget, cond=None):
 
         return model, closure, quality
 
-    # A subspace over a single parameter vector is degenerate, so representation /
-    # block / cma axes are skipped here; these envs carry the solver, schedule,
-    # geometry, and quadratic axes in full space.
+    # A single parameter vector makes subspaces degenerate, so these envs run
+    # full space and skip the representation / block / cma axes.
     return Env(
         name=name,
         kind="synthetic",
@@ -359,10 +338,6 @@ def _hybrid(rank):
     return lambda model, layout: HybridSubspace.from_layout(layout, rank=rank)
 
 
-def _linear(rank):
-    return lambda model, layout: LinearSubspace.from_layout(layout, rank=rank)
-
-
 def _adaptive(model, layout):
     return AdaptiveSubspace.auto_from_params(model, min_rank=8, max_rank=64)
 
@@ -386,7 +361,6 @@ def screen_configs(env: Env):
     cfgs += [
         Config("representation", "hybrid_r8", "softmax", subspace=_hybrid(8), needs_subspace=True),
         Config("representation", "hybrid_r16", "softmax", subspace=_hybrid(16), needs_subspace=True),
-        Config("representation", "linear_r8", "softmax", subspace=_linear(8), needs_subspace=True),
         Config("representation", "adaptive", "softmax", subspace=_adaptive, needs_subspace=True),
         Config("representation", "cma_subspace", "softmax", subspace=_cma, needs_subspace=True),
     ]
@@ -516,20 +490,19 @@ def configs_for(env: Env, stage: str):
     if stage in ("interactions", "all"):
         catalog += interaction_configs(env)
     if stage == "mechanism":
-        # Mechanism isolation reuses the screen axes (solver, representation) on the
-        # dedicated envs (aniso, sphere) so the marginal-violation and C_diag plots
-        # have the full solver / subspace spread.
+        # Mechanism isolation reuses the screen axes on the dedicated envs
+        # (aniso, sphere) so the marginal-violation and C_diag plots get the
+        # full solver / subspace spread.
         catalog += screen_configs(env)
     out = []
     for c in catalog:
         if (c.needs_subspace or c.subspace is not None) and not env.subspace_ok:
             continue
-        # Solver comparison belongs in full space; on envs that need a subspace
-        # baseline (mnist, snn) it is not informative, so run it on the full-space envs.
+        # Solver comparison belongs in full space; on subspace-baseline envs
+        # (mnist, snn) it is not informative.
         if c.axis == "solver" and env.baseline_subspace is not None:
             continue
-        # Full-space configs are impractical on large models (100k+ params); the
-        # subspace-baseline envs cover representation, schedule, radius, cma instead.
+        # Full-space configs are impractical on large models (100k+ params).
         if c.full_space and env.baseline_subspace is not None:
             continue
         out.append(c)
@@ -546,8 +519,8 @@ def configs_for(env: Env, stage: str):
 
 
 def baseline_kwargs(env: Env, seed: int):
-    # Horizon for the cosine anneal, in optimizer steps. Approximate (evals per
-    # step vary a little by config); the schedule just needs to reach target.
+    # Cosine anneal horizon in optimizer steps; approximate (evals per step vary
+    # by config), the schedule just needs to reach target.
     horizon = max(200, env.budget // 64)
     return dict(
         epsilon=CosineEpsilon(init=1.0, target=0.05, decay=0.02, total_steps=horizon),
@@ -722,17 +695,33 @@ def run_one(env: Env, cfg: Config, seed: int, device: str):
     }
 
 
-# Rank the baselines share with PolyStep's representation axis, and the probe radius
+# Baselines share PolyStep's representation-axis rank and the probe radius
 # `baseline_kwargs` gives PolyStep, so the grids are centred on the same scale.
 BASELINE_RANK = 8
 BASELINE_PROBE_SCALE = 1.5
 
 
-def run_baseline_one(env: Env, method: str, hp: dict, name: str, seed: int, device: str):
+def _probe_scale(env, device: str) -> float:
+    """``BASELINE_PROBE_SCALE`` as a per-coordinate scale for this env.
+
+    PolyStep's radius is a displacement norm and a baseline's sigma is
+    per-coordinate, so divide by ``sqrt(dim)``.
+    """
+    model, _, _ = env.build(device)
+    layout = ParamLayout.from_module(model)
+    dim = (
+        make_subspace(layout, rank=BASELINE_RANK, seed=0, method="openai_es").subspace_dim
+        if env.subspace_ok
+        else layout.total_params
+    )
+    return BASELINE_PROBE_SCALE / math.sqrt(dim)
+
+
+def run_baseline_one(env: Env, method: str, hp: dict, name: str, seed: int, device: str, probe_scale: float = None):
     """One baseline configuration on one env, at the env's eval budget.
 
-    Same budget, same subspace and same probe scale as the PolyStep configs above,
-    so the two sweeps are comparable config-for-config.
+    Same budget, subspace, and probe scale as the PolyStep configs, so the two
+    sweeps are comparable config-for-config.
     """
     torch.manual_seed(seed)
     model, closure, quality_fn = env.build(device)
@@ -754,7 +743,7 @@ def run_baseline_one(env: Env, method: str, hp: dict, name: str, seed: int, devi
         subspace=subspace,
         subspace_rank=BASELINE_RANK if subspace is not None else None,
         hp=hp,
-        probe_scale=BASELINE_PROBE_SCALE,
+        probe_scale=probe_scale if probe_scale is not None else _probe_scale(env, device),
         quality_key=env.quality_name,
     )
     key = f"val_{env.quality_name}"
@@ -793,13 +782,14 @@ def sweep_baseline(method: str, envs, seeds, device: str, results_dir: str) -> d
     """Sweep one baseline over ``TUNING_GRID[method]`` and return its tuning cost."""
     per_env = {}
     for env in envs:
-        cfgs = tuning_configs(method, probe_scale=BASELINE_PROBE_SCALE, seed=seeds[0])
+        scale = _probe_scale(env, device)
+        cfgs = tuning_configs(method, probe_scale=scale, seed=seeds[0])
         print(f"[{env.name}] {method}: {len(cfgs)} configs x {len(seeds)} seeds (budget={env.budget} evals)")
         for i, hp in enumerate(cfgs):
             name = "_".join(f"{k}{v:g}" for k, v in sorted(TUNING_GRID[method][i].items()))
             for seed in seeds:
                 try:
-                    rec = run_baseline_one(env, method, hp, name, seed, device)
+                    rec = run_baseline_one(env, method, hp, name, seed, device, probe_scale=scale)
                 except Exception as e:
                     print(f"  ERROR {env.name}/{method}:{name}/seed{seed}: {type(e).__name__}: {e}")
                     continue

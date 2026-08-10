@@ -113,6 +113,7 @@ def train_sgd(
     best_accuracy = 0.0
     best_state = None
     total_samples_seen = 0
+    total_batches_seen = 0
     start_time = time.time()
 
     # Model selection runs on the validation split when there is one, so
@@ -143,6 +144,7 @@ def train_sgd(
                 epoch_correct += (outputs.argmax(dim=1) == targets).sum().item()
                 epoch_total += targets.size(0)
                 total_samples_seen += inputs.size(0)
+                total_batches_seen += 1
 
             if scheduler is not None:
                 scheduler.step()
@@ -177,8 +179,12 @@ def train_sgd(
     if val_loader is None and final_accuracy > best_accuracy:
         best_accuracy = final_accuracy
 
-    # function_evals = total forward passes = total training samples seen
-    function_evals = total_samples_seen
+    # One "evaluation" is one forward pass over a minibatch -- the same unit the
+    # gradient-free methods count, where a candidate is scored on one minibatch.
+    # Counting training *samples* made the budget column read as batch_size times
+    # larger than the comparison it sits next to, so Adam appeared to be handed
+    # several times the budget when it in fact spends far fewer forward passes.
+    function_evals = total_batches_seen
 
     return {
         "benchmark": "unknown",
@@ -197,7 +203,9 @@ def train_sgd(
             "wall_time_seconds": wall_time,
             "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
             "function_evals": function_evals,
-            "total_steps": epochs,
+            # Optimizer steps, not epochs: "steps" is the second axis the paper
+            # reports against, and one epoch is len(train_loader) of them.
+            "total_steps": total_batches_seen,
         },
         "epoch_logs": epoch_logs,
     }

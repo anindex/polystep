@@ -43,8 +43,8 @@ from experiments.runners.nondiff_models import MaxSATModel
 from experiments.runners.run_maxsat import (
     CRA_ALPHA,
     CRA_LAMBDA,
-    PSTORCH_CONFIG,
-    PSTORCH_TURBO_1M,
+    POLYSTEP_CONFIG,
+    POLYSTEP_TURBO_1M,
     evaluate_sat_result,
     make_sat_closure,
 )
@@ -80,10 +80,10 @@ def run_softmax_maxsat(
     # Select config based on scale
     turbo = num_vars >= 1_000_000
     if turbo:
-        config = PSTORCH_TURBO_1M
+        config = POLYSTEP_TURBO_1M
         pdim = config["particle_dim"]
     else:
-        config = PSTORCH_CONFIG
+        config = POLYSTEP_CONFIG
         pdim = 2
 
     # Create optimizer with solver='softmax' explicitly (full-space, not default)
