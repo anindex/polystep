@@ -1,17 +1,8 @@
 """05 - MNIST: train a 2-layer MLP with PolyStep.
 
-Demonstrates the recommended configuration: a ``HybridSubspace`` with
-cosine-scheduled epsilon, step_radius, and probe_radius, driven by an
-explicit per-epoch training loop with best-state tracking. Downloads
-MNIST data directly (no torchvision dependency).
-
-What you should see:
-  ~95% test accuracy after 15 epochs, ~96% with 30 (matches the paper). Much
-  slower on CPU than on a GPU.
-  Best-state tracking restores the peak accuracy across epochs.
-
-Output:
-  Terminal log with per-epoch loss and accuracy.
+Recommended configuration: a ``HybridSubspace`` with cosine-scheduled epsilon,
+step_radius, and probe_radius, plus best-state tracking across epochs. MNIST is
+downloaded directly (no torchvision).
 
 Run:
   python examples/05_mnist.py
@@ -29,9 +20,9 @@ from collections import OrderedDict
 
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
+
+_env.setup()
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -56,11 +47,10 @@ def get_mnist_loaders(data_dir: str = "/tmp/mnist", batch_size: int = 512):
 class MNISTNet(nn.Sequential):
     """Two-layer MLP (101K parameters).
 
-    An ``nn.Sequential`` subclass, not a plain ``nn.Module``: every batched
-    evaluator checks ``type(model).forward is nn.Sequential.forward`` before it will
-    build a plan, so an identical hand-written ``forward`` silently opts the model out
-    of the bmm and subspace-delta paths. The ``OrderedDict`` keeps the ``fc1``/``fc2``
-    state_dict keys.
+    Must be an ``nn.Sequential`` subclass: the batched evaluators check
+    ``type(model).forward is nn.Sequential.forward`` before building a plan,
+    so a hand-written ``forward`` silently opts out of the fast paths. The
+    ``OrderedDict`` keeps the ``fc1``/``fc2`` state_dict keys.
     """
 
     def __init__(self, hidden: int = 128):
@@ -106,15 +96,13 @@ def main():
     model = MNISTNet(hidden=args.hidden).to(device)
     num_params = sum(p.numel() for p in model.parameters())
 
-    # rank=8 gives 16 polytope vertices per step. Cosine schedules run broad exploration
-    # early into fine exploitation late.
+    # rank=8 gives 16 polytope vertices per step.
     total_steps = args.epochs * len(train_loader)
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(layout, rank=8, rotation_interval=0, absorb_interval=0)
 
-    # eps_target 0.5, not 0.1: a plan that concentrates toward argmax takes the full
-    # step_radius, so the effective step grows late even as step_radius anneals. At 0.1
-    # the last epoch diverged on every seed (loss 0.17 -> 0.27..0.49); 0.5 holds it.
+    # eps_target 0.5, not 0.1: a plan concentrated near argmax takes the full
+    # step_radius, so a small target makes the effective step grow late and diverge.
     eps_init, eps_target = 10.0, 0.5
     sr_init, sr_target = 5.0, 1.0
     pr_init, pr_target = 10.0, 2.0
@@ -128,13 +116,10 @@ def main():
         epsilon=CosineEpsilon(init=eps_init, target=eps_target, decay=(eps_init - eps_target) / total_steps),
         step_radius=CosineEpsilon(init=sr_init, target=sr_target, decay=(sr_init - sr_target) / total_steps),
         probe_radius=CosineEpsilon(init=pr_init, target=pr_target, decay=(pr_init - pr_target) / total_steps),
-        # Four momentum steps between OT steps: only every fifth pays for probes, and
-        # a momentum step needs no forward pass at all. Past 5 the trajectory coasts
-        # on a stale direction.
+        # Only every fifth step pays for probes; momentum steps need no forward pass.
         amortize_steps=5,
         amortize_ema=0.7,
-        # Inductor's warm-up costs more than it returns over a run this short, at an
-        # unchanged accuracy. Example 06 runs 2750 steps and does win.
+        # Inductor warm-up costs more than it returns over a run this short.
         compile=False,
     )
 
@@ -147,8 +132,7 @@ def main():
     print(f"  initial test accuracy: {100 * init_acc:.1f}%")
     print()
 
-    # Best-state tracking: the reported number is the peak, not wherever the last
-    # epoch landed. api.train(restore_best=True) does the same thing.
+    # Best-state tracking: report the peak accuracy, not the last epoch's.
     loss_fn = nn.CrossEntropyLoss()
     evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
     best_acc = 0.0

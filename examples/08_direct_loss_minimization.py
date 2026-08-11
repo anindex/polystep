@@ -1,21 +1,11 @@
 """Direct loss minimization: optimize the true task metric, no surrogate.
 
-Many task metrics (F1, exact-match, edit distance) are non-decomposable and
-piecewise-constant in the model parameters, so they carry no useful gradient.
-The usual workaround trains a differentiable surrogate (cross-entropy), but the
-surrogate optimum is not the metric optimum, so it leaves regret (Hazan,
-Keshet, McAllester, NeurIPS 2010; Song, Schwing, Zemel, Urtasun, ICML 2016).
-
-Here a small sign-activation net is optimized directly for F1 on a class-imbalanced
-XOR checkerboard. The parameter count is small, so no subspace is used and the
-comparison is fair: same parameters, same evaluation budget, averaged over seeds.
-
-  Adam+STE on cross-entropy: the sign net has no true gradient, so Adam uses a
-    straight-through estimator whose forward/backward mismatch is biased, and it
-    optimizes cross-entropy rather than F1 (surrogate on both counts).
-  OpenAI-ES on F1: the fragmented boundary makes F1 piecewise-constant with wide
-    plateaus, so the isotropic-noise gradient estimate averages to no signal.
-  PolyStepES on F1: the soft-argmin over directed probes descends the true metric.
+Non-decomposable metrics like F1 are piecewise-constant in the parameters, so
+the usual differentiable surrogate leaves regret (Hazan, Keshet, McAllester,
+NeurIPS 2010; Song, Schwing, Zemel, Urtasun, ICML 2016). Here a small
+sign-activation net is optimized directly for F1 on a class-imbalanced XOR
+checkerboard, compared against Adam+STE on cross-entropy and OpenAI-ES on F1,
+all on the same evaluation budget averaged over seeds.
 
 Run:
     MPLBACKEND=Agg python examples/08_direct_loss_minimization.py
@@ -27,9 +17,9 @@ import os
 import sys
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
+
+_env.setup()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -43,11 +33,7 @@ SEEDS = 5
 
 
 def make_checkerboard_imbalanced(n=600, k=3, pos_frac=0.25, noise=0.05, seed=0):
-    """k x k XOR grid with the positive class subsampled to a minority.
-
-    The fragmented boundary makes F1 piecewise-constant with wide plateaus; the
-    imbalance makes the cross-entropy 0-threshold F1-suboptimal.
-    """
+    """k x k XOR grid with the positive class subsampled to a minority."""
     g = torch.Generator().manual_seed(seed)
     X = torch.rand(n, 2, generator=g) * k
     lab = (X[:, 0].floor().long() + X[:, 1].floor().long()) % 2

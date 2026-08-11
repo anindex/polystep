@@ -1,45 +1,18 @@
 """10 - LeNet-5 on MNIST: a classical CNN trained with forward passes only.
 
 LeCun et al. 1998, in the usual modern form (ReLU and max-pool in place of the
-original tanh and average-pool): two convolutions, two hidden fully-connected layers,
-61,706 parameters. No gradients are computed anywhere.
+original tanh and average-pool): two convolutions, two hidden fully-connected
+layers, 61,706 parameters. No gradients are computed anywhere.
 
-Every fast path before ``SiteVmapEvaluator`` needed an ``nn.Sequential`` of ``Linear``
-and elementwise layers, so a convolution fell back to building one full weight set per
-candidate. This example is the counter-case: a plain ``nn.Module`` with convolutions
-and a hand-written ``forward``.
+A plain ``nn.Module`` with convolutions and a hand-written ``forward`` runs on
+the site-aware path: a candidate perturbs one contiguous coordinate run, so
+``SiteVmapEvaluator`` batches only the one parameter tensor that differs and
+runs the layers ahead of it once per step instead of once per candidate.
+Chunks break at parameter boundaries so a chunk can name a single site.
 
-Three insights carry it. The first two are automatic once the evaluator is
-registered:
-
-  1. A candidate perturbs one contiguous coordinate run, so it differs from the base
-     inside a single parameter tensor. ``SiteVmapEvaluator`` batches only that tensor
-     and passes the rest once, so the layers ahead of it run once rather than per
-     candidate. It asks nothing of the module set beyond being traceable by
-     ``torch.func``.
-  2. Chunks break at parameter boundaries. Sized purely by memory a chunk spans
-     several parameters, resolves to no site, and falls back.
-
-``register_evaluator`` turns both on. Without it the step reaches the model only
-through ``closure()`` and has no choice but to materialize.
-
-  3. A smaller rank and more amortization are both cheaper and, here, better. rank=4
-     halves the coordinates, and ``amortize_steps=5`` means only every fifth step pays
-     for probes. Not "smaller is always better": rank=2 or amortize_steps=8 swings
-     tens of points between seeds, and on the MLP of example 05 rank=4 costs accuracy.
-
-``compile_evaluator`` and ``candidate_autocast`` are the wrong levers for this model.
-Both target the vmap path, and this net runs on the site-aware path, where
-``compile_evaluator`` shrinks the auto chunk for headroom it never uses. Both are
-slower here.
-
-Only the probe radius is scheduled, cosine from 10 to 2, sized from ``--epochs``.
-Epsilon and the step radius stay flat. Step count matters more than any radius: halving
-the batch doubles the steps per epoch and is worth several points.
-
-What you should see (defaults: 20k images, batch 256, 40 epochs):
-  93-95% by epoch 40. A zeroth-order test curve moves several points between epochs
-  and a couple across seeds, so the best checkpoint is kept.
+Only the probe radius is scheduled, cosine from 10 to 2, sized from
+``--epochs``; epsilon and step radius stay flat. A zeroth-order test curve
+moves several points between epochs, so the best checkpoint is kept.
 
 Run:
   python examples/10_cnn_mnist.py --epochs 10
@@ -56,9 +29,9 @@ import time
 
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
+
+_env.setup()
 import torch.nn as nn  # noqa: E402
 
 from polystep import PolyStepOptimizer  # noqa: E402
@@ -74,8 +47,7 @@ from _mnist_data import get_mnist_tensors  # noqa: E402
 class LeNet5(nn.Module):
     """LeCun et al. 1998, with ReLU and max-pool. 61,706 parameters.
 
-    A plain ``nn.Module`` with its own ``forward``, which is what
-    the Sequential-only fast paths decline, and what the site-aware path handles.
+    A plain ``nn.Module`` with its own ``forward``, handled by the site-aware path.
     """
 
     def __init__(self):
@@ -97,15 +69,12 @@ class LeNet5(nn.Module):
 def build_optimizer(model: nn.Module, total_steps: int, seed: int) -> PolyStepOptimizer:
     """A per-layer subspace, flat epsilon and step radius, one annealed probe radius.
 
-    A per-layer subspace is also what makes the site argument hold on coordinates:
-    each layer owns a coordinate block, so a candidate's run lands inside one block and
-    moves one parameter. A single global projection would mix every layer into every
-    coordinate, leaving no site to resolve and no shared prefix to reuse.
+    Per-layer is required for the site argument: each layer owns a coordinate block,
+    so a candidate's run lands inside one block and moves one parameter. A global
+    projection would mix every layer into every coordinate, leaving no site to resolve.
     """
-    # rank=4, not 8. Halves the coordinates and so the candidates per step, and scores
-    # better here: the conv descent direction is low-rank, so the smaller perturbation
-    # carries less variance per evaluation. Not free everywhere; on the MLP of
-    # example 05 the same cut costs accuracy.
+    # rank=4, not 8: halves the coordinates and the candidates per step; the conv
+    # descent direction is low-rank, so the smaller perturbation carries less variance.
     subspace = HybridSubspace.from_layout(
         ParamLayout.from_module(model), rank=4, rotation_interval=0, absorb_interval=0
     )
@@ -115,14 +84,12 @@ def build_optimizer(model: nn.Module, total_steps: int, seed: int) -> PolyStepOp
         subspace=subspace,
         solver="softmax",
         num_probe=1,
-        # Annealing epsilon collapses the run to chance mid-training, so it stays flat.
-        # step_radius is a schedule only because epsilon multiplies float radii and not
-        # scheduled ones: a bare 5.0 would step at 50.
+        # Epsilon stays flat; step_radius is a schedule only because epsilon
+        # multiplies float radii and not scheduled ones: a bare 5.0 would step at 50.
         epsilon=10.0,
         step_radius=LinearEpsilon(init=5.0, target=5.0, decay=0.0),
         probe_radius=CosineEpsilon(init=10.0, target=2.0, total_steps=total_steps),
         # Four momentum steps between OT steps, so only every fifth pays for probes.
-        # Cliff just past this: amortize_steps=8 or rank=2 swing wildly between seeds.
         amortize_steps=5,
         amortize_ema=0.7,
     )
@@ -135,8 +102,7 @@ def run_epoch(optimizer, evaluator, x, y, batch_size, register=True):
         idx = order[start : start + batch_size]
         xb, yb = x[idx], y[idx]
         if register:
-            # Hands the step the model and this batch, so candidates are scored
-            # directly instead of through the closure.
+            # Register so candidates are scored directly, not through the closure.
             optimizer.register_evaluator(evaluator, xb, yb)
         total += optimizer.step(lambda params, _x=xb, _y=yb: evaluator.evaluate(params, _x, _y))
         batches += 1

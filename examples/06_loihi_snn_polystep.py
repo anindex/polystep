@@ -1,48 +1,10 @@
 """06 - PolyStep on Loihi 2 (skeleton): MNIST SNN + on-chip readout adaptation.
 
-A two-stage demonstration that PolyStep can train a spiking network and
-adapt the deployed model on device under input distribution shift, using
-only the writable subset a real Loihi 2 chip exposes at runtime, without
-backpropagation, surrogate gradients, or BPTT.
-
-Stage 1, Off-chip pretrain on clean MNIST. Full-model PolyStep with
-    the paper's SNN configuration from
-    ``experiments/runners/run_elevation.py`` ``PSTORCH_CONFIGS["snn"]``
-    (flat schedules; ``CosineEpsilon`` on eps / sr / pr collapses SNN
-    accuracy in the paper sweeps). Stands in for a SLAYER + ``netx``
-    deploy.
-
-Stage 2, On-chip readout adaptation under input shift. Hidden layer is
-    frozen; only the writable subset is adapted, ``fc2`` weights and
-    the per-population learnable LIF ``vth`` / ``beta`` (the chip's
-    runtime-mutable microcode neuron ``Var``s). Three TENT-style
-    safeguards (Wang et al., ICLR 2021) keep Stage 2 from drifting:
-
-      1. Mixed-batch shift (``--mixed-shift``, default on): each adapt
-         batch is ``[clean ; shifted]`` so the writable subset is
-         pulled toward both manifolds and clean accuracy does not drift.
-      2. Higher rank on the tiny writable subspace (``--adapt-rank 8``).
-      3. Two probes per step (``--adapt-num-probe 2``) for variance
-         reduction on the noisier shifted landscape.
-
-Both stages use best-test early stopping (patience 4: higher than
-typical SGD because zeroth-order test curves are noisier per epoch).
-The weights at the end of each stage are the checkpoint with the
-highest test accuracy on that stage's target distribution (clean for
-Stage 1, shifted for Stage 2). The frozen-readout baseline reloads
-the Stage 1 best weights, and the shifted test set uses a fixed,
-seeded noise mask across pre / post / baseline evaluations, so the
-reported recovery is a paired comparison free of sampling jitter.
-
-Backends. ``--backend cpu_sim`` (default) uses PyTorch as the forward
-evaluator. The host loop is identical to the on-chip loop: only
-``LoihiSpikeEvaluator.evaluate`` would change for ``--backend loihi2``.
-
-What you should see at the defaults:
-Stage 1 reaches ~74% clean test accuracy, which drops to ~50% under the
-shift; Stage 2 recovers it to ~61% while holding clean accuracy, a paired
-shift-recovery of about +12 pp over the frozen readout. CUDA reductions
-are non-deterministic, so expect a couple of points of run-to-run spread.
+Stage 1 pretrains a rate-coded SNN on clean MNIST with the paper's SNN
+config; Stage 2 freezes the hidden layer and adapts only the chip-writable
+subset (``fc2`` plus per-population LIF ``vth``/``beta``) under Gaussian
+input shift, with no backpropagation. The default ``cpu_sim`` backend runs
+the same host loop the on-chip path would.
 
 Run::
 
@@ -55,19 +17,16 @@ Run::
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import time
 from pathlib import Path
 
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
+
+_env.setup()
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polystep import PolyStepOptimizer  # noqa: E402
 from polystep.benchmarks.utils import get_mnist_loaders  # noqa: E402
@@ -98,21 +57,11 @@ def select_backend(requested: str) -> str:
 
 
 class LearnableLIF(nn.Module):
-    """Leaky integrate-and-fire with learnable threshold and decay.
+    """Leaky integrate-and-fire with learnable threshold and decay (subtractive reset).
 
-    Dynamics (snnTorch / Loihi convention, subtractive reset)::
-
-        mem[t] = beta * mem[t-1] + I[t]
-        spk[t] = (mem[t] >= vth)        # hard Heaviside, derivative = 0
-        mem[t] = mem[t] - spk[t] * vth  # subtract on spike
-
-    ``beta`` is parameterized through a sigmoid so it stays in (0, 1)
-    under unconstrained PolyStep updates. ``vth`` is parameterized
-    directly. Both are scalars: vmap stacks them along dim 0 with no
-    special handling.
-
-    On a real Loihi 2 these would be the per-population ``vth`` and
-    ``du``/``dv`` µcode neuron Vars writable from the host between runs.
+    ``beta`` goes through a sigmoid so it stays in (0, 1) under
+    unconstrained PolyStep updates. On a real Loihi 2 these map to the
+    writable per-population ``vth`` and ``du``/``dv`` neuron Vars.
     """
 
     def __init__(self, beta: float = 0.95, vth: float = 1.0):
@@ -134,12 +83,10 @@ class LearnableLIF(nn.Module):
 
 
 class MnistSpikingNet(nn.Module):
-    """Two-layer rate-coded SNN for MNIST.
+    """Two-layer rate-coded SNN for MNIST (Linear -> LIF -> Linear -> LIF).
 
-    Architecture mirrors snnTorch tutorial 5 (Linear -> Leaky ->
-    Linear -> Leaky) and the paper's ``SpikingMNISTNet``, scaled down
-    for CPU-friendliness. Returns *summed spike counts* over time
-    (rate code) so cross-entropy has a usable signal range.
+    Returns summed spike counts over time (rate code) so cross-entropy
+    has a usable signal range.
     """
 
     def __init__(self, hidden: int = 64, num_steps: int = 10, beta: float = 0.95):
@@ -179,29 +126,9 @@ class CpuSimEvaluator:
 class LoihiSpikeEvaluator:
     """Loihi 2 forward evaluator (Lava ``netx`` deployment), Stage 2.
 
-    Implementation sketch (real version requires ``lava`` + a SLAYER-
-    trained HDF5 net description; not run by default in this example)::
-
-        from lava.lib.dl.netx import hdf5
-        from lava.magma.core.run_conditions import RunSteps
-        from lava.magma.core.run_configs import Loihi2SimCfg  # or Loihi2HwCfg
-
-        net = hdf5.Network(net_config="snn_mnist.net")
-
-        for k in range(V):
-            # 1. Write vertex-k parameters into chip Vars (readout
-            #    weights, vth, du, dv). On Kapoho Point this is
-            #    parallelised: vertex k -> chip k.
-            for key, tensor in stacked_params.items():
-                _write_var(net, key, tensor[k])
-            # 2. Run for K timesteps, read spike counts, compute loss.
-            net.run(condition=RunSteps(num_steps=K),
-                    run_cfg=Loihi2SimCfg())
-            losses[k] = loss_fn(_read_spikes(net), targets)
-            net.stop()
-
-    The make-or-break number is host<->chip round-trip per vertex
-    upload.
+    Sketch only: write each vertex's parameters into chip Vars, run K
+    timesteps, read spike counts, compute the loss. Requires ``lava``
+    plus a SLAYER-trained HDF5 net description; not run by default.
     """
 
     def __init__(self, hdf5_path: str, loss_fn: nn.Module):
@@ -214,14 +141,11 @@ class LoihiSpikeEvaluator:
 
 
 def freeze_to_writable_subset(model: MnistSpikingNet) -> int:
-    """Freeze ``fc1``; keep the *writable* subset (readout + LIF Vars).
+    """Freeze ``fc1``; keep the Loihi 2 runtime-writable subset trainable.
 
-    Mirrors what a real Loihi 2 chip exposes at runtime without
-    recompilation: readout weights ``fc2``, per-population thresholds
-    ``lif{1,2}.vth``, and membrane decays ``lif{1,2}.beta_logit``.
-    PolyStep's ``ParamLayout.from_module`` honours ``requires_grad``
-    (see ``src/polystep/transform.py``), so frozen tensors are excluded
-    from the OT particle automatically.
+    Leaves ``fc2`` plus per-population ``lif{1,2}.vth`` / ``beta_logit``
+    trainable. ``ParamLayout.from_module`` honours ``requires_grad``, so
+    frozen tensors stay out of the OT particle.
     """
     for p in model.parameters():
         p.requires_grad_(False)
@@ -242,10 +166,8 @@ def make_pretrain_optimizer(
 ) -> PolyStepOptimizer:
     """Stage 1 optimizer (off-chip pretrain): paper SNN config from ``run_elevation.py``.
 
-    Mirrors ``PSTORCH_CONFIGS["snn"]`` exactly. Key insight from the
-    paper sweeps (see ``experiments/runners/run_elevation.py``):
-    *flat* epsilon / step_radius / probe_radius, ``CosineEpsilon``
-    scheduling on any of them collapses SNN accuracy to 10-47%.
+    Flat epsilon / step_radius / probe_radius: ``CosineEpsilon``
+    scheduling on any of them collapses SNN accuracy.
     """
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
@@ -281,19 +203,10 @@ def make_adapt_optimizer(
     step_radius: float = 1.5,
     probe_radius: float = 0.75,
 ) -> PolyStepOptimizer:
-    """Stage 2 optimizer (on-chip readout adaptation): small writable subset, low-rank, all flat.
+    """Stage 2 optimizer (on-chip readout adaptation): small writable subset, low-rank, flat schedules.
 
-    Defaults are tuned for on-chip adaptation under input shift:
-    - ``rank=8`` (the writable subset is tiny ~1.3 % of params, so a
-      richer subspace costs nothing and improves recovery).
-    - ``num_probe=2`` (better gradient estimate on the noisier shifted
-      landscape; doubles probe-cost only on the *short* adapt phase).
-    - ``step_radius=1.5`` / ``probe_radius=0.75`` (slightly larger than
-      paper SNN defaults; the writable subset is well-conditioned and
-      benefits from larger moves under shift).
-
-    All scheduling stays *flat*: the paper-sweep finding that
-    ``CosineEpsilon`` collapses SNN training applies here too.
+    The writable subset is tiny (~1.3% of params), so a richer subspace
+    (``rank=8``) and an extra probe cost little and improve recovery.
     """
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
@@ -323,10 +236,8 @@ def make_adapt_optimizer(
 def evaluate(model: nn.Module, loader, device: torch.device, *, shift_sigma: float = 0.0, noise_seed: int = 0) -> float:
     """Test-set accuracy.
 
-    When ``shift_sigma > 0`` the same per-batch noise mask is used
-    across calls with the same ``noise_seed``: so pre/post/baseline
-    shifted-accuracy comparisons are paired, not contaminated by
-    independent ~N(0,sigma^2) draws.
+    With ``shift_sigma > 0`` the noise mask is fixed by ``noise_seed``,
+    so pre/post/baseline shifted accuracies are paired comparisons.
     """
     correct = total = 0
     model.eval()
@@ -361,15 +272,8 @@ def train_loop(
     """Per-batch PolyStep updates with best-test early stopping.
 
     ``mixed_shift=True`` concatenates each batch with a shifted copy of
-    itself (half clean, half ``+ N(0, sigma^2)``), the standard
-    online-adaptation safeguard against forgetting the in-distribution
-    manifold while recovering on the shifted one. It matters for
-    continuous on-chip adaptation, where the deployed model has to keep
-    performing when the shift weakens or vanishes.
-
-    Returns ``(best_acc, best_state_dict)``. The model's parameters are
-    restored to ``best_state_dict`` before return, so the caller never
-    sees a worse-than-best checkpoint.
+    itself so adaptation does not forget the clean manifold. Restores
+    the best-seen parameters before return.
     """
     step = 0
     t0 = time.time()
@@ -391,10 +295,8 @@ def train_loop(
             def closure(stacked_params, _x=x, _y=y):
                 return evaluator.evaluate(stacked_params, _x, _y)
 
-            # No register_evaluator: the site-aware path batches one
-            # parameter and shares the rest, but this net's forward is a loop over
-            # timesteps, so vmapping it per site costs more than the materializing path
-            # it replaces.
+            # No register_evaluator: vmapping this net's timestep loop
+            # per site costs more than the materializing path.
             optimizer.step(closure)
             last_x, last_y = x, y
             step += 1
@@ -439,9 +341,9 @@ def train_loop(
 
 
 # Color palette: colorblind-safe (Wong 2011)
-_COLOR_CLEAN = "#0072B2"  # blue  : in-distribution
-_COLOR_BASELINE = "#D55E00"  # orange: shifted, no adaptation (failure)
-_COLOR_RECOVERED = "#009E73"  # green : shifted, after adaptation (success)
+_COLOR_CLEAN = "#0072B2"
+_COLOR_BASELINE = "#D55E00"
+_COLOR_RECOVERED = "#009E73"
 _COLOR_SHIFT_ACCENT = "#D55E00"
 
 
@@ -459,13 +361,7 @@ def _save_visualization(
     n_total: int,
     out_path: Path,
 ) -> None:
-    """Publication-grade two-panel figure summarising the demo.
-
-    Panel (a): clean vs. shifted MNIST inputs, side-by-side, with the
-    shifted row visually flagged (orange frame + bracket).
-    Panel (b): grouped bar chart per phase, with a curved arrow
-    annotating the shift-recovery in percentage points.
-    """
+    """Two-panel figure: clean vs. shifted inputs, plus per-phase accuracy bars with the recovery annotated."""
     try:
         import matplotlib
 
@@ -598,7 +494,6 @@ def _save_visualization(
         linewidth=1.0,
     )
 
-    # Bar value labels
     for b, v in zip(list(bars_clean) + list(bars_shift), clean_vals + shift_vals):
         ax_bar.text(
             b.get_x() + b.get_width() / 2,
@@ -610,7 +505,6 @@ def _save_visualization(
             color="#222",
         )
 
-    # X axis: group labels
     ax_bar.set_xticks(group_centers)
     ax_bar.set_xticklabels(
         ["Stage 1\noff-chip pretrain", "Stage 2\non-chip adaptation"],
@@ -623,8 +517,7 @@ def _save_visualization(
     ax_bar.grid(axis="y", linestyle=":", color="#ccc", alpha=0.7, zorder=0)
     ax_bar.set_axisbelow(True)
 
-    # Recovery annotation: curved arrow between the two shifted bars.
-    # Anchor well above bar value labels to avoid overlap.
+    # Curved arrow between the two shifted bars, anchored above the value labels.
     recovery = (post_shift - base_shift) * 100
     x_from = group_centers[0] + bar_offset
     x_to = group_centers[1] + bar_offset
@@ -655,8 +548,7 @@ def _save_visualization(
         fontweight="bold",
     )
 
-    # Custom legend (clean / shifted-failed / shifted-recovered) - placed
-    # horizontally above the bar axis so it never overlaps the data.
+    # Legend below the bar axis so it never overlaps the data.
     legend_handles = [
         mpatches.Patch(color=_COLOR_CLEAN, label="Clean test"),
         mpatches.Patch(color=_COLOR_BASELINE, label=f"Shifted (σ={shift_sigma}), no adaptation"),
@@ -773,10 +665,8 @@ def main():
     print(f"  total params: {n_total:,}")
     print()
 
-    # Stash a small batch for the end-of-run visualization. Done AFTER
-    # model init so the global RNG state used to seed model weights is
-    # the canonical seed-only state (otherwise reading the test_loader
-    # iterator would advance it and change the trained model).
+    # Grab the visualization batch AFTER model init: reading the loader
+    # earlier would advance the global RNG and change the seeded weights.
     _vis_batch = next(iter(test_loader))
     _vis_x_clean = _vis_batch[0][:5].to(device)
     _vis_y = _vis_batch[1][:5].to(device)
@@ -792,7 +682,6 @@ def main():
     init_clean = evaluate(model, test_loader, device)
     print(f"  init test acc (clean): {100 * init_clean:.1f}%")
 
-    # Stage 1: off-chip pretrain (clean MNIST)
     print()
     print("Stage 1: off-chip PolyStep pretrain (paper SNN config)")
     print("-" * 70)
@@ -813,8 +702,8 @@ def main():
         patience=args.patience,
         noise_seed=args.seed,
     )
-    # Best Stage 1 weights are now loaded; sample their shifted accuracy
-    # for context (and for the paired baseline comparison below).
+    # Best Stage 1 weights are loaded; measure their shifted accuracy
+    # (paired with the frozen-readout baseline below).
     pre_shift = evaluate(
         model,
         test_loader,
@@ -827,7 +716,6 @@ def main():
     # Snapshot the Stage 1 best for the frozen-readout baseline.
     pretrained_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-    # Stage 2: 'on-chip' readout + LIF Var adaptation
     print()
     print(f"Stage 2: 'on-chip' readout + LIF Var adaptation (shift sigma={args.shift_sigma})")
     print("-" * 70)
@@ -866,7 +754,7 @@ def main():
         patience=args.patience,
         noise_seed=args.seed,
     )
-    # Best Stage 2 weights are now loaded; sample clean accuracy on it.
+    # Best Stage 2 weights are loaded; measure clean accuracy.
     post_clean = evaluate(
         model,
         test_loader,
@@ -875,8 +763,7 @@ def main():
         noise_seed=args.seed,
     )
 
-    # Reload Stage 1 best to evaluate the frozen-readout baseline
-    # against the SAME shift noise mask as post_shift: paired.
+    # Frozen-readout baseline: same noise mask as post_shift, so paired.
     model.load_state_dict(pretrained_state)
     base_shift = evaluate(
         model,

@@ -1,59 +1,69 @@
 """04 - MAX-SAT at scale: 10,000 variables.
 
-Random 3-SAT at the phase-transition density (clause / variable ratio
-4.27) solved by direct gradient-free optimization on the variable
-assignment vector. The integer rounding step is treated as a black box
-and the piecewise-constant SAT objective is optimized without
-surrogate gradients.
+Random 3-SAT at the phase-transition density (clause/variable ratio 4.27),
+optimized gradient-free on the assignment vector; the integer rounding step
+is treated as a black box. Hyperparameters are sqrt-scaled from the 100K row
+of experiments/runners/run_maxsat.py.
 
-The main scaling result from the paper, reduced to a single
-runnable script. The hyperparameters mirror the 10K row of
-``experiments/runners/run_maxsat.py`` (sqrt-scaled from a 100K reference).
-
-Hardware:
-  Default: 10,000 variables, ~42,700 clauses. Best on a CUDA GPU with
-  >=4 GB free.
-  ``--small``: 2,000 variables, ~8,500 clauses. Runs on CPU.
-
-What you should see:
-  SAT ratio climbs from ~0.86 (random assignment) past 0.98 within
-  ~700 steps and continues to creep upward. The default 1500-step
-  budget gives comfortable margin above the 98%% threshold across
-  seeds. Phase-transition 3-SAT is intrinsically hard; domain solvers
-  like probSAT reach ~0.996.
-
-Output:
-  examples/figures/maxsat_10k.png
+Default: 10,000 variables (GPU recommended). ``--small``: 2,000 variables,
+CPU-friendly.
 
 Run:
-  python examples/04_maxsat_10k.py             # 10K vars, GPU recommended
-  python examples/04_maxsat_10k.py --small     # 2K vars, CPU-friendly
+  python examples/04_maxsat_10k.py
+  python examples/04_maxsat_10k.py --small
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import random
 import importlib.util
 import os
-import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT))  # so experiments/runners/* is importable
+_env.setup()
 
 from polystep import PolyStepOptimizer  # noqa: E402
 from polystep.epsilon import CosineEpsilon  # noqa: E402
-from experiments.runners.nondiff_data import generate_maxsat_instance  # noqa: E402
-from experiments.runners.nondiff_models import MaxSATModel  # noqa: E402
+
+
+def generate_maxsat_instance(num_vars, k=3, ratio=4.27, seed=42):
+    """A random k-SAT instance at the critical clause-to-variable ratio."""
+    rng = random.Random(seed)
+    num_clauses = int(num_vars * ratio)
+    clause_vars, clause_signs = [], []
+    for _ in range(num_clauses):
+        chosen = rng.sample(range(num_vars), k)
+        clause_vars.append(chosen)
+        clause_signs.append([1.0 if rng.random() < 0.5 else 0.0 for _ in chosen])
+    return {
+        "clause_vars": torch.tensor(clause_vars, dtype=torch.long),
+        "clause_signs": torch.tensor(clause_signs, dtype=torch.float),
+        "num_vars": num_vars,
+        "num_clauses": num_clauses,
+    }
+
+
+class MaxSATModel(nn.Module):
+    """Continuous relaxation of a MAX-SAT assignment, hardened by round()."""
+
+    def __init__(self, num_vars: int):
+        super().__init__()
+        self.assignments = nn.Parameter(torch.randn(num_vars) * 0.1)
+
+    def forward(self, clause_vars: torch.Tensor, clause_signs: torch.Tensor) -> torch.Tensor:
+        hard = torch.round(torch.sigmoid(self.assignments))  # non-differentiable
+        gathered = hard[clause_vars]
+        literals = gathered * clause_signs + (1.0 - clause_signs) * (1.0 - gathered)
+        satisfied = (literals > 0.5).any(dim=-1).float()
+        return 1.0 - satisfied.mean()
 
 
 # Hyperparameter reference: sqrt-scaled from the 100K row of run_maxsat.py.
@@ -77,10 +87,8 @@ def scaled_radii(num_vars: int):
 def satisfied_clauses(assignments: torch.Tensor, clause_vars: torch.Tensor, clause_signs: torch.Tensor):
     """Which clauses each assignment satisfies, shape ``assignments.shape[:-1] + (C,)``.
 
-    A literal is true exactly when its rounded variable equals its sign, so the whole
-    clause test is one equality on booleans. The gathered ``(..., C, k)`` tensor is the
-    largest thing in the step, and a bool one is a quarter the memory traffic of the
-    arithmetic form.
+    Kept as a boolean equality because the gathered ``(..., C, k)`` tensor is the
+    largest allocation in the step and bool is a quarter the memory traffic.
     """
     hard = torch.sigmoid(assignments) > 0.5
     return (hard[..., clause_vars] == clause_signs).any(dim=-1)
@@ -123,7 +131,7 @@ def main():
     print(f"  device:    {device}")
 
     clause_vars = instance["clause_vars"].to(device)
-    clause_signs = instance["clause_signs"].to(device).bool()  # 1 for a positive literal
+    clause_signs = instance["clause_signs"].to(device).bool()  # 1 = positive literal
 
     model = MaxSATModel(num_vars=num_vars).to(device)
 
@@ -132,9 +140,9 @@ def main():
         model,
         compile=False,
         seed=seed,
-        epsilon=CosineEpsilon(5.0, 0.5),
-        step_radius=CosineEpsilon(sr_init, sr_tgt),
-        probe_radius=CosineEpsilon(pr_init, pr_tgt),
+        epsilon=CosineEpsilon(init=5.0, target=0.5),
+        step_radius=CosineEpsilon(init=sr_init, target=sr_tgt),
+        probe_radius=CosineEpsilon(init=pr_init, target=pr_tgt),
         num_probe=1,
         chunk_size=256,
         amortize_steps=3,
@@ -145,8 +153,7 @@ def main():
     )
 
     def closure(stacked_params):
-        # The optimizer hands us {"assignments": (N, num_vars)}; return the fraction
-        # of unsatisfied clauses per candidate.
+        # cost = fraction of unsatisfied clauses per candidate
         satisfied = satisfied_clauses(stacked_params["assignments"], clause_vars, clause_signs)
         return 1.0 - satisfied.sum(dim=-1) / clause_vars.shape[0]
 

@@ -35,11 +35,11 @@ only `closure()` and materializes.
 | 03 | [`03_rl_cartpole.py`](03_rl_cartpole.py) | Direct policy search on CartPole-v1 | 2 s |
 | 04 | [`04_maxsat_10k.py`](04_maxsat_10k.py) | Random 3-SAT with 10K variables, gradient-free | 14 s (GPU) |
 | 05 | [`05_mnist.py`](05_mnist.py) | MNIST training with `PolyStepOptimizer` | 22 s (GPU) |
-| 06 | [`06_loihi_snn_polystep.py`](06_loihi_snn_polystep.py) | Loihi 2 skeleton: MNIST SNN pretrain, then on-chip readout adaptation under input shift | 3.5 min (GPU) |
+| 06 | [`06_loihi_snn_polystep.py`](06_loihi_snn_polystep.py) | Loihi 2 skeleton: MNIST SNN pretrain, then on-chip readout adaptation under input shift | 3.1 min (GPU) |
 | 07 | [`07_binary_net_no_ste.py`](07_binary_net_no_ste.py) | STE-free binary (sign-activation) net via ask/tell, scored on 0-1 error against OpenAI-ES | 4 s |
 | 08 | [`08_direct_loss_minimization.py`](08_direct_loss_minimization.py) | Directly maximize a non-decomposable metric (F1) on an imbalanced checkerboard, against Adam+STE and OpenAI-ES over 5 seeds | 4 s |
 | 09 | [`09_hard_decision_tree.py`](09_hard_decision_tree.py) | Train a hard oblique decision tree (strict argmax routing, no relaxation) on an XOR checkerboard, against OpenAI-ES, SPSA and a soft-tree Adam baseline scored after hardening | 6 s |
-| 10 | [`10_cnn_mnist.py`](10_cnn_mnist.py) | LeNet-5 on MNIST, forward passes only. Convolutions and a hand-written `forward`, which every earlier fast path declines | 36 s (GPU, 40 epochs) |
+| 10 | [`10_cnn_mnist.py`](10_cnn_mnist.py) | LeNet-5 on MNIST, forward passes only. Convolutions and a hand-written `forward`, which every earlier fast path declines | 25 s (GPU, 40 epochs) |
 | 11 | [`11_transformer_selective_copy.py`](11_transformer_selective_copy.py) | Transformer solving a pointer-following task that needs attention, forward passes only | 4 s (GPU) |
 
 ## Quick start

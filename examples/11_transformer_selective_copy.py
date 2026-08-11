@@ -1,37 +1,17 @@
 """11 - Transformer on selective copy: attention trained with forward passes only.
 
-The task needs attention and nothing else will do. Each sequence is six tokens; the
-first is a pointer ``p``, and the label is the token sitting at position ``p``. A
-network that mixes fixed positions cannot solve it, because which position matters
-changes per example. Content-based lookup is exactly what an attention head does, so
-solving it is evidence the head is being trained rather than bypassed.
+Each sequence is six tokens; the first is a pointer ``p``, and the label is the
+token at position ``p``. Only content-based lookup (an attention head) can solve
+it, so solving it shows the head is being trained rather than bypassed.
 
-Attention mixes every position with every other, so nothing about it fits the
-Sequential-of-Linear shape the earlier fast paths require. Before
-``SiteVmapEvaluator`` a transformer had to build one full weight set per candidate.
+The site-aware path applies unchanged: a candidate perturbs one contiguous run
+of the flat parameter vector, so exactly one parameter tensor differs from the
+base, and everything ahead of it is computed once per step instead of once per
+candidate.
 
-The insight that carries it does not care that the layer is attention: a candidate
-perturbs one contiguous run of the flat parameter vector, so exactly one parameter
-tensor differs from the base. Batching that tensor alone and passing the rest once
-means the embedding and every layer ahead of the perturbed one are computed once
-instead of per candidate. Chunks break at parameter boundaries so a chunk can name a
-single site; sized purely by memory it would span several and fall back.
-
-Attention comes from ``polystep.layers.VmapSafeMultiHeadAttention``. Stock
-``nn.MultiheadAttention`` fuses its projections in a way ``vmap`` cannot trace, which
-drops the model onto the sequential fallback; the drop-in keeps it batched. See
-LIMITATIONS.md for what the replacement does not support.
-
-``amortize_steps=5`` is the other lever: a momentum step reuses the EMA transport
-direction and evaluates no candidates. It is not free, though, because it spends step
-budget. This task needs about 900 steps, so it is paired with a halved batch that
-doubles the steps per epoch and holds accuracy at 100%. Amortizing without that drops
-it well below.
-
-What you should see:
-  Chance is 12.5%. Accuracy sits near chance for ~20 epochs while the head learns to
-  attend, then rises sharply and reaches 100%.
-  The registered run matches the materializing run to floating-point tolerance.
+Attention uses ``polystep.layers.VmapSafeMultiHeadAttention``: stock
+``nn.MultiheadAttention`` fuses its projections in a way ``vmap`` cannot trace
+and would drop the model onto the sequential fallback. See LIMITATIONS.md.
 
 Run:
   python examples/11_transformer_selective_copy.py
@@ -42,14 +22,13 @@ Run:
 from __future__ import annotations
 
 import argparse
-import os
 import time
 
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
+
+_env.setup()
 import torch.nn as nn  # noqa: E402
 
 from polystep import PolyStepOptimizer  # noqa: E402
@@ -94,9 +73,8 @@ class SelectiveCopyTransformer(nn.Module):
 def build_optimizer(model: nn.Module, seed: int) -> PolyStepOptimizer:
     """A per-layer subspace, so a coordinate run lands inside one parameter's block.
 
-    That is what lets the step name a site in coordinate space. A single global
-    projection would spread every coordinate across every layer, leaving no site to
-    resolve and no shared prefix to reuse.
+    That is what lets the step name a site in coordinate space; a single global
+    projection would spread every coordinate across every layer.
     """
     subspace = HybridSubspace.auto_from_layout(ParamLayout.from_module(model), compression_ratio=4)
     return PolyStepOptimizer(
@@ -106,14 +84,13 @@ def build_optimizer(model: nn.Module, seed: int) -> PolyStepOptimizer:
         step_radius=6.0,
         probe_radius=1.0,
         seed=seed,
-        # A momentum step reuses the EMA transport direction and evaluates nothing, so
-        # only every fifth step pays for probes. It spends step budget rather than
-        # forward passes, so it needs a run with steps to spare: at a batch of 256 this
-        # task has too few steps and amortizing loses accuracy. Halving the batch doubles
-        # them, and the pair is faster at full accuracy.
+        # A momentum step reuses the EMA transport direction and evaluates nothing,
+        # so only every fifth step pays for probes. It spends step budget rather than
+        # forward passes, so it needs a run with steps to spare; halving the batch
+        # doubles the steps per epoch to cover that.
         amortize_steps=5,
         amortize_ema=0.7,
-        # Inductor fusion over the vmapped forward, at an unchanged accuracy.
+        # Inductor fusion over the vmapped forward.
         compile_evaluator=True,
     )
 
@@ -124,8 +101,7 @@ def run_epoch(optimizer, evaluator, x, y, batch_size):
     for start in range(0, x.shape[0] - batch_size + 1, batch_size):
         idx = order[start : start + batch_size]
         xb, yb = x[idx], y[idx]
-        # Hands the step the model and this batch, so candidates are scored directly
-        # rather than through the closure.
+        # Register so candidates are scored directly, not through the closure.
         optimizer.register_evaluator(evaluator, xb, yb)
         total += optimizer.step(lambda params, _x=xb, _y=yb: evaluator.evaluate(params, _x, _y))
         batches += 1

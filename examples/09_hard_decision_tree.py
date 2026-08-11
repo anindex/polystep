@@ -1,27 +1,10 @@
 """Training a hard oblique decision tree with no gradients and no relaxation.
 
-An oblique decision tree routes each sample with a strict test at every internal
-node: go right when w.x + b > 0, else left. The sample lands in exactly one leaf
-and takes that leaf's label. The loss is piecewise-constant in the node weights:
-its gradient is zero almost everywhere and undefined at the split boundaries.
-
-That breaks the usual toolbox:
-
-  * Adam cannot touch the hard tree, so the standard fix is a soft relaxation
-    (sigmoid routing). The relaxed model trains, but hardening it back to real
-    splits at inference loses much of the accuracy it appeared to reach.
-  * OpenAI-ES and SPSA estimate a local gradient from small perturbations. On a
-    flat piece the perturbed losses are equal, the estimate averages to zero, and
-    they stall.
-
-PolyStep is a randomized direct search: it probes a finite-radius polytope around
-the current parameters and moves toward the best vertices by an optimal-transport
-barycenter. A finite radius steps across split boundaries, so it optimizes the
-hard tree directly.
-
-The script trains the same hard tree with PolyStep, OpenAI-ES, and SPSA under a
-matched forward-pass budget, plus an Adam soft-tree baseline scored after
-hardening, and reports accuracy on a synthetic tabular task.
+Each node routes with a strict w.x + b > 0 test, so the loss is
+piecewise-constant in the weights: gradient zero almost everywhere,
+undefined at split boundaries. Trains the same hard tree with PolyStep,
+OpenAI-ES, and SPSA under a matched forward-pass budget, plus an Adam
+soft-tree baseline scored after hardening.
 
 Run:
     MPLBACKEND=Agg python examples/09_hard_decision_tree.py
@@ -33,9 +16,9 @@ import os
 import sys
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
+
+_env.setup()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

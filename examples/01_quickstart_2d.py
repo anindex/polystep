@@ -1,44 +1,28 @@
 """01 - Quickstart: PolyStep on a 2D non-smooth landscape.
 
-Newcomers should run this first. It demonstrates the core mechanic of
-PolyStep (sample polytope vertices around each particle, evaluate the
-objective, and update via softmax-weighted optimal transport) on a
-*visible* 2D problem so the polytope and the particle cloud are tangible.
+16 particles contract toward the origin on a piecewise-constant radial
+staircase, and a figure is saved to examples/figures/quickstart_2d.png.
 
-What you should see:
-  * 16 particles start spread around a 2D plane.
-  * Over ~50 steps they contract toward the global minimum at the origin.
-  * The objective is piecewise-constant ("staircase") in radius, so the
-    landscape contours are sharp and non-smooth. Surrogate-gradient
-    methods stall on this regime; PolyStep handles it directly.
-
-Output:
-  examples/figures/quickstart_2d.png
-
-Run:
-  python examples/01_quickstart_2d.py
+Run: python examples/01_quickstart_2d.py
 """
 
 from __future__ import annotations
 
 import importlib.util
 import os
-import sys
 from pathlib import Path
 
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+_env.setup()
+
 
 from polystep.solver import PolyStep  # noqa: E402
 
 
-# A 2D non-smooth objective: staircase in radius. Minimum at the origin,
-# piecewise-constant in concentric annuli, gradient zero almost everywhere.
+# Piecewise-constant in concentric annuli; gradient zero almost everywhere.
 
 
 def staircase_radial(X: torch.Tensor) -> torch.Tensor:
@@ -64,8 +48,7 @@ def main():
     torch.manual_seed(seed)
     generator = torch.Generator().manual_seed(seed)
 
-    # 16 particles, 50 iterations. Probe radius wider than step radius so
-    # probes reliably cross at least one staircase boundary per step.
+    # probe_radius > step_radius so probes cross a staircase boundary per step
     objective = StaircaseObjective()
     solver = PolyStep.create(
         objective,
@@ -89,7 +72,6 @@ def main():
         cloud_history.append(state.X.clone())
         cost_history.append(state.costs[-1])
 
-    # Best-particle trajectory: lowest cost in each cloud.
     best_traj = []
     for c in cloud_history:
         best_traj.append(c[staircase_radial(c).argmin()])

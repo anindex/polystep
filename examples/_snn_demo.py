@@ -1,9 +1,8 @@
 """Shared tiny-SNN demo helpers.
 
-Single source of truth for the small spiking network used by the
-``examples/02_snn_starter.py`` runnable demo. Kept tiny (~1-3K
-parameters) so the example finishes in under a couple of minutes on
-CPU and can also drive small 2D loss-landscape visualizations.
+Small spiking network (~1-3K parameters) used by
+``examples/02_snn_starter.py``; tiny enough to finish in a couple of
+minutes on CPU.
 """
 
 from __future__ import annotations
@@ -50,10 +49,9 @@ OUTPUT_SCALE = 10.0
 class LIFNeuron(nn.Module):
     """Leaky Integrate-and-Fire neuron with hard threshold spike.
 
-    The spike function ``(mem >= threshold).float()`` is truly
-    non-differentiable: ``d(spike)/d(mem) == 0`` almost everywhere, so
-    backpropagation through this layer gives zero gradient. PolyStep
-    only evaluates the forward pass, so the spike stays as-is.
+    The spike ``(mem >= threshold).float()`` has zero gradient almost
+    everywhere, so backprop through this layer gives nothing; PolyStep
+    only evaluates the forward pass.
     """
 
     def __init__(self, beta: float = 0.95, threshold: float = 1.0):
@@ -69,10 +67,9 @@ class LIFNeuron(nn.Module):
 
 
 class TinySNN(nn.Module):
-    """A 1-hidden-layer SNN with hard LIF spikes.
+    """A 1-hidden-layer SNN with hard LIF spikes (``Linear -> LIF -> Linear -> LIF``).
 
-    Architecture: ``Linear -> LIF -> Linear -> LIF``. Output is the mean
-    spike rate over ``num_steps`` simulated timesteps.
+    Output is the mean spike rate over ``num_steps`` simulated timesteps.
     """
 
     def __init__(
@@ -103,8 +100,7 @@ class TinySNN(nn.Module):
             spk1, mem1 = self.lif1(cur1, mem1)
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
-        # Mean spike rate per output class in [0, 1]; multiply by OUTPUT_SCALE
-        # at loss / argmax time to sharpen the cross-entropy signal.
+        # Mean spike rate in [0, 1]; OUTPUT_SCALE sharpens it at loss/argmax time.
         return total / self.num_steps
 
 
@@ -113,10 +109,8 @@ def make_dataset(
 ):
     """Synthetic class-conditional rate-coded dataset.
 
-    Each class is a distinct subset of "on" features; samples are noisy
-    versions of the per-class template. Easy enough for the tiny network to
-    learn in tens of steps yet rugged enough that the LIF non-smoothness
-    shows up in the loss landscape, which is what the GIF is for.
+    Each class owns a distinct block of "on" features; samples are noisy
+    copies of the class template.
     """
     rng = torch.Generator().manual_seed(seed)
     neurons_per_class = max(1, input_dim // num_classes)
@@ -182,9 +176,9 @@ class SNNDemoConfig:
 def make_optimizer(model: nn.Module, *, seed: int = 42, config: SNNDemoConfig | None = None) -> PolyStepOptimizer:
     """Build the PolyStepOptimizer with SNN-tuned hyperparameters.
 
-    Larger radii than typical NN settings (0.15 / 0.3) because the LIF
-    temporal dynamics make the loss landscape rugged on the scale of a few
-    weight units. Values are the ones the SNN examples were tuned at.
+    Larger radii than typical NN settings because the LIF temporal
+    dynamics make the loss landscape rugged on the scale of a few
+    weight units.
     """
     cfg = config or SNNDemoConfig()
     return PolyStepOptimizer(

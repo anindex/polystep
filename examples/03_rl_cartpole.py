@@ -1,22 +1,9 @@
 """03 - RL starter: gradient-free policy training on CartPole.
 
 PolyStep optimizes the policy directly against the (non-differentiable)
-total episode return: no policy gradient theorem, no value baselines,
-no Gym dependency at training time. The reward signal is the
-optimization target.
-
-The CartPole-v1 dynamics are vectorized in pure PyTorch (no Gymnasium)
-and match the official Gym thresholds and reset distribution, so this
-example doubles as a small reproducible test of zeroth-order policy
-search against a black-box objective.
-
-What you should see:
-  Mean episode return rises from ~10-20 (random policy) to the 200 cap
-  over 40 PolyStep steps. CartPole-v1's max return is 500; we use a
-  reduced horizon of 200 to keep the demo at a couple of seconds on CPU.
-
-  After training, the script launches a Gymnasium render window to visually
-  verify the trained policy (pass ``--no-render`` to skip).
+total episode return. The CartPole-v1 dynamics are vectorized in pure
+PyTorch and match the official Gym thresholds; after training, a
+Gymnasium render window shows the trained policy.
 
 Output:
   examples/figures/rl_cartpole.png
@@ -31,17 +18,15 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
-import sys
 import time
 from pathlib import Path
 
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+_env.setup()
+
 
 from polystep import PolyStepOptimizer  # noqa: E402
 from polystep.benchmarks.rl.cartpole import (  # noqa: E402
@@ -56,18 +41,15 @@ from polystep.transform import ParamLayout  # noqa: E402
 
 
 def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
-    """Run the trained policy in Gymnasium and save a GIF visualization.
+    """Run the trained policy in Gymnasium and save a GIF.
 
-    Uses ``render_mode="rgb_array"`` to avoid OpenGL/GLX dependency -
-    Gymnasium's ``"human"`` mode requires a working GLX context which
-    fails on many setups (WSL, remote desktops, containers, missing
-    GPU drivers).  The resulting GIF is saved next to the training plot.
+    Uses ``render_mode="rgb_array"``: the ``"human"`` mode needs a GLX
+    context that fails on headless setups.
     """
     import gymnasium as gym
     from PIL import Image
 
-    # Override the default 500-step truncation so we can demonstrate
-    # long-term stability of the trained policy.
+    # Override the 500-step truncation to show long-term stability.
     env = gym.make("CartPole-v1", render_mode="rgb_array", max_episode_steps=horizon)
     frames: list = []
 
@@ -100,8 +82,8 @@ def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
 def main():
     parser = argparse.ArgumentParser(description="CartPole policy search with PolyStep")
     parser.add_argument("--no-render", action="store_true", help="skip Gymnasium visualization after training")
-    # CPU by default: the rollout loop is sequential and each step is tiny, so launch
-    # overhead outweighs the device. CUDA measured slower here.
+    # CPU by default: the rollout loop is sequential and each step is tiny,
+    # so device launch overhead dominates.
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
@@ -128,9 +110,8 @@ def main():
         device=device,
     )
 
-    # Recipe mirrors experiments/runners/run_rl.py::run_polystep_cartpole.
-    # HybridSubspace + softmax solver + small radii are the configuration
-    # that actually drives policy improvement on CartPole.
+    # Mirrors experiments/runners/run_rl.py::run_polystep_cartpole:
+    # HybridSubspace + softmax solver + small radii.
     layout = ParamLayout.from_module(policy)
     subspace = HybridSubspace.from_layout(layout, rank=4)
 
@@ -175,8 +156,8 @@ def main():
     print("training...")
     start = time.time()
 
-    # Single closure shared across steps; uses the optimizer's own iteration
-    # counter so the CRN seed advances correctly each step.
+    # Shared closure; the optimizer's own iteration counter advances the
+    # CRN seed correctly each step.
     def closure(stacked_params):
         step = optimizer.state.iteration_count if optimizer.state is not None else 0
         return evaluator.loss_for_stacked_params(
@@ -255,8 +236,7 @@ def main():
         plt.close(fig)
         print(f"saved figure: {out}")
 
-    # Visualization with Gymnasium rendering. Training uses the internal dynamics, so
-    # gymnasium is only needed here.
+    # Gymnasium is only needed for rendering; training uses the internal dynamics.
     if args.no_render:
         print("(skipping Gymnasium render; pass without --no-render to visualize)")
     elif importlib.util.find_spec("gymnasium") is None:

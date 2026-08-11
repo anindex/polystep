@@ -1,7 +1,4 @@
-"""MNIST download and tensor loading, shared by the examples that need it.
-
-Reads the IDX files directly so the examples need no torchvision.
-"""
+"""MNIST download and tensor loading; reads the IDX files directly, no torchvision."""
 
 from __future__ import annotations
 
@@ -48,7 +45,6 @@ def load_mnist_labels(filepath: str) -> np.ndarray:
 
 def get_mnist_tensors(n_train: int = 0, n_test: int = 0, data_dir: str = "/tmp/mnist"):
     """Normalized ``(train_x, train_y, test_x, test_y)``, images shaped (N, 1, 28, 28).
-
     ``n_train``/``n_test`` cap the split; 0 takes all of it.
     """
     download_mnist(data_dir)

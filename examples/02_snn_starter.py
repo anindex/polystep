@@ -1,23 +1,10 @@
 """02 - SNN starter: train a tiny spiking network without gradients.
 
-A small spiking neural network with hard-threshold LIF spikes (truly
-non-differentiable) trained via PolyStep on CPU.
+A small spiking neural network with hard-threshold LIF spikes (zero gradient
+almost everywhere, so no backprop) trained via PolyStep. Saves a loss/accuracy
+figure to examples/figures/snn_starter.png.
 
-Why gradient-free for SNNs?
-  Hard LIF spikes have ``d(spike) / d(mem) == 0`` almost everywhere, so
-  backpropagation gives zero gradients. The usual workaround is a
-  *surrogate* gradient that smooths the spike. PolyStep evaluates the
-  SNN forward only and leaves the spikes alone.
-
-What you should see:
-  Test accuracy climbs from single digits to 100% within ~20 of the 60
-  steps. A 2-panel figure shows the loss + accuracy curves.
-
-Output:
-  examples/figures/snn_starter.png
-
-Run:
-  python examples/02_snn_starter.py
+Run: python examples/02_snn_starter.py
 """
 
 from __future__ import annotations
@@ -31,12 +18,11 @@ from pathlib import Path
 
 import torch
 
-# One thread: PolyStep's per-step ops are small enough that torch's default pool of
-# nproc threads costs far more than it returns. See docs/performance.md.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or 1)
+import _env  # noqa: E402
+
+_env.setup()
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _snn_demo import (  # noqa: E402  (sys.path mutation above)

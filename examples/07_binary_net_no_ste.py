@@ -1,15 +1,10 @@
 """STE-free training of a hard-threshold (sign-activation) net.
 
-Binary / 1-bit nets power quantized inference, but sign() has zero gradient
-almost everywhere, so backprop needs a straight-through estimator whose
-forward/backward mismatch is biased, worst at 1-2 bit
-(https://arxiv.org/abs/2505.18113, https://arxiv.org/pdf/2601.22660).
-
-This skips gradients and minimizes 0-1 error (doubly non-differentiable) with two
-ask/tell optimizers on a matched budget: PolyStepES vs OpenAI-ES. On a
-piecewise-constant loss OpenAI-ES averages to no signal and stalls once the
-boundary fragments; PolyStep still descends. Easy boundary (moons): both win.
-Hard boundary (XOR checkerboard): PolyStep leads by ~20 points.
+sign() has zero gradient almost everywhere, so backprop needs a straight-through
+estimator whose forward/backward mismatch is biased, worst at 1-2 bit
+(https://arxiv.org/abs/2505.18113, https://arxiv.org/pdf/2601.22660). This
+example skips gradients and minimizes 0-1 error directly, comparing PolyStepES
+against OpenAI-ES on a matched budget.
 
 Run:
     MPLBACKEND=Agg python examples/07_binary_net_no_ste.py
@@ -21,10 +16,9 @@ import os
 import sys
 import torch
 
-# Eight threads, not the one every other example pins: the cost here is this file's own
-# objective, sign() over a (258, 400, 32) activation, which is wide enough for the pool
-# to pay for itself at an unchanged accuracy. Capped below nproc, where it collapses.
-torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or min(8, os.cpu_count() or 1))
+import _env  # noqa: E402
+
+_env.setup(default_threads=8)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -67,8 +61,7 @@ def param_dim(hidden=HIDDEN, d_in=2):
 def error_rate(flat, X, y, hidden=HIDDEN):
     """0-1 error of a sign-activation MLP for a batch of flat param vectors.
 
-    flat: (B, D) -> (B,) misclassification rates. Fully non-differentiable:
-    sign hidden activations, a hard 0-threshold decision, then 0-1 loss.
+    flat: (B, D) -> (B,) misclassification rates. Fully non-differentiable.
     """
     B = flat.shape[0]
     d_in = X.shape[1]

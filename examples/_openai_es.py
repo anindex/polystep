@@ -9,8 +9,7 @@ class OpenAIES:
     """OpenAI-ES (Salimans et al., 2017).
 
     Antithetic sampling, z-scored fitness shaping, and the gradient estimate
-    ``g = (1 / (pop * sigma)) * sum(shaped * eps)``. Every caller passes its own
-    ``sigma`` and ``lr``.
+    ``g = (1 / (pop * sigma)) * sum(shaped * eps)``.
     """
 
     def __init__(self, dim, popsize, x0, sigma=0.5, lr=0.2, seed=0):
