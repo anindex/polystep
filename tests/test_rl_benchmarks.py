@@ -106,7 +106,6 @@ def test_gym_evaluator_nondiff_acrobot():
     assert torch.isfinite(logits_t).all() and torch.isfinite(logits_b).all()
     assert not torch.allclose(logits_t, logits_b), "binary activation must yield different logits than tanh"
 
-    # End-to-end: binary evaluator returns finite losses.
     ev_b = GymVectorEvaluator("Acrobot-v1", rollouts_per_candidate=2, horizon=20, activation="binary")
     losses_b = ev_b.loss_for_stacked_params(sp, seed=0, step=0)
     assert torch.isfinite(losses_b).all()
@@ -132,7 +131,6 @@ def test_hardened_env_smoke(require_experiments):
     )
     obs0, _ = env.reset(seed=0)
     obs1, _ = env.reset(seed=1)
-    # Quantizer outputs should be one of 4 bin centers per channel.
     assert obs0.shape == (4,) and obs0.dtype == np.float32
     assert np.unique(np.concatenate([obs0, obs1])).size <= 8  # <= 4 bins x 2 resets
     env.close()
@@ -155,3 +153,23 @@ def test_hardened_env_smoke(require_experiments):
         e = gym.make(gid)
         e.reset(seed=0)
         e.close()
+
+
+def test_goal_reaching_success_is_not_inverted():
+    """Acrobot success must mean reaching the goal, not timing out at the horizon.
+
+    The default flag is ``lengths >= horizon``, which is right for balancing
+    tasks and exactly backwards for goal-reaching ones.
+    """
+    import torch
+
+    from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
+
+    acrobot = GymVectorEvaluator("Acrobot-v1", rollouts_per_candidate=2)
+    lengths = torch.tensor([[81.0, float(acrobot.horizon)]])
+    returns = torch.tensor([[-80.0, -float(acrobot.horizon)]])
+    flags = acrobot.success_fn(returns, lengths)
+    assert flags.tolist() == [[True, False]], flags
+
+    # Balancing tasks keep the survived-to-horizon default.
+    assert GymVectorEvaluator("CartPole-v1", rollouts_per_candidate=2).success_fn is None

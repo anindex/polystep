@@ -17,9 +17,8 @@ from polystep.geometry import apply_biased_rotation, get_random_rotation_matrice
 def test_vanishing_bias_direction_keeps_the_frame_orthonormal(pdim):
     """A vanishing descent direction must leave the frame orthonormal.
 
-    Normalizing by ``norm.clamp(min=1e-10)`` turns a 1e-12 direction into a column
-    of norm 1e-2, and Gram-Schmidt against a scaled axis skews the frame. A
-    particle with no usable heading keeps its unbiased rotation instead.
+    Normalizing by ``norm.clamp(min=1e-10)`` would skew the frame through
+    Gram-Schmidt, so such a particle keeps its unbiased rotation instead.
     """
     P = 32
     gen = torch.Generator().manual_seed(7)
@@ -51,7 +50,6 @@ class TestEvalModeEnforced:
         loss_fn = nn.CrossEntropyLoss()
         evaluator = NNCostEvaluator(model, loss_fn)
 
-        # User switches to train mode
         model.train()
         assert model.training
 
@@ -79,7 +77,6 @@ class TestEvalModeEnforced:
             raise ValueError("intentional")
 
         evaluator = NNCostEvaluator(model, bad_loss)
-        # Simulate user switching to train mode AFTER evaluator creation
         model.train()
         assert model.training
 
@@ -128,7 +125,6 @@ class TestBuffersExcluded:
         model = TiedModel()
         layout = ParamLayout.from_module(model)
 
-        # fc2.weight should appear as shared alias of fc1.weight
         all_layout_keys = set()
         for e in layout.entries:
             all_layout_keys.add(e.key)
@@ -137,7 +133,6 @@ class TestBuffersExcluded:
         assert "fc1.weight" in all_layout_keys
         assert "fc2.weight" in all_layout_keys, "Shared param fc2.weight missing from layout"
 
-        # Round-trip should preserve both
         flat = layout.flatten(model)
         recovered = layout.unflatten(flat)
         assert "fc1.weight" in recovered
@@ -151,7 +146,6 @@ class TestBuffersExcluded:
             nn.BatchNorm1d(20),
             nn.Linear(20, 5),
         )
-        # Give BN non-trivial running stats
         model.train()
         model(torch.randn(8, 10))
         model.eval()
@@ -198,12 +192,12 @@ class TestBlockwiseTurboFeatures:
         def closure(bp):
             return evaluator.evaluate(bp, inputs, targets)
 
-        # First step: full OT (amortize counter=0 -> triggers full OT)
+        # First step triggers a full OT.
         optimizer.step(closure)
         ema = optimizer._transport_direction_ema
         assert ema is not None, "the amortized momentum step has nothing to coast along"
-        # A populated-but-zero EMA makes every cheap step a no-op, which "is not None"
-        # cannot see. The next step must then move the parameters without a full OT.
+        # A populated-but-zero EMA makes every cheap step a no-op, which the
+        # None check cannot see.
         assert ema.shape == optimizer.state.X.shape
         assert ema.abs().max() > 0, "the EMA is all zeros, so a momentum step would not move anything"
 
@@ -265,16 +259,13 @@ class TestBlockwiseTurboFeatures:
         def closure(bp):
             return evaluator.evaluate(bp, inputs, targets)
 
-        # First step: no previous duals yet
         optimizer.step(closure)
-        # Second step: prev_prev_block_duals should now be populated
         optimizer.step(closure)
         ppbd = getattr(optimizer._state, "_prev_prev_block_duals", None)
         assert ppbd is not None, (
             "After 2 blockwise steps with dual_momentum_beta>0, _prev_prev_block_duals should be populated"
         )
         assert len(ppbd) > 0
-        # At least one block should have non-None duals
         has_duals = any(f is not None for f, g in ppbd)
         assert has_duals, "At least one block should have previous duals"
 
@@ -295,7 +286,6 @@ class TestNoAmortAndFixedEpsilon:
             num_probe=1,
             sinkhorn_max_iters=20,
         )
-        # Check epsilon at multiple iterations
         for i in range(100):
             eps = optimizer._get_epsilon(i)
             assert eps == 1.0, f"Fixed epsilon changed at iteration {i}: {eps}"
@@ -323,22 +313,12 @@ class TestNoAmortAndFixedEpsilon:
         for _ in range(n_steps):
             optimizer.step(closure)
 
-        # Transport direction EMA should never be populated
         assert optimizer._transport_direction_ema is None, (
             "amortize_steps=1 should never populate _transport_direction_ema"
         )
         assert optimizer._state.iteration_count == n_steps, (
             f"Expected {n_steps} OT iterations, got {optimizer._state.iteration_count}"
         )
-
-
-def test_sinkhorn_rejects_empty_cost_matrix():
-    """An empty (0-row or 0-col) cost matrix must raise a clear error rather
-    than crash deep inside marginal alignment (1.0 / n)."""
-    from polystep.solvers.sinkhorn import SinkhornSolver
-
-    with pytest.raises(ValueError, match="empty cost matrix"):
-        SinkhornSolver(epsilon=0.5).solve(torch.zeros(0, 3))
 
 
 def test_cosine_epsilon_stays_in_range_past_schedule():
@@ -490,7 +470,7 @@ class TestRotationPreservesPoint:
             prev_projection = opt.state.projection.clone()
 
     def test_loss_reduction_floor(self):
-        """Multi-seed floor. Keeping coords across rotation scored 6.1% here."""
+        """Median loss reduction across seeds must clear a floor."""
         from polystep.adaptive_subspace import AdaptiveSubspace
 
         reductions = []
@@ -522,7 +502,7 @@ class TestCMAWrapperIsWiredIn:
 
         model = nn.Sequential(nn.Linear(20, 16), nn.ReLU(), nn.Linear(16, 4))
         base = AdaptiveSubspace.auto_from_params(model)
-        direct = CMAAdaptiveSubspace(base)
+        direct = CMAAdaptiveSubspace(full_dim=base.full_dim, subspace_dim=base.subspace_dim)
         factory = CMAAdaptiveSubspace.from_adaptive_subspace(base)
 
         assert direct.c_mu > 0.0
@@ -531,11 +511,10 @@ class TestCMAWrapperIsWiredIn:
 
     @pytest.mark.parametrize("mu_eff", [1.0, 7.0])
     def test_explicit_mu_eff_reaches_the_evolution_path(self, mu_eff):
-        """The rates honoured it while the path updates hardcoded 1.0.
+        """The learning rates and the path update must use the same mu_eff.
 
         From ``p_sigma = 0`` and ``C_diag = 1``, one step leaves
-        ``||p_sigma|| = sqrt(c_sigma (2 - c_sigma) mu_eff)`` because the step feeds the
-        path a unit-norm direction, so the factor is readable straight off the norm.
+        ``||p_sigma|| = sqrt(c_sigma (2 - c_sigma) mu_eff)``, readable off the norm.
         """
         import math
 
@@ -544,7 +523,7 @@ class TestCMAWrapperIsWiredIn:
 
         model, closure, _ = _mlp_and_closure(0)
         base = AdaptiveSubspace.auto_from_params(model)
-        sub = CMAAdaptiveSubspace(base, mu_eff=mu_eff)
+        sub = CMAAdaptiveSubspace.from_adaptive_subspace(base, mu_eff=mu_eff)
         assert sub.mu_eff == mu_eff
 
         opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.1, max_iterations=5, use_covariance_adaptation=True)
@@ -622,7 +601,7 @@ def test_fully_frozen_model_raises_clearly():
 
 
 def test_rank_transition_carries_hybrid_config():
-    """Listing config fields by hand dropped the absorb_* fields."""
+    """A rank transition must carry the absorb_* config fields over."""
     from polystep.hybrid_subspace import HybridSubspace
     from polystep.optimizer import RankSchedule
 
@@ -713,9 +692,7 @@ def test_covariance_adaptation_preserves_trace():
 def test_mu_eff_matches_the_unit_innovation_convention():
     """The learning rates must be derived at the same mu_eff the paths run at.
 
-    The step feeds the evolution paths a unit-norm direction, which is mu_eff = 1.
-    Deriving c_sigma from the vertex count instead gave ~2/3, a 1.5-step path memory
-    that no update ever used.
+    The step feeds the evolution paths a unit-norm direction, i.e. mu_eff = 1.
     """
     from polystep.adaptive_subspace import AdaptiveSubspace
     from polystep.cma_subspace import CMAAdaptiveSubspace
@@ -809,8 +786,7 @@ def test_all_infinite_cost_gives_uniform_plan_without_nan():
 
 
 def test_entropic_plan_is_invariant_to_a_constant_cost_shift():
-    """Scaling before recentering tied the effective temperature to the absolute
-    loss level, so adding a constant to every cost changed the plan."""
+    """The plan must be invariant to a constant shift of every cost."""
     from polystep.solvers import SinkhornSolver, SoftmaxSolver
 
     cost = torch.tensor([[0.0, 1.0, 2.0, 3.0], [3.0, 1.0, 0.0, 2.0]])

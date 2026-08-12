@@ -29,7 +29,6 @@ class TestPerLayerBlocks:
         model = SimpleMLP()
         layout = ParamLayout.from_module(model)
         blocks = create_per_layer_blocks(layout)
-        # SimpleMLP has 4 entries: fc1.weight, fc1.bias, fc2.weight, fc2.bias
         assert len(blocks) == len(layout.entries)
 
     def test_block_names_match_keys(self):
@@ -43,9 +42,7 @@ class TestPerLayerBlocks:
         model = SimpleMLP()
         layout = ParamLayout.from_module(model)
         blocks = create_per_layer_blocks(layout)
-        # First block starts at 0
         assert blocks[0].flat_start == 0
-        # Each block starts where the previous ends
         for i in range(1, len(blocks)):
             assert blocks[i].flat_start == blocks[i - 1].flat_end
 
@@ -71,7 +68,6 @@ class TestGroupedBlocks:
         model = SimpleMLP()
         layout = ParamLayout.from_module(model)
         blocks = create_grouped_blocks(layout, group_size=2)
-        # First group: fc1.weight (4*8=32) + fc1.bias (8) = 40
         entries = layout.entries
         group0_numel = entries[0].numel + entries[1].numel
         padded0 = group0_numel + (-group0_numel % 2)
@@ -133,8 +129,8 @@ class TestBlockLayoutConversion:
         class MisalignedModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.fc1 = nn.Linear(13, 1, bias=False)  # 13 params
-                self.fc2 = nn.Linear(5, 1, bias=False)  # 5 params
+                self.fc1 = nn.Linear(13, 1, bias=False)
+                self.fc2 = nn.Linear(5, 1, bias=False)
 
         model = MisalignedModel()
         with torch.no_grad():
@@ -167,11 +163,8 @@ class TestBlockLayoutConversion:
         ids=["per_layer", "grouped"],
     )
     def test_column_map_scatters_to_the_same_place_as_the_slice_copy(self, make_blocks):
-        """The blockwise step scatters candidates straight into layout order.
-
-        The column map has to agree with ``blocks_to_layout_flat``, which builds the
-        same vector by slice copies, or a candidate lands on the wrong parameter and
-        the cost matrix scores a configuration nobody asked for.
+        """The column map must agree with ``blocks_to_layout_flat``, which builds
+        the same vector by slice copies, or a candidate lands on the wrong parameter.
         """
         from polystep.blockwise import block_to_layout_columns
 
@@ -194,8 +187,8 @@ class TestBlockLayoutConversion:
         class TwoLayer(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.w1 = nn.Linear(7, 1, bias=False)  # 7 params
-                self.w2 = nn.Linear(3, 1, bias=False)  # 3 params
+                self.w1 = nn.Linear(7, 1, bias=False)
+                self.w2 = nn.Linear(3, 1, bias=False)
 
         model = TwoLayer()
         with torch.no_grad():

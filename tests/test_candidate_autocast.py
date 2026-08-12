@@ -1,10 +1,8 @@
 """``candidate_autocast`` must preserve the cost matrix's ranking.
 
-What autocast can destroy is contrast: two candidates whose losses differ below BF16
-resolution come back tied, and the OT solve then ranks them arbitrarily. Absolute loss
-agreement is not the contract and would fail at any useful tolerance, so these tests
-check rank correlation and the tied-loss rate instead. They run on CPU, where BF16
-autocast is supported and buys no speed; the speedup is a CUDA claim.
+BF16 can tie candidates whose losses differ below its resolution, so these tests
+check rank correlation and tie rate, not absolute loss agreement. They run on CPU;
+the speedup is a CUDA claim.
 """
 
 import pytest

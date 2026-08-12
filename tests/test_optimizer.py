@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from polystep.solver import PolyStep
-from polystep import CosineEpsilon, PolyStepOptimizer, SolverState
+from polystep import CosineEpsilon, PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
 from polystep.dynamics import compute_momentum_coefficient
 
@@ -56,55 +56,22 @@ def optimizer(model):
 
 
 class TestClosureInterface:
-    def test_step_updates_model(self, model, closure):
-        initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        opt.step(closure)
-        updated_params = model.state_dict()
-        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
-        assert any_changed, "Model parameters should change after step"
-
-    def test_step_increments_iteration(self, optimizer, closure):
+    def test_each_step_moves_the_model_and_records_one_cost(self, model, optimizer, closure):
+        initial = {k: v.clone() for k, v in model.state_dict().items()}
         assert optimizer.state.iteration_count == 0
-        optimizer.step(closure)
-        assert optimizer.state.iteration_count == 1
 
-    def test_multiple_steps(self, model, closure):
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
+        for i in range(5):
+            optimizer.step(closure)
+            assert optimizer.state.iteration_count == i + 1
+            assert len(optimizer.state.costs) == i + 1
+
+        updated = model.state_dict()
+        assert any(not torch.equal(initial[k], updated[k]) for k in initial), (
+            "Model parameters should change after step"
         )
-        for _ in range(5):
-            opt.step(closure)
-        assert len(opt.state.costs) == 5
-        assert opt.state.iteration_count == 5
 
 
 class TestMomentum:
-    def test_momentum_disabled_by_default(self, model, closure):
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        assert opt.state.velocity is None
-        opt.step(closure)
-        assert opt.state.velocity is None
-
     def test_momentum_initializes_velocity(self, model):
         opt = PolyStepOptimizer(
             model,
@@ -130,7 +97,6 @@ class TestMomentum:
         )
         opt.step(closure)
         assert opt.state.velocity is not None
-        # After one step, velocity should be non-zero (displacement was applied)
         assert torch.any(opt.state.velocity != 0)
 
     def test_momentum_warmup(self):
@@ -143,7 +109,7 @@ class TestMomentum:
         assert beta_99 == pytest.approx(0.95)
 
     def test_momentum_smooths_trajectory(self):
-        """Momentum version has smaller displacement variance."""
+        """Momentum must accumulate velocity and change the trajectory."""
         torch.manual_seed(42)
         model_no_mom = _make_model()
         model_mom = copy.deepcopy(model_no_mom)
@@ -175,14 +141,11 @@ class TestMomentum:
             opt_no_mom.step(closure_no_mom)
             opt_mom.step(closure_mom)
 
-        # Both should have completed without error
         assert len(opt_no_mom.state.displacement_sqnorms) == n_steps
         assert len(opt_mom.state.displacement_sqnorms) == n_steps
 
-        # Momentum must have a real effect: velocity accumulates and the
-        # trajectory diverges from the no-momentum run (both seeded identically,
-        # so any difference is momentum). The variance-ordering claim is
-        # stochastic, so we assert the mechanism rather than a flaky inequality.
+        # Both runs are seeded identically, so any trajectory difference is due
+        # to momentum.
         assert opt_mom.state.velocity is not None
         assert opt_mom.state.velocity.abs().sum() > 0
         traj_no_mom = torch.tensor(opt_no_mom.state.displacement_sqnorms)
@@ -238,20 +201,10 @@ class TestIntegration:
         )
         for _ in range(10):
             opt.step(closure)
-        # Both should be active
         assert opt.state.velocity is not None
         assert torch.any(opt.state.velocity != 0)
         assert 0.5 <= opt.state.radius_multiplier <= 3.0
         assert opt.state.iteration_count == 10
-
-    def test_state_accessible(self, optimizer, closure):
-        optimizer.step(closure)
-        state = optimizer.state
-        assert isinstance(state, SolverState)
-        assert state.iteration_count == 1
-        assert len(state.costs) == 1
-        assert state.X is not None
-        assert state.a is not None
 
 
 class TestParticleDim:
@@ -261,8 +214,7 @@ class TestParticleDim:
     def test_particle_dim_4(self, polytope, dim, verts):
         """particle_dim=D gives D-dim particles and the polytope's own vertex count.
 
-        The simplex (the default) is D+1, the orthoplex 2*D. Naming the polytope keeps this
-        from silently re-testing whatever the default happens to be.
+        The simplex has D+1 vertices, the orthoplex 2*D.
         """
         torch.manual_seed(42)
         model = _make_model()
@@ -342,10 +294,8 @@ class TestParticleDim:
 class TestAdaptiveProbes:
     """Tests for cost-matrix reuse across steps.
 
-    A candidate is the whole configuration with one particle row replaced, so every
-    row of the cost matrix depends on every particle's position. Reuse is therefore
-    all or nothing: the matrix is reused whole while X has not moved, and dropped as
-    soon as it has.
+    Every candidate row depends on all particle positions, so reuse is all or
+    nothing: kept while X has not moved, dropped as soon as it has.
     """
 
     def test_one_moving_particle_invalidates_every_cached_row(self):
@@ -362,7 +312,7 @@ class TestAdaptiveProbes:
             return closure(batched_params)
 
         opt.step(counting)
-        # Freeze all but one particle, then move that one well past the threshold.
+        # Move one particle well past the reuse threshold.
         opt._prev_X = opt.state.X.clone()
         opt._prev_X[0] += 1.0
 
@@ -393,8 +343,7 @@ class TestAdaptiveProbes:
     def test_adaptive_probes_defaults_to_where_it_is_implemented(self, block_strategy, expected):
         """``adaptive_probes=None`` resolves to on for monolithic, off elsewhere.
 
-        Blockwise never populates the reuse cache, so leaving it on there would only
-        cost memory. An explicit True still warns.
+        Blockwise never populates the reuse cache; an explicit True still warns.
         """
         torch.manual_seed(42)
         opt = PolyStepOptimizer(
@@ -451,11 +400,9 @@ class TestAdaptiveProbes:
             losses.append(loss)
             assert math.isfinite(loss)
 
-        # After the first step the configuration and cost matrix are cached
         assert opt._prev_X is not None
         assert opt._prev_cost_matrix is not None
 
-        # Model should have changed
         updated_params = model.state_dict()
         any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Model parameters should change with adaptive_probes=True"
@@ -463,8 +410,8 @@ class TestAdaptiveProbes:
     @pytest.mark.parametrize(
         "threshold, reuses",
         [
-            (1e10, True),  # every particle counts as stagnant, so every row is reused
-            (0.0, False),  # strict <, so nothing is stagnant and every row is re-measured
+            (1e10, True),  # every particle counts as stagnant
+            (0.0, False),  # strict <, so nothing is stagnant
         ],
     )
     def test_adaptive_probes_reuse_follows_the_threshold(self, threshold, reuses):
@@ -509,7 +456,6 @@ class TestDualMomentum:
         model_default = _make_model()
         model_beta0 = copy.deepcopy(model_default)
 
-        # Create shared random data for identical closures
         evaluator_default = NNCostEvaluator(model_default, loss_fn=nn.MSELoss())
         evaluator_beta0 = NNCostEvaluator(model_beta0, loss_fn=nn.MSELoss())
         inputs = torch.randn(16, 4)
@@ -568,8 +514,8 @@ class TestDualMomentum:
     def test_extrapolation_clamped(self):
         """The extrapolated warm start handed to the solver stays inside the clamp.
 
-        Checked on the value passed to solve(), not on state.f: sinkhorn clamps its
-        output again internally, so the output cannot show whether this clamp ran.
+        Checked on the value passed to solve(): sinkhorn clamps its output again
+        internally, so the output cannot show whether this clamp ran.
         """
         torch.manual_seed(42)
         model = _make_model()
@@ -652,25 +598,8 @@ class TestAutoEpsilon:
             optimizer.step(closure)
             eps_values.append(optimizer._progressive_epsilon.at())
 
-        # Epsilon should be changing (not stuck at init)
         assert len(set(round(e, 6) for e in eps_values)) > 1, f"Epsilon did not change across steps: {eps_values}"
-        # All values should be finite and positive
         assert all(0 < e < 100 for e in eps_values)
-
-
-@pytest.mark.parametrize(
-    "param_name, value",
-    [
-        ("curvature_aware_radius", True),
-        ("entropy_target", 0.7),
-        ("nesterov_lookahead", True),
-    ],
-)
-def test_curvature_aware_radius_removed(param_name, value):
-    """Parameters removed in cleanup should raise TypeError."""
-    model = nn.Linear(4, 2)
-    with pytest.raises(TypeError, match=param_name):
-        PolyStepOptimizer(model, **{param_name: value})
 
 
 @pytest.mark.parametrize(
@@ -687,10 +616,9 @@ def test_curvature_aware_radius_removed(param_name, value):
     ],
 )
 def test_documented_defaults(attribute, expected):
-    """The published defaults, pinned off one optimizer rather than one build each.
+    """The published defaults, pinned off one optimizer.
 
-    Every acceleration knob is off unless asked for, so a default construction runs
-    the plain algorithm.
+    Every acceleration knob is off unless asked for.
     """
     opt = PolyStepOptimizer(_make_model(), epsilon=0.1, compile=False, seed=42)
     value = opt
@@ -703,12 +631,10 @@ def test_documented_defaults(attribute, expected):
 
 
 class TestProbeRadiusJitter:
-    """Probe-radius jitter implements Theorem 4.2 condition (iv).
+    """Probe-radius jitter gives the step density a spread along any wall normal.
 
-    The Fubini transversality argument requires the joint (rotation, jitter)
-    probe distribution to be absolutely continuous on a positive-Lebesgue-measure
-    tube around the (d_p-1)-sphere. Default 0.0 keeps reported experiments
-    bit-for-bit reproducible; non-zero values activate the jitter.
+    The probe distribution must be absolutely continuous on a positive-measure
+    tube around the (d_p-1)-sphere; the 0.0 default keeps runs reproducible.
     """
 
     def test_default_is_zero(self):

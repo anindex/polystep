@@ -1,8 +1,6 @@
 """apply_biased_rotation must point the first search axis along the requested
-bias, stay a proper rotation, and work in bf16.
-
-QR fixes a column only up to sign, so without a correction the biased axis could
-come back negated and steer the search toward ascent instead of descent.
+bias, stay a proper rotation, and work in bf16. QR fixes a column only up to
+sign, so the biased axis needs an explicit sign correction.
 """
 
 import torch
@@ -50,12 +48,7 @@ def test_bfloat16_cpu_still_returns_a_proper_rotation():
 
 
 def test_bfloat16_actually_applies_the_bias():
-    """bf16 must keep the bias, not silently fall back to the unbiased rotation.
-
-    Gram-Schmidt in bf16 leaves the Gram matrix ~5.7e-3 off identity, so a fixed
-    1e-3 orthonormality tolerance rejected every particle at dim >= 4 and
-    biased_rotation became a no-op under mixed_precision.
-    """
+    """bf16 must keep the bias, not silently fall back to the unbiased rotation."""
     for dim in (2, 4, 8, 16):
         torch.manual_seed(dim)
         R = get_random_rotation_matrices(64, dim, dtype=torch.float32)
@@ -76,10 +69,8 @@ def test_bfloat16_actually_applies_the_bias():
 def test_collapsed_column_falls_back_to_an_orthonormal_frame():
     """A bias parallel to an existing axis must not yield duplicate columns.
 
-    Gram-Schmidt annihilates the axis the bias replaced, and restoring the original
-    column leaves it non-orthogonal to the bias. R=I, bias=e_k produced a finite
-    singular frame (two identical columns, det 0) that the finiteness guard let past,
-    so two polytope vertices coincided.
+    Gram-Schmidt annihilates the axis the bias replaced, so the fallback must
+    rebuild an orthonormal frame instead of restoring the original column.
     """
     for dim in (2, 3, 8):
         for k in range(dim):
@@ -89,12 +80,3 @@ def test_collapsed_column_falls_back_to_an_orthonormal_frame():
             gram = Q.T @ Q
             assert torch.allclose(gram, torch.eye(dim), atol=1e-4), f"dim={dim} k={k}:\n{gram}"
             assert torch.det(Q) > 0.9, f"dim={dim} k={k}: det={torch.det(Q)}"
-
-
-if __name__ == "__main__":
-    test_first_axis_aligns_with_bias()
-    test_sign_ambiguous_bias_not_flipped()
-    test_stays_proper_rotation()
-    test_bfloat16_cpu_still_returns_a_proper_rotation()
-    test_collapsed_column_falls_back_to_an_orthonormal_frame()
-    print("ok")

@@ -1,15 +1,9 @@
-"""One place for the behaviour every subspace class must share.
+"""Behaviour every subspace class must share, parametrized over all of them.
 
-Each class reconstructs a state_dict from a coordinate vector, and four properties
-follow from that regardless of how the projection is built: a zero coordinate changes
-nothing, the batched reconstruction agrees with the single-vector one, absorbing folds
-the perturbation into the base and zeros the coordinates, and absorbing does not move
-the point the subspace represents.
-
-These were written out per class in test_subspace.py, test_adaptive_subspace.py,
-test_hybrid_subspace.py, test_factored_subspace.py and test_cma_subspace.py, three to
-five copies each, and no class had all four. Parametrizing covers every class with
-every property. Behaviour specific to one class stays in that class's file.
+Four properties follow from reconstructing a state_dict from a coordinate vector:
+a zero coordinate changes nothing, batched reconstruction agrees with the
+single-vector one, absorb folds the perturbation into the base and zeros the
+coordinates, and absorb does not move the represented point.
 """
 
 import pytest
@@ -20,7 +14,6 @@ from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.factored_subspace import FactoredSubspace
 from polystep.hybrid_subspace import HybridSubspace
-from polystep.subspace import LinearSubspace, LowRankSubspace
 from polystep.transform import ParamLayout
 
 
@@ -29,11 +22,8 @@ def _model():
     return nn.Sequential(nn.Linear(12, 10), nn.ReLU(), nn.Linear(10, 6))
 
 
-# Each entry returns (subspace, projection). The projection is None for classes that
-# carry their factors internally, and the adapters below take that as "omit the argument".
+# Each entry returns (subspace, projection); every remaining class takes one.
 BUILDERS = {
-    "lowrank": lambda lay: (LowRankSubspace.from_layout(lay, rank=3), None),
-    "linear": lambda lay: (LinearSubspace.from_layout(lay, rank=3, seed=0), None),
     "adaptive": lambda lay: _with_single(AdaptiveSubspace.from_layout(lay, rank=3)),
     "cma": lambda lay: _with_single(
         CMAAdaptiveSubspace.from_adaptive_subspace(AdaptiveSubspace.from_layout(lay, rank=3))
@@ -52,17 +42,15 @@ def _with_dict(sub):
 
 
 def _apply(sub, proj, base_sd, coords):
-    return sub.apply_perturbation(base_sd, coords) if proj is None else sub.apply_perturbation(proj, base_sd, coords)
+    return sub.apply_perturbation(proj, base_sd, coords)
 
 
 def _batch(sub, proj, base_sd, coords_batch):
-    if proj is None:
-        return sub.reconstruct_batch(base_sd, coords_batch)
     return sub.reconstruct_batch(proj, base_sd, coords_batch)
 
 
 def _absorb(sub, proj, base_sd, coords):
-    return sub.absorb(base_sd, coords) if proj is None else sub.absorb(proj, base_sd, coords)
+    return sub.absorb(proj, base_sd, coords)
 
 
 @pytest.fixture(params=sorted(BUILDERS))

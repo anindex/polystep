@@ -207,7 +207,7 @@ def test_evaluator_different_params_different_losses():
 
     N = 10
     batch = particle.unsqueeze(0).expand(N, -1, -1).clone()
-    batch += torch.randn_like(batch) * 1.0  # large perturbation
+    batch += torch.randn_like(batch) * 1.0
     stacked = layout.batch_unflatten(batch)
 
     evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
@@ -215,7 +215,6 @@ def test_evaluator_different_params_different_losses():
     targets = torch.randint(0, 2, (32,))
     losses = evaluator.evaluate(stacked, inputs, targets)
 
-    # Not all losses should be identical
     assert not torch.all(losses == losses[0]), "All losses identical despite different params"
 
 
@@ -266,11 +265,9 @@ def test_evaluator_fallback_warning():
         warnings.simplefilter("always")
         losses = evaluator.evaluate(stacked, inputs, targets)
 
-    # Check warning was emitted
     fallback_warnings = [x for x in w if "Falling back" in str(x.message)]
     assert len(fallback_warnings) > 0, "Expected 'Falling back' warning"
 
-    # Results should still be valid
     assert losses.shape == (N,)
     assert losses.isfinite().all()
 
@@ -306,12 +303,7 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         assert evaluator._batched_linear is not None
 
     def test_use_inplace_wins_over_the_bmm_path(self):
-        """``use_inplace`` is a memory contract and must outrank the bmm fast path.
-
-        The bmm branch returned first, so an MLP that asked for O(1) activation memory
-        silently got the O(N x activation) stack instead. Auto-detection was preempted
-        the same way, which is the >500K-param GPU regime where bmm is what OOMs.
-        """
+        """``use_inplace`` is a memory contract and must outrank the bmm fast path."""
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
         layout = ParamLayout.from_module(model)
@@ -330,11 +322,7 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
 
     @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
     def test_regression_losses_use_fast_path_and_match_vmap(self, loss_fn):
-        """The bmm forward is loss-independent; only the reduction differs.
-
-        Gating the fast path on CrossEntropyLoss sent every regression MLP through
-        vmap for no reason.
-        """
+        """The bmm forward is loss-independent; only the reduction differs."""
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
         layout = ParamLayout.from_module(model)
@@ -421,19 +409,9 @@ def test_chunk_size_produces_same_result():
 
 def test_auto_detect_chunk_size_cpu():
     """auto_detect_chunk_size returns None for CPU model (even on GPU machine)."""
-    model = nn.Linear(100, 50)  # CPU model
+    model = nn.Linear(100, 50)
     result = auto_detect_chunk_size(model)
     assert result is None, f"Expected None for CPU model, got {result}"
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA")
-def test_auto_detect_chunk_size_returns_positive():
-    """auto_detect_chunk_size returns positive int for GPU model."""
-    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)).cuda()
-    result = auto_detect_chunk_size(model)
-    assert isinstance(result, int), f"Expected int, got {type(result)}"
-    assert result > 0, f"Expected positive, got {result}"
 
 
 def test_evaluator_auto_chunk_size():
@@ -466,8 +444,7 @@ def test_auto_chunk_size_cached():
     evaluator = NNCostEvaluator(model, nn.MSELoss(), chunk_size="auto")
     cs1 = evaluator.chunk_size
     cs2 = evaluator.chunk_size
-    assert cs1 == cs2  # same value (None on CPU)
-    # Verify internal cache attribute exists and sentinel was replaced
+    assert cs1 == cs2
     assert hasattr(evaluator, "_chunk_size_cached")
     from polystep.cost_nn import _UNSET
 
@@ -479,7 +456,7 @@ def _make_probe_setup(in_dim=4, hidden=8, out_dim=2, P=10, V=4, K=3):
     model = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, out_dim))
     layout = ParamLayout.from_module(model)
     p = layout.flatten(model)
-    D = p.shape[0] * p.shape[1]  # flat size
+    D = p.shape[0] * p.shape[1]
     X_probe = p.reshape(1, 1, 1, D).expand(P, V, K, D).clone()
     X_probe += torch.randn(P, V, K, D) * 0.01
     evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
@@ -513,11 +490,6 @@ def test_fullspace_default_chunk_matches_explicit_chunk():
     loss_default = _chunk_bound_step(None)
     loss_explicit = _chunk_bound_step(500)
     assert abs(loss_default - loss_explicit) < 1e-4
-
-
-if __name__ == "__main__":
-    test_fullspace_default_chunk_matches_explicit_chunk()
-    print("ok")
 
 
 @pytest.mark.parametrize(

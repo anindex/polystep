@@ -23,7 +23,6 @@ from polystep import PolyStepOptimizer, TrainCallback, TrainConfig, train
 from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.epsilon import LinearEpsilon
 from polystep.hybrid_subspace import HybridSubspace
-from polystep.subspace import LinearSubspace, LowRankSubspace
 from polystep.transform import ParamLayout
 
 
@@ -133,7 +132,7 @@ def test_mnist_accuracy(mnist_loaders):
 @pytest.mark.slow
 @pytest.mark.timeout(600)
 @pytest.mark.flaky(reruns=2)
-@pytest.mark.parametrize("kind", ["linear", "adaptive", "hybrid"])
+@pytest.mark.parametrize("kind", ["adaptive", "hybrid"])
 def test_subspace_trains(mnist_loaders, kind):
     """One training run per subspace mode, checking everything that run can show.
 
@@ -145,12 +144,10 @@ def test_subspace_trains(mnist_loaders, kind):
     torch.manual_seed(42)
     # hidden=32 rather than 64: half the parameters converge faster per step in a fixed
     # subspace rank, so this reaches a higher accuracy in a third of the wall clock.
-    # Do not shrink it further: at hidden=24 the linear floor fails at 26.2%.
+    # Do not shrink it further: at hidden=24 the adaptive floor fails at 26.2%.
     model = SmallMLP(hidden=32)
     layout = ParamLayout.from_module(model)
-    if kind == "linear":
-        subspace = LinearSubspace.from_layout(layout, rank=4)
-    elif kind == "adaptive":
+    if kind == "adaptive":
         subspace = AdaptiveSubspace.from_layout(
             layout, rank=128, rotation_mode="displacement", absorb_mode="periodic", absorb_interval=5
         )
@@ -164,7 +161,8 @@ def test_subspace_trains(mnist_loaders, kind):
         compile=False,
         seed=42,
         epsilon=LinearEpsilon(init=1.0, target=0.1, decay=0.01),
-        step_radius=10.0 if kind == "adaptive" else 4.5,
+        # Per mode: a single global projection wants a larger radius than a per-layer one.
+        step_radius={"adaptive": 10.0, "hybrid": 4.5}[kind],
         probe_radius=2.0,
         # K=1 is the library default and evaluates 31,320 candidates here against 93,960
         # at K=3, for higher accuracy on two of the three modes.
@@ -190,17 +188,15 @@ def test_subspace_trains(mnist_loaders, kind):
     finite_disps = [d for d in optimizer.state.displacement_sqnorms if d == d]
     assert sum(finite_disps) > 0, "every displacement was zero or NaN, so no step moved"
 
-    if kind != "linear":
-        # LinearSubspace has a fixed projection and never rotates, so it keeps no
-        # displacement history; the rotating subspaces steer their next basis with it.
-        assert optimizer.state.displacement_history_count > 0, "displacement history was never populated"
-        assert optimizer.state.absorb_count > 0, (
-            f"absorb never fired in {optimizer.state.iteration_count} steps with absorb_interval=5"
-        )
-        base = optimizer.state.base_params
-        assert any(not torch.equal(initial_base[k], base[k]) for k in initial_base), (
-            "absorb_count incremented but the base weights are unchanged"
-        )
+    # Both remaining classes rotate, so they steer their next basis with this history.
+    assert optimizer.state.displacement_history_count > 0, "displacement history was never populated"
+    assert optimizer.state.absorb_count > 0, (
+        f"absorb never fired in {optimizer.state.iteration_count} steps with absorb_interval=5"
+    )
+    base = optimizer.state.base_params
+    assert any(not torch.equal(initial_base[k], base[k]) for k in initial_base), (
+        "absorb_count incremented but the base weights are unchanged"
+    )
 
     # Against the untrained model, not against epoch 1: the first epoch's average is
     # taken over a model that is already improving, so it is a moving baseline.
@@ -210,12 +206,11 @@ def test_subspace_trains(mnist_loaders, kind):
         f"train loss did not fall: {initial_loss:.4f} -> {final_loss:.4f} (epochs: {tracker.losses})"
     )
 
-    # 10-class MNIST, so 10% is chance. Measured: linear 44.6%, adaptive 30.0%,
-    # hybrid 60.2%. Per-step coverage differs a lot between the families, so
-    # adaptive's global projection gets a lower floor than the per-layer ones.
-    # A floor at 2x chance would pass on a near-dead run; these sit just under
-    # the measured values instead.
-    floor = {"hybrid": 0.50, "linear": 0.32, "adaptive": 0.25}[kind]
+    # 10-class MNIST, so 10% is chance. Measured: adaptive 30.0%, hybrid 60.2%.
+    # Adaptive's single global projection covers less per step than the per-layer
+    # basis, so it gets a lower floor. A floor at 2x chance would pass on a
+    # near-dead run; these sit just under the measured values instead.
+    floor = {"hybrid": 0.50, "adaptive": 0.25}[kind]
     accuracy = _accuracy(model, test_loader)
     assert accuracy >= floor, f"{kind} accuracy {accuracy * 100:.1f}% is below the {floor * 100:.0f}% floor"
 
@@ -251,12 +246,11 @@ def test_mnist_gpu_full_space(mnist_loaders):
 
 @pytest.mark.gpu
 def test_mnist_gpu_subspace_particle_dim_8(mnist_loaders):
-    """subspace_particle_dim=8 (16 orthoplex vertices) plus absorb_every on CUDA.
+    """subspace_particle_dim=8 (16 orthoplex vertices) plus a periodic absorb on CUDA.
 
     Covers the GPU subspace pipeline: projection build, chunked probe evaluation, model
-    sync, and absorb folding into the base. Accuracy is not asserted; the bilinear B@A
-    factorization converges slowly by design and ``test_mnist_gpu_full_space`` owns
-    accuracy.
+    sync, and absorb folding into the base. Accuracy is not asserted;
+    ``test_mnist_gpu_full_space`` owns that.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -278,9 +272,8 @@ def test_mnist_gpu_subspace_particle_dim_8(mnist_loaders):
         probe_radius=60.0,
         num_probe=1,
         sinkhorn_max_iters=100,
-        subspace=LowRankSubspace.from_layout(layout, rank=4),
+        subspace=HybridSubspace.from_layout(layout, rank=4, absorb_mode="periodic", absorb_interval=10),
         subspace_particle_dim=8,
-        absorb_every=10,
         scale_cost="mean",
         chunk_size=256,
     )
@@ -298,5 +291,5 @@ def test_mnist_gpu_subspace_particle_dim_8(mnist_loaders):
     )
     base = optimizer.state.base_params
     assert any(not torch.equal(initial_params[k], base[k]) for k in initial_params), (
-        "base params unchanged, so absorb_every never triggered"
+        "base params unchanged, so the periodic absorb never triggered"
     )

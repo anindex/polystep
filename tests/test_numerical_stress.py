@@ -1,12 +1,7 @@
 """Numerical stress tests for the Sinkhorn solver and OT pipeline.
 
-Edge conditions that could expose hidden numerical issues: extreme epsilon at both
-limits, constant and negative costs, warm start across a 100x cost-scale change,
-non-uniform marginals, and ParamLayout round-trip under padding.
-
-Non-finite cost sanitisation lives in test_input_validation.py (unit) and
-test_regressions.py (the ordering contract); marginal satisfaction over
-many random problems lives in test_sinkhorn_numerics.py.
+Sanitisation lives in test_input_validation.py and test_regressions.py;
+random-problem marginal checks live in test_sinkhorn_numerics.py.
 """
 
 import torch
@@ -20,9 +15,7 @@ class TestSinkhornEdgeCases:
     def test_smaller_epsilon_concentrates_the_plan(self):
         """Lower eps means a sharper plan: each row's mass piles onto fewer columns.
 
-        The bound is relative, not absolute. With 10 rows of mass 1/10 feeding 6 columns
-        of capacity 1/6, some rows must split across two columns no matter how small eps
-        gets, so the eps -> 0 limit here has a min row share of 0.5, not 1.
+        Rows that must split across two columns cap the eps -> 0 row share at 0.5.
         """
         torch.manual_seed(0)
         n, m = 10, 6
@@ -39,8 +32,7 @@ class TestSinkhornEdgeCases:
     def test_very_large_epsilon_is_near_uniform(self):
         """As eps -> inf the plan approaches the independent coupling ``a b^T``.
 
-        The bound has to be relative: with uniform marginals every entry is already in
-        ``[0, 1/n]``, so an absolute tolerance of 0.1 against ``1/60`` cannot fail.
+        The bound is relative: an absolute tolerance could not fail at 1/(n*m) scale.
         """
         torch.manual_seed(0)
         n, m = 10, 6
@@ -62,7 +54,6 @@ class TestSinkhornEdgeCases:
 
         T = result.matrix
         assert torch.isfinite(T).all()
-        # Should be uniform
         row_sums = T.sum(dim=1)
         col_sums = T.sum(dim=0)
         assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-4)
@@ -72,7 +63,7 @@ class TestSinkhornEdgeCases:
         """Cost matrix with negative values should still work."""
         torch.manual_seed(0)
         n, m = 10, 6
-        C = torch.randn(n, m)  # mean 0, includes negatives
+        C = torch.randn(n, m)
         solver = SinkhornSolver(epsilon=1.0, max_iterations=200)
         result = solver.solve(C)
         T = result.matrix
@@ -88,10 +79,8 @@ class TestSinkhornEdgeCases:
 
         solver = SinkhornSolver(epsilon=1.0, max_iterations=200)
 
-        # Cold start on small costs
         result1 = solver.solve(C_small)
 
-        # Warm start on large costs using duals from small costs
         result2 = solver.solve(C_large, init_f=result1.f, init_g=result1.g)
         T2 = result2.matrix
         assert torch.isfinite(T2).all(), "Warm start with scale change produced NaN/Inf"
@@ -116,7 +105,7 @@ class TestParamLayoutStress:
     @pytest.mark.parametrize("particle_dim", [1, 3, 8])
     def test_roundtrip_various_particle_dims(self, particle_dim):
         """Round-trip should work for any particle_dim."""
-        model = nn.Linear(13, 7)  # Odd dimensions to test padding
+        model = nn.Linear(13, 7)
         layout = ParamLayout.from_module(model, particle_dim=particle_dim)
 
         assert layout.padded_size % particle_dim == 0

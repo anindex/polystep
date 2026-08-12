@@ -1,8 +1,7 @@
 """Tests for ParamLayout flatten/unflatten round-trip correctness.
 
-Covers the common architectures (MLP, CNN, tied weights, BatchNorm),
-``float64`` round-trip, parameterless modules, particle shape,
-metadata preservation, device handling, and deterministic generators.
+Covers MLP, CNN, tied weights, BatchNorm, float64, parameterless modules,
+particle shape, metadata, device handling, and deterministic generators.
 """
 
 import dataclasses
@@ -44,7 +43,6 @@ class SharedWeightsModel(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(10, 10)
         self.fc2 = nn.Linear(10, 10)
-        # Tie weights: fc2.weight IS fc1.weight
         self.fc2.weight = self.fc1.weight
 
     def forward(self, x):
@@ -77,8 +75,7 @@ def test_roundtrip_cnn():
     recovered = layout.unflatten(particles)
 
     sd = model.state_dict()
-    # Non-trainable buffers (running_mean/var, num_batches_tracked)
-    # are excluded from the particle layout - only trainable
+    # Non-trainable buffers are excluded from the layout; only trainable
     # parameters and their shared aliases are included.
     trainable_ptrs = {p.data_ptr() for n, p in model.named_parameters() if p.requires_grad}
     expected_keys = {k for k, v in sd.items() if v.data_ptr() in trainable_ptrs}
@@ -95,11 +92,9 @@ def test_roundtrip_shared_params():
     recovered = layout.unflatten(particles)
 
     sd = model.state_dict()
-    # Round-trip correctness
     for key in sd:
         assert torch.equal(sd[key], recovered[key]), f"Mismatch in {key}"
 
-    # Deduplication: particle array should be smaller than naive concat
     naive_total = sum(p.numel() for p in sd.values())
     assert layout.total_params < naive_total, (
         f"Shared params not deduplicated: total_params={layout.total_params}, naive={naive_total}"
@@ -122,7 +117,6 @@ def test_particle_shape():
 
     assert particles.ndim == 2, f"Expected 2D, got {particles.ndim}D"
     assert particles.shape[1] == layout.particle_dim
-    # Total elements must accommodate all params
     assert particles.shape[0] * particles.shape[1] >= layout.total_params
 
 
@@ -143,8 +137,7 @@ def test_param_entries_metadata():
     layout = ParamLayout.from_module(model)
 
     sd = model.state_dict()
-    # Build requires_grad lookup from named_parameters (state_dict
-    # values are always detached, so we need the live parameters).
+    # state_dict values are detached, so requires_grad must come from the live parameters.
     param_grad = {n: p.requires_grad for n, p in model.named_parameters()}
 
     for entry in layout.entries:
@@ -157,7 +150,6 @@ def test_param_entries_metadata():
         assert entry.requires_grad == expected_grad, (
             f"{entry.key}: requires_grad {entry.requires_grad} != {expected_grad}"
         )
-        # module_path is the prefix before the last dot
         if "." in entry.key:
             expected_path = entry.key.rsplit(".", 1)[0]
         else:

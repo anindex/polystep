@@ -1,12 +1,6 @@
-"""The optimizer actually learns.
-
-Everything else in the suite checks a piece: a solver returns a valid plan, a subspace
-round-trips, a step does not NaN. Nothing checked that the pieces together reduce a real
-loss and raise a real accuracy, because the only tests that did were the MNIST ones,
-which are ``slow``-marked and never run in CI.
+"""The optimizer actually learns: loss falls and accuracy beats chance.
 
 Synthetic separable data, fixed seed, no network, no download, under a second per case.
-If the optimizer stops optimizing, this is the test that fails.
 """
 
 import pytest
@@ -91,10 +85,7 @@ def test_optimizer_learns_a_separable_classification_task(kind):
 def test_a_zero_step_radius_does_not_learn():
     """Guards the test above: with no movement allowed, its thresholds must not be met.
 
-    Without this, a bug that turned ``train`` into a no-op would still leave the learning
-    test passing on a lucky initialization.
-
-    The weights do drift by ~1e-7 even at ``step_radius=0``: reconstructing
+    The weights still drift by ~1e-7 at ``step_radius=0``: reconstructing
     ``base + P @ coords`` and pushing it back through ``load_state_dict`` is a
     round-trip through fp32, so the bound is round-off scale, not exact equality.
     """
@@ -114,8 +105,8 @@ def test_a_zero_step_radius_does_not_learn():
 
 
 class _Recorder(TrainCallback):
-    """Records the exact per-step loss. Also makes ``train`` compute it, rather than
-    tracking the cheaper OT-cost proxy, which is what ``restore_best`` then uses."""
+    """Records the per-step loss. Also makes ``train`` compute it, rather than the
+    cheaper OT-cost proxy that ``restore_best`` uses."""
 
     def __init__(self, sink):
         self.sink = sink
@@ -132,11 +123,7 @@ def test_orthoplex_with_the_quadratic_model_beats_the_simplex_per_forward_pass()
     The orthoplex costs 2k vertices against the simplex's k+1, so it pays off only
     with the finite-difference machinery its antithetic pairing enables. The budget
     is candidate evaluations, not steps, or the orthoplex just gets more forwards.
-
-    The budget now charges the per-particle centre evaluations the quadratic model
-    needs, which it previously did not. That costs the orthoplex leg about half its
-    steps and leaves the measured ratio at 1.51. The threshold is 1.25 rather than
-    just under that: a 0.7% margin flips on any BLAS blocking difference.
+    A thin margin would flip on any BLAS blocking difference, hence the 1.25 bar.
     """
     from polystep.cost_nn import NNCostEvaluator
     from polystep.transform import ParamLayout

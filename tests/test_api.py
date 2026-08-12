@@ -70,11 +70,6 @@ class TestTrainCallback:
         cb = TrainCallback()
         assert cb.on_step_end({}) is False
 
-    def test_base_on_epoch_end_noop(self):
-        cb = TrainCallback()
-        result = cb.on_epoch_end({})
-        assert result is None
-
 
 class TestTrain:
     def test_train_returns_model(self):
@@ -208,10 +203,8 @@ class TestLoggingCallback:
 class TestEarlyStoppingCallback:
     def test_stops_after_patience(self):
         cb = EarlyStoppingCallback(patience=3, min_delta=0.01)
-        # Improving losses: all return False
         for loss in [1.0, 0.9, 0.8]:
             assert cb.on_step_end({"loss": loss, "step": 0}) is False
-        # Stagnating losses: counter increments
         assert cb.on_step_end({"loss": 0.8, "step": 1}) is False  # counter=1
         assert cb.on_step_end({"loss": 0.8, "step": 2}) is False  # counter=2
         assert cb.on_step_end({"loss": 0.8, "step": 3}) is True  # counter=3 >= patience
@@ -222,11 +215,9 @@ class TestEarlyStoppingCallback:
         cb.on_step_end({"loss": 0.95, "step": 1})  # improvement
         cb.on_step_end({"loss": 0.95, "step": 2})  # stagnation counter=1
         cb.on_step_end({"loss": 0.95, "step": 3})  # counter=2
-        # Now improve
         cb.on_step_end({"loss": 0.8, "step": 4})  # improvement, counter resets
         assert cb.on_step_end({"loss": 0.8, "step": 5}) is False  # counter=1
-        assert cb.on_step_end({"loss": 0.8, "step": 6}) is False  # counter=2
-        # counter=2 < patience=3, should NOT stop
+        assert cb.on_step_end({"loss": 0.8, "step": 6}) is False  # counter=2 < patience=3
 
     def test_min_delta_threshold(self):
         cb = EarlyStoppingCallback(patience=2, min_delta=0.1)
@@ -313,12 +304,9 @@ def test_train_with_logging_and_early_stop(capsys):
     result = train(model, dl, nn.MSELoss(), opt, config)
     assert result is model
 
-    # Verify logging output was produced
     captured = capsys.readouterr().out
     assert "[Step 0]" in captured
 
-    # Verify training ran (callback mechanism works).
-    # With multi-particle architecture, loss may continue improving
-    # so early stopping may or may not trigger within 20 steps.
+    # Early stopping may or may not trigger within 20 steps; just check training ran.
     assert opt.state.iteration_count > 0
     assert opt.state.iteration_count <= 20

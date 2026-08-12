@@ -1,10 +1,8 @@
 """Parity and reach of the site-aware vmap evaluator.
 
 A candidate perturbs one contiguous run of the flat parameter vector, so it differs
-from the base inside a single parameter tensor. :class:`SiteVmapEvaluator` batches only
-that tensor and leaves the rest shared, which makes the graph ahead of it run once.
-Unlike the sparse-delta path it assumes nothing about the module set, so it has to
-agree with the plain vmap path on models that path is the only alternative for.
+from the base inside a single parameter tensor; the evaluator batches only that
+tensor and must agree with the plain vmap path it replaces.
 """
 
 import pytest
@@ -19,12 +17,8 @@ PDIM = 2
 
 
 class RepackedLinear(nn.Module):
-    """A layer whose forward reads state ``functional_call`` cannot substitute.
-
-    Stands in for a photonic MZI mesh: the transfer matrix is rebuilt from phase
-    parameters through a reference captured when the layer was packed. An in-place
-    write reaches that storage; swapping the Parameter attribute does not, so every
-    candidate scores at the base weight.
+    """A layer whose forward reads state ``functional_call`` cannot substitute:
+    only an in-place write reaches the packed storage.
     """
 
     def __init__(self, d_in, d_out):
@@ -177,12 +171,8 @@ def test_sparse_delta_still_wins_where_it_applies():
 
 
 def test_subspace_step_on_a_conv_model_matches_the_materializing_path():
-    """A per-layer block maps to one parameter, so the site argument holds in
-    coordinate space too.
-
-    The offset is relative to the barycentre the shared weights already carry. Adding
-    the absolute coordinates instead counts it twice, which is invisible on the first
-    step because the coordinates start at zero.
+    """Per-layer blocks map to one parameter, so the site argument holds in
+    coordinate space; the offset is relative to the barycentre the weights carry.
     """
     from polystep import HybridSubspace, ParamLayout
 
@@ -212,11 +202,8 @@ def test_subspace_step_on_a_conv_model_matches_the_materializing_path():
 
 
 def test_the_stateless_paths_score_a_repacked_model_blind():
-    """The failure the in-place contract exists to prevent, stated as a measurement.
-
-    Without this the guard below looks like a performance preference rather than a
-    correctness one: the site path does not error on such a model, it returns one
-    number for every candidate and the run reports success while measuring nothing.
+    """On a repacked model the stateless paths score every candidate blind: one
+    loss for all candidates, and no error.
     """
     torch.manual_seed(0)
     model = nn.Sequential(RepackedLinear(6, 5), nn.ReLU(), RepackedLinear(5, 3))
@@ -246,11 +233,8 @@ def test_the_stateless_paths_score_a_repacked_model_blind():
 
 @pytest.mark.parametrize("subspace", [False, True])
 def test_forced_inplace_disarms_every_stateless_path(subspace):
-    """``use_inplace=True`` is a correctness contract, not only a memory one.
-
-    It already outranked the bmm path. The site-aware paths score through
-    ``functional_call`` for the same reason bmm does, so they have to honour it too --
-    in full space and in a subspace, since each arms a different set.
+    """``use_inplace=True`` is a correctness contract: the site-aware paths score
+    through ``functional_call`` and must honour it, in full space and subspace.
     """
     from polystep import HybridSubspace
 
@@ -278,11 +262,7 @@ def test_forced_inplace_disarms_every_stateless_path(subspace):
 
 
 def test_swapping_back_to_an_unforced_evaluator_rearms():
-    """The disarm must not be permanent for the model and loss it happened on.
-
-    The fast paths are rebuilt only when they are absent, so setting them to None left
-    a later unforced evaluator on the same model and loss with no fast path at all.
-    """
+    """Swapping back to an unforced evaluator must rebuild the fast paths."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 3))
     loss_fn = nn.CrossEntropyLoss()  # one instance, so the cache key would not move
@@ -296,12 +276,7 @@ def test_swapping_back_to_an_unforced_evaluator_rearms():
 
 
 def test_forced_inplace_disarms_the_factored_low_rank_path():
-    """The low-rank identity is stateless too, and it dispatches on its own branch.
-
-    ``_step_monolithic`` reaches ``elif _factored_eval is not None`` after the site
-    branches, so leaving it armed keeps the model's forward unrun on exactly the models
-    the guard exists for.
-    """
+    """The factored low-rank path is stateless too; forced in-place must disarm it."""
     from polystep import FactoredSubspace
 
     torch.manual_seed(0)
@@ -320,11 +295,8 @@ def test_forced_inplace_disarms_the_factored_low_rank_path():
 
 
 def test_a_forward_that_draws_randomness_falls_back_instead_of_crashing():
-    """The step calls the site path directly, so it needs its own vmap fallback.
-
-    ``NNCostEvaluator.evaluate`` demotes a vmap failure to a sequential loop; the site
-    path had no such guard, so a per-forward noise draw killed the run instead of
-    degrading it. vmap's default is ``randomness='error'``.
+    """A per-forward noise draw makes vmap fail (randomness='error'); the site
+    path must fall back to a sequential loop, not crash.
     """
     torch.manual_seed(0)
     model = NoisyMLP()
@@ -368,10 +340,8 @@ def _dense_reference(site, projections, bary_sd, spec, col_start, dcoords):
 
 @pytest.mark.parametrize("projection_type", ["dense", "sparse"])
 def test_the_block_diagonal_correction_matches_the_dense_one(projection_type):
-    """Only pdim columns per group are nonzero, so the correction is a per-group bmm.
-
-    The dense ``dcoords @ P.t()`` cost O(n * num_coords * num_params) where the nonzero
-    structure allows O(n * pdim * num_params). Both must give the same losses.
+    """Only pdim columns per group are nonzero, so the block-diagonal bmm must
+    match the dense ``dcoords @ P.t()``.
     """
     from polystep import HybridSubspace
 

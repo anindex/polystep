@@ -1,10 +1,8 @@
 """Lifecycle of the cached fused block-diagonal projection.
 
-``reconstruct_batch`` scores candidates through the cached ``_fused_P`` while
-``_sync_model`` writes the barycenter through ``state.hybrid_projections``. If a basis
-change refreshes one and not the other, the optimizer evaluates in one basis and steps
-in another, with no error raised. The rebuild is a full dense reconstruction, so it must
-also not run on the steps where the basis held still.
+If a basis change refreshes the fused cache but not the projections (or vice versa),
+the optimizer evaluates in one basis and steps in another, with no error raised. The
+rebuild is a full dense reconstruction, so it must not run when the basis held still.
 """
 
 import torch
@@ -63,11 +61,7 @@ def test_fused_matrix_tracks_the_basis_across_an_aligned_absorb():
 
 
 def test_blockwise_mode_still_rotates_a_per_layer_subspace():
-    """absorb_interval must not be silently ignored under a block strategy.
-
-    The blockwise path tracked only state.projection, which a HybridSubspace does not
-    use, so its basis stayed frozen for the whole run with no error raised.
-    """
+    """absorb_interval must not be silently ignored under a block strategy."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
     layout = ParamLayout.from_module(model)
@@ -174,10 +168,8 @@ def test_absorb_reuses_the_seeded_basis_without_redrawing_it():
 def test_rank_transition_rebuilds_the_fused_projection():
     """A transition swaps in a new-rank basis, so the fused matrix must follow it.
 
-    The step only rebuilds on a basis-object change, and nothing changes the basis again
-    after a transition, so a transition that does not build its own leaves ``_fused_P``
-    at the old rank's shape for the rest of the run. Silent: reconstruction still works
-    through the per-layer path, only slower.
+    The step only rebuilds on a basis-object change, so a transition that does not
+    build its own leaves ``_fused_P`` at the old rank's shape for the rest of the run.
     """
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 16))
@@ -199,10 +191,3 @@ def test_rank_transition_rebuilds_the_fused_projection():
     assert fused is not None, "fused projection lost after the rank transition"
     assert fused.shape[1] < before, f"fused matrix kept the old rank's width: {fused.shape[1]} vs {before}"
     assert fused.shape[1] == sum(s.num_coords for s, _ in opt.subspace._fused_dense_specs)
-
-
-if __name__ == "__main__":
-    test_fused_projection_not_rebuilt_when_static()
-    test_absorb_reuses_the_seeded_basis_without_redrawing_it()
-    test_rank_transition_rebuilds_the_fused_projection()
-    print("ok")

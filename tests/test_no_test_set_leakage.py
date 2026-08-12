@@ -1,6 +1,4 @@
-"""The main runners must expose --allow-test-leakage so test-set selection is
-opt-in. A source scan avoids importing the runners' heavy optional deps.
-"""
+"""The main runners must expose --allow-test-leakage so test-set selection is opt-in."""
 
 import ast
 import inspect
@@ -19,10 +17,7 @@ RUNNER_DIR = REPO_ROOT / "experiments" / "runners"
 
 @pytest.mark.parametrize("runner", RUNNERS)
 def test_runner_exposes_allow_test_leakage(runner, require_experiments):
-    """The flag must be a live argparse option, not a string that appears in the file.
-
-    A substring scan passes on a commented-out or docstring mention.
-    """
+    """The flag must be a live argparse option, not just a string in the file."""
     path = RUNNER_DIR / runner
     assert path.exists(), f"{runner} is missing; the leakage guard cannot be checked"
 
@@ -40,10 +35,7 @@ def test_runner_exposes_allow_test_leakage(runner, require_experiments):
         f"found options: {sorted(o for o in added if o.startswith('--'))}"
     )
 
-    # Registering the flag proves nothing on its own. The guard that decides which
-    # split selects the reported model is ``audit_no_leakage``, so the flag has to
-    # reach it: hardcoding ``audit_no_leakage=True`` leaves the option inert and the
-    # registration check green.
+    # The flag must reach audit_no_leakage; hardcoding it would leave the option inert.
     wired = [
         kw
         for node in ast.walk(tree)
@@ -66,12 +58,7 @@ def _tiny_loaders():
 
 
 def test_run_mnist_dispatch_gives_every_method_a_val_split(require_experiments, monkeypatch, tmp_path):
-    """run_method must hand the held-out split to cmaes/es/spsa/adam too.
-
-    The regression this guards: the dispatch used to pass ``val_loader``
-    inside ``if method == "polystep"`` and drop it for everything else,
-    so every baseline selected its reported checkpoint on the test set.
-    """
+    """run_method must hand the held-out split to every method, not only polystep."""
     sys.path.insert(0, str(REPO_ROOT))
     import experiments.runners.run_mnist as run_mnist
 
@@ -122,11 +109,9 @@ def test_baselines_accept_a_validation_split(require_experiments):
     from experiments.baselines.openai_es import train_openai_es
     from experiments.baselines.sgd_baseline import train_sgd
     from experiments.baselines.spsa import train_spsa
-    from polystep.benchmarks.baselines import train_cmaes
 
     for fn in (train_sgd, train_openai_es, train_spsa):
         assert "val_loader" in inspect.signature(fn).parameters, f"{fn.__name__} has no val_loader"
-    assert "val_data" in inspect.signature(train_cmaes).parameters, "train_cmaes has no val_data"
 
 
 # --- (b) a leaked run cannot become a paper number -------------------------

@@ -1,11 +1,13 @@
 """Shared test fixtures and pytest configuration for polystep tests."""
 
+import contextlib
 import gzip
 import os
+import shutil
 import struct as pystruct
 import sysconfig
 from urllib.error import URLError
-from urllib.request import urlretrieve
+from urllib.request import urlopen
 
 import numpy as np
 import pytest
@@ -17,12 +19,7 @@ from polystep.cost_nn import NNCostEvaluator
 
 
 def _python_include_dir() -> str:
-    """Return the directory containing ``Python.h`` for the active interpreter.
-
-    ``torch.compile``'s C++ backend needs ``Python.h``, which may not
-    be in the standard ``/usr/include/pythonX.Y`` when using venvs or
-    conda environments.
-    """
+    """Return the directory containing ``Python.h`` for the active interpreter."""
     include_dir = sysconfig.get_path("include")
     if os.path.isfile(os.path.join(include_dir, "Python.h")):
         return include_dir
@@ -38,11 +35,7 @@ def _python_include_dir() -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def _cplus_include_path():
-    """Prepend the Python include directory to ``CPLUS_INCLUDE_PATH``.
-
-    Scoped to the session and unwound at teardown so the mutation does
-    not leak into the parent shell or sibling pytest processes.
-    """
+    """Prepend the Python include directory to ``CPLUS_INCLUDE_PATH``, restored at teardown."""
     include_dir = _python_include_dir()
     previous = os.environ.get("CPLUS_INCLUDE_PATH")
     if include_dir not in (previous or ""):
@@ -56,8 +49,8 @@ def _cplus_include_path():
             os.environ["CPLUS_INCLUDE_PATH"] = previous
 
 
-# The slow tests train at batch 512, where the intra-op pool does pay off. Capped at 16
-# to leave cores free, floored at 2 so a 4-core CI runner does not land on one thread.
+# The intra-op pool pays off at the slow tests' batch 512; capped at 16 to leave
+# cores free, floored at 2 so small CI runners keep more than one thread.
 _SLOW_TEST_THREADS = max(2, min(16, (os.cpu_count() or 1) - 8))
 _FAST_TEST_THREADS = int(os.environ.get("POLYSTEP_TEST_THREADS", "1"))
 
@@ -65,10 +58,8 @@ _FAST_TEST_THREADS = int(os.environ.get("POLYSTEP_TEST_THREADS", "1"))
 def pytest_configure(config):
     """Register custom markers and pin torch to one intra-op thread.
 
-    The fast suite's tensors are small enough that the intra-op pool's fork/join costs
-    more than the arithmetic, and under ``-n auto`` it also stops each worker grabbing
-    every core. ``POLYSTEP_TEST_THREADS`` overrides the count; ``slow`` tests get a
-    multi-threaded pool from the ``_torch_threads`` fixture. Numbers in CONTRIBUTING.md.
+    The fast suite's tensors are small enough that the intra-op pool costs more than
+    the arithmetic. ``POLYSTEP_TEST_THREADS`` overrides; numbers in CONTRIBUTING.md.
     """
     config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
     config.addinivalue_line("markers", "gpu: marks tests requiring CUDA GPU")
@@ -77,11 +68,8 @@ def pytest_configure(config):
 
 @pytest.fixture(autouse=True)
 def _seed_global_rng():
-    """Seed the global RNG before every test.
-
-    Per test, not per call, so tests needing distinct successive draws still work.
-    Without it, files drawing with a bare ``torch.randn`` depend on execution order.
-    """
+    """Seed the global RNG before every test, so bare ``torch.randn`` draws do not
+    depend on execution order."""
     torch.manual_seed(1234)
 
 
@@ -89,14 +77,8 @@ def _seed_global_rng():
 def _torch_threads(request):
     """Give ``slow`` tests a multi-threaded but unsaturated pool, pin everything else.
 
-    Restores the count after EVERY test, not only the slow ones. A test that calls
-    into ``experiments.runners.common.set_seed`` gets ``pin_threads`` with it, which
-    widens the intra-op pool to ``nproc - 2`` and leaves it there. A wide pool
-    changes the reduction order of every float sum that follows, which is enough to
-    push a tight-tolerance Sinkhorn solve past its convergence threshold: two tests
-    in unrelated files failed under full-suite ordering while passing in isolation.
-
-    Switching the count back and forth does not leave the pool degraded.
+    Restores the count after every test: a widened pool changes float reduction
+    order, which can push a tight-tolerance Sinkhorn solve past its threshold.
     """
     want = _SLOW_TEST_THREADS if "slow" in request.keywords else _FAST_TEST_THREADS
     torch.set_num_threads(want)
@@ -109,11 +91,7 @@ def _torch_threads(request):
 
 @pytest.fixture
 def require_experiments():
-    """Skip the requesting test when the reproduction harness is absent.
-
-    ``experiments/`` is the paper reproduction harness and is deliberately not part of
-    the distribution, so tests that read or import it cannot run from an sdist.
-    """
+    """Skip when ``experiments/`` is absent; it is not part of the distribution."""
     import pathlib
 
     if not (pathlib.Path(__file__).resolve().parent.parent / "experiments" / "runners").is_dir():
@@ -122,11 +100,8 @@ def require_experiments():
 
 @pytest.fixture
 def cost_grid():
-    """Yield a (cost, eps) grid for solver overflow / stability stress tests.
-
-    Cost ranges {1, 10, 100, 1000} crossed with eps {0.01, 0.1, 1, 10} give
-    16 cells covering small-eps explosion and large-eps near-uniform regimes.
-    """
+    """Yield a 16-cell (cost, eps) grid covering small-eps explosion and large-eps
+    near-uniform regimes."""
     cost_ranges = (1.0, 10.0, 100.0, 1000.0)
     eps_values = (0.01, 0.1, 1.0, 10.0)
     return [(c, e) for c in cost_ranges for e in eps_values]
@@ -141,20 +116,13 @@ def simple_mlp():
 
 @pytest.fixture
 def make_closure():
-    """Factory fixture that creates an NNCostEvaluator closure for a model.
-
-    Usage::
-
-        def test_example(simple_mlp, make_closure):
-            closure = make_closure(simple_mlp)
-            # closure(batched_params) -> losses
-    """
+    """Factory fixture: ``make_closure(model)`` returns a closure mapping batched
+    params to losses."""
 
     def _make_closure(model, loss_fn=None, num_samples=16, input_dim=4, output_dim=None):
         torch.manual_seed(42)
         if loss_fn is None:
             loss_fn = nn.MSELoss()
-        # Infer output dim from last linear layer
         if output_dim is None:
             for m in reversed(list(model.modules())):
                 if isinstance(m, nn.Linear):
@@ -202,16 +170,21 @@ def _read_idx_labels(path):
 def mnist_arrays():
     """Download MNIST once per session and return normalized ``(train_x, train_y, test_x, test_y)``.
 
-    Skips only on a download failure. A gzip or IDX parse error is a real bug and must
-    propagate rather than silently skip the file.
+    Skips only on download failure; a gzip or IDX parse error is a real bug and must
+    propagate.
     """
     os.makedirs(MNIST_DIR, exist_ok=True)
     for filename in MNIST_FILES.values():
         path = os.path.join(MNIST_DIR, filename)
         if not os.path.exists(path):
             try:
-                urlretrieve(MNIST_URL + filename, path)
+                # Timeout, or a dead mirror hangs the session fixture.
+                with contextlib.closing(urlopen(MNIST_URL + filename, timeout=30)) as src:
+                    with open(path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
             except (URLError, OSError) as exc:
+                if os.path.exists(path):
+                    os.remove(path)
                 pytest.skip(f"MNIST download failed ({exc}); needs network access")
 
     mean, std = 0.1307, 0.3081
@@ -226,8 +199,7 @@ def mnist_arrays():
 def mnist_loaders(mnist_arrays):
     """Factory: ``mnist_loaders(n_train, n_test, batch_size, downsample=1)``.
 
-    ``downsample`` average-pools the images (2 -> 14x14, 4 -> 7x7) to shrink the input
-    dimension, which is what keeps the full-space OT problem tractable on CPU.
+    ``downsample`` average-pools the images to keep the OT problem tractable on CPU.
     """
     train_x, train_y, test_x, test_y = mnist_arrays
 
@@ -239,8 +211,23 @@ def mnist_loaders(mnist_arrays):
             te_x = nn.functional.avg_pool2d(te_x, downsample)
         train_ds = TensorDataset(tr_x, torch.from_numpy(train_y[:n_train].copy()))
         test_ds = TensorDataset(te_x, torch.from_numpy(test_y[:n_test].copy()))
+        # A per-loader generator is seeded once at construction and advances per
+        # epoch, so the Nth run in a process sees the Nth stream and only
+        # reseed_loaders can rewind it.
+        try:
+            from experiments.runners.common import seeded_loader_kwargs
+        except ModuleNotFoundError:
+            # An sdist ships no experiments/, so skip rather than error the whole run.
+            pytest.skip("experiments/runners not present (running outside the repo)")
+
         return (
-            DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0),
+            DataLoader(
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0,
+                **seeded_loader_kwargs(42),
+            ),
             DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0),
         )
 
@@ -251,10 +238,8 @@ def mnist_loaders(mnist_arrays):
 def regression_closure():
     """Factory for a closure whose cost depends on the parameters.
 
-    Returns a callable with two extras attached: ``initial_loss`` (the single-model loss
-    at construction) and ``true_loss()`` (the current single-model loss). Tests that
-    assert descent need both; a closure returning ``torch.rand`` drives the cost matrix,
-    the plan and the barycentric step with noise, so nothing downstream is under test.
+    Attaches ``initial_loss`` and ``true_loss()``; tests that assert descent need
+    both, since a random-cost closure would leave nothing downstream under test.
     """
 
     def _build(model, num_samples=32, seed=0):

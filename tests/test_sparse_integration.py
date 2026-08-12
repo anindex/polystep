@@ -1,8 +1,4 @@
-"""Integration tests for sparse projection in PolyStepOptimizer.
-
-Covers the projection_type parameter, sparse projection creation, step execution,
-rotation, absorb, and dtype compatibility.
-"""
+"""Integration tests for sparse projection in PolyStepOptimizer."""
 
 import math
 
@@ -17,11 +13,7 @@ from polystep.projection import SparseRandomProjection
 
 @pytest.fixture
 def small_model():
-    """Small model for quick testing (below auto-sparse threshold).
-
-    This model has ~67 params which is below the 10K sparse threshold.
-    Use medium_model for sparse projection tests.
-    """
+    """Small model below the auto-sparse threshold."""
     torch.manual_seed(42)
     return nn.Sequential(
         nn.Linear(10, 5),
@@ -32,11 +24,7 @@ def small_model():
 
 @pytest.fixture
 def medium_model():
-    """Medium model above tiny threshold but below auto-sparse threshold.
-
-    Has ~11K params which is above 10K tiny threshold but below 1M auto-sparse.
-    Suitable for testing explicit sparse projection.
-    """
+    """Model above the 10K tiny threshold but below the 1M auto-sparse threshold."""
     torch.manual_seed(42)
     return nn.Sequential(
         nn.Linear(100, 100),  # 10100 params
@@ -95,12 +83,7 @@ def test_projection_type_invalid_raises(small_model, adaptive_subspace):
 
 
 def test_sparse_projection_step_descends(medium_model, medium_subspace, regression_closure):
-    """Sparse projection actually optimizes, not merely runs.
-
-    The closure has to depend on the parameters. With ``torch.rand`` the cost matrix,
-    the plan and the barycentric step are all driven by noise, so nothing about the
-    sparse pipeline is under test.
-    """
+    """Sparse projection must descend on a parameter-dependent closure."""
     opt = PolyStepOptimizer(
         medium_model,
         subspace=medium_subspace,
@@ -123,16 +106,12 @@ def test_sparse_projection_step_descends(medium_model, medium_subspace, regressi
 
 
 def test_sparse_projection_absorb_works(medium_model, medium_subspace, regression_closure):
-    """Absorb with sparse projection creates new SparseRandomProjection.
-
-    Uses medium_model (>10K params) to avoid tiny model fallback.
-    """
-    # Configure for aggressive absorb
+    """Absorb with sparse projection builds a fresh SparseRandomProjection."""
     sub = AdaptiveSubspace(
         full_dim=medium_subspace.full_dim,
         subspace_dim=medium_subspace.subspace_dim,
         absorb_mode="periodic",
-        absorb_interval=2,  # Absorb every 2 steps
+        absorb_interval=2,
         _entry_specs=medium_subspace._entry_specs,
     )
 
@@ -160,10 +139,7 @@ def test_sparse_projection_absorb_works(medium_model, medium_subspace, regressio
 
 
 def test_sparse_projection_dimensions(medium_model, medium_subspace):
-    """Sparse projection has correct full_dim and subspace_dim.
-
-    Uses medium_model (>10K params) to avoid tiny model fallback.
-    """
+    """Sparse projection reports the subspace's full_dim and subspace_dim."""
     opt = PolyStepOptimizer(
         medium_model,
         subspace=medium_subspace,

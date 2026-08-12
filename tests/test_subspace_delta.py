@@ -61,9 +61,8 @@ def test_matches_reconstruct_batch(model_fn, name, sparse, batch):
     bary_sd = sub.apply_perturbation(projections, base_sd, bary)
 
     n_groups, n_cand = 2, 3
-    # One site per coordinate block, taken at the block start, so weight and bias
-    # entries of every layer are covered without rebuilding the batch thousands of
-    # times. resolve_site rejects the blocks too narrow to hold n_groups particles.
+    # One site per coordinate block, at the block start, so weight and bias entries
+    # of every layer are covered; resolve_site rejects blocks too narrow for n_groups.
     starts = sorted({s.flat_start // pdim for s in sub.specs})
     checked, kinds = 0, set()
     for start_particle in starts:
@@ -117,11 +116,7 @@ def test_try_build_declines_a_non_mlp():
 
 
 def test_subspace_blockwise_step_scores_through_the_delta_path():
-    """A subspace block-wise step must reach the delta path and agree with the dense one.
-
-    Block-wise reconstructed a full weight set per candidate, so the subspace delta
-    evaluator was unreachable from it.
-    """
+    """A subspace block-wise step must reach the delta path and agree with the dense one."""
     from polystep import HybridSubspace, ParamLayout, PolyStepOptimizer
     from polystep.cost_nn import NNCostEvaluator
 
@@ -167,11 +162,7 @@ def test_subspace_blockwise_step_scores_through_the_delta_path():
     ids=["fp32", "bf16"],
 )
 def test_optimizer_step_matches_the_materializing_path(mixed, dtype, tol):
-    """The step must agree with reconstruct_batch, mixed precision included.
-
-    Disabling it whenever mixed_precision is set costs bf16 runs the fast path silently,
-    with nothing to show they gave it up.
-    """
+    """The step must agree with reconstruct_batch, mixed precision included."""
     from polystep import HybridSubspace, ParamLayout, PolyStepOptimizer
 
     def build(register):
@@ -201,11 +192,8 @@ def test_optimizer_step_matches_the_materializing_path(mixed, dtype, tol):
 
 
 def test_resolve_site_declines_an_unprojected_weight():
-    """Only a projected weight or an unprojected bias has a correction here.
-
-    An unprojected weight's coordinates index the flattened weight rather than output
-    units, so neither branch applies and it has to fall back.
-    """
+    """An unprojected weight's coordinates index the flattened weight, not output
+    units, so neither correction branch applies and it must fall back."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(64, 16), nn.ReLU(), nn.Linear(16, 10))
     _, sub, _, _ = _setup(model)
@@ -219,12 +207,9 @@ def test_resolve_site_declines_an_unprojected_weight():
 
 
 def test_basis_products_matches_the_materialized_column_block():
-    """The dense branch reads P as a strided view instead of gathering and transposing it.
-
-    ``P`` is ``(d_out*d_in, num_coords)`` row-major, so ``P.view(d_out, d_in, -1)[o, i, j]``
-    is ``M_j[o, i]``. Wrong index arithmetic there silently scores every candidate against
-    a transposed or shifted basis, which no loss-level assertion would localize.
-    """
+    """``P`` is ``(d_out*d_in, num_coords)`` row-major, so
+    ``P.view(d_out, d_in, -1)[o, i, j]`` is ``M_j[o, i]``; wrong index arithmetic
+    there silently scores against a transposed basis."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(64, 16), nn.ReLU(), nn.Linear(16, 10))
     _, sub, projections, _ = _setup(model)

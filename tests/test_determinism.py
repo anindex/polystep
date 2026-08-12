@@ -1,9 +1,8 @@
 """Two identically seeded runs must produce the same loss trajectory.
 
-Guards the run-to-run drift recorded in CHANGELOG.md: seeding alone left
-cuDNN autotuning, TF32 and the DataLoader shuffle order free, so repeats
-of the same seed diverged. ``set_seed`` now calls ``set_deterministic``,
-and every loader carries a seeded generator.
+Seeding alone leaves cuDNN autotuning, TF32 and the DataLoader shuffle order
+free, so ``set_seed`` also pins deterministic kernels and every loader carries
+a seeded generator.
 """
 
 import sys
@@ -49,11 +48,14 @@ def _restore_global_determinism_flags():
 def _train_once(train_loader, seed=42, epochs=2, device="cpu"):
     """Train a tiny MLP with PolyStep and return the per-step losses."""
     sys.path.insert(0, str(REPO_ROOT))
-    from experiments.runners.common import set_seed
+    from experiments.runners.common import reseed_loaders, set_seed
     from polystep.cost_nn import NNCostEvaluator
     from polystep.optimizer import PolyStepOptimizer
 
     set_seed(seed)
+    # A loader's own generator advances per epoch and ignores the global RNG, so
+    # the second run must rewind it to see the same stream.
+    reseed_loaders(seed, train_loader)
     # Built after seeding: identical initial weights are half of the claim.
     model = nn.Sequential(nn.Flatten(), nn.Linear(49, 16), nn.ReLU(), nn.Linear(16, 10)).to(device)
     loss_fn = nn.CrossEntropyLoss()

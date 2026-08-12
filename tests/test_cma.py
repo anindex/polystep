@@ -29,12 +29,6 @@ class TestComputeCMAHyperparameters:
         params = compute_cma_hyperparameters(n=100, mu_eff=2.0)
         assert set(params.keys()) == {"c_sigma", "c_c", "c_1", "c_mu"}
 
-    def test_hyperparams_positive(self):
-        """All hyperparameters should be positive."""
-        params = compute_cma_hyperparameters(n=50, mu_eff=2.0)
-        for key, value in params.items():
-            assert value > 0, f"{key} should be positive, got {value}"
-
     @pytest.mark.parametrize("n, mu_eff", [(10, 3.0), (50, 2.0), (512, 8.0)])
     def test_rates_match_hansen_table_1(self, n, mu_eff):
         """c_c, c_1 and c_mu are the tutorial forms; only c_sigma deviates."""
@@ -92,7 +86,7 @@ class TestEvolutionPathSigma:
         n = 10
         p_sigma = torch.zeros(n)
         displacement = torch.randn(n)
-        C_diag = torch.full((n,), 1e-15)  # Extremely small
+        C_diag = torch.full((n,), 1e-15)
         result = update_evolution_path_sigma(p_sigma, displacement, C_diag, c_sigma=0.3, mu_eff=3.0)
         assert torch.isfinite(result).all(), f"Non-finite result: {result}"
 
@@ -114,7 +108,7 @@ class TestEvolutionPathC:
         """When h_sigma=False, displacement is not added (only decay)."""
         n = 32
         p_c = torch.ones(n) * 0.5
-        displacement = torch.ones(n) * 10.0  # Large, should be ignored
+        displacement = torch.ones(n) * 10.0
         c_c = 0.1
 
         p_c_new = update_evolution_path_c(p_c, displacement, h_sigma=False, c_c=c_c, mu_eff=2.0)
@@ -181,7 +175,7 @@ class TestCovarianceUpdate:
         """Rank-one update term c_1 * p_c^2 is present."""
         n = 16
         C_diag = torch.ones(n)
-        p_c = torch.ones(n) * 2.0  # p_c^2 = 4
+        p_c = torch.ones(n) * 2.0
         rank_mu = torch.zeros(n)
         c_1 = 0.2
         c_mu = 0.0

@@ -26,7 +26,7 @@ def test_tell_requires_ask_first():
 
 
 def test_tell_keeps_the_best_candidate_it_was_shown():
-    """``best_solution`` is what the adapter exists to return, and only its type was checked."""
+    """``best_solution`` must be the best candidate ever shown, not just the latest round's."""
     es = PolyStepES(3, num_particles=2, seed=0)
     candidates = es.ask()
     fitness = _sphere(candidates)

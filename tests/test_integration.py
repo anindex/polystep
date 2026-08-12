@@ -1,11 +1,6 @@
-"""Feature interaction tests: cross-module feature combinations.
-
-Tests combinations NOT already covered by test_optimizer.py:
-- subspace + momentum
-- blockwise + adaptive radius
-- subspace + blockwise (combined mode)
-- API-level integration (train() with feature combos)
-- Parametric improvements: particle_dim, omega, rank_schedule, adaptive_probes
+"""Feature interaction tests: cross-module feature combinations not covered by
+test_optimizer.py (subspace+momentum, blockwise+adaptive radius, combined mode,
+train() API combos, and the particle_dim/omega/rank_schedule/adaptive_probes knobs).
 """
 
 import math
@@ -18,7 +13,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from polystep import PolyStepOptimizer, train, TrainConfig, RankSchedule
 from polystep.cost_nn import NNCostEvaluator
 from polystep.hybrid_subspace import HybridSubspace
-from polystep.subspace import LowRankSubspace, LinearSubspace
 from polystep.transform import ParamLayout
 
 
@@ -28,7 +22,7 @@ class TestFeatureInteractions:
         torch.manual_seed(42)
         model = simple_mlp
         layout = ParamLayout.from_module(model)
-        subspace = LowRankSubspace.from_layout(layout, rank=4)
+        subspace = HybridSubspace.from_layout(layout, rank=4)
 
         opt = PolyStepOptimizer(
             model,
@@ -50,7 +44,6 @@ class TestFeatureInteractions:
         assert opt.state.velocity is not None
         assert torch.any(opt.state.velocity != 0), "Velocity should be non-zero after 5 steps"
         assert len(opt.state.costs) == 5
-        # All costs should be finite
         for c in opt.state.costs:
             assert torch.isfinite(torch.tensor(c)), f"Cost {c} is not finite"
 
@@ -86,7 +79,7 @@ class TestFeatureInteractions:
         torch.manual_seed(42)
         model = simple_mlp
         layout = ParamLayout.from_module(model)
-        subspace = LowRankSubspace.from_layout(layout, rank=4)
+        subspace = HybridSubspace.from_layout(layout, rank=4)
 
         opt = PolyStepOptimizer(
             model,
@@ -130,7 +123,7 @@ class TestFeatureInteractions:
         torch.manual_seed(42)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
         layout = ParamLayout.from_module(model)
-        subspace = LowRankSubspace.from_layout(layout, rank=4)
+        subspace = HybridSubspace.from_layout(layout, rank=4)
 
         X = torch.randn(32, 4)
         y = torch.randn(32, 2)
@@ -148,11 +141,8 @@ class TestFeatureInteractions:
             sinkhorn_max_iters=100,
         )
 
-        # restore_best=False so the run ends on the last step's weights. With the
-        # default restore_best=True, train() rolls the model back to the best epoch
-        # and calls resync_from_model(), which clears the velocity on purpose: a
-        # velocity measured at the position the run ended at does not describe the
-        # restored one, and applying it would move the weights with nothing evaluated.
+        # restore_best=False: the default True calls resync_from_model(), which
+        # clears the velocity on purpose.
         config = TrainConfig(epochs=1, restore_best=False)
         result = train(model, dl, nn.MSELoss(), opt, config)
         assert result is model
@@ -162,12 +152,8 @@ class TestFeatureInteractions:
 
 
 def _make_small_model():
-    """Tiny model for integration tests: Linear(8, 6) -> ReLU -> Linear(6, 4).
-
-    Kept small on purpose; these tests check optimizer plumbing (finite loss,
-    param change, iteration counts, determinism), all of which are independent
-    of model size, so a tiny net keeps the per-step forward and OT solve cheap.
-    """
+    """Tiny model for integration tests; the checks are size-independent, so
+    small keeps the per-step forward and OT solve cheap."""
     return nn.Sequential(nn.Linear(8, 6), nn.ReLU(), nn.Linear(6, 4))
 
 
@@ -184,13 +170,8 @@ def _make_integration_closure(model, input_dim=8, output_dim=4):
 
 
 class TestParticleDimAdaptiveProbes:
-    """Integration tests for four core configuration knobs.
-
-    1. ``particle_dim=4`` (richer OT signal in full-space mode).
-    2. ``omega=1.5`` (overrelaxed Sinkhorn iterations).
-    3. ``RankSchedule`` (progressive rank expansion).
-    4. ``adaptive_probes`` (cost-row reuse for stagnant particles).
-    """
+    """Integration tests for the particle_dim, omega, RankSchedule, and
+    adaptive_probes knobs."""
 
     @pytest.mark.parametrize(
         "extra_kwargs, omega",
@@ -252,8 +233,7 @@ class TestParticleDimAdaptiveProbes:
             loss = opt.step(closure)
             assert torch.isfinite(torch.tensor(loss))
 
-        # The transition itself, not just that three steps ran: the iteration count is
-        # the same whether or not the schedule ever fired.
+        # Iteration count alone cannot show the transition fired.
         assert opt.state.iteration_count == 3
         assert opt._applied_rank == 4, "the stage at step 2 never applied"
         assert opt.subspace.subspace_dim > subspace.subspace_dim, "rank 4 must widen the subspace"
@@ -280,12 +260,10 @@ class TestParticleDimAdaptiveProbes:
             loss = opt.step(closure)
             assert torch.isfinite(torch.tensor(loss))
 
-        # Verify the reuse cache is populated
         assert opt._prev_X is not None
         assert opt._prev_cost_matrix is not None
         assert opt.state.iteration_count == 5
 
-        # Verify optimization happened
         updated_params = model.state_dict()
         any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
         assert any_changed, "Optimization should proceed with adaptive_probes=True"
@@ -319,7 +297,7 @@ class TestSinkhornAccelerationComposition:
         torch.manual_seed(42)
         model = _make_small_model()
         layout = ParamLayout.from_module(model)
-        subspace = LinearSubspace.from_layout(layout, rank=2)
+        subspace = HybridSubspace.from_layout(layout, rank=2)
         closure = _make_integration_closure(model)
         opt = PolyStepOptimizer(
             model,
@@ -357,7 +335,6 @@ def test_default_step_is_deterministic():
 
     closure = _make_integration_closure(model)
 
-    # Run 3 steps with default parameters
     losses = []
     for _ in range(3):
         loss = opt.step(closure)
@@ -367,19 +344,16 @@ def test_default_step_is_deterministic():
     assert opt._particle_dim == 2, "Default particle_dim should be 2"
     assert opt.solver.omega == 1.0, "Default omega should be 1.0"
     assert opt._rank_schedule is None, "Default rank_schedule should be None"
-    # Monolithic is where cost-row reuse is implemented, so it is on by default
-    # and the reuse cache is populated after a step.
+    # Cost-row reuse is monolithic-only, so it is on by default here.
     assert opt._adaptive_probes
     assert opt._prev_X is not None
     assert opt._prev_cost_matrix is not None
 
-    # Verify optimization succeeded
     assert opt.state.iteration_count == 3
     updated_params = model.state_dict()
     any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
     assert any_changed, "Default optimization should still update parameters"
 
-    # Verify reproducibility (same seed gives same results)
     torch.manual_seed(42)
     model2 = _make_small_model()
     opt2 = PolyStepOptimizer(

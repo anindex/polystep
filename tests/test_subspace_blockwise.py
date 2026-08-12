@@ -1,14 +1,5 @@
-"""Integration tests for combined subspace + block-wise mode (combined subspace+block extension).
-
-Tests verify that:
-1. Combined mode initializes without NotImplementedError
-2. Per-block OT operates in projected subspace coordinates
-3. Synchronized absorb resets all blocks and rotates global projection
-4. Memory usage is reduced compared to alternatives
-
-Tests that call optimizer.step() use minimal configs (low rank,
-few Sinkhorn iters) to keep wall-clock time under the 120s timeout.
-The sequential closure is inherently slow on CPU.
+"""Integration tests for combined subspace + block-wise mode: initialization,
+per-block OT in subspace coordinates, and synchronized absorb.
 """
 
 import pytest
@@ -66,7 +57,6 @@ def simple_closure(simple_model):
         losses = []
         for i in range(batch_size):
             params_i = {k: v[i] for k, v in batched_params.items()}
-            # Load params into model
             simple_model.load_state_dict(params_i, strict=False)
             output = simple_model(inputs)
             loss = criterion(output, targets)
@@ -119,7 +109,6 @@ class TestCombinedModeInitialization:
         """Combined subspace + blockwise splits the subspace into usable blocks."""
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5)
 
-        # This should NOT raise NotImplementedError anymore
         optimizer = PolyStepOptimizer(
             simple_model,
             subspace=subspace,
@@ -184,11 +173,8 @@ class TestCombinedModeInitialization:
 @pytest.mark.timeout(180)
 class TestCombinedModeStep:
     def test_step_updates_state(self, simple_model, simple_closure):
-        """Test that the represented point moves after a step.
-
-        Checks model parameters rather than ``state.X``: rotation re-anchors the
-        coordinate origin, folding coords into ``base_params`` and zeroing ``X``, so
-        ``X`` is 0 both before and after while the weights do move.
+        """The represented point must move after a step; check model params, since
+        rotation re-anchors the origin and zeroes ``X``.
         """
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
 
@@ -205,11 +191,8 @@ class TestCombinedModeStep:
         assert any(not torch.allclose(a, b) for a, b in zip(params_before, simple_model.parameters()))
 
     def test_block_duals_updated(self, simple_model, simple_closure):
-        """Per-block dual potentials are populated after a step by a solver that has them.
-
-        Pinned to sinkhorn: under the default softmax there are no duals at all, so
-        every slot stays None and the assertions below never run. rotation_interval=0
-        for the same reason: a basis change invalidates them right after the solve.
+        """Per-block duals are populated after a sinkhorn step (softmax has none);
+        rotation_interval=0 keeps the basis from invalidating them right away.
         """
         subspace = AdaptiveSubspace.auto_from_params(
             simple_model, compression_target=0.5, max_rank=16, rotation_interval=0
@@ -230,10 +213,8 @@ class TestCombinedModeStep:
 
         loss = optimizer.step(simple_closure)
 
-        # The step must complete with a finite cost and keep block_duals a
-        # well-formed per-block list: one (f, g) slot per block, each either
-        # unset or a finite tensor pair. (The default subspace solver is
-        # softmax, which has no duals, so the prior `is not None` was vacuous.)
+        # block_duals must stay a well-formed per-block list: one (f, g) slot per
+        # block, each unset or a finite tensor pair.
         assert torch.isfinite(torch.tensor(loss))
         assert len(optimizer._state.block_duals) == len(optimizer._subspace_blocks)
         for f, g in optimizer._state.block_duals:
@@ -270,8 +251,8 @@ class TestSynchronizedAbsorb:
             optimizer.step(simple_closure)
 
         assert optimizer._state.absorb_count >= 1, "periodic absorb never triggered"
-        # Absorb folds the accumulated perturbation into the base weights, so at
-        # least one base tensor must change (the prior if-guard made this vacuous).
+        # Absorb folds the perturbation into the base weights, so at least one
+        # base tensor must change.
         changed = any(not torch.allclose(base_before[k], v) for k, v in optimizer._state.base_params.items())
         assert changed, "absorb did not fold the perturbation into base params"
 
@@ -300,7 +281,6 @@ class TestSynchronizedAbsorb:
 
         P_after = optimizer._state.projection
 
-        # Projection should have changed (rotated)
         assert not torch.allclose(P_before, P_after)
 
 
@@ -315,9 +295,8 @@ def test_cma_combined_mode_steps(simple_model, simple_closure):
         **_FAST_OPT_KWARGS,
     )
 
-    # Construction alone proves nothing; the combined mode has to take a step that
-    # moves the model. The coordinates themselves can come back to zero, because an
-    # absorb folds them into the base and re-anchors the origin.
+    # Construction alone proves nothing; absorb can re-zero coordinates, so check
+    # the model itself moved.
     before = torch.cat([p.detach().reshape(-1) for p in simple_model.parameters()]).clone()
     optimizer.step(simple_closure)
     assert optimizer.state.iteration_count == 1
@@ -440,10 +419,6 @@ class TestEdgeCases:
         assert any(not torch.allclose(a, b) for a, b in zip(params_before, simple_model.parameters()))
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 def test_blockwise_keeps_the_displacement_history_in_full_space():
     """The basis rotates every step, so subspace-coordinate history mixes frames.
 
@@ -483,11 +458,13 @@ def test_blockwise_sanitizes_before_averaging_probes_like_the_monolithic_driver(
     The two drivers then built different cost matrices from identical evaluations, and
     nothing in the suite ran both.
     """
+    from types import SimpleNamespace
+
     from polystep._step_blockwise import _cost_from_losses
 
     # One particle, two vertices, three probes. Vertex 0's middle probe is +inf.
     losses = torch.tensor([1.0, float("inf"), 1.0, 2.0, 2.0, 2.0])
-    cost = _cost_from_losses(losses, P=1, V=2, K=3)
+    cost = _cost_from_losses(SimpleNamespace(_all_nonfinite=None), losses, P=1, V=2, K=3)
 
     assert torch.isfinite(cost).all()
     # Penalty is 2 * max|finite| + 1 = 5. Vertex 0 must come back as a blend of its two

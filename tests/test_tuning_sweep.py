@@ -1,9 +1,9 @@
 """The validation-only hyperparameter sweep behind the two scale experiments.
 
-Three things a reviewer would check, and one thing that is easy to get wrong:
+Three properties the sweep must hold, and one thing that is easy to get wrong:
 
-1. **A sweep must not touch the test split.** Not "we were careful": the sweep hands
-   itself a :class:`~experiments.runners.fairness.TestSplitTripwire` and any read
+1. **A sweep must not touch the test split.** The sweep hands itself a
+   :class:`~experiments.runners.fairness.TestSplitTripwire` and any read
    raises. The end-to-end test below proves the guard is live *and* that it is not
    vacuous, by showing the same run does read the test split when tuning is off.
 2. **Equal tuning budget.** Every method's grid is the same size, so
@@ -117,7 +117,6 @@ def test_the_tripwire_check_is_not_vacuous(headquant, tmp_path, fairness):
 @pytest.mark.parametrize(
     "runner,fns",
     [
-        ("run_cifar.py", ("run_gradfree", "run_polystep")),
         ("run_gpt2_finetune.py", ("run_headquant",)),
     ],
 )
@@ -196,17 +195,17 @@ def test_an_all_ties_sweep_is_flagged_uninformative(fairness, tmp_path):
 def test_selection_roundtrips_through_disk(fairness, tmp_path):
     path = str(tmp_path / "sel.json")
     trials = [
-        {"showcase": "cifar_int8", "method": "eggroll", "index": i, "name": f"c{i}", "point": {"lr": i}, "val": v}
+        {"showcase": "snn", "method": "eggroll", "index": i, "name": f"c{i}", "point": {"lr": i}, "val": v}
         for i, v in enumerate([0.1, 0.9, 0.9])
     ]
-    fairness.write_selection("cifar", trials, {"budget_per_config": 7}, {"eggroll": {"configs": 3}}, path)
-    entry, provenance = fairness.load_selection("cifar", "cifar_int8", "eggroll", path)
+    fairness.write_selection("elevation", trials, {"budget_per_config": 7}, {"eggroll": {"configs": 3}}, path)
+    entry, provenance = fairness.load_selection("elevation", "snn", "eggroll", path)
     assert entry["point"] == {"lr": 1}, "ties must go to the earlier grid index"
     assert entry["informative"] is True and entry["distinct_val_scores"] == 2
     assert provenance["budget_per_config"] == 7 and "written" in provenance
     # An unswept method falls back rather than borrowing someone else's config.
-    assert fairness.load_selection("cifar", "cifar_int8", "cma_es", path) == (None, None)
-    assert fairness.load_selection("cifar", "cifar_int8", "eggroll", str(tmp_path / "nope.json")) == (None, None)
+    assert fairness.load_selection("elevation", "snn", "cma_es", path) == (None, None)
+    assert fairness.load_selection("elevation", "snn", "eggroll", str(tmp_path / "nope.json")) == (None, None)
 
 
 # --- how a grid point becomes hyperparameters -------------------------------------

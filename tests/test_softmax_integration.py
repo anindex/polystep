@@ -1,9 +1,4 @@
-"""Integration tests for softmax solver wired into PolyStepOptimizer.
-
-Verifies the solver strategy pattern works end-to-end: solver selection,
-ProgressiveEpsilon blocking, functional step(), amortization, subspace
-modes, and epsilon sharing.
-"""
+"""Integration tests for the softmax solver wired into PolyStepOptimizer."""
 
 import math
 
@@ -13,7 +8,6 @@ import torch.nn as nn
 
 from polystep import (
     PolyStepOptimizer,
-    LinearSubspace,
     HybridSubspace,
     ParamLayout,
 )
@@ -68,16 +62,9 @@ class TestSolverSelection:
         opt = PolyStepOptimizer(model)
         assert isinstance(opt.solver, SinkhornSolver)
 
-    @pytest.mark.parametrize(
-        "make_subspace",
-        [
-            lambda layout: LinearSubspace.from_layout(layout, rank=4),
-            lambda layout: HybridSubspace.from_layout(layout, rank=4, rotation_interval=0),
-        ],
-    )
-    def test_linear_subspace_defaults_to_softmax(self, model, layout, make_subspace):
+    def test_a_subspace_defaults_to_softmax(self, model, layout):
         """Subspace -> SoftmaxSolver by default."""
-        sub = make_subspace(layout)
+        sub = HybridSubspace.from_layout(layout, rank=4, rotation_interval=0)
         opt = PolyStepOptimizer(model, subspace=sub)
         assert isinstance(opt.solver, SoftmaxSolver)
 
@@ -97,7 +84,7 @@ class TestProgressiveEpsilonBlocking:
 
     def test_auto_epsilon_auto_subspace_raises(self, model, layout):
         """auto_epsilon=True with subspace (auto-selects softmax) raises."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
+        sub = HybridSubspace.from_layout(layout, rank=4)
         with pytest.raises(ValueError, match="ProgressiveEpsilon"):
             PolyStepOptimizer(model, subspace=sub, auto_epsilon=True)
 
@@ -110,7 +97,7 @@ class TestSoftmaxFunctionalStep:
         opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         loss = opt.step(closure)
         assert math.isfinite(loss)
-        assert not (loss != loss), "Loss is NaN"  # NaN check
+        assert not (loss != loss), "Loss is NaN"
 
     def test_step_updates_model_params(self, model, closure):
         """Softmax step actually updates model parameters."""
@@ -213,7 +200,7 @@ class TestFusedSoftmaxDispatch:
 
     def test_fused_softmax_path_active_with_softmax_solver(self, model, layout):
         """Fused path is active when solver='softmax' with subspace."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
+        sub = HybridSubspace.from_layout(layout, rank=4)
         opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.5)
         assert opt._use_fused_softmax is True, "_use_fused_softmax should be True for softmax solver"
         closure = _make_closure(model)
@@ -231,7 +218,7 @@ class TestFusedSoftmaxDispatch:
 
     def test_fused_path_with_turbo_features(self, model, layout):
         """Fused path works with biased_rotation + amortization."""
-        sub = LinearSubspace.from_layout(layout, rank=4)
+        sub = HybridSubspace.from_layout(layout, rank=4)
         opt = PolyStepOptimizer(
             model,
             subspace=sub,

@@ -1,12 +1,9 @@
 """Guards the in-place ``compile_forward`` (CUDA-graph) evaluator path.
 
-The launch-bound win comes from ``torch.compile(mode="reduce-overhead")`` (CUDA
-graphs) capturing the forward+loss once and replaying it per candidate while the
-swap loop mutates ``param.data`` in place. The one silent-wrongness failure mode
-(flagged by every reviewer): if the graph pools parameters into a static buffer,
-``.data.copy_`` writes the wrong storage and every candidate replays the SAME
-weights: distinct configs then yield IDENTICAL losses and OT sees zero contrast,
-with no error. So the test is: distinct configs -> distinct losses.
+The silent-wrongness failure mode: if the graph pools parameters into a static
+buffer, ``.data.copy_`` writes the wrong storage and every candidate replays the
+same weights, yielding identical losses with no error. So the test is: distinct
+configs -> distinct losses.
 """
 
 import torch
@@ -77,7 +74,7 @@ def test_compile_forward_matches_eager():
 def test_compile_forward_falls_back_on_cpu():
     """On CPU (no CUDA graphs) compile_forward must silently use the eager forward
     and still return correct distinct losses: never crash, never go stale."""
-    net = _CustomForwardNet()  # CPU
+    net = _CustomForwardNet()
     x = torch.rand(8, 16)
     y = torch.randint(0, 4, (8,))
     n = 5
@@ -98,11 +95,10 @@ def test_compile_forward_falls_back_on_cpu():
     ],
 )
 def test_compile_forward_defaults_to_the_inplace_path(use_inplace, compile_forward, expected):
-    """CUDA graphs only help the in-place path, which is the only place they apply.
+    """CUDA graphs only help the in-place path, so the flag defaults on there.
 
     The in-place path is a Python loop of N sequential forwards, so it is
-    launch-bound. Leaving the flag off by default meant the fix never reached the
-    only code that needs it. An explicit value still wins.
+    launch-bound. An explicit value still wins.
     """
     ev = NNCostEvaluator(
         nn.Sequential(nn.Linear(8, 4)),

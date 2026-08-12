@@ -1,8 +1,5 @@
-"""The library must reject what it cannot handle rather than compute something wrong.
-
-Covers the shared solver helpers, fused/non-fused softmax scale_cost parity,
-and the new input-validation guards (epsilon revalidation, check_every,
-num_probe, numeric scale_cost).
+"""Tests that invalid inputs are rejected and the fused softmax path matches
+SoftmaxSolver on every scale_cost mode.
 """
 
 import pytest
@@ -22,12 +19,8 @@ from polystep.solvers._shared import align_dual, align_marginal, recenter_cost, 
 @pytest.mark.parametrize("scale_cost", ["mean", "max_cost", 2.0, None])
 @pytest.mark.parametrize("variant", ["finite", "inf", "bf16"])
 def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
-    """The fused path (optimizer flow: sanitize_cost -> scale -> kernel) matches
-    SoftmaxSolver.solve for every scale_cost mode, including +inf hard
-    constraints and BF16. The failure mode: the fused path ignoring
-    'max_cost'/float and treated None as 'mean'. The +inf/BF16 cases guard the
-    parity too, since SoftmaxSolver sanitizes the cost and the fused path must
-    match it."""
+    """The fused path (sanitize_cost -> scale -> kernel) matches SoftmaxSolver.solve
+    for every scale_cost mode, including +inf hard constraints and BF16."""
     torch.manual_seed(0)
     P, dim = 6, 2
     verts = get_orthoplex_vertices(dim)  # (V, dim), V = 2*dim
@@ -45,8 +38,7 @@ def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
     # Non-fused reference (sanitizes internally)
     ref = SoftmaxSolver(epsilon=eps).solve(cost, a=a, scale_cost=scale_cost).matrix
 
-    # Fused path as wired in the optimizer: step sanitizes, branch recenters then
-    # scales (recenter first, or the data-dependent divisor is not shift-invariant).
+    # Recenter before scaling: with a data-dependent divisor the order is not shift-invariant.
     scaled = scale_cost_matrix(recenter_cost(sanitize_cost(cost))[0], scale_cost)
     _, fused_T = _fused_softmax_project(
         scaled,
@@ -77,10 +69,10 @@ def test_numeric_scale_cost_zero_and_inf_raise():
 
 
 def test_sinkhorn_epsilon_revalidated_per_solve():
-    """Schedules mutate solver.epsilon; a bad value must be caught in solve()
-    rather than dividing by zero (it is only validated in __post_init__)."""
+    """epsilon is only validated in __post_init__, but schedules mutate it, so
+    solve() must revalidate it rather than divide by zero."""
     solver = SinkhornSolver(threshold=1e-3, max_iterations=10)
-    solver.epsilon = -1.0  # simulate a misconfigured schedule
+    solver.epsilon = -1.0
     with pytest.raises(ValueError, match="epsilon"):
         solver.solve(torch.rand(4, 6))
 
@@ -95,7 +87,6 @@ def test_sanitize_cost_promotes_and_replaces_nonfinite():
     out = sanitize_cost(cost)
     assert out.dtype == torch.float32
     assert torch.isfinite(out).all()
-    # finite entries preserved
     assert out[0, 0].item() == pytest.approx(1.0, abs=1e-2)
 
 
@@ -121,15 +112,12 @@ def test_tempered_softmax_handles_nonfinite_cost():
     cost = torch.tensor([[1.0, float("inf")], [0.5, 2.0]], dtype=torch.bfloat16)
     res = TemperedSoftmaxSolver(tau=0.5).solve(cost)
     assert torch.isfinite(res.matrix).all()
-    # row sums equal the (uniform) source marginal
     assert torch.allclose(res.matrix.sum(dim=1), torch.full((2,), 0.5), atol=1e-5)
 
 
 def test_batched_linear_honors_nondefault_activations():
-    """The MLP fast path must read each activation module's real config.
-
-    A hardcoded leaky_relu(0.01) / gelu('none') computes a different, silently wrong loss.
-    """
+    """The MLP fast path must read each activation module's real config; a
+    hardcoded default would compute a silently wrong loss."""
     torch.manual_seed(0)
     model = nn.Sequential(
         nn.Linear(6, 8),
@@ -159,10 +147,8 @@ def test_batched_linear_skips_nondefault_flatten():
 
 
 def test_batched_linear_rejects_inline_functional_activations():
-    """A custom module applying activations inline (torch.relu in forward) has
-    no activation submodule, so the bmm plan reconstructed from named_children()
-    would silently omit it and compute a wrong (activation-free) loss. try_build
-    must detect the non-Sequential forward and fall back to the correct vmap path."""
+    """Inline activations (torch.relu in forward) have no activation submodule, so
+    the bmm plan would silently drop them; try_build must fall back to vmap."""
 
     class InlineMLP(nn.Module):
         def __init__(self):
@@ -184,8 +170,7 @@ def test_warmstart_dual_centering_keeps_marginals():
     cost = torch.rand(8, 8)
     solver = SinkhornSolver(epsilon=0.1, omega=1.5, threshold=1e-8, max_iterations=2000)
     res = solver.solve(cost)
-    # warm-start a second solve from the first solution
-    res2 = solver.solve(cost, init_f=res.f, init_g=res.g, init_eps=0.1)
+    res2 = solver.solve(cost, init_f=res.f, init_g=res.g)
     P = res2.matrix
     a = torch.ones(8) / 8
     assert torch.allclose(P.sum(dim=1), a, atol=1e-4)

@@ -1,9 +1,7 @@
 """Models that are MLPs must not opt themselves out of the batched evaluators.
 
-Every batched path requires ``type(model).forward is nn.Sequential.forward``. A
-hand-written forward identical to the inherited one costs 2x on CUDA and 5x on CPU with
-no other symptom, so the library warns on that shape. These tests pin the warning and
-the shipped models that would otherwise trigger it.
+Every batched path requires ``type(model).forward is nn.Sequential.forward``;
+these tests pin the warning and the shipped models that would trigger it.
 """
 
 import warnings
@@ -147,11 +145,9 @@ def test_ordereddict_form_keeps_the_children_walkable():
 
 
 def test_subspace_inplace_matches_the_materializing_path():
-    """``evaluate_subspace_inplace`` is ~95 lines with no test of its own.
+    """``evaluate_subspace_inplace`` must match ``reconstruct_batch`` plus ``evaluate``.
 
-    It trades the stacked ``(N, *param_shape)`` dict for one in-place weight swap per
-    candidate, so its only contract is that it returns what ``reconstruct_batch`` plus
-    a normal ``evaluate`` returns, and that it leaves the model where it found it.
+    It must also leave the model weights where it found them.
     """
     import torch.nn as nn
 
@@ -226,9 +222,8 @@ def _hand_two_layer(layer_cls):
 def _converted_models():
     """The model pairs, or one skipped param when the harness is absent.
 
-    ``experiments/`` is the paper reproduction harness and ships in the repo, not in the
-    distribution, so this runs at collection time in a checkout and skips from an sdist.
-    Returning an empty list instead would delete the tests with no signal.
+    ``experiments/`` ships in the repo but not the distribution, so this skips from
+    an sdist rather than silently dropping the tests.
     """
     try:
         from experiments.runners import nondiff_models as models
@@ -330,13 +325,9 @@ def _record_fc1_shapes(net):
 def test_spiking_net_applies_fc1_per_timestep_on_temporal_input():
     """Temporal input keeps fc1 inside the timestep loop.
 
-    One (T*B, F) GEMM blocks differently from the T (B, F) GEMMs it would replace, and
-    the LIF threshold turns that difference into a whole spike. Only the static branch,
-    where every call sees the same tensor, may hoist fc1 out.
-
-    Asserted on the call shapes, not on the outputs: whether the two GEMM shapes differ
-    bitwise is a property of the BLAS blocking, so an output comparison passes or fails
-    by machine.
+    Hoisting fc1 to one (T*B, F) GEMM changes BLAS blocking, and the LIF threshold
+    turns that into a whole spike. Asserted on call shapes, not outputs, since
+    bitwise GEMM differences are machine-dependent.
     """
     from polystep.benchmarks.utils import SpikingNet
 

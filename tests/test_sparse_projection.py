@@ -1,12 +1,4 @@
-"""Unit tests for SparseRandomProjection.
-
-Tests cover:
-- Core functionality (shapes, transpose, determinism)
-- Memory efficiency (O(nnz) not O(n*k))
-- JLT distance preservation property
-- Device compatibility (CPU and CUDA)
-- Statistical properties (unit variance, extreme-compression warning)
-"""
+"""Unit tests for SparseRandomProjection: shapes, memory, JLT, determinism."""
 
 import warnings
 
@@ -43,10 +35,8 @@ class TestCoreProjection:
 
 class TestMemoryEfficiency:
     def test_memory_estimate(self):
-        """Density is 1/sqrt(full_dim) per Li, Hastie, Church.
-
-        Values are pinned rather than re-derived: recomputing the formula the
-        implementation uses would move with any change to it.
+        """Density is 1/sqrt(full_dim) per Li, Hastie, Church; values are pinned
+        so the test does not move with the formula.
         """
         proj = SparseRandomProjection(full_dim=100_000, subspace_dim=256, seed=42)
 
@@ -65,7 +55,6 @@ class TestMemoryEfficiency:
         sparse_bytes = proj.memory_bytes
 
         # At default density 1/sqrt(100K) ~ 0.316%, should be >50x smaller
-        # (Memory overhead from int64 indices reduces ratio vs float32-only dense)
         ratio = dense_bytes / sparse_bytes
         assert ratio > 50, f"Expected >50x reduction, got {ratio:.1f}x"
 
@@ -78,7 +67,6 @@ class TestMemoryEfficiency:
         # Dense: 100M * 256 * 4 = 100GB
         dense_gb = 100_000_000 * 256 * 4 / 1e9
 
-        # Sparse should be << 1GB
         sparse_gb = proj.memory_bytes / 1e9
 
         assert sparse_gb < 1.0, f"Expected <1 GB, got {sparse_gb:.3f} GB"
@@ -86,10 +74,9 @@ class TestMemoryEfficiency:
 
     def test_custom_density(self):
         """Custom density is respected."""
-        # Use 1% density explicitly
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, density=0.01, seed=42)
 
-        expected_nnz_per_col = max(1, int(0.01 * 10000))  # 100
+        expected_nnz_per_col = max(1, int(0.01 * 10000))
         assert proj._nnz_per_col == expected_nnz_per_col
         assert proj.nnz == expected_nnz_per_col * 64
 
@@ -97,22 +84,17 @@ class TestMemoryEfficiency:
 class TestJLTProperty:
     def test_distance_preservation(self):
         """Sparse projection approximately preserves distances."""
-        # JLT: distances preserved within (1 +/- eps) factor
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=256, seed=42)
 
-        # Create random vectors in subspace
         torch.manual_seed(123)
         x1 = torch.randn(256)
         x2 = torch.randn(256)
 
-        # Distance in subspace
         d_sub = torch.norm(x1 - x2).item()
 
-        # Distance after projection to full space
         d_full = torch.norm(proj.project(x1) - proj.project(x2)).item()
 
-        # Should be approximately equal
-        # JLT allows multiplicative distortion; sparse JLT has similar bounds
+        # JLT allows multiplicative distortion
         ratio = d_full / d_sub
         assert 0.5 < ratio < 2.0, f"Distance ratio {ratio} outside [0.5, 2.0]"
 
@@ -132,7 +114,6 @@ class TestJLTProperty:
             if d_sub > 1e-6:  # Avoid division by zero
                 ratios.append(d_full / d_sub)
 
-        # Most ratios should be reasonably close to 1
         mean_ratio = sum(ratios) / len(ratios)
         assert 0.7 < mean_ratio < 1.5, f"Mean distance ratio {mean_ratio} too far from 1"
 
@@ -148,11 +129,8 @@ class TestJLTProperty:
     def test_linearity(self):
         """Projection is linear: ``P(a x) == a P(x)``.
 
-        Compared in the norm, not per element. The two expressions reassociate the fp32
-        sparse matmul differently, so an entry that lands near cancellation has a large
-        relative error (worst 1.5e-3 over 200 draws) while the vectors agree to 7e-8.
-        A per-element ``rtol=1e-5`` therefore passed or failed on the luck of the draw,
-        which is how it survived until the suite ran under xdist.
+        Compared in the norm, not per element: the two forms reassociate the fp32
+        sparse matmul, so near-cancellation entries have large relative error.
         """
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
 
@@ -223,13 +201,10 @@ def test_repr():
 
 def test_min_nnz_per_col():
     """At least 1 nonzero per column even at very low density."""
-    # Very small full_dim with very low density
     proj = SparseRandomProjection(full_dim=10, subspace_dim=5, density=0.001, seed=42)
 
-    # Should have at least 1 nonzero per column
     assert proj._nnz_per_col >= 1
 
-    # Should still project correctly
     coords = torch.randn(5)
     full = proj.project(coords)
     assert full.shape == (10,)

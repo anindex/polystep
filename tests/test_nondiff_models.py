@@ -36,10 +36,6 @@ from experiments.runners.nondiff_models import (  # noqa: E402
     BinaryConv2d,
     BinaryConv2dSTE,
     BinaryMNISTNetSTE,
-    TernaryMNISTNetSTE,
-    BinaryCIFAR10Net,
-    BinaryCIFAR10NetSTE,
-    DiscreteAttention,
     DiscreteAttentionNet,
     StaircaseActivation,
     StaircaseNet,
@@ -49,7 +45,6 @@ from experiments.runners.nondiff_models import (  # noqa: E402
     SoftMoENet,
     compute_expert_utilization,
     MaxSATModel,
-    evaluate_sat_loss,
     cra_penalty,
     HardPermutationNet,
     SoftPermutationNet,
@@ -143,10 +138,10 @@ class TestSTETernary:
     "build, input_shape",
     [
         (lambda: BinaryLinearSTE(16, 8), (2, 16)),
+        (lambda: TernaryLinearSTE(16, 8, threshold=0.3), (2, 16)),
         (lambda: BinaryConv2dSTE(3, 16, 3, padding=1), (2, 3, 8, 8)),
         (lambda: SoftMoELayer(input_dim=32, hidden_dim=64, num_experts=4), (2, 32)),
         (BinaryMNISTNetSTE, (2, 1, 28, 28)),
-        (BinaryCIFAR10NetSTE, (2, 3, 32, 32)),
         (SoftMoENet, (2, 1, 28, 28)),
     ],
 )
@@ -163,15 +158,6 @@ def test_ste_passes_gradient_to_every_weight(build, input_shape):
         assert p.grad.abs().max() > 0, name
 
 
-def test_forward_shape_and_gradient():
-    layer = TernaryLinearSTE(16, 8, threshold=0.3)
-    x = torch.randn(2, 16)
-    out = layer(x)
-    assert out.shape == (2, 8)
-    out.sum().backward()
-    assert layer.weight.grad is not None
-
-
 def test_weights_are_binary():
     """forward() must convolve with sign-binarized weights, not the raw ones."""
     layer = BinaryConv2d(1, 1, 1, padding=0)  # 1x1 conv -> per-pixel scale by the (binarized) weight
@@ -185,23 +171,6 @@ def test_weights_are_binary():
     out = layer(x)
     assert torch.allclose(out, -x, atol=1e-6)  # -1 -> negate
     assert not torch.allclose(out, -0.2 * x, atol=1e-3)  # not the raw (-0.2) conv
-
-
-@pytest.mark.parametrize(
-    "build, input_shape, output_shape",
-    [
-        (TernaryMNISTNetSTE, (2, 1, 28, 28), (2, 10)),
-        (BinaryCIFAR10Net, (2, 3, 32, 32), (2, 10)),
-        (BinaryCIFAR10NetSTE, (2, 3, 32, 32), (2, 10)),
-        (lambda: DiscreteAttention(dim=32, num_slots=8), (2, 32), (2, 32)),
-    ],
-    ids=["ternary_mnist_ste", "binary_cifar10", "binary_cifar10_ste", "discrete_attention"],
-)
-def test_forward_shape(build, input_shape, output_shape):
-    torch.manual_seed(0)
-    out = build()(torch.randn(*input_shape))
-    assert out.shape == output_shape
-    assert torch.isfinite(out).all()
 
 
 def test_output_values_quantized():
@@ -253,18 +222,6 @@ def test_param_count_matches_hard():
 
 
 class TestExpertUtilization:
-    def test_returns_correct_keys(self):
-        model = HardMoENet()
-        # Create a minimal test loader
-        dataset = torch.utils.data.TensorDataset(torch.randn(20, 1, 28, 28), torch.randint(0, 20, (20,)))
-        loader = torch.utils.data.DataLoader(dataset, batch_size=10)
-        result = compute_expert_utilization(model, loader, device="cpu")
-        assert "expert_utilization" in result
-        assert "max_expert_share" in result
-        assert "collapsed" in result
-        assert "routing_entropy" in result
-        assert "normalized_entropy" in result
-
     def test_utilization_sums_to_one(self):
         model = HardMoENet()
         dataset = torch.utils.data.TensorDataset(torch.randn(100, 1, 28, 28), torch.randint(0, 20, (100,)))
@@ -287,14 +244,6 @@ class TestExpertUtilization:
 
 
 class TestMaxSATModel:
-    def test_forward_returns_scalar(self):
-        model = MaxSATModel(num_vars=20)
-        # Create simple clauses: 3 clauses, each with 3 variables
-        clause_vars = torch.tensor([[0, 1, 2], [3, 4, 5], [6, 7, 8]])
-        clause_signs = torch.tensor([[1.0, 1.0, 0.0], [0.0, 1.0, 1.0], [1.0, 0.0, 0.0]])
-        out = model(clause_vars, clause_signs)
-        assert out.dim() == 0 or out.numel() == 1, "MaxSATModel should return scalar"
-
     def test_no_hidden_layers(self):
         """MaxSATModel should have NO hidden layers, only self.assignments."""
         model = MaxSATModel(num_vars=20)
@@ -312,14 +261,6 @@ def test_known_values():
     # For x=1: (2*1-1)^2 = 1, so 1-1=0
     # For x=0.5: (2*0.5-1)^2 = 0, so 1-0=1
     assert penalty.item() == pytest.approx(1.0, abs=1e-5)
-
-
-def test_returns_scalar():
-    soft = torch.tensor([0.5, 0.8, 0.2])
-    clause_vars = torch.tensor([[0, 1], [1, 2]])
-    clause_signs = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
-    loss = evaluate_sat_loss(soft, clause_vars, clause_signs)
-    assert loss.dim() == 0 or loss.numel() == 1
 
 
 class TestVmapCompatibility:

@@ -1,11 +1,5 @@
-"""Parity and fallback contract for the full-space sparse-delta evaluator.
-
-A full-space candidate perturbs one contiguous run of the flat parameter vector, so
-every layer but one holds the shared base weight. :class:`SparseDeltaEvaluator`
-exploits that by carrying a ``(G, C, B, particle_dim)`` delta instead of materializing
-per-candidate activations. It must agree with the dense path to floating-point
-tolerance, must give the same answer however the candidates are grouped, and must
-decline the cases where the confinement argument does not hold.
+"""Parity and fallback contract for the full-space sparse-delta evaluator: it
+must match the dense path and decline where the confinement argument fails.
 """
 
 import pytest
@@ -46,11 +40,7 @@ ARCHITECTURES = [
 
 @pytest.mark.parametrize("name,dims,loss_fn,kind", ARCHITECTURES, ids=[a[0] for a in ARCHITECTURES])
 def test_matches_the_dense_path_at_every_perturbation_site(name, dims, loss_fn, kind):
-    """Every candidate the fast path accepts must match the dense path.
-
-    Sweeps every particle row, so weight sites, bias sites, the last layer, and rows
-    whose two scalars share an output unit are all covered.
-    """
+    """Every accepted candidate must match the dense path, across all site kinds."""
     torch.manual_seed(0)
     model = _mlp(dims)
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -109,9 +99,7 @@ def test_a_batch_of_candidates_matches_one_at_a_time():
 
 
 def test_grouping_candidates_by_particle_changes_nothing():
-    """Candidates sharing a particle share one ``local_idx`` row, which is what lets
-    every gather run at G rows instead of N. The grouped call must return exactly what
-    the one-group-per-candidate call returns, in the same order."""
+    """Grouping candidates by particle must return the same losses in the same order."""
     torch.manual_seed(0)
     model = _mlp([6, 5, 4, 3])
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -141,11 +129,7 @@ def test_grouping_candidates_by_particle_changes_nothing():
 
 
 def test_declines_a_run_that_straddles_two_parameters():
-    """The layout packs entries back to back with no particle_dim alignment.
-
-    A row spanning the end of one parameter and the start of the next perturbs two
-    layers at once, which breaks the single-site assumption.
-    """
+    """A run straddling two parameters perturbs two layers at once and must be declined."""
     torch.manual_seed(0)
     # Linear(3, 3) gives a 9-element weight, so the flat run [8, 10) crosses into bias.
     model = _mlp([3, 3, 2])
@@ -195,10 +179,8 @@ def test_declines_tied_weights():
     ids=["layernorm", "batchnorm", "softmax", "conv"],
 )
 def test_declines_layers_that_mix_features(model):
-    """Delta confinement holds only for elementwise ops.
-
-    Normalization, softmax and convolution spread a two-column perturbation across
-    every output, so the delta goes dense immediately and the shortcut is invalid.
+    """Normalization, softmax and convolution spread a perturbation across every
+    output, breaking delta confinement.
     """
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
     assert SparseDeltaEvaluator.try_build(model, nn.MSELoss(), layout) is None
@@ -223,9 +205,8 @@ def test_optimizer_step_matches_with_and_without_the_fast_path():
         model = _mlp([8, 6, 3])
         evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
         inputs, targets = torch.randn(12, 8), torch.randint(0, 3, (12,))
-        # A small chunk keeps each candidate run inside one layout entry. One chunk
-        # spanning every particle row makes resolve_site reject it, and the fast path
-        # would not run at all.
+        # Small chunk_size keeps each candidate run inside one layout entry;
+        # otherwise resolve_site rejects every chunk and the fast path never runs.
         opt = PolyStepOptimizer(model, compile=False, seed=7, chunk_size=4)
         opt.register_evaluator(evaluator, inputs, targets)
         if not use_fast:
@@ -332,9 +313,8 @@ def _sweep_every_site(model):
 
 @pytest.mark.parametrize("activation", [nn.ReLU, nn.Sigmoid, _SignAct], ids=["relu", "sigmoid", "sign"])
 def test_delta_algebra_is_exact_for_any_elementwise_activation(activation):
-    """``module(a + d) - module(a)`` is a finite difference, not a linearization.
-
-    A piecewise-constant activation is therefore as exact as a smooth one.
+    """``module(a + d) - module(a)`` is an exact finite difference for any
+    elementwise activation.
     """
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 5), activation(), nn.Linear(5, 3))
@@ -343,9 +323,8 @@ def test_delta_algebra_is_exact_for_any_elementwise_activation(activation):
 
 @pytest.mark.parametrize("layer", [nn.Linear, _SignLinear], ids=["linear", "sign_weight"])
 def test_delta_algebra_is_exact_for_a_declared_weight_transform(layer):
-    """A weight-transforming layer moves its output by ``Q(w + d) - Q(w)``, not by ``d``.
-
-    The linear assumption is right for a plain Linear and wrong by O(1) for sign.
+    """A weight-transforming layer moves its output by ``Q(w + d) - Q(w)``, which
+    the evaluator must reproduce.
     """
     torch.manual_seed(0)
     model = nn.Sequential(layer(6, 5), nn.ReLU(), layer(5, 3))
@@ -354,10 +333,8 @@ def test_delta_algebra_is_exact_for_a_declared_weight_transform(layer):
 
 @pytest.mark.parametrize("activation", [_StatefulAct, _PerTensorAct], ids=["buffer", "per_tensor"])
 def test_a_module_that_cannot_keep_the_elementwise_contract_is_declined(activation):
-    """Declaring ``polystep_elementwise`` is not enough on its own.
-
-    A buffer is state the plan calls one activation several times over; a whole-tensor
-    reduction couples every output to every input. Both fall back to vmap.
+    """A module with a buffer or a whole-tensor reduction cannot keep the
+    elementwise contract and must be declined.
     """
     model = nn.Sequential(nn.Linear(6, 5), activation(), nn.Linear(5, 3))
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -394,8 +371,8 @@ def test_the_per_tensor_control_really_does_disagree():
 def test_blockwise_step_scores_through_the_delta_path():
     """A block-wise step must reach the delta path and agree with the dense one.
 
-    Block-wise used to build a full model configuration per candidate and call the
-    closure, so none of the delta evaluators were reachable from it at all.
+    Without it block-wise builds a full model configuration per candidate and calls
+    the closure, leaving every delta evaluator unreachable.
     """
     from polystep import PolyStepOptimizer
     from polystep.cost_nn import NNCostEvaluator

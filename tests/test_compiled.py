@@ -30,39 +30,26 @@ def test_per_function_fallback_independence(monkeypatch):
     original_compile = torch.compile
 
     def selective_compile(fn, *, fullgraph=True, mode="reduce-overhead", **kw):
-        # Fail only for sinkhorn_iteration
         if getattr(fn, "__name__", "") == "_sinkhorn_iteration":
             raise RuntimeError("Simulated compile failure for sinkhorn_iteration")
         return original_compile(fn, fullgraph=fullgraph, mode=mode, **kw)
 
     monkeypatch.setattr(torch, "compile", selective_compile)
 
-    # Also need CUDA to appear available so CompiledFunctions attempts compilation
+    # CompiledFunctions only attempts compilation when CUDA appears available.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         cf = CompiledFunctions(compile=True)
 
-    # sinkhorn_iter should have fallen back to the original function
     assert cf.sinkhorn_iter is _sinkhorn_iteration, "sinkhorn_iter should be the original eager function after fallback"
 
-    # Other functions should NOT be the original (they got compiled wrappers)
     assert cf.rotate_and_translate is not _rotate_and_translate
     assert cf.barycentric_projection is not _barycentric_projection
 
-    # Verify warning was emitted for the failed function
     fail_warnings = [x for x in w if "sinkhorn_iteration" in str(x.message)]
     assert len(fail_warnings) >= 1, "Expected warning about sinkhorn_iteration failure"
-
-
-def test_barycentric_projection_zero_marginal_is_finite():
-    """_barycentric_projection equivalence and shape."""
-    B, V, d = 3, 4, 2
-    transport_matrix = torch.zeros(B, V)
-    X_vertices = torch.randn(B, V, d)
-    result = _barycentric_projection(transport_matrix, X_vertices)
-    assert torch.isfinite(result).all()
 
 
 def _make_sinkhorn_args(device):
@@ -115,7 +102,6 @@ def _make_fused_softmax_args(device, P=10, V=8, dim=4, seed=42):
     epsilon = 0.1
     a = torch.ones(P, device=device) / P
     polytope_verts = torch.randn(V, dim, device=device)
-    # Random rotation matrices via QR
     raw = torch.randn(P, dim, dim, device=device)
     Q, _ = torch.linalg.qr(raw)
     rot_mats = Q

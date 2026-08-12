@@ -1,9 +1,4 @@
-"""Contract tests for the shipped synthetic objectives.
-
-Each class declares ``optimizers`` and ``optimal_value``; the test checks the declaration
-against the implementation, so a typo in either is caught. Five of the nine (StyblinskiTang,
-Levy, Griewank, Beale, Branin) had no coverage at all before this file.
-"""
+"""Contract tests: each objective's declared optima and bounds match its implementation."""
 
 import pytest
 import torch
@@ -21,9 +16,8 @@ from polystep.objectives import (
     StyblinskiTang,
 )
 
-# (factory, tolerance at the declared optimizer). Branin and StyblinskiTang carry
-# rounded literals in their definitions, so they need a looser tolerance than the
-# ones whose optimum is exactly 0.
+# Tolerance at the declared optimizer; Branin and StyblinskiTang use rounded
+# literals, so they get a looser tolerance than the exactly-zero optima.
 ALL = [
     (lambda: Ackley(dim=2), 1e-6),
     (lambda: Ackley(dim=5), 1e-6),

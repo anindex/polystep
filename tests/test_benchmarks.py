@@ -1,8 +1,4 @@
-"""Synthetic optimization benchmark tests for PolyStep solver.
-
-Verifies convergence on standard test functions (Ackley, Rosenbrock,
-Rastrigin, Sphere) in low dimensions.
-"""
+"""Convergence tests for PolyStep on synthetic objectives (Ackley, Rosenbrock, Rastrigin, Sphere)."""
 
 import math
 
@@ -42,9 +38,6 @@ def _run_benchmark(
     gen = torch.Generator().manual_seed(42)
     state = solver.run(X_init, generator=gen)
     return state, X_init
-
-
-# Test class
 
 
 class TestSyntheticBenchmarks:
@@ -88,11 +81,7 @@ class TestSyntheticBenchmarks:
         )
 
     def test_health_series_stay_aligned_with_costs(self):
-        """``record_solver_health`` promises ess/rho/evals indexed like ``costs``.
-
-        The standalone solver appended only ``costs``, so any reader of the health
-        series got them empty or short.
-        """
+        """``record_solver_health`` promises ess/rho/evals aligned with ``costs`` in length and bounds."""
         state, _ = _run_benchmark(Sphere(dim=2), dim=2, num_particles=8, max_iters=6)
 
         n = len(state.costs)
@@ -105,7 +94,7 @@ class TestSyntheticBenchmarks:
         assert all(v > 0 for v in state.evals), state.evals
 
     def test_run_stops_early_once_the_displacement_settles(self):
-        """The convergence break is the point of ``threshold`` and never had a test."""
+        """A huge ``threshold`` must trip the convergence break right after ``min_iterations``."""
         torch.manual_seed(0)
         solver = PolyStep(
             objective_fn=Sphere(dim=2),
@@ -143,15 +132,12 @@ class TestSyntheticBenchmarks:
         gen = torch.Generator().manual_seed(42)
         state = solver.run(X_init, generator=gen)
 
-        # Cost should decrease
         assert state.costs[-1] < state.costs[0], (
             f"Sphere+LinearEpsilon cost did not decrease: {state.costs[0]:.4f} -> {state.costs[-1]:.4f}"
         )
 
-        # Epsilon should have decayed (final epsilon < initial)
         assert state.epsilon < 1.0, f"Epsilon did not decay: final epsilon={state.epsilon}"
 
-        # Particles should converge toward origin
         init_dist = torch.norm(X_init, dim=-1).mean().item()
         final_dist = torch.norm(state.X, dim=-1).mean().item()
         assert final_dist < init_dist, (

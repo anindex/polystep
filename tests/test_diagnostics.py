@@ -1,7 +1,7 @@
 """Solver-health diagnostics: ess, rho, and the evaluation count.
 
-Anything that zips these against costs needs them equal length and recorded on every
-step, including the amortized ones that run no OT solve.
+Anything zipped against costs needs these equal length, recorded on every step
+including amortized ones.
 """
 
 import pytest
@@ -47,8 +47,7 @@ def test_greedy_solver_moves_all_the_way_to_a_vertex():
 
 
 def test_evals_records_what_the_step_actually_cost():
-    """P*V*K per step, and 0 on a reused-probe step. The denominator for any design
-    comparison."""
+    """P*V*K per step, and 0 on a reused-probe step."""
     torch.manual_seed(0)
     model = _model()
     x, y = torch.randn(32, 12), torch.randint(0, 4, (32,))
@@ -57,8 +56,8 @@ def test_evals_records_what_the_step_actually_cost():
     for _ in range(3):
         opt.step(lambda bp: ev.evaluate(bp, x, y))
 
-    # 276 parameters at particle_dim=4 give 69 particles, and a 4-D simplex has 5
-    # vertices. Reading P and V back off the optimizer would pass if both drifted.
+    # 276 parameters at particle_dim=4 give 69 particles; a 4-D simplex has 5 vertices.
+    # Reading P and V back off the optimizer would mask a drift in both.
     assert get_diagnostics(opt)["evals"] == [69 * 5] * 3
 
 
