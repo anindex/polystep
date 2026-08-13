@@ -31,10 +31,9 @@ function, with no error and no shape mismatch.
 
 ## Which polytope pays for itself
 
-The simplex is `k+1` vertices, the orthoplex `2k`. The orthoplex is the only template
-with antithetic `+/-` pairs, which the finite-difference quadratic model, `trust_region`,
-`newton_refinement` and `multifidelity_screen` read; on the default simplex those
-features warn and stay inert.
+The simplex is `k+1` vertices, the orthoplex `2k`. Only the orthoplex has antithetic
+`+/-` pairs, and only `newton_refinement` still needs them. The quadratic model and
+`trust_region` run on any template, because every one of them is a centred tight frame.
 
 At a fixed budget of 300K candidate evaluations, 20-32-3 MLP, 6 seeds, mean loss
 reduction (`experiments/scripts/bench_polytope.py`):
@@ -44,33 +43,63 @@ reduction (`experiments/scripts/bench_polytope.py`):
 | `simplex` (default) | 0.079 | 260 |
 | `orthoplex` alone | 0.066 | 195 |
 | `orthoplex` + `multifidelity_screen` | 0.064 | 260 |
-| `orthoplex` + `use_quadratic_model` + `trust_region` | **0.132** | 143 |
+| `orthoplex` + `use_quadratic_model` + `trust_region`, `num_probe=2` | 0.156 | 173 |
+| `orthoplex` + `use_quadratic_model` + `trust_region`, `num_probe=1` | 0.140 | 195 |
+| `simplex` + `use_quadratic_model` + `trust_region`, `num_probe=1` | **0.178** | 259 |
 
-The orthoplex alone loses. Paired with the quadratic model it wins 1.7x per forward pass,
-so the default stays `simplex` and the configuration worth reaching for is:
+The orthoplex alone loses. The quadratic model is what pays, and it pays most on the
+cheaper polytope: 2.25x per forward pass against the plain simplex, on `k+1` vertices
+instead of `2k`. The configuration to reach for:
 
 ```python
-PolyStepOptimizer(model, polytope_type='orthoplex',
-                  use_quadratic_model=True, trust_region=True, num_probe=1)
+PolyStepOptimizer(model, use_quadratic_model=True, trust_region=True, num_probe=1)
 ```
 
-The table row was measured at `num_probe=2`; `num_probe=1` is the cheaper setting for the
-same result, for the reason below. The budget charges the per-particle centre evaluations
-the quadratic model needs.
+with the default `polytope_type='simplex'`. Use the orthoplex only for
+`newton_refinement`, which reads the antithetic pairs directly.
 
-That result is a full-space 20-32-3 MLP and it does not transfer to a subspace run. The
-same three flags on `examples/05` (784-128-10, `HybridSubspace(rank=8)`) gave 30.9 s /
-94.6% against 23.1 s / 94.7% on the shipped simplex config, and 3855 against 2160 ms/step
-on CPU: the orthoplex's `2k` vertices against the simplex's `k+1` cost more than the
-quadratic model recovers there. Measure before switching.
+The trust region scores the previous step's prediction against this step's loss, so it
+needs both from the same objective, as in the benchmark above: one fixed batch and
+`amortize_steps=1`. Two setups take it out:
 
-`num_probe=1` because the curvature no longer needs two probe scales to regress on. At
-`K=1` the step evaluates one `f(X)` per particle and reads the diagonal Hessian from
-`L(+s) + L(-s) - 2 L(0)`, which is `P*V + P` evaluations against `P*V*K`. On an 8-16-1
-MLP over 15 steps that is 6075 candidate evaluations against 9720 at `num_probe=2`, same
-final loss. The same `f(X)` is what the trust-region ratio compares against, in place of
-`mean_i min_v C[i,v]` under a fresh random rotation, which moved by 0.04 across 100
-rotations at a fixed point.
+- **Amortization.** A momentum step predicts nothing and drops the pending comparison, so
+  the next OT step has none to score. The constructor warns. Only the shared `f(X)`
+  remains, at +6% wall-clock on `examples/10_cnn_mnist.py` for no accuracy change.
+- **A minibatch stream.** Without `objective_token` the ratio compares a prediction made
+  on one batch against a loss measured on the next, the noise reads as a bad step every
+  time, and the radius sits at `radius_min`. On `examples/02_snn_starter.py` that is
+  100% against 68.8%. Passing `objective_token` per batch makes the step decline the
+  stale comparison instead, and the run is unchanged.
+
+So it pays on a stationary objective (a fixed dataset, a simulator with a fixed seed, a
+combinatorial instance) and does nothing for minibatch SGD-style loops.
+
+## Why the model runs on any polytope
+
+Every template is centred, unit-radius and tight: `sum_v v = 0` and
+`sum_v v v^T = (V/d) I`, to 1e-15. The least-squares affine fit is then a closed form:
+
+```text
+g       = (d / (V s r)) sum_v L_v v
+tr(H)/d = 2 (mean_v L_v - f(X)) / (s r)^2
+```
+
+On antipodal pairs `g` reduces to the central difference, and the code takes that form,
+so no orthoplex result moves bit for bit. Elsewhere the third moment survives and `g`
+carries an `O(r)` bias: 0.67% at `r = 0.01` on the simplex, 6.7% at `r = 0.1`. The curvature is exact at any radius, and it is one
+number instead of `d`: the frame is Haar-random every step, so `E[H_jj] = tr(H)/d` for
+every `j` and the orthoplex diagonal is `d` noisy estimates of it. Only
+`newton_refinement` uses the anisotropy that costs.
+
+The centre is evaluated only when `biased_rotation` or `trust_region` is on, and the
+model is built under the same condition: `use_quadratic_model=True` alone computes
+nothing. At `num_probe=1` the system is exactly determined, `d+1` equations for `d+1`
+unknowns, at `P*V + 1` evaluations against `P*V*K`. The centre is one forward, not one
+per particle: a centre candidate is `X` with a row rewritten to the value already there.
+The trust-region ratio compares against that same `f(X)` instead of
+`mean_i min_v C[i,v]`, which moved by 0.04 across 100 rotations at a fixed point. At
+`num_probe >= 2` off the orthoplex there is no centre and no pairs, so the model has
+nothing to read and the constructor says so.
 
 ## Where a subspace step spends its time
 
@@ -359,8 +388,8 @@ batch, then spends full fidelity only on the top `screen_keep_ratio`. Sample-for
 of the unscreened budget: 0.75x at the defaults, 0.40x at `screen_keep_ratio=0.25` with
 `screen_fidelity=0.15`. Skipped with a warning whenever that figure is not below 1.
 
-The contrast ranking reads antithetic vertex pairs, so it needs
-`polytope_type='orthoplex'` or a selection solver (`min_cost_greedy`, `top_k_mean`).
+Ranking is by deviation from the row mean, which on an orthoplex is the antithetic
+contrast, so any polytope screens.
 
 Wall-clock follows only when the per-sample cost dominates, since the screen adds one
 evaluation call per step. CPU, 2-layer MLP, defaults `0.5 / 0.25`:
@@ -450,16 +479,16 @@ the CPU examples, same box:
 The last column was measured on a box with other work on it, which is the condition it
 degrades under; read it as a range, not a constant.
 
-The blowup is at the core count, not above one: pinning the rotation QR and the `thin_qr`
-basis build to a single thread took the mid-range counts off the cliff they used to sit
-on, and `03` at 16 threads went from 213 s to 2.0 s. What survives is oversubscription at
-`nproc`, below.
+The blowup is at the core count, not above one. The rotation QR and the `thin_qr` basis
+build run single-threaded, which is what keeps the mid-range counts flat: `03` at 16
+threads is 2.0 s, against 213 s unpinned. What survives is oversubscription at `nproc`,
+below.
 
 The CUDA examples are flat because the threads have little to do (1 thread against 16:
 `05` 22.9 s / 22.0 s, `11` 3.8 s / 3.8 s, `06` 208.2 s / 208.5 s). So ten of the eleven
 examples pin 1. `07` pins 8: its own objective, `sign()` over a `(258, 400, 32)`
 activation, is 3.2 s of its 11 s at one thread and wide enough to pay for the pool.
-`POLYSTEP_THREADS` overrides everywhere.
+`POLYSTEP_THREADS` overrides the examples; the test suite reads `POLYSTEP_TEST_THREADS`.
 
 The default is the worst setting available, not merely suboptimal. Full-space step on a
 `784-64-10` MLP, batch 64, which is the largest per-op shape PolyStep produces:
@@ -484,12 +513,13 @@ MNIST as the sanity check:
 |---|---|---|---|---|
 | full space | `LinearEpsilon(1.0 -> 0.1)` | 0.15 | 0.12 | |
 | `HybridSubspace` | decaying | 4.5 | 2.0 | `rank=4`, `rotation_interval=0` |
-| `LinearSubspace` | decaying | larger than Hybrid | 2.0 | see below |
 | `AdaptiveSubspace` | fixed 0.5 | 10.0 | 2.0 | large `rank` (4096), `use_adaptive_radius=True` |
 
 Per-layer subspaces want a decaying epsilon; a single global projection wants a fixed
 epsilon with an adaptive radius, and a larger `step_radius` than a per-layer one.
 
-`LinearSubspace` needs more radius than `HybridSubspace` because its Gaussian columns are
-scaled by `1/sqrt(num_coords)`, so its gain is `sqrt(num_params / num_coords)` and
-layer-dependent, against Hybrid's uniform QR-orthonormal 1.
+`step_radius` is measured in coordinates, so it only means a fixed weight step where the
+projection has unit gain. Hybrid's QR-orthonormal columns give exactly 1 on the layers
+below `sparse_threshold_bytes`. Above it Hybrid routes the layer to
+`SparseRandomProjection`, which is only *approximately* orthonormal, so the gain there is
+`Pi^T Pi = I` only to about a percent.

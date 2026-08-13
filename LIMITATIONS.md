@@ -1,6 +1,6 @@
 # Limitations
 
-What does not work in `polystep`, with source-file references for each entry.
+What does not work in `polystep`, with source-file references where the behaviour is not obvious from the API.
 
 ## Drop-in vmap-safe layers
 
@@ -68,11 +68,11 @@ directly when none of the above restrictions apply.
 
 (per [`src/polystep/solvers/_shared.py`](src/polystep/solvers/_shared.py))
 
-- The `+inf` penalty is `2 * max|finite| + 1` over the whole matrix, not per row. It
-  still ranks above every finite entry in every row, so no vertex is misordered against
-  its own row. But with `scale_cost='max_cost'` a single masked entry becomes the matrix
-  maximum, which roughly halves the contrast for every particle that step, including
-  those with nothing masked.
+- Every non-finite cost, `-inf` included, is invalid and becomes `2 * max|finite| + 1`
+  over the whole matrix, not per row. It still ranks above every finite entry in every
+  row. But with `scale_cost='max_cost'` a single masked entry becomes the matrix maximum,
+  which roughly halves the contrast for every particle that step, including those with
+  nothing masked.
 
 ## Subspace and projection
 
@@ -89,6 +89,9 @@ typical optimization workloads. Projecting models at or above GPT-2 124M scale t
   accepts. Block-wise modes live on `PolyStepOptimizer`.
 - `AdaptiveSubspace` step-0 (no displacement history) falls back to a random rotation:
   deterministic-reproducible with a seeded `torch.Generator`.
+- Momentum is heavy-ball, so at steady state the move is `velocity_lr/(1-beta)` times the
+  barycentric displacement, 20x at the default `momentum_final`. `step_radius`, the trust
+  region and the radius controller scale only the displacement.
 - Momentum does not survive a basis change. The velocity is a displacement in the basis
   being replaced, so an absorb or a rotation zeroes it rather than applying it through
   the new one. `AdaptiveSubspace` rotates every step by default (`rotation_interval=1`),
@@ -100,7 +103,7 @@ typical optimization workloads. Projecting models at or above GPT-2 124M scale t
   which is also the accuracy recommendation.
 - `FactoredSubspace` confines every perturbation to the `rank` input directions spanned
   by its fixed `B` factor, so at matched subspace dimension it makes less progress per
-  step than `HybridSubspace`'s dense projection. It is 3-11x cheaper per step; on the
+  step than `HybridSubspace`'s dense projection. It is up to 11.2x cheaper per step; on the
   MNIST example at matched dimension it reached 81.4% against 90.9%, or 88.8% with
   `rotation_interval=1`. It is a speed/memory trade, not a drop-in improvement, and is
   not the default. See `docs/performance.md`.
@@ -122,8 +125,7 @@ typical optimization workloads. Projecting models at or above GPT-2 124M scale t
   barycentre is a deterministic descent direction, so that reference does not apply and
   the step size would grow without bound. Use `use_adaptive_radius` for loss-driven step
   adaptation. Two-Point step-size Adaptation (arXiv:0805.0231) is the model-free
-  alternative that would fit here, and is nearly free given the orthoplex already
-  evaluates antithetic pairs; it is not implemented.
+  alternative that would fit here; it is not implemented.
 
 ## Optimizer
 
@@ -133,8 +135,8 @@ typical optimization workloads. Projecting models at or above GPT-2 124M scale t
 - `subspace` is passed as an instance, not a string enum. A string reaches the step and
   raises `AttributeError: 'str' object has no attribute 'subspace_dim'`.
 - A model that computes in more than one dtype needs a per-entry subspace
-  (`HybridSubspace`, `LinearSubspace`, `LowRankSubspace`), which gives each parameter its
-  own projection and keeps its dtype. Full space and `AdaptiveSubspace` hold every
+  (`HybridSubspace` or `FactoredSubspace`), which gives each parameter its own projection
+  and keeps its dtype. Full space and `AdaptiveSubspace` hold every
   parameter in one vector at the layout's `dominant_dtype`, so the minority would be
   optimized at the majority's precision; both raise at construction instead. The
   perturbation itself is at coordinate resolution, which is `dominant_dtype`, since the
@@ -165,10 +167,9 @@ typical optimization workloads. Projecting models at or above GPT-2 124M scale t
 - `train()` rejects `trust_region`: its ratio compares a prediction made on one minibatch
   against the loss on the next, so it never adapted. Drive `optimizer.step()` on a fixed
   batch instead.
-- `multifidelity_screen` warns and does not run outside a narrow set of conditions, which
-  the default simplex does not meet, and pays off in wall-clock only when the per-sample
-  cost dominates. Conditions and measurements in
-  [`docs/performance.md`](docs/performance.md).
+- `multifidelity_screen` warns and does not run alongside the quadratic model, and pays
+  off in wall-clock only when the per-sample cost dominates. Conditions and measurements
+  in [`docs/performance.md`](docs/performance.md).
 - The CMA scalings read like errors and are not. `trace_scale=n` and the `pdim` factor on
   rank-mu compensate for evolution paths fed unit-normalized innovations, so `E||p_c||^2`
   is about 1 rather than `n`.
@@ -199,7 +200,6 @@ No result files ship for these; they are recorded here, not in
 - **GPT-2 124M all-parameter fine-tune** (`experiments/runners/run_gpt2_finetune.py`):
   collapses to random predictions at a 128-dim projection (ratio 1e-6, below the 1e-5 JL
   floor above). Head-only works.
-- **CIFAR-10**: deferred. Network-type and size scalability is the bottleneck.
 
 ### Asymmetric baseline comparisons
 
@@ -207,10 +207,10 @@ No result files ship for these; they are recorded here, not in
   SLS heuristic is an in-repo Python WalkSAT, single seed, 50K flips at 1M vars. PolyStep
   receives `STEP_BUDGETS * popsize` evals; SLS receives only flip budget. **Not a fair
   comparison** to a tuned production solver.
-- **SNN Adam-surrogate baseline**: the surrogate-gradient baseline reported in the paper
-  (§5.3) is not bundled with this release; the Adam baseline in
-  `experiments/results/softmax/main/snn_adam_*.json` uses straight-through gradients
-  only.
+- **SNN Adam-surrogate baseline**: bundled, over five seeds, in
+  `experiments/results/revision/snn_adam_*.json` at $0.8626 \pm 0.106$ mean test accuracy
+  (0.6886 to 0.9478 across seeds -- the spread is the limitation, not the mean). Earlier
+  releases carried only a straight-through-gradient Adam.
 
 ### Evaluation protocol
 

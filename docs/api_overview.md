@@ -90,8 +90,8 @@ optimizer = PolyStepOptimizer(model, subspace=subspace,
 ### FactoredSubspace
 
 Perturbs each 2D parameter by `dW = A @ B` with `B` fixed, so a candidate's weights are
-never built. 11x faster per step than `HybridSubspace` at matched search dimension, and
-2.5x less memory; the identity and the accuracy trade are in
+never built. 11.2x faster per step than `HybridSubspace` at matched search dimension;
+the identity and the accuracy trade are in
 [`docs/performance.md`](performance.md#trading-accuracy-for-speed-factoredsubspace).
 
 Needs a plain `nn.Sequential` of Linear and activation layers; anything else falls back
@@ -119,18 +119,6 @@ from polystep.transform import ParamLayout
 
 layout = ParamLayout.from_module(model)
 subspace = AdaptiveSubspace.from_layout(layout, rank=64)
-```
-
-### LinearSubspace
-
-Fixed random projection baseline.
-
-```python
-from polystep import LinearSubspace
-from polystep.transform import ParamLayout
-
-layout = ParamLayout.from_module(model)
-subspace = LinearSubspace.from_layout(layout, rank=8)
 ```
 
 ### SparseRandomProjection
@@ -249,9 +237,9 @@ optimizer = PolyStepOptimizer(model,
 |-----------|---------|-------|
 | `epsilon` | 0.1 | Use `CosineEpsilon` for scheduled decay |
 | `step_radius` | 1.0 | Multiplied by the current epsilon unless itself a schedule |
-| `probe_radius` | 2.0 | Multiplied by the current epsilon unless itself a schedule |
+| `probe_radius` | 2.0 | Multiplied by the current epsilon unless itself a schedule. Probe `k` sits at `k/(num_probe+1)` of it, so the default single probe is at half |
 | `num_probe` | 1 | K=1 is optimal: entropic regularization already does the averaging that larger K buys |
-| `polytope_type` | `'simplex'` | `'orthoplex'`, `'simplex'`, `'cube'`. The simplex is the minimum positive spanning set, so a step costs `k+1` evaluations instead of `2k`. Features that read the orthoplex's antithetic vertex pairing need `'orthoplex'` |
+| `polytope_type` | `'simplex'` | `'orthoplex'`, `'simplex'`, `'cube'`. The simplex is the minimum positive spanning set, so a step costs `k+1` evaluations instead of `2k`. Only `newton_refinement` needs `'orthoplex'` |
 | `compile` | False | Compiles the geometry and solver kernels. Off by default because ablations showed no end-to-end gain against the JIT warm-up cost; also a no-op on CPU. For forward-pass compilation see `compile_evaluator` / `compile_forward` |
 | `chunk_size` | None | Estimated from the tensors a step allocates; set it only to override |
 | `adaptive_probes` | True (monolithic) | Reuses the cached cost matrix while the configuration has not moved. Needs `objective_token` |
@@ -297,22 +285,20 @@ optimizer = PolyStepOptimizer(model, ...)  # same arguments as the original run
 optimizer.load_state_dict(ckpt["opt"])
 ```
 
-Resume is bit-exact for every configuration: alongside the solver state, `state_dict()`
-captures the optimizer-owned control state that steers the next step (amortization phase,
-transport-direction memory, adaptive-probe reuse caches, trust-region multiplier and
-pending prediction, block-wise dual-momentum history), and `load_state_dict()` rebuilds
-the fused `HybridSubspace` basis from the restored projections.
+Resume is bit-exact for every configuration.
 
-The dict carries a `format` key, currently 3. Loading a newer checkpoint raises. A
+The dict carries a `format` key, currently 4. Loading a newer checkpoint raises. A
 format-1 checkpoint loads with the reuse caches dropped; a format-2 one warns and resets
-the rotation-bias and quadratic-model steering state.
+the rotation-bias and quadratic-model steering state. Format 4 adds the probe-jitter
+pool and the CMA sampling-projection cache, so resume is exact under
+`probe_radius_jitter` and `use_covariance_adaptation` too.
 
 ## Cutting the Forward Budget
 
 Each step costs `num_particles * num_vertices * num_probe` forward passes.
 
-Before tuning anything else, hand the optimizer the evaluator, per batch, as `train()`
-does. Without it the fast evaluators never run:
+Register the evaluator per batch, as `train()` does; without it the fast evaluators
+never run:
 
 ```python
 evaluator = NNCostEvaluator(model, loss_fn)
@@ -333,26 +319,23 @@ Two options then cut the count itself:
   minibatch objective nothing is reused.
 - `multifidelity_screen=True` ranks every direction on a `screen_fidelity` slice of the
   batch, then spends the full fidelity only on the top `screen_keep_ratio` directions
-  (both signs of each, so the orthoplex stays antithetic). Dropped vertices keep their
-  cheap value plus a per-particle offset calibrated on the kept ones. See
+  (both signs of each on an orthoplex). Dropped vertices keep their cheap value plus a
+  per-particle offset calibrated on the kept ones. See
   [`docs/performance.md`](performance.md) for the budget arithmetic and the measured
   wall-clock crossover.
 
 It needs a cheap closure. `api.train` builds one; when driving `step()` yourself:
 
-  ```python
-  opt = PolyStepOptimizer(model, multifidelity_screen=True, screen_keep_ratio=0.5,
-                          screen_fidelity=0.25, polytope_type='orthoplex')
-  screen = opt.screen_closure_from(closure, inputs, targets)  # None when screening is
-  off
-  opt.step(closure, screen_closure=screen)
-  ```
+```python
+opt = PolyStepOptimizer(model, multifidelity_screen=True, screen_keep_ratio=0.5,
+                        screen_fidelity=0.25)
+screen = opt.screen_closure_from(closure, inputs, targets)  # None when screening is off
+opt.step(closure, screen_closure=screen)
+```
 
-Screening is skipped, with a one-time warning, when the polytope is neither an orthoplex
-nor paired with a selection solver (`min_cost_greedy`, `top_k_mean`), while
-`use_quadratic_model`, `newton_refinement` or `trust_region` is on, or when
-`screen_fidelity/num_probe + screen_keep_ratio >= 1`. The contrast ranking needs the
-orthoplex's antithetic pairs, so the default simplex does not screen.
+Screening is skipped, with a one-time warning, while `use_quadratic_model`,
+`newton_refinement` or `trust_region` is on, or when
+`screen_fidelity/num_probe + screen_keep_ratio >= 1`.
 
 ## Restoring the Best Weights
 

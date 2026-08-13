@@ -30,6 +30,8 @@ compression, a softmax solver, and convergence analysis for piecewise-smooth los
        alt="One PolyStep: subspace projection, polytope probes, cost matrix, soft entropic-OT assignment, and barycentric projection, plus the softmax-to-full-OT solver continuum.">
 </p>
 
+> Want to play around with parameters? [**Viet T. Nguyen**](https://vietngth.github.io/) built a gorgeous interactive walkthrough that animates every step of the method -> **[explore the PolyStep visualization](https://vietngth.github.io/polystep-visualization/)**.
+
 ## Installation
 
 ```bash
@@ -43,8 +45,8 @@ From source:
 pip install -e .                      # core library (torch only)
 pip install -e ".[examples]"          # + numpy, torchvision, matplotlib, Pillow, gymnasium, python-sat
 pip install -e ".[dev]"               # + numpy, pytest (+ plugins), ruff
-pip install -e ".[experiments]"       # + numpy, pandas, python-sat, torchvision, cma, evotorch, snntorch, datasets, gymnasium
-pip install -e ".[rl]"                # + gymnasium[box2d], stable-baselines3 (Box2D envs)
+pip install -e ".[experiments]"       # + numpy, pandas, python-sat, torchvision, cma, snntorch, datasets, transformers, gymnasium
+pip install -e ".[rl]"                # + gymnasium[box2d], stable-baselines3, swig (Box2D envs)
 ```
 
 GPU: `pip install torch --index-url https://download.pytorch.org/whl/cu130`, or pick the
@@ -103,10 +105,9 @@ optimizer = PolyStepOptimizer(
 train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 ```
 
-Gradient-free training is forward-pass bound: expect this to be much slower per step
-than backprop, and prefer a GPU build of PyTorch for anything beyond a smoke test.
+Expect this to cost far more per step than backprop. Use a GPU build.
 
-Two things dominate wall-clock in practice:
+Two things dominate wall-clock:
 
 - **Pin the CPU thread count below `nproc`.** PolyStep's per-step ops are small, so
   torch's default core-count intra-op pool oversubscribes and OpenMP spin-wait takes
@@ -174,11 +175,8 @@ everywhere, so finite differences carry no signal and ES/SPSA stall while a fini
 steps across the flat regions. Example 09 shows the separation on a hard decision tree.
 
 Classical direct search (generalized pattern search, MADS) motivates that finite radius,
-but PolyStep does not inherit its convergence guarantees: those rest on evaluating the
-incumbent, accepting only improving steps, and refining the mesh on a failed poll.
-PolyStep evaluates no incumbent (probes exclude scale 0), moves to the barycenter every
-step, and drives its radius from the epsilon schedule. Its guarantees come from the
-Sinkhorn Step analysis instead.
+but PolyStep does not inherit its guarantees: it evaluates no incumbent, moves to the
+barycenter every step, and drives its radius from the epsilon schedule.
 
 ## Gradient-free baselines
 
@@ -214,10 +212,7 @@ result = random_search(obj, sigma=0.1)   # isolates the subspace from the update
 
 **One evaluation means one candidate scored.** `Objective` counts rows, so a method that
 vmaps 32 candidates behind one call spends 32, exactly like one that makes 32 calls. It
-refuses a batch that would exceed the budget, so no method can overspend. This is a
-single replacement for the three older, mutually incompatible counters in `experiments/`
-(`FunctionEvalCounter` counts closure calls, `CountingClosure` counts `losses.shape[0]`,
-`sgd_baseline` counts samples).
+refuses a batch that would exceed the budget, so no method can overspend.
 
 Note on EGGROLL: its rank-`r` perturbations `A B^T` are defined on weight *matrices*, and
 `Objective.shapes` says where those are. `Objective.from_layout` preserves the per-tensor
@@ -242,8 +237,8 @@ python experiments/runners/variant_sweep.py --envs mnist_mlp --stage screen   # 
 python experiments/runners/variant_sweep.py --envs mnist_mlp --baseline spsa  # appends to it
 ```
 
-`--theory-mode` runs the configuration Theorem 4.2 assumes instead of the tuned one:
-`probe_radius_jitter=0.05` with the smooth mollifier density, independently sampled
+`--theory-mode` runs the unaccelerated reference configuration instead of the tuned one:
+jitter `0.05` on the probe and step radii with the smooth mollifier density, independently sampled
 rotations, flat epsilon, step radius `r_0 (t+1)^-(1/2+0.1)` (`polystep.PowerDecay`),
 orthoplex, `HybridSubspace`, and no momentum, amortization or Anderson acceleration.
 Jitter and the amortization heuristics are mutually exclusive and `PolyStepOptimizer`
@@ -253,31 +248,39 @@ heuristics read as progress.
 
 ## Benchmarks
 
-5-seed mean ± std (seeds: 42, 123, 456, 789, 1337). Hardware: NVIDIA RTX 5090.
+5-seed mean ± std, every method tuned on validation at an equal budget and matched on
+optimizer steps. Protocol and per-experiment notes:
+[`experiments/EXPERIMENT_INDEX.md`](https://github.com/anindex/polystep/blob/main/experiments/EXPERIMENT_INDEX.md).
+Tables are generated from the result JSONs, not hand-maintained.
 
+<!-- BENCH:START -->
 ### Non-differentiable tasks
 
-Adam is gradient-based (backprop, on a smoothed surrogate where the task is
-non-differentiable). It is a reference upper bound, not a gradient-free peer of PolyStep,
-CMA-ES, OpenAI-ES and SPSA, and is shown only to bound the gap to a gradient method. Bold
-marks the best method on each row; a dash means the run is not in this release.
+Test accuracy %. A dash means the cell is not in this release.
 
-| Task | PolyStep | Adam (surrogate) | CMA-ES | OpenAI-ES | SPSA | Non-diff op |
-|------|----------|------------------|--------|-----------|------|-------------|
-| SNN/LIF (MNIST) | **93.4 ± 0.3** | 80.5 ± 13.1 | 16.2 ± 8.9 | 33.1 ± 5.5 | 29.4 ± 5.9 | threshold() |
-| Int8 quantized | 97.1 ± 0.1 | **98.1 ± 0.0** | 80.7 ± 1.7 | 78.1 ± 0.7 | 91.2 ± 0.1 | round() |
-| Argmax attention | 86.8 ± 0.4 | **89.1 ± 0.2** | 72.6 ± 0.6 | 75.7 ± 0.3 | 77.7 ± 0.2 | argmax() |
-| Staircase activation | 93.2 ± 0.3 | **97.6 ± 0.1** | 72.8 ± 3.1 | 85.5 ± 0.2 | 49.3 ± 4.7 | floor() |
-| Hard MoE routing | **90.7 ± 0.2** | - | 62.8 ± 2.1 | 63.5 ± 6.4 | 69.3 ± 2.2 | argmax() |
-| MAX-SAT 100K vars | **98.0 ± 0.01** | - | 90.1 ± 0.04 | 88.9 ± 0.01 | - | round() |
-| MAX-SAT 1M vars | **92.6 ± 0.02** | - | - | 87.8 ± 0.00 | - | round() |
+| Task | PolyStep | CMA-ES | OpenAI-ES | SPSA | Adam (surrogate) | Non-diff op |
+|---|---|---|---|---|---|---|
+| SNN/LIF (MNIST) | 93.0 ± 0.2 | 77.1 ± 13.3 | 79.6 ± 5.2 | 53.9 ± 3.0 | 86.3 ± 10.6 | `threshold()` |
+| Int8 quantized | 97.0 ± 0.1 | 91.6 ± 0.4 | 94.4 ± 0.2 | 82.5 ± 0.5 | 97.8 ± 0.1 | `round()` |
+| Argmax attention | 86.6 ± 0.4 | 79.5 ± 0.5 | 80.0 ± 0.4 | 67.4 ± 1.3 | 88.6 ± 0.1 | `argmax()` |
+| Staircase activation | 94.3 ± 0.1 | 89.2 ± 0.4 | 88.9 ± 0.5 | 45.2 ± 4.2 | 97.5 ± 0.1 | `floor()` |
+| Hard MoE routing | 90.6 ± 0.2 | 77.8 ± 1.5 | 82.5 ± 0.8 | 25.4 ± 3.5 | - | `argmax()` |
+
+### MAX-SAT (% clauses satisfied)
+
+| Variables | PolyStep | CMA-ES | OpenAI-ES | probSAT | RC2 |
+|---|---|---|---|---|---|
+| 100 | 98.0 ± 0.7 | 99.0 ± 0.3 | 99.4 ± 0.1 | 99.8 | 99.8 |
+| 5,000 | 98.1 ± 0.1 | 95.2 ± 0.2 | 92.9 ± 0.2 | 99.9 | timeout |
+| 100,000 | 98.1 ± 0.0 | 90.7 ± 0.1 | 88.9 ± 0.0 | 99.6 | timeout |
 
 ### Differentiable sanity checks
 
-| Task | PolyStep | Adam | Architecture |
-|------|---------|------|--------------|
-| MNIST | 96.0% ± 0.1 | **97.9% ± 0.0** | 2-layer MLP (101K) |
-| ETTh1 timeseries | **MSE 0.121 ± 0.004** | MSE 0.187 | LSTM (23K) |
+| Task | PolyStep | Adam |
+|---|---|---|
+| MNIST (2-layer MLP) | 96.8 ± 0.1 | 97.7 ± 0.1 |
+| ETTh1 (LSTM, MSE; lower is better) | 0.253 ± 0.023 | 0.247 ± 0.023 |
+<!-- BENCH:END -->
 
 ### SNN memory scaling (forward-only vs. BPTT)
 
@@ -286,12 +289,9 @@ marks the best method on each row; a dash means the run is not in this release.
 | T=25 | 31.8 MB | 132 MB | 4.2x |
 | T=400 | 51.6 MB | 1,538 MB | **29.8x** |
 
-PolyStep leads every gradient-free row here, at 60x (SNN) to 13,000x (MAX-SAT 1M) the
-evaluation budget of the ES and SPSA baselines. Against the gradient surrogate it wins
-where the non-differentiability is hard (SNN LIF, hard MoE routing) and loses where an
-accurate smooth surrogate exists (int8, argmax, staircase), so the niche is hard
-non-differentiability, not non-differentiability in general. On MAX-SAT the domain
-solvers win outright: probSAT reaches about 99.6% at 100K variables and 98.9% at 1M.
+PolyStep leads every gradient-free baseline on all five non-differentiable tasks, and
+beats the gradient surrogate only where the non-differentiability is hard. It does not
+beat Adam on differentiable problems, or domain solvers on MAX-SAT.
 
 ## Features
 
@@ -321,8 +321,7 @@ solvers win outright: probSAT reaches about 99.6% at 100K variables and 98.9% at
 - **High-dimensional NLP.** All-parameter fine-tuning of GPT-2 124M through a 128-dim
   projection collapses to random predictions; the projection ratio is far below the
   Johnson-Lindenstrauss floor.
-- **Adam baseline.** Where a smooth surrogate exists, Adam wins (see the benchmark
-  tables). The stronger surrogate-gradient / BPTT baseline for SNNs (paper §5.3) is not
+- **Adam baseline.** The stronger surrogate-gradient / BPTT baseline for SNNs is not
   bundled with this release; see the arXiv preprint.
 
 Full discussion in
@@ -343,7 +342,7 @@ Full discussion in
 
 ## Citation
 
-If you find this work useful, please consider citing:
+Citation:
 
 ```bibtex
 @article{le2026training,
@@ -356,9 +355,7 @@ If you find this work useful, please consider citing:
 
 ## Acknowledgments
 
-Thanks to [**Viet T. Nguyen**](https://vietngth.github.io/) for the interactive
-[PolyStep visualization](https://vietngth.github.io/polystep-visualization/), which
-animates every step of the method.
+A huge thank you to [**Viet**](https://vietngth.github.io/) for building a beautiful interactive [PolyStep visualization](https://vietngth.github.io/polystep-visualization/), it brings the method to life and makes every step click!
 
 ## License
 

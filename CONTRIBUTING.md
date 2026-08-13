@@ -26,36 +26,35 @@ ruff format --check .
 # the slow and the gpu markers, so neither is collected.
 pytest tests/ -v
 
-# Exactly what CI selects, in parallel. About 9s.
+# Exactly what CI selects, in parallel. About 19 s.
 pytest tests/ -m "not slow and not gpu" -n auto
 
-# Every test, including the ones marked slow. Those train on MNIST; about 90 s total.
+# Every test, including the slow ones, which train on MNIST.
 pytest tests/ -m ""
 
 # With coverage
 pytest tests/ --cov=polystep --cov-report=term-missing
 ```
 
-`conftest.py` pins `torch.set_num_threads(1)` for everything except the `slow` tests,
-which train at batch 512 and get `cpu_count() - 8`. The fast tests are small-tensor
-bound, where torch's intra-op pool costs more than it saves; unpinned the suite is both
-slower and erratic, which was tripping the timeout on the Sinkhorn-heavy tests. Serial it
-runs in about 18 s. `POLYSTEP_TEST_THREADS` overrides the fast count.
+`tests/conftest.py` pins one intra-op thread: the fast tests are small-tensor bound,
+where torch's pool costs more than it saves. `slow` tests get
+`max(2, min(16, nproc - 8))`. `POLYSTEP_TEST_THREADS` overrides the fast count.
 
-CI runs the fast suite on Python 3.11-3.14 per push, and the `slow` marker nightly (or on
-`workflow_dispatch`), since those legs download MNIST.
-
-It also builds the sdist, checks that it collects, and runs `tests/test_api.py` from the
-unpacked tarball. To reproduce that:
+CI runs the fast suite on Python 3.11, 3.12 and 3.14 per pull request, adds 3.13 on push,
+and runs the `slow` marker nightly or on `workflow_dispatch`, since those legs download
+MNIST. It also builds the sdist and runs the fast suite from the unpacked tarball:
 
 ```bash
 uv build --sdist
 mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
-cd /tmp/sdist && uv pip install --system ".[dev]" && pytest tests/test_api.py -q
+cd /tmp/sdist && uv pip install --system ".[dev]"
+pytest tests/ -q -m "not slow and not gpu" --timeout=120 -n auto
 ```
 
-Tests that read or import `experiments/` request the `require_experiments` fixture, which
-skips them outside a repo checkout.
+`experiments/` is not distributed, so tests that read or import it must skip outside a
+repo checkout: a whole file skips at import (`pytest.skip(..., allow_module_level=True)`),
+a single test takes the `require_experiments` fixture. The sdist job above is what catches
+a missing guard.
 
 ## Cutting a release
 
@@ -74,15 +73,14 @@ same version and `CHANGELOG.md` has a section for it, so update all four togethe
 
 ## Code Style
 
-- Follow existing code conventions
 - Use type hints for public functions
 - Add docstrings with Args/Returns sections for public APIs
 - Keep comments short and specific; explain why, not what
 
 The package ships `py.typed`, so annotations on the public surface are part of the
-contract. `mypy src/polystep/` currently reports errors, mostly narrowing complaints on
-the duck-typed `subspace` argument, so it is not yet a CI gate. New code should not add
-to the count.
+contract. `mypy` is not a CI gate and is not in the `dev` extra; run `uvx mypy
+src/polystep/` if you want it. It reports narrowing complaints on the duck-typed
+`subspace` argument. New code should not add to the count.
 
 ## Reporting Issues
 
