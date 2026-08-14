@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.11.0 - 2026-08-14
+
+### Breaking
+
+- Removed `LowRankSubspace`, `FactorSpec`, `LinearSubspace`. Use `HybridSubspace` or
+  `FactoredSubspace`.
+- Removed `absorb_every`; subspaces absorb through `absorb_mode`.
+- Removed `polystep.benchmarks.baselines` and the `evotorch` dependency. Use
+  `polystep.baselines.cma_es`.
+- Removed `SinkhornSolver.solve(init_eps=...)`, `PolyStep.warm_start` and
+  `CompiledFunctions.warm_start`.
+- `CMAAdaptiveSubspace` subclasses `AdaptiveSubspace`; `.base` is gone.
+- `probe_scale_of(cfg, dim=...)` requires `dim` and returns a per-coordinate scale.
+  Baselines used to probe `sqrt(d)` too far; their old numbers were deleted.
+
+### Fixed
+
+- A zero transport row moved the particle to the coordinate origin. It spreads uniformly.
+- `-inf` costs tied with a real minimum. Every non-finite cost is invalid.
+- `polytope_type='cube'` at `particle_dim=2` was read as an orthoplex by vertex count.
+- Newton refinement left the momentum velocity on the discarded position.
+- The trust region shrank on probe-reuse steps, and held when it predicted a rise that
+  happened.
+- Blockwise claimed convergence on an all-NaN sweep.
+- A pre-format-4 checkpoint under `use_covariance_adaptation` resumed on a different
+  projection without warning.
+- The quadratic model charged P forward passes for one shared centre evaluation.
+- A seed changed which rotation algorithm ran, not just the stream.
+- `PolyStep.init_state` permanently swapped in `SoftmaxSolver` after a single-particle
+  call.
+- MAX-SAT tables inferred a timeout from a zero score. Baselines were tuned only on GPT-2.
+
+### Performance
+
+- `use_quadratic_model` and `trust_region` run on any polytope: the least-squares gradient
+  is a closed form on a centred tight frame and one shared `f(X)` gives `tr(H)/d`. At 300K
+  evaluations over 6 seeds the simplex config reduces loss 0.178 against 0.079 plain and
+  0.156 for the orthoplex, on `k+1` vertices instead of `2k`. Only `newton_refinement`
+  still needs the orthoplex.
+- `multifidelity_screen` no longer needs antithetic pairs.
+- Radius jitter samples from a cached inverse-CDF table, not by rejection: ~300-1000x. The
+  SNN showcase went from under one epoch in 621 s to 190 s per epoch.
+- `Objective.__call__` 11 ms to 0.2 ms; every gradient-free baseline goes through it.
+
 ## 0.10.1 - 2026-08-01
 
 ### Fixed
@@ -542,7 +586,7 @@ Codebase cleanup, test modernization, and documentation correctness pass.
 
 - `examples/06_loihi_snn_polystep.py`: end-to-end skeleton for a Loihi 2-style two-stage
   workflow. Stage 1 pretrains a hard-LIF MNIST SNN with PolyStep using
-  `PSTORCH_CONFIGS["snn"]`. Stage 2 adapts only the writable subset a real Loihi 2 chip
+  `POLYSTEP_CONFIGS["snn"]`. Stage 2 adapts only the writable subset a real Loihi 2 chip
   exposes at runtime (`fc2`, per-population `vth`, and `beta`; about 1.3% of model
   parameters) under an `N(0, 1)` Gaussian input shift. Stage 2 uses TENT-style
   safeguards: mixed-batch (half clean / half shifted), rank-8 probing on the writable
