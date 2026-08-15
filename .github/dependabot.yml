@@ -1,0 +1,11 @@
+version: 2
+
+# The workflows pin actions to a commit SHA, which never updates itself. Without this
+# they stay on whatever was current when they were pinned, security fixes included.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
