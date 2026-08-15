@@ -161,6 +161,7 @@ def test_goal_reaching_success_is_not_inverted():
     The default flag is ``lengths >= horizon``, which is right for balancing
     tasks and exactly backwards for goal-reaching ones.
     """
+    pytest.importorskip("gymnasium")
     import torch
 
     from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
