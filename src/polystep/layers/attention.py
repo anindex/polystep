@@ -1,4 +1,4 @@
-"""Vmap-compatible multi-head attention using explicit matmul instead of SDPA (issue #151558)."""
+"""Vmap-compatible multi-head attention with native CPU SDPA."""
 
 import math
 import warnings
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 class VmapSafeMultiHeadAttention(nn.Module):
-    """Multi-head attention via explicit matmul, vmap-safe.
+    """Multi-head attention, vmap-safe.
 
     Returns only the output tensor, not ``(output, weights)``. No built-in causal
     mask; kdim/vdim must equal embed_dim.
@@ -115,35 +115,49 @@ class VmapSafeMultiHeadAttention(nn.Module):
         K = K.view(batch_size, seq_k, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_k, self.num_heads, self.head_dim).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-
-        # Bool masks fill with -inf; float masks add.
+        # Convert MHA's True=masked convention to an additive SDPA-compatible mask.
         if attn_mask is not None:
             if attn_mask.dim() == 2:
                 attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
             elif attn_mask.dim() == 3:
-                attn_mask = attn_mask.unsqueeze(1)
+                if attn_mask.shape[0] == batch_size * self.num_heads:
+                    attn_mask = attn_mask.reshape(batch_size, self.num_heads, seq_q, seq_k)
+                else:
+                    # Also retain the wrapper's per-batch mask extension.
+                    attn_mask = attn_mask.unsqueeze(1)
             elif attn_mask.dim() != 4:
                 raise ValueError(
                     "attn_mask must have 2, 3, or 4 dimensions, got "
                     f"{attn_mask.dim()}D (shape {tuple(attn_mask.shape)})"
                 )
             if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(attn_mask, float("-inf"))
-            else:
-                scores = scores + attn_mask
+                attn_mask = torch.zeros_like(attn_mask, dtype=Q.dtype).masked_fill(attn_mask, float("-inf"))
 
         if key_padding_mask is not None:
             padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(padding_mask, float("-inf"))
+            if padding_mask.dtype == torch.bool:
+                padding_mask = torch.zeros_like(padding_mask, dtype=Q.dtype).masked_fill(padding_mask, float("-inf"))
+            attn_mask = padding_mask if attn_mask is None else attn_mask + padding_mask
 
-        # Softmax of an all -inf row is NaN, which spreads through the value mix.
-        fully_masked = torch.isneginf(scores).all(dim=-1, keepdim=True)
-        attn_weights = F.softmax(scores.masked_fill(fully_masked, 0.0), dim=-1)
-        attn_weights = attn_weights.masked_fill(fully_masked, 0.0)
-        attn_weights = self.attn_dropout(attn_weights)
-
-        context = torch.matmul(attn_weights, V)
+        if Q.device.type == "cpu":
+            context = F.scaled_dot_product_attention(
+                Q,
+                K,
+                V,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                scale=self.scale,
+            )
+        else:
+            # Keep the established CUDA/vmap path until fused dispatch is measured
+            # across the supported torch versions (including the 2.8 floor).
+            scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+            if attn_mask is not None:
+                scores = scores + attn_mask
+            fully_masked = torch.isneginf(scores).all(dim=-1, keepdim=True)
+            weights = F.softmax(scores.masked_fill(fully_masked, 0.0), dim=-1)
+            weights = weights.masked_fill(fully_masked, 0.0)
+            context = torch.matmul(self.attn_dropout(weights), V)
 
         # reshape, not .contiguous().view(): the latter copies once per candidate under vmap.
         context = context.transpose(1, 2).reshape(batch_size, seq_q, self.embed_dim)

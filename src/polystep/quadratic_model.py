@@ -1,8 +1,10 @@
 """Quadratic model extraction from the cost evaluations of a centred tight frame.
 
-``sum_v v = 0`` and ``sum_v v v^T = (V/d) I`` hold to 1e-15 for every template, which is
-what makes the fits below closed forms rather than solves.
+``sum_v v = 0`` and ``sum_v v v^T = (V/d) I`` hold up to floating-point rounding
+for every template, giving closed-form fits.
 """
+
+import math
 
 import torch
 
@@ -16,10 +18,9 @@ def extract_fd_gradient(
 ) -> torch.Tensor:
     """``g = (d / (V s r)) sum_v L_v v``, the rotated-frame least-squares gradient.
 
-    ``verts=None`` takes the antithetic form, which is the same expression with the
-    ``2d-2`` zero terms dropped, so it is exact rather than exact to the last ulp.
-    Without antipodal pairs the third moment survives: 0.67% error at r=0.01 on the
-    simplex, 6.7% at 0.1.
+    ``verts=None`` uses central differences on orthoplex pairs. These recover the
+    gradient of a quadratic up to rounding. Without antipodal pairs, a quadratic's
+    third-moment contribution can bias the estimate by ``O(probe_radius)``.
     """
     V = losses_3d.shape[1]
 
@@ -31,7 +32,10 @@ def extract_fd_gradient(
         return ((losses_3d[:, :pdim, :] - losses_3d[:, pdim:, :]) / denom).mean(dim=-1)
 
     # (P, V, K) against (V, pdim) -> (P, pdim, K)
-    moment = torch.einsum("pvk,vd->pdk", losses_3d, verts.to(dtype=losses_3d.dtype, device=losses_3d.device))
+    # The frame is centred mathematically, not bit-for-bit. Remove a common loss
+    # before taking moments or a large constant objective invents a gradient.
+    centered = losses_3d - losses_3d[:, :1, :]
+    moment = torch.einsum("pvk,vd->pdk", centered, verts.to(dtype=losses_3d.dtype, device=losses_3d.device))
     denom = ((V / pdim) * scales * probe_radius).clamp(min=1e-10)  # (K,)
     return (moment / denom).mean(dim=-1)  # (P, pdim)
 
@@ -44,7 +48,7 @@ def extract_iso_curvature(
 ) -> torch.Tensor:
     """Isotropic curvature ``tr(H)/d`` as ``(P, 1)``, from the vertex mean and one ``f(X)``.
 
-    ``mean_v v^T H v = tr(H sum_v v v^T)/V = tr(H)/d``, so this is exact at any radius.
+    ``mean_v v^T H v = tr(H sum_v v v^T)/V = tr(H)/d``, so this is exact at any radius for a quadratic objective.
     The frame is Haar-random each step, so ``E[H_jj] = tr(H)/d`` for every ``j``.
     """
     mean_over_v = losses_3d.mean(dim=1)  # (P, K)
@@ -198,6 +202,8 @@ def update_trust_region(
     pred = predicted_improvement.mean().item()
     actual = actual_improvement.mean().item()
 
+    if not (math.isfinite(pred) and math.isfinite(actual)):
+        return max(current_radius * shrink_factor, min_radius)
     if abs(pred) < 1e-10:
         return current_radius
 

@@ -1,218 +1,289 @@
-"""Backend x architecture matrix for the per-step candidate-forward evaluation.
+"""Candidate-forward parity, cold cost, throughput and memory on CPU or CUDA.
 
-Covers the architectures that route through vmap or in-place, not the pure-MLP bmm
-fast path:
-
-  eager_vmap             vmap + functional_call, no compile          (baseline)
-  compiled_vmap_default  torch.compile(mode="default"): fusion only  (no CUDA graphs)
-  inplace_eager          sequential .data-swap loop, eager forward
-  inplace_graph          compile_forward: torch.compile(reduce-overhead), CUDA
-                         graphs on the forward and loss, replayed per candidate
-
-Reports median wall-clock and IQR, speedup against eager_vmap, and the backend that
-actually ran, since compile can fall back silently. Run on GPU, from the repository
-root.
-
-    python experiments/scripts/bench_forward_backends.py
+PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --device cpu
+Add --compile to include compiler warmup; --prefix measures complete MLP steps.
 """
 
 from __future__ import annotations
 
+import argparse
+from contextlib import nullcontext
+import json
+from pathlib import Path
 import statistics
-import sys
 import time
+from unittest.mock import patch
 
-sys.path.insert(0, ".")
 import torch
-import torch.nn as nn
-from torch.func import functional_call, vmap
+from torch import nn
 
-from experiments.runners.nondiff_models import (
-    DiscreteAttentionNet,
-    HardMoENet,
-    SpikingMNISTNet,
-)
-from polystep.cost_nn import NNCostEvaluator
-
-# (name, build_fn, input_shape (per-sample), n_classes)
-MODELS = [
-    ("SpikingMNISTNet (recurrent, T=15)", lambda: SpikingMNISTNet(num_steps=15), (784,), 10),
-    ("DiscreteAttentionNet (MLP+argmax)", lambda: DiscreteAttentionNet(), (784,), 10),
-    ("HardMoENet (MLP+hard-gate)", lambda: HardMoENet(), (784,), 20),
-]
-
-BATCH = 128
-N_CAND = 128  # representative candidate chunk (P*V*K)
-WARMUP = 50
-# Sub-millisecond sweeps are noisy: a per-call time budget gives cheap backends
-# many more reps. Pin GPU clocks (nvidia-smi -lgc) for stable numbers.
-MIN_REPS = 60
-TIME_BUDGET_S = 1.5
+from experiments.runners.search_suite import WORKLOADS, synchronize, task
+from polystep import PolyStepOptimizer
+from polystep.cost_nn import NNCostEvaluator, SiteVmapEvaluator
+from polystep.hybrid_subspace import HybridSubspace
+from polystep.transform import ParamLayout
 
 
-def _stacked(model, n, noise=0.02, gen=None):
-    """N candidate param dicts = current params broadcast + small noise.
-
-    Keyed by param name: exactly what NNCostEvaluator.evaluate expects.
-    """
-    out = {}
-    for name, p in model.named_parameters():
-        base = p.detach()
-        cfg = base.unsqueeze(0).expand(n, *base.shape).contiguous()
-        cfg = cfg + noise * torch.randn(cfg.shape, device=cfg.device, dtype=cfg.dtype, generator=gen)
-        out[name] = cfg
-    return out
-
-
-def _time(fn):
-    """GPU-side timing via cuda.Event, with a wall-time budget so sub-ms sweeps
-    get many reps (less Python/sync jitter than perf_counter)."""
-    for _ in range(WARMUP):
+def measure(fn, device, warmup, repeats):
+    synchronize(device)
+    before = time.perf_counter()
+    fn()
+    synchronize(device)
+    cold = time.perf_counter() - before
+    for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
-    ts = []
-    start = time.perf_counter()
-    while len(ts) < MIN_REPS or (time.perf_counter() - start) < TIME_BUDGET_S:
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
+    synchronize(device)
+    if torch.device(device).type == "cuda":
+        base_memory = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    times = []
+    for _ in range(repeats):
+        synchronize(device)
+        before = time.perf_counter()
         fn()
-        e1.record()
-        torch.cuda.synchronize()
-        ts.append(e0.elapsed_time(e1))  # ms, GPU-side
-        if len(ts) >= 5000:
-            break
-    q = statistics.quantiles(ts, n=4)
-    return statistics.median(ts), q[2] - q[0]
+        synchronize(device)
+        times.append(time.perf_counter() - before)
+    q = statistics.quantiles(times, n=4)
+    return dict(
+        cold_seconds=cold,
+        median_seconds=statistics.median(times),
+        iqr_seconds=q[2] - q[0],
+        peak_extra_bytes=torch.cuda.max_memory_allocated(device) - base_memory
+        if torch.device(device).type == "cuda"
+        else None,
+    )
 
 
-def _backend_used(ev, kind):
-    """Report the path that actually ran (compile can silently fall back)."""
-    if kind.startswith("inplace"):
-        if kind == "inplace_graph":
-            return "inplace-eager (compile fell back)" if ev._compile_forward_failed else "inplace+CUDAgraph"
-        return "inplace-eager"
-    # vmap arms
-    if ev._vmap_failed:
-        return "sequential-loop (vmap fell back)"
-    if kind == "compiled_vmap_default":
-        return "vmap-eager (compile fell back)" if ev._compile_failed else "vmap+fusion"
-    return "vmap-eager"
+def profile_call(fn, device):
+    """Profile outside timed samples; report executed operators and compiled regions."""
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.device(device).type == "cuda":
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    with torch.profiler.profile(activities=activities, record_shapes=True, profile_memory=True) as prof:
+        fn()
+    events = prof.key_averages()
+    return dict(
+        compiled_regions=sum(e.count for e in events if "Torch-Compiled Region" in e.key),
+        operators=[
+            dict(
+                name=e.key,
+                calls=e.count,
+                self_cpu_us=e.self_cpu_time_total,
+                self_device_us=getattr(e, "self_device_time_total", 0),
+                self_cpu_bytes=e.self_cpu_memory_usage,
+            )
+            for e in sorted(events, key=lambda e: e.self_cpu_time_total, reverse=True)[:20]
+        ],
+    )
 
 
-def _build_vmap_ro(model, loss_fn):
-    """torch.compile(reduce-overhead) on the vmapped fn.
+@torch.inference_mode()
+def candidate_bench(args):
+    rows = []
+    for name in args.workloads or WORKLOADS:
+        for seed in args.seeds:
+            model, (train, _, _) = task(name, seed, args.device, args.batch)
+            x, y = train
+            layout = ParamLayout.from_module(model)
+            base = {k: p.detach().clone() for k, p in model.named_parameters()}
+            # Sample an early large site and the last site; prefix work differs sharply.
+            keys = dict.fromkeys((max(base, key=lambda k: base[k].numel()), next(reversed(base))))
+            for key in keys:
+                site = base[key][None] + 0.02 * torch.randn(args.candidates, *base[key].shape, device=args.device)
+                stacked = {k: v[None].expand(args.candidates, *v.shape) for k, v in base.items()} | {key: site}
+                reference_ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+                expected = reference_ev._evaluate_loop(stacked, x, y)
+                backends = ["evaluator", "site", "inplace"] + (
+                    ["compiled_evaluator", "compiled_site"] if args.compile else []
+                )
+                for backend in backends:
+                    # Independent backends must not exhaust a shared Dynamo code
+                    # object's recompilation budget before the next trial starts.
+                    if args.compile:
+                        torch.compiler.reset()
+                    ev = NNCostEvaluator(
+                        model,
+                        nn.CrossEntropyLoss(),
+                        use_inplace=backend == "inplace",
+                        compile_vmap=backend.startswith("compiled"),
+                        compile_forward=False,
+                    )
+                    site_ev = SiteVmapEvaluator.try_build(ev, layout)
 
-    With chunk_size=None (no chunking) there is no chunk-concat, so CUDA graphs
-    on the whole N-candidate sweep may capture: one graph, N candidates. The
-    evaluator's compile_vmap deliberately ships mode="default" instead; tested
-    raw here against fusion on launch-bound nets.
-    """
-    buffers = dict(model.named_buffers())
+                    def fn():
+                        if backend.endswith("site"):
+                            return site_ev._vmap_over_site(key, base, site, x, y)
+                        return ev.evaluate(stacked, x, y)
 
-    def single(params, inputs, targets):
-        out = functional_call(model, {**params, **buffers}, (inputs,))
-        loss = loss_fn(out, targets)
-        return loss.mean() if loss.dim() > 0 else loss
+                    row = dict(
+                        workload=name,
+                        seed=seed,
+                        site=key,
+                        backend=backend,
+                        device=args.device,
+                        torch=torch.__version__,
+                        candidates=args.candidates,
+                        batch=args.batch,
+                        threads=args.threads,
+                        warmup=args.warmup,
+                        repeats=args.repeats,
+                    )
+                    try:
+                        row.update(measure(fn, args.device, args.warmup, args.repeats))
+                        got = fn()
+                        torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+                        row.update(status="ok", max_loss_error=float((got - expected).abs().max()))
+                        row["compile_fallback"] = bool(
+                            ev._compile_failed or (site_ev and site_ev._compile_failed_sites)
+                        )
+                        row["actual_path"] = (
+                            "site-vmap"
+                            if backend.endswith("site")
+                            else "inplace"
+                            if ev._use_inplace
+                            else "bmm"
+                            if ev._batched_linear is not None
+                            else "loop"
+                            if ev._vmap_failed
+                            else "vmap"
+                        )
+                        row["compiled_callable"] = (
+                            bool(site_ev._compiled_sites)
+                            if backend.endswith("site")
+                            else ev._compiled_vmap_fn is not None
+                        )
+                        if args.profile:
+                            row["profile"] = profile_call(fn, args.device)
+                    except Exception as error:
+                        row.update(status="failed", error=f"{type(error).__name__}: {error}")
+                    rows.append(row)
+                    print(json.dumps(row), flush=True)
+    return rows
 
-    batched = vmap(single, in_dims=(0, None, None), chunk_size=None)
-    return torch.compile(batched, mode="reduce-overhead", fullgraph=False)
+
+@torch.inference_mode()
+def prefix_bench(args):
+    rows = []
+    for width in (64, 256):
+        for dimension in (0, 512):
+            for seed in args.seeds:
+                reference = None
+                for reuse in (False, True):
+                    torch.manual_seed(seed)
+                    model = nn.Sequential(
+                        nn.Linear(32, width), nn.ReLU(), nn.Linear(width, width), nn.ReLU(), nn.Linear(width, 4)
+                    ).to(args.device)
+                    x = torch.randn(args.batch, 32, device=args.device)
+                    y = torch.randint(0, 4, (args.batch,), device=args.device)
+                    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+                    sub = (
+                        HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4, max_subspace_dim=dimension)
+                        if dimension
+                        else None
+                    )
+                    opt = PolyStepOptimizer(
+                        model, subspace=sub, solver="softmax", chunk_size=72, compile=False, seed=seed
+                    )
+                    opt.register_evaluator(ev, x, y)
+
+                    def fn():
+                        return opt.step(lambda p: ev.evaluate(p, x, y))
+
+                    context = (
+                        nullcontext()
+                        if reuse
+                        else patch("polystep._step_monolithic._reuse_prefixes", lambda *a: lambda f: f)
+                    )
+                    with context:
+                        row = measure(fn, args.device, args.warmup, args.repeats)
+                        if args.profile:
+                            row["profile"] = profile_call(fn, args.device)
+                    if reference is None:
+                        reference = opt.state.X.clone()
+                    else:
+                        torch.testing.assert_close(opt.state.X, reference, rtol=0, atol=0)
+                    row.update(
+                        workload="mlp_step",
+                        width=width,
+                        subspace=dimension,
+                        seed=seed,
+                        prefix_reuse=reuse,
+                        device=args.device,
+                        batch=args.batch,
+                        threads=args.threads,
+                        torch=torch.__version__,
+                        status="ok",
+                    )
+                    rows.append(row)
+                    print(json.dumps(row), flush=True)
+    return rows
 
 
-def _make_ev(model, loss_fn, kind):
-    if kind == "eager_vmap":
-        return NNCostEvaluator(model, loss_fn, use_inplace=False, compile_vmap=False)
-    if kind == "compiled_vmap_default":
-        return NNCostEvaluator(model, loss_fn, use_inplace=False, compile_vmap=True)
-    if kind == "inplace_eager":
-        return NNCostEvaluator(model, loss_fn, use_inplace=True, compile_forward=False)
-    if kind == "inplace_graph":
-        return NNCostEvaluator(model, loss_fn, use_inplace=True, compile_forward=True)
-    raise ValueError(kind)
+@torch.inference_mode()
+def attention_bench(args):
+    rows = []
+    for seq in (6, 64, 128):
+        torch.manual_seed(0)
+        q = torch.randn(args.candidates, args.batch, 2, seq, 8, device=args.device)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
 
+        def explicit(q, k, v):
+            scores = (q @ k.transpose(-1, -2)) / 8**0.5
+            return scores.softmax(-1) @ v
 
-BACKENDS = [
-    "eager_vmap",
-    "compiled_vmap_default",
-    "compiled_vmap_reduce_overhead",
-    "inplace_eager",
-    "inplace_graph",
-]
+        reference = torch.vmap(explicit)(q, k, v)
+        for name, kernel in (("explicit", explicit), ("sdpa", nn.functional.scaled_dot_product_attention)):
 
+            def fn():
+                return torch.vmap(kernel)(q, k, v)
 
-def run_model(name, build, in_shape, n_classes, seeds=(0, 1, 2)):
-    loss_fn = nn.CrossEntropyLoss()
-    per_backend = {b: [] for b in BACKENDS}
-    used = {}
-    for seed in seeds:
-        torch.manual_seed(seed)
-        gen = torch.Generator(device="cuda").manual_seed(seed)
-        model = build().cuda().eval()
-        x = torch.rand(BATCH, *in_shape, device="cuda")
-        y = torch.randint(0, n_classes, (BATCH,), device="cuda")
-        stacked = _stacked(model, N_CAND, gen=gen)
-
-        for kind in BACKENDS:
-            if kind == "compiled_vmap_reduce_overhead":
-                # CUDA graphs on the vmapped sweep.
-                try:
-                    fn = _build_vmap_ro(model, loss_fn)
-                    with torch.inference_mode():
-                        med, iqr = _time(lambda: fn(stacked, x, y))
-                        losses = fn(stacked, x, y)
-                    ok = torch.unique(losses).numel() > N_CAND // 2
-                    per_backend[kind].append(med if ok else float("inf"))
-                    # CUDA graphs do not benefit the already vmap-amortized sweep.
-                    used[kind] = "vmap+reduce-overhead" if ok else "vmap+RO STALE (rejected)"
-                except Exception as e:  # noqa: BLE001
-                    per_backend[kind].append(float("inf"))
-                    used[kind] = f"FAILED ({type(e).__name__})"
-                torch.cuda.empty_cache()
-                continue
-            ev = _make_ev(model, loss_fn, kind)
-            # Guard: these models must NOT hit the pure-MLP bmm fast path, else the
-            # benchmark silently bypasses compile.
-            assert ev._batched_linear is None, f"{name} hit BatchedLinearEvaluator: bmm bypass"
-            with torch.inference_mode():
-                med, iqr = _time(lambda: ev.evaluate(stacked, x, y))
-            per_backend[kind].append(med)
-            used[kind] = _backend_used(ev, kind)
-            # sanity: distinct configs -> distinct losses (stale-weight guard)
-            with torch.inference_mode():
-                losses = ev.evaluate(stacked, x, y)
-            assert torch.unique(losses).numel() > N_CAND // 2, f"{name}/{kind}: losses collapsed (stale weights?)"
-        del model
-        torch.cuda.empty_cache()
-
-    base = statistics.median(per_backend["eager_vmap"])
-    print(f"\n{name}   batch={BATCH} N_cand={N_CAND}  ({len(seeds)} seeds)")
-    print(f"  {'backend':24s}{'ms/sweep':>11s}{'ms/cand':>10s}{'speedup':>9s}   actual-path")
-    for kind in BACKENDS:
-        med = statistics.median(per_backend[kind])
-        print(f"  {kind:24s}{med:11.3f}{med / N_CAND:10.4f}{base / med:8.2f}x   {used[kind]}")
-    best = min(BACKENDS, key=lambda k: statistics.median(per_backend[k]))
-    return name, base / statistics.median(per_backend[best]), best, used
+            row = measure(fn, args.device, args.warmup, args.repeats)
+            torch.testing.assert_close(fn(), reference, rtol=1e-5, atol=1e-6)
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+                fn()
+            kernels = [e.key for e in prof.key_averages() if "attention" in e.key]
+            row.update(
+                workload="attention_kernel",
+                backend=name,
+                sequence=seq,
+                device=args.device,
+                candidates=args.candidates,
+                batch=args.batch,
+                operators=kernels,
+                torch=torch.__version__,
+            )
+            rows.append(row)
+            print(json.dumps(row), flush=True)
+    return rows
 
 
 def main():
-    if not torch.cuda.is_available():
-        print("SKIP: needs CUDA.")
-        return
-    print(f"Backend x architecture matrix  device={torch.cuda.get_device_name(0)}  torch={torch.__version__}")
-    print("Currency = wall-clock (median over timed reps). Never forward count.")
-    verdicts = [run_model(*m) for m in MODELS]
-    print("\n=== VERDICT (illustrative: pin GPU clocks for stable numbers) ===")
-    for name, speedup, best, _ in verdicts:
-        print(f"  {name:36s} best={best:24s} {speedup:5.2f}x vs eager_vmap")
-    print("  - vmap already amortizes launches: ~30-40x vs the sequential in-place loop.")
-    print("  - compiled_vmap_default (fusion) is best on all four, ~1.2-1.9x on top of vmap;")
-    print("    LARGEST on the FLOP-heavy CNN, SMALLEST on the already-amortized SNN.")
-    print("  - reduce-overhead on the vmapped path does NOT beat fusion (CUDA graphs give no")
-    print("    benefit once the sweep is vmap-amortized).")
-    print("  - CUDA graphs help only the sequential in-place path (inplace_graph), proportional")
-    print("    to launch-boundness (SNN ~6x, CNN ~1.1x); that path is used only when vmap OOMs.")
-    print("  - eager_vmap can LOSE to inplace on activation-heavy nets (CNN 25 vs 19 ms): vmap")
-    print("    of conv lowers to grouped conv. Never compare by forward count.")
+    ap = argparse.ArgumentParser(__doc__)
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--workloads", nargs="+", choices=WORKLOADS)
+    ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--candidates", type=int, default=16)
+    ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--repeats", type=int, default=15)
+    ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--prefix", action="store_true")
+    ap.add_argument("--attention", action="store_true")
+    ap.add_argument("--output", type=Path, default=Path("experiments/results/benchmarks/forward.json"))
+    args = ap.parse_args()
+    if args.repeats < 2 or min(args.batch, args.candidates, args.threads) < 1 or args.warmup < 0:
+        ap.error("repeats must be >=2; batch, candidates and threads positive; warmup nonnegative")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        ap.error("CUDA is unavailable; run on CPU or restore GPU access")
+    torch.set_num_threads(args.threads)
+    rows = prefix_bench(args) if args.prefix else attention_bench(args) if args.attention else candidate_bench(args)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(rows, indent=2) + "\n")
+    if any(row.get("status") == "failed" for row in rows):
+        raise SystemExit("Some backends failed; inspect the result file")
 
 
 if __name__ == "__main__":

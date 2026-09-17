@@ -65,7 +65,7 @@ def test_trust_region_activates_without_biased_rotation():
 
 
 def test_trust_region_runs_at_num_probe_one_via_the_shared_centre():
-    """One f(X) per particle replaces the second probe scale the regression needs."""
+    """One shared f(X) replaces the second probe scale the regression needs."""
     torch.manual_seed(0)
     model = _model()
     with warnings.catch_warnings():
@@ -128,23 +128,21 @@ def test_trust_region_warns_when_amortization_makes_it_inert():
     assert len(opt._state.trust_region_multipliers) == 0
 
 
-def test_the_simplex_model_needs_the_shared_centre():
-    """At num_probe >= 2 there is no centre and no antipodal pairs, so nothing to read."""
-    torch.manual_seed(0)
+def test_the_simplex_model_uses_the_shared_centre_at_multiple_scales():
     model = _model()
-    with pytest.warns(UserWarning, match="num_probe=1"):
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            num_probe=2,
-            polytope_type="simplex",
-            trust_region=True,
-            compile=False,
-            seed=0,
-        )
+    opt = PolyStepOptimizer(
+        model,
+        max_iterations=50,
+        epsilon=0.1,
+        num_probe=2,
+        polytope_type="simplex",
+        trust_region=True,
+        compile=False,
+        seed=0,
+    )
     _run(opt, _closure(model))
-    assert len(opt._state.trust_region_multipliers) == 0
+    assert opt._center_loss is not None
+    assert len(opt._state.trust_region_multipliers) > 0
 
 
 def test_a_probe_reuse_step_does_not_move_the_trust_region():

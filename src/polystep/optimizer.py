@@ -174,8 +174,9 @@ class PolyStepOptimizer(SerializationMixin):
         use_adaptive_radius: Stagnation-based radius adaptation.
         stagnation_threshold: Relative change below which is stagnation.
         stagnation_patience: Stagnation iterations before a radius boost.
-        use_quadratic_model: Fit gradient and curvature from the vertex losses. Costs one
-            shared ``f(X)`` per step and needs ``num_probe=1`` off the orthoplex.
+        use_quadratic_model: Fit gradient and curvature from the vertex losses when
+            biased_rotation or trust_region consumes the model. Costs one shared
+            ``f(X)`` per step on every polytope.
         newton_refinement: Correct the barycentre with a Newton step. Orthoplex only,
             ``num_probe>=2``.
         newton_refinement_alpha: Step size for that correction.
@@ -317,21 +318,13 @@ class PolyStepOptimizer(SerializationMixin):
 
         # newton_refinement reads the antithetic vertex order directly. The gradient and
         # the curvature are closed forms on any centred tight frame, but off the orthoplex
-        # the curvature comes from a shared f(X), which only num_probe=1 evaluates.
+        # the curvature comes from one shared f(X) evaluation.
         if polytope_type != "orthoplex":
             if newton_refinement:
                 warnings.warn(
                     f"newton_refinement reads the orthoplex's antithetic vertex ordering, but "
                     f"polytope_type={polytope_type!r}. It will not take effect. Pass "
                     f"polytope_type='orthoplex' to use it.",
-                    stacklevel=2,
-                )
-            if (use_quadratic_model or trust_region) and num_probe != 1:
-                warnings.warn(
-                    f"use_quadratic_model on polytope_type={polytope_type!r} takes its curvature "
-                    f"from one shared f(X), which the step only evaluates at num_probe=1; got "
-                    f"num_probe={num_probe}, so the model will not take effect. Pass num_probe=1, "
-                    f"or polytope_type='orthoplex' to regress across probe scales instead.",
                     stacklevel=2,
                 )
 
@@ -1295,6 +1288,8 @@ class PolyStepOptimizer(SerializationMixin):
         # Rebuild the fast paths when the objective changes; they cache the model and
         # loss_fn they were built from.
         fastpath_key = (
+            id(evaluator),
+            evaluator._reset_count,
             id(evaluator.model),
             id(evaluator.loss_fn),
             evaluator._inplace_forced,
@@ -1491,11 +1486,17 @@ class PolyStepOptimizer(SerializationMixin):
 
     def _step_blockwise(self, closure: Callable) -> float:
         """Block-wise step: per-block OT solve."""
-        return _step_blockwise_fn(self, closure)
+        from .cost_nn import _reuse_prefixes
+
+        with _reuse_prefixes(getattr(self, "_sparse_delta_evaluator", None)):
+            return _step_blockwise_fn(self, closure)
 
     def _step_subspace_blockwise(self, closure: Callable) -> float:
         """Combined subspace + block-wise step: per-block OT in subspace coords."""
-        return _step_subspace_blockwise_fn(self, closure)
+        from .cost_nn import _reuse_prefixes
+
+        with _reuse_prefixes(getattr(self, "_subspace_delta_evaluator", None)):
+            return _step_subspace_blockwise_fn(self, closure)
 
     def _step_momentum(self, closure: Callable) -> float:
         """Cheap step: reapply the last direction with decay, no forward passes."""

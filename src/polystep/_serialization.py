@@ -8,7 +8,8 @@ import torch
 # state_dict schema version. Bump when a key changes meaning.
 # 1: SolverState only. 2: adds "control". 3: rotation-bias and quadratic-model state.
 # 4: jitter pool and CMA sampling-projection cache.
-_STATE_DICT_FORMAT = 4
+# 5: whole-model (summed) trust prediction and incumbent-only comparisons.
+_STATE_DICT_FORMAT = 5
 
 # Optimizer attributes outside SolverState that steer the *next* step.
 _SPARSE_TAG = "__sparse_projection__"
@@ -174,6 +175,13 @@ class SerializationMixin:
                 )
                 self._prev_descent_direction_finite = False
                 self._loss_decreasing_count = 0
+
+        if fmt < 5:
+            if self._prev_loss_from_center and self._prev_predicted_improvement is not None:
+                self._prev_predicted_improvement = self._prev_predicted_improvement.sum()
+            else:
+                self._prev_predicted_improvement = None
+                self._prev_pre_step_loss = None
 
         # Rebuild the scaled projection the restored cache describes. The saved copies
         # stay distinct objects from the live state: _update_sampling_projection skips

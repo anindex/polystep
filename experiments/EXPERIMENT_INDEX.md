@@ -1,21 +1,8 @@
-# Experiment Index
+# Experiment results
 
-What each experiment measures, which runner produces it, and the full result tables.
-The README carries a short version of the same tables; both are generated from
-`results/revision/`, so neither can drift from the other:
-
-```bash
-python experiments/scripts/generate_paper_tables.py \
-    --results-dir experiments/results/revision \
-    --readme README.md --index experiments/EXPERIMENT_INDEX.md
-```
-
-All runners default to the honest protocol (validation-selected checkpoints) and 5
-seeds `{42, 123, 456, 789, 1337}`. Results vary slightly with hardware and PyTorch
-version. Setup and per-runner commands:
-[`../docs/reproducibility.md`](../docs/reproducibility.md).
-
-## Results
+Architecture results use seeds 42, 123, 456, 789, and 1337, with validation-selected
+configurations and checkpoints. Tables compare optimizer steps. Evaluation- and
+time-matched results are reported separately.
 
 <!-- BENCH:START -->
 ### Non-differentiable tasks
@@ -49,70 +36,22 @@ Test accuracy %. A dash means the cell is not in this release.
 | ETTh1 (LSTM, MSE; lower is better) | 0.253 ± 0.023 | 0.247 ± 0.023 |
 <!-- BENCH:END -->
 
-## Experiments
+Adam uses surrogate gradients where necessary and is a gradient-based reference.
+Specialized MAX-SAT solvers use different work units; their flip budgets do not equal
+neural candidate budgets.
 
-### Non-differentiable tasks (primary)
+## Reproduction
 
-| # | Task | Runner | Non-diff op |
-|---|------|--------|-------------|
-| 1 | SNN hard-LIF | `run_elevation.py` | `threshold()` |
-| 2 | INT8 quantized | `run_elevation.py` | `round()` |
-| 3 | Argmax attention | `run_elevation.py` | `argmax()` |
-| 4 | Staircase | `run_elevation.py` | `floor()` |
-| 5 | Hard MoE routing | `run_moe.py` | `argmax()` |
-| 6 | MAX-SAT, 100 to 100K vars | `run_maxsat.py` | `round()` |
+See the [runner list](README.md#runners), [protocol](../docs/reproducibility.md), and
+[controlled hard-LIF comparison](CONTROLLED_EXPERIMENTS.md).
 
-### Sanity checks
+Regenerate these tables and the README from result files:
 
-| # | Task | Runner | Note |
-|---|------|--------|------|
-| 7 | MNIST (101K MLP) | `run_mnist.py` | fully differentiable; Adam is the reference |
-| 8 | ETTh1 timeseries | `run_timeseries.py` | reported as MSE, lower is better |
-| 9 | GPT-2 SST-2 (head-only) | `run_gpt2_finetune.py` | see [`../LIMITATIONS.md`](../LIMITATIONS.md) |
-
-### RL policy search
-
-| Task | Runner |
-|------|--------|
-| CartPole / Acrobot (vanilla + hardened) | `run_rl.py` |
-
-### Ablations
-
-| Study | Runner |
-|-------|--------|
-| MAX-SAT scaling | `run_maxsat_softmax_scaling.py` |
-| Optimizer variants (solver, subspace, block, schedule) | `variant_sweep.py` |
-| Unaccelerated reference config (`--theory-mode`) | `run_revision.sh` |
-
-## Reading the tables
-
-- **Adam is not a gradient-free peer.** It backprops, on a smoothed surrogate where
-  the task is not differentiable. It is there to bound the gap to a gradient method.
-- **PolyStep's niche is hard non-differentiability.** It beats the gradient surrogate
-  on the SNN's LIF threshold and loses on int8, argmax and staircase, where an
-  accurate smooth surrogate exists. On the differentiable checks Adam is ahead.
-- **MAX-SAT is a scaling claim, not a win.** PolyStep holds ~98% from 100 to 100,000
-  variables while the ES baselines decay with problem size, but probSAT stays above
-  99.5% throughout. RC2 is exact below ~500 variables and times out above.
-- **Budgets are matched on optimizer steps.** Population methods are fixed at
-  `FAIR_POPSIZE` so one generation costs one step. The wall-clock and
-  evaluation-matched arms live in subdirectories and are reported separately.
-
-## Result layout
-
-Run outputs are not tracked in git. One JSON per `(benchmark, method, seed)` under
-`results/revision/`, plus:
-
-```text
-experiments/results/revision/
-  logs/         per-cell stdout
-  theory/       --theory-mode cells
-  evalmatched/  evaluation-matched arm
-  wallclock/    wall-clock-matched arm
+```bash
+python experiments/scripts/generate_paper_tables.py \
+    --results-dir experiments/results/revision \
+    --readme README.md --index experiments/EXPERIMENT_INDEX.md
 ```
 
-Per-file JSON schema: [`../docs/reproducibility.md`](../docs/reproducibility.md).
-
-## Hardware
-
-NVIDIA RTX 5090, Python 3.11+, PyTorch 2.8+ (tested with 2.13+cu130 on Ubuntu Linux).
+Architecture results live in `results/revision/`, with `theory/`, `evalmatched/`, and
+`wallclock/` subdirectories for separate protocols. Outputs are not tracked in Git.

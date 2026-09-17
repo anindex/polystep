@@ -14,7 +14,7 @@ import torch
 from .solvers._shared import thin_qr
 from .subspace import ProjectedAbsorbMixin, absorb_due
 
-from .hybrid_subspace import LayerProjectionSpec, _stable_entry_seed
+from .hybrid_subspace import LayerProjectionSpec, _require_positive_rank, _stable_entry_seed
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         **kwargs,
     ) -> "FactoredSubspace":
         """Build specs from a ParamLayout."""
+        _require_positive_rank(rank, "rank")
         specs = []
         ranks: Dict[str, int] = {}
         offset = 0

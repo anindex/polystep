@@ -27,6 +27,12 @@ class SparseRandomProjection:
         seed: int = 0,
     ):
         """Initialize the sparse projection."""
+        if not isinstance(full_dim, int) or isinstance(full_dim, bool) or full_dim < 1:
+            raise ValueError("full_dim must be a positive integer")
+        if not isinstance(subspace_dim, int) or isinstance(subspace_dim, bool) or subspace_dim < 1:
+            raise ValueError("subspace_dim must be a positive integer")
+        if density is not None and not (math.isfinite(density) and 0 < density <= 1):
+            raise ValueError("density must be finite and in (0, 1]")
         self.full_dim = full_dim
         self.subspace_dim = subspace_dim
         self.density = density if density is not None else 1.0 / math.sqrt(full_dim)
@@ -113,14 +119,13 @@ class SparseRandomProjection:
         self._values = values.to(device)
         self._device = device
         self._dtype = dtype
+        self._sparse_matrix = None
+        self._csr_matrix = None
 
     def _get_sparse_matrix(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Return the sparse COO matrix, building it on first use."""
         if self._indices is None or self._device != device or self._dtype != dtype:
             self._init_sparse_matrix(device, dtype)
-            self._sparse_matrix = None
-            self._csr_matrix = None
-            self._csr_matrix = None
 
         if self._sparse_matrix is None:
             # Indices are in range by construction; the context-manager opt-out is process-global.
@@ -150,7 +155,6 @@ class SparseRandomProjection:
         """
         if self._indices is None or self._device != device or self._dtype != dtype:
             self._init_sparse_matrix(device, dtype)
-            self._sparse_matrix = None
         rows = self._indices[0].view(self.subspace_dim, self._nnz_per_col)
         vals = self._values.view(self.subspace_dim, self._nnz_per_col)
         return rows.index_select(0, cols), vals.index_select(0, cols)

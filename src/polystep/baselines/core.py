@@ -152,7 +152,7 @@ class Objective:
         losses = torch.as_tensor(self._fn(X)).reshape(n)
         self.evals += n
         # NaN would win argmin, -inf would win forever.
-        finite = torch.nan_to_num(losses.detach(), nan=float("inf"), neginf=float("inf"))
+        finite = torch.nan_to_num(losses.detach(), nan=float("inf"), posinf=float("inf"), neginf=float("inf"))
         # Take the value by reduction and the row by a device-side gather: indexing with argmin's result would sync.
         # The loss may be computed on a different device than the search space; normalize once here so scalars follow the candidates.
         if finite.device != X.device:
@@ -184,16 +184,23 @@ class Objective:
 
     @property
     def best_x(self) -> Optional[torch.Tensor]:
-        """Best candidate so far, or None if nothing has been scored."""
+        """Best candidate so far, or None if no finite loss has been scored."""
+        if self._best_loss_t is None or not bool(torch.isfinite(self._best_loss_t)):
+            return None
         return self._best_x_t
 
 
 def centered_rank(x: torch.Tensor) -> torch.Tensor:
-    """Rank-based utilities in ``[-0.5, 0.5]``, ascending (Salimans et al. 2017)."""
+    """Ascending centered utilities with average tied ranks (Salimans et al. 2017)."""
     n = x.numel()
     if n <= 1:
         return torch.zeros_like(x)
-    return x.argsort().argsort().to(x.dtype) / (n - 1) - 0.5
+    values, order = x.flatten().sort()
+    _, inverse, counts = torch.unique_consecutive(values, return_inverse=True, return_counts=True)
+    dtype = x.dtype if x.is_floating_point() else torch.float32
+    midpoint = counts.cumsum(0).to(dtype) - (counts.to(dtype) + 1) / 2
+    ranks = midpoint[inverse] / (n - 1) - 0.5
+    return torch.empty_like(ranks).scatter_(0, order, ranks).reshape_as(x)
 
 
 def zscore(x: torch.Tensor) -> torch.Tensor:

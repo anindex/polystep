@@ -473,13 +473,9 @@ def test_only_newton_refinement_still_needs_the_orthoplex():
     with pytest.warns(UserWarning, match="antithetic vertex ordering"):
         PolyStepOptimizer(model, particle_dim=4, seed=0, num_probe=1, newton_refinement=True)
 
-    # Off the orthoplex the curvature comes from the shared f(X), which needs num_probe=1.
-    with pytest.warns(UserWarning, match="num_probe=1"):
-        PolyStepOptimizer(model, particle_dim=4, seed=0, num_probe=3, use_quadratic_model=True)
-
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        PolyStepOptimizer(model, particle_dim=4, seed=0, num_probe=1, use_quadratic_model=True, trust_region=True)
+        PolyStepOptimizer(model, particle_dim=4, seed=0, num_probe=3, use_quadratic_model=True, trust_region=True)
         PolyStepOptimizer(
             model, particle_dim=4, seed=0, num_probe=3, solver="min_cost_greedy", multifidelity_screen=True
         )

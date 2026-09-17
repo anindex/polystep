@@ -8,6 +8,7 @@ the one parameter a candidate perturbs.
 from __future__ import annotations
 
 import warnings
+from contextlib import contextmanager
 from typing import Callable, Optional, TYPE_CHECKING, Union
 
 import torch
@@ -148,14 +149,11 @@ def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
 
     n = outputs.shape[0]
     if loss_kind == "cross_entropy":
-        tgt = targets.unsqueeze(0).expand(n, -1)  # (N, B)
-        return (
-            torch.nn.functional.cross_entropy(
-                outputs.reshape(n * targets.shape[0], -1), tgt.reshape(-1), reduction="none"
-            )
-            .reshape(n, -1)
-            .mean(dim=1)
-        )  # (N,)
+        tgt = targets.unsqueeze(0).expand(n, *targets.shape).flatten(0, 1)
+        losses = torch.nn.functional.cross_entropy(outputs.flatten(0, 1), tgt, reduction="none").reshape(n, -1)
+        if targets.shape == outputs.shape[1:]:  # Probability targets have no ignored labels.
+            return losses.mean(dim=1)
+        return losses.sum(dim=1) / (targets != -100).sum()  # All ignored: 0/0 matches mean CE.
 
     # Cast before expand, or the cast materializes the whole (N, *target) tensor;
     # promote so FP64 targets keep precision.
@@ -169,11 +167,16 @@ def cast_inputs_memo(holder, inputs: torch.Tensor, dtype: Optional[torch.dtype])
     """Cast float inputs to ``dtype``, memoized on ``holder`` so a chunk loop casts once."""
     if dtype is None or not inputs.is_floating_point() or inputs.dtype == dtype:
         return inputs
+    # Inference tensors have no version counter; their contents can change unseen.
+    if torch.is_inference(inputs):
+        holder._cast_cache = None
+        return inputs.to(dtype)
+    version = inputs._version
     cached = getattr(holder, "_cast_cache", None)
-    if cached is not None and cached[0] is inputs and cached[1] is dtype:
+    if cached is not None and cached[0] is inputs and cached[1] is dtype and cached[3] == version:
         return cached[2]
     out = inputs.to(dtype)
-    holder._cast_cache = (inputs, dtype, out)
+    holder._cast_cache = (inputs, dtype, out, version)
     return out
 
 
@@ -218,6 +221,7 @@ class NNCostEvaluator:
         self.per_sample = per_sample
         self._chunk_size_raw = chunk_size
         self._chunk_size_cached = _UNSET  # lazily computed for "auto"
+        self._reset_count = 0
         self._vmap_failed = False
         self._warned = False
         self._compile_vmap = compile_vmap
@@ -278,6 +282,7 @@ class NNCostEvaluator:
         Call after swapping a layer, rebinding a buffer, replacing a Parameter, or
         moving the model.
         """
+        self._reset_count += 1
         self._vmap_failed = False
         self._warned = False
         # A prior compile failure should not stay latched after the model changed.
@@ -546,7 +551,7 @@ class NNCostEvaluator:
         rather than failing mid-loop.
         """
         fwd_loss = self._forward_loss_fn()
-        if fwd_loss is self._forward_loss or self._compile_forward_verified:
+        if fwd_loss == self._forward_loss or self._compile_forward_verified:
             return fwd_loss
         try:
             fwd_loss(inputs, targets)
@@ -630,9 +635,7 @@ class NNCostEvaluator:
         device = inputs.device
 
         # Cast float inputs to the param dtype (integers untouched).
-        first = next(self.model.parameters(), None)
-        if first is not None:
-            inputs = self.cast_inputs(inputs, first.dtype)
+        inputs = self.cast_inputs(inputs, self._input_dtype(base_sd))
 
         losses = torch.empty(N, device=device, dtype=loss_buffer_dtype(flat_subspace_batch.dtype))
 
@@ -640,7 +643,6 @@ class NNCostEvaluator:
         if was_training:
             self.model.eval()
 
-        fwd_loss = self._verified_forward_loss_fn(inputs, targets)
         # Refresh the cached parameter dict only if it no longer covers these entries.
         param_dict = self._param_dict_cache
         if not param_dict.keys() >= {s.entry_key for s in subspace.specs} & set(base_sd):
@@ -660,6 +662,8 @@ class NNCostEvaluator:
             for k in _keys:
                 entry_params[k].copy_(param_dict[k].data)
         try:
+            with self._autocast(device):
+                fwd_loss = self._verified_forward_loss_fn(inputs, targets)
             for i in range(N):
                 # Reconstruct config i directly into the model params.
                 subspace.apply_perturbation_inplace(
@@ -738,6 +742,43 @@ _TAGGED_LAYERS = (
     (nn.SiLU, "activation"),
 )
 _SUPPORTED_LAYERS = tuple(base for base, _ in _TAGGED_LAYERS)
+
+
+@contextmanager
+def _reuse_prefixes(*evaluators):
+    """Reuse deterministic base activations only within one candidate sweep."""
+    eligible = [
+        ev for ev in evaluators if ev is not None and all(type(m) in _SUPPORTED_LAYERS for _, _, m in ev._layer_keys)
+    ]
+    previous = [getattr(ev, "_prefix_cache", None) for ev in eligible]
+    for ev in eligible:
+        ev._prefix_cache = {}
+    try:
+        yield
+    finally:
+        for ev, cache in zip(eligible, previous):
+            ev._prefix_cache = cache
+
+
+def _base_prefix(evaluator, params, inputs, end):
+    """Activation before layer ``end``; params and inputs stay fixed within the sweep."""
+    cache = evaluator._prefix_cache
+    if not cache:
+        cache[0] = inputs if inputs.dim() == 2 else inputs.reshape(inputs.shape[0], -1)
+    if end not in cache:
+        start = max(i for i in cache if i < end)
+        x = cache[start]
+        for i in range(start, end):
+            name, tag, module = evaluator._layer_keys[i]
+            if tag == "linear":
+                # Match the delta paths' arithmetic (including its rounding order).
+                x = x @ params[f"{name}.weight"].t()
+                if f"{name}.bias" in params:
+                    x = x + params[f"{name}.bias"]
+            elif tag not in ("flatten", "dropout"):
+                x = module(x)
+            cache[i + 1] = x
+    return cache[end]
 
 
 def _probe_elementwise(module: nn.Module) -> bool:
@@ -1039,6 +1080,8 @@ class SiteVmapEvaluator:
         self._entry_by_key = {e.key: e for e in layout.entries}
         self._starts = torch.tensor([e.offset for e in layout.entries], dtype=torch.long)
         self._keys = [e.key for e in layout.entries]
+        self._compiled_sites = {}
+        self._compile_failed_sites = set()
 
     @classmethod
     def try_build(cls, evaluator: "NNCostEvaluator", layout) -> "SiteVmapEvaluator | None":
@@ -1126,7 +1169,7 @@ class SiteVmapEvaluator:
 
         # Repeat evaluate()'s cast/autocast frame here. Cast to the model's dtype, not
         # the site's: the perturbed layer need not be the one the input reaches first.
-        cast_to = _uniform_float_dtype(shared, site.dtype)
+        cast_to = _uniform_float_dtype(shared, site)
         if cast_to is not None and inputs.is_floating_point() and inputs.dtype != cast_to:
             inputs = self._owner.cast_inputs(inputs, cast_to) if self._owner is not None else inputs.to(cast_to)
 
@@ -1135,7 +1178,7 @@ class SiteVmapEvaluator:
         if was_training:
             model.eval()
 
-        def single_eval(site_param, inputs, targets):
+        def single_eval(site_param, shared, inputs, targets):
             output = functional_call(model, {**shared, key: site_param}, (inputs,))
             loss = loss_fn(output, targets) if targets is not None else loss_fn(output)
             return _fold_candidate_loss(loss, per_sample)
@@ -1143,7 +1186,21 @@ class SiteVmapEvaluator:
         # No autocast frame: under vmap it casts activations but not a Conv2d bias, so
         # a conv model raises a dtype mismatch.
         try:
-            return vmap(single_eval, in_dims=(0, None, None))(site, inputs, targets)
+            batched = vmap(single_eval, in_dims=(0, None, None, None))
+            if self._owner is not None and self._owner._compile_vmap and key not in self._compile_failed_sites:
+                try:
+                    if key not in self._compiled_sites:
+                        # Shared weights, buffers and data are explicit arguments: no
+                        # batch or incumbent from the first call is baked into a graph.
+                        self._compiled_sites[key] = torch.compile(batched, mode="default", fullgraph=False)
+                    return self._compiled_sites[key](site, shared, inputs, targets)
+                except torch.cuda.OutOfMemoryError:
+                    raise
+                except Exception as e:
+                    self._compiled_sites.pop(key, None)
+                    self._compile_failed_sites.add(key)
+                    warnings.warn(f"compile_vmap failed at site {key!r} ({e}); using eager vmap.", stacklevel=2)
+            return batched(site, shared, inputs, targets)
         except Exception as e:
             # The step calls this directly, so the failure never reaches evaluate()'s
             # fallback. Usual cause is a forward that draws its own randomness, which
@@ -1158,7 +1215,7 @@ class SiteVmapEvaluator:
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return torch.stack([single_eval(site[i], inputs, targets) for i in range(site.shape[0])])
+            return torch.stack([single_eval(site[i], shared, inputs, targets) for i in range(site.shape[0])])
         finally:
             if was_training:
                 model.train()
@@ -1249,7 +1306,12 @@ class SparseDeltaEvaluator:
         # differ only at `dcols` by `dvals`; after it `xn` is dense.
         dcols = dvals = xn = None
 
-        for idx, (name, tag, module) in enumerate(self._layer_keys):
+        reuse = getattr(self, "_prefix_cache", None) is not None
+        params = base_sd
+        if reuse:
+            x = _base_prefix(self, params, inputs, site_idx)
+        start = site_idx if reuse else 0
+        for idx, (name, tag, module) in enumerate(self._layer_keys[start:], start):
             if tag in ("flatten", "dropout"):
                 continue
 
@@ -1280,9 +1342,12 @@ class SparseDeltaEvaluator:
                     xn = xn + bias
                 continue
 
-            out = x @ weight.t()  # (B, d_out), the weight is shared
-            if bias is not None:
-                out = out + bias
+            if reuse:
+                out = _base_prefix(self, params, inputs, idx + 1)
+            else:
+                out = x @ weight.t()
+                if bias is not None:
+                    out = out + bias
 
             if dvals is not None:
                 # Mix the confined delta into every output unit: it goes dense here.
@@ -1423,7 +1488,12 @@ class SubspaceDeltaEvaluator:
         n = n_groups * n_cand
         xn = None
 
-        for idx, (name, tag, module) in enumerate(self._layer_keys):
+        reuse = getattr(self, "_prefix_cache", None) is not None
+        params = bary_sd
+        if reuse:
+            x = _base_prefix(self, params, inputs, site_idx)
+        start = site_idx if reuse else 0
+        for idx, (name, tag, module) in enumerate(self._layer_keys[start:], start):
             if tag in ("flatten", "dropout"):
                 continue
             if tag != "linear":
@@ -1442,9 +1512,12 @@ class SubspaceDeltaEvaluator:
                     xn = xn + bias
                 continue
 
-            out = x @ weight.t()  # (B, d_out), the barycenter weight is shared
-            if bias is not None:
-                out = out + bias
+            if reuse:
+                out = _base_prefix(self, params, inputs, idx + 1)
+            else:
+                out = x @ weight.t()
+                if bias is not None:
+                    out = out + bias
 
             if idx == site_idx:
                 if is_weight:

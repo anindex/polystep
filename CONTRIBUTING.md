@@ -1,91 +1,47 @@
-# Contributing to polystep
+# Contributing
 
-## Getting Started
+Install the development dependencies and run the same checks as CI:
 
 ```bash
-git clone https://github.com/anindex/polystep.git
-cd polystep
 pip install -e ".[dev]"
-```
-
-## Development Workflow
-
-1. Create a branch from `main`
-2. Make your changes
-3. Run the checks below; they are the lint and test commands CI runs
-4. Submit a pull request
-
-## Running the checks
-
-```bash
-# Lint and formatting, exactly as CI runs them
 ruff check .
 ruff format --check .
+pytest tests/ -q
+```
 
-# Fast tests (recommended during development). The pyproject addopts deselect both
-# the slow and the gpu markers, so neither is collected.
-pytest tests/ -v
+Create a branch, make the change, add regression coverage where needed, and open a
+pull request. Keep comments specific and public APIs typed.
 
-# Exactly what CI selects, in parallel. About 19 s.
-pytest tests/ -m "not slow and not gpu" -n auto
+## Tests
 
-# Every test, including the slow ones, which train on MNIST.
+The default suite excludes `slow` and `gpu` tests. To select them:
+
+```bash
+pytest tests/ -m slow
+pytest tests/ -m gpu
 pytest tests/ -m ""
-
-# With coverage
-pytest tests/ --cov=polystep --cov-report=term-missing
 ```
 
-`tests/conftest.py` pins one intra-op thread: the fast tests are small-tensor bound,
-where torch's pool costs more than it saves. `slow` tests get
-`max(2, min(16, nproc - 8))`. `POLYSTEP_TEST_THREADS` overrides the fast count.
+Tests use one CPU thread by default; `POLYSTEP_TEST_THREADS` overrides it. Slow tests
+may download MNIST. Tests importing `experiments/` must skip when that directory is
+absent, since it is excluded from distributions.
 
-CI runs the fast suite on Python 3.11, 3.12 and 3.14 per pull request, adds 3.13 on push,
-and runs the `slow` marker nightly or on `workflow_dispatch`, since those legs download
-MNIST. It also builds the sdist and runs the fast suite from the unpacked tarball:
+CI also builds the source distribution and runs its tests. Before a release:
 
 ```bash
-uv build --sdist
-mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
-cd /tmp/sdist && uv pip install --system ".[dev]"
-pytest tests/ -q -m "not slow and not gpu" --timeout=120 -n auto
+uv build
+uvx twine check --strict dist/*
 ```
 
-`experiments/` is not distributed, so tests that read or import it must skip outside a
-repo checkout: a whole file skips at import (`pytest.skip(..., allow_module_level=True)`),
-a single test takes the `require_experiments` fixture. The sdist job above is what catches
-a missing guard.
+## Releases
 
-## Cutting a release
+Update `polystep.__version__`, the version and date in `CITATION.cff`, and
+`CHANGELOG.md`. `pyproject.toml` reads the package version automatically.
 
-`release.yml` publishes on a GitHub Release through PyPI trusted publishing. It refuses
-to publish unless the tag, `src/polystep/__init__.py`, and `CITATION.cff` all carry the
-same version and `CHANGELOG.md` has a section for it, so update all four together:
+Publishing a GitHub Release tagged `vX.Y.Z` triggers the PyPI workflow. It checks
+version consistency, lint, tests, and package metadata before publishing.
 
-```bash
-# 1. bump __version__ in src/polystep/__init__.py
-# 2. bump version and date-released in CITATION.cff
-# 3. add a "## X.Y.Z - YYYY-MM-DD" section to CHANGELOG.md
-# 4. tag as vX.Y.Z and publish the GitHub Release
-```
+## Issues
 
-`pyproject.toml` reads the version from `polystep.__version__`, so it needs no edit.
-
-## Code Style
-
-- Use type hints for public functions
-- Add docstrings with Args/Returns sections for public APIs
-- Keep comments short and specific; explain why, not what
-
-The package ships `py.typed`, so annotations on the public surface are part of the
-contract. `mypy` is not a CI gate and is not in the `dev` extra; run `uvx mypy
-src/polystep/` if you want it. It reports narrowing complaints on the duck-typed
-`subspace` argument. New code should not add to the count.
-
-## Reporting Issues
-
-Please include:
-- Python and PyTorch versions
-- GPU model (if relevant)
-- Minimal reproduction script
-- Full error traceback
+Include a minimal reproduction, the traceback, Python and PyTorch versions, and
+hardware details relevant to the failure.

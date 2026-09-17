@@ -136,7 +136,7 @@ class PolyStepES:
             self.X = X_new
 
         # NaN and -inf would poison torch.min, so map both to +inf first.
-        flat_cost = torch.nan_to_num(cost.reshape(-1), nan=float("inf"), neginf=float("inf"))
+        flat_cost = torch.nan_to_num(cost.reshape(-1), nan=float("inf"), posinf=float("inf"), neginf=float("inf"))
         fmin, idx = torch.min(flat_cost, dim=0)
         if fmin.item() < self.best_fitness:
             self.best_fitness = fmin.item()

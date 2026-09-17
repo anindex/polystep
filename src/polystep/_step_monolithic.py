@@ -9,6 +9,7 @@ from typing import Callable
 
 import torch
 
+from .cost_nn import _reuse_prefixes
 from .costs import scale_cost_matrix
 from .solvers._shared import loss_buffer_dtype, recenter_cost, sanitize_cost, solver_health
 from .epsilon import feed_solver_stats, radius_epsilon_factor
@@ -381,9 +382,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             or _subspace_delta is not None
             or _subspace_site is not None
         )
-        # At K_eff == 1 the regression has nothing to regress on, so buy one shared
-        # f(X) per particle instead of a second scale.
-        _center_wanted = K_eff == 1 and opt.use_quadratic_model and (opt.biased_rotation or opt.trust_region)
+        # One incumbent loss serves every parameter block, at every probe count.
+        _center_wanted = opt.use_quadratic_model and (opt.biased_rotation or opt.trust_region)
         screen_inputs, screen_targets = opt._screen_data(_evaluator_native)
         # A selection solver ranks vertices by their own screened cost, so it needs no
         # antithetic pairing; the contrast-ranked branch below still does.
@@ -464,6 +464,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         _, losses, _, _local_range_full, _i_all, _v_all, _k_all = _bufs
         _configs_wanted = chunk <= total_evals
 
+        @_reuse_prefixes(_sparse_delta, _subspace_delta)
         def _evaluate_candidates(
             i_all,
             v_all,
@@ -735,39 +736,29 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 P_active * V,
             )
 
-        if K_eff == 1:
-            cost_matrix = losses.reshape(P, V)
-            if opt.use_quadratic_model:
-                # clone: `losses` is the persistent step buffer, so a view would
-                # become the next step's values.
-                opt._losses_3d = losses.reshape(P, V, 1).detach().clone()
-                # A shared f(X) replaces the second probe scale the regression needs.
-                opt._center_loss = None
-                if _center_wanted:
-                    # Each centre candidate equals X itself, so evaluate once and
-                    # broadcast to the (P,) shape the curvature estimate reads.
-                    _one = torch.zeros(1, dtype=torch.long, device=device)
-                    _center = _evaluate_candidates(
-                        _one,
-                        _one,
-                        _one,
-                        closure,
-                        _fused_inputs,
-                        _fused_targets,
-                        X.new_empty(1, dtype=_loss_dtype),
-                        probes_src=X.reshape(P, 1, 1, -1),
-                        track_nonfinite=False,
-                    ).detach()
-                    opt._center_loss = _center.expand(P).clone()
-                    _evals_this_step += 1
-        else:
-            losses_3d_full = losses.reshape(P, V, K_eff)
-            cost_matrix = losses_3d_full.mean(dim=-1)  # (P, V)
-            opt._center_loss = None
-            if opt.use_quadratic_model:
-                # clone: `losses` is the persistent step buffer, so a view would
-                # become the next step's values.
-                opt._losses_3d = losses_3d_full.detach().clone()
+        losses_3d_full = losses.reshape(P, V, K_eff)
+        cost_matrix = losses.reshape(P, V) if K_eff == 1 else losses_3d_full.mean(dim=-1)
+        opt._center_loss = None
+        if opt.use_quadratic_model:
+            # The step buffer is overwritten next time; the model owns a snapshot.
+            opt._losses_3d = losses_3d_full.detach().clone()
+        if _center_wanted:
+            # Every centre candidate equals X, so evaluate once, not once per block.
+            _one = torch.zeros(1, dtype=torch.long, device=device)
+            _center = _evaluate_candidates(
+                _one,
+                _one,
+                _one,
+                closure,
+                _fused_inputs,
+                _fused_targets,
+                X.new_empty(1, dtype=_loss_dtype),
+                probes_src=X.reshape(P, 1, 1, -1),
+                sanitize=False,
+                track_nonfinite=False,
+            ).detach()
+            opt._center_loss = _center.expand(P).clone()
+            _evals_this_step += 1
 
     # Charged after the quadratic model's centre evaluations, which also add to
     # _evals_this_step and would otherwise be undercounted here.
@@ -787,17 +778,16 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         and not _can_reuse
         and opt._prev_predicted_improvement is not None
         and opt._prev_pre_step_loss is not None
-        and _center_now == opt._prev_loss_from_center
+        and _center_now
+        and opt._prev_loss_from_center
     ):
-        # f(X) where available; the min-over-vertices fallback moves between steps even
-        # at a fixed point.
-        current_loss = opt._center_loss.mean().item() if _center_now else cost_matrix.min(dim=1).values.mean().item()
+        current_loss = opt._center_loss[0].item()
         # Negative means loss decreased.
         actual_improvement = torch.tensor([current_loss - opt._prev_pre_step_loss])
         from .quadratic_model import update_trust_region
 
         opt._trust_region_multiplier = update_trust_region(
-            opt._prev_predicted_improvement,
+            opt._prev_predicted_improvement.sum(),
             actual_improvement,
             opt._trust_region_multiplier,
             min_radius=0.1,
@@ -891,6 +881,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         opt.use_quadratic_model
         and opt._losses_3d is not None
         and opt._losses_3d.shape == (P, V, K_eff)
+        and (_center_loss is None or bool(torch.isfinite(_center_loss).all()))
         and (_center_loss is not None or (K_eff >= 2 and _antithetic))
     )
     _fd_grad = _fd_hess = None
@@ -1011,15 +1002,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
 
     # state.X is final here, so the model scores the realized move, not a Newton step
     # that was never applied.
-    if opt.trust_region and _fd_grad is not None:
+    if opt.trust_region and _fd_grad is not None and _center_loss is not None:
         from .quadratic_model import compute_predicted_improvement
 
         realized_rot = torch.einsum("bij,bj->bi", rot_mats.transpose(-1, -2), state.X - X)
-        opt._prev_predicted_improvement = compute_predicted_improvement(_fd_grad, _fd_hess, realized_rot).detach()
-        opt._prev_loss_from_center = _center_loss is not None
-        opt._prev_pre_step_loss = (
-            _center_loss.mean().item() if _center_loss is not None else raw_cost_matrix.min(dim=1).values.mean().item()
-        )
+        # Rows are disjoint parameter blocks of one objective, not independent losses.
+        opt._prev_predicted_improvement = compute_predicted_improvement(_fd_grad, _fd_hess, realized_rot).sum().detach()
+        opt._prev_loss_from_center = True
+        opt._prev_pre_step_loss = _center_loss[0].item()
 
     if opt.use_covariance_adaptation:
         cma_sub = opt.subspace  # CMAAdaptiveSubspace
