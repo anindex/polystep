@@ -133,12 +133,12 @@ def adapter_for(showcase):
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--showcase", default="snn")
-    p.add_argument("--seed", type=int, default=42, help="Tuning seed. Not a headline seed.")
+    p.add_argument("--seed", type=int, default=42, help="Tuning seed.")
     p.add_argument(
         "--epochs",
         type=int,
         default=10,
-        help="Epochs per trial. Fewer than the headline run: this ranks configs, it "
+        help="Epochs per trial. Fewer than the reported run: this ranks configs, it "
         "does not produce the number. The matched budget scales with it, so every "
         "trial stays budget-matched to itself.",
     )
@@ -156,7 +156,7 @@ def main() -> int:
         type=float,
         default=None,
         help="Set step_radius_jitter on the base config before applying multipliers. "
-        "Must match what the headline run passes, or the grid is swept around a "
+        "Must match what the reported run passes, or the grid is swept around a "
         "different config than the one it selects for.",
     )
     p.add_argument(

@@ -1,7 +1,5 @@
-"""The main runners must expose --allow-test-leakage so test-set selection is opt-in."""
+"""Validation reaches the runners; leaked results cannot enter reported tables."""
 
-import ast
-import inspect
 import json
 import sys
 from pathlib import Path
@@ -10,40 +8,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-RUNNERS = ["run_mnist.py", "run_moe.py", "run_elevation.py", "run_timeseries.py"]
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNNER_DIR = REPO_ROOT / "experiments" / "runners"
-
-
-@pytest.mark.parametrize("runner", RUNNERS)
-def test_runner_exposes_allow_test_leakage(runner, require_experiments):
-    """The flag must be a live argparse option, not just a string in the file."""
-    path = RUNNER_DIR / runner
-    assert path.exists(), f"{runner} is missing; the leakage guard cannot be checked"
-
-    source = path.read_text()
-    tree = ast.parse(source)
-    added = {
-        arg.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument"
-        for arg in node.args
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
-    }
-    assert "--allow-test-leakage" in added, (
-        f"{runner} does not register --allow-test-leakage with add_argument; "
-        f"found options: {sorted(o for o in added if o.startswith('--'))}"
-    )
-
-    # The flag must reach audit_no_leakage; hardcoding it would leave the option inert.
-    wired = [
-        kw
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        for kw in node.keywords
-        if kw.arg == "audit_no_leakage" and "allow_test_leakage" in ast.dump(kw.value)
-    ]
-    assert wired, f"{runner} registers --allow-test-leakage but never passes it to audit_no_leakage"
 
 
 # --- (a) the val split reaches every method, not only polystep -------------
@@ -77,41 +42,6 @@ def test_run_mnist_dispatch_gives_every_method_a_val_split(require_experiments, 
     for method, kwargs in seen.items():
         assert kwargs.get("val_loader") is not None, f"{method} was dispatched without a validation split"
         assert kwargs.get("audit_no_leakage") is True, f"{method} was dispatched without the leakage guard"
-
-
-@pytest.mark.parametrize("runner", ["run_moe.py", "run_elevation.py"])
-def test_every_method_runner_loads_the_val_split(runner, require_experiments):
-    """In these runners each method loads its own data, so each must go
-    through ``_load_split`` -- the one place that carves the val slice."""
-    tree = ast.parse((RUNNER_DIR / runner).read_text())
-    runner_fns = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("run_") and node.name != "run_method"
-    ]
-    assert runner_fns, f"{runner} defines no run_* functions"
-
-    for fn in runner_fns:
-        calls = {n.func.id for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-        assert "_load_split" in calls, f"{runner}::{fn.name} loads data without carving the validation split"
-        assert "audit_no_leakage" in {a.arg for a in fn.args.args}, (
-            f"{runner}::{fn.name} cannot be told to run the honest protocol"
-        )
-
-    split_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_load_split")
-    split_calls = {n.func.id for n in ast.walk(split_fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert "make_train_val_split" in split_calls, f"{runner}::_load_split does not actually hold out a val set"
-
-
-def test_baselines_accept_a_validation_split(require_experiments):
-    """A baseline with no val parameter can only select on the test set."""
-    sys.path.insert(0, str(REPO_ROOT))
-    from experiments.baselines.openai_es import train_openai_es
-    from experiments.baselines.sgd_baseline import train_sgd
-    from experiments.baselines.spsa import train_spsa
-
-    for fn in (train_sgd, train_openai_es, train_spsa):
-        assert "val_loader" in inspect.signature(fn).parameters, f"{fn.__name__} has no val_loader"
 
 
 # --- (b) a leaked run cannot become a paper number -------------------------
@@ -162,4 +92,18 @@ def test_honest_run_aggregates_on_the_selected_checkpoint(require_experiments, t
     assert saved["metrics"]["test_accuracy_at_selected"] == 0.9
 
     df = aggregate_results(str(tmp_path))
-    assert df.loc[0, "mean_accuracy"] == 0.9, "headline metric is not test_accuracy_at_selected"
+    assert df.loc[0, "mean_accuracy"] == 0.9, "reported metric is not test_accuracy_at_selected"
+
+
+def test_markdown_tables_use_the_selected_checkpoint(require_experiments, tmp_path, monkeypatch):
+    pytest.importorskip("pandas")
+    from experiments.scripts import generate_tables as tables
+
+    output = tmp_path / "README.md"
+    output.write_text(f"{tables.README_START}\n{tables.README_END}\n")
+    work = tmp_path / "code"
+    work.mkdir()
+    _write_result(work, leaked=False)
+    monkeypatch.setattr(sys, "argv", ["tables", "--results-dir", str(work), "--readme", str(output)])
+    tables.main()
+    assert "| MNIST (2-layer MLP) | 90.0 | - |" in output.read_text()

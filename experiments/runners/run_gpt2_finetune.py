@@ -514,7 +514,7 @@ def run_polystep(
         epoch_logs=epoch_logs,
         step_logs=step_logs,
         results_dir=results_dir,
-        # SST-2 publishes no test labels, so these four legacy arms select the best
+        # SST-2 publishes no test labels, so these four legacy variants select the best
         # epoch and report it on the SAME split. That is a selection leak however
         # conservative the arm (all four report negative results), so the run is
         # stamped and the aggregator refuses to put it in a table. The head-quant
@@ -1278,22 +1278,10 @@ class _SignalCounter:
 
 
 def _headquant_search_space(method: str, n_params: int) -> dict:
-    """What space this method searched, and whether it is the same as everyone else's.
+    """Record the shared full parameter space and EGGROLL's perturbation rank.
 
-    On the head-quant experiment it *is* the same, exactly: 1,538 parameters, full
-    space, no projection for anybody. That matters because it settles the EGGROLL
-    subspace question here rather than deferring it.
-
-    Inside a projected subspace, matching EGGROLL's ``FactoredSubspace`` dimension to
-    the shared one forces rank 1, and a ``(d_out, 1)`` coordinate matrix is already
-    rank 1, so its ``A B^T`` sampler would have nothing to factor and it would
-    degenerate into dense Gaussian ES. There is no such tradeoff here: nothing is
-    projected, so dimension and rank are both matched and there is no gap to report.
-
-    The rank EGGROLL runs at is still worth recording. Its perturbation factors the
-    ``(2, 768)`` weight, whose maximum rank is ``min(2, 768) = 2``, so ``rank=1`` is a
-    genuine low-rank perturbation -- half the available rank, not a degenerate one.
-    ``rank=2`` would be the dense control, and ``_lowrank_noise`` clips anything higher.
+    All methods search 1,538 parameters without projection. EGGROLL uses rank 1
+    for the (2, 768) weight; rank 2 is the dense control.
     """
     space = {
         "subspace_class": None,  # full 1,538-dim parameter space; no projection
@@ -1782,7 +1770,7 @@ def _tune_head_quant(args, splits):
 
     n = sum(len(TUNING_GRID[m]) for m in methods if m in HEADQUANT_TUNABLE)
     print(f"GPT-2 head-quant tuning sweep (validation only) | {variants} x {methods} x seed {seed}")
-    print(f"  {n} configs per variant, {budget} evals each (1/{HEADQUANT_TUNE_DIVISOR} of the headline budget)\n")
+    print(f"  {n} configs per variant, {budget} evals each (1/{HEADQUANT_TUNE_DIVISOR} of the final budget)\n")
 
     trials, path = [], args.selection
     # Method-outer, so the cheap methods finish first and the selection file is usable

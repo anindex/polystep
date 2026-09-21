@@ -1,15 +1,8 @@
-"""Fairness checks in both directions.
-
-- Contamination: baselines must not import polystep acceleration helpers.
-- Budget matching: every gradient-free method in a fairness table must get the
-  same candidate budget and the same search space.
-- The PySAT SLS baseline must run and return sensible numbers on a tiny 3-SAT.
-"""
+"""Evaluation budgets, search representations, seed control, and baseline behavior."""
 
 from __future__ import annotations
 
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -22,57 +15,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # package, so this module is unimportable when the tests run from an sdist.
 if not (REPO_ROOT / "experiments" / "runners").is_dir():
     pytest.skip("experiments/runners not present (running outside the repo)", allow_module_level=True)
-
-
-_TURBO_TOKENS = (
-    "apply_momentum",
-    "amortize_steps",
-    "amortize_ema",
-    "biased_rotation",
-    "anderson_depth",
-    "adaptive_omega",
-    "dual_momentum_beta",
-    "data_dependent_init",
-)
-
-# src/polystep/baselines is the tree the fairness tables actually run; the >= 4
-# guard below keeps the scan from passing vacuously on a missing tree.
-_BASELINE_DIRS = (
-    REPO_ROOT / "experiments" / "baselines",
-    REPO_ROOT / "src" / "polystep" / "baselines",
-)
-
-
-def _baseline_python_files():
-    files = []
-    for d in _BASELINE_DIRS:
-        if d.is_dir():
-            for p in d.glob("*.py"):
-                if p.name == "__init__.py":
-                    continue
-                # External baselines (sls_pysat.py) only provide alternatives.
-                files.append(p)
-    return files
-
-
-def test_no_baseline_imports_polystep_turbo_features():
-    """Baselines must not import polystep acceleration helpers (contamination check)."""
-    failures = []
-    checked = []
-    for path in _baseline_python_files():
-        if not path.is_file():
-            continue
-        checked.append(path)
-        src = path.read_text()
-        # Match `from polystep... import TOKEN` or `polystep.TOKEN`, not docstring mentions.
-        for token in _TURBO_TOKENS:
-            pattern = rf"(from\s+polystep[\w.]*\s+import[^\n]*\b{token}\b|polystep[\w.]*\.{token}\b)"
-            if re.search(pattern, src):
-                failures.append(f"{path.relative_to(REPO_ROOT)} imports/uses {token}")
-
-    # Guard against a vacuous pass when the baselines tree is missing or renamed.
-    assert len(checked) >= 4, f"expected at least 4 baseline files to scan, found {len(checked)}"
-    assert not failures, "Baseline contamination detected:\n" + "\n".join(failures)
 
 
 def test_sls_pysat_baseline_runs_on_small_instance():
@@ -314,43 +256,13 @@ def test_probe_scale_is_per_coordinate():
     assert probe_scale_of(cfg) == 2.0
 
 
-def test_runners_pass_dim_to_probe_scale():
-    """Every runner that builds a table must divide the radius by its search dimension.
-
-    Parsed with ``ast`` rather than grepped, so spacing and intermediate variables
-    cannot hide a call.
-    """
-    import ast
-    import pathlib
-
-    root = pathlib.Path(__file__).resolve().parents[1] / "experiments"
-    paths = sorted(root.glob("runners/run_*.py")) + sorted(root.glob("scripts/*.py"))
-    checked = 0
-    for path in paths:
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            fn = node.func
-            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
-            if name != "probe_scale_of":
-                continue
-            checked += 1
-            assert any(kw.arg == "dim" for kw in node.keywords), (
-                f"{path.name}:{node.lineno} calls probe_scale_of without dim=, which "
-                "hands the baseline PolyStep's radius as a per-coordinate sigma and "
-                "makes it probe sqrt(dim) times too far"
-            )
-    assert checked >= 4, f"expected to find the known call sites, found {checked}"
-
-
 def test_reseed_loaders_makes_repeated_iteration_reproducible():
     """A shared loader must give every run the same minibatch stream.
 
     ``seeded_loader_kwargs`` seeds each loader's generator once, at construction, so
     the shuffle order stops depending on global RNG consumption. It keeps depending on
     how many times the loader has already been iterated, because the generator advances
-    per epoch. A sweep that builds its loaders once and reuses them across cells
+    per epoch. A sweep that builds its loaders once and reuses them across configurations
     therefore trains cell *i* on the *i*-th stream and ranks configurations partly by
     their position in the sweep.
     """

@@ -39,5 +39,5 @@ CPU checks require no dataset:
 PYTHONPATH=src:. pytest tests/test_controlled.py tests/test_practical.py
 ```
 
-The [experiment section](../docs/paper_experiments.tex) gives the full statistical
+The [paper](https://arxiv.org/abs/2605.01928) gives the full statistical
 protocol. Aggregators retain individual seed outcomes and do not fill missing runs.

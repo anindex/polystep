@@ -10,6 +10,40 @@ from experiments.runners.search_suite import ARMS, draw_directions, run_search
 from polystep.transform import ParamLayout
 
 
+def test_search_cli_uses_one_budget_protocol_and_saves_baseline_only(tmp_path, monkeypatch):
+    import json
+    import sys
+    from experiments.scripts.bench_polytope import main
+
+    output = tmp_path / "search.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bench",
+            "--workloads",
+            "mlp",
+            "--arms",
+            "hybrid",
+            "--seeds",
+            "0",
+            "--budget",
+            "160",
+            "--batch",
+            "8",
+            "--output",
+            str(output),
+        ],
+    )
+    main()
+    rows = json.loads(output.read_text())
+    assert len(rows) == 1
+    assert rows[0]["arm"] == "hybrid"
+    assert 0 < rows[0]["candidates"] <= 160
+    with pytest.raises(ValueError, match="Unknown arm"):
+        run_search("mlp", "hybrid_typo", 0)
+
+
 @pytest.mark.parametrize("arm", ARMS)
 def test_search_respects_budget_and_keeps_test_data_out_of_selection(arm):
     result = run_search("mlp", arm, 0, budget=512, batch=8, streaming=True)

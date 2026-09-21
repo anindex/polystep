@@ -1151,7 +1151,7 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-run cells whose result file already exists (default: skip them).",
+        help="Repeat runs even when result files exist.",
     )
     parser.add_argument(
         "--theory-mode",
@@ -1180,7 +1180,7 @@ def main():
         default=None,
         help="Override the evolution-strategy candidate-evaluation budget. The default is "
         "step-matched (polystep_steps * popsize), which at 100,000 variables gives the ES "
-        "arms 50,000 evaluations against PolyStep's 50,100,000. Set this to PolyStep's own "
+        "methods 50,000 evaluations against PolyStep's 50,100,000. Set this to PolyStep's own "
         "budget to separate the effect of dimension from the effect of budget.",
     )
     args = parser.parse_args()

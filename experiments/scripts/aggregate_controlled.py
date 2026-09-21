@@ -90,7 +90,7 @@ def main():
     if all(arm in summaries for arm in arms[:20]):
         plot(records, summaries)
         endpoint_plot(summaries, contrasts)
-    print(f"Final arms complete: {len(summaries)}/{len(arms)}")
+    print(f"Completed variants: {len(summaries)}/{len(arms)}")
 
 
 def plot(records, summaries):

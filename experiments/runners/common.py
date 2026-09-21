@@ -124,7 +124,7 @@ def save_result(
         raise ValueError(f"Missing required metric keys: {missing}")
 
     metrics = dict(metrics)
-    # Headline metric; runners evaluate the selected checkpoint on test as their
+    # Reported metric; runners evaluate the selected checkpoint on test as their
     # last act, so final_accuracy is the same number when not passed explicitly.
     metrics.setdefault("test_accuracy_at_selected", metrics["final_accuracy"])
 

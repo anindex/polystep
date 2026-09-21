@@ -48,7 +48,7 @@ See the [runner list](README.md#runners), [protocol](../docs/reproducibility.md)
 Regenerate these tables and the README from result files:
 
 ```bash
-python experiments/scripts/generate_paper_tables.py \
+python experiments/scripts/generate_tables.py \
     --results-dir experiments/results/revision \
     --readme README.md --index experiments/EXPERIMENT_INDEX.md
 ```

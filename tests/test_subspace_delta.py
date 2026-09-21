@@ -51,7 +51,7 @@ def test_matches_reconstruct_batch(model_fn, name, sparse, batch):
     threshold = 0 if sparse else None
     layout, sub, projections, base_sd = _setup(model, sparse_threshold_bytes=threshold)
     loss_fn = nn.CrossEntropyLoss()
-    ev = NNCostEvaluator(model, loss_fn, layout)
+    ev = NNCostEvaluator(model, loss_fn)
     delta_ev = SubspaceDeltaEvaluator.try_build(model, loss_fn, sub)
     assert delta_ev is not None, "plain MLP must be supported"
 

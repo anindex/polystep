@@ -32,10 +32,12 @@ python experiments/scripts/tune_gallery.py
 python experiments/scripts/tune_polystep.py
 bash experiments/scripts/run_revision.sh
 python experiments/scripts/check_grid_complete.py experiments/results/revision
-python experiments/scripts/generate_paper_tables.py \
+python experiments/scripts/generate_tables.py \
     --results-dir experiments/results/revision \
     --readme README.md --index experiments/EXPERIMENT_INDEX.md
 ```
+
+The table generator updates Markdown only and rejects test-selected results.
 
 Individual runners accept `--methods` and `--seeds`:
 
@@ -73,3 +75,6 @@ python experiments/scripts/aggregate_results.py experiments/results/revision --w
 
 See [determinism](determinism.md), [controlled experiments](../experiments/CONTROLLED_EXPERIMENTS.md),
 and [forward benchmarks](performance.md#benchmarks) for their specific checks.
+
+With the datasets and CUDA available, run the practical-study update checks with
+`PYTHONPATH=src:. pytest tests/test_practical.py -m gpu`.

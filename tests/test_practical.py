@@ -1,4 +1,4 @@
-"""Configuration-grid and exact hard-forward checks; no dataset or GPU is needed."""
+"""Practical-study contracts, with dataset/CUDA integration behind the gpu marker."""
 
 import pytest
 import torch
@@ -36,6 +36,38 @@ def test_grids_and_hard_models():
     self_check()
 
 
-if __name__ == "__main__":
-    test_grids_and_hard_models()
-    print("practical grids and hard-forward controls passed")
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "task,method",
+    [
+        (task, method)
+        for task in ("snn", "dvs", "int8")
+        for method in ("polystep_tuned", "polystep", "openai_es", "eggroll", "spsa", "mezo", "random_search")
+        if task != "int8" or method in ("polystep_tuned", "polystep", "mezo")
+    ],
+)
+@torch.inference_mode()
+def test_practical_gpu_update(task, method):
+    from experiments.runners.run_practical import host_data, make_engine
+
+    data = host_data(task)[0]
+    n = 32 if task == "dvs" else 128
+    batch = (data[0][:n].cuda().float(), data[1][:n].cuda())
+    torch.manual_seed(2026)
+    tuned = method == "polystep_tuned"
+    cfg = list(points(task, method))[13]
+    if not tuned and "population" in cfg:
+        cfg["population"] = 32
+    engine = make_engine(task, method, cfg, 2026, 512 if tuned else 128, tuned)
+    before = {k: p.clone() for k, p in engine.params().items()}
+    old_z = None if tuned else engine.z.clone()
+    for j in range(2 if tuned else 1):
+        engine.progress = 0.5 * j
+        assert engine.step(batch) == engine.candidates_per_step
+    assert all(torch.isfinite(p).all() for p in engine.params().values())
+    if tuned:
+        assert any(not torch.equal(before[k], p) for k, p in engine.params().items())
+    else:
+        assert torch.equal(engine.z[engine.active :], old_z[engine.active :])
+        assert all(torch.equal(p, engine.base[k]) for k, p in engine.model.named_parameters())

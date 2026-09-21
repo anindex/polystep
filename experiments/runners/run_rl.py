@@ -1119,7 +1119,7 @@ def main() -> None:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-run cells whose result file already exists (default: skip them).",
+        help="Repeat runs even when result files exist.",
     )
     args = parser.parse_args()
 

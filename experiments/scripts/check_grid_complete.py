@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Report which (benchmark, method, seed) cells are missing, and which failed.
+"""Report which (benchmark, method, seed) runs are missing, and which failed.
 
 The runners catch per-run exceptions, print ERROR, and carry on, so a job that
 loses 39 of its 40 runs still exits 0 and the launcher logs "done".  Without
@@ -58,7 +58,7 @@ def main() -> int:
     unmet = []
     # Only files directly in ``root``: a theory-mode run under ``theory/`` and a tuning
     # trial under ``tune_polystep/cell*/`` carry the same filename, so recursing would
-    # let either stand in for a headline cell that never ran.
+    # count those as final runs.
     for path in glob.glob(os.path.join(root, "*.json")):
         d = json.load(open(path))
         key = (d.get("benchmark"), d.get("method"), d.get("seed"))
@@ -76,7 +76,7 @@ def main() -> int:
     want = expected()
     missing = [k for k in want if k not in have]
 
-    print(f"{len(want) - len(missing)}/{len(want)} cells present")
+    print(f"{len(want) - len(missing)}/{len(want)} runs present")
     if leaked:
         print(f"\nLEAKED files present ({len(leaked)}); a clean aggregate is impossible:")
         for p in leaked:

@@ -52,7 +52,7 @@ def load_single_result(path: str) -> Dict[str, Any]:
         "benchmark": data["benchmark"],
         "method": data["method"],
         "seed": data["seed"],
-        # Headline metric: test accuracy of the val-selected checkpoint. Older
+        # Reported metric: test accuracy of the val-selected checkpoint. Older
         # result files lack the key; final_accuracy is the fallback (best_accuracy
         # was max-over-epochs test).
         "test_accuracy_at_selected": metrics.get("test_accuracy_at_selected", metrics.get("final_accuracy", 0.0)),
@@ -223,7 +223,7 @@ def main() -> None:
 
     # Same population as the summary above: directly in ``results_dir``, filtered
     # by ``--benchmark``, skipping files that will not parse. Recursing would pull
-    # in theory-mode runs and tuning trials that share the headline
+    # in theory-mode runs and tuning trials that share the reported
     # ``{benchmark}_{method}_{seed}`` filename pattern.
     rows: List[Dict[str, Any]] = []
     pattern = os.path.join(results_dir, f"{benchmark}_*.json") if benchmark else os.path.join(results_dir, "*.json")

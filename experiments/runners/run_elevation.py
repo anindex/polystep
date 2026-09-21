@@ -521,8 +521,7 @@ def run_gradient_free(
     out["hyperparameters"]["fair"] = fair
     out["hyperparameters"]["tuned"] = selected["name"] if selected else None
     out["hyperparameters"]["tuning_provenance"] = provenance
-    # Which axis this cell was budgeted on: step-matched and eval-matched arms
-    # belong in different tables.
+    # Keep comparisons with step and evaluation budgets in separate tables.
     out["hyperparameters"]["match_axis"] = match_axis
     out["hyperparameters"]["polystep_steps"] = epochs * len(train_loader)
     filepath = save_result(

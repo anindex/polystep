@@ -261,7 +261,7 @@ def regression_metrics(test: dict, val_mse: float, val_mae: float, **extra) -> d
         "final_accuracy": float("nan"),
         "best_accuracy": float("nan"),
         "test_accuracy_at_selected": float("nan"),
-        # best_mse carries the headline number: test MSE of the val-selected
+        # best_mse carries the reported number: test MSE of the val-selected
         # checkpoint. A min-over-epochs test MSE here would leak.
         "final_mse": test["mse"],
         "best_mse": test["mse"],
@@ -684,8 +684,7 @@ def run_gradient_free(
         quality_key="mse",
         deadline_s=deadline_s,
     )
-    # run_baseline leaves the val-selected checkpoint loaded, so this scores the
-    # same weights the headline metric reports, on test, once.
+    # Score the validation-selected checkpoint on test once.
     final = evaluate_regression(model, test_data, device=device)
     out["metrics"].update(
         final_mse=final["mse"],
@@ -852,7 +851,7 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-run cells whose result file already exists (default: skip them).",
+        help="Repeat runs even when result files exist.",
     )
     args = parser.parse_args()
 

@@ -63,7 +63,7 @@ WORKLOADS = {
 
 
 def task(name, seed, device="cpu", batch=32, train_batches=1):
-    """Identical initialization and held-out splits across arms; no test-set tuning."""
+    """Identical initialization and held-out splits across variants; no test-set tuning."""
     build, shape = WORKLOADS[name]
     torch.manual_seed(seed)
     model = build().to(device).eval()
@@ -131,6 +131,8 @@ def run_search(name, arm, seed, *, device="cpu", budget=4096, seconds=None, batc
     Validation after each step is timed but counted separately. Test data is touched
     only once, at the validation-selected final checkpoint. No arm tunes on test.
     """
+    if arm not in ARMS:
+        raise ValueError(f"Unknown arm {arm!r}")
     model, (train, valid, test) = task(name, seed, device, batch, train_batches=4 if streaming else 1)
     x, y = train[0][:batch], train[1][:batch]
     loss_fn = nn.CrossEntropyLoss()
@@ -157,7 +159,7 @@ def run_search(name, arm, seed, *, device="cpu", budget=4096, seconds=None, batc
             opts.update(multifidelity_screen=True, screen_fidelity=0.25, screen_keep_ratio=0.5)
         if arm == "hybrid_amortized":
             opts["amortize_steps"] = 3
-        # Bound the simultaneous full-model move by the same .1 used by global arms.
+        # Bound the simultaneous full-model move by the same .1 used by global variants.
         opt = PolyStepOptimizer(
             model,
             subspace=sub,
@@ -174,8 +176,6 @@ def run_search(name, arm, seed, *, device="cpu", budget=4096, seconds=None, batc
             **opts,
         )
         opt.register_evaluator(evaluator, x, y)
-    elif arm not in ARMS:
-        raise ValueError(f"Unknown arm {arm!r}")
 
     def evaluate(points):
         return evaluator.evaluate(layout.batch_unflatten(points), x, y)

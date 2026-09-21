@@ -2,7 +2,7 @@
 """Run all methods and seeds for Hard MoE (Mixture-of-Experts) benchmark.
 
 Methods:
-  - polystep: PolyStepOptimizer with HybridSubspace on hard-gated MoE
+  - polystep: PolyStepOptimizer with HybridSubspace on MoE with hard routing
   - the six gradient-free baselines from ``polystep.baselines``: cma_es, openai_es,
     spsa, mezo, random_search, eggroll
 
@@ -66,8 +66,7 @@ from experiments.runners.fairness import (
 
 BENCHMARK = "moe"
 
-#: PolyStep's own sweep writes here, not to the shared gallery file, so a tuning run
-#: cannot untune a headline run that is reading the shared file at the same time.
+# Store PolyStep tuning separately from baseline selections.
 POLYSTEP_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "polystep_selected.json")
 BATCH_SIZE = 512
 EPOCHS = 30
@@ -482,7 +481,7 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-run cells whose result file already exists (default: skip them).",
+        help="Repeat runs even when result files exist.",
     )
     args = parser.parse_args()
 

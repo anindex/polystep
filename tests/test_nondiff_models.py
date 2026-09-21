@@ -185,8 +185,7 @@ def test_output_values_quantized():
 
 
 def test_hard_routing_selects_argmax_expert():
-    """forward() must return the argmax-gated expert's output (hard top-1),
-    not a soft average of the experts."""
+    """Return the output of the expert selected by argmax."""
     torch.manual_seed(0)
     moe = HardMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
     x = torch.randn(5, 8)

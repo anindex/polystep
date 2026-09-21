@@ -41,18 +41,6 @@ def _with_dict(sub):
     return sub, sub.init_projections(torch.device("cpu"), torch.float32)
 
 
-def _apply(sub, proj, base_sd, coords):
-    return sub.apply_perturbation(proj, base_sd, coords)
-
-
-def _batch(sub, proj, base_sd, coords_batch):
-    return sub.reconstruct_batch(proj, base_sd, coords_batch)
-
-
-def _absorb(sub, proj, base_sd, coords):
-    return sub.absorb(proj, base_sd, coords)
-
-
 @pytest.fixture(params=sorted(BUILDERS))
 def case(request):
     model = _model()
@@ -67,7 +55,7 @@ def _coords(sub, scale=0.01):
 
 def test_a_zero_coordinate_leaves_the_base_unchanged(case):
     sub, proj, base_sd = case
-    result = _apply(sub, proj, base_sd, torch.zeros(sub.subspace_dim))
+    result = sub.apply_perturbation(proj, base_sd, torch.zeros(sub.subspace_dim))
     for key, value in result.items():
         torch.testing.assert_close(value, base_sd[key], msg=lambda m, k=key: f"{k}: {m}")
 
@@ -75,7 +63,7 @@ def test_a_zero_coordinate_leaves_the_base_unchanged(case):
 def test_a_nonzero_coordinate_moves_at_least_one_parameter(case):
     """Guards the zero test above: it would also pass if the class ignored coords."""
     sub, proj, base_sd = case
-    result = _apply(sub, proj, base_sd, _coords(sub))
+    result = sub.apply_perturbation(proj, base_sd, _coords(sub))
     assert any(not torch.allclose(v, base_sd[k]) for k, v in result.items())
 
 
@@ -84,9 +72,9 @@ def test_the_batched_reconstruction_agrees_with_the_single_one(case):
     torch.manual_seed(2)
     batch = torch.randn(4, sub.subspace_dim) * 0.01
 
-    batched = _batch(sub, proj, base_sd, batch)
+    batched = sub.reconstruct_batch(proj, base_sd, batch)
     for i in range(batch.shape[0]):
-        single = _apply(sub, proj, base_sd, batch[i])
+        single = sub.apply_perturbation(proj, base_sd, batch[i])
         for key, value in single.items():
             torch.testing.assert_close(
                 batched[key][i], value, atol=1e-5, rtol=1e-5, msg=lambda m, k=key, i=i: f"row {i}, {k}: {m}"
@@ -96,24 +84,15 @@ def test_the_batched_reconstruction_agrees_with_the_single_one(case):
 def test_absorb_zeros_the_coordinates_and_folds_them_into_the_base(case):
     sub, proj, base_sd = case
     coords = _coords(sub)
-    expected = _apply(sub, proj, base_sd, coords)
+    expected = sub.apply_perturbation(proj, base_sd, coords)
 
-    new_base, zeroed = _absorb(sub, proj, base_sd, coords)
+    new_base, zeroed = sub.absorb(proj, base_sd, coords)
 
     assert zeroed.shape == coords.shape
     assert torch.all(zeroed == 0)
     for key, value in expected.items():
         torch.testing.assert_close(new_base[key], value, atol=1e-6, rtol=1e-6, msg=lambda m, k=key: f"{k}: {m}")
 
-
-def test_absorb_does_not_move_the_represented_point(case):
-    """base + P @ coords must be the same point before and after the fold."""
-    sub, proj, base_sd = case
-    coords = _coords(sub)
-    before = _apply(sub, proj, base_sd, coords)
-
-    new_base, zeroed = _absorb(sub, proj, base_sd, coords)
-    after = _apply(sub, proj, new_base, zeroed)
-
-    for key, value in before.items():
-        torch.testing.assert_close(after[key], value, atol=1e-6, rtol=1e-6, msg=lambda m, k=key: f"{k}: {m}")
+    after = sub.apply_perturbation(proj, new_base, zeroed)
+    for key, value in expected.items():
+        torch.testing.assert_close(after[key], value, atol=1e-6, rtol=1e-6)

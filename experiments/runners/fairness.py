@@ -245,60 +245,28 @@ EVALS_PER_GENERATION = {
     "random_search": 1,
 }
 
-#: Showcases whose *population* methods are also budgeted on steps rather than
-#: evaluations. moe alone: ``polystep_eval_budget`` there is 100,552,050 --- ten times
-#: the next largest, because moe runs 6,330 steps in a 14,120-dimensional subspace ---
-#: which at ``FAIR_POPSIZE`` is 3.14M generations and, measured, 35 hours per cell. That
-#: is 4.5 GPU-days to fill three rows of the *appendix* table, on the secondary axis.
-#: The step axis, which is the headline one, reads at 6,330 steps
-#: and is unaffected. Every other showcase stays eval-matched; their population cells
-#: total ~91 cell-hours, which is affordable.
+# Step budgets cap the expensive MoE/attention population runs and the untuned
+# ETTh1 baselines. Other population comparisons retain evaluation budgets.
 STEP_CAPPED_SHOWCASES = ("moe", "argmax", "timeseries")
 
-#: ``timeseries`` joins them for a reason that is not only cost. Its budget is 21,115,080
-#: and the LSTM forward is slow enough that a population cell measured ~7 hours, 15 cells
-#: -- but the deciding point is that ETTh1's baselines cannot be tuned at all: no
-#: load_selection, and tune_gallery has no minimize-mode branch.
-#: Spending a GPU-day to fill an eval-axis row that would have to be captioned "untuned"
-#: buys nothing the step axis does not already give.
-
-#: ``argmax`` joins moe for the same reason at a different scale. Its budget is
-#: 42,014,160 -- the largest in the gallery -- and DiscreteAttentionNet's eight
-#: hard-attention slots cost 59 ms per generation against ~7 ms for an MLP of the same
-#: parameter count, measured mid-run. That is 21 hours per population cell, 15 cells.
-#: The eval-axis appendix still covers snn, mnist, int8 and staircase; argmax and moe
-#: report on the step axis, which is the headline one and is unaffected.
-
-#: Methods whose generation costs at most two candidates. At a matched *evaluation*
-#: budget these take budget/2 or budget sequential steps -- 7.77M and 15.5M on the SNN
-#: against PolyStep's 3,180 -- and measuring that costs days per cell to fill one
-#: appendix entry. They are budgeted on steps instead; see :func:`step_matched_budget`.
+# Match sequential optimizer steps for methods using at most two candidates.
 SEQUENTIAL_METHODS = ("spsa", "mezo", "random_search")
 
 
 def step_matched_budget(method: str, polystep_steps: int, popsize: int = FAIR_POPSIZE) -> int:
-    """Evaluations that buys ``method`` exactly ``polystep_steps`` of its own steps.
-
-    The primary axis is accuracy at a matched number of optimizer steps (REBUTTAL.md 1b):
-    a forward pass is cheap and parallel, a step is a sequential dependency. This is that
-    axis expressed as the budget the method has to be given to reach it.
-    """
+    """Evaluations needed for ``method`` to take ``polystep_steps`` steps."""
     per = EVALS_PER_GENERATION.get(method)
     if per is None:
         per = int(popsize)
     return max(1, int(polystep_steps) * int(per))
 
 
-#: So only the deadline binds on a wall-clock-matched arm.
+# Only the deadline limits runs with time budgets.
 WALLCLOCK_EVAL_CAP = 1 << 40
 
 
 def polystep_wall_seconds(showcase: str, seed: int, results_dir: str) -> Optional[float]:
-    """Seconds PolyStep spent on this exact cell, or None if it has not been run.
-
-    Per seed, not averaged, so the deadline is the cost of the run the baseline is
-    compared against.
-    """
+    """Recorded PolyStep runtime for this task and seed, or None if absent."""
     name = f"{showcase}_polystep_{seed}.json"
     # The wall-clock arm writes to a subdirectory of the campaign it is matched against,
     # like results/revision/evalmatched does, so look one level up too.
@@ -509,29 +477,13 @@ _INT_AXES = {"popsize"}
 
 
 def refine_grid(method: str, winner: dict) -> List[dict]:
-    """Round two: the same number of cells, recentred on round one's winner.
+    """Recenter a grid of the same size on the first round's winner.
 
-    Round one is a fixed grid, so its winner can land on an edge, which means the
-    optimum is outside the swept range: on the SNN that happens for five of the six
-    tuned baselines. Reporting such a sweep as "tuned" understates the baseline.
-
-    Each axis is re-swept at ``(w/f, w, w*f)`` about the winner ``w``, with the
-    spacing chosen by where the winner landed. On an edge of the round-one range the
-    spacing is that axis's full ratio, which walks the grid outward into values never
-    swept. Strictly inside it, the optimum is already bracketed and there is nothing
-    to extend to, so the spacing is ``sqrt(ratio)`` and the round refines instead.
-    Without that split an interior winner reproduces the round-one grid exactly and
-    the second round measures nothing, which is the case that matters most for
-    PolyStep: its grid is centred on the transplanted config and it won round one at
-    the centre. Cell count is unchanged either way, so the tuning budget stays equal
-    across the table at two rounds per method.
-    """
+    Expand boundary winners by the full axis ratio; refine interior winners
+    with its square root. Preserve the number of trials for equal tuning budgets."""
     grid = TUNING_GRID[method]
     axes = sorted({k for point in grid for k in point})
-    # Ladder length per axis, so the product matches round one's cell count where a
-    # full product is the shape used. A one-knob method (random_search sweeps only
-    # sigma) otherwise got a three-cell round two against everyone else's nine, and
-    # then had nine quoted for it.
+    # Preserve the trial count for one- and multi-parameter grids.
     rungs = max(3, int(round(len(grid) ** (1.0 / max(1, len(axes))))))
     per_axis = {}
     for axis in axes:
@@ -543,9 +495,7 @@ def refine_grid(method: str, winner: dict) -> List[dict]:
         half = (rungs - 1) / 2.0
         vals = [w * f ** (i - half) for i in range(rungs)]
         if axis in _INT_AXES:
-            # Round to even: eggroll rejects an odd popsize outright, so the four
-            # cells an odd value produced raised and were swallowed by the sweep's
-            # per-cell except, costing that method four of its nine round-two cells.
+            # EGGROLL requires an even population.
             vals = sorted({max(4, 2 * int(round(v / 2))) for v in vals})
         per_axis[axis] = vals
 
@@ -594,17 +544,9 @@ def tuning_cost(
     rounds: int = 1,
     configs: Optional[int] = None,
 ) -> dict:
-    """Configurations tried x cost per configuration, for the paper to quote.
+    """Count tuning evaluations across configurations and seeds.
 
-    ``rounds`` counts the recentring passes of :func:`refine_grid`. Every method gets
-    the same number of rounds at the same cell count, so this stays comparable across
-    the table, which is the whole point of quoting it.
-
-    ``configs`` is the number of cells that actually ran. Pass it. Deriving the count
-    from ``TUNING_GRID`` quotes the grid we intended rather than the sweep we did, and
-    a cell that raises is dropped by the sweep's per-cell ``except`` without changing
-    the quoted number.
-    """
+    Pass ``configs`` to count completed trials, including all rounds."""
     n = int(configs) if configs is not None else len(TUNING_GRID[method]) * int(rounds)
     return {
         "method": method,
@@ -645,13 +587,7 @@ def apply_polystep_multipliers(cfg: dict, point: dict) -> dict:
 
 
 class TestSplitTripwire:
-    """Stands in for the test split during a hyperparameter sweep.
-
-    A sweep that reads the test set invalidates the headline numbers it selects, so
-    rather than trust a code review, the sweep is handed this and any use of it --
-    iterating a DataLoader, unpacking an ``(x, y)`` split -- raises. Both go through
-    ``__iter__``.
-    """
+    """Raise if a tuning run tries to read the test split."""
 
     def __iter__(self):
         raise AssertionError("a hyperparameter sweep touched the test split")
@@ -665,11 +601,7 @@ DEFAULT_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "selec
 
 
 def select_best(trials: List[dict]) -> dict:
-    """The winning trial: highest ``val``, ties broken by earliest grid index.
-
-    Deterministic in both arguments -- validation floats tie often on small splits,
-    and "first in :data:`TUNING_GRID` order" is a rule a reader can re-apply.
-    """
+    """Highest validation score, with ties broken by the earliest grid index."""
     return max(trials, key=lambda t: (t["val"], -t["index"]))
 
 
@@ -979,7 +911,7 @@ def run_baseline(
             relative to PolyStep's step count -- are resolved.
         quality_key: Name for the recorded quality, e.g. ``"accuracy"`` or ``"mse"``.
         deadline_s: Wall-clock seconds the method may spend, or ``None``. Used by the
-            wall-clock-matched arms; the objective stops the run when it passes.
+            wall-clock-matched runs; the objective stops the run when it passes.
 
     Returns:
         ``{"metrics", "hyperparameters", "epoch_logs", "step_logs"}``, ready to splat
@@ -1003,7 +935,7 @@ def run_baseline(
     # its first sample far past that. Same 25 points, a third of them below step 3,000.
     log_at = _log_schedule(budget, log_points)
     next_log = [0]
-    # Wall-clock-matched arms log on the clock, evenly, since evals are not the budget.
+    # Wall-clock-matched runs log on the clock, evenly, since evals are not the budget.
     time_at = [deadline_s * (i + 1) / log_points for i in range(log_points)] if deadline_s is not None else []
     next_time = [0.0]
 
@@ -1045,7 +977,7 @@ def run_baseline(
         trajectory.append(
             {
                 "evals": obj.evals,
-                # The generation index, the axis the headline tables use. It cannot be
+                # The generation index, the axis the reported tables use. It cannot be
                 # recovered from ``evals``: CMA-ES doubles its population on every IPOP
                 # restart, so evals/popsize is off by whatever the restart schedule did.
                 "step": generations[0],

@@ -7,6 +7,7 @@ its candidate budget, and must behave identically with and without a subspace.
 from __future__ import annotations
 
 import math
+from importlib.util import find_spec
 
 import pytest
 import torch
@@ -16,7 +17,10 @@ from polystep.baselines import METHODS, BudgetExhausted, Objective, Result, cent
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
-pytest.importorskip("cma", reason="pycma drives the CMA-ES baseline")
+METHOD_NAMES = [
+    pytest.param(name, marks=pytest.mark.skipif(name == "cma_es" and find_spec("cma") is None, reason="requires cma"))
+    for name in sorted(METHODS)
+]
 
 DIM = 12
 BUDGET = 640
@@ -61,17 +65,16 @@ def run(name: str, budget: int = BUDGET, **overrides) -> tuple[Objective, Result
 # Per-method behaviour
 
 
-@pytest.mark.parametrize("name", sorted(METHODS))
-def test_reduces_loss_on_quadratic(name):
+@pytest.mark.parametrize("name", METHOD_NAMES)
+def test_reduces_loss_and_respects_budget(name):
     obj, result = run(name)
     start = quadratic()(torch.zeros(1, DIM))[0].item()
     assert result.best_loss < start * 0.5, f"{name}: {result.best_loss} vs start {start}"
     assert torch.isfinite(result.x).all()
+    assert obj.iterate is not None
+    assert obj.iterate.shape == (DIM,)
+    assert torch.isfinite(obj.iterate).all()
 
-
-@pytest.mark.parametrize("name", sorted(METHODS))
-def test_respects_budget(name):
-    obj, result = run(name)
     assert result.evals == obj.evals
     assert result.evals <= BUDGET
     # It stopped because it could not afford another iteration, not early.
@@ -80,7 +83,7 @@ def test_respects_budget(name):
         assert obj.remaining < PER_ITER[name], f"{name} left {obj.remaining} unspent"
 
 
-@pytest.mark.parametrize("name", sorted(METHODS))
+@pytest.mark.parametrize("name", METHOD_NAMES)
 @pytest.mark.parametrize("budget", [3, 17, 33])
 def test_never_overspends_odd_budgets(name, budget):
     if name == "cma_es" and budget < 16:
@@ -90,7 +93,7 @@ def test_never_overspends_odd_budgets(name, budget):
     assert result.evals == obj.evals
 
 
-@pytest.mark.parametrize("name", sorted(METHODS))
+@pytest.mark.parametrize("name", METHOD_NAMES)
 def test_deterministic_given_seed(name):
     _, a = run(name, seed=7)
     _, b = run(name, seed=7)
@@ -168,16 +171,19 @@ def subspace_objective(budget: int) -> Objective:
     return Objective.from_subspace(hybrid, base_sd, loss_batch, budget)
 
 
-@pytest.mark.parametrize("name", sorted(METHODS))
+@pytest.mark.parametrize("name", METHOD_NAMES)
 def test_runs_in_subspace_with_same_counter_semantics(name):
     """Same method, same budget, same counter meaning, projected coordinates."""
     plain = Objective(quadratic(), dim=DIM, budget=BUDGET, shapes=[(3, 4)])
     projected = subspace_objective(BUDGET)
     assert projected.dim != plain.dim, "subspace should change the search dimension"
 
+    start = projected(torch.zeros(1, projected.dim))[0].item()
+    plain(torch.zeros(1, plain.dim))
     kwargs = HYPERPARAMS[name]
     r_plain = METHODS[name](plain, **kwargs)
     r_proj = METHODS[name](projected, **kwargs)
+    assert r_proj.best_loss < start * 0.9, f"{name}: {r_proj.best_loss} vs start {start}"
 
     for obj, res in ((plain, r_plain), (projected, r_proj)):
         assert res.evals == obj.evals <= BUDGET
@@ -187,14 +193,6 @@ def test_runs_in_subspace_with_same_counter_semantics(name):
     if name != "cma_es":
         assert r_plain.evals == r_proj.evals
         assert r_plain.iters == r_proj.iters
-
-
-@pytest.mark.parametrize("name", sorted(METHODS))
-def test_reduces_loss_in_subspace(name):
-    obj = subspace_objective(BUDGET)
-    start = obj(torch.zeros(1, obj.dim))[0].item()
-    result = METHODS[name](obj, **HYPERPARAMS[name])
-    assert result.best_loss < start * 0.9, f"{name}: {result.best_loss} vs start {start}"
 
 
 def test_subspace_objective_reports_layer_shapes():

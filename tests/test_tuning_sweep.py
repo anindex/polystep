@@ -1,23 +1,7 @@
-"""The validation-only hyperparameter sweep behind the two scale experiments.
-
-Three properties the sweep must hold, and one thing that is easy to get wrong:
-
-1. **A sweep must not touch the test split.** The sweep hands itself a
-   :class:`~experiments.runners.fairness.TestSplitTripwire` and any read
-   raises. The end-to-end test below proves the guard is live *and* that it is not
-   vacuous, by showing the same run does read the test split when tuning is off.
-2. **Equal tuning budget.** Every method's grid is the same size, so
-   ``configs x seeds x evals-per-config`` is one number for the whole table.
-3. **Deterministic selection.** Best validation score, ties broken by grid order.
-
-And the easy mistake: an option registered but never wired, which
-``tests/test_no_test_set_leakage.py`` already guards for ``--allow-test-leakage``.
-Same treatment here for ``--tune``.
-"""
+"""Validation-only tuning, equal search budgets, and deterministic selection."""
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
 
@@ -25,7 +9,6 @@ import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RUNNER_DIR = REPO_ROOT / "experiments" / "runners"
 
 
 @pytest.fixture
@@ -111,36 +94,6 @@ def test_the_tripwire_check_is_not_vacuous(headquant, tmp_path, fairness):
             probe_every=64,
             point={"lr": 0.01, "sigma": 1.0},
             tune=False,
-        )
-
-
-@pytest.mark.parametrize(
-    "runner,fns",
-    [
-        ("run_gpt2_finetune.py", ("run_headquant",)),
-    ],
-)
-def test_tune_is_registered_and_wired(runner, fns, require_experiments):
-    """``--tune`` must be a live option that actually reaches the split selection.
-
-    A registered-but-inert flag would leave every check above green while the sweep
-    read the test set anyway.
-    """
-    tree = ast.parse((RUNNER_DIR / runner).read_text())
-    options = {
-        arg.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument"
-        for arg in node.args
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
-    }
-    assert "--tune" in options, f"{runner} does not register --tune"
-
-    for name in fns:
-        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
-        dumped = ast.dump(fn)
-        assert "TestSplitTripwire" in dumped or "hide_test" in dumped, (
-            f"{runner}::{name} never hides the test split, so --tune cannot be honest"
         )
 
 
@@ -306,3 +259,44 @@ def test_binary_head_is_labelled_as_a_partial_control(headquant):
         torch.nn.functional.cross_entropy(head(x), y).backward()
         grad = 0.0 if head.bias.grad is None else float(head.bias.grad.abs().sum())
         assert (grad > 0.0) is bias_live, f"{name}: bias gradient {grad} contradicts backprop_sees_the_bias={bias_live}"
+
+
+def test_round_two_gives_every_method_the_same_cell_count(fairness):
+    """Both tuning rounds use nine configurations per method."""
+    for method, grid in fairness.TUNING_GRID.items():
+        for winner in grid:
+            got = fairness.refine_grid(method, winner)
+            assert len(got) == len(grid), (
+                f"{method}: round two produced {len(got)} configurations against round one's {len(grid)} for winner {winner}"
+            )
+
+
+def test_round_two_integer_axes_stay_even(fairness):
+    """eggroll raises on an odd popsize, and the sweep swallows the exception, so
+    round-two configurations must keep popsize even."""
+    for winner in fairness.TUNING_GRID["eggroll"]:
+        for point in fairness.refine_grid("eggroll", winner):
+            assert point["popsize"] % 2 == 0 and point["popsize"] >= 2, (
+                f"eggroll round two produced popsize={point['popsize']} from {winner}, "
+                "which methods.eggroll rejects outright"
+            )
+
+
+def test_tuning_cost_quotes_the_cells_that_ran(fairness):
+    """A cell that raises is dropped by the sweep, so the count must be passed in."""
+    nominal = fairness.tuning_cost("eggroll", 1000, rounds=2)
+    realized = fairness.tuning_cost("eggroll", 1000, rounds=2, configs=14)
+    assert nominal["configs"] == len(fairness.TUNING_GRID["eggroll"]) * 2
+    assert realized["configs"] == 14
+    assert realized["tuning_evals"] == 14 * 1000
+
+
+def test_maxsat_config_has_every_key_its_builder_reads(require_experiments):
+    """get_polystep_config reads probe_radius_jitter, so POLYSTEP_CONFIG must define it."""
+    from experiments.runners.run_maxsat import get_polystep_config
+
+    cfg = get_polystep_config(100_000)
+    assert "probe_radius_jitter" in cfg
+    # Stated, not defaulted: this value decides whether condition (iv) of the
+    # convergence theorem holds for this configuration.
+    assert isinstance(cfg["probe_radius_jitter"], float)

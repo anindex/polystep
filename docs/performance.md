@@ -32,6 +32,10 @@ Delta paths reuse base activations within each candidate sweep. Reuse applies to
 supported builtin layers and ends before the next batch or fidelity level.
 Custom layers can declare the contracts in the [API reference](api_overview.md#custom-layers).
 
+Dense MLP evaluation also shares activations until the first changed layer when
+unchanged candidate parameters are expanded views. Shared weights use one linear
+operation across candidates. `chunk_size` bounds activation batches on this path.
+
 ## Subspaces and memory
 
 Use `HybridSubspace.from_layout(..., max_subspace_dim=...)` to bound candidate count;
@@ -121,7 +125,7 @@ PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --profile
 PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --prefix --repeats 7 --warmup 2
 PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --attention --batch 16
 PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --compile --profile
-PYTHONPATH=src:. python experiments/scripts/bench_polytope.py --suite --seeds 0 1 2 3 4 --budget 4096 --wall
+PYTHONPATH=src:. python experiments/scripts/bench_polytope.py --seeds 0 1 2 3 4 --budget 4096 --wall
 ```
 
 Use `--device cuda` for GPU measurements and `--output` to keep separate result files.

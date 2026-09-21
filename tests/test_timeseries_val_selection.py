@@ -73,7 +73,7 @@ def test_selector_picks_the_best_val_checkpoint_not_the_best_test_one(rt):
     assert sel.best_mse == pytest.approx(0.25), "selection did not follow validation MSE"
     metrics = sel.metrics(wall_time_seconds=0.0, peak_gpu_memory_mb=0.0, function_evals=0, total_steps=0)
 
-    # Headline keys all carry test at the selected checkpoint, i.e. (10 - 0.5)**2.
+    # Reported keys all carry test at the selected checkpoint, i.e. (10 - 0.5)**2.
     assert metrics["best_mse"] == metrics["final_mse"] == metrics["test_mse_at_selected"]
     assert metrics["test_mse_at_selected"] == pytest.approx(90.25)
     assert metrics["val_mse_at_selected"] == pytest.approx(0.25)

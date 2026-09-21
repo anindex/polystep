@@ -18,7 +18,7 @@
 | GPT-2 head tuning | `runners/run_gpt2_finetune.py` |
 | Controlled update rules | `runners/run_controlled.py` |
 | Candidate- and time-budget comparisons | `runners/run_practical.py` |
-| Synthetic search methods | `scripts/bench_polytope.py --suite` |
+| Synthetic search methods | `scripts/bench_polytope.py` |
 
 ## Search benchmarks
 
@@ -27,8 +27,8 @@ quantization. It compares existing optimizer options with global-subspace, rank-
 momentum-subspace, and same-batch acceptance experiments. All are opt-in.
 
 ```bash
-PYTHONPATH=src:. python experiments/scripts/bench_polytope.py --suite --seeds 0 1 2 3 4 --budget 4096 --wall
-PYTHONPATH=src:. python experiments/scripts/bench_polytope.py --suite --streaming --arms hybrid_deferred global_orthoplex same_batch_accept
+PYTHONPATH=src:. python experiments/scripts/bench_polytope.py --seeds 0 1 2 3 4 --budget 4096 --wall
+PYTHONPATH=src:. python experiments/scripts/bench_polytope.py --streaming --arms hybrid_deferred global_orthoplex same_batch_accept
 ```
 
 The suite matches initialization, data, probe norm, and temperature. Validation

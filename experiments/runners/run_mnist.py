@@ -59,15 +59,14 @@ from experiments.baselines.sgd_baseline import train_sgd
 
 BENCHMARK = "mnist"
 
-#: PolyStep's own sweep writes here, not the shared gallery file, so a tuning run
-#: cannot untune a headline run reading that file.
+# Store PolyStep tuning separately from baseline selections.
 POLYSTEP_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "polystep_selected.json")
 BATCH_SIZE = 512
 EPOCHS = 30
 
 # polystep hyperparameters (HybridSubspace + cosine schedules), no momentum.
 # No probe_radius_jitter here: setting it forces amortize_steps=1 (see
-# PolyStepOptimizer.__init__) and would change the tuned headline run;
+# PolyStepOptimizer.__init__) and would change the tuned run;
 # --theory-mode runs the analysed configuration instead.
 POLYSTEP_CONFIG = {
     "rank": 8,
@@ -519,7 +518,7 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-run cells whose result file already exists (default: skip them).",
+        help="Repeat runs even when result files exist.",
     )
     args = parser.parse_args()
 

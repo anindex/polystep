@@ -4,7 +4,7 @@
 The gallery runners do not sweep :data:`fairness.TUNING_GRID` themselves; this
 script does and writes the picks to ``experiments/results/tuning/selected_configs.json``.
 
-Selection is on the validation split at a reduced budget; the headline runs then spend
+Selection is on the validation split at a reduced budget; the reported runs then spend
 the full matched budget at the selected config, on all five seeds. Test is never read.
 
     python experiments/scripts/tune_gallery.py --showcases snn mnist \
@@ -110,13 +110,13 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--showcases", nargs="+", default=["snn"])
     p.add_argument("--methods", nargs="+", default=list(GF_METHODS))
-    p.add_argument("--seed", type=int, default=42, help="Tuning seed. Not a headline seed.")
+    p.add_argument("--seed", type=int, default=42, help="Tuning seed.")
     p.add_argument(
         "--epochs",
         type=int,
         default=None,
         help="Epochs the matched budget is derived from. Must match the runners' "
-        "--epochs-polystep, or the config is tuned at a budget the headline "
+        "--epochs-polystep, or the config is tuned at a budget the reported "
         "runs never spend.",
     )
     p.add_argument(
@@ -240,8 +240,7 @@ def main() -> int:
                 # count for every method.
                 points = refine_grid(method, select_best(picked_so_far())["point"])
 
-            # Count cells that actually ran, not cells the grid intended: a cell
-            # that raises is dropped by the per-cell except above.
+            # Count completed trials; failed trials were skipped above.
             costs.setdefault(showcase, {})[method] = tuning_cost(
                 method, budget, seeds=1, rounds=args.rounds, configs=len(picked_so_far())
             )
