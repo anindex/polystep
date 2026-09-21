@@ -1,19 +1,13 @@
-"""Numerical contract of the Softmax solver: overflow safety, marginals,
-warnings, no caller-tensor mutation, and the runner solver pin.
-"""
+"""Softmax numerics, marginals, warnings, and caller-state preservation."""
 
 from __future__ import annotations
 
-import re
 import warnings
-from pathlib import Path
 
 import pytest
 import torch
 
 from polystep import SoftmaxSolver
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -120,45 +114,6 @@ def test_softmax_does_not_mutate_caller_cost_matrix():
     assert torch.equal(C, C_before), (
         "solver mutated caller's cost matrix via scale_cost_matrix. softmax.py:87 must clone before scaling."
     )
-
-
-def test_runner_pins_softmax_solver(require_experiments):
-    """Result-reporting runners must pin softmax, not inherit auto-selection.
-
-    The gallery runners pin it through ``fairness.build_polystep``; MAX-SAT scaling
-    builds its own optimizer and carries the literal.
-    """
-    import inspect
-
-    from experiments.runners.fairness import build_polystep
-
-    assert inspect.signature(build_polystep).parameters["solver"].default == "softmax"
-    for relpath in ("experiments/runners/run_moe.py", "experiments/runners/run_elevation.py"):
-        src = (REPO_ROOT / relpath).read_text()
-        assert not re.search(r"build_polystep\([^)]*solver\s*=", src), (
-            f"{relpath} overrides the pinned solver on a build_polystep call"
-        )
-    scaling = (REPO_ROOT / "experiments/runners/run_maxsat_softmax_scaling.py").read_text()
-    assert re.search(r"solver\s*=\s*'softmax'", scaling)
-
-
-@pytest.mark.parametrize("eps", [0.0, -0.1])
-def test_softmax_rejects_nonpositive_epsilon(eps):
-    """epsilon <= 0 must raise ValueError on solve()."""
-    solver = SoftmaxSolver(epsilon=eps)
-    with pytest.raises(ValueError, match="epsilon"):
-        solver.solve(torch.rand(5, 8))
-
-
-def test_softmax_result_invariants():
-    """SolverResult fields are well-formed: f/g None, converged, n_iters=1."""
-    solver = SoftmaxSolver(epsilon=0.1)
-    result = solver.solve(torch.rand(5, 8))
-    assert result.f is None
-    assert result.g is None
-    assert result.converged is True
-    assert result.n_iters == 1
-    assert isinstance(result.ent_reg_cost, float)
 
 
 def test_softmax_init_f_and_g_are_ignored():

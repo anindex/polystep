@@ -76,11 +76,7 @@ class SinkhornSolver:
 
     def __post_init__(self):
         """Initialize compiled function registry and validate parameters."""
-        if self.epsilon <= 0:
-            raise ValueError(
-                f"epsilon must be > 0, got {self.epsilon}. "
-                f"A zero or negative epsilon causes division by zero in log-domain Sinkhorn iterations."
-            )
+        validate_positive(self.epsilon, "epsilon")
         if self.omega < 0.5 or self.omega > 1.95:
             raise ValueError(
                 f"omega must be in [0.5, 1.95], got {self.omega}. "

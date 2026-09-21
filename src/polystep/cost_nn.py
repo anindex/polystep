@@ -8,6 +8,7 @@ the one parameter a candidate perturbs.
 from __future__ import annotations
 
 import warnings
+from bisect import bisect_right
 from contextlib import contextmanager
 from typing import Callable, Optional, TYPE_CHECKING, Union
 
@@ -113,7 +114,7 @@ def _batched_loss_kind(loss_fn) -> Optional[str]:
     A configured loss has no reproduction and falls back to vmap; a subclass that
     overrides ``forward`` would score candidates on a different objective.
     """
-    if getattr(loss_fn, "reduction", None) != "mean":
+    if getattr(loss_fn, "reduction", None) != "mean" or _has_hooks(loss_fn):
         return None
     for base, kind in ((nn.CrossEntropyLoss, "cross_entropy"), (nn.MSELoss, "mse"), (nn.L1Loss, "l1")):
         if not isinstance(loss_fn, base):
@@ -208,6 +209,8 @@ class NNCostEvaluator:
         per_sample: bool = False,
         autocast_dtype: Optional[torch.dtype] = None,
     ):
+        if chunk_size not in (None, "auto") and (type(chunk_size) is not int or chunk_size < 1):
+            raise ValueError("chunk_size must be None, 'auto', or a positive integer")
         self.model = model
         self.loss_fn = loss_fn
         self.autocast_dtype = autocast_dtype
@@ -297,6 +300,7 @@ class NNCostEvaluator:
         self._subspace_backup = None
         self._cast_cache = None
         self._input_dtype_cache = _UNSET
+        self._chunk_size_cached = _UNSET
         loss_kind = _batched_loss_kind(self.loss_fn)
         self._batched_linear = (
             BatchedLinearEvaluator.try_build(self.model, self.loss_fn, loss_kind) if loss_kind is not None else None
@@ -385,7 +389,18 @@ class NNCostEvaluator:
             and not self.per_sample
             and not (self._batched_linear.loss_kind == "cross_entropy" and targets.dim() != 1)
         ):
-            return self._batched_linear.evaluate(stacked_params, inputs, targets)
+            n = next(iter(stacked_params.values())).shape[0]
+            chunk = self.chunk_size
+            if chunk is None or n <= chunk:
+                return self._batched_linear.evaluate(stacked_params, inputs, targets)
+            return torch.cat(
+                [
+                    self._batched_linear.evaluate(
+                        {k: v[start : start + chunk] for k, v in stacked_params.items()}, inputs, targets
+                    )
+                    for start in range(0, n, chunk)
+                ]
+            )
 
         if self._vmap_failed:
             result = self._evaluate_loop(stacked_params, inputs, targets)
@@ -856,7 +871,7 @@ def _plan_children(model: nn.Module):
     for name, mod in model._modules.items():
         if mod is None:
             continue
-        if isinstance(mod, nn.Sequential):
+        if isinstance(mod, nn.Sequential) and type(mod).forward is nn.Sequential.forward and not _has_hooks(mod):
             for sub, m in mod._modules.items():
                 if m is not None:
                     yield f"{name}.{sub}", m
@@ -995,42 +1010,49 @@ class BatchedLinearEvaluator:
     ) -> torch.Tensor:
         """Batched forward via bmm for Linear layers."""
         N = next(iter(stacked_params.values())).shape[0]
-        # Expand the input across the N param configs.
-        if inputs.dim() == 2:
-            x = inputs.unsqueeze(0).expand(N, -1, -1)  # (N, B, in_feat)
-        else:
-            # Flatten spatial dims for non-2D inputs.
-            x = inputs.reshape(inputs.shape[0], -1).unsqueeze(0).expand(N, -1, -1)
+        # Keep the prefix shared until a candidate actually changes a layer.
+        x = inputs if inputs.dim() == 2 else inputs.reshape(inputs.shape[0], -1)
 
         for name, tag, module in self._layer_keys:
             if tag == "linear":
                 w_key = f"{name}.weight"
                 b_key = f"{name}.bias"
                 wq, bq = _weight_transforms(module)
-                # Frozen params are constant across candidates, so the module's tensor
-                # stands in; bmm does not broadcast its batch dim, hence the expand.
                 W = stacked_params.get(w_key)
                 if W is None:
-                    W = module.weight.unsqueeze(0).expand(N, -1, -1)
+                    W = module.weight
+                elif W.stride(0) == 0:
+                    W = W[0]  # expanded view: every candidate shares this weight
                 if wq is not None:
                     # Elementwise, so transforming the whole stack equals per-candidate.
                     W = wq(W)
                 bias = stacked_params.get(b_key)
                 if bias is None and getattr(module, "bias", None) is not None:
-                    bias = module.bias.unsqueeze(0)
+                    bias = module.bias
+                elif bias is not None and bias.stride(0) == 0:
+                    bias = bias[0]
                 if bias is not None and bq is not None:
                     bias = bq(bias)
-                # baddbmm folds the bias into the same kernel.
-                if bias is not None:
-                    x = torch.baddbmm(bias.unsqueeze(1), x, W.transpose(1, 2))
+                if W.dim() == 2:
+                    # One GEMM for shared weights, including a shared prefix.
+                    x = nn.functional.linear(x, W, bias if bias is not None and bias.dim() == 1 else None)
+                    if bias is not None and bias.dim() == 2:
+                        x = x + bias.unsqueeze(1)
                 else:
-                    x = torch.bmm(x, W.transpose(1, 2))
+                    if x.dim() == 2:
+                        x = x.unsqueeze(0).expand(N, -1, -1)
+                    if bias is not None:
+                        x = torch.baddbmm(bias.unsqueeze(-2), x, W.transpose(1, 2))
+                    else:
+                        x = torch.bmm(x, W.transpose(1, 2))
             elif tag in ("flatten", "dropout"):
                 pass  # input is pre-flattened; dropout is identity in eval mode
             else:
                 # Apply the real module so its configuration is exact.
                 x = module(x)
 
+        if x.dim() == 2:
+            x = x.unsqueeze(0).expand(N, -1, -1)
         return _reduce_per_candidate(x, targets, self.loss_fn, self.loss_kind)
 
 
@@ -1046,7 +1068,7 @@ def _resolve_layout_entry(self, offsets: torch.Tensor, pdim: int, span=None):
     else:
         lo, hi = span
 
-    idx = int(torch.searchsorted(self._starts, torch.tensor(lo), right=True)) - 1
+    idx = bisect_right(self._starts, lo) - 1
     if idx < 0 or idx >= len(self._keys):
         return None
     entry = self._entry_by_key[self._keys[idx]]
@@ -1078,7 +1100,7 @@ class SiteVmapEvaluator:
         self._buffers = buffers
         self._owner = owner
         self._entry_by_key = {e.key: e for e in layout.entries}
-        self._starts = torch.tensor([e.offset for e in layout.entries], dtype=torch.long)
+        self._starts = [e.offset for e in layout.entries]
         self._keys = [e.key for e in layout.entries]
         self._compiled_sites = {}
         self._compile_failed_sites = set()
@@ -1245,7 +1267,7 @@ class SparseDeltaEvaluator:
                 self._site[f"{name}.bias"] = (idx, False)
         self._entry_by_key = {e.key: e for e in layout.entries}
         # Flat spans of the entries this path can perturb, for the containment test.
-        self._starts = torch.tensor([e.offset for e in layout.entries], dtype=torch.long)
+        self._starts = [e.offset for e in layout.entries]
         self._keys = [e.key for e in layout.entries]
 
     @classmethod

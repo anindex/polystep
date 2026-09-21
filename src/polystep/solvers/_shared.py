@@ -10,13 +10,14 @@ import torch
 from .base import SolverResult
 
 
-def validate_positive(value: float, name: str, context: str = "") -> None:
-    """Raise ValueError unless ``value > 0``."""
-    if not value > 0:
-        msg = f"{name} must be > 0, got {value}."
+def validate_positive(value: float, name: str, context: str = "") -> float:
+    """Return a positive finite value, or raise ValueError."""
+    if not (math.isfinite(value) and value > 0):
+        msg = f"{name} must be > 0 and finite, got {value}."
         if context:
             msg += " " + context
         raise ValueError(msg)
+    return value
 
 
 def solver_health(transport: torch.Tensor, displacement: torch.Tensor, step_radius: float):

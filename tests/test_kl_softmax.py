@@ -35,6 +35,19 @@ def test_lam_zero_recovers_softmax_row_marginals() -> None:
     torch.testing.assert_close(res_kl.matrix, res_sm.matrix, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("epsilon", [1e-3, 1e-20])
+@pytest.mark.parametrize("lam", [0.0, 1.0])
+def test_row_mass_survives_large_row_offsets(epsilon, lam):
+    costs = torch.tensor([[0.0, 1.0], [100.0, 101.0], [50.0, 51.0]])
+    a = torch.tensor([0.25, 0.75, 0.0])
+    result = KLSoftmaxSolver(epsilon=epsilon, lam=lam, max_iterations=20).solve(costs, a=a)
+    torch.testing.assert_close(result.matrix.sum(1), a, rtol=1e-6, atol=0)
+    if lam == 0:
+        expected = SoftmaxSolver(epsilon=epsilon).solve(costs, a=a)
+        torch.testing.assert_close(result.matrix, expected.matrix, rtol=1e-6, atol=0)
+        assert result.cost == pytest.approx(expected.cost)
+
+
 def test_lam_huge_recovers_sinkhorn_full_marginals() -> None:
     C, a, b = _make_problem()
     eps = 0.1
@@ -101,6 +114,11 @@ def test_nan_safe_at_small_epsilon() -> None:
 def test_validation_invalid_constructor_args_raise(kwargs) -> None:
     with pytest.raises(ValueError):
         KLSoftmaxSolver(**kwargs)
+
+
+@pytest.mark.parametrize("epsilon,lam,expected", [(1e308, 1e308, 0.5), (1.0, 1e-309, 1e-309)])
+def test_alpha_avoids_overflow(epsilon, lam, expected):
+    assert KLSoftmaxSolver(epsilon=epsilon, lam=lam).alpha == pytest.approx(expected, abs=0.0)
 
 
 def test_default_uniform_marginals_when_a_b_none() -> None:

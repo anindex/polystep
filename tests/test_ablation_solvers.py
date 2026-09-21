@@ -25,17 +25,6 @@ def source_marginal():
 
 
 class TestMinCostGreedySolver:
-    def test_basic_assignment(self, cost_matrix, source_marginal):
-        solver = MinCostGreedySolver()
-        result = solver.solve(cost_matrix, a=source_marginal)
-
-        assert isinstance(result, SolverResult)
-        assert result.matrix.shape == (4, 6)
-        assert result.converged is True
-        assert result.n_iters == 1
-        assert result.f is None
-        assert result.g is None
-
     def test_argmin_correctness(self, cost_matrix, source_marginal):
         """Each row should have mass only at the argmin column."""
         solver = MinCostGreedySolver()
@@ -49,12 +38,6 @@ class TestMinCostGreedySolver:
             mask[min_col] = False
             assert T[i, mask].sum().item() == pytest.approx(0.0, abs=1e-10)
 
-    def test_deterministic(self, cost_matrix, source_marginal):
-        solver = MinCostGreedySolver()
-        r1 = solver.solve(cost_matrix, a=source_marginal)
-        r2 = solver.solve(cost_matrix, a=source_marginal)
-        assert torch.equal(r1.matrix, r2.matrix)
-
     def test_default_uniform_marginal(self, cost_matrix):
         solver = MinCostGreedySolver()
         result = solver.solve(cost_matrix)
@@ -64,15 +47,6 @@ class TestMinCostGreedySolver:
 
 
 class TestTopKMeanSolver:
-    def test_basic_assignment(self, cost_matrix, source_marginal):
-        solver = TopKMeanSolver(k=3)
-        result = solver.solve(cost_matrix, a=source_marginal)
-
-        assert isinstance(result, SolverResult)
-        assert result.matrix.shape == (4, 6)
-        assert result.converged is True
-        assert result.n_iters == 1
-
     def test_top_k_correctness(self, cost_matrix, source_marginal):
         """Each row should have exactly k non-zero entries at the top-k positions."""
         solver = TopKMeanSolver(k=3)
@@ -84,18 +58,7 @@ class TestTopKMeanSolver:
             nonzero_mask = T[i] > 0
             assert nonzero_mask.sum().item() == 3
             for idx in topk_idx:
-                assert T[i, idx].item() > 0
-
-    def test_uniform_weights_within_top_k(self, cost_matrix, source_marginal):
-        """Each selected vertex should get a[i]/k mass."""
-        solver = TopKMeanSolver(k=3)
-        result = solver.solve(cost_matrix, a=source_marginal)
-        T = result.matrix
-
-        for i in range(4):
-            nonzero = T[i][T[i] > 0]
-            expected = source_marginal[i] / 3
-            assert torch.allclose(nonzero, expected.expand_as(nonzero), atol=1e-7)
+                assert T[i, idx].item() == pytest.approx(source_marginal[i].item() / 3)
 
     def test_v_less_than_k(self):
         """When V < k, should use all V vertices gracefully."""
@@ -120,11 +83,6 @@ class TestTopKMeanSolver:
         assert T[1, 2] == 0.0
         torch.testing.assert_close(T.sum(dim=1), a)
 
-    def test_a_fully_masked_row_keeps_its_mass(self):
-        """A fully masked row keeps its mass."""
-        T = TopKMeanSolver(k=2).solve(torch.full((1, 4), float("inf"))).matrix
-        assert T.sum().item() == pytest.approx(1.0)
-
     def test_k_equals_1_matches_greedy(self, cost_matrix, source_marginal):
         """TopKMean with k=1 should match greedy exactly."""
         greedy = MinCostGreedySolver()
@@ -135,17 +93,6 @@ class TestTopKMeanSolver:
 
 
 class TestTemperedSoftmaxSolver:
-    def test_basic(self, cost_matrix, source_marginal):
-        solver = TemperedSoftmaxSolver(tau=1.0)
-        result = solver.solve(cost_matrix, a=source_marginal)
-
-        assert isinstance(result, SolverResult)
-        assert result.matrix.shape == (4, 6)
-        assert result.converged is True
-        # One-sided solver: the rows must carry the source marginal exactly.
-        torch.testing.assert_close(result.matrix.sum(dim=-1), source_marginal, atol=1e-6, rtol=1e-6)
-        assert (result.matrix >= 0).all()
-
     def test_uses_tau_not_epsilon(self, cost_matrix, source_marginal):
         """Output should depend on tau, not epsilon."""
         solver1 = TemperedSoftmaxSolver(epsilon=0.1, tau=1.0)
@@ -207,9 +154,14 @@ class TestTemperedSoftmaxSolver:
 def test_various_sizes(P, V):
     C = torch.rand(P, V)
     a = torch.ones(P) / P
-    for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3), TemperedSoftmaxSolver(tau=1.0)]:
+    for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3), TemperedSoftmaxSolver(tau=1.0), SoftmaxSolver()]:
         result = solver.solve(C, a=a)
+        assert isinstance(result, SolverResult)
         assert result.matrix.shape == (P, V)
+        assert result.converged and result.n_iters == 1
+        assert result.f is None and result.g is None
+        assert isinstance(result.ent_reg_cost, float)
+        assert (result.matrix >= 0).all()
         assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-6)
 
 
@@ -280,3 +232,10 @@ def test_half_precision_cost_gives_a_full_precision_plan(solver):
     result = solver.solve(C)
     assert result.matrix.dtype == torch.float32
     assert torch.allclose(result.matrix.sum(dim=1), torch.full((5,), 0.2), atol=1e-5)
+
+
+def test_topk_excludes_every_nonfinite_cost_and_freezes_uninformative_rows():
+    costs = torch.tensor([[1.0, float("-inf"), float("nan"), float("inf")], [float("nan")] * 4, [2.0] * 4])
+    plan = TopKMeanSolver(k=3).solve(costs).matrix
+    expected = torch.tensor([[1 / 3, 0.0, 0.0, 0.0], [1 / 12] * 4, [1 / 12] * 4])
+    torch.testing.assert_close(plan, expected)

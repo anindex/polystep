@@ -65,6 +65,7 @@ from .solvers import (
     TopKMeanSolver,
 )
 from .solver import SolverState
+from .solvers._shared import validate_positive
 from .adaptive_subspace import AdaptiveSubspace
 from .cma import compute_cma_hyperparameters
 from .cma_subspace import CMAAdaptiveSubspace
@@ -1112,20 +1113,13 @@ class PolyStepOptimizer(SerializationMixin):
         """Actual projection type in use ('dense' or 'sparse')."""
         return self._actual_projection_type
 
-    @staticmethod
-    def _check_temperature(value: float, name: str) -> float:
-        """Reject a non-positive temperature the fused kernel would divide by unguarded."""
-        if not value > 0:
-            raise ValueError(f"{name} must resolve to > 0, got {value}.")
-        return value
-
     def _get_epsilon(self, iteration: int) -> float:
         """Resolve epsilon at current iteration."""
         if self._progressive_epsilon is not None:
-            return self._check_temperature(self._progressive_epsilon.at(iteration), "epsilon")
+            return validate_positive(self._progressive_epsilon.at(iteration), "epsilon")
         if hasattr(self.epsilon, "at"):
-            return self._check_temperature(self.epsilon.at(iteration), "epsilon")
-        return self.epsilon
+            return validate_positive(self.epsilon.at(iteration), "epsilon")
+        return validate_positive(self.epsilon, "epsilon")
 
     def _get_step_radius(self, iteration: int) -> float:
         """Resolve step_radius at current iteration (supports schedule objects)."""
@@ -1220,8 +1214,8 @@ class PolyStepOptimizer(SerializationMixin):
         if self.ent_epsilon is None:
             return None
         if hasattr(self.ent_epsilon, "at"):
-            return self._check_temperature(self.ent_epsilon.at(iteration), "ent_epsilon")
-        return self.ent_epsilon
+            return validate_positive(self.ent_epsilon.at(iteration), "ent_epsilon")
+        return validate_positive(self.ent_epsilon, "ent_epsilon")
 
     def _bf16_supported(self) -> bool:
         """Whether BF16 is supported on the model's device."""

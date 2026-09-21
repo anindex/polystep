@@ -11,7 +11,6 @@ import torch
 from ._shared import (
     align_dual,
     align_marginal,
-    exp_plan,
     prepare_cost,
     validate_positive,
     warn_tiny_temperature,
@@ -33,10 +32,7 @@ class KLSoftmaxSolver:
     last_marginal_violation: Optional[float] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.epsilon <= 0:
-            raise ValueError(
-                f"epsilon must be > 0, got {self.epsilon}. epsilon is the entropic temperature and must be positive."
-            )
+        validate_positive(self.epsilon, "epsilon")
         if self.lam < 0:
             raise ValueError(f"lam must be >= 0, got {self.lam}. lam is the KL penalty on the column marginal.")
         if self.threshold < 0:
@@ -51,7 +47,10 @@ class KLSoftmaxSolver:
             return 0.0
         if math.isinf(self.lam):
             return 1.0
-        return float(self.lam / (self.lam + self.epsilon))
+        if self.lam < self.epsilon:
+            ratio = self.lam / self.epsilon
+            return float(ratio / (1.0 + ratio))
+        return float(1.0 / (1.0 + self.epsilon / self.lam))
 
     def solve(
         self,
@@ -98,7 +97,6 @@ class KLSoftmaxSolver:
 
             # Softmax limit, closed form in one iteration. The bound is the dtype's smallest normal: below it the /alpha residual becomes 0/0 = NaN.
             if alpha < torch.finfo(dtype).tiny:
-                f = eps * (log_a - torch.logsumexp(-C / eps, dim=1))
                 g = torch.zeros_like(g)
                 converged = True
                 n_iters = 1
@@ -129,11 +127,13 @@ class KLSoftmaxSolver:
                             break
                     f, g = f_new, g_new
 
-                # One more f-update so P1 == a holds, since the loop leaves f one step behind g.
-                f = eps * (log_a - torch.logsumexp((g.unsqueeze(0) - C) / eps, dim=1))
-
-            # Clamped exponent, not a zero-fill: zeroing overflowed entries would drop the mass that makes P1 == a.
-            P = exp_plan(f, g, C, eps)
+            # Enforce rows directly: exp((f + g - C)/eps) loses their mass when
+            # f and C nearly cancel. Shift before division, including at lam=0.
+            scores = g.unsqueeze(0) - C
+            row_max = scores.amax(dim=1, keepdim=True)
+            logits = (scores - row_max) / eps
+            P = torch.softmax(logits, dim=1) * a.unsqueeze(1)
+            f = eps * (log_a - torch.logsumexp(logits, dim=1)) - row_max.squeeze(1)
 
             # Undo both frame changes so cost is <C_raw, P> (sum(P) == a.sum()).
             cost = ((C * P).sum() * cost_scale + cost_shift * a.sum()).item()

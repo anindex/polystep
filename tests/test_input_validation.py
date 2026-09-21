@@ -12,7 +12,7 @@ from polystep.cost_nn import NNCostEvaluator
 from polystep.costs import scale_cost_matrix
 from polystep._compiled import _fused_softmax_project
 from polystep.geometry import get_orthoplex_vertices, get_random_rotation_matrices
-from polystep.solvers import SinkhornSolver, SoftmaxSolver, TemperedSoftmaxSolver
+from polystep.solvers import KLSoftmaxSolver, SinkhornSolver, SoftmaxSolver, TemperedSoftmaxSolver
 from polystep.solvers._shared import align_dual, align_marginal, recenter_cost, sanitize_cost
 
 
@@ -68,11 +68,12 @@ def test_numeric_scale_cost_zero_and_inf_raise():
         scale_cost_matrix(cost, float("inf"))
 
 
-def test_sinkhorn_epsilon_revalidated_per_solve():
-    """epsilon is only validated in __post_init__, but schedules mutate it, so
-    solve() must revalidate it rather than divide by zero."""
-    solver = SinkhornSolver(threshold=1e-3, max_iterations=10)
-    solver.epsilon = -1.0
+@pytest.mark.parametrize("solver_class", [SinkhornSolver, KLSoftmaxSolver, SoftmaxSolver])
+@pytest.mark.parametrize("epsilon", [0.0, -1.0, float("inf"), float("nan")])
+def test_epsilon_revalidated_per_solve(solver_class, epsilon):
+    """Schedules can mutate epsilon after construction."""
+    solver = solver_class()
+    solver.epsilon = epsilon
     with pytest.raises(ValueError, match="epsilon"):
         solver.solve(torch.rand(4, 6))
 

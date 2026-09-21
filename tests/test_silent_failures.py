@@ -577,14 +577,18 @@ class TestAuditSilentFailures:
         with pytest.raises(ValueError, match="one loss per candidate"):
             opt.step(lambda bp: torch.tensor(3.0))
 
-    @pytest.mark.parametrize("target", [0.0, -0.1])
-    def test_a_schedule_resolving_to_a_nonpositive_epsilon_is_rejected(self, target):
+    @pytest.mark.parametrize("target", [0.0, -0.1, float("inf"), float("nan")])
+    @pytest.mark.parametrize("name", ["epsilon", "ent_epsilon"])
+    @pytest.mark.parametrize("scheduled", [False, True])
+    def test_invalid_temperature_is_rejected_before_fused_step(self, target, name, scheduled):
         """Zero froze the run through NaN reversion; negative made it ascend."""
         from polystep.epsilon import LinearEpsilon
 
         torch.manual_seed(0)
-        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, epsilon=LinearEpsilon(init=1.0, target=target, decay=10.0))
-        with pytest.raises(ValueError, match="epsilon must resolve to > 0"):
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, solver="softmax")
+        value = LinearEpsilon(init=1.0, target=target, decay=10.0) if scheduled else target
+        setattr(opt, name, value)
+        with pytest.raises(ValueError, match=f"{name} must be > 0"):
             for _ in range(4):
                 opt.step(_constant_closure(1.0, [0]))
 

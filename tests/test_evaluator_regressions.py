@@ -13,6 +13,70 @@ from polystep.ask_tell import PolyStepES
 from polystep.cost_nn import NNCostEvaluator, cast_inputs_memo
 
 
+@pytest.mark.parametrize("behavior", ["nested_forward", "nested_hook", "loss_hook"])
+def test_fast_paths_preserve_container_and_loss_behavior(behavior):
+    class Offset(nn.Sequential):
+        def forward(self, x):
+            return super().forward(x) + 3
+
+    inner = (Offset if behavior == "nested_forward" else nn.Sequential)(nn.Linear(3, 2))
+    model, loss = nn.Sequential(inner), nn.MSELoss()
+    if behavior == "nested_hook":
+        inner.register_forward_hook(lambda module, args, output: output + 3)
+    if behavior == "loss_hook":
+        loss.register_forward_hook(lambda module, args, output: output + 3)
+    ev = NNCostEvaluator(model, loss, use_inplace=False)
+    params = {k: v.detach()[None] + torch.randn(4, *v.shape) * 0.1 for k, v in model.named_parameters()}
+    x, y = torch.randn(5, 3), torch.randn(5, 2)
+    torch.testing.assert_close(ev.evaluate(params, x, y), ev._evaluate_loop(params, x, y))
+    # Every delta evaluator shares the same compatibility check.
+    from polystep.cost_nn import FactoredEvaluator, SparseDeltaEvaluator, SubspaceDeltaEvaluator
+    from polystep.hybrid_subspace import HybridSubspace
+    from polystep.transform import ParamLayout
+
+    layout = ParamLayout.from_module(model)
+    assert SparseDeltaEvaluator.try_build(model, loss, layout) is None
+    assert SubspaceDeltaEvaluator.try_build(model, loss, HybridSubspace.from_layout(layout, rank=1)) is None
+    assert FactoredEvaluator.try_build(model, loss) is None
+
+
+def test_dense_evaluator_bounds_activation_batches_by_chunk_size():
+    model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2))
+    ev = NNCostEvaluator(model, nn.MSELoss(), chunk_size=3, use_inplace=False)
+    params = {k: v.detach()[None] + torch.randn(8, *v.shape) * 0.1 for k, v in model.named_parameters()}
+    x, y = torch.randn(5, 3), torch.randn(5, 2)
+    with patch("torch.baddbmm", wraps=torch.baddbmm) as matmul:
+        got = ev.evaluate(params, x, y)
+    assert max(call.args[1].shape[0] for call in matmul.call_args_list) <= 3
+    torch.testing.assert_close(got, ev._evaluate_loop(params, x, y))
+
+
+@pytest.mark.parametrize("chunk", [0, -1, True, 2.5, "invalid"])
+def test_evaluator_rejects_invalid_chunks(chunk):
+    with pytest.raises(ValueError, match="chunk_size"):
+        NNCostEvaluator(nn.Linear(3, 2), nn.MSELoss(), chunk_size=chunk)
+
+
+def test_reset_recomputes_automatic_chunk_size():
+    ev = NNCostEvaluator(nn.Linear(3, 2), nn.MSELoss(), chunk_size="auto")
+    with patch("polystep.cost_nn.auto_detect_chunk_size", side_effect=[8, 2]):
+        assert ev.chunk_size == 8
+        ev.reset_vmap()
+        assert ev.chunk_size == 2
+
+
+@pytest.mark.parametrize("site", ["0.weight", "0.bias", "2.weight", "2.bias"])
+def test_dense_shared_weights_match_materialized_candidates(site):
+    model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2)).double()
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    params = {k: v.detach()[None].expand(8, *v.shape) for k, v in model.named_parameters()}
+    params[site] = params[site] + torch.randn_like(params[site]) * 0.1
+    x, y = torch.randn(5, 3).double(), torch.randn(5, 2).double()
+    expected = ev._evaluate_loop(params, x, y)
+    torch.testing.assert_close(ev.evaluate(params, x, y), expected, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(ev.evaluate({k: v.clone() for k, v in params.items()}, x, y), expected)
+
+
 @pytest.mark.parametrize("targets", [[0, -100], [-100, -100]])
 def test_fast_cross_entropy_matches_ignored_target_reduction(targets):
     model = nn.Sequential(nn.Linear(2, 2)).double()

@@ -12,7 +12,7 @@ from .costs import compute_cost_matrix
 from .epsilon import feed_solver_stats, resolve_radius, LinearEpsilon
 from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
 from .solvers import SinkhornSolver, SoftmaxSolver
-from .solvers._shared import solver_health
+from .solvers._shared import solver_health, validate_positive
 
 
 @dataclass
@@ -173,16 +173,16 @@ class PolyStep:
     def _get_epsilon(self, iteration: int) -> float:
         """Resolve epsilon at ``iteration``; duck-types on ``.at()`` so schedules and plain floats both work."""
         if hasattr(self.epsilon, "at"):
-            return self.epsilon.at(iteration)
-        return self.epsilon
+            return validate_positive(self.epsilon.at(iteration), "epsilon")
+        return validate_positive(self.epsilon, "epsilon")
 
     def _get_ent_epsilon(self, iteration: int) -> Optional[float]:
         """Resolve ent_epsilon at current iteration (supports schedule objects)."""
         if self.ent_epsilon is None:
             return None
         if hasattr(self.ent_epsilon, "at"):
-            return self.ent_epsilon.at(iteration)
-        return self.ent_epsilon
+            return validate_positive(self.ent_epsilon.at(iteration), "ent_epsilon")
+        return validate_positive(self.ent_epsilon, "ent_epsilon")
 
     @torch.inference_mode()
     def step(

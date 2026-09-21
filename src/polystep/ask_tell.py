@@ -11,6 +11,7 @@ import torch
 from ._compiled import _barycentric_projection, _rotate_and_translate
 from .geometry import get_orthoplex_vertices, get_random_rotation_matrices
 from .solvers import SinkhornSolver, SoftmaxSolver
+from .solvers._shared import validate_positive
 
 __all__ = ["PolyStepES", "minimize"]
 
@@ -52,8 +53,7 @@ class PolyStepES:
             raise ValueError(f"dim must be >= 1, got {dim}.")
         if num_particles < 1:
             raise ValueError(f"num_particles must be >= 1, got {num_particles}.")
-        if not epsilon > 0:
-            raise ValueError(f"epsilon must be > 0, got {epsilon}.")
+        validate_positive(epsilon, "epsilon")
         if not (math.isfinite(step_radius) and step_radius >= 0):
             raise ValueError(f"step_radius must be finite and >= 0, got {step_radius}.")
         self.dim = dim

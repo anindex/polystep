@@ -43,7 +43,7 @@ def test_fused_matrix_tracks_the_basis_across_an_aligned_absorb():
     opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.1, step_radius=0.05, adaptive_probes=False)
     x = torch.randn(8, 16)
     y = torch.randint(0, 4, (8,))
-    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), layout)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
 
     def closure(params):
         return ev.evaluate(params, x, y)
@@ -83,7 +83,7 @@ def test_blockwise_mode_still_rotates_a_per_layer_subspace():
     )
     x = torch.randn(8, 16)
     y = torch.randint(0, 4, (8,))
-    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), layout)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
     before = {k: v.clone() for k, v in opt.state.hybrid_projections.items()}
 
     for i in range(4):

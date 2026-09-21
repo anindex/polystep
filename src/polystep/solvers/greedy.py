@@ -89,13 +89,15 @@ class TopKMeanSolver:
         _, topk_indices = C_raw.topk(k_eff, dim=-1, largest=False)  # (P, k_eff)
 
         # topk does not honour the sanitize mask, so drop infeasible picks and spread mass over what is left; the row still sums to a.
-        feasible = ~(torch.isnan(cost_matrix) | (cost_matrix == float("inf")))
+        feasible = torch.isfinite(cost_matrix)
         keep = feasible.gather(1, topk_indices)
         keep = keep | ~keep.any(dim=1, keepdim=True)
 
         transport = torch.zeros(P, V, device=device, dtype=dtype)
         mass = a.unsqueeze(1) / keep.sum(dim=1, keepdim=True) * keep
         transport.scatter_(1, topk_indices, mass.to(dtype))
+        informative = (C_raw.amax(dim=-1) > C_raw.amin(dim=-1)).unsqueeze(1)
+        transport = torch.where(informative, transport, a.unsqueeze(1).expand(P, V) / V)
 
         # scale_cost is unused: topk is invariant to a positive divisor.
         ent_cost = (C_raw * transport).sum().item()
