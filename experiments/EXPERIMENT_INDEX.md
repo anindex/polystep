@@ -7,7 +7,7 @@ time-matched results are reported separately.
 <!-- BENCH:START -->
 ### Non-differentiable tasks
 
-Test accuracy %. A dash means the cell is not in this release.
+Test accuracy %. A dash means the result is not in this release.
 
 | Task | PolyStep | OpenAI-ES | CMA-ES | EGGROLL | MeZO | SPSA | Random search | Adam (surrogate) | Non-diff op |
 |---|---|---|---|---|---|---|---|---|---|

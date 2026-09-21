@@ -38,15 +38,14 @@ Issues = "https://github.com/anindex/polystep/issues"
 # Lightweight: just enough for examples/ demos
 examples = [
     "numpy>=2.0",
-    "torchvision>=0.25",
     "matplotlib>=3.8",
     "Pillow>=10.0",
     "gymnasium[classic-control]>=0.29",
-    "python-sat",  # example 04 generates its 3-SAT instance through pysat
 ]
 # Core dev: lint + test the library itself (no experiment deps)
 dev = [
     "numpy>=2.0",  # the test suite loads MNIST through it
+    "setuptools>=77",  # PyTorch 2.8's compiler imports it at runtime
     "pytest>=8.0",
     "pytest-timeout>=2.2",
     "pytest-rerunfailures>=14.0",

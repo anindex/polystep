@@ -1,86 +1,67 @@
 name: Publish to PyPI
 
-# Publishes on a GitHub Release via PyPI Trusted Publishing (OIDC), no API tokens.
-# One-time setup on PyPI: Project -> Publishing -> add a trusted publisher for
-#   owner=anindex, repo=polystep, workflow=release.yml, environment=pypi.
-#
-# Actions are pinned to a commit SHA rather than a tag: a tag is mutable, and publish
-# holds id-token: write, so a retagged action could mint an OIDC token for this project.
-
 on:
   release:
     types: [published]
+
+concurrency:
+  group: pypi-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  # ci.yml runs on push and pull_request, so it may never have run on the tagged
-  # commit. Re-check lint and tests at that revision before publishing. Keep both
-  # commands identical to ci.yml, or this check is the weaker of the two.
-  verify:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # Default PyPI torch pulls ~2.7 GB of nvidia-* wheels onto a runner with no GPU.
-      # Set per job, not workflow-wide: publish resolves nothing and holds the OIDC
-      # token, so it inherits no package-resolution settings from here.
       UV_TORCH_BACKEND: cpu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
-          enable-cache: true
-          cache-dependency-glob: 'pyproject.toml'
-          cache-suffix: release
+          enable-cache: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
-      - name: Check the tag matches the packaged version
+          python-version: '3.12'
+      - name: Check release version and changelog
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          VERSION=$(python -c "import re,pathlib;print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/polystep/__init__.py').read_text()).group(1))")
-          CITATION=$(python -c "import re,pathlib;print(re.search(r'^version: (.+)$', pathlib.Path('CITATION.cff').read_text(), re.M).group(1).strip())")
-          echo "tag=$TAG packaged=$VERSION citation=$CITATION"
-          test "$TAG" = "$VERSION"
-          test "$TAG" = "$CITATION"
-      - name: Check the changelog has a section for this version
-        run: grep -q "^## ${GITHUB_REF_NAME#v} " CHANGELOG.md
-      - name: Install
-        run: uv pip install --system -e ".[dev]"
-      - name: Lint
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = re.search(r'^__version__ = "([^"]+)"$', Path('src/polystep/__init__.py').read_text(), re.M).group(1)
+          citation = re.search(r'^version: (.+)$', Path('CITATION.cff').read_text(), re.M).group(1).strip()
+          assert os.environ['GITHUB_REF_NAME'] == f'v{version}', 'release tag must match the package version'
+          assert citation == version, 'CITATION.cff version must match the package version'
+          assert any(line.startswith(f'## {version} ') for line in Path('CHANGELOG.md').read_text().splitlines()), 'missing changelog entry'
+          PY
+      - name: Lint and test the release commit
         run: |
+          uv pip install --system -e ".[dev]"
           ruff check .
           ruff format --check .
-      - name: Test
-        run: pytest tests/ -q -rs -m "not slow and not gpu" --timeout=120 -n auto
-
-  # Separate from publish so the build backend, which runs code from the source tree,
-  # never executes in the job that can mint an OIDC token.
-  build:
-    needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
-      - name: Build sdist + wheel
-        run: uv build
-      - name: Check artifact metadata
-        run: uvx twine check --strict dist/*
-      - name: Install wheel + import smoke test
-        env:
-          UV_TORCH_BACKEND: cpu
+          pytest -q -rs -n auto
+      - name: Build and check distributions
         run: |
+          uv build
+          uvx twine check --strict dist/*
           uv venv
-          uv pip install dist/*.whl
-          .venv/bin/python -c "import polystep; from polystep import *"
-      - name: Verify py.typed ships in the wheel
-        run: .venv/bin/python -c "import importlib.resources, polystep; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
+          for wheel in dist/*.whl; do
+            uv pip install "${wheel}[dev]"
+          done
+          .venv/bin/python -I -c "import importlib.resources, polystep; from polystep import *; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
+      - name: Test the installed wheel with the shipped tests
+        run: |
+          mkdir "$RUNNER_TEMP/sdist"
+          tar xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist" --strip-components=1
+          cd "$RUNNER_TEMP/sdist"
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest -q -rs -n auto
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
@@ -88,17 +69,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Only this job can mint the PyPI token; it runs no repository code.
   publish:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: pypi
+    environment:
+      name: pypi
+      url: https://pypi.org/p/polystep
     permissions:
-      contents: read   # a job-level block replaces the top-level default
-      id-token: write  # required for trusted publishing
+      id-token: write  # PyPI Trusted Publishing
     steps:
-      # No checkout: this job only forwards what build produced, so nothing from the
-      # source tree runs alongside the token.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist

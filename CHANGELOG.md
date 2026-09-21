@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.0 - 2026-09-22
+
+- Fix KL row mass, nonfinite inputs, evaluator hooks, and chunk handling.
+- Reuse shared MLP forward work and load only requested MNIST images.
+- Fix example checkpoint selection and evaluation budgets; trim demo dependencies.
+
 ## 0.12.0 - 2026-09-17
 
 - Fix cross-entropy targets, stale caches, attention masks, nonfinite best values,

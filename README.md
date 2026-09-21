@@ -8,6 +8,8 @@
 
 Gradient-free neural network training via optimal transport.
 
+Accepted at [Transactions on Machine Learning Research (TMLR)](https://openreview.net/forum?id=8mlcqTTMuU).
+
 PolyStep evaluates finite-radius parameter perturbations and updates parameters
 through a weighted barycenter. It supports spiking networks, quantized layers, hard
 routing, and other models without useful gradients. For differentiable models,
@@ -19,10 +21,8 @@ backpropagation is usually faster.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/method_diagram.png" width="840"
-       alt="PolyStep: subspace projection, polytope probes, loss evaluation, and a weighted parameter update.">
+       alt="PolyStep: search coordinates, polytope probes, cost evaluation, soft assignment, and a barycentric update.">
 </p>
-
-> Want to play around with parameters? [**Viet T. Nguyen**](https://vietngth.github.io/) built a gorgeous interactive walkthrough that animates every step of the method -> **[explore the PolyStep visualization](https://vietngth.github.io/polystep-visualization/)**.
 
 ## Installation
 
@@ -120,7 +120,7 @@ studies are reported separately in the [experiment index](experiments/EXPERIMENT
 <!-- BENCH:START -->
 ### Non-differentiable tasks
 
-Test accuracy %. A dash means the cell is not in this release.
+Test accuracy %. A dash means the result is not in this release.
 
 | Task | PolyStep | CMA-ES | OpenAI-ES | SPSA | Adam (surrogate) | Non-diff op |
 |---|---|---|---|---|---|---|
@@ -172,7 +172,8 @@ on the differentiable tasks, and specialized solvers lead on MAX-SAT. See
 
 ## Acknowledgments
 
-A huge thank you to [**Viet**](https://vietngth.github.io/) for building a beautiful interactive [PolyStep visualization](https://vietngth.github.io/polystep-visualization/), it brings the method to life and makes every step click!
+Thanks to [Viet T. Nguyen](https://vietngth.github.io/) for the
+[interactive visualization](https://vietngth.github.io/polystep-visualization/).
 
 ## License
 

@@ -10,19 +10,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # Pull requests only. On main the ref is shared with the nightly schedule, so
-  # cancelling would let a push kill an in-flight slow run.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 permissions:
   contents: read
 
 env:
-  # Runners have no GPU. Default PyPI torch pulls ~2.7 GB of nvidia-* wheels on top of a
-  # 1.1 GB torch; the cpu index ships one ~200 MB wheel. uv-only, and no pip extra index:
-  # an extra index widens the set of package names a second host can claim, and the jobs
-  # that need torch all resolve it through uv.
   UV_TORCH_BACKEND: cpu
 
 jobs:
@@ -34,8 +28,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
-      # Pinned to the same version as the dev extra, so format never disagrees with a
-      # local run. uvx fetches the one tool without resolving the project.
       - run: uvx ruff@0.15.13 check .
       - run: uvx ruff@0.15.13 format --check .
 
@@ -45,9 +37,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.13 dropped on pull requests: the four legs test the same code and the
-        # bookends have caught every version-specific failure so far.
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.11","3.12","3.14"]') || fromJSON('["3.11","3.12","3.13","3.14"]') }}
+        # Regular runs cover both ends; scheduled runs add intermediate versions and coverage.
+        python-version: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["3.11","3.12","3.13","3.14"]') || fromJSON('["3.11","3.14"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,30 +46,27 @@ jobs:
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           enable-cache: true
-          cache-dependency-glob: 'pyproject.toml'
-          # setup-uv's key omits the interpreter: without a suffix the legs share one
-          # entry and three re-download torch for the wrong cpXY tag every run.
+          cache-dependency-glob: pyproject.toml
           cache-suffix: py${{ matrix.python-version }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      # Coverage costs ~30% and reports the same number on every leg, so only 3.12
-      # runs it. -rs prints skip reasons: ~14 tests importorskip torchvision,
-      # gymnasium or pysat, which [dev] does not install.
-      - name: Core library tests
+      - name: Install and test
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
-          uv pip install --system -e ".[dev]"
-          if [ "${{ matrix.python-version }}" = "3.12" ]; then
-            pytest tests/ -rs -m "not slow and not gpu" --timeout=120 -n auto \
-              --cov=polystep --cov-report=term-missing
+          if [ "$PYTHON_VERSION" = "3.11" ]; then
+            uv pip install --system -e ".[dev]" 'torch==2.8.*'
           else
-            pytest tests/ -q -rs -m "not slow and not gpu" --timeout=120 -n auto
+            uv pip install --system -e ".[dev]"
+          fi
+          if [ "$PYTHON_VERSION" = "3.12" ]; then
+            pytest -q -rs -n auto --cov=polystep --cov-report=term-missing
+          else
+            pytest -q -rs -n auto
           fi
 
   slow:
-    # The real-data accuracy assertions live behind -m slow, which every other job
-    # deselects. Nightly and on demand, not per push: the MNIST legs download the
-    # dataset and take about a minute.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -89,15 +77,14 @@ jobs:
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           enable-cache: true
-          cache-dependency-glob: 'pyproject.toml'
+          cache-dependency-glob: pyproject.toml
           cache-suffix: slow
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
-      - name: Slow tests
-        run: |
-          uv pip install --system -e ".[dev]" torchvision
-          pytest tests/ -q -rs -m "slow and not gpu" --timeout=900
+          python-version: '3.12'
+      - run: |
+          uv pip install --system -e ".[dev]"
+          pytest -q -rs -m "slow and not gpu" --timeout=900
 
   build:
     runs-on: ubuntu-latest
@@ -109,38 +96,22 @@ jobs:
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           enable-cache: true
-          cache-dependency-glob: 'pyproject.toml'
+          cache-dependency-glob: pyproject.toml
           cache-suffix: build
-      - name: Build sdist + wheel
-        run: uv build
-      - name: Install wheel into a clean venv
+      - name: Build and check distributions
         run: |
-          uv venv
+          uv build
+          uvx twine check --strict dist/*
+          uv venv --python 3.12
           uv pip install dist/*.whl
-      - name: Clean-import smoke test
-        run: .venv/bin/python -c "import polystep; from polystep import *; print(polystep.__version__)"
-      - name: Verify py.typed ships in the wheel
-        run: .venv/bin/python -c "import importlib.resources, polystep; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
-
-  sdist:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
-        with:
-          enable-cache: true
-          cache-dependency-glob: 'pyproject.toml'
-          cache-suffix: sdist
-      - name: Unpack and check the shipped tests are runnable
+          .venv/bin/python -I -c "import importlib.resources, polystep; from polystep import *; assert (importlib.resources.files('polystep') / 'py.typed').is_file()"
+      - name: Test the installed wheel with the shipped tests
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
-          uv build --sdist
-          mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
-          cd /tmp/sdist
-          uv pip install --system ".[dev]"
-          pytest tests/ -q -rs -m "not slow and not gpu" --timeout=120 -n auto
+          for wheel in dist/*.whl; do
+            uv pip install "${wheel}[dev]"
+          done
+          mkdir "$RUNNER_TEMP/sdist"
+          tar xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist" --strip-components=1
+          cd "$RUNNER_TEMP/sdist"
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest -q -rs -n auto
