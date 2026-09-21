@@ -1,12 +1,13 @@
 """05 - MNIST: train a 2-layer MLP with PolyStep.
 
 Recommended configuration: a ``HybridSubspace`` with cosine-scheduled epsilon,
-step_radius, and probe_radius, plus best-state tracking across epochs. MNIST is
+step_radius, and probe_radius, plus validation-based checkpoint selection. MNIST is
 downloaded directly (no torchvision).
 
 Run:
   python examples/05_mnist.py
   python examples/05_mnist.py --device cuda --epochs 10
+  python examples/05_mnist.py --device cpu --train-size 2000 --hidden 32 --epochs 2
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import _env  # noqa: E402
 
 _env.setup()
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, random_split
 
 from polystep import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
@@ -36,10 +37,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mnist_data import get_mnist_tensors  # noqa: E402
 
 
-def get_mnist_loaders(data_dir: str = "/tmp/mnist", batch_size: int = 512):
-    train_x, train_y, test_x, test_y = get_mnist_tensors(0, 0, data_dir)
+def get_mnist_loaders(data_dir: str = "/tmp/mnist", batch_size: int = 512, seed: int = 42, train_size: int = 0):
+    train_x, train_y, test_x, test_y = get_mnist_tensors(train_size, 0, data_dir)
+    train, val = random_split(
+        TensorDataset(train_x, train_y), [0.9, 0.1], generator=torch.Generator().manual_seed(seed)
+    )
     return (
-        DataLoader(TensorDataset(train_x, train_y), batch_size=batch_size, shuffle=True),
+        DataLoader(train, batch_size=batch_size, shuffle=True),
+        DataLoader(val, batch_size=256),
         DataLoader(TensorDataset(test_x, test_y), batch_size=256, shuffle=False),
     )
 
@@ -81,9 +86,14 @@ def main():
     parser = argparse.ArgumentParser(description="MNIST with PolyStep")
     parser.add_argument("--epochs", type=int, default=15, help="Training epochs (paper uses 30 for 96%%).")
     parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--train-size", type=int, default=0, help="Cap MNIST training samples (0 = all).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    if args.epochs < 1 or args.hidden < 1:
+        parser.error("--epochs and --hidden must be positive")
+    if args.train_size < 0 or 0 < args.train_size < 10:
+        parser.error("--train-size must be 0 or at least 10")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -92,11 +102,11 @@ def main():
     print("MNIST Training with PolyStep (HybridSubspace + Softmax)")
     print("=" * 60)
 
-    train_loader, test_loader = get_mnist_loaders()
+    train_loader, val_loader, test_loader = get_mnist_loaders(seed=args.seed, train_size=args.train_size)
     model = MNISTNet(hidden=args.hidden).to(device)
     num_params = sum(p.numel() for p in model.parameters())
 
-    # rank=8 gives 16 polytope vertices per step.
+    # Compress each weight matrix to a rank-8 search subspace.
     total_steps = args.epochs * len(train_loader)
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(layout, rank=8, rotation_interval=0, absorb_interval=0)
@@ -128,11 +138,11 @@ def main():
     print(f"  eps: {eps_init}->{eps_target}  sr: {sr_init}->{sr_target}  pr: {pr_init}->{pr_target}")
     print()
 
-    init_acc = evaluate(model, test_loader)
-    print(f"  initial test accuracy: {100 * init_acc:.1f}%")
+    init_acc = evaluate(model, val_loader)
+    print(f"  initial validation accuracy: {100 * init_acc:.1f}%")
     print()
 
-    # Best-state tracking: report the peak accuracy, not the last epoch's.
+    # Select checkpoints on held-out training data; test once after selection.
     loss_fn = nn.CrossEntropyLoss()
     evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
     best_acc = 0.0
@@ -158,13 +168,13 @@ def main():
             n_steps += 1
 
         avg_loss = epoch_loss / max(n_steps, 1)
-        test_acc = evaluate(model, test_loader)
+        val_acc = evaluate(model, val_loader)
 
-        if test_acc > best_acc:
-            best_acc = test_acc
+        if val_acc > best_acc:
+            best_acc = val_acc
             best_state = copy.deepcopy(model.state_dict())
 
-        print(f"  epoch {epoch:2d} | loss={avg_loss:.4f} | test={100 * test_acc:.1f}% | best={100 * best_acc:.1f}%")
+        print(f"  epoch {epoch:2d} | loss={avg_loss:.4f} | val={100 * val_acc:.1f}% | best={100 * best_acc:.1f}%")
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -172,7 +182,7 @@ def main():
     final_acc = evaluate(model, test_loader)
     print()
     print("=" * 60)
-    print(f"  final test accuracy: {100 * final_acc:.1f}% (best across epochs)")
+    print(f"  final test accuracy: {100 * final_acc:.1f}% (validation-selected checkpoint)")
     print("=" * 60)
 
 

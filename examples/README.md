@@ -23,8 +23,12 @@ Examples set CPU thread counts; override with `POLYSTEP_THREADS`. Examples 02, 0
 05, 06, 10, and 11 use CUDA when available. Example 03 accepts `--device cuda`.
 Use `--device cpu` for 05, 06, 10, and 11; use `--small` for a smaller MAX-SAT task.
 
-Examples 10 and 11 support `--compare` to time registered candidate evaluation against
-materialized candidates. Runtime and accuracy depend on subspace dimension and
-amortization; see [performance](../docs/performance.md).
+Examples 10 and 11 support `--compare` to check loss agreement and time registered
+evaluation against materialized candidates, including first-call setup. See
+[performance](../docs/performance.md) for subspace and amortization settings.
+
+Examples 05, 06, 10, and 11 select checkpoints on validation data and report
+test accuracy afterward. The Loihi example runs a CPU simulation; its hardware
+evaluator is a deployment sketch.
 
 For published comparisons, see [experiments](../experiments/README.md).

@@ -64,11 +64,12 @@ def _download_mnist(data_dir: str) -> None:
         download_file(MNIST_URL + filename, filepath)
 
 
-def _load_mnist_images(filepath: str) -> np.ndarray:
+def _load_mnist_images(filepath: str, limit: int = 0) -> np.ndarray:
     """Load MNIST images from gzipped IDX file."""
     with gzip.open(filepath, "rb") as f:
         _magic, num, rows, cols = pystruct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8)
+        num = min(num, limit) if limit > 0 else num
+        images = np.frombuffer(f.read(num * rows * cols), dtype=np.uint8)
         images = images.reshape(num, 1, rows, cols)
     return images.astype(np.float32) / 255.0
 
@@ -92,9 +93,9 @@ def get_mnist_loaders(
     data_dir = data_dir or _default_data_dir("mnist")
     _download_mnist(data_dir)
 
-    train_images = _load_mnist_images(os.path.join(data_dir, MNIST_FILES["train_images"]))
+    train_images = _load_mnist_images(os.path.join(data_dir, MNIST_FILES["train_images"]), max_train)
     train_labels = _load_mnist_labels(os.path.join(data_dir, MNIST_FILES["train_labels"]))
-    test_images = _load_mnist_images(os.path.join(data_dir, MNIST_FILES["test_images"]))
+    test_images = _load_mnist_images(os.path.join(data_dir, MNIST_FILES["test_images"]), max_test)
     test_labels = _load_mnist_labels(os.path.join(data_dir, MNIST_FILES["test_labels"]))
 
     if normalize:

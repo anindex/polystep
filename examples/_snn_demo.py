@@ -20,7 +20,6 @@ __all__ = [
     "LIFNeuron",
     "TinySNN",
     "SNNDemoConfig",
-    "OUTPUT_SCALE",
     "DEFAULT_INPUT_DIM",
     "DEFAULT_HIDDEN",
     "DEFAULT_NUM_CLASSES",
@@ -42,8 +41,6 @@ DEFAULT_NUM_STEPS = 20
 DEFAULT_NUM_TRAIN = 256
 DEFAULT_NUM_TEST = 64
 DEFAULT_BATCH_SIZE = 32
-
-OUTPUT_SCALE = 10.0
 
 
 class LIFNeuron(nn.Module):
@@ -100,7 +97,7 @@ class TinySNN(nn.Module):
             spk1, mem1 = self.lif1(cur1, mem1)
             spk2, mem2 = self.lif2(self.fc2(spk1), mem2)
             total = total + spk2
-        # Mean spike rate in [0, 1]; OUTPUT_SCALE sharpens it at loss/argmax time.
+        # Mean spike rate in [0, 1].
         return total / self.num_steps
 
 
@@ -195,12 +192,12 @@ def make_optimizer(model: nn.Module, *, seed: int = 42, config: SNNDemoConfig | 
 
 @torch.no_grad()
 def evaluate_accuracy(model: nn.Module, loader: DataLoader) -> float:
-    """Classification accuracy using the ``OUTPUT_SCALE`` convention."""
+    """Classification accuracy from the mean spike rates."""
     device = next(model.parameters()).device
     correct = total = 0
     for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
-        logits = model(inputs) * OUTPUT_SCALE
+        logits = model(inputs)
         preds = logits.argmax(dim=-1)
         correct += (preds == targets).sum().item()
         total += targets.size(0)

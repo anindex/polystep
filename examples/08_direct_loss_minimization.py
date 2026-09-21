@@ -5,7 +5,8 @@ the usual differentiable surrogate leaves regret (Hazan, Keshet, McAllester,
 NeurIPS 2010; Song, Schwing, Zemel, Urtasun, ICML 2016). Here a small
 sign-activation net is optimized directly for F1 on a class-imbalanced XOR
 checkerboard, compared against Adam+STE on cross-entropy and OpenAI-ES on F1,
-all on the same evaluation budget averaged over seeds.
+averaged over seeds. PolyStepES and OpenAI-ES share an evaluation budget;
+Adam+STE uses a separate 1,500-step gradient baseline.
 
 Run:
     MPLBACKEND=Agg python examples/08_direct_loss_minimization.py

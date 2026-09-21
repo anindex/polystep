@@ -26,6 +26,7 @@ import _env  # noqa: E402
 
 _env.setup()
 import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
 
 
 from polystep import PolyStepOptimizer  # noqa: E402
@@ -264,12 +265,12 @@ def train_loop(
     shift_sigma: float,
     label: str,
     mixed_shift: bool = False,
-    test_loader=None,
+    val_loader,
     eval_shift_sigma: float = 0.0,
     patience: int = 2,
     noise_seed: int = 0,
 ) -> tuple[float, dict]:
-    """Per-batch PolyStep updates with best-test early stopping.
+    """Per-batch PolyStep updates with validation-based early stopping.
 
     ``mixed_shift=True`` concatenates each batch with a shifted copy of
     itself so adaptation does not forget the clean manifold. Restores
@@ -303,39 +304,31 @@ def train_loop(
         with torch.no_grad():
             logits = model(last_x)
             train_acc = (logits.argmax(-1) == last_y).float().mean().item()
-        if test_loader is not None:
-            test_acc = evaluate(
-                model,
-                test_loader,
-                device,
-                shift_sigma=eval_shift_sigma,
-                noise_seed=noise_seed,
-            )
-            improved = test_acc > best_acc
-            tag = "*" if improved else " "
-            if improved:
-                best_acc = test_acc
-                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                bad_epochs = 0
-            else:
-                bad_epochs += 1
-            elapsed = time.time() - t0
-            print(
-                f"  [{label}] epoch {epoch + 1}/{epochs} | "
-                f"step {step:3d} | batch_acc={100 * train_acc:5.1f}% | "
-                f"test{'(σ=' + str(eval_shift_sigma) + ')' if eval_shift_sigma > 0 else '(clean)'}"
-                f"={100 * test_acc:5.1f}%{tag} | {elapsed:5.1f}s"
-            )
-            if bad_epochs >= patience:
-                print(f"  [{label}] early stop at epoch {epoch + 1} (patience {patience}); best={100 * best_acc:.1f}%")
-                break
+        val_acc = evaluate(
+            model,
+            val_loader,
+            device,
+            shift_sigma=eval_shift_sigma,
+            noise_seed=noise_seed,
+        )
+        improved = val_acc > best_acc
+        tag = "*" if improved else " "
+        if improved:
+            best_acc = val_acc
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            bad_epochs = 0
         else:
-            elapsed = time.time() - t0
-            print(
-                f"  [{label}] epoch {epoch + 1}/{epochs} | "
-                f"step {step:3d} | batch_acc={100 * train_acc:5.1f}% | "
-                f"{elapsed:5.1f}s"
-            )
+            bad_epochs += 1
+        elapsed = time.time() - t0
+        print(
+            f"  [{label}] epoch {epoch + 1}/{epochs} | "
+            f"step {step:3d} | batch_acc={100 * train_acc:5.1f}% | "
+            f"val{'(σ=' + str(eval_shift_sigma) + ')' if eval_shift_sigma > 0 else '(clean)'}"
+            f"={100 * val_acc:5.1f}%{tag} | {elapsed:5.1f}s"
+        )
+        if bad_epochs >= patience:
+            print(f"  [{label}] early stop at epoch {epoch + 1} (patience {patience}); best={100 * best_acc:.1f}%")
+            break
     model.load_state_dict(best_state)
     return best_acc, best_state
 
@@ -625,10 +618,10 @@ def main():
         "--patience",
         type=int,
         default=4,
-        help="Early-stop patience on test accuracy "
+        help="Early-stop patience on validation accuracy "
         "(epochs without improvement before halt). "
         "Higher than typical SGD because zeroth-"
-        "order test curves are noisier per epoch.",
+        "order validation curves are noisier per epoch.",
     )
     parser.add_argument("--data-dir", type=str, default="data/mnist")
     parser.add_argument(
@@ -656,6 +649,10 @@ def main():
         max_train=args.max_train,
         max_test=args.max_test,
     )
+
+    train, val = random_split(train_loader.dataset, [0.9, 0.1], generator=torch.Generator().manual_seed(args.seed))
+    train_loader = DataLoader(train, batch_size=args.batch_size, shuffle=True, generator=train_loader.generator)
+    val_loader = DataLoader(val, batch_size=256, generator=torch.Generator().manual_seed(args.seed))
 
     model = MnistSpikingNet(
         hidden=args.hidden,
@@ -687,7 +684,7 @@ def main():
     print("-" * 70)
     pre_opt = make_pretrain_optimizer(model, seed=args.seed, device=device)
     pre_eval = CpuSimEvaluator(model, loss_fn=loss_fn)
-    pre_clean, _ = train_loop(
+    train_loop(
         model,
         pre_opt,
         pre_eval,
@@ -697,11 +694,12 @@ def main():
         device=device,
         shift_sigma=0.0,
         label="pre",
-        test_loader=test_loader,
+        val_loader=val_loader,
         eval_shift_sigma=0.0,
         patience=args.patience,
         noise_seed=args.seed,
     )
+    pre_clean = evaluate(model, test_loader, device)
     # Best Stage 1 weights are loaded; measure their shifted accuracy
     # (paired with the frozen-readout baseline below).
     pre_shift = evaluate(
@@ -738,7 +736,7 @@ def main():
         rank=args.adapt_rank,
         num_probe=args.adapt_num_probe,
     )
-    post_shift, _ = train_loop(
+    train_loop(
         model,
         ad_opt,
         adapt_eval,
@@ -749,11 +747,12 @@ def main():
         shift_sigma=args.shift_sigma,
         label="adapt",
         mixed_shift=args.mixed_shift,
-        test_loader=test_loader,
+        val_loader=val_loader,
         eval_shift_sigma=args.shift_sigma,
         patience=args.patience,
         noise_seed=args.seed,
     )
+    post_shift = evaluate(model, test_loader, device, shift_sigma=args.shift_sigma, noise_seed=args.seed)
     # Best Stage 2 weights are loaded; measure clean accuracy.
     post_clean = evaluate(
         model,

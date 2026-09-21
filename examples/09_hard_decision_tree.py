@@ -113,7 +113,7 @@ def run_to_budget(opt, fit_fn, popsize, budget=TOTAL_EVALS):
     """Run ask/tell until the forward-pass budget is spent; return (evals, best-acc)."""
     evals, curve = [], []
     used = 0
-    while used < budget:
+    while used + popsize <= budget:
         opt.tell(fit_fn(opt.ask()))
         used += popsize
         evals.append(used)

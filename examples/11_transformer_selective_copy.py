@@ -1,8 +1,7 @@
 """11 - Transformer on selective copy: attention trained with forward passes only.
 
 Each sequence is six tokens; the first is a pointer ``p``, and the label is the
-token at position ``p``. Only content-based lookup (an attention head) can solve
-it, so solving it shows the head is being trained rather than bypassed.
+token at position ``p``. The attention head learns to retrieve that token.
 
 The site-aware path applies unchanged: a candidate perturbs one contiguous run
 of the flat parameter vector, so exactly one parameter tensor differs from the
@@ -90,15 +89,15 @@ def build_optimizer(model: nn.Module, seed: int) -> PolyStepOptimizer:
         # doubles the steps per epoch to cover that.
         amortize_steps=5,
         amortize_ema=0.7,
-        # Inductor fusion over the vmapped forward.
-        compile_evaluator=True,
+        # CPU compilation costs more than this small model's forward passes.
+        compile_evaluator=next(model.parameters()).is_cuda,
     )
 
 
 def run_epoch(optimizer, evaluator, x, y, batch_size):
     order = torch.randperm(x.shape[0])
     total, batches = 0.0, 0
-    for start in range(0, x.shape[0] - batch_size + 1, batch_size):
+    for start in range(0, x.shape[0], batch_size):
         idx = order[start : start + batch_size]
         xb, yb = x[idx], y[idx]
         # Register so candidates are scored directly, not through the closure.
@@ -122,18 +121,23 @@ def compare_paths(x, y, device, batch_size, steps=6):
         model = SelectiveCopyTransformer().to(device)
         evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
         optimizer = build_optimizer(model, seed=3)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         started = time.perf_counter()
         losses = []
         for i in range(steps):
-            xb = x[i * batch_size : (i + 1) * batch_size]
-            yb = y[i * batch_size : (i + 1) * batch_size]
+            start = (i * batch_size) % len(x)
+            xb, yb = x[start : start + batch_size], y[start : start + batch_size]
             if register:
                 optimizer.register_evaluator(evaluator, xb, yb)
             losses.append(optimizer.step(lambda p, _x=xb, _y=yb: evaluator.evaluate(p, _x, _y)))
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         results["site" if register else "materializing"] = (losses, time.perf_counter() - started)
 
     dense_losses, dense_time = results["materializing"]
     site_losses, site_time = results["site"]
+    torch.testing.assert_close(torch.tensor(site_losses), torch.tensor(dense_losses), rtol=1e-4, atol=1e-5)
     drift = max(abs(a - b) for a, b in zip(dense_losses, site_losses))
     print(f"  materializing : {dense_time:6.2f} s for {steps} steps")
     print(f"  site-aware    : {site_time:6.2f} s for {steps} steps   ({dense_time / site_time:.1f}x)")
@@ -150,13 +154,17 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--compare", action="store_true", help="time both paths and exit")
     args = parser.parse_args()
+    if min(args.epochs, args.batch_size, args.train_size, args.test_size) < 1:
+        parser.error("epochs, batch size and split sizes must be positive")
 
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     train_x, train_y = make_batch(args.train_size, seed=0)
     test_x, test_y = make_batch(args.test_size, seed=1)
+    val_x, val_y = make_batch(args.test_size, seed=2)
     train_x, train_y = train_x.to(device), train_y.to(device)
     test_x, test_y = test_x.to(device), test_y.to(device)
+    val_x, val_y = val_x.to(device), val_y.to(device)
 
     if args.compare:
         print("\nSame batches, same seed, both paths:\n")
@@ -175,15 +183,15 @@ def main():
     started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
         loss = run_epoch(optimizer, evaluator, train_x, train_y, args.batch_size)
-        test_acc = accuracy(model, test_x, test_y)
-        if test_acc > best:
-            best, best_state = test_acc, {k: v.detach().clone() for k, v in model.state_dict().items()}
+        val_acc = accuracy(model, val_x, val_y)
+        if val_acc > best:
+            best, best_state = val_acc, {k: v.detach().clone() for k, v in model.state_dict().items()}
         if epoch % 5 == 0 or epoch == 1:
-            print(f"  epoch {epoch:3d}  loss {loss:.4f}  test {test_acc:5.1f}%")
+            print(f"  epoch {epoch:3d}  loss {loss:.4f}  val {val_acc:5.1f}%")
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    print(f"\n  best test accuracy: {best:.1f}%  ({time.perf_counter() - started:.1f} s)")
+    print(f"\n  test accuracy: {accuracy(model, test_x, test_y):.1f}%  ({time.perf_counter() - started:.1f} s)")
 
 
 if __name__ == "__main__":

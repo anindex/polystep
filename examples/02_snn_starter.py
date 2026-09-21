@@ -26,7 +26,6 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _snn_demo import (  # noqa: E402  (sys.path mutation above)
-    OUTPUT_SCALE,
     TinySNN,
     evaluate_accuracy,
     make_loaders,
@@ -86,7 +85,7 @@ def main():
             optimizer.step(closure)
 
             with torch.no_grad():
-                logits = model(inputs) * OUTPUT_SCALE
+                logits = model(inputs)
                 step_loss = loss_fn(logits, targets).item()
                 step_acc = (logits.argmax(dim=-1) == targets).float().mean().item()
 

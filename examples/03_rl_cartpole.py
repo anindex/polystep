@@ -59,7 +59,7 @@ def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
         for _ in range(horizon):
             frame = env.render()
             frames.append(frame)
-            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=next(policy.parameters()).device).unsqueeze(0)
             with torch.no_grad():
                 logits = policy(obs_t)
                 action = int(logits.argmax(dim=-1).item())

@@ -26,6 +26,25 @@ from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
 
+def test_capped_mnist_matches_full_data(tmp_path):
+    import gzip
+    import struct
+
+    from polystep.benchmarks.utils import MNIST_FILES, get_mnist_loaders
+
+    for kind, filename in MNIST_FILES.items():
+        with gzip.open(tmp_path / filename, "wb") as f:
+            if "images" in kind:
+                f.write(struct.pack(">IIII", 2051, 3, 2, 2) + bytes(range(12)))
+            else:
+                f.write(struct.pack(">II", 2049, 3) + bytes(range(3)))
+    full = get_mnist_loaders(str(tmp_path))
+    capped = get_mnist_loaders(str(tmp_path), max_train=2, max_test=10)
+    for loader, reference, count in zip(capped, full, (2, 3)):
+        for actual, expected in zip(loader.dataset.tensors, reference.dataset.tensors):
+            assert torch.equal(actual, expected[:count])
+
+
 class SmallMNISTNet(nn.Sequential):
     """7x7 input, 16 hidden: 49*16+16 + 16*10+10 = 970 params.
 

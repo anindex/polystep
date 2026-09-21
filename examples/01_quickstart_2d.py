@@ -124,7 +124,7 @@ def main():
     ax_right.plot(range(1, len(cost_history) + 1), cost_history, color="#0072B2", lw=1.4)
     ax_right.set_xlabel("PolyStep iteration")
     ax_right.set_ylabel("Entropic OT cost")
-    ax_right.set_title("Solver cost decreases monotonically", fontsize=9)
+    ax_right.set_title("OT cost across iterations", fontsize=9)
     ax_right.grid(True, alpha=0.3)
 
     out = Path(__file__).parent / "figures" / "quickstart_2d.png"

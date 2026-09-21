@@ -11,8 +11,8 @@ runs the layers ahead of it once per step instead of once per candidate.
 Chunks break at parameter boundaries so a chunk can name a single site.
 
 Only the probe radius is scheduled, cosine from 10 to 2, sized from
-``--epochs``; epsilon and step radius stay flat. A zeroth-order test curve
-moves several points between epochs, so the best checkpoint is kept.
+``--epochs``; epsilon and step radius stay flat. Checkpoints are selected
+on a held-out tenth of the training data, then evaluated on the test set.
 
 Run:
   python examples/10_cnn_mnist.py --epochs 10
@@ -33,6 +33,7 @@ import _env  # noqa: E402
 
 _env.setup()
 import torch.nn as nn  # noqa: E402
+from torch.utils.data import random_split
 
 from polystep import PolyStepOptimizer  # noqa: E402
 from polystep.cost_nn import NNCostEvaluator  # noqa: E402
@@ -98,7 +99,7 @@ def build_optimizer(model: nn.Module, total_steps: int, seed: int) -> PolyStepOp
 def run_epoch(optimizer, evaluator, x, y, batch_size, register=True):
     order = torch.randperm(x.shape[0])
     total, batches = 0.0, 0
-    for start in range(0, x.shape[0] - batch_size + 1, batch_size):
+    for start in range(0, x.shape[0], batch_size):
         idx = order[start : start + batch_size]
         xb, yb = x[idx], y[idx]
         if register:
@@ -128,18 +129,23 @@ def compare_paths(x, y, device, batch_size, steps=4):
         model = LeNet5().to(device)
         evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
         optimizer = build_optimizer(model, total_steps=steps, seed=3)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         started = time.perf_counter()
         losses = []
         for i in range(steps):
-            xb = x[i * batch_size : (i + 1) * batch_size]
-            yb = y[i * batch_size : (i + 1) * batch_size]
+            start = (i * batch_size) % len(x)
+            xb, yb = x[start : start + batch_size], y[start : start + batch_size]
             if register:
                 optimizer.register_evaluator(evaluator, xb, yb)
             losses.append(optimizer.step(lambda p, _x=xb, _y=yb: evaluator.evaluate(p, _x, _y)))
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         results["site" if register else "materializing"] = (losses, time.perf_counter() - started)
 
     dense_losses, dense_time = results["materializing"]
     site_losses, site_time = results["site"]
+    torch.testing.assert_close(torch.tensor(site_losses), torch.tensor(dense_losses), rtol=1e-4, atol=1e-5)
     drift = max(abs(a - b) for a, b in zip(dense_losses, site_losses))
     print(f"  materializing : {dense_time:6.2f} s for {steps} steps")
     print(f"  site-aware    : {site_time:6.2f} s for {steps} steps   ({dense_time / site_time:.1f}x)")
@@ -156,6 +162,10 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--compare", action="store_true", help="time both paths and exit")
     args = parser.parse_args()
+    if args.epochs < 1 or args.batch_size < 1 or args.train_size < 0 or args.test_size < 0 or 0 < args.train_size < 10:
+        parser.error(
+            "epochs and batch size must be positive; train size must be 0 or at least 10; test size must be >= 0"
+        )
 
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
@@ -168,8 +178,11 @@ def main():
         compare_paths(train_x, train_y, device, args.batch_size)
         return
 
+    train, val = random_split(range(len(train_x)), [0.9, 0.1], generator=torch.Generator().manual_seed(args.seed))
+    val_x, val_y = train_x[val.indices], train_y[val.indices]
+    train_x, train_y = train_x[train.indices], train_y[train.indices]
     model = LeNet5().to(device)
-    steps_per_epoch = args.train_size // args.batch_size
+    steps_per_epoch = (len(train_x) + args.batch_size - 1) // args.batch_size
     optimizer = build_optimizer(model, total_steps=args.epochs * steps_per_epoch, seed=args.seed)
     evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
     print(
@@ -181,18 +194,18 @@ def main():
     started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
         loss = run_epoch(optimizer, evaluator, train_x, train_y, args.batch_size)
-        test_acc = accuracy(model, test_x, test_y)
-        if test_acc > best:
-            best, best_state = test_acc, {k: v.detach().clone() for k, v in model.state_dict().items()}
+        val_acc = accuracy(model, val_x, val_y)
+        if val_acc > best:
+            best, best_state = val_acc, {k: v.detach().clone() for k, v in model.state_dict().items()}
         print(
-            f"  epoch {epoch:2d}  loss {loss:.4f}  test {test_acc:5.2f}%  "
+            f"  epoch {epoch:2d}  loss {loss:.4f}  val {val_acc:5.2f}%  "
             f"best {best:5.2f}%  ({time.perf_counter() - started:.0f} s)",
             flush=True,
         )
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    print(f"\n  best test accuracy: {best:.2f}%  ({time.perf_counter() - started:.1f} s)")
+    print(f"\n  test accuracy: {accuracy(model, test_x, test_y):.2f}%  ({time.perf_counter() - started:.1f} s)")
 
 
 if __name__ == "__main__":

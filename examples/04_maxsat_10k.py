@@ -59,11 +59,7 @@ class MaxSATModel(nn.Module):
         self.assignments = nn.Parameter(torch.randn(num_vars) * 0.1)
 
     def forward(self, clause_vars: torch.Tensor, clause_signs: torch.Tensor) -> torch.Tensor:
-        hard = torch.round(torch.sigmoid(self.assignments))  # non-differentiable
-        gathered = hard[clause_vars]
-        literals = gathered * clause_signs + (1.0 - clause_signs) * (1.0 - gathered)
-        satisfied = (literals > 0.5).any(dim=-1).float()
-        return 1.0 - satisfied.mean()
+        return 1.0 - satisfied_clauses(self.assignments, clause_vars, clause_signs).float().mean()
 
 
 # Hyperparameter reference: sqrt-scaled from the 100K row of run_maxsat.py.
@@ -90,7 +86,7 @@ def satisfied_clauses(assignments: torch.Tensor, clause_vars: torch.Tensor, clau
     Kept as a boolean equality because the gathered ``(..., C, k)`` tensor is the
     largest allocation in the step and bool is a quarter the memory traffic.
     """
-    hard = torch.sigmoid(assignments) > 0.5
+    hard = assignments > 0
     return (hard[..., clause_vars] == clause_signs).any(dim=-1)
 
 
@@ -111,6 +107,8 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.steps < 1:
+        parser.error("--steps must be positive")
 
     num_vars = 2_000 if args.small else 10_000
     seed = args.seed
@@ -121,9 +119,6 @@ def main():
     print("=" * 60)
     print(f"MAX-SAT (3-SAT): {num_vars} vars at phase-transition density")
     print("=" * 60)
-
-    if importlib.util.find_spec("pysat") is None:
-        raise SystemExit("this example generates its instance through pysat: pip install python-sat")
 
     instance = generate_maxsat_instance(num_vars=num_vars, ratio=4.27, seed=seed)
     print(f"  variables: {instance['num_vars']:,}")
