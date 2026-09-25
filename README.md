@@ -17,7 +17,8 @@ backpropagation is usually faster.
 
 [Paper](https://arxiv.org/abs/2605.01928) ·
 [Interactive visualization](https://vietngth.github.io/polystep-visualization/) ·
-[API reference](docs/api_overview.md)
+[API reference](docs/api_overview.md) ·
+[Julia package](https://github.com/anindex/PolyStep.jl)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/method_diagram.png" width="840"
