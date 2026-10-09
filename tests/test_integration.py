@@ -1,6 +1,6 @@
 """Feature interaction tests: cross-module feature combinations not covered by
 test_optimizer.py (subspace+momentum, blockwise+adaptive radius, combined mode,
-train() API combos, and the particle_dim/omega/rank_schedule/adaptive_probes knobs).
+train() API combos, and the particle_dim/omega/rank_schedule knobs).
 """
 
 import math
@@ -169,9 +169,8 @@ def _make_integration_closure(model, input_dim=8, output_dim=4):
     return closure
 
 
-class TestParticleDimAdaptiveProbes:
-    """Integration tests for the particle_dim, omega, RankSchedule, and
-    adaptive_probes knobs."""
+class TestParticleDimOmegaRankSchedule:
+    """Integration tests for the particle_dim, omega, and RankSchedule knobs."""
 
     @pytest.mark.parametrize(
         "extra_kwargs, omega",
@@ -239,41 +238,12 @@ class TestParticleDimAdaptiveProbes:
         assert opt.subspace.subspace_dim > subspace.subspace_dim, "rank 4 must widen the subspace"
         assert opt.state.X.reshape(-1).numel() >= opt.subspace.subspace_dim
 
-    def test_adaptive_probes_integration(self):
-        """adaptive_probes=True runs 5 steps without error."""
-        torch.manual_seed(42)
-        model = _make_small_model()
-        initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-
-        opt = PolyStepOptimizer(
-            model,
-            adaptive_probes=True,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-
-        closure = _make_integration_closure(model)
-        for _ in range(5):
-            loss = opt.step(closure)
-            assert torch.isfinite(torch.tensor(loss))
-
-        assert opt._prev_X is not None
-        assert opt._prev_cost_matrix is not None
-        assert opt.state.iteration_count == 5
-
-        updated_params = model.state_dict()
-        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
-        assert any_changed, "Optimization should proceed with adaptive_probes=True"
-
 
 class TestSinkhornAccelerationComposition:
     """The acceleration knobs must compose, in full space and in a subspace."""
 
-    def test_full_space_particle_dim_with_omega_and_probe_reuse(self):
-        """particle_dim=4 + adaptive_omega + Anderson + probe reuse still descends."""
+    def test_full_space_particle_dim_with_omega(self):
+        """particle_dim=4 + adaptive_omega + Anderson still descends."""
         torch.manual_seed(42)
         model = _make_small_model()
         closure = _make_integration_closure(model)
@@ -283,17 +253,16 @@ class TestSinkhornAccelerationComposition:
             solver="sinkhorn",
             adaptive_omega=True,
             anderson_depth=3,
-            adaptive_probes=True,
             epsilon=0.1,
             sinkhorn_max_iters=100,
             seed=42,
         )
-        losses = [opt.step(closure) for _ in range(8)]  # stationary objective, so probe reuse engages
+        losses = [opt.step(closure) for _ in range(8)]
         assert all(math.isfinite(v) for v in losses), losses
         assert min(losses) < losses[0], f"no descent under the composed knobs: {losses}"
 
-    def test_subspace_rank_schedule_with_omega_and_probe_reuse(self):
-        """rank_schedule + adaptive_omega + Anderson + probe reuse survives a rank change."""
+    def test_subspace_rank_schedule_with_omega(self):
+        """rank_schedule + adaptive_omega + Anderson survives a rank change."""
         torch.manual_seed(42)
         model = _make_small_model()
         layout = ParamLayout.from_module(model)
@@ -306,13 +275,12 @@ class TestSinkhornAccelerationComposition:
             solver="sinkhorn",
             adaptive_omega=True,
             anderson_depth=3,
-            adaptive_probes=True,
             epsilon=0.1,
             sinkhorn_max_iters=100,
             max_iterations=8,
             seed=42,
         )
-        losses = [opt.step(closure) for _ in range(8)]  # stationary objective, so probe reuse engages
+        losses = [opt.step(closure) for _ in range(8)]
         assert all(math.isfinite(v) for v in losses), losses
         assert min(losses) < losses[0], f"no descent across the rank transition: {losses}"
 
@@ -344,10 +312,6 @@ def test_default_step_is_deterministic():
     assert opt._particle_dim == 2, "Default particle_dim should be 2"
     assert opt.solver.omega == 1.0, "Default omega should be 1.0"
     assert opt._rank_schedule is None, "Default rank_schedule should be None"
-    # Cost-row reuse is monolithic-only, so it is on by default here.
-    assert opt._adaptive_probes
-    assert opt._prev_X is not None
-    assert opt._prev_cost_matrix is not None
 
     assert opt.state.iteration_count == 3
     updated_params = model.state_dict()

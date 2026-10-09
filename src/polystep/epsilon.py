@@ -97,11 +97,12 @@ class ProgressiveEpsilon:
 def feed_solver_stats(scheduler, solver, n_iters: int, converged: bool) -> None:
     """Feed a solve's stats to ``scheduler``; no-op for schedulers that ignore them.
 
-    Skipped at ``threshold <= 0``: fixed-iteration Sinkhorn always reports converged with
-    ``n_iters == max_iterations``, a ratio of 1.0, which would raise epsilon to
-    ``max_epsilon`` every step.
+    Skipped at ``threshold <= 0`` and for solvers without a convergence threshold:
+    fixed-iteration Sinkhorn always reports converged with ``n_iters == max_iterations``,
+    and a one-shot solver reports one iteration of one, both a ratio of 1.0, which would
+    raise epsilon to ``max_epsilon`` every step.
     """
-    if not isinstance(scheduler, ProgressiveEpsilon) or getattr(solver, "threshold", 1.0) <= 0:
+    if not isinstance(scheduler, ProgressiveEpsilon) or getattr(solver, "threshold", 0.0) <= 0:
         return
     scheduler.update(
         n_iters=n_iters,

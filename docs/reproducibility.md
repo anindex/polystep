@@ -22,8 +22,8 @@ MNIST under `data/mnist`; see its [protocol](../experiments/CONTROLLED_EXPERIMEN
 
 The architecture tables compare optimizer steps. Current ES baselines average tied
 ranks; the historical architecture runs used sorting-order ranks.
-`--theory-mode` selects the reference configuration with jitter and without probe
-reuse or amortization. Projection assumptions still need to be checked for each task.
+`--theory-mode` selects the reference configuration with jitter and without
+amortization. Projection assumptions still need to be checked for each task.
 
 ## Architecture experiments
 

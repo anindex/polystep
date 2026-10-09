@@ -47,12 +47,12 @@ def test_greedy_solver_moves_all_the_way_to_a_vertex():
 
 
 def test_evals_records_what_the_step_actually_cost():
-    """P*V*K per step, and 0 on a reused-probe step."""
+    """P*V*K per step."""
     torch.manual_seed(0)
     model = _model()
     x, y = torch.randn(32, 12), torch.randint(0, 4, (32,))
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
-    opt = PolyStepOptimizer(model=model, particle_dim=4, epsilon=1.0, seed=0, num_probe=1, adaptive_probes=False)
+    opt = PolyStepOptimizer(model=model, particle_dim=4, epsilon=1.0, seed=0, num_probe=1)
     for _ in range(3):
         opt.step(lambda bp: ev.evaluate(bp, x, y))
 

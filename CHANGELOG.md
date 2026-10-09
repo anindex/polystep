@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.0.0 (unreleased)
+
+- Remove `CMAAdaptiveSubspace`, `compute_cma_hyperparameters`,
+  `use_covariance_adaptation`, and the CMA fields of `SolverState`; use
+  `AdaptiveSubspace`.
+- `PolyStepOptimizer` raises `TypeError` for a subspace that is not an
+  `AdaptiveSubspace`, `HybridSubspace`, or `FactoredSubspace`.
+- Remove `adaptive_probes` and `adaptive_probes_threshold`. Runs that passed a
+  constant `objective_token` now evaluate every step instead of replaying cached
+  probe costs.
+- `objective_token` now only decides whether the pending trust-region comparison
+  still applies.
+- Remove `TemperedSoftmaxSolver`, `solver='tempered_softmax'`, and
+  `tempered_softmax_tau`; use `solver='softmax'` with `ent_epsilon` for a fixed
+  temperature.
+- Remove `data_dependent_init` from `SinkhornSolver` and `PolyStepOptimizer`; cold
+  Sinkhorn solves start from zero duals.
+- Remove `auto_epsilon` and `auto_epsilon_config`; pass a `ProgressiveEpsilon` as
+  `epsilon`. The old defaults were `init=e`, `target=max(0.01, 0.1 * e)`,
+  `max_epsilon=5 * e` for a float `e`; the schedule's `init` and `target` with
+  `max_epsilon=5 * init` for a `LinearEpsilon`; and `init=1.0`, `target=0.01`,
+  `max_epsilon=5.0` for a `CosineEpsilon`.
+- `ProgressiveEpsilon` with `ent_epsilon` raises `ValueError` in
+  `PolyStepOptimizer` and `PolyStep`.
+- `ProgressiveEpsilon` ignores solvers without a convergence threshold, so a
+  one-particle `PolyStep` no longer pushes epsilon to `max_epsilon`.
+- Remove the `subspace`, `nn_evaluator`, `train_inputs`, and `train_targets` fields
+  of `PolyStep` and the `base_params` argument of `PolyStep.init_state`; train
+  networks with `PolyStepOptimizer`.
+- Remove `TrainConfig.batch_size` and `TrainConfig.log_every`, which `train()` never
+  read; the `DataLoader` sets the batch size and `LoggingCallback(log_every=...)` the
+  logging interval.
+- Remove `create_hybrid_blocks` and the `LayerProjectionSpec` alias; use
+  `polystep.subspace.ProjectionSpec`.
+- Remove the unused `compile` field of `SoftmaxSolver`, `MinCostGreedySolver`,
+  `TopKMeanSolver`, and `KLSoftmaxSolver`.
+- `polystep` no longer exports `CompiledFunctions`, `try_compile`, `apply_momentum`,
+  `update_radius_multiplier`, `update_stagnation`, `compute_momentum_coefficient`,
+  `BlockConfig`, `create_per_layer_blocks`, `create_grouped_blocks`,
+  `auto_detect_chunk_size`, `ProjectionSpec`, `create_generator`, `ParamEntry`,
+  `compute_cost_matrix`, or `scale_cost_matrix`; import them from `polystep._compiled`,
+  `polystep.dynamics`, `polystep.blockwise`, `polystep.cost_nn`, `polystep.subspace`,
+  `polystep.transform`, or `polystep.costs`.
+- Soft-label cross-entropy on Linear-only models scores on the batched path, so its
+  costs can differ from the vmap path in the last bit.
+- `FactoredSubspace.apply_perturbation` returns only the subspace's entries, so a
+  frozen parameter edited outside the optimizer keeps the edit.
+
 ## 0.13.0 - 2026-09-22
 
 - Fix KL row mass, nonfinite inputs, evaluator hooks, and chunk handling.

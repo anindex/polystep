@@ -10,6 +10,7 @@ from polystep import (
     PolyStepOptimizer,
     HybridSubspace,
     ParamLayout,
+    ProgressiveEpsilon,
 )
 from polystep.cost_nn import NNCostEvaluator
 from polystep.solvers import SoftmaxSolver, SinkhornSolver
@@ -72,21 +73,24 @@ class TestSolverSelection:
 class TestProgressiveEpsilonBlocking:
     """Verify ProgressiveEpsilon is blocked with softmax solver."""
 
-    def test_auto_epsilon_with_softmax_raises(self, model):
-        """auto_epsilon=True with solver='softmax' raises ValueError."""
+    def test_progressive_epsilon_with_softmax_raises(self, model):
+        """ProgressiveEpsilon with solver='softmax' raises ValueError."""
+        eps = ProgressiveEpsilon(init=0.1, target=0.01, max_epsilon=0.5)
         with pytest.raises(ValueError, match="ProgressiveEpsilon"):
-            PolyStepOptimizer(model, solver="softmax", auto_epsilon=True)
+            PolyStepOptimizer(model, solver="softmax", epsilon=eps)
 
-    def test_auto_epsilon_with_sinkhorn_ok(self, model):
-        """auto_epsilon=True with solver='sinkhorn' does NOT raise."""
-        opt = PolyStepOptimizer(model, solver="sinkhorn", auto_epsilon=True)
-        assert opt._progressive_epsilon is not None
+    def test_progressive_epsilon_with_sinkhorn_ok(self, model):
+        """ProgressiveEpsilon with solver='sinkhorn' does NOT raise."""
+        eps = ProgressiveEpsilon(init=0.1, target=0.01, max_epsilon=0.5)
+        opt = PolyStepOptimizer(model, solver="sinkhorn", epsilon=eps)
+        assert opt._progressive_epsilon is eps
 
-    def test_auto_epsilon_auto_subspace_raises(self, model, layout):
-        """auto_epsilon=True with subspace (auto-selects softmax) raises."""
+    def test_progressive_epsilon_auto_subspace_raises(self, model, layout):
+        """ProgressiveEpsilon with subspace (auto-selects softmax) raises."""
         sub = HybridSubspace.from_layout(layout, rank=4)
+        eps = ProgressiveEpsilon(init=0.1, target=0.01, max_epsilon=0.5)
         with pytest.raises(ValueError, match="ProgressiveEpsilon"):
-            PolyStepOptimizer(model, subspace=sub, auto_epsilon=True)
+            PolyStepOptimizer(model, subspace=sub, epsilon=eps)
 
 
 class TestSoftmaxFunctionalStep:
@@ -133,12 +137,11 @@ class TestSoftmaxFunctionalStep:
     [
         {"amortize_steps": 2, "amortize_ema": 0.7},
         {"biased_rotation": True},
-        {"adaptive_probes": True},
         {"use_momentum": True},
     ],
 )
 def test_amortize_steps_with_softmax(model, closure, feature_kwargs):
-    """amortize_steps + adaptive_probes + biased_rotation, all on softmax."""
+    """amortize_steps, biased_rotation and momentum, each on softmax."""
     opt = PolyStepOptimizer(
         model,
         solver="softmax",

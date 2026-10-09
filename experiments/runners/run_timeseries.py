@@ -296,10 +296,9 @@ POLYSTEP_CONFIG = {
     "absorb_interval": 0,
     "chunk_size": 1024,
     # Probe-radius jitter makes anything measured at the previous step's radius
-    # stale, so amortized OT and adaptive probes stay off while jitter is on.
+    # stale, so amortized OT stays off while jitter is on.
     "amortize_steps": 3,
     "amortize_ema": 0.7,
-    "adaptive_probes": False,
     "use_momentum": True,
     "momentum_init": 0.5,
     "momentum_final": 0.95,
@@ -389,7 +388,6 @@ def run_polystep(
         probe_radius_jitter_dist=cfg.get("probe_radius_jitter_dist", "smooth"),
         step_radius_jitter=cfg.get("step_radius_jitter", 0.0),
         polytope_type=cfg.get("polytope_type", "simplex"),
-        adaptive_probes=cfg.get("adaptive_probes", None),
         amortize_steps=cfg.get("amortize_steps", 1),
         amortize_ema=cfg.get("amortize_ema", 0.0),
         use_momentum=cfg.get("use_momentum", False),

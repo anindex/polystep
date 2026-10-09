@@ -26,7 +26,6 @@ class KLSoftmaxSolver:
     lam: float = float("inf")
     max_iterations: int = 2000
     threshold: float = 1e-6
-    compile: bool = False
 
     # KL(P^T 1 || b) from the last solve; None until the first solve.
     last_marginal_violation: Optional[float] = field(default=None, init=False, repr=False)

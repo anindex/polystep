@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from polystep import PolyStepOptimizer, TrainConfig, train
+from polystep import PolyStepOptimizer, ProgressiveEpsilon, TrainConfig, train
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.optimizer import RankSchedule
 from polystep.transform import ParamLayout
@@ -96,7 +96,6 @@ class TestStateDictRoundTrip:
         "kwargs",
         [
             pytest.param({"amortize_steps": 3, "use_momentum": True}, id="amortize"),
-            pytest.param({"adaptive_probes": True}, id="adaptive_probes"),
             pytest.param(
                 # orthoplex, or the constructor disables both and this tests nothing.
                 {
@@ -109,14 +108,14 @@ class TestStateDictRoundTrip:
             ),
             pytest.param({"hybrid": True}, id="hybrid_subspace"),
             pytest.param({"probe_radius_jitter": 0.2}, id="probe_jitter"),
-            pytest.param({"cma": True, "use_covariance_adaptation": True}, id="cma_covariance"),
+            pytest.param({"adaptive": True}, id="adaptive_subspace"),
         ],
     )
     def test_resume_is_exact_for_stateful_features(self, kwargs):
         """Features whose state lives outside SolverState still resume bit-exactly."""
         kwargs = dict(kwargs)
         hybrid = kwargs.pop("hybrid", False)
-        cma = kwargs.pop("cma", False)
+        adaptive = kwargs.pop("adaptive", False)
 
         def build():
             model, closure = _model_and_closure(seed=2)
@@ -126,10 +125,10 @@ class TestStateDictRoundTrip:
                 from polystep.transform import ParamLayout
 
                 subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4, seed=3)
-            if cma:
-                from polystep.cma_subspace import CMAAdaptiveSubspace
+            if adaptive:
+                from polystep.adaptive_subspace import AdaptiveSubspace
 
-                subspace = CMAAdaptiveSubspace.auto_from_params(model)
+                subspace = AdaptiveSubspace.auto_from_params(model)
             opt = PolyStepOptimizer(
                 model,
                 subspace=subspace,
@@ -197,8 +196,7 @@ class TestStateDictRoundTrip:
         model, closure = _model_and_closure()
         opt = PolyStepOptimizer(
             model,
-            epsilon=0.5,
-            auto_epsilon=True,
+            epsilon=ProgressiveEpsilon(init=0.5, target=0.05, max_epsilon=2.5),
             solver="sinkhorn",
             max_iterations=20,
         )
@@ -259,7 +257,7 @@ class TestRestoreBest:
             loader,
             nn.MSELoss(),
             opt,
-            TrainConfig(epochs=6, batch_size=32, callbacks=[Recorder()], restore_best=True),
+            TrainConfig(epochs=6, callbacks=[Recorder()], restore_best=True),
         )
 
         inputs, targets = next(iter(self._loaders(batch_size=32)))
@@ -282,7 +280,7 @@ class TestRestoreBest:
                 loader,
                 nn.MSELoss(),
                 opt,
-                TrainConfig(epochs=3, batch_size=16, restore_best=flag),
+                TrainConfig(epochs=3, restore_best=flag),
             )
             inputs, targets = next(iter(self._loaders(batch_size=32)))
             with torch.no_grad():
@@ -316,7 +314,7 @@ class TestRestoreBest:
             loader,
             nn.MSELoss(),
             opt,
-            TrainConfig(epochs=2, batch_size=16, callbacks=[Saboteur()], restore_best=True),
+            TrainConfig(epochs=2, callbacks=[Saboteur()], restore_best=True),
         )
 
         inputs, targets = next(iter(self._loaders(batch_size=32)))
@@ -423,35 +421,3 @@ def test_resume_across_a_rank_transition():
     actual = resumed.step(closure_for(resumed_model))
 
     assert actual == pytest.approx(expected, abs=1e-9)
-
-
-def test_a_pre_format_4_cma_checkpoint_warns_instead_of_resuming_silently():
-    """Format 3 carries no sampling-projection cache, so the resumed run samples from a
-    projection its saved coordinates were never measured under."""
-    import copy
-
-    from polystep.adaptive_subspace import AdaptiveSubspace
-    from polystep.cma_subspace import CMAAdaptiveSubspace
-
-    torch.manual_seed(0)
-
-    def build():
-        m = nn.Sequential(nn.Linear(8, 6), nn.ReLU(), nn.Linear(6, 4))
-        sub = CMAAdaptiveSubspace.from_adaptive_subspace(AdaptiveSubspace.auto_from_params(m, min_rank=8, max_rank=8))
-        return m, PolyStepOptimizer(m, subspace=sub, use_covariance_adaptation=True, seed=0, compile=False)
-
-    def closure(bp):
-        v = next(iter(bp.values()))
-        return v.reshape(v.shape[0], -1).pow(2).sum(1)
-
-    _, saved = build()
-    for _ in range(3):
-        saved.step(closure)
-    legacy = copy.deepcopy(saved.state_dict())
-    legacy["format"] = 3
-    for key in ("_sampling_proj_src", "_sampling_C_diag"):
-        legacy["control"].pop(key, None)
-
-    _, resumed = build()
-    with pytest.warns(UserWarning, match="pre-format-4 checkpoint"):
-        resumed.load_state_dict(legacy)

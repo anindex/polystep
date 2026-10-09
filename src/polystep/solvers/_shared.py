@@ -180,7 +180,7 @@ def prepare_cost(cost_matrix, a, scale_cost, solver: str):
 
 
 def solve_softmax(solver_obj, cost_matrix, a, temperature: float, scale_cost, solver: str, name: str):
-    """One-sided softmax solve, shared by ``SoftmaxSolver`` and ``TemperedSoftmaxSolver``."""
+    """One-sided softmax solve for ``SoftmaxSolver``."""
     validate_positive(temperature, name, f"{name} is the temperature in softmax(-C/{name}).")
     C, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, solver)
     warn_tiny_temperature(solver_obj, temperature, C, solver, name)

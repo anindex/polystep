@@ -291,164 +291,6 @@ class TestParticleDim:
             assert len(cube_warnings) >= 1, f"Expected cube warning, got: {[str(x.message) for x in w]}"
 
 
-class TestAdaptiveProbes:
-    """Tests for cost-matrix reuse across steps.
-
-    Every candidate row depends on all particle positions, so reuse is all or
-    nothing: kept while X has not moved, dropped as soon as it has.
-    """
-
-    def test_one_moving_particle_invalidates_every_cached_row(self):
-        """A stagnant particle's row is still measured against the others' positions."""
-        torch.manual_seed(0)
-        model = _make_model()
-        opt = PolyStepOptimizer(model, adaptive_probes=True, epsilon=0.1, compile=False, seed=0)
-        closure = _make_closure(model)
-
-        calls = {"n": 0}
-
-        def counting(batched_params):
-            calls["n"] += batched_params[next(iter(batched_params))].shape[0]
-            return closure(batched_params)
-
-        opt.step(counting)
-        # Move one particle well past the reuse threshold.
-        opt._prev_X = opt.state.X.clone()
-        opt._prev_X[0] += 1.0
-
-        calls["n"] = 0
-        opt.step(counting)
-        assert calls["n"] > 0, "a moved particle must force a full re-evaluation"
-
-    def test_an_unmoved_configuration_reuses_the_matrix(self):
-        torch.manual_seed(0)
-        model = _make_model()
-        opt = PolyStepOptimizer(model, adaptive_probes=True, epsilon=0.1, compile=False, seed=0)
-        closure = _make_closure(model)
-
-        calls = {"n": 0}
-
-        def counting(batched_params):
-            calls["n"] += batched_params[next(iter(batched_params))].shape[0]
-            return closure(batched_params)
-
-        opt.step(counting, objective_token="stationary")
-        opt._prev_X = opt.state.X.clone()
-
-        calls["n"] = 0
-        opt.step(counting, objective_token="stationary")
-        assert calls["n"] == 0, "an unmoved configuration must spend no forwards"
-
-    @pytest.mark.parametrize("block_strategy,expected", [("monolithic", True), ("per_layer", False)])
-    def test_adaptive_probes_defaults_to_where_it_is_implemented(self, block_strategy, expected):
-        """``adaptive_probes=None`` resolves to on for monolithic, off elsewhere.
-
-        Blockwise never populates the reuse cache; an explicit True still warns.
-        """
-        torch.manual_seed(42)
-        opt = PolyStepOptimizer(
-            _make_model(),
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-            block_strategy=block_strategy,
-        )
-        assert opt._adaptive_probes is expected
-
-    def test_adaptive_probes_off_stores_nothing(self):
-        """With reuse disabled, no per-particle displacement or cost row is retained."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-            adaptive_probes=False,
-        )
-        assert opt._prev_X is None
-        assert opt._prev_cost_matrix is None
-
-        opt.step(_make_closure(model))
-        assert opt._prev_X is None
-        assert opt._prev_cost_matrix is None
-
-    def test_adaptive_probes_enabled(self):
-        """adaptive_probes=True runs without error and produces valid optimization steps."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            adaptive_probes=True,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-        assert opt._adaptive_probes
-        initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-
-        closure = _make_closure(model)
-        losses = []
-        for _ in range(5):
-            loss = opt.step(closure)
-            losses.append(loss)
-            assert math.isfinite(loss)
-
-        assert opt._prev_X is not None
-        assert opt._prev_cost_matrix is not None
-
-        updated_params = model.state_dict()
-        any_changed = any(not torch.equal(initial_params[k], updated_params[k]) for k in initial_params)
-        assert any_changed, "Model parameters should change with adaptive_probes=True"
-
-    @pytest.mark.parametrize(
-        "threshold, reuses",
-        [
-            (1e10, True),  # every particle counts as stagnant
-            (0.0, False),  # strict <, so nothing is stagnant
-        ],
-    )
-    def test_adaptive_probes_reuse_follows_the_threshold(self, threshold, reuses):
-        """Reused rows cost no forward passes, so the closure call count is the check."""
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = PolyStepOptimizer(
-            model,
-            adaptive_probes=True,
-            adaptive_probes_threshold=threshold,
-            max_iterations=50,
-            epsilon=0.1,
-            sinkhorn_max_iters=100,
-            compile=False,
-            seed=42,
-        )
-
-        call_counts = []
-        base_closure = _make_closure(model)
-
-        def counting_closure(batched_params):
-            call_counts.append(batched_params[next(iter(batched_params))].shape[0])
-            return base_closure(batched_params)
-
-        opt.step(counting_closure, objective_token="stationary")  # no cached matrix yet
-        step1_evals = sum(call_counts)
-        call_counts.clear()
-
-        opt.step(counting_closure, objective_token="stationary")
-        step2_evals = sum(call_counts)
-
-        if reuses:
-            assert step2_evals < step1_evals, f"{step2_evals} vs {step1_evals}"
-        else:
-            assert step2_evals == step1_evals, f"{step2_evals} vs {step1_evals}"
-
-
 class TestDualMomentum:
     def test_beta_zero_matches_standard(self):
         """dual_momentum_beta=0.0 produces identical cost to default optimizer over 3 steps."""
@@ -548,12 +390,12 @@ class TestDualMomentum:
 
 
 class TestSinkhornParamWiring:
-    """Verify anderson_depth, adaptive_omega, data_dependent_init wire through
+    """Verify anderson_depth and adaptive_omega wire through
     from PolyStepOptimizer constructor to the internal SinkhornSolver."""
 
     def test_custom_sinkhorn_params_wired(self):
-        """PolyStepOptimizer(anderson_depth=5, adaptive_omega=True,
-        data_dependent_init=True) creates solver with those exact values."""
+        """PolyStepOptimizer(anderson_depth=5, adaptive_omega=True) creates solver
+        with those exact values."""
         torch.manual_seed(42)
         model = _make_model()
         opt = PolyStepOptimizer(
@@ -562,26 +404,25 @@ class TestSinkhornParamWiring:
             seed=42,
             anderson_depth=5,
             adaptive_omega=True,
-            data_dependent_init=True,
         )
         assert opt.solver.anderson_depth == 5
         assert opt.solver.adaptive_omega is True
-        assert opt.solver.data_dependent_init is True
 
 
-class TestAutoEpsilon:
-    def test_auto_epsilon_adjusts_from_solver_feedback(self):
-        """auto_epsilon should change epsilon based on convergence speed."""
+class TestProgressiveEpsilon:
+    def test_progressive_epsilon_adjusts_from_solver_feedback(self):
+        """ProgressiveEpsilon should change epsilon based on convergence speed."""
+        from polystep import ProgressiveEpsilon
+
         torch.manual_seed(42)
         model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
         optimizer = PolyStepOptimizer(
             model,
-            epsilon=1.0,
+            epsilon=ProgressiveEpsilon(init=1.0, target=0.1, max_epsilon=5.0),
             step_radius=0.5,
             num_probe=2,
             compile=False,
             seed=42,
-            auto_epsilon=True,
         )
         inputs = torch.randn(8, 4)
         targets = torch.randint(0, 2, (8,))
@@ -612,7 +453,6 @@ class TestAutoEpsilon:
         ("_progressive_epsilon", None),
         ("solver.anderson_depth", 0),
         ("solver.adaptive_omega", False),
-        ("solver.data_dependent_init", False),
     ],
 )
 def test_documented_defaults(attribute, expected):

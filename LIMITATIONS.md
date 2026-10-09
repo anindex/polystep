@@ -18,10 +18,6 @@ by default, so momentum requires a longer rotation interval to accumulate.
 Heavy-ball momentum can amplify the barycentric displacement; `step_radius` bounds
 the displacement before momentum.
 
-CMA adaptation keeps its basis fixed between absorbs and normalizes covariance to
-`trace(C) = n`. Its default `mu_eff=1` gives rank-one adaptation only. Cumulative
-step-size adaptation is not implemented.
-
 ## Evaluation
 
 - `step()` expects `closure(batched_params) -> losses` with shape `(N,)`.
@@ -31,8 +27,6 @@ step-size adaptation is not implemented.
   global-subspace coordinates use one dtype and reject mixed parameter dtypes.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
   Models needing autocast internally must provide it.
-- `adaptive_probes` needs an unchanged whole configuration and `objective_token`.
-  It cannot reuse losses across changing minibatches.
 - Deferred `trust_region` comparisons require the same objective. `train()` rejects
   this option; use manual steps on a stationary objective.
 - `trust_region` and `use_adaptive_radius` both scale the step. Choose one controller.

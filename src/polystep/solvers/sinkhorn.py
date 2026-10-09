@@ -72,7 +72,6 @@ class SinkhornSolver:
     omega: float = 1.0
     anderson_depth: int = 0  # 0 = disabled, >0 = ring buffer depth for Anderson acceleration
     adaptive_omega: bool = False  # True = residual-ratio dynamic omega (Lehmann 2022)
-    data_dependent_init: bool = False  # True = row-softmin init for cold starts
 
     def __post_init__(self):
         """Initialize compiled function registry and validate parameters."""
@@ -154,19 +153,13 @@ class SinkhornSolver:
         log_a = torch.log(torch.clamp(a, min=1e-30))
         log_b = torch.log(torch.clamp(b, min=1e-30))
 
-        # Data-dependent init, only when no warm start is given.
-        if self.data_dependent_init and init_f is None and init_g is None:
-            # Closed form of the first f then g update from zero duals; a row softmin keeps the exponent near zero.
-            f = eps * (log_a - torch.logsumexp(log_K, dim=1))
-            g = eps * (log_b - torch.logsumexp(f.unsqueeze(1) / eps + log_K, dim=0))
-        else:
-            # align_dual returns None on a shape mismatch, so fall back to zeros.
-            f = align_dual(init_f, n, device, dtype, "init_f")
-            g = align_dual(init_g, m, device, dtype, "init_g")
-            if f is None:
-                f = torch.zeros(n, device=device, dtype=dtype)
-            if g is None:
-                g = torch.zeros(m, device=device, dtype=dtype)
+        # align_dual returns None on a shape mismatch, so fall back to zeros.
+        f = align_dual(init_f, n, device, dtype, "init_f")
+        g = align_dual(init_g, m, device, dtype, "init_g")
+        if f is None:
+            f = torch.zeros(n, device=device, dtype=dtype)
+        if g is None:
+            g = torch.zeros(m, device=device, dtype=dtype)
 
         # Dual potentials scale with the cost magnitude, not epsilon. Kept on-device to avoid a sync per solve.
         clamp_scale = cost_matrix.abs().max().clamp(min=1e-6)

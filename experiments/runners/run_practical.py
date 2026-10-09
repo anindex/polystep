@@ -247,7 +247,6 @@ class TunedRun:
             chunk_size=chunk,
             num_probe=1,
             polytope_type="simplex",
-            adaptive_probes=False,
             adaptive_num_probe=False,
             biased_rotation=task != "int8",
             use_momentum=task == "int8",

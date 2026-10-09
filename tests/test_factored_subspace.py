@@ -105,3 +105,21 @@ def test_optimizer_falls_back_and_warns_for_an_unsupported_model():
         return evaluator.evaluate(params, inputs, targets)
 
     assert torch.isfinite(torch.tensor(opt.step(closure)))
+
+
+@pytest.mark.filterwarnings("ignore:FactoredSubspace is in use:UserWarning")
+def test_a_frozen_parameter_edited_between_steps_keeps_the_edit():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+    model[0].weight.requires_grad_(False)
+    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    inputs, targets = torch.randn(16, 4), torch.randn(16, 2)
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    opt = PolyStepOptimizer(model, subspace=subspace, seed=0)
+    opt.register_evaluator(evaluator, inputs, targets)
+
+    with torch.no_grad():
+        model[0].weight.fill_(0.5)
+    opt.step(lambda params: evaluator.evaluate(params, inputs, targets))
+
+    assert torch.all(model[0].weight == 0.5)

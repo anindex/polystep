@@ -34,7 +34,6 @@ import torch.nn as nn
 from polystep import PolyStepOptimizer
 from polystep.baselines import METHODS
 from polystep.adaptive_subspace import AdaptiveSubspace
-from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.cost_nn import NNCostEvaluator
 from polystep.epsilon import CosineEpsilon, LinearEpsilon
 from polystep.hybrid_subspace import HybridSubspace
@@ -129,7 +128,7 @@ def _synthetic_env(name, obj_cls, dim, x0_val, budget, cond=None):
         return model, closure, quality
 
     # A single parameter vector makes subspaces degenerate, so these envs run
-    # full space and skip the representation / block / cma axes.
+    # full space and skip the representation / block axes.
     return Env(
         name=name,
         kind="synthetic",
@@ -342,17 +341,13 @@ def _adaptive(model, layout):
     return AdaptiveSubspace.auto_from_params(model, min_rank=8, max_rank=64)
 
 
-def _cma(model, layout):
-    return CMAAdaptiveSubspace.auto_from_params(model, min_rank=8, max_rank=64)
-
-
 def screen_configs(env: Env):
     """One-factor-at-a-time configs from the per-env baseline."""
     s = env.default_solver
     cfgs = [Config("baseline", "baseline", s)]
 
     # 1. Solver / weighting (full space, where the vertex marginal binds).
-    for solver in ["softmax", "tempered_softmax", "min_cost_greedy", "top_k_mean", "sinkhorn"]:
+    for solver in ["softmax", "min_cost_greedy", "top_k_mean", "sinkhorn"]:
         if solver == s:
             continue
         cfgs.append(Config("solver", f"solver={solver}", solver, full_space=True))
@@ -362,7 +357,6 @@ def screen_configs(env: Env):
         Config("representation", "hybrid_r8", "softmax", subspace=_hybrid(8), needs_subspace=True),
         Config("representation", "hybrid_r16", "softmax", subspace=_hybrid(16), needs_subspace=True),
         Config("representation", "adaptive", "softmax", subspace=_adaptive, needs_subspace=True),
-        Config("representation", "cma_subspace", "softmax", subspace=_cma, needs_subspace=True),
     ]
 
     # 3. Block strategy (full-space per-layer / grouped OT).
@@ -401,22 +395,9 @@ def screen_configs(env: Env):
         cfgs += [
             Config("sinkhorn_accel", "anderson", s, kwargs={"anderson_depth": 5}),
             Config("sinkhorn_accel", "adaptive_omega", s, kwargs={"adaptive_omega": True}),
-            Config("sinkhorn_accel", "ddi", s, kwargs={"data_dependent_init": True}),
         ]
 
-    # 8. CMA (needs CMAAdaptiveSubspace + monolithic).
-    cfgs += [
-        Config(
-            "cma",
-            "covariance",
-            "softmax",
-            subspace=_cma,
-            kwargs={"use_covariance_adaptation": True},
-            needs_subspace=True,
-        ),
-    ]
-
-    # 9. Quadratic cluster (orthoplex + num_probe>=2).
+    # 8. Quadratic cluster (orthoplex + num_probe>=2).
     cfgs += [
         Config("quadratic", "quadratic_model", s, kwargs={"num_probe": 2, "use_quadratic_model": True}),
         Config("quadratic", "trust_region", s, kwargs={"num_probe": 2, "trust_region": True}),
@@ -430,7 +411,7 @@ def screen_configs(env: Env):
         Config("quadratic", "multifidelity", s, kwargs={"num_probe": 2, "multifidelity_screen": True}),
     ]
 
-    # 10. Geometry.
+    # 9. Geometry.
     cfgs += [
         Config("geometry", "simplex", s, kwargs={"polytope_type": "simplex"}),
         Config("geometry", "num_probe_3", s, kwargs={"num_probe": 3}),
@@ -444,18 +425,6 @@ def interaction_configs(env: Env):
     # solver x representation
     for solver in ["softmax", "sinkhorn"]:
         cfgs.append(Config("solver_x_repr", f"{solver}_hybrid", solver, subspace=_hybrid(8), needs_subspace=True))
-    # CMA x AdaptiveSubspace vs plain adaptive
-    cfgs.append(Config("cma_x_adaptive", "adaptive_no_cma", "softmax", subspace=_adaptive, needs_subspace=True))
-    cfgs.append(
-        Config(
-            "cma_x_adaptive",
-            "cma_covariance",
-            "softmax",
-            subspace=_cma,
-            kwargs={"use_covariance_adaptation": True},
-            needs_subspace=True,
-        )
-    )
     # block x representation
     cfgs.append(
         Config(
@@ -491,8 +460,8 @@ def configs_for(env: Env, stage: str):
         catalog += interaction_configs(env)
     if stage == "mechanism":
         # Mechanism isolation reuses the screen axes on the dedicated envs
-        # (aniso, sphere) so the marginal-violation and C_diag plots get the
-        # full solver / subspace spread.
+        # (aniso, sphere) so the marginal-violation plots get the full solver /
+        # subspace spread.
         catalog += screen_configs(env)
     out = []
     for c in catalog:
@@ -614,9 +583,6 @@ def self_checks(cfg: Config, state, log):
         tm = state.trust_region_multipliers
         if len(tm) == 0 or all(v == 1.0 for v in tm):
             reasons.append("trust_region multiplier frozen")
-    if kw.get("use_covariance_adaptation"):
-        if state.generation == 0 or state.C_diag is None:
-            reasons.append("CMA generation did not advance")
     if kw.get("use_adaptive_radius"):
         if abs(state.radius_multiplier - 1.0) < 1e-9:
             reasons.append("adaptive radius never moved")
@@ -685,7 +651,6 @@ def run_one(env: Env, cfg: Config, seed: int, device: str):
         "diagnostics": {
             "solver": cfg.solver,
             "radius_multiplier": float(state.radius_multiplier),
-            "generation": int(state.generation),
             "absorb_count": int(state.absorb_count),
             "n_trust_updates": len(state.trust_region_multipliers),
             "dead": dead,

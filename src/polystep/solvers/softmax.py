@@ -15,7 +15,6 @@ class SoftmaxSolver:
     """Direct softmax weighting: transport weights via ``softmax(-C/epsilon)`` scaled to row sum ``a``."""
 
     epsilon: float = 0.1
-    compile: bool = False
 
     def solve(
         self,

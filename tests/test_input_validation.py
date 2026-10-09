@@ -12,7 +12,7 @@ from polystep.cost_nn import NNCostEvaluator
 from polystep.costs import scale_cost_matrix
 from polystep._compiled import _fused_softmax_project
 from polystep.geometry import get_orthoplex_vertices, get_random_rotation_matrices
-from polystep.solvers import KLSoftmaxSolver, SinkhornSolver, SoftmaxSolver, TemperedSoftmaxSolver
+from polystep.solvers import KLSoftmaxSolver, SinkhornSolver, SoftmaxSolver
 from polystep.solvers._shared import align_dual, align_marginal, recenter_cost, sanitize_cost
 
 
@@ -108,14 +108,6 @@ def test_align_dual_coerces_dtype_and_warns_on_mismatch():
     assert bad is None
 
 
-def test_tempered_softmax_handles_nonfinite_cost():
-    """A bf16 cost with an +inf entry must still give a finite, correctly normalized plan."""
-    cost = torch.tensor([[1.0, float("inf")], [0.5, 2.0]], dtype=torch.bfloat16)
-    res = TemperedSoftmaxSolver(tau=0.5).solve(cost)
-    assert torch.isfinite(res.matrix).all()
-    assert torch.allclose(res.matrix.sum(dim=1), torch.full((2,), 0.5), atol=1e-5)
-
-
 def test_batched_linear_honors_nondefault_activations():
     """The MLP fast path must read each activation module's real config; a
     hardcoded default would compute a silently wrong loss."""
@@ -189,6 +181,11 @@ def test_unknown_string_options_raise(kwargs, message):
     """Downstream code tests `!= "monolithic"`, so a typo would select block-wise mode."""
     with pytest.raises(ValueError, match=message):
         PolyStepOptimizer(nn.Linear(8, 4), compile=False, **kwargs)
+
+
+def test_unsupported_subspace_type_raises():
+    with pytest.raises(TypeError, match="subspace must be"):
+        PolyStepOptimizer(nn.Linear(8, 4), subspace=object(), compile=False)
 
 
 def test_newton_refinement_warns_under_a_block_strategy():

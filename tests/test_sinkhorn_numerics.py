@@ -10,7 +10,7 @@ import warnings
 import pytest
 import torch
 
-from polystep import KLSoftmaxSolver, SinkhornSolver, SoftmaxSolver, TemperedSoftmaxSolver
+from polystep import KLSoftmaxSolver, SinkhornSolver, SoftmaxSolver
 from polystep.solvers.greedy import MinCostGreedySolver, TopKMeanSolver
 
 
@@ -323,10 +323,9 @@ def test_sanitize_cost_penalty_does_not_overflow(dtype):
     [
         lambda: SoftmaxSolver(epsilon=1e-20),
         lambda: SinkhornSolver(epsilon=1e-20),
-        lambda: TemperedSoftmaxSolver(tau=1e-20),
         lambda: KLSoftmaxSolver(epsilon=1e-20),
     ],
-    ids=["softmax", "sinkhorn", "tempered", "kl_softmax"],
+    ids=["softmax", "sinkhorn", "kl_softmax"],
 )
 def test_saturating_temperature_warns(make_solver):
     """A temperature far below the cost scale saturates ``-C/temperature`` and the
@@ -346,12 +345,11 @@ def test_saturating_temperature_warns(make_solver):
     [
         lambda: SoftmaxSolver(),
         lambda: SinkhornSolver(),
-        lambda: TemperedSoftmaxSolver(),
         lambda: KLSoftmaxSolver(),
         lambda: MinCostGreedySolver(),
         lambda: TopKMeanSolver(),
     ],
-    ids=["softmax", "sinkhorn", "tempered", "kl_softmax", "greedy", "topk"],
+    ids=["softmax", "sinkhorn", "kl_softmax", "greedy", "topk"],
 )
 def test_empty_cost_matrix_raises_valueerror(make_solver):
     """Zero vertices is a caller error, not an IndexError from inside a reduction

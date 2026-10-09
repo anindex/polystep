@@ -1,4 +1,4 @@
-"""Tests for the ablation solvers MinCostGreedy, TopKMean, and TemperedSoftmax."""
+"""Tests for the ablation solvers MinCostGreedy and TopKMean."""
 
 import pytest
 import torch
@@ -8,7 +8,6 @@ from polystep.solvers.base import SolverResult
 from polystep.solvers.greedy import MinCostGreedySolver, TopKMeanSolver
 from polystep.solvers.sinkhorn import SinkhornSolver
 from polystep.solvers.softmax import SoftmaxSolver
-from polystep.solvers.tempered_softmax import TemperedSoftmaxSolver
 
 
 @pytest.fixture
@@ -92,69 +91,11 @@ class TestTopKMeanSolver:
         assert torch.allclose(r_greedy.matrix, r_topk1.matrix, atol=1e-7)
 
 
-class TestTemperedSoftmaxSolver:
-    def test_uses_tau_not_epsilon(self, cost_matrix, source_marginal):
-        """Output should depend on tau, not epsilon."""
-        solver1 = TemperedSoftmaxSolver(epsilon=0.1, tau=1.0)
-        solver2 = TemperedSoftmaxSolver(epsilon=99.0, tau=1.0)
-        r1 = solver1.solve(cost_matrix, a=source_marginal)
-        r2 = solver2.solve(cost_matrix, a=source_marginal)
-        assert torch.allclose(r1.matrix, r2.matrix, atol=1e-7)
-
-    def test_different_tau_different_result(self, cost_matrix, source_marginal):
-        solver1 = TemperedSoftmaxSolver(tau=0.1)
-        solver2 = TemperedSoftmaxSolver(tau=10.0)
-        r1 = solver1.solve(cost_matrix, a=source_marginal)
-        r2 = solver2.solve(cost_matrix, a=source_marginal)
-        assert not torch.allclose(r1.matrix, r2.matrix, atol=1e-3)
-
-    def test_shifts_per_row_like_softmax(self):
-        """A row sitting far above the global minimum must not lose its spread to the
-        -C/tau division before softmax subtracts the row max."""
-        from polystep.solvers.softmax import SoftmaxSolver
-
-        # Row 1 is offset far above row 0, so a global-only recentre leaves it huge.
-        cost = torch.tensor([[0.0, 1.0], [1e4, 1e4 + 1.0]])
-        tempered = TemperedSoftmaxSolver(epsilon=0.1, tau=1.0).solve(cost).matrix
-        assert torch.isfinite(tempered).all()
-        # tau == epsilon and both are one-sided softmax, so the two must agree.
-        torch.testing.assert_close(tempered, SoftmaxSolver(epsilon=1.0).solve(cost).matrix, atol=1e-6, rtol=1e-6)
-
-    def test_tau_validation(self):
-        solver = TemperedSoftmaxSolver(tau=-1.0)
-        C = torch.rand(3, 4)
-        with pytest.raises(ValueError, match="tau must be > 0"):
-            solver.solve(C)
-
-    def test_low_tau_approaches_greedy(self):
-        """Very low tau should approximate greedy (argmin) on unscaled costs."""
-        # Use a well-separated cost matrix so there are no near-ties
-        C = torch.tensor(
-            [
-                [10.0, 1.0, 5.0, 8.0],
-                [3.0, 7.0, 2.0, 9.0],
-                [6.0, 4.0, 8.0, 1.0],
-            ]
-        )
-        a = torch.ones(3) / 3
-        solver = TemperedSoftmaxSolver(tau=0.001)
-        result = solver.solve(C, a=a)
-        T = result.matrix
-
-        greedy = MinCostGreedySolver()
-        r_greedy = greedy.solve(C, a=a)
-
-        # tau=1e-3 with well-separated costs (gaps >= 1) makes exp(-gap/tau)
-        # underflow to ~0, so the tempered softmax collapses to the greedy
-        # assignment up to float32 rounding.
-        assert torch.allclose(T, r_greedy.matrix, atol=1e-5)
-
-
 @pytest.mark.parametrize("P,V", [(1, 4), (10, 2), (50, 16), (100, 8)])
 def test_various_sizes(P, V):
     C = torch.rand(P, V)
     a = torch.ones(P) / P
-    for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3), TemperedSoftmaxSolver(tau=1.0), SoftmaxSolver()]:
+    for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3), SoftmaxSolver()]:
         result = solver.solve(C, a=a)
         assert isinstance(result, SolverResult)
         assert result.matrix.shape == (P, V)
@@ -177,7 +118,6 @@ class TestSolverSelection:
             "sinkhorn",
             "min_cost_greedy",
             "top_k_mean",
-            "tempered_softmax",
             "kl_softmax",
         ],
     )
@@ -200,7 +140,6 @@ class TestSolverSelection:
             SinkhornSolver,
             MinCostGreedySolver,
             TopKMeanSolver,
-            TemperedSoftmaxSolver,
             KLSoftmaxSolver,
         )
 
@@ -209,7 +148,6 @@ class TestSolverSelection:
             "sinkhorn": SinkhornSolver,
             "min_cost_greedy": MinCostGreedySolver,
             "top_k_mean": TopKMeanSolver,
-            "tempered_softmax": TemperedSoftmaxSolver,
             "kl_softmax": KLSoftmaxSolver,
         }
         assert isinstance(opt.solver, expected[solver_name])
@@ -219,6 +157,8 @@ class TestSolverSelection:
 
         with pytest.raises(ValueError, match="Unknown solver"):
             PolyStepOptimizer(simple_model, solver="nonexistent")
+        with pytest.raises(ValueError, match="solver='softmax' with ent_epsilon"):
+            PolyStepOptimizer(simple_model, solver="tempered_softmax")
 
 
 @pytest.mark.parametrize(

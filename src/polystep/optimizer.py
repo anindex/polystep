@@ -54,21 +54,18 @@ from .blockwise import (
     create_per_layer_blocks,
     create_subspace_blocks,
 )
-from .epsilon import LinearEpsilon
+from .epsilon import LinearEpsilon, ProgressiveEpsilon
 from .geometry import POLYTOPE_MAP
 from .solvers import (
     KLSoftmaxSolver,
     MinCostGreedySolver,
     SinkhornSolver,
     SoftmaxSolver,
-    TemperedSoftmaxSolver,
     TopKMeanSolver,
 )
 from .solver import SolverState
 from .solvers._shared import validate_positive
 from .adaptive_subspace import AdaptiveSubspace
-from .cma import compute_cma_hyperparameters
-from .cma_subspace import CMAAdaptiveSubspace
 from .factored_subspace import FactoredSubspace
 from .hybrid_subspace import HybridSubspace
 from ._serialization import SerializationMixin
@@ -142,16 +139,14 @@ class PolyStepOptimizer(SerializationMixin):
             needs the orthoplex's antithetic vertex pairs.
         epsilon: Entropic regularization; a float or a scheduler with ``.at()``.
             With float radii it multiplies both radii, so it is the learning rate.
-        ent_epsilon: Separate solver temperature; if None, uses ``epsilon``.
+        ent_epsilon: Separate solver temperature; if None, uses ``epsilon``. Not allowed
+            with a ``ProgressiveEpsilon``.
         scale_cost: Cost scaling ('mean', 'max_cost', float, or None).
         step_radius: Step size. A scalar multiplies ``epsilon``; a schedule with
             ``.at()`` is the physical distance.
         probe_radius: Probe radius, same two parameterizations as ``step_radius``. Probe
             ``k`` sits at ``k/(num_probe+1)`` of it, so the default single probe is at half.
         num_probe: Probe points per direction; 1 is optimal.
-        adaptive_probes: Reuse the previous cost matrix when nothing moved. Default
-            on for monolithic blocks.
-        adaptive_probes_threshold: Squared displacement below which the matrix is reused.
         max_iterations: Maximum outer iterations.
         sinkhorn_max_iters: Maximum inner Sinkhorn iterations.
         chunk_size: Chunk size for cost-evaluation memory control.
@@ -159,7 +154,6 @@ class PolyStepOptimizer(SerializationMixin):
         compile: Compile hot-path tensor functions (default False).
         solver: OT solver. None auto-selects softmax for subspace modes, sinkhorn
             otherwise.
-        tempered_softmax_tau: Fixed temperature for 'tempered_softmax'.
         kl_softmax_lam: KL penalty for 'kl_softmax'; 0 is softmax, inf is Sinkhorn.
         subspace: Subspace object, or None for full parameter space.
         subspace_particle_dim: OT polytope dimension in subspace mode (default 8).
@@ -193,8 +187,6 @@ class PolyStepOptimizer(SerializationMixin):
         radius_decrease: Multiplicative factor for radius decay.
         radius_min: Minimum radius multiplier.
         radius_max: Maximum radius multiplier.
-        use_covariance_adaptation: Diagonal CMA-ES covariance learning (needs
-            CMAAdaptiveSubspace).
         seed: Seed for reproducible random rotations.
         mixed_precision: Cast model, particles, and projections to BF16.
         candidate_autocast: Run the candidate forward in BF16 under autocast.
@@ -209,15 +201,12 @@ class PolyStepOptimizer(SerializationMixin):
         particle_dim: int = 2,
         epsilon: Union[float, LinearEpsilon] = 0.1,
         ent_epsilon: Optional[Union[float, LinearEpsilon]] = None,
-        # Feedback-driven epsilon.
-        auto_epsilon: bool = False,
-        auto_epsilon_config: Optional[dict] = None,
         scale_cost: Optional[Union[str, float]] = 1.0,
         step_radius: float = 1.0,
         probe_radius: float = 2.0,
         # Jitter keeps probes off the discontinuity set; the convergence proof needs it > 0.
-        # Default 0.0: it also makes the recorded cost noisy, which the reuse heuristics
-        # misread as progress.
+        # Default 0.0: it also makes the recorded cost noisy, which amortization misreads
+        # as progress.
         probe_radius_jitter: float = 0.0,
         probe_radius_jitter_dist: str = "smooth",
         # Makes the one-step law of the iterate continuous within its plane.
@@ -226,8 +215,6 @@ class PolyStepOptimizer(SerializationMixin):
         # None means "on wherever implemented".
         adaptive_num_probe: Optional[bool] = None,
         adaptive_probe_warmup: int = 20,
-        adaptive_probes: Optional[bool] = None,
-        adaptive_probes_threshold: float = 1e-6,
         max_iterations: int = 50,
         sinkhorn_max_iters: int = 2000,
         chunk_size: Optional[int] = None,
@@ -237,9 +224,8 @@ class PolyStepOptimizer(SerializationMixin):
         amortize_ema: float = 0.7,
         compile: bool = False,
         solver: Optional[str] = None,
-        tempered_softmax_tau: float = 1.0,
         kl_softmax_lam: float = float("inf"),
-        subspace: Optional[Union[AdaptiveSubspace, HybridSubspace, CMAAdaptiveSubspace, FactoredSubspace]] = None,
+        subspace: Optional[Union[AdaptiveSubspace, HybridSubspace, FactoredSubspace]] = None,
         subspace_particle_dim: int = 8,
         rank_schedule: Optional[RankSchedule] = None,
         block_strategy: str = "monolithic",
@@ -259,7 +245,6 @@ class PolyStepOptimizer(SerializationMixin):
         dual_momentum_beta: float = 0.0,
         anderson_depth: int = 0,
         adaptive_omega: bool = False,
-        data_dependent_init: bool = False,
         biased_rotation: bool = False,
         # Extract finite-difference gradient/Hessian from cost evaluations.
         use_quadratic_model: bool = False,
@@ -272,7 +257,6 @@ class PolyStepOptimizer(SerializationMixin):
         multifidelity_screen: bool = False,
         screen_keep_ratio: float = 0.5,
         screen_fidelity: float = 0.25,
-        use_covariance_adaptation: bool = False,
         seed: Optional[int] = None,
         mixed_precision: bool = False,
         candidate_autocast: bool = False,
@@ -297,6 +281,11 @@ class PolyStepOptimizer(SerializationMixin):
             raise ValueError(f"block_group_size must be >= 1, got {block_group_size}.")
         if polytope_type not in POLYTOPE_MAP:
             raise ValueError(f"Invalid polytope_type: {polytope_type!r}. Use one of {sorted(POLYTOPE_MAP)}.")
+        if subspace is not None and not isinstance(subspace, (AdaptiveSubspace, HybridSubspace, FactoredSubspace)):
+            raise TypeError(
+                f"subspace must be an AdaptiveSubspace, HybridSubspace or FactoredSubspace, "
+                f"got {type(subspace).__name__}."
+            )
         self._requested_projection_type = projection_type
         self._compile_evaluator = compile_evaluator
         self._compile_forward = compile_forward
@@ -369,35 +358,9 @@ class PolyStepOptimizer(SerializationMixin):
         self.epsilon = epsilon
         self.ent_epsilon = ent_epsilon
 
-        # Adopt a scheduler passed as ``epsilon`` so it advances like ``auto_epsilon``
-        # does, rather than sitting frozen at ``init``.
-        from .epsilon import ProgressiveEpsilon
-
-        if isinstance(epsilon, ProgressiveEpsilon):
-            self._progressive_epsilon = epsilon
-        elif auto_epsilon:
-            if isinstance(epsilon, LinearEpsilon):
-                prog_init = epsilon.init
-                prog_target = epsilon.target
-            elif isinstance(epsilon, (int, float)):
-                prog_init = float(epsilon)
-                prog_target = max(0.01, prog_init * 0.1)
-            else:
-                prog_init = 1.0
-                prog_target = 0.01
-            config = auto_epsilon_config or {}
-            self._progressive_epsilon = ProgressiveEpsilon(
-                init=config.get("init", prog_init),
-                target=config.get("target", prog_target),
-                max_epsilon=config.get("max_epsilon", prog_init * 5.0),
-                increase_factor=config.get("increase_factor", 1.2),
-                decrease_factor=config.get("decrease_factor", 0.95),
-                fast_threshold=config.get("fast_threshold", 0.1),
-                slow_threshold=config.get("slow_threshold", 0.5),
-                ema_alpha=config.get("ema_alpha", 0.7),
-            )
-        else:
-            self._progressive_epsilon = None
+        self._progressive_epsilon = epsilon if isinstance(epsilon, ProgressiveEpsilon) else None
+        if self._progressive_epsilon is not None and ent_epsilon is not None:
+            raise ValueError("ProgressiveEpsilon adapts the solve epsilon; it cannot be combined with ent_epsilon.")
         self.scale_cost = scale_cost
         # A negative radius flips the finite-difference denominator, which the
         # clamp then turns positive and scales the gradient by 1e10. 0 is the
@@ -440,33 +403,16 @@ class PolyStepOptimizer(SerializationMixin):
         # These run only in the monolithic step; default to None so the ignore warning
         # fires on an explicit True, not the default.
         _savings_default = block_strategy == "monolithic"
-        # Whether the caller asked for reuse explicitly.
-        self._adaptive_probes_explicit = adaptive_probes is not None
         # Reducing K needs a K above 1, so stay off at the default num_probe=1.
         if adaptive_num_probe is None:
             adaptive_num_probe = _savings_default and num_probe > 1
-        adaptive_probes = _savings_default if adaptive_probes is None else adaptive_probes
         self.adaptive_num_probe = adaptive_num_probe
         self._adaptive_probe_warmup = adaptive_probe_warmup
         self._loss_decreasing_count = 0
         # OT-step costs only, to avoid mixing in momentum costs.
         self._ot_step_costs: collections.deque = collections.deque(maxlen=3)
-        self._adaptive_probes = adaptive_probes
-        self._adaptive_probes_threshold = adaptive_probes_threshold
-        # A candidate replaces one row of X, so reuse needs every row unchanged.
-        self._prev_X: Optional[torch.Tensor] = None
-        self._prev_cost_matrix: Optional[torch.Tensor] = None
         self._param_write_cache = None
-        # Cached rotations, restored with the matrix so rows match their vertices.
-        self._prev_rot_mats: Optional[torch.Tensor] = None
-        # Track K_eff and both radii to invalidate the cached matrix on change.
-        self._prev_k_eff: Optional[int] = None
-        self._prev_step_r: Optional[float] = None
-        self._prev_probe_r: Optional[float] = None
-        # Reusing across minibatches would rank vertices partly by which batch they came
-        # from. None asserts a stationary objective.
         self._prev_objective_token: object = None
-        self._objective_token_warned = False
         self.max_iterations = max_iterations
         if chunk_size is not None and chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0 or None, got {chunk_size}.")
@@ -478,25 +424,16 @@ class PolyStepOptimizer(SerializationMixin):
         self.amortize_steps = max(1, amortize_steps)
         self.amortize_ema = amortize_ema
 
-        # Jitter makes the per-step cost noisy, which the reuse heuristics read as
-        # progress, so disable them here for every caller.
-        if self.probe_radius_jitter > 0.0:
-            disabled = []
-            if self._adaptive_probes:
-                self._adaptive_probes = False
-                if self._adaptive_probes_explicit:
-                    disabled.append("adaptive_probes")
-            if self.amortize_steps > 1:
-                self.amortize_steps = 1
-                disabled.append("amortize_steps")
-            if disabled:
-                warnings.warn(
-                    f"probe_radius_jitter={self.probe_radius_jitter} disables "
-                    f"{', '.join(disabled)}: jitter makes the per-step cost a noisy "
-                    f"estimate, which those heuristics read as progress. Set "
-                    f"probe_radius_jitter=0.0 to keep them.",
-                    stacklevel=2,
-                )
+        # Jitter makes the per-step cost noisy, which amortization reads as progress, so
+        # disable it here for every caller.
+        if self.probe_radius_jitter > 0.0 and self.amortize_steps > 1:
+            self.amortize_steps = 1
+            warnings.warn(
+                f"probe_radius_jitter={self.probe_radius_jitter} disables amortize_steps: "
+                f"jitter makes the per-step cost a noisy estimate, which amortization reads "
+                f"as progress. Set probe_radius_jitter=0.0 to keep it.",
+                stacklevel=2,
+            )
 
         # SNN-like models lose accuracy under a shrinking step_radius. Match on
         # module class-name substrings.
@@ -624,26 +561,11 @@ class PolyStepOptimizer(SerializationMixin):
 
         self._dual_momentum_beta = dual_momentum_beta
 
-        self._cma_subspace = isinstance(subspace, CMAAdaptiveSubspace)
-
-        if use_covariance_adaptation and not self._cma_subspace:
-            warnings.warn("use_covariance_adaptation requires CMAAdaptiveSubspace. It will be disabled.")
-            use_covariance_adaptation = False
-
-        # CMA covariance scaling and state update run only in the monolithic step.
-        if use_covariance_adaptation and self.block_strategy != "monolithic":
-            warnings.warn(
-                "use_covariance_adaptation is only supported with block_strategy='monolithic'; "
-                f"disabled for block_strategy='{self.block_strategy}'."
-            )
-            use_covariance_adaptation = False
-
         # Blockwise re-evaluates per block, so these save nothing there.
         if self.block_strategy != "monolithic":
             _ignored = [
                 name
                 for name, on in (
-                    ("adaptive_probes", adaptive_probes),
                     ("adaptive_num_probe", adaptive_num_probe),
                     ("multifidelity_screen", multifidelity_screen),
                 )
@@ -677,10 +599,6 @@ class PolyStepOptimizer(SerializationMixin):
                 stacklevel=2,
             )
 
-        self.use_covariance_adaptation = use_covariance_adaptation
-        # Coord-to-param projection for this step, covariance-scaled for CMA, so a
-        # step's probes and its sync share one metric.
-        self._sampling_projection = None
         # Shape-keyed scratch buffers, reused across steps and overwritten on use.
         self._step_buffers = None
 
@@ -822,7 +740,6 @@ class PolyStepOptimizer(SerializationMixin):
                 for name, value in (
                     ("anderson_depth", anderson_depth),
                     ("adaptive_omega", adaptive_omega),
-                    ("data_dependent_init", data_dependent_init),
                 )
                 if value
             ]
@@ -834,24 +751,18 @@ class PolyStepOptimizer(SerializationMixin):
                 )
 
         if solver == "softmax":
-            self.solver = SoftmaxSolver(compile=compile)
+            self.solver = SoftmaxSolver()
         elif solver == "sinkhorn":
             self.solver = SinkhornSolver(
                 max_iterations=sinkhorn_max_iters,
                 compile=compile,
                 anderson_depth=anderson_depth,
                 adaptive_omega=adaptive_omega,
-                data_dependent_init=data_dependent_init,
             )
         elif solver == "min_cost_greedy":
-            self.solver = MinCostGreedySolver(compile=compile)
+            self.solver = MinCostGreedySolver()
         elif solver == "top_k_mean":
-            self.solver = TopKMeanSolver(compile=compile)
-        elif solver == "tempered_softmax":
-            self.solver = TemperedSoftmaxSolver(
-                tau=tempered_softmax_tau,
-                compile=compile,
-            )
+            self.solver = TopKMeanSolver()
         elif solver == "kl_softmax":
             self.solver = KLSoftmaxSolver(
                 lam=kl_softmax_lam,
@@ -860,14 +771,15 @@ class PolyStepOptimizer(SerializationMixin):
         else:
             raise ValueError(
                 f"Unknown solver: {solver!r}. Expected 'softmax', 'sinkhorn', "
-                f"'min_cost_greedy', 'top_k_mean', 'tempered_softmax', 'kl_softmax', or None."
+                f"'min_cost_greedy', 'top_k_mean', 'kl_softmax', or None. For a fixed "
+                f"softmax temperature, use solver='softmax' with ent_epsilon."
             )
 
         # KLSoftmax interpolates softmax (lam=0) to Sinkhorn (lam=inf), inheriting
         # each limit's guards.
-        _one_shot = isinstance(
-            self.solver, (SoftmaxSolver, MinCostGreedySolver, TopKMeanSolver, TemperedSoftmaxSolver)
-        ) or (isinstance(self.solver, KLSoftmaxSolver) and self.solver.lam == 0)
+        _one_shot = isinstance(self.solver, (SoftmaxSolver, MinCostGreedySolver, TopKMeanSolver)) or (
+            isinstance(self.solver, KLSoftmaxSolver) and self.solver.lam == 0
+        )
         self._balanced_ot = isinstance(self.solver, SinkhornSolver) or (
             isinstance(self.solver, KLSoftmaxSolver) and self.solver.lam == INF
         )
@@ -897,8 +809,6 @@ class PolyStepOptimizer(SerializationMixin):
             self._state.subspace = subspace
 
         self._init_subspace(subspace, seed, model_device)
-
-        self._init_cma(subspace, seed, model_device)
 
         if use_momentum:
             self._state.velocity = torch.zeros_like(X_init)
@@ -957,47 +867,6 @@ class PolyStepOptimizer(SerializationMixin):
                 device=model_device,
                 dtype=self._model_dtype,
             )
-
-    def _init_cma(self, subspace, seed, model_device) -> None:
-        """CMA evolution paths; _init_subspace already built the projection and history."""
-        self._cma_params = None
-        if not self._cma_subspace:
-            return
-
-        if self.use_covariance_adaptation and self._actual_projection_type == "sparse":
-            # _update_sampling_projection only scales a dense Tensor.
-            raise ValueError(
-                "use_covariance_adaptation needs a dense projection; "
-                f"projection_type resolved to 'sparse' for full_dim={subspace.full_dim}. "
-                "Pass projection_type='dense', or drop use_covariance_adaptation."
-            )
-
-        if self.use_covariance_adaptation:
-            # fp32 accumulators: c_1 ~ 2/(n+1.3)^2 rounds to 1 in bf16, so C_diag
-            # would never move.
-            cma_state = subspace.init_cma_state(
-                device=model_device,
-                dtype=torch.float32,
-            )
-            self._state.p_c = cma_state["p_c"]
-            self._state.p_sigma = cma_state["p_sigma"]
-            self._state.C_diag = cma_state["C_diag"]
-            self._state.generation = 0
-            # The step feeds the paths a unit-norm direction, so derive rates at
-            # mu_eff = 1 too.
-            n = subspace.subspace_dim
-            mu_eff = float(subspace.mu_eff) if getattr(subspace, "_mu_eff_explicit", False) else 1.0
-            hyperparams = compute_cma_hyperparameters(n, mu_eff)
-            self._cma_params = {
-                **hyperparams,
-                # A rate the caller set explicitly wins over the derived one.
-                **getattr(subspace, "_explicit_rates", {}),
-                "mu_eff": mu_eff,
-                "cov_min": subspace.cov_min,
-                "cov_max": subspace.cov_max,
-            }
-            # Write back so the attribute reports what the step actually runs at.
-            subspace.mu_eff = mu_eff
 
     def _init_blocks(
         self,
@@ -1115,8 +984,6 @@ class PolyStepOptimizer(SerializationMixin):
 
     def _get_epsilon(self, iteration: int) -> float:
         """Resolve epsilon at current iteration."""
-        if self._progressive_epsilon is not None:
-            return validate_positive(self._progressive_epsilon.at(iteration), "epsilon")
         if hasattr(self.epsilon, "at"):
             return validate_positive(self.epsilon.at(iteration), "epsilon")
         return validate_positive(self.epsilon, "epsilon")
@@ -1230,17 +1097,6 @@ class PolyStepOptimizer(SerializationMixin):
             return True  # may be slower without AMX
         else:
             return True  # let PyTorch error if unsupported
-
-    def _invalidate_reuse_cache(self) -> None:
-        """Drop cached cost rows, rotations, and probe state when the cost geometry changes."""
-        self._prev_cost_matrix = None
-        self._prev_rot_mats = None
-        self._losses_3d = None
-        self._prev_X = None
-        self._prev_k_eff = None
-        self._prev_step_r = None
-        self._prev_probe_r = None
-        self._prev_objective_token = None
 
     @property
     def compile_evaluator(self) -> bool:
@@ -1420,32 +1276,14 @@ class PolyStepOptimizer(SerializationMixin):
             closure: ``closure(batched_params) -> losses``, where ``batched_params``
                 is ``{key: (N, *shape)}`` and ``losses`` has shape ``(N,)``.
             screen_closure: Cheap-fidelity closure for ``multifidelity_screen``.
-            objective_token: Identity of the objective ``closure`` measures; when it
-                changes, cached cost rows are not reused. Leave ``None`` for a
-                stationary objective.
+            objective_token: Identity of the objective ``closure`` measures; a change
+                drops the pending trust-region comparison. ``None`` or a constant means
+                a stationary objective.
 
         Returns:
             Mean raw model cost for this step.
         """
         if objective_token != self._prev_objective_token:
-            if (
-                self._adaptive_probes_explicit
-                and self._adaptive_probes
-                and self._prev_cost_matrix is not None
-                and not self._objective_token_warned
-            ):
-                self._objective_token_warned = True
-                warnings.warn(
-                    "adaptive_probes=True but the objective changed between steps "
-                    "(objective_token differs), so no cached cost rows can be reused and no "
-                    "forward evaluations are saved. Reuse is only sound for a stationary "
-                    "objective, e.g. full-batch training. Turning it off for this run.",
-                    stacklevel=2,
-                )
-                # A moving objective never reuses, so stop paying for the X clone and
-                # the retained cost matrix every step.
-                self._adaptive_probes = False
-            self._invalidate_reuse_cache()
             # A prediction on the previous minibatch cannot be scored against this one.
             self._prev_predicted_improvement = None
             self._prev_pre_step_loss = None
@@ -1552,12 +1390,6 @@ class PolyStepOptimizer(SerializationMixin):
         # one broadcast stale row.
         if state.velocity is not None:
             state.velocity = torch.zeros_like(new_X)
-        if state.p_c is not None:
-            state.p_c = torch.zeros(sub_dim, dtype=new_X.dtype, device=new_X.device)
-        if state.p_sigma is not None:
-            state.p_sigma = torch.zeros(sub_dim, dtype=new_X.dtype, device=new_X.device)
-        if state.C_diag is not None:
-            state.C_diag = torch.ones(sub_dim, dtype=new_X.dtype, device=new_X.device)
 
         if isinstance(self.subspace, HybridSubspace):
             state.displacement_history = torch.zeros(
@@ -1580,7 +1412,7 @@ class PolyStepOptimizer(SerializationMixin):
         num_points = state.X.shape[0]
         state.a = torch.ones(num_points, device=state.X.device, dtype=state.X.dtype) / num_points
 
-        # Duals, directions, and the reuse cache were measured in the outgoing basis.
+        # Duals and directions were measured in the outgoing basis.
         invalidate_for_basis_change(self, state)
 
         # Record only once the rebuild succeeded.
@@ -1589,45 +1421,6 @@ class PolyStepOptimizer(SerializationMixin):
         logger.info(
             f"Rank transition: rank={new_rank}, subspace_dim={self.subspace.subspace_dim}, particles={num_points}"
         )
-
-    def _update_sampling_projection(self) -> None:
-        """Cache the coord-to-param projection, covariance-scaled under CMA.
-
-        Absorbs first when the scaling moved, since rescaling under a nonzero ``X``
-        moves the represented parameters without any candidate scoring the move.
-        """
-        state = self._state
-        proj = state.projection
-        if not (
-            self._cma_subspace
-            and self.use_covariance_adaptation
-            and isinstance(proj, torch.Tensor)
-            and state.C_diag is not None
-        ):
-            self._sampling_projection = proj
-            return
-
-        # Compare by identity, not value, to skip work on unchanged steps.
-        previous_C = getattr(self, "_sampling_C_diag", None)
-        if previous_C is state.C_diag and getattr(self, "_sampling_proj_src", None) is proj:
-            return
-        if previous_C is not None and previous_C.shape == state.C_diag.shape and self._sampling_projection is not None:
-            flat = state.X.reshape(-1)[: state.subspace.subspace_dim]
-            if bool(flat.any()):
-                # Absorb under the projection X was measured in, before the buffer is
-                # overwritten with the new scaling.
-                state.base_params, _ = state.subspace.absorb(self._sampling_projection, state.base_params, flat)
-                self._base_params = state.base_params
-                state.X = torch.zeros_like(state.X)
-                # Re-anchoring changes the metric, so cached directions index the old frame.
-                invalidate_for_basis_change(self, state)
-            else:
-                # The coord-to-param map moved, so cached costs no longer describe their points.
-                self._invalidate_reuse_cache()
-
-        self._sampling_C_diag = state.C_diag
-        self._sampling_proj_src = proj
-        self._sampling_projection = self.subspace.apply_covariance_scaling(proj, state.C_diag)
 
     def resync_from_model(self) -> None:
         """Re-read particle state from the model's current weights, after external writes."""
@@ -1645,7 +1438,6 @@ class PolyStepOptimizer(SerializationMixin):
         self._state.g = None
         self._state.prev_prev_f = None
         self._state.prev_prev_g = None
-        self._invalidate_reuse_cache()
         # These were measured at the old anchor; keep them and the next step coasts
         # on a stale direction.
         self._amortize_counter = 0
@@ -1687,9 +1479,6 @@ class PolyStepOptimizer(SerializationMixin):
                 self.subspace.build_fused_projection(state.hybrid_projections)
         if state.projection is not None:
             state.projection = _move(state.projection)
-        self._sampling_projection = None
-        self._sampling_C_diag = None
-        self._sampling_proj_src = None
 
     def _write_params(self, sd: dict) -> None:
         """Copy the parameter entries of ``sd`` into the live parameters, once per step.
@@ -1712,25 +1501,8 @@ class PolyStepOptimizer(SerializationMixin):
             # Flatten X back to subspace coords, then rebuild params from base + perturb.
             X = state.X  # (num_sub_particles, particle_dim)
             flat_sub = X.reshape(-1)[: state.subspace.subspace_dim]
-            if self._per_layer_projections:
-                full_sd = state.subspace.apply_perturbation(
-                    state.hybrid_projections,
-                    state.base_params,
-                    flat_sub,
-                )
-            elif self._adaptive:
-                # Use the step's cached projection so the sync matches the probe metric.
-                proj = self._sampling_projection if self._sampling_projection is not None else state.projection
-                full_sd = state.subspace.apply_perturbation(
-                    proj,
-                    state.base_params,
-                    flat_sub,
-                )
-            else:
-                full_sd = state.subspace.apply_perturbation(
-                    state.base_params,
-                    flat_sub,
-                )
+            proj = state.hybrid_projections if self._per_layer_projections else state.projection
+            full_sd = state.subspace.apply_perturbation(proj, state.base_params, flat_sub)
             self._write_params(full_sd)
         else:
             particles_2d = state.X

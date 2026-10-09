@@ -257,7 +257,6 @@ def test_svd_ratio_at_start(step, total, expected):
 
 def _absorb_schedules(**kwargs):
     """One subspace per class, all sharing the absorb schedule under test."""
-    from polystep.cma_subspace import CMAAdaptiveSubspace
     from polystep.factored_subspace import FactoredSubspace
     from polystep.hybrid_subspace import HybridSubspace
 
@@ -266,21 +265,20 @@ def _absorb_schedules(**kwargs):
         "adaptive": base,
         "hybrid": HybridSubspace(specs=(), subspace_dim=10, compression_ratio=0.1, **kwargs),
         "factored": FactoredSubspace(specs=(), subspace_dim=10, compression_ratio=0.1, **kwargs),
-        "cma": CMAAdaptiveSubspace.from_adaptive_subspace(base),
     }
 
 
 class TestShouldAbsorb:
     """The absorb schedule, checked on every subspace class that exposes it."""
 
-    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored", "cma"])
+    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored"])
     def test_stagnation_fires_at_the_patience_boundary(self, kind):
         sub = _absorb_schedules(absorb_mode="stagnation", absorb_patience=20)[kind]
         assert not sub.should_absorb(stagnation_count=19, iteration=50)
         assert sub.should_absorb(stagnation_count=20, iteration=50)
         assert sub.should_absorb(stagnation_count=25, iteration=50)
 
-    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored", "cma"])
+    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored"])
     def test_periodic_fires_on_multiples_and_skips_iteration_zero(self, kind):
         sub = _absorb_schedules(absorb_mode="periodic", absorb_interval=10)[kind]
         assert not sub.should_absorb(stagnation_count=0, iteration=0)
@@ -289,7 +287,7 @@ class TestShouldAbsorb:
         assert sub.should_absorb(stagnation_count=0, iteration=10)
         assert sub.should_absorb(stagnation_count=0, iteration=20)
 
-    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored", "cma"])
+    @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored"])
     def test_periodic_with_zero_interval_never_fires(self, kind):
         sub = _absorb_schedules(absorb_mode="periodic", absorb_interval=0)[kind]
         assert not sub.should_absorb(stagnation_count=100, iteration=100)

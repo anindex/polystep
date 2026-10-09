@@ -218,7 +218,6 @@ class TestAndersonAcceleration:
         [
             ({"omega": 1.5}, (8, 8), 500),
             ({"anderson_depth": 3}, (10, 8), 2000),
-            ({"data_dependent_init": True}, (10, 8), 2000),
             ({"adaptive_omega": True}, (10, 8), 2000),
         ],
     )
@@ -269,83 +268,6 @@ class TestAndersonAcceleration:
         # Transport plan must be finite (no NaN propagation)
         P = result.matrix
         assert torch.isfinite(P).all(), f"noise={noise}: Transport matrix contains NaN or Inf"
-
-
-class TestDataDependentInit:
-    """Tests for data-dependent initialization in Sinkhorn solver (convergence acceleration)."""
-
-    def test_cold_start_fewer_iterations(self):
-        """data_dependent_init=True converges in fewer iterations than False on cold start."""
-        torch.manual_seed(42)
-        n, m = 15, 15
-        C = torch.rand(n, m)
-
-        solver_cold = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=5000,
-            threshold=1e-6,
-            check_every=1,
-            compile=False,
-            data_dependent_init=False,
-        )
-        result_cold = solver_cold.solve(C)
-
-        solver_ddi = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=5000,
-            threshold=1e-6,
-            check_every=1,
-            compile=False,
-            data_dependent_init=True,
-        )
-        result_ddi = solver_ddi.solve(C)
-
-        assert result_cold.converged, f"Cold start did not converge in {result_cold.n_iters} iters"
-        assert result_ddi.converged, f"DDI did not converge in {result_ddi.n_iters} iters"
-        assert result_ddi.n_iters <= result_cold.n_iters, (
-            f"DDI ({result_ddi.n_iters} iters) should be <= cold ({result_cold.n_iters} iters)"
-        )
-
-    def test_warm_start_bypasses_init(self):
-        """data_dependent_init=True with init_f/init_g uses warm-start, not data-dependent init."""
-        torch.manual_seed(42)
-        n, m = 10, 10
-        C = torch.rand(n, m)
-
-        # First solve to get warm-start potentials
-        solver_base = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-8,
-            compile=False,
-        )
-        result_base = solver_base.solve(C)
-
-        # With DDI + warm-start: should use warm-start (same as without DDI + warm-start)
-        solver_ddi_warm = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-8,
-            compile=False,
-            data_dependent_init=True,
-        )
-        result_ddi_warm = solver_ddi_warm.solve(C, init_f=result_base.f, init_g=result_base.g)
-
-        solver_warm = SinkhornSolver(
-            epsilon=0.1,
-            max_iterations=2000,
-            threshold=1e-8,
-            compile=False,
-            data_dependent_init=False,
-        )
-        result_warm = solver_warm.solve(C, init_f=result_base.f, init_g=result_base.g)
-
-        assert torch.allclose(result_ddi_warm.f, result_warm.f, atol=1e-10), (
-            f"f difference: {(result_ddi_warm.f - result_warm.f).abs().max():.2e}"
-        )
-        assert torch.allclose(result_ddi_warm.g, result_warm.g, atol=1e-10), (
-            f"g difference: {(result_ddi_warm.g - result_warm.g).abs().max():.2e}"
-        )
 
 
 def test_ill_conditioned_stays_finite():

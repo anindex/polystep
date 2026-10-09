@@ -5,7 +5,6 @@ from .greedy import MinCostGreedySolver, TopKMeanSolver
 from .kl_softmax import KLSoftmaxSolver
 from .sinkhorn import SinkhornSolver, SinkhornResult
 from .softmax import SoftmaxSolver
-from .tempered_softmax import TemperedSoftmaxSolver
 
 __all__ = [
     "SolverResult",
@@ -15,5 +14,4 @@ __all__ = [
     "SinkhornResult",
     "SoftmaxSolver",
     "KLSoftmaxSolver",
-    "TemperedSoftmaxSolver",
 ]

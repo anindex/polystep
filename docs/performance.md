@@ -87,11 +87,10 @@ new `objective_token` whenever the objective changes. Minibatch changes and
 momentum-only steps invalidate the deferred comparison; `train()` rejects this
 controller. Use a stationary objective with the manual step API.
 
-`adaptive_probes` can reuse losses only when the whole configuration and objective
-are unchanged. `amortize_steps` skips evaluations between sampled updates.
-`multifidelity_screen` uses a smaller batch to select candidates for full evaluation;
-it requires `screen_fidelity / num_probe + screen_keep_ratio < 1` and cannot run with
-the quadratic model. Measure quality at equal evaluation and time budgets.
+`amortize_steps` skips evaluations between sampled updates. `multifidelity_screen`
+uses a smaller batch to select candidates for full evaluation; it requires
+`screen_fidelity / num_probe + screen_keep_ratio < 1` and cannot run with the
+quadratic model. Measure quality at equal evaluation and time budgets.
 
 ## CPU measurements
 

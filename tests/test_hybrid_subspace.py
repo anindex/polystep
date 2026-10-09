@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 
 from polystep.cost_nn import NNCostEvaluator
-from polystep.hybrid_subspace import HybridSubspace, LayerProjectionSpec, create_hybrid_blocks
+from polystep.hybrid_subspace import HybridSubspace
 from polystep.optimizer import RankSchedule
+from polystep.subspace import ProjectionSpec
 from polystep.transform import ParamLayout
 
 
@@ -41,7 +42,7 @@ def hybrid_sub(layout):
 
 class TestHybridFromLayout:
     def test_from_layout_creates_correct_specs(self, layout):
-        """from_layout creates LayerProjectionSpecs matching layout entries."""
+        """from_layout creates ProjectionSpecs matching layout entries."""
         hybrid = HybridSubspace.from_layout(layout, rank=4)
 
         assert len(hybrid.specs) == len(layout.entries)
@@ -247,7 +248,7 @@ class TestHybridRotateDisplacement:
     def test_a_wide_spec_is_rejected_by_both_projection_paths(self, hybrid_sub):
         """num_coords > num_params must be rejected: QR would silently drop columns
         and a Gaussian would move at the wrong scale."""
-        spec = LayerProjectionSpec(
+        spec = ProjectionSpec(
             entry_key="w",
             original_shape=(3, 7),
             num_params=21,
@@ -272,7 +273,7 @@ class TestHybridRotateDisplacement:
     def test_rotate_displacement_tall_layer_unit_norm_columns(self, hybrid_sub):
         """Tall layers keep unit-norm columns after rotation, matching init, so
         there is no sqrt(N) magnitude jump on the first rotation."""
-        spec = LayerProjectionSpec(
+        spec = ProjectionSpec(
             entry_key="w",
             original_shape=(20, 10),
             num_params=200,
@@ -323,37 +324,6 @@ class TestHybridRotateDisplacement:
                     any_different = True
                     break
         assert any_different
-
-
-class TestCreateHybridBlocks:
-    def test_create_hybrid_blocks_correct_count(self, hybrid_sub):
-        """create_hybrid_blocks creates one block per spec."""
-        blocks = create_hybrid_blocks(hybrid_sub, particle_dim=8)
-        assert len(blocks) == len(hybrid_sub.specs)
-
-    def test_create_hybrid_blocks_names_match_specs(self, hybrid_sub):
-        """Block names match spec entry_keys."""
-        blocks = create_hybrid_blocks(hybrid_sub, particle_dim=8)
-        for block, spec in zip(blocks, hybrid_sub.specs):
-            assert block.name == spec.entry_key
-
-    def test_create_hybrid_blocks_contiguous(self, hybrid_sub):
-        """Block flat ranges are contiguous."""
-        blocks = create_hybrid_blocks(hybrid_sub, particle_dim=8)
-        prev_end = 0
-        for block in blocks:
-            assert block.flat_start == prev_end
-            assert block.flat_end > block.flat_start
-            prev_end = block.flat_end
-
-    def test_create_hybrid_blocks_particle_dim(self, hybrid_sub):
-        """All blocks have the specified particle_dim."""
-        particle_dim = 8
-        blocks = create_hybrid_blocks(hybrid_sub, particle_dim=particle_dim)
-        for block in blocks:
-            assert block.particle_dim == particle_dim
-            assert block.num_particles > 0
-            assert block.flat_end - block.flat_start == block.num_particles * particle_dim
 
 
 def test_optimizer_detects_hybrid_mode(model):
@@ -691,7 +661,7 @@ class TestHybridReconstructionProperties:
 
     def test_tied_weights_are_projected_once(self):
         """A tied embedding/lm_head pair must produce exactly one
-        :class:`LayerProjectionSpec` instead of one per state_dict key.
+        :class:`ProjectionSpec` instead of one per state_dict key.
         """
 
         class _TiedHead(nn.Module):

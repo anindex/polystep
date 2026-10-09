@@ -33,18 +33,12 @@ class TrainConfig:
     """
 
     epochs: int = 10
-    batch_size: int = 32
-    log_every: int = 10
     callbacks: Optional[List[TrainCallback]] = None
     restore_best: bool = True
 
     def __post_init__(self):
         if self.epochs <= 0:
             raise ValueError(f"epochs must be > 0, got {self.epochs}")
-        if self.batch_size <= 0:
-            raise ValueError(f"batch_size must be > 0, got {self.batch_size}")
-        if self.log_every <= 0:
-            raise ValueError(f"log_every must be > 0, got {self.log_every}")
         if self.callbacks is None:
             self.callbacks = []
 
@@ -67,13 +61,7 @@ def train(
             "Drop trust_region, or drive optimizer.step() on a fixed batch."
         )
     was_training = model.training
-    evaluator = NNCostEvaluator(
-        model,
-        loss_fn=loss_fn,
-        compile_vmap=getattr(optimizer, "compile_evaluator", False),
-        compile_forward=getattr(optimizer, "compile_forward", False),
-        autocast_dtype=getattr(optimizer, "_candidate_autocast_dtype", None),
-    )
+    evaluator = NNCostEvaluator(model, loss_fn)
     callbacks = list(config.callbacks)
     global_step = 0
     stop = False
@@ -122,7 +110,6 @@ def train(
                 # Without this the fused in-place, factored and sparse-delta evaluators never run.
                 optimizer.register_evaluator(evaluator, cost_inputs, cost_targets)
 
-                # objective_token: every batch is a different objective, so cached rows from the last step don't describe this one.
                 optimizer.step(
                     closure,
                     screen_closure=optimizer.screen_closure_from(closure, cost_inputs, cost_targets),

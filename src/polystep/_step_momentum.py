@@ -10,7 +10,6 @@ import torch
 def step_momentum(opt, closure: Callable) -> float:
     """Cheap step: reapply the last direction with decay, no forward passes."""
     state = opt._state
-    opt._update_sampling_projection()
     if opt._transport_direction_ema is None:
         return state.costs[-1] if state.costs else float("inf")
 
@@ -33,8 +32,6 @@ def step_momentum(opt, closure: Callable) -> float:
         state.X = X_old
         opt._transport_direction_ema = None
         opt._newton_direction = None
-        # X_old is a momentum position after the first step, so the cached rows still describe somewhere the particles left.
-        opt._invalidate_reuse_cache()
         opt._sync_model()
         prev_cost = state.costs[-1] if state.costs else float("inf")
         state.costs.append(prev_cost)
@@ -44,9 +41,6 @@ def step_momentum(opt, closure: Callable) -> float:
         state.record_solver_health(evals=0)
         state.iteration_count += 1
         return prev_cost
-
-    # The particles moved, so the adaptive-probe cache is stale; its reuse guards wouldn't catch it.
-    opt._invalidate_reuse_cache()
 
     opt._sync_model()
 

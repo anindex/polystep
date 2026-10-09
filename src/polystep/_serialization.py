@@ -7,7 +7,7 @@ import torch
 
 # state_dict schema version. Bump when a key changes meaning.
 # 1: SolverState only. 2: adds "control". 3: rotation-bias and quadratic-model state.
-# 4: jitter pool and CMA sampling-projection cache.
+# 4: jitter pool.
 # 5: whole-model (summed) trust prediction and incumbent-only comparisons.
 _STATE_DICT_FORMAT = 5
 
@@ -20,13 +20,6 @@ _CONTROL_STATE_KEYS = (
     "_trust_region_multiplier",
     "_prev_predicted_improvement",
     "_prev_pre_step_loss",
-    "_prev_cost_matrix",
-    "_prev_rot_mats",
-    "_losses_3d",
-    "_prev_X",
-    "_prev_k_eff",
-    "_prev_step_r",
-    "_prev_probe_r",
     # Read before they are written on the next step.
     "_prev_descent_direction",
     "_prev_descent_direction_finite",
@@ -40,9 +33,6 @@ _CONTROL_STATE_KEYS = (
     "_applied_rank",
     # Batched jitter draws not yet consumed.
     "_jitter_pool",
-    # What the cached sampling projection was built from.
-    "_sampling_C_diag",
-    "_sampling_proj_src",
 )
 
 
@@ -154,7 +144,6 @@ class SerializationMixin:
         # Restore the optimizer-owned control state; format-0 checkpoints drop the caches.
         control = sd.get("control")
         if control is None:
-            self._invalidate_reuse_cache()
             self._transport_direction_ema = None
         else:
             for name in _CONTROL_STATE_KEYS:
@@ -182,24 +171,6 @@ class SerializationMixin:
             else:
                 self._prev_predicted_improvement = None
                 self._prev_pre_step_loss = None
-
-        # Rebuild the scaled projection the restored cache describes. The saved copies
-        # stay distinct objects from the live state: _update_sampling_projection skips
-        # its work on an identity match, and CMA rebinds C_diag every step, so making
-        # them identical here would make the first resumed step skip an absorb the
-        # uninterrupted run performs.
-        src, C = getattr(self, "_sampling_proj_src", None), getattr(self, "_sampling_C_diag", None)
-        if isinstance(src, torch.Tensor) and C is not None:
-            self._sampling_projection = self.subspace.apply_covariance_scaling(src, C)
-        else:
-            if fmt < 4 and self.use_covariance_adaptation:
-                warnings.warn(
-                    "pre-format-4 checkpoint under use_covariance_adaptation: it carries no "
-                    "sampling-projection cache, so the resumed run samples from a projection "
-                    "the saved coordinates were not measured under. Re-checkpoint for exact resume.",
-                    stacklevel=2,
-                )
-            self._sampling_projection = None
 
         # The fused block-diagonal projection caches the step-0 basis; the checkpoint carries a later one.
         if self._hybrid and hasattr(self.subspace, "build_fused_projection"):

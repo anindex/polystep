@@ -9,7 +9,7 @@ import torch
 
 from ._compiled import CompiledFunctions
 from .costs import compute_cost_matrix
-from .epsilon import feed_solver_stats, resolve_radius, LinearEpsilon
+from .epsilon import feed_solver_stats, resolve_radius, LinearEpsilon, ProgressiveEpsilon
 from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
 from .solvers import SinkhornSolver, SoftmaxSolver
 from .solvers._shared import solver_health, validate_positive
@@ -45,11 +45,6 @@ class SolverState:
     displacement_history_idx: int = 0
     displacement_history_count: int = 0
     absorb_count: int = 0
-    # CMA-ES state
-    p_c: Optional[torch.Tensor] = None
-    p_sigma: Optional[torch.Tensor] = None
-    C_diag: Optional[torch.Tensor] = None
-    generation: int = 0
     # Dual potential momentum
     prev_prev_f: Optional[torch.Tensor] = None
     prev_prev_g: Optional[torch.Tensor] = None
@@ -90,10 +85,6 @@ class PolyStep:
     sinkhorn_max_iters: int = 2000
     chunk_size: Optional[int] = None
     compile: bool = False
-    subspace: Optional[object] = None
-    nn_evaluator: Optional[object] = None
-    train_inputs: Optional[object] = None
-    train_targets: Optional[object] = None
 
     def __post_init__(self):
         """Initialize derived state: polytope template, probes, solver, compiled fns."""
@@ -103,6 +94,8 @@ class PolyStep:
                 "empty probe tensor, so the cost matrix is a mean over nothing (NaN) "
                 "and every step becomes a no-op with a fabricated finite cost."
             )
+        if isinstance(self.epsilon, ProgressiveEpsilon) and self.ent_epsilon is not None:
+            raise ValueError("ProgressiveEpsilon adapts the solve epsilon; it cannot be combined with ent_epsilon.")
 
         self.polytope_vertices = POLYTOPE_MAP[self.polytope_type](self.dim, radius=1.0)
         self.probes = torch.linspace(0, 1, self.num_probe + 2)[1 : self.num_probe + 1]
@@ -125,12 +118,8 @@ class PolyStep:
 
         return cls(objective_fn=objective_fn, dim=dim, **kwargs)
 
-    def init_state(
-        self,
-        X_init: torch.Tensor,
-        base_params: Optional[dict] = None,
-    ) -> SolverState:
-        """Initialize solver state from ``X_init`` and optional ``base_params``."""
+    def init_state(self, X_init: torch.Tensor) -> SolverState:
+        """Initialize solver state from ``X_init``."""
         # Normalize a 1-D point to one particle so the marginal ``a`` is sized by particle count, not dim.
         if X_init.dim() == 1:
             X_init = X_init.unsqueeze(0)
@@ -148,13 +137,7 @@ class PolyStep:
                 stacklevel=2,
             )
 
-        state = SolverState(X=X_init.clone(), a=a)
-
-        if self.subspace is not None and base_params is not None:
-            state.base_params = base_params
-            state.subspace = self.subspace
-
-        return state
+        return SolverState(X=X_init.clone(), a=a)
 
     def _solver_for(self, state: SolverState):
         """The solver this state's particle count needs, without mutating ``self``.
@@ -231,26 +214,11 @@ class PolyStep:
             probe_radius,
         )
 
-        if state.subspace is not None and self.nn_evaluator is not None:
-            # Subspace mode: reconstruct full params from subspace probes.
-            P, V, K, D = X_probe.shape
-            flat_probes = X_probe.reshape(P * V * K, D)
-            stacked_params = state.subspace.reconstruct_batch(
-                state.base_params,
-                flat_probes,
-            )
-            losses = self.nn_evaluator.evaluate(
-                stacked_params,
-                self.train_inputs,
-                self.train_targets,
-            )
-            cost_matrix = losses.reshape(P, V, K).mean(dim=-1)
-        else:
-            cost_matrix = compute_cost_matrix(
-                self.objective_fn,
-                X_probe,
-                chunk_size=self.chunk_size,
-            )
+        cost_matrix = compute_cost_matrix(
+            self.objective_fn,
+            X_probe,
+            chunk_size=self.chunk_size,
+        )
 
         # No sanitize here: prepare_cost does it; a second pass would double-penalize.
 
@@ -322,13 +290,7 @@ class PolyStep:
         X_init: torch.Tensor,
         generator: Optional[torch.Generator] = None,
     ) -> SolverState:
-        """Run the full outer loop; subspace mode raises (it needs ``init_state``'s ``base_params``)."""
-        if self.subspace is not None:
-            raise ValueError(
-                "PolyStep.run() cannot drive subspace mode: the subspace needs "
-                "base_params, which only init_state() accepts. Call "
-                "init_state(X_init, base_params=...) and step() in your own loop."
-            )
+        """Run the full outer loop."""
         state = self.init_state(X_init)
 
         for i in range(self.max_iterations):

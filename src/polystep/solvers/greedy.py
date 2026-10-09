@@ -14,7 +14,6 @@ class MinCostGreedySolver:
     """Greedy argmin: each particle moves to its single lowest-cost vertex."""
 
     epsilon: float = 0.1
-    compile: bool = False
 
     def solve(
         self,
@@ -58,7 +57,6 @@ class TopKMeanSolver:
     """Top-K mean: each particle moves to the uniform average of its k lowest-cost vertices."""
 
     epsilon: float = 0.1
-    compile: bool = False
     k: int = 3
 
     def __post_init__(self):

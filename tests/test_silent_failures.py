@@ -181,71 +181,6 @@ def _constant_closure(value, counter):
     return closure
 
 
-def test_adaptive_probes_do_not_reuse_costs_across_objectives():
-    torch.manual_seed(0)
-    opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, adaptive_probes=True, adaptive_probes_threshold=1e9)
-    calls = [0]
-
-    opt.step(_constant_closure(1.0, calls), objective_token=0)
-    calls[0] = 0
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        cost = opt.step(_constant_closure(9.0, calls), objective_token=1)
-
-    assert calls[0] > 0
-    assert cost == pytest.approx(9.0)
-
-
-def test_adaptive_probes_still_reuse_for_a_stationary_objective():
-    """A caller asserts stationarity by passing an objective_token that does not change."""
-    torch.manual_seed(0)
-    opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, adaptive_probes=True, adaptive_probes_threshold=1e9)
-    calls = [0]
-
-    opt.step(_constant_closure(1.0, calls), objective_token="full-batch")
-    calls[0] = 0
-    opt.step(_constant_closure(1.0, calls), objective_token="full-batch")
-    assert calls[0] == 0
-
-
-def test_adaptive_probes_do_not_reuse_without_an_objective_token():
-    """A minibatch loop that passes no token would score this batch with the last one's costs."""
-    torch.manual_seed(0)
-    opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, adaptive_probes=True, adaptive_probes_threshold=1e9)
-    calls = [0]
-
-    opt.step(_constant_closure(1.0, calls))
-    calls[0] = 0
-    opt.step(_constant_closure(1.0, calls))
-    assert calls[0] > 0
-
-
-def test_adaptive_probes_reuse_cannot_latch_on_a_drifting_particle():
-    """Drift is measured from the cached matrix, not from the previous step, so
-    many small steps must eventually trip the reuse gate.
-    """
-    torch.manual_seed(0)
-    model = nn.Linear(8, 4)
-    opt = PolyStepOptimizer(model, seed=0, adaptive_probes=True, step_radius=1e-3, epsilon=0.3)
-
-    start = model.weight.detach().clone()
-    losses = [opt.step(_quadratic_closure) for _ in range(8)]
-
-    # The particle drifts: each step is under the threshold, the total is well over it.
-    assert (model.weight.detach() - start).pow(2).sum() > opt._adaptive_probes_threshold
-    # So the costs must be re-measured rather than reused for the whole run.
-    assert len(set(losses)) > 1
-
-
-def test_amortized_step_invalidates_the_reuse_cache():
-    """A cheap momentum step moves the particles; the cached rows describe the old spot."""
-    torch.manual_seed(0)
-    opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, amortize_steps=4, adaptive_probes=True)
-    for _ in range(2):  # one OT step, then one momentum step
-        opt.step(_quadratic_closure)
-    assert opt._prev_cost_matrix is None
-
-
 def test_blockwise_biased_rotation_runs_under_bfloat16():
     """Block-wise biased rotation must run under bfloat16 mixed precision."""
     torch.manual_seed(0)
@@ -693,16 +628,6 @@ class TestAuditSilentFailures:
         opt._applied_rank = 7
         opt.load_state_dict(sd)
         assert opt._applied_rank == 7
-
-    def test_covariance_adaptation_is_rejected_on_a_sparse_projection(self):
-        """C_diag, p_c and p_sigma updated every step and reached nothing."""
-        from polystep.cma_subspace import CMAAdaptiveSubspace
-
-        model = nn.Sequential(nn.Linear(200, 60), nn.Linear(60, 10))
-        full = sum(p.numel() for p in model.parameters())
-        sub = CMAAdaptiveSubspace(full_dim=full, subspace_dim=16)
-        with pytest.raises(ValueError, match="dense projection"):
-            PolyStepOptimizer(model, subspace=sub, projection_type="sparse", use_covariance_adaptation=True, seed=0)
 
     def test_a_user_supplied_solver_keeps_its_own_temperature(self):
         """tell() overwrote it with PolyStepES.epsilon on every call."""

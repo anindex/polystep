@@ -40,7 +40,7 @@ def test_fused_matrix_tracks_the_basis_across_an_aligned_absorb():
         absorb_interval=2,
         absorb_aligned_active=True,
     )
-    opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.1, step_radius=0.05, adaptive_probes=False)
+    opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.1, step_radius=0.05)
     x = torch.randn(8, 16)
     y = torch.randint(0, 4, (8,))
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
@@ -79,7 +79,6 @@ def test_blockwise_mode_still_rotates_a_per_layer_subspace():
         epsilon=0.1,
         step_radius=0.05,
         block_strategy="per_layer",
-        adaptive_probes=False,
     )
     x = torch.randn(8, 16)
     y = torch.randint(0, 4, (8,))

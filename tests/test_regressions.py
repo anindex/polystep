@@ -8,7 +8,6 @@ import pytest
 from torch.func import functional_call
 
 from polystep import ParamLayout, PolyStepOptimizer
-from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.cost_nn import NNCostEvaluator
 from polystep.geometry import apply_biased_rotation, get_random_rotation_matrices
 
@@ -374,17 +373,13 @@ class TestLargeCostOffsetStability:
         # back in the raw frame: <C_raw, P> = 1e6 at unit mass.
         assert kl_result.cost == pytest.approx(1_000_000.0, rel=1e-6)
 
-    @pytest.mark.parametrize("solver_name", ["softmax", "tempered"])
-    def test_softmax_no_nan_at_extreme_epsilon(self, solver_name):
+    def test_softmax_no_nan_at_extreme_epsilon(self):
         """A finite cost with a huge negative entry must not NaN the softmax;
         the limiting weights put all mass on the minimum-cost vertex."""
-        from polystep.solvers import SoftmaxSolver, TemperedSoftmaxSolver
+        from polystep.solvers import SoftmaxSolver
 
         C = torch.tensor([[-1e20, 0.0]], dtype=torch.float32)
-        if solver_name == "softmax":
-            W = SoftmaxSolver(epsilon=1e-20).solve(C).matrix
-        else:
-            W = TemperedSoftmaxSolver(tau=1e-20).solve(C).matrix
+        W = SoftmaxSolver(epsilon=1e-20).solve(C).matrix
         assert torch.isfinite(W).all(), W
         # a=[1.0]; all mass on the min-cost (col 0).
         assert torch.allclose(W, torch.tensor([[1.0, 0.0]]), atol=1e-5), W
@@ -492,104 +487,6 @@ class TestRotationPreservesPoint:
         assert median > 8.0, reductions
 
 
-class TestCMAWrapperIsWiredIn:
-    """An ``isinstance(AdaptiveSubspace)`` gate skips the wrapper entirely."""
-
-    def test_direct_construction_fills_hyperparameters(self):
-        """The bare constructor must not leave the ``0.0`` sentinels in place."""
-        from polystep.adaptive_subspace import AdaptiveSubspace
-        from polystep.cma_subspace import CMAAdaptiveSubspace
-
-        model = nn.Sequential(nn.Linear(20, 16), nn.ReLU(), nn.Linear(16, 4))
-        base = AdaptiveSubspace.auto_from_params(model)
-        direct = CMAAdaptiveSubspace(full_dim=base.full_dim, subspace_dim=base.subspace_dim)
-        factory = CMAAdaptiveSubspace.from_adaptive_subspace(base)
-
-        assert direct.c_mu > 0.0
-        for name in ("c_c", "c_sigma", "c_1", "c_mu", "mu_eff"):
-            assert getattr(direct, name) == pytest.approx(getattr(factory, name))
-
-    @pytest.mark.parametrize("mu_eff", [1.0, 7.0])
-    def test_explicit_mu_eff_reaches_the_evolution_path(self, mu_eff):
-        """The learning rates and the path update must use the same mu_eff.
-
-        From ``p_sigma = 0`` and ``C_diag = 1``, one step leaves
-        ``||p_sigma|| = sqrt(c_sigma (2 - c_sigma) mu_eff)``, readable off the norm.
-        """
-        import math
-
-        from polystep.adaptive_subspace import AdaptiveSubspace
-        from polystep.cma_subspace import CMAAdaptiveSubspace
-
-        model, closure, _ = _mlp_and_closure(0)
-        base = AdaptiveSubspace.auto_from_params(model)
-        sub = CMAAdaptiveSubspace.from_adaptive_subspace(base, mu_eff=mu_eff)
-        assert sub.mu_eff == mu_eff
-
-        opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.1, max_iterations=5, use_covariance_adaptation=True)
-        opt.step(closure)
-
-        c_sigma = opt._cma_params["c_sigma"]
-        expected = math.sqrt(c_sigma * (2 - c_sigma) * mu_eff)
-        assert opt.state.p_sigma.norm().item() == pytest.approx(expected, rel=1e-5)
-
-    def test_absorb_and_rotation_run_for_the_wrapper(self):
-        """Periodic absorb must fire and the projection must change."""
-        from polystep.adaptive_subspace import AdaptiveSubspace
-        from polystep.cma_subspace import CMAAdaptiveSubspace
-
-        model, closure, _ = _mlp_and_closure(0)
-        base = AdaptiveSubspace.auto_from_params(model)
-        base.absorb_mode = "periodic"
-        base.absorb_interval = 1
-        opt = PolyStepOptimizer(
-            model,
-            subspace=CMAAdaptiveSubspace.from_adaptive_subspace(base),
-            epsilon=0.1,
-            max_iterations=20,
-        )
-        first_projection = opt.state.projection.clone()
-        for _ in range(5):
-            opt.step(closure)
-
-        assert opt.state.absorb_count == 5
-        assert not torch.equal(first_projection, opt.state.projection)
-
-    def test_wrapper_delegates_absorb_settings(self):
-        """The constructor warning reads these through ``getattr`` on the subspace."""
-        from polystep.adaptive_subspace import AdaptiveSubspace
-        from polystep.cma_subspace import CMAAdaptiveSubspace
-
-        model = nn.Sequential(nn.Linear(20, 16), nn.ReLU(), nn.Linear(16, 4))
-        base = AdaptiveSubspace.auto_from_params(model)
-        wrapper = CMAAdaptiveSubspace.from_adaptive_subspace(base)
-        assert wrapper.absorb_mode == base.absorb_mode
-        assert wrapper.absorb_patience == base.absorb_patience
-        assert wrapper.absorb_interval == base.absorb_interval
-        assert wrapper.displacement_history_size == base.displacement_history_size
-
-
-def test_load_state_dict_drops_stale_reuse_cache():
-    """Reuse rows describe the pre-load point, so they must not survive a load."""
-    model, closure, _ = _mlp_and_closure(0)
-    opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10, adaptive_probes=True)
-    saved = opt.state_dict()
-    for _ in range(3):
-        opt.step(closure)
-
-    assert opt._prev_cost_matrix is not None
-
-    opt.load_state_dict(saved)
-    assert opt._prev_cost_matrix is None
-    assert opt._prev_rot_mats is None
-    assert opt._losses_3d is None
-    assert opt._prev_k_eff is None
-    assert opt._prev_step_r is None
-    assert opt._prev_probe_r is None
-    assert opt._newton_direction is None
-    assert opt._transport_direction_ema is None
-
-
 def test_fully_frozen_model_raises_clearly():
     """A model with no trainable parameters must say so, not fail deep in the layout."""
     model = nn.Sequential(nn.Linear(4, 4))
@@ -636,7 +533,7 @@ def test_rank_transition_carries_hybrid_config():
     assert opt.subspace.absorb_aligned_active is True
 
 
-def test_rank_transition_resets_momentum_and_cma_state():
+def test_rank_transition_resets_momentum():
     """Stale velocity either raises a shape error or broadcasts one row over all particles."""
     from polystep.hybrid_subspace import HybridSubspace
     from polystep.optimizer import RankSchedule
@@ -661,77 +558,6 @@ def test_newton_refinement_warns_at_default_num_probe():
     """The finite-difference model needs two probe scales; num_probe defaults to 1."""
     with pytest.warns(UserWarning, match="newton_refinement needs num_probe"):
         PolyStepOptimizer(nn.Linear(8, 4), epsilon=0.1, max_iterations=5, newton_refinement=True)
-
-
-def test_covariance_adaptation_preserves_trace():
-    """Without trace-scaling and the mean-1 renormalization, an uninformative step
-    shrinks every entry a little each generation and C_diag walks down to its floor.
-    """
-    from polystep.adaptive_subspace import AdaptiveSubspace
-    from polystep.cma_subspace import CMAAdaptiveSubspace
-
-    model, closure, _ = _mlp_and_closure(2)
-    base = AdaptiveSubspace.auto_from_params(model)
-    opt = PolyStepOptimizer(
-        model,
-        subspace=CMAAdaptiveSubspace.from_adaptive_subspace(base),
-        epsilon=0.1,
-        max_iterations=80,
-        use_covariance_adaptation=True,
-    )
-    for _ in range(40):
-        opt.step(closure)
-
-    assert opt.state.C_diag.mean().item() == pytest.approx(1.0, abs=1e-4)
-    assert opt.state.C_diag.min().item() > 0.1
-    # Clamping runs after the mean-1 rescale, so the declared bounds actually hold.
-    assert opt.state.C_diag.min().item() >= opt._cma_params["cov_min"]
-    assert opt.state.C_diag.max().item() <= opt._cma_params["cov_max"]
-
-
-def test_mu_eff_matches_the_unit_innovation_convention():
-    """The learning rates must be derived at the same mu_eff the paths run at.
-
-    The step feeds the evolution paths a unit-norm direction, i.e. mu_eff = 1.
-    """
-    from polystep.adaptive_subspace import AdaptiveSubspace
-    from polystep.cma_subspace import CMAAdaptiveSubspace
-
-    model = nn.Sequential(nn.Linear(20, 16), nn.ReLU(), nn.Linear(16, 4))
-    base = AdaptiveSubspace.auto_from_params(model)
-    opt = PolyStepOptimizer(
-        model,
-        subspace=CMAAdaptiveSubspace.from_adaptive_subspace(base),
-        epsilon=0.1,
-        max_iterations=5,
-        use_covariance_adaptation=True,
-    )
-    assert opt._cma_params["mu_eff"] == 1.0
-    n = opt.subspace.subspace_dim
-    assert opt._cma_params["c_sigma"] == pytest.approx(3.0 / (n + 4))
-    # Path memory must span many steps, not collapse to ~1.
-    assert 1.0 / opt._cma_params["c_sigma"] > 10.0
-
-
-@pytest.mark.gpu
-def test_cma_state_is_fp32_under_mixed_precision():
-    """bf16 rounds 1 + c_1*x back to 1, so the covariance would never move."""
-    from polystep.adaptive_subspace import AdaptiveSubspace
-    from polystep.cma_subspace import CMAAdaptiveSubspace
-
-    if not torch.cuda.is_available():
-        pytest.skip("mixed_precision requires CUDA")
-    model = nn.Sequential(nn.Linear(20, 16), nn.ReLU(), nn.Linear(16, 4)).cuda()
-    base = AdaptiveSubspace.auto_from_params(model)
-    opt = PolyStepOptimizer(
-        model,
-        subspace=CMAAdaptiveSubspace.from_adaptive_subspace(base),
-        epsilon=0.1,
-        max_iterations=5,
-        use_covariance_adaptation=True,
-        mixed_precision=True,
-    )
-    assert opt.state.C_diag.dtype == torch.float32
 
 
 def test_newton_step_survives_a_flat_coordinate():
@@ -939,7 +765,7 @@ class TestNaNRevertRestoresState:
     """A NaN step must clear the derived state, not merely leave it finite.
 
     A partial revert keeps running and stays finite, then poisons later steps through
-    momentum, the transport EMA, or sqrt(C_diag). A NaN loss does not reach this path
+    momentum or the transport EMA. A NaN loss does not reach this path
     (``sanitize_cost`` substitutes a penalty); a poisoned X or velocity does.
     """
 
@@ -992,41 +818,6 @@ class TestNaNRevertRestoresState:
         opt.state.X = torch.full_like(opt.state.X, float("nan"))
         opt.step(closure)
         assert opt._transport_direction_ema is None
-
-    def test_cma_state_returns_to_its_identity_not_merely_to_finite(self):
-        from polystep.adaptive_subspace import AdaptiveSubspace
-
-        model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
-        base = AdaptiveSubspace.auto_from_params(model)
-        opt = PolyStepOptimizer(
-            model,
-            subspace=CMAAdaptiveSubspace.from_adaptive_subspace(base),
-            epsilon=0.1,
-            use_covariance_adaptation=True,
-            seed=0,
-            compile=False,
-        )
-        x = torch.randn(8, 16, generator=torch.Generator().manual_seed(0))
-
-        def closure(batched_params):
-            n = next(iter(batched_params.values())).shape[0]
-            return torch.stack(
-                [
-                    functional_call(model, {k: v[i] for k, v in batched_params.items()}, (x,)).pow(2).mean()
-                    for i in range(n)
-                ]
-            )
-
-        for _ in range(2):
-            opt.step(closure)
-        assert not torch.allclose(opt.state.C_diag, torch.ones_like(opt.state.C_diag)), "covariance never adapted"
-
-        opt.state.X = torch.full_like(opt.state.X, float("nan"))
-        opt.step(closure)
-
-        torch.testing.assert_close(opt.state.C_diag, torch.ones_like(opt.state.C_diag))
-        assert torch.count_nonzero(opt.state.p_c) == 0
-        assert torch.count_nonzero(opt.state.p_sigma) == 0
 
 
 class TestAuditCrashes:

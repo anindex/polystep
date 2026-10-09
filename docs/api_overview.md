@@ -57,7 +57,6 @@ optimizer = PolyStepOptimizer(model, subspace=subspace)
 | `HybridSubspace` | Per-parameter projections with an optional total dimension cap |
 | `FactoredSubspace` | Matrix perturbations `dW = A @ B` with fixed `B` |
 | `AdaptiveSubspace` | Global projection updated from displacement history |
-| `CMAAdaptiveSubspace` | Adaptive subspace with diagonal covariance adaptation |
 
 Factored evaluation avoids candidate weight construction for supported sequential
 MLPs; other models use reconstructed candidates. Mixed-dtype models need a per-entry
@@ -98,7 +97,6 @@ optimizer = PolyStepOptimizer(
 | `subspace` | `None` | A constructed subspace instance |
 | `block_strategy` | `'monolithic'` | Also `'per_layer'` or `'grouped'` |
 | `chunk_size` | `None` | Automatic candidate chunk estimate |
-| `adaptive_probes` | Monolithic only | Reuses losses when state and objective are unchanged |
 | `adaptive_num_probe` | Monolithic, multiple probes | Reduces probe count after decreasing costs |
 
 Scalar radii are multiplied by epsilon. Scheduled radii supply their own scale:
@@ -110,9 +108,13 @@ schedule = CosineEpsilon(init=1.0, target=0.1, decay=0.01)
 optimizer = PolyStepOptimizer(model, epsilon=schedule)
 ```
 
+`ProgressiveEpsilon` adapts epsilon to how quickly Sinkhorn converges instead of
+following the step count. It needs an iterative solver and cannot be combined with
+`ent_epsilon`.
+
 Solver choices are `sinkhorn` (full-space default), `softmax` (subspace default),
-`kl_softmax`, `tempered_softmax`, `min_cost_greedy`, and `top_k_mean`. Sinkhorn
-constrains both marginals; softmax constrains only the source marginal.
+`kl_softmax`, `min_cost_greedy`, and `top_k_mean`. Sinkhorn constrains both
+marginals; softmax constrains only the source marginal.
 
 ## Evaluation controls
 
@@ -123,8 +125,9 @@ constrains both marginals; softmax constrains only the source marginal.
 | `compile_forward` | `None` | Automatic compilation on the in-place forward path |
 | `candidate_autocast` | `None` | Candidate forward precision |
 
-Use `objective_token=0` for a stationary objective. Change the token whenever the
-batch or loss changes. Probe reuse and deferred trust comparisons depend on it.
+Pass a new `objective_token` whenever the batch or loss changes. A change drops the
+deferred trust-region comparison; `None` or a constant token means a stationary
+objective.
 
 Multi-fidelity screening needs a cheaper closure:
 

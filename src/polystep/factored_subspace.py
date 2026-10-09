@@ -12,9 +12,9 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from .solvers._shared import thin_qr
-from .subspace import ProjectedAbsorbMixin, absorb_due
+from .subspace import ProjectedAbsorbMixin, ProjectionSpec, _stable_entry_seed, absorb_due
 
-from .hybrid_subspace import LayerProjectionSpec, _require_positive_rank, _stable_entry_seed
+from .hybrid_subspace import _require_positive_rank
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
     #: Coordinate blocks are (d_out, rank) matrices, so the low-rank sampler factors over them.
     coords_are_factored = True
 
-    specs: Tuple[LayerProjectionSpec, ...]
+    specs: Tuple[ProjectionSpec, ...]
     subspace_dim: int
     compression_ratio: float
     seed: int = 0
@@ -65,7 +65,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
                 projected = False
 
             specs.append(
-                LayerProjectionSpec(
+                ProjectionSpec(
                     entry_key=entry.key,
                     original_shape=shape,
                     num_params=math.prod(shape) if len(shape) >= 2 else entry.numel,
@@ -88,7 +88,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
             **kwargs,
         )
 
-    def _make_b(self, spec: LayerProjectionSpec, device, dtype, step: int) -> torch.Tensor:
+    def _make_b(self, spec: ProjectionSpec, device, dtype, step: int) -> torch.Tensor:
         """Fixed ``(rank, d_in)`` factor with orthonormal rows, from a stable seed.
 
         Drawn on CPU in fp32 so the seed is portable across devices.
@@ -132,7 +132,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
             iteration,
         )
 
-    def _delta(self, spec: LayerProjectionSpec, B: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+    def _delta(self, spec: ProjectionSpec, B: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
         """``dW`` for one entry from its coordinate slice."""
         if not spec.is_projected:
             return coords
@@ -147,8 +147,8 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         base_sd: Dict[str, torch.Tensor],
         flat_subspace: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Full state_dict for a single coordinate vector."""
-        out = dict(base_sd)
+        """Perturbed weights for a single coordinate vector, keyed by spec."""
+        out = {}
         for spec in self.specs:
             base = base_sd.get(spec.entry_key)
             if base is None:

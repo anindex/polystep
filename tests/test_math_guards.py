@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 
 from polystep._compiled import _barycentric_projection, _rotate_and_translate
-from polystep.cma import compute_cma_hyperparameters, update_covariance_diagonal, update_evolution_path_sigma
 from polystep.geometry import get_orthoplex_vertices
 from polystep.solver import PolyStep
 from polystep.solvers import MinCostGreedySolver, SinkhornSolver, SoftmaxSolver
@@ -36,43 +35,6 @@ def test_diverged_sinkhorn_duals_do_not_yield_a_nan_plan():
     solver = SinkhornSolver(epsilon=1e-4, max_iterations=5, threshold=0.0)
     res = solver.solve(cost_matrix=torch.randn(4, 6) * 1e3)
     assert torch.isfinite(res.matrix).all()
-
-
-def test_p_sigma_ignores_c_diag_on_a_whitened_step():
-    """C_diag=None must equal passing y = sqrt(C) z with the same C."""
-    n = 6
-    torch.manual_seed(0)
-    C_diag = torch.rand(n) + 0.5
-    z = torch.randn(n)
-    z = z / z.norm()
-    p0 = torch.zeros(n)
-
-    whitened = update_evolution_path_sigma(p0, z, None, c_sigma=0.3, mu_eff=1.0)
-    round_trip = update_evolution_path_sigma(p0, torch.sqrt(C_diag) * z, C_diag, c_sigma=0.3, mu_eff=1.0)
-    torch.testing.assert_close(whitened, round_trip)
-
-
-def test_covariance_normalizes_then_clamps():
-    n = 8
-    hp = compute_cma_hyperparameters(n, 1.0)
-    C = torch.ones(n)
-    p_c = torch.zeros(n)
-    p_c[0] = 10.0
-    out = update_covariance_diagonal(
-        C_diag=C,
-        p_c=p_c,
-        rank_mu=torch.zeros(n),
-        c_1=hp["c_1"],
-        c_mu=0.0,
-        h_sigma=True,
-        c_c=hp["c_c"],
-        trace_scale=float(n),
-        cov_min=1e-6,
-        cov_max=1e6,
-        trace=float(n),
-    )
-    assert (out >= 1e-6).all() and (out <= 1e6).all()
-    torch.testing.assert_close(out.sum(), torch.tensor(float(n)))
 
 
 def test_greedy_leaves_an_all_infeasible_row_where_it_is():

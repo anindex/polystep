@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Callable, Dict, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
 
@@ -16,11 +16,7 @@ from .subspace import ProjectedAbsorbMixin, ProjectionSpec, SvdRatioMixin, _stab
 
 if TYPE_CHECKING:
     import torch.nn as nn
-    from .blockwise import BlockConfig
     from .transform import ParamLayout
-
-
-LayerProjectionSpec = ProjectionSpec
 
 
 def _mixed_entry_dtypes(layout: "ParamLayout") -> "Optional[Dict[str, torch.dtype]]":
@@ -36,13 +32,46 @@ def _require_positive_rank(rank: int, name: str) -> None:
         raise ValueError(f"{name} must be >= 1, got {rank}.")
 
 
-def _require_tall(spec: "LayerProjectionSpec") -> None:
+def _require_tall(spec: "ProjectionSpec") -> None:
     """Reject a wide spec, which has no orthonormal basis."""
     if spec.num_params < spec.num_coords:
         raise ValueError(
             f"{spec.entry_key}: num_coords ({spec.num_coords}) exceeds num_params "
             f"({spec.num_params}), which has no orthonormal projection."
         )
+
+
+def _layer_specs(layout: "ParamLayout", rank_of: Callable[[int, int], int]) -> "Tuple[list, int]":
+    """One spec per entry; a matrix gets ``rank_of(d_out, d_in)`` factors, clamped to its shape."""
+    specs = []
+    offset = 0
+    for entry in layout.entries:
+        shape = entry.shape
+        if len(shape) >= 2:
+            d_out = shape[0]
+            d_in = math.prod(shape[1:])
+            effective_rank = min(rank_of(d_out, d_in), d_in, d_out)
+            num_params = math.prod(shape)
+            # Capped at num_params: a wider matrix has no orthonormal basis and the
+            # fallback gain sqrt(num_params/num_coords) breaks the step radii.
+            num_coords = min(d_out * effective_rank + effective_rank * d_in, num_params)
+        else:
+            # 1D params (bias, LayerNorm) are perturbed directly.
+            num_params = num_coords = entry.numel
+        specs.append(
+            ProjectionSpec(
+                entry_key=entry.key,
+                original_shape=shape,
+                num_params=num_params,
+                num_coords=num_coords,
+                flat_start=offset,
+                flat_end=offset + num_coords,
+                # Full width means the projection is the identity; perturb directly.
+                is_projected=num_coords < num_params,
+            )
+        )
+        offset += num_coords
+    return specs, offset
 
 
 def _scale_specs_to_budget(
@@ -93,7 +122,7 @@ def _scale_specs_to_budget(
 class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     """Hybrid subspace: per-layer projections with a shared rotation schedule."""
 
-    specs: Tuple[LayerProjectionSpec, ...]
+    specs: Tuple[ProjectionSpec, ...]
     subspace_dim: int
     compression_ratio: float
     seed: int = 0
@@ -139,48 +168,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     ) -> "HybridSubspace":
         """Create a HybridSubspace with fixed rank from a ParamLayout."""
         _require_positive_rank(rank, "rank")
-        specs = []
-        offset = 0
-
-        for entry in layout.entries:
-            shape = entry.shape
-            if len(shape) >= 2:
-                d_out = shape[0]
-                d_in = math.prod(shape[1:])
-                effective_rank = min(rank, d_in, d_out)
-                num_params = math.prod(shape)
-                # Capped at num_params: a wider matrix has no orthonormal basis and the
-                # fallback gain sqrt(num_params/num_coords) breaks the step radii.
-                num_coords = min(d_out * effective_rank + effective_rank * d_in, num_params)
-                specs.append(
-                    LayerProjectionSpec(
-                        entry_key=entry.key,
-                        original_shape=shape,
-                        num_params=num_params,
-                        num_coords=num_coords,
-                        flat_start=offset,
-                        flat_end=offset + num_coords,
-                        # Full width means the projection is the identity; perturb directly.
-                        is_projected=num_coords < num_params,
-                    )
-                )
-                offset += num_coords
-            else:
-                # 1D params (bias, LayerNorm) are perturbed directly.
-                num_elements = entry.numel
-                specs.append(
-                    LayerProjectionSpec(
-                        entry_key=entry.key,
-                        original_shape=shape,
-                        num_params=num_elements,
-                        num_coords=num_elements,
-                        flat_start=offset,
-                        flat_end=offset + num_elements,
-                        is_projected=False,
-                    )
-                )
-                offset += num_elements
-
+        specs, offset = _layer_specs(layout, lambda d_out, d_in: rank)
         specs, offset = _scale_specs_to_budget(specs, max_subspace_dim, offset)
 
         total_params = layout.total_params
@@ -211,47 +199,9 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         """Create a HybridSubspace with auto per-layer rank selection."""
         _require_positive_rank(min_rank, "min_rank")
         _require_positive_rank(max_rank, "max_rank")
-        specs = []
-        offset = 0
-
-        for entry in layout.entries:
-            shape = entry.shape
-            if len(shape) >= 2:
-                d_out = shape[0]
-                d_in = math.prod(shape[1:])
-                min_dim = min(d_in, d_out)
-                auto_rank = max(min_rank, min(max_rank, min_dim // compression_ratio))
-                effective_rank = min(auto_rank, d_in, d_out)
-                num_params = math.prod(shape)
-                num_coords = min(d_out * effective_rank + effective_rank * d_in, num_params)
-                specs.append(
-                    LayerProjectionSpec(
-                        entry_key=entry.key,
-                        original_shape=shape,
-                        num_params=num_params,
-                        num_coords=num_coords,
-                        flat_start=offset,
-                        flat_end=offset + num_coords,
-                        # Full width means the projection is the identity; perturb directly.
-                        is_projected=num_coords < num_params,
-                    )
-                )
-                offset += num_coords
-            else:
-                num_elements = entry.numel
-                specs.append(
-                    LayerProjectionSpec(
-                        entry_key=entry.key,
-                        original_shape=shape,
-                        num_params=num_elements,
-                        num_coords=num_elements,
-                        flat_start=offset,
-                        flat_end=offset + num_elements,
-                        is_projected=False,
-                    )
-                )
-                offset += num_elements
-
+        specs, offset = _layer_specs(
+            layout, lambda d_out, d_in: max(min_rank, min(max_rank, min(d_in, d_out) // compression_ratio))
+        )
         specs, offset = _scale_specs_to_budget(specs, max_subspace_dim, offset)
 
         total_params = layout.total_params
@@ -300,17 +250,17 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         self._init_projections_cache = ((device, dtype), projections)
         return projections
 
-    def entry_dtype(self, spec: LayerProjectionSpec, default: torch.dtype) -> torch.dtype:
+    def entry_dtype(self, spec: ProjectionSpec, default: torch.dtype) -> torch.dtype:
         """The dtype this entry's projection is built at (its own parameter dtype)."""
         return (self._entry_dtypes or {}).get(spec.entry_key, default)
 
-    def _use_sparse(self, spec: LayerProjectionSpec) -> bool:
+    def _use_sparse(self, spec: ProjectionSpec) -> bool:
         """Whether this layer's dense projection would exceed the byte threshold."""
         return spec.num_params * spec.num_coords * 4 > self.sparse_threshold_bytes
 
     def _get_projection(
         self,
-        spec: LayerProjectionSpec,
+        spec: ProjectionSpec,
         device: torch.device,
         dtype: torch.dtype,
         step: int = 0,
@@ -451,7 +401,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     def _rotate_layer_displacement(
         self,
         P_old: torch.Tensor,
-        spec: LayerProjectionSpec,
+        spec: ProjectionSpec,
         layer_displacement: torch.Tensor,
         svd_ratio: float,
         device: torch.device,
@@ -753,39 +703,3 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
                 result[spec.entry_key] = base.unsqueeze(0) + delta
 
         return result
-
-
-def create_hybrid_blocks(
-    hybrid: HybridSubspace,
-    particle_dim: int = 8,
-) -> "List[BlockConfig]":
-    """One ``BlockConfig`` per spec, so each layer gets its own OT solve.
-
-    Use the block's flat ranges, not the spec's, to split and reassemble.
-    """
-    from .blockwise import BlockConfig
-
-    blocks = []
-    offset = 0  # contiguous offset that accounts for padding
-
-    for i, spec in enumerate(hybrid.specs):
-        num_coords = spec.flat_end - spec.flat_start
-        padded_coords = num_coords + (-num_coords % particle_dim)
-        num_particles = padded_coords // particle_dim
-
-        # Use a contiguous offset, not spec.flat_start, to avoid gaps or overlaps.
-        blocks.append(
-            BlockConfig(
-                name=spec.entry_key,
-                leaf_indices=(i,),
-                flat_start=offset,
-                flat_end=offset + padded_coords,
-                num_particles=num_particles,
-                particle_dim=particle_dim,
-            )
-        )
-        offset += padded_coords
-
-    # `offset` (sum of padded block dims) may exceed hybrid.subspace_dim; callers must
-    # allocate vectors of size `offset`, not hybrid.subspace_dim.
-    return blocks

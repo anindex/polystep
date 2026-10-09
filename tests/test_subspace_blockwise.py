@@ -8,7 +8,6 @@ import torch.nn as nn
 
 from polystep import PolyStepOptimizer, AdaptiveSubspace
 from polystep.optimizer import RankSchedule
-from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.blockwise import (
     create_subspace_blocks,
     split_subspace_to_blocks,
@@ -282,25 +281,6 @@ class TestSynchronizedAbsorb:
         P_after = optimizer._state.projection
 
         assert not torch.allclose(P_before, P_after)
-
-
-def test_cma_combined_mode_steps(simple_model, simple_closure):
-    """CMAAdaptiveSubspace runs a combined subspace + blockwise step."""
-    cma_subspace = CMAAdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, max_rank=16)
-
-    optimizer = PolyStepOptimizer(
-        simple_model,
-        subspace=cma_subspace,
-        block_strategy="per_layer",
-        **_FAST_OPT_KWARGS,
-    )
-
-    # Construction alone proves nothing; absorb can re-zero coordinates, so check
-    # the model itself moved.
-    before = torch.cat([p.detach().reshape(-1) for p in simple_model.parameters()]).clone()
-    optimizer.step(simple_closure)
-    assert optimizer.state.iteration_count == 1
-    assert not torch.equal(before, torch.cat([p.detach().reshape(-1) for p in simple_model.parameters()]))
 
 
 @pytest.mark.parametrize("interval, expected_rotations", [(1, 6), (3, 2), (0, 0)])

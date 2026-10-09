@@ -45,26 +45,24 @@ def test_invalid_distribution_rejected():
 
 # --- Jitter is exclusive with the amortization heuristics -------------------------
 #
-# Jitter noise reads as particle movement to the reuse and amortization heuristics,
-# so the constructor turns them off instead of leaving each config to remember.
+# Jitter noise reads as particle movement to the amortization heuristic, so the
+# constructor turns it off instead of leaving each config to remember.
 
 
-def test_jitter_disables_amortization_and_adaptive_probes():
+def test_jitter_disables_amortization():
     import warnings
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        opt = _optimizer(probe_radius_jitter=0.05, amortize_steps=3, adaptive_probes=True, seed=0)
+        opt = _optimizer(probe_radius_jitter=0.05, amortize_steps=3, seed=0)
     assert opt.amortize_steps == 1
-    assert opt._adaptive_probes is False
     msg = " ".join(str(w.message) for w in caught)
-    assert "amortize_steps" in msg and "adaptive_probes" in msg, msg
+    assert "amortize_steps" in msg, msg
 
 
-def test_no_jitter_leaves_the_heuristics_alone():
-    opt = _optimizer(probe_radius_jitter=0.0, amortize_steps=3, adaptive_probes=True, seed=0)
+def test_no_jitter_leaves_amortization_alone():
+    opt = _optimizer(probe_radius_jitter=0.0, amortize_steps=3, seed=0)
     assert opt.amortize_steps == 3
-    assert opt._adaptive_probes is True
 
 
 # --- Step-radius jitter: absolute continuity of the one-step law -------------------

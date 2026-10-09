@@ -198,7 +198,6 @@ def run_search(
             step_radius=0.1 / math.sqrt(math.ceil(sub.subspace_dim / 8)),
             probe_radius=0.6,
             use_momentum=arm == "hybrid_newton_momentum",
-            adaptive_probes=False,
             compile=False,
             seed=seed + 20000,
             scale_cost=None,

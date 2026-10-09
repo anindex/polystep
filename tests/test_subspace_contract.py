@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 
 from polystep.adaptive_subspace import AdaptiveSubspace
-from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep.factored_subspace import FactoredSubspace
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
@@ -25,9 +24,6 @@ def _model():
 # Each entry returns (subspace, projection); every remaining class takes one.
 BUILDERS = {
     "adaptive": lambda lay: _with_single(AdaptiveSubspace.from_layout(lay, rank=3)),
-    "cma": lambda lay: _with_single(
-        CMAAdaptiveSubspace.from_adaptive_subspace(AdaptiveSubspace.from_layout(lay, rank=3))
-    ),
     "hybrid": lambda lay: _with_dict(HybridSubspace.from_layout(lay, rank=3)),
     "factored": lambda lay: _with_dict(FactoredSubspace.from_layout(lay, rank=3, seed=0)),
 }

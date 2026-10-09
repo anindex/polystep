@@ -106,7 +106,6 @@ def invalidate_for_basis_change(opt, state) -> None:
     opt._center_loss = None
     opt._prev_predicted_improvement = None
     opt._prev_pre_step_loss = None
-    opt._invalidate_reuse_cache()
 
     if opt.use_momentum and state.velocity is not None:
         state.velocity = torch.zeros_like(state.velocity)

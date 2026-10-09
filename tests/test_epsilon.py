@@ -168,7 +168,7 @@ class TestProgressiveEpsilonIsDrivenByEveryStepDriver:
         from polystep.optimizer import PolyStepOptimizer
 
         model = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 3))
-        kwargs.setdefault("auto_epsilon", True)
+        kwargs.setdefault("epsilon", ProgressiveEpsilon(init=0.1, target=0.01, max_epsilon=0.5))
         opt = PolyStepOptimizer(model, seed=0, compile=False, **kwargs)
         x = torch.randn(8, 6, generator=torch.Generator().manual_seed(0))
 
@@ -182,9 +182,8 @@ class TestProgressiveEpsilonIsDrivenByEveryStepDriver:
         return seen
 
     def test_scheduler_passed_as_epsilon_is_driven(self):
-        """A user-supplied ``epsilon=ProgressiveEpsilon(...)`` must advance, not just
-        the one built by ``auto_epsilon=True``."""
-        seen = self._run(auto_epsilon=False, epsilon=ProgressiveEpsilon(init=1.0, target=0.01, max_epsilon=5.0))
+        """A user-supplied ``epsilon=ProgressiveEpsilon(...)`` must advance."""
+        seen = self._run(epsilon=ProgressiveEpsilon(init=1.0, target=0.01, max_epsilon=5.0))
         assert len(set(seen)) > 1, f"epsilon pinned at {seen[0]}"
 
     @pytest.mark.parametrize("strategy", ["monolithic", "per_layer", "grouped"])
@@ -211,6 +210,29 @@ class TestProgressiveEpsilonIsDrivenByEveryStepDriver:
             state = solver.step(state)
             seen.append(scheduler.at(None))
         assert len(set(seen)) > 1, f"epsilon pinned at {seen[0]}"
+
+    def test_solvers_without_a_threshold_do_not_feed_it(self):
+        """A one-shot solve reports a ratio of 1.0, which would read as a slow Sinkhorn."""
+        from polystep.epsilon import feed_solver_stats
+        from polystep.solvers import SoftmaxSolver
+
+        pe = ProgressiveEpsilon(init=1.0, target=0.01, max_epsilon=5.0)
+        feed_solver_stats(pe, SoftmaxSolver(), n_iters=1, converged=True)
+        assert pe.at() == 1.0
+
+    @pytest.mark.parametrize("driver", ["optimizer", "polystep"])
+    def test_rejects_ent_epsilon(self, driver):
+        import torch.nn as nn
+
+        from polystep.optimizer import PolyStepOptimizer
+        from polystep.solver import PolyStep
+
+        eps = ProgressiveEpsilon(init=0.1, target=0.01, max_epsilon=0.5)
+        with pytest.raises(ValueError, match="ent_epsilon"):
+            if driver == "optimizer":
+                PolyStepOptimizer(nn.Linear(2, 1), epsilon=eps, ent_epsilon=0.05)
+            else:
+                PolyStep(objective_fn=lambda x: (x**2).sum(-1), dim=2, epsilon=eps, ent_epsilon=0.05)
 
 
 class TestDefaults:

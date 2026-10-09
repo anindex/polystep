@@ -46,23 +46,12 @@ class TestTrainConfig:
     def test_defaults(self):
         config = TrainConfig()
         assert config.epochs == 10
-        assert config.batch_size == 32
-        assert config.log_every == 10
         assert config.callbacks == []
 
-    @pytest.mark.parametrize(
-        "field,value",
-        [
-            ("epochs", 0),
-            ("epochs", -1),
-            ("log_every", 0),
-            ("batch_size", 0),
-            ("batch_size", -1),
-        ],
-    )
-    def test_invalid_epochs_zero(self, field, value):
+    @pytest.mark.parametrize("epochs", [0, -1])
+    def test_invalid_epochs(self, epochs):
         with pytest.raises(ValueError):
-            TrainConfig(**{field: value})
+            TrainConfig(epochs=epochs)
 
 
 class TestTrainCallback:

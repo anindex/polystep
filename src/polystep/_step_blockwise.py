@@ -260,14 +260,6 @@ def _finish_step(opt, state, X, X_new_full, blocks, outcomes, iteration, current
             state._prev_prev_block_duals = None
         if opt.biased_rotation:
             opt._prev_block_descent_directions = None
-        # A reverted X with poisoned sqrt(C_diag) can't recover; keep in step with the monolithic revert.
-        if opt.use_covariance_adaptation:
-            if state.p_c is not None:
-                state.p_c = torch.zeros_like(state.p_c)
-            if state.p_sigma is not None:
-                state.p_sigma = torch.zeros_like(state.p_sigma)
-            if state.C_diag is not None:
-                state.C_diag = torch.ones_like(state.C_diag)
         nan_reverted = True
 
     # The pure OT move, before momentum; state.X would fold in beta * velocity.
@@ -445,10 +437,7 @@ def step_subspace_blockwise(opt, closure: Callable) -> float:
     sub_dim = opt.subspace.subspace_dim
 
     current_eps, ot_epsilon, step_r, probe_r = _resolve_geometry(opt, state, iteration)
-
-    # Cache the coord-to-param projection so probes and the closing _sync_model share one basis.
-    opt._update_sampling_projection()
-    proj_used = opt._sampling_projection if opt._sampling_projection is not None else state.projection
+    proj_used = state.projection
 
     pre_step_sub_coords = None
     if opt._adaptive or opt._per_layer_projections:
@@ -563,9 +552,7 @@ def _reconstruct(opt, state, proj_used, coords):
     """Full parameters for a batch of subspace coordinate vectors."""
     if opt._adaptive:
         return state.subspace.reconstruct_batch(proj_used, state.base_params, coords)
-    if opt._per_layer_projections:
-        return state.subspace.reconstruct_batch(state.hybrid_projections, state.base_params, coords)
-    return state.subspace.reconstruct_batch(state.base_params, coords)
+    return state.subspace.reconstruct_batch(state.hybrid_projections, state.base_params, coords)
 
 
 def _maintain_subspace(opt, state, blocks, avg_model_loss, pre_step_sub_coords) -> None:
@@ -582,7 +569,7 @@ def _maintain_subspace(opt, state, blocks, avg_model_loss, pre_step_sub_coords) 
     from .projection import SparseRandomProjection
 
     adaptive_sub = opt.subspace
-    proj_used = opt._sampling_projection if opt._sampling_projection is not None else state.projection
+    proj_used = state.projection
     record_displacement(state, adaptive_sub, pre_step_sub_coords, proj_used)
 
     if adaptive_sub.should_absorb(state.stagnation_count, state.iteration_count):
@@ -611,13 +598,6 @@ def _maintain_subspace(opt, state, blocks, avg_model_loss, pre_step_sub_coords) 
         # Clear the stagnation counter, else a plateau redraws the basis every step.
         state.stagnation_count = 0
         state.prev_loss = avg_model_loss
-        if opt.use_covariance_adaptation:
-            state.p_c = torch.zeros_like(state.p_c)
-            state.p_sigma = torch.zeros_like(state.p_sigma)
-            state.C_diag = torch.ones_like(state.C_diag)
-    elif opt.use_covariance_adaptation:
-        # A diagonal covariance does not stay diagonal under rotation, so hold the basis between absorbs.
-        pass
     elif _rotation_due(adaptive_sub, state.iteration_count):
         # Re-anchor the origin before rotating: replacing P with non-zero coords would move the weights unevaluated.
         state.base_params, _ = adaptive_sub.absorb(

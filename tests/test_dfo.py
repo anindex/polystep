@@ -1,5 +1,5 @@
-"""Derivative-free machinery: FD quadratic model, Newton and trust-region steps, probe
-reuse, and the multi-fidelity screen."""
+"""Derivative-free machinery: FD quadratic model, Newton and trust-region steps, and the
+multi-fidelity screen."""
 
 import warnings
 
@@ -206,33 +206,6 @@ def test_newton_refinement_reconciles_the_momentum_velocity():
     realized = opt._state.X - X_before
     assert realized.abs().max() > 0, "the step did not move"
     torch.testing.assert_close(opt._state.velocity, realized)
-
-
-def test_adaptive_probes_reuses_rotation_for_stagnant_particles():
-    """A stagnant particle reuses its previous rotation so its reused cost row
-    stays consistent with the vertices that row was evaluated at."""
-    model, make_closure = _make_model_and_closure()
-    opt = PolyStepOptimizer(
-        model,
-        particle_dim=2,
-        epsilon=0.5,
-        adaptive_probes=True,
-        adaptive_probes_threshold=1e9,  # force all stagnant
-        num_probe=3,
-        max_iterations=10,
-        seed=42,
-    )
-    closure = make_closure(opt)
-
-    # First step cannot reuse (no history yet) but stores the rotations.
-    opt.step(closure, objective_token="stationary")
-    assert opt._prev_rot_mats is not None
-    rot_after_first = opt._prev_rot_mats.clone()
-
-    # Second step: all particles stagnant, so rotations are reused unchanged.
-    opt.step(closure, objective_token="stationary")
-    torch.testing.assert_close(opt._prev_rot_mats, rot_after_first)
-    assert torch.isfinite(opt._state.X).all()
 
 
 def test_multifidelity_screening_keeps_descending():

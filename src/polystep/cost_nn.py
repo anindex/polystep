@@ -380,14 +380,12 @@ class NNCostEvaluator:
                 )
             return self._evaluate_inplace(stacked_params, inputs, targets)
 
-        # Batched bmm for Linear-only models, supervised only. Soft-label targets are
-        # (B, C) and would fail the cross-entropy expand, so vmap handles them.
+        # Batched bmm for Linear-only models, supervised only.
         if (
             self._batched_linear is not None
             and targets is not None
             and (inputs.dim() == 2 or self._batched_linear.leading_flatten)
             and not self.per_sample
-            and not (self._batched_linear.loss_kind == "cross_entropy" and targets.dim() != 1)
         ):
             n = next(iter(stacked_params.values())).shape[0]
             chunk = self.chunk_size

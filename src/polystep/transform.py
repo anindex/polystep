@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Tuple
 
 
@@ -150,16 +150,7 @@ class ParamLayout:
             if entry.key in shared_map:
                 aliases = tuple(shared_map[entry.key])
                 shared_groups.append(aliases)
-                entry = ParamEntry(
-                    key=entry.key,
-                    shape=entry.shape,
-                    dtype=entry.dtype,
-                    offset=entry.offset,
-                    numel=entry.numel,
-                    requires_grad=entry.requires_grad,
-                    module_path=entry.module_path,
-                    shared_with=tuple(k for k in aliases if k != entry.key),
-                )
+                entry = replace(entry, shared_with=tuple(k for k in aliases if k != entry.key))
             updated_entries.append(entry)
 
         # Log the dedup, or a shared embedding leaves an unexplained parameter-count gap.

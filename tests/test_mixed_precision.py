@@ -12,7 +12,6 @@ import torch.nn as nn
 
 from polystep import PolyStepOptimizer
 from polystep.adaptive_subspace import AdaptiveSubspace
-from polystep.cma_subspace import CMAAdaptiveSubspace
 from polystep._compiled import _barycentric_projection, _fused_softmax_project
 from polystep.cost_nn import NNCostEvaluator
 from polystep.hybrid_subspace import HybridSubspace
@@ -159,16 +158,6 @@ class TestProjectionDtype:
         subspace = AdaptiveSubspace(full_dim=100, subspace_dim=16)
         projection = subspace.init_projection(dtype=dtype)
         assert projection.dtype == expected_dtype
-
-    def test_cma_subspace_projection_dtype(self):
-        """CMAAdaptiveSubspace passes dtype through."""
-        cma = CMAAdaptiveSubspace(full_dim=100, subspace_dim=16)
-
-        projection_fp32 = cma.init_projection(dtype=torch.float32)
-        assert projection_fp32.dtype == torch.float32
-
-        projection_bf16 = cma.init_projection(dtype=torch.bfloat16)
-        assert projection_bf16.dtype == torch.bfloat16
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_displacement_rotation_runs_in_half_precision(self, dtype):
@@ -376,29 +365,6 @@ def test_optimizer_mixed_precision_step(solver):
     # lands far outside that scale without ever producing a NaN.
     assert 0.0 < loss < 10.0
     assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters())), "the model never moved"
-
-
-def test_cma_subspace_is_rejected_on_a_mixed_dtype_model():
-    """One global projection holds every parameter at the dominant dtype, CMA included.
-
-    CMA is an AdaptiveSubspace, so the guard covers it.
-    """
-    from polystep.cma_subspace import CMAAdaptiveSubspace
-
-    class MixedDtype(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.big = nn.Parameter(torch.randn(20, 20))
-            self.small = nn.Parameter(torch.randn(4, 4, dtype=torch.float64))
-
-        def forward(self, x):
-            return x @ self.big
-
-    model = MixedDtype()
-    full = sum(p.numel() for p in model.parameters())
-    sub = CMAAdaptiveSubspace(full_dim=full, subspace_dim=16)
-    with pytest.raises(ValueError, match="mixes parameter dtypes"):
-        PolyStepOptimizer(model, subspace=sub, compile=False, seed=0)
 
 
 def test_mixed_dtype_model_runs_in_subspace_mode():

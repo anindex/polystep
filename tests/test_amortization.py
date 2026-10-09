@@ -1,5 +1,5 @@
 """Amortized steps: run the OT solve every N steps and move on the cached transport
-direction in between, plus the probe reuse that makes a repeated step free."""
+direction in between."""
 
 import torch
 import torch.nn as nn

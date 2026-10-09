@@ -145,31 +145,26 @@ def test_the_simplex_model_uses_the_shared_centre_at_multiple_scales():
     assert len(opt._state.trust_region_multipliers) > 0
 
 
-def test_a_probe_reuse_step_does_not_move_the_trust_region():
-    """Reuse re-reports the cached loss, so the ratio would be 0 against a live prediction."""
+@pytest.mark.parametrize("first, second, recorded", [(0, 0, 1), (None, None, 1), (0, 1, 0)])
+def test_objective_token_change_drops_the_pending_pair(first, second, recorded):
+    """A prediction is scored only against the same objective; None or a constant token is stationary."""
     torch.manual_seed(0)
     model = _model()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        opt = PolyStepOptimizer(
-            model,
-            max_iterations=50,
-            epsilon=0.1,
-            num_probe=1,
-            polytope_type="orthoplex",
-            trust_region=True,
-            adaptive_probes=True,
-            adaptive_probes_threshold=1e9,
-            compile=False,
-            seed=0,
-        )
+    opt = PolyStepOptimizer(
+        model,
+        max_iterations=50,
+        epsilon=0.1,
+        num_probe=1,
+        polytope_type="simplex",
+        trust_region=True,
+        compile=False,
+        seed=0,
+    )
     closure = _closure(model)
-    opt.step(closure, objective_token=0)
-    before, evals = opt._trust_region_multiplier, opt.candidate_evals
-    opt.step(closure, objective_token=0)
-
-    assert opt.candidate_evals == evals, "expected a reuse step, got fresh evaluations"
-    assert opt._trust_region_multiplier == before
+    opt.step(closure, objective_token=first)
+    assert opt._prev_predicted_improvement is not None
+    opt.step(closure, objective_token=second)
+    assert len(opt._state.trust_region_multipliers) == recorded
 
 
 @pytest.mark.parametrize(
