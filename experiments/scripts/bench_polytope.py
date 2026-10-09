@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--arms", nargs="+", choices=ARMS)
     ap.add_argument("--wall", action="store_true", help="Also compare at the baseline wall budget")
     ap.add_argument("--streaming", action="store_true")
+    ap.add_argument("--solver", default="softmax")
     ap.add_argument("--output", type=Path, default=Path("experiments/results/benchmarks/algorithms.json"))
     args = ap.parse_args()
     if min(args.budget, args.batch, args.threads) < 1:
@@ -41,6 +42,7 @@ def main():
                 budget=args.budget,
                 batch=args.batch,
                 streaming=args.streaming,
+                solver=args.solver,
             )
             target = base["start_validation_loss"] - max(
                 0.01, 0.5 * (base["start_validation_loss"] - base["best_validation_loss"])
@@ -65,6 +67,7 @@ def main():
                         batch=args.batch,
                         target=target,
                         streaming=args.streaming,
+                        solver=args.solver,
                     )
                     row["axis"] = axis
                     rows.append(row)

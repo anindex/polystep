@@ -44,14 +44,28 @@ def test_search_cli_uses_one_budget_protocol_and_saves_baseline_only(tmp_path, m
         run_search("mlp", "hybrid_typo", 0)
 
 
+BUDGETS = dict.fromkeys(ARMS, 512) | {"hybrid_newton": 1024, "hybrid_newton_momentum": 1024}
+
+
 @pytest.mark.parametrize("arm", ARMS)
 def test_search_respects_budget_and_keeps_test_data_out_of_selection(arm):
-    result = run_search("mlp", arm, 0, budget=512, batch=8, streaming=True)
-    assert 0 < result["candidates"] <= 512
+    budget = BUDGETS[arm]
+    result = run_search("mlp", arm, 0, budget=budget, batch=8, streaming=True)
+    assert 0 < result["candidates"] <= budget
     assert result["sample_forwards"] == result["candidates"] * 8
     assert result["steps"] > 0
     assert result["best_validation_loss"] <= result["start_validation_loss"]
     assert all("test_loss" not in h for h in result["history"])
+
+
+def test_search_below_one_step_budget_takes_no_step():
+    short = run_search("mlp", "hybrid_newton", 0, budget=767, batch=8)
+    assert short["steps"] == short["candidates"] == 0
+    assert short["history"] == []
+    assert short["best_validation_loss"] == short["start_validation_loss"]
+    exact = run_search("mlp", "hybrid_newton", 0, budget=768, batch=8)
+    assert exact["steps"] == 1
+    assert exact["candidates"] == 768
 
 
 def test_global_search_geometry_and_momentum_direction():

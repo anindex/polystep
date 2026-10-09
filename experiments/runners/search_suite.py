@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from polystep import PolyStepOptimizer
+from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.baselines.methods import _lowrank_noise
 from polystep.cost_nn import NNCostEvaluator
 from polystep.factored_subspace import FactoredSubspace
@@ -97,8 +98,14 @@ ARMS = (
     "hybrid_displacement",
     "hybrid_screen",
     "hybrid_amortized",
+    "hybrid_inplace",
+    "hybrid_sinkhorn",
+    "hybrid_newton",
+    "hybrid_newton_momentum",
+    "hybrid_absorb",
     "factored",
     "factored_rotating",
+    "adaptive",
     "global_simplex",
     "global_orthoplex",
     "lowrank",
@@ -125,32 +132,54 @@ def draw_directions(layout, q, generator, device, dtype, arm, momentum=None):
 
 
 @torch.inference_mode()
-def run_search(name, arm, seed, *, device="cpu", budget=4096, seconds=None, batch=32, target=None, streaming=False):
+def run_search(
+    name,
+    arm,
+    seed,
+    *,
+    device="cpu",
+    budget=4096,
+    seconds=None,
+    batch=32,
+    target=None,
+    streaming=False,
+    solver="softmax",
+):
     """Run to a candidate or wall-clock budget; all training evaluations are charged.
 
+    A step runs only if its probes and centre evaluation fit in the remaining budget,
+    so a budget below one step takes no step and reports the initial model.
     Validation after each step is timed but counted separately. Test data is touched
     only once, at the validation-selected final checkpoint. No arm tunes on test.
     """
     if arm not in ARMS:
         raise ValueError(f"Unknown arm {arm!r}")
+    if arm == "hybrid_sinkhorn":
+        solver = "sinkhorn"
     model, (train, valid, test) = task(name, seed, device, batch, train_batches=4 if streaming else 1)
     x, y = train[0][:batch], train[1][:batch]
     loss_fn = nn.CrossEntropyLoss()
-    evaluator = NNCostEvaluator(model, loss_fn, use_inplace=False)
+    evaluator = NNCostEvaluator(model, loss_fn, use_inplace=arm == "hybrid_inplace")
     layout = ParamLayout.from_module(model)
     initial = layout.flatten(model).reshape(-1)[: layout.total_params].clone()
     gen = torch.Generator(device=device).manual_seed(seed + 20000)
     opt = None
-    if arm.startswith(("hybrid", "factored")):
+    if arm.startswith(("hybrid", "factored", "adaptive")):
         sub = (
             FactoredSubspace.from_layout(layout, rank=2, rotation_interval=5 if arm == "factored_rotating" else 0)
             if arm.startswith("factored")
+            else AdaptiveSubspace.from_layout(layout, rank=16)
+            if arm == "adaptive"
             else HybridSubspace.from_layout(layout, rank=2, max_subspace_dim=128)
         )
         if arm == "hybrid_displacement":
             sub.rotation_interval = 5
             sub.svd_ratio_init = sub.svd_ratio_final = 0.5
+        if arm == "hybrid_absorb":
+            sub.absorb_mode, sub.absorb_interval, sub.rotation_interval = "periodic", 3, 4
         opts = dict(polytope_type="orthoplex") if arm == "hybrid_orthoplex" else {}
+        if arm.startswith("hybrid_newton"):
+            opts.update(polytope_type="orthoplex", num_probe=3, newton_refinement=True)
         if arm == "hybrid_biased":
             opts.update(biased_rotation=True, use_quadratic_model=True)
         if arm == "hybrid_deferred":
@@ -163,12 +192,12 @@ def run_search(name, arm, seed, *, device="cpu", budget=4096, seconds=None, batc
         opt = PolyStepOptimizer(
             model,
             subspace=sub,
-            solver="softmax",
+            solver=solver,
             epsilon=1.0,
             ent_epsilon=0.1,
             step_radius=0.1 / math.sqrt(math.ceil(sub.subspace_dim / 8)),
             probe_radius=0.6,
-            use_momentum=False,
+            use_momentum=arm == "hybrid_newton_momentum",
             adaptive_probes=False,
             compile=False,
             seed=seed + 20000,
@@ -199,8 +228,13 @@ def run_search(name, arm, seed, *, device="cpu", budget=4096, seconds=None, batc
         if opt is not None:
             p = opt.state.X.shape[0]
             v = opt._polytope_vertices.shape[0]
-            required = p * v + int(opt.trust_region or opt.biased_rotation)
-            if opt.amortize_steps > 1 and opt._amortize_counter % opt.amortize_steps:
+            k = opt._probes.shape[0]
+            required = p * v * k + int(opt.use_quadratic_model and (opt.trust_region or opt.biased_rotation))
+            if (
+                opt.amortize_steps > 1
+                and opt._amortize_counter % opt.amortize_steps
+                and opt._transport_direction_ema is not None
+            ):
                 required = 0  # coasting uses no objective forwards
         else:
             q = min(8, layout.total_params)
@@ -264,6 +298,7 @@ def run_search(name, arm, seed, *, device="cpu", budget=4096, seconds=None, batc
         budget=budget,
         seconds_budget=seconds,
         streaming=streaming,
+        solver=solver,
         candidates=spent,
         sample_forwards=spent * batch,
         validation_sample_forwards=validations,
