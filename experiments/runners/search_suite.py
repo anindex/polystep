@@ -100,12 +100,15 @@ ARMS = (
     "hybrid_amortized",
     "hybrid_inplace",
     "hybrid_sinkhorn",
+    "hybrid_sinkhorn_segmented",
     "hybrid_newton",
     "hybrid_newton_momentum",
     "hybrid_absorb",
     "factored",
     "factored_rotating",
     "adaptive",
+    "full_per_layer",
+    "full_grouped",
     "global_simplex",
     "global_orthoplex",
     "lowrank",
@@ -154,7 +157,7 @@ def run_search(
     """
     if arm not in ARMS:
         raise ValueError(f"Unknown arm {arm!r}")
-    if arm == "hybrid_sinkhorn":
+    if arm.startswith("hybrid_sinkhorn"):
         solver = "sinkhorn"
     model, (train, valid, test) = task(name, seed, device, batch, train_batches=4 if streaming else 1)
     x, y = train[0][:batch], train[1][:batch]
@@ -164,9 +167,11 @@ def run_search(
     initial = layout.flatten(model).reshape(-1)[: layout.total_params].clone()
     gen = torch.Generator(device=device).manual_seed(seed + 20000)
     opt = None
-    if arm.startswith(("hybrid", "factored", "adaptive")):
+    if arm.startswith(("hybrid", "factored", "adaptive", "full")):
         sub = (
-            FactoredSubspace.from_layout(layout, rank=2, rotation_interval=5 if arm == "factored_rotating" else 0)
+            None
+            if arm.startswith("full")
+            else FactoredSubspace.from_layout(layout, rank=2, rotation_interval=5 if arm == "factored_rotating" else 0)
             if arm.startswith("factored")
             else AdaptiveSubspace.from_layout(layout, rank=16)
             if arm == "adaptive"
@@ -188,6 +193,11 @@ def run_search(
             opts.update(multifidelity_screen=True, screen_fidelity=0.25, screen_keep_ratio=0.5)
         if arm == "hybrid_amortized":
             opts["amortize_steps"] = 3
+        if arm == "hybrid_sinkhorn_segmented":
+            opts["block_strategy"] = "per_layer"
+        if arm.startswith("full"):
+            opts["block_strategy"] = arm.removeprefix("full_")
+        dim, pdim = (layout.total_params, 2) if sub is None else (sub.subspace_dim, 8)
         # Bound the simultaneous full-model move by the same .1 used by global variants.
         opt = PolyStepOptimizer(
             model,
@@ -195,7 +205,7 @@ def run_search(
             solver=solver,
             epsilon=1.0,
             ent_epsilon=0.1,
-            step_radius=0.1 / math.sqrt(math.ceil(sub.subspace_dim / 8)),
+            step_radius=0.1 / math.sqrt(math.ceil(dim / pdim)),
             probe_radius=0.6,
             use_momentum=arm == "hybrid_newton_momentum",
             compile=False,
@@ -225,7 +235,7 @@ def run_search(
         if seconds is not None and elapsed >= seconds:
             break
         if opt is not None:
-            p = opt.state.X.shape[0]
+            p = sum(b.num_particles for b in opt._blocks) if opt._blocks else opt.state.X.shape[0]
             v = opt._polytope_vertices.shape[0]
             k = opt._probes.shape[0]
             required = p * v * k + int(opt.use_quadratic_model and (opt.trust_region or opt.biased_rotation))

@@ -1,4 +1,4 @@
-"""Monolithic step: a single OT solve over all particles."""
+"""Monolithic step: one OT solve over all particles, or one per row segment."""
 
 from __future__ import annotations
 
@@ -14,8 +14,11 @@ from .costs import scale_cost_matrix
 from .solvers._shared import loss_buffer_dtype, recenter_cost, sanitize_cost, solver_health
 from .epsilon import feed_solver_stats, radius_epsilon_factor
 from ._step_core import (
+    check_losses,
+    chunk_spans,
     invalidate_for_basis_change,
     record_saturation,
+    site_bounds,
     update_amortized_direction,
     update_stagnation_and_radius,
     warn_all_nonfinite,
@@ -34,8 +37,9 @@ logger = logging.getLogger(__name__)
 def _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P, V, K_eff, mask_dropped=False):
     """Assemble the (P*V*K_eff,) loss vector from a screened evaluation.
 
-    Kept vertices carry full-fidelity values; dropped ones get a calibrated cheap
-    value for weighted solvers, or ``+inf`` (``mask_dropped``) for selection solvers.
+    Kept vertices carry full-fidelity values; dropped ones get a cheap value
+    calibrated on the finite kept entries for weighted solvers, or ``+inf``
+    (``mask_dropped``) for selection solvers.
     """
     losses = screen_cost.new_empty(P * V * K_eff)
     losses[sel_idx] = kept
@@ -44,29 +48,39 @@ def _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P, V, K_eff, ma
     mask_3d = keep_mask.unsqueeze(-1)
     if mask_dropped:
         return torch.where(mask_3d, full_3d, torch.full_like(full_3d, float("inf"))).reshape(-1)
+    ok = mask_3d & torch.isfinite(full_3d)
+    w = ok.sum(dim=-1).to(screen_cost.dtype) / K_eff
+    n_kept = w.sum(dim=1, keepdim=True)
+    n_kept = torch.where(n_kept > 0, n_kept, torch.ones_like(n_kept))
     # Zero dropped positions before summing, or 0 * inf becomes NaN.
-    full_kept = torch.where(mask_3d, full_3d, torch.zeros_like(full_3d))
-    n_kept = keep_mask.sum(dim=1, keepdim=True).to(screen_cost.dtype).clamp(min=1)
+    full_kept = torch.where(ok, full_3d, torch.zeros_like(full_3d))
     full_mean = full_kept.sum(dim=(1, 2)).unsqueeze(1) / (n_kept * K_eff)
-    screen_mean = (screen_cost * keep_mask).sum(dim=1, keepdim=True) / n_kept
+    screen_mean = (screen_cost * w).sum(dim=1, keepdim=True) / n_kept
     calibrated = (screen_cost + (full_mean - screen_mean)).unsqueeze(-1).expand(P, V, K_eff)
 
     return torch.where(mask_3d, full_3d, calibrated).reshape(-1)
 
 
-def _chunk_spans(n_cand: int, chunk: int, bounds=None):
-    """Yield (start, end) chunks of at most ``chunk``, also breaking at ``bounds``.
-
-    Cutting at entry boundaries lets the site-aware paths resolve a site.
-    """
-    stops = sorted(set(bounds or ()) | {n_cand})
-    start = 0
-    for stop in stops:
-        if stop <= start:
-            continue
-        for chunk_start in range(start, stop, chunk):
-            yield chunk_start, min(chunk_start + chunk, stop)
-        start = stop
+def _solve_segments(solver, segments, cost_matrix, init_f, init_g, scale_cost) -> SolverResult:
+    """Solve each row segment on its own; ``g`` stacks one column dual per segment."""
+    costs = cost_matrix.tensor_split(segments)
+    fs = gs = [None] * segments
+    if (
+        init_f is not None
+        and init_g is not None
+        and init_f.shape == cost_matrix.shape[:1]
+        and init_g.shape == (segments, cost_matrix.shape[1])
+    ):
+        fs, gs = init_f.tensor_split(segments), init_g.unbind()
+    parts = [solver.solve(cost_matrix=c, init_f=f, init_g=g, scale_cost=scale_cost) for c, f, g in zip(costs, fs, gs)]
+    return SolverResult(
+        matrix=torch.cat([r.matrix for r in parts]),
+        cost=0.0,
+        f=torch.cat([r.f for r in parts]),
+        g=torch.stack([r.g for r in parts]),
+        converged=all(r.converged for r in parts),
+        n_iters=max(r.n_iters for r in parts),
+    )
 
 
 def _rotation_due(adaptive_sub, iteration: int) -> bool:
@@ -100,110 +114,78 @@ def record_displacement(state, adaptive_sub, pre_step_sub_coords, proj_used) -> 
     )
 
 
-def maintain_per_layer_subspace(opt, state, cost_mean: float, pre_step_sub_coords) -> bool:
-    """Displacement tracking, absorb, and rotation for a per-layer subspace.
+def finish_absorb(opt, state) -> None:
+    """Count an absorb and reset the history, basis caches and stagnation; call after the new basis is drawn."""
+    state.displacement_history.zero_()
+    if state.displacement_history_full is not None:
+        state.displacement_history_full.zero_()
+    state.displacement_history_idx = 0
+    state.displacement_history_count = 0
+    invalidate_for_basis_change(opt, state)
+    state.absorb_count += 1
+    # Otherwise a stagnation absorb re-triggers every step on a plateau.
+    state.stagnation_count = 0
 
-    Returns whether the basis changed, so callers can drop warm-started duals.
-    """
+
+def maintain_per_layer_subspace(opt, state, pre_step_sub_coords) -> None:
+    """Displacement tracking, absorb, and rotation for a per-layer subspace."""
     if not opt._per_layer_projections:
-        return False
+        return
     hybrid_sub = opt.subspace
-    _basis_before = state.hybrid_projections
 
-    post_step_sub_coords = state.X.reshape(-1)[: hybrid_sub.subspace_dim]
-    displacement = post_step_sub_coords - pre_step_sub_coords
-
-    idx = state.displacement_history_idx
-    state.displacement_history[idx] = displacement
-    state.displacement_history_idx = (idx + 1) % hybrid_sub.displacement_history_size
-    state.displacement_history_count = min(
-        state.displacement_history_count + 1,
-        hybrid_sub.displacement_history_size,
-    )
+    record_displacement(state, hybrid_sub, pre_step_sub_coords, None)
 
     should_absorb = hybrid_sub.should_absorb(
         state.stagnation_count,
         state.iteration_count,
     )
-
-    if should_absorb:
-        full_flat_sub = state.X.reshape(-1)[: hybrid_sub.subspace_dim]
-        new_base, _zeroed = hybrid_sub.absorb(
+    hist = state.displacement_history[: state.displacement_history_count]
+    # absorb_aligned_active biases the basis toward productive directions via displacement-SVD.
+    if should_absorb and getattr(hybrid_sub, "absorb_aligned_active", False):
+        svd_ratio = hybrid_sub.get_svd_ratio(state.iteration_count, opt.max_iterations or 1)
+        new_projections = hybrid_sub._rotate_all_displacement(
             state.hybrid_projections,
-            state.base_params,
-            full_flat_sub,
+            hist,
+            svd_ratio,
+            state.X.device,
+            state.X.dtype,
+            state.iteration_count,
         )
-        state.base_params = new_base
-        state.X = torch.zeros_like(state.X)
-        # init_projections seeds step=0, so absorbing returns the same basis;
-        # absorb_aligned_active biases it toward productive directions via displacement-SVD.
-        if getattr(hybrid_sub, "absorb_aligned_active", False) and state.displacement_history_count > 0:
-            hist = state.displacement_history[: state.displacement_history_count]
-            svd_ratio = hybrid_sub.get_svd_ratio(state.iteration_count, opt.max_iterations or 1)
-            state.hybrid_projections = hybrid_sub._rotate_all_displacement(
-                state.hybrid_projections,
-                hist,
-                svd_ratio,
-                state.X.device,
-                state.X.dtype,
-                state.iteration_count,
-            )
-        else:
-            state.hybrid_projections = hybrid_sub.init_projections(
-                state.X.device,
-                state.X.dtype,
-            )
-        # Rebuild the fused matrix for the new basis, unless the basis came back by identity.
-        if state.hybrid_projections is not _basis_before and hasattr(hybrid_sub, "build_fused_projection"):
-            hybrid_sub.build_fused_projection(state.hybrid_projections)
-        state.displacement_history.zero_()
-        if state.displacement_history_full is not None:
-            state.displacement_history_full.zero_()
-        state.displacement_history_idx = 0
-        state.displacement_history_count = 0
-        invalidate_for_basis_change(opt, state)
-        state.absorb_count += 1
-        # Otherwise a stagnation absorb re-triggers every step on a plateau.
-        state.stagnation_count = 0
-        state.prev_loss = cost_mean
     else:
-        hist = (
-            state.displacement_history[: state.displacement_history_count]
-            if state.displacement_history_count > 0
-            else None
-        )
         new_projections = hybrid_sub.rotate_all(
             state.hybrid_projections,
             step=state.iteration_count,
             total_steps=opt.max_iterations,
             displacement_history=hist,
         )
-        # Only act when projections changed; identity means the block_diag rebuild
-        # below can be skipped.
-        if new_projections is not state.hybrid_projections:
-            # Re-anchor first: swapping P at non-zero coords moves the weights unevaluated.
-            state.base_params, _ = hybrid_sub.absorb(
-                state.hybrid_projections,
-                state.base_params,
-                state.X.reshape(-1)[: hybrid_sub.subspace_dim],
-            )
-            state.X = torch.zeros_like(state.X)
-            # Rows index the replaced basis, so the next rotation would read phantom
-            # directions.
-            state.displacement_history.zero_()
-            state.displacement_history_idx = 0
-            state.displacement_history_count = 0
-            invalidate_for_basis_change(opt, state)
-            state.hybrid_projections = new_projections
-            if hasattr(hybrid_sub, "build_fused_projection"):
-                hybrid_sub.build_fused_projection(new_projections)
-    # An absorb re-anchors the origin even when the basis is unchanged, so identity
-    # alone would under-report it and leave duals warm-started against the old origin.
-    return should_absorb or state.hybrid_projections is not _basis_before
+    # Identity means nothing rotated, so the block_diag rebuild below can be skipped.
+    rotated = new_projections is not state.hybrid_projections
+    if not (should_absorb or rotated):
+        return
+    # Re-anchor first: swapping P at non-zero coords moves the weights unevaluated.
+    state.base_params, _ = hybrid_sub.absorb(
+        state.hybrid_projections,
+        state.base_params,
+        state.X.reshape(-1)[: hybrid_sub.subspace_dim],
+    )
+    state.X = torch.zeros_like(state.X)
+    if rotated:
+        state.hybrid_projections = new_projections
+        if hasattr(hybrid_sub, "build_fused_projection"):
+            hybrid_sub.build_fused_projection(new_projections)
+    if should_absorb:
+        finish_absorb(opt, state)
+    else:
+        # Rows index the replaced basis, so the next rotation would read phantom
+        # directions.
+        state.displacement_history.zero_()
+        state.displacement_history_idx = 0
+        state.displacement_history_count = 0
+        invalidate_for_basis_change(opt, state)
 
 
 def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = None) -> float:
-    """Monolithic step: one OT solve over all particles."""
+    """Monolithic step: one OT solve over all particles, or one per row segment."""
     state = opt._state
     X = state.X  # (P, particle_dim)
     iteration = state.iteration_count
@@ -305,9 +287,11 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         and getattr(getattr(opt, "_cost_evaluator", None), "_use_inplace", False)
     )
 
+    _fused_inputs = getattr(opt, "_fused_inputs", None)
+    _fused_targets = getattr(opt, "_fused_targets", None)
     # Factored subspace scores through the low-rank identity, never building a
     # candidate weight.
-    _factored_eval = getattr(opt, "_factored_evaluator", None) if opt._factored else None
+    _factored_eval = getattr(opt, "_factored_evaluator", None) if opt._factored and _fused_inputs is not None else None
 
     # Full space perturbs one contiguous run, so only that tensor needs batching.
     _sparse_delta = getattr(opt, "_sparse_delta_evaluator", None) if not _is_subspace else None
@@ -317,8 +301,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     if _sparse_delta is not None or _site_vmap is not None:
         _base_sd = opt.layout.unflatten(X)
 
-    _fused_inputs = getattr(opt, "_fused_inputs", None)
-    _fused_targets = getattr(opt, "_fused_targets", None)
     _subspace_delta = getattr(opt, "_subspace_delta_evaluator", None) if opt._hybrid else None
     # The same site argument in coordinate space: a per-layer block maps to one
     # parameter, so only that one is batched.
@@ -335,16 +317,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         _subspace_delta = _subspace_site = None
         _bary_coords = None
 
-    _evaluator_native = (
-        _use_fused_inplace
-        or _sparse_delta is not None
-        or _factored_eval is not None
-        or _subspace_delta is not None
-        or _subspace_site is not None
-    )
     # One incumbent loss serves every parameter block, at every probe count.
     _center_wanted = opt.use_quadratic_model and (opt.biased_rotation or opt.trust_region)
-    screen_inputs, screen_targets = opt._screen_data(_evaluator_native)
+    screen_inputs, screen_targets = opt._screen_data()
     # A selection solver ranks vertices by their own screened cost, so it needs no
     # antithetic pairing; the contrast-ranked branch below still does.
     _selection_solver = isinstance(opt.solver, (MinCostGreedySolver, TopKMeanSolver))
@@ -383,7 +358,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         chunk = min(total_evals, max(1, (1 << 26) // per_candidate))
 
     _group = V * K_eff
-    _site_bounds = None
     if _subspace_delta is not None or _sparse_delta is not None or _site_vmap is not None or _subspace_site:
         # Keep whole particle groups in one chunk, or the (G, C, pdim) reshape
         # misaligns.
@@ -395,12 +369,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         _starts = [s.flat_start for s in state.subspace.specs]
     else:
         _starts = []
-    if _starts:
-        # Each start contributes its own group and the next, isolating the
-        # straddling particle in its own chunk.
-        _site_bounds = sorted(
-            {min(b, total_evals) for s in _starts for b in ((s // pdim) * _group, -(-s // pdim) * _group)}
-        )
+    _site_bounds = site_bounds(_starts, pdim, _group, total_evals)
 
     # Shape-determined and fully overwritten each step, so cached on the optimizer.
     _loss_dtype = loss_buffer_dtype(X.dtype)
@@ -448,7 +417,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # Restore only the rows the previous chunk dirtied (O(chunk*pdim) vs a full
         # copy); None means copy it all first.
         dirty_rows = None
-        for chunk_start, chunk_end in _chunk_spans(n_cand, chunk, _site_bounds if dense else None):
+        for chunk_start, chunk_end in chunk_spans(n_cand, chunk, _site_bounds if dense else None):
             chunk_size_actual = chunk_end - chunk_start
 
             i_idx = i_all[chunk_start:chunk_end]
@@ -505,14 +474,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 _g0, _g1 = chunk_start // _group, chunk_end // _group
                 _spec = _subspace_site.resolve_spec(state.subspace, _g0 * pdim, _g1 * pdim, _sub_dim)
                 if _spec is not None:
-                    # An offset from the barycentre, which _bary_sd already carries.
-                    _d = (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(_g1 - _g0, _group, pdim)
                     out[chunk_start:chunk_end] = _subspace_site.evaluate_subspace(
                         state.hybrid_projections,
+                        state.base_params,
+                        _bary_coords,
                         _bary_sd,
                         _spec,
                         _g0 * pdim - _spec.flat_start,
-                        _d,
+                        probe_src[i_idx, v_idx, k_idx].reshape(_g1 - _g0, _group, pdim),
                         fused_inputs,
                         fused_targets,
                     ).to(out.dtype)
@@ -581,11 +550,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 chunk_params = opt.layout.batch_unflatten(flat_for_layout)
                 chunk_losses = closure_fn(chunk_params)
 
-            if chunk_losses.shape != (chunk_end - chunk_start,):
-                raise ValueError(
-                    f"the closure must return one loss per candidate, shape "
-                    f"({chunk_end - chunk_start},), got {tuple(chunk_losses.shape)}."
-                )
+            check_losses(chunk_losses, chunk_end - chunk_start)
             out[chunk_start:chunk_end] = chunk_losses.to(out.dtype)
 
         # Over every candidate at once, not per chunk: the 2*max|finite|+1 penalty
@@ -721,7 +686,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         and opt._prev_predicted_improvement is not None
         and opt._prev_pre_step_loss is not None
         and _center_now
-        and opt._prev_loss_from_center
     ):
         current_loss = opt._center_loss[0].item()
         # Negative means loss decreased.
@@ -735,6 +699,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             min_radius=0.1,
             max_radius=3.0,
         )
+        step_r = _sr * opt._trust_region_multiplier * _sr_eps * radius_mult
+        X_vertices = rotated * step_r + X.unsqueeze(1)
         state.trust_region_multipliers.append(opt._trust_region_multiplier)
         opt._prev_predicted_improvement = None
         opt._prev_pre_step_loss = None
@@ -757,6 +723,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         and state.f is not None
         and state.prev_prev_f is not None
         and state.prev_prev_g is not None
+        and state.prev_prev_g.shape == state.g.shape
     ):
         beta = opt._dual_momentum_beta
         init_f_for_solve = state.f + beta * (state.f - state.prev_prev_f)
@@ -796,10 +763,12 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             init_g=init_g_for_solve,
             scale_cost=opt.scale_cost,
         )
-        ot_result = opt.solver.solve(**solve_kwargs)
+        ot_result = (
+            opt.solver.solve(**solve_kwargs)
+            if opt._row_segments is None or P < 2
+            else _solve_segments(opt.solver, min(opt._row_segments, P), **solve_kwargs)
+        )
     state.last_solve_eps = ot_epsilon
-
-    feed_solver_stats(opt._progressive_epsilon, opt.solver, ot_result.n_iters, ot_result.converged)
 
     # Pre-step subspace coords for the displacement history.
     _pre_step_sub_coords = None
@@ -892,33 +861,12 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # Reduced from tensors already in hand; syncs with the cost mean below.
     _ess_tensor, _rho_tensor = solver_health(ot_result.matrix, X_bary - X, step_r)
 
-    if opt.use_momentum and state.velocity is not None:
-        beta = compute_momentum_coefficient(
-            iteration,
-            opt.max_iterations,
-            opt.momentum_init,
-            opt.momentum_final,
-        )
-        X_new, vel_new = apply_momentum(
-            X,
-            X_bary,
-            state.velocity,
-            beta,
-            opt.velocity_lr,
-        )
-        state.velocity = vel_new
-        state.X = X_new
-    else:
-        state.X = X_bary
-
-    # Post-OT correction; tracks whether the refinement makes the solve's duals stale.
-    _duals_invalidated = False
+    # Post-OT correction, ahead of momentum so the velocity carries it.
+    X_target = X_bary
     if opt._newton_refinement and opt._losses_3d is not None and K_eff >= 2 and opt.polytope_type == "orthoplex":
         from .quadratic_model import apply_newton_refinement
 
         X_refined = apply_newton_refinement(
-            # X_bary, not state.X: the accept test scores the pure OT step, and the
-            # post-momentum position would double-count momentum.
             X_bary=X_bary,
             losses_3d=opt._losses_3d,
             scales=probes,
@@ -930,16 +878,26 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             max_step_norm=step_r * 0.5,
             hessian_reg=1e-4,
         )
-        if torch.isfinite(X_refined).all():
-            state.X = X_refined
-            # Refinement replaced the post-momentum position, so re-derive the velocity from
-            # the move that actually happened. apply_momentum's identity is X = X_old + lr*v.
-            if opt.use_momentum and state.velocity is not None:
-                state.velocity = (
-                    (X_refined - X) / opt.velocity_lr if opt.velocity_lr != 0 else torch.zeros_like(state.velocity)
-                )
-            # The duals now encode old positions; mark stale so the save below skips them.
-            _duals_invalidated = True
+        X_target = torch.where(torch.isfinite(X_refined).all(-1, keepdim=True), X_refined, X_bary)
+
+    if opt.use_momentum and state.velocity is not None:
+        beta = compute_momentum_coefficient(
+            iteration,
+            opt.max_iterations,
+            opt.momentum_init,
+            opt.momentum_final,
+        )
+        X_new, vel_new = apply_momentum(
+            X,
+            X_target,
+            state.velocity,
+            beta,
+            opt.velocity_lr,
+        )
+        state.velocity = vel_new
+        state.X = X_new
+    else:
+        state.X = X_target
 
     # state.X is final here, so the model scores the realized move, not a Newton step
     # that was never applied.
@@ -949,7 +907,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         realized_rot = torch.einsum("bij,bj->bi", rot_mats.transpose(-1, -2), state.X - X)
         # Rows are disjoint parameter blocks of one objective, not independent losses.
         opt._prev_predicted_improvement = compute_predicted_improvement(_fd_grad, _fd_hess, realized_rot).sum().detach()
-        opt._prev_loss_from_center = True
         opt._prev_pre_step_loss = _center_loss[0].item()
 
     # One transfer for all three, not three device syncs a step.
@@ -965,8 +922,13 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             cost_matrix.min(dim=1).values.mean(),
         ]
     ).tolist()
+    _fabricated = bool(_all_nonfinite)
     if _all_nonfinite:
         warn_all_nonfinite(opt)
+    if _fabricated:
+        _cost_mean = _progress = float("inf")
+    _converged = ot_result.converged and not _fabricated
+    feed_solver_stats(opt._progressive_epsilon, opt.solver, ot_result.n_iters, _converged)
     # Candidate evaluations this step, net of screening.
     state.record_solver_health(_ess, _rho, _evals_this_step)
     update_stagnation_and_radius(opt, state, _progress)
@@ -993,19 +955,20 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     per_particle_disp_sqnorms = torch.sum((state.X - X) ** 2, dim=-1)  # (P,)
     disp_sqnorm_tensor = torch.mean(per_particle_disp_sqnorms)
     state.costs.append(_cost_mean)
-    state.linear_convergence.append(ot_result.converged)
+    state.linear_convergence.append(_converged)
     state.displacement_sqnorms.append(disp_sqnorm_tensor.item())
     state.iteration_count += 1
     opt._ot_step_costs.append(_cost_mean)
 
-    # Save duals for warm-starting; reset if NaN reverted or refinement moved particles.
-    if _nan_reverted or _duals_invalidated:
+    # Save duals for warm-starting; reset if NaN reverted, and keep the old ones when
+    # the solve saw a fabricated flat matrix.
+    if _nan_reverted:
         state.f = None
         state.g = None
         if opt._dual_momentum_beta > 0.0:
             state.prev_prev_f = None
             state.prev_prev_g = None
-    else:
+    elif not _fabricated:
         if opt._dual_momentum_beta > 0.0:
             state.prev_prev_f = state.f.clone() if state.f is not None else None
             state.prev_prev_g = state.g.clone() if state.g is not None else None
@@ -1051,17 +1014,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                     device=state.X.device,
                     dtype=state.X.dtype,
                 )
-            state.displacement_history.zero_()
-            if state.displacement_history_full is not None:
-                state.displacement_history_full.zero_()
-            state.displacement_history_idx = 0
-            state.displacement_history_count = 0
-            invalidate_for_basis_change(opt, state)
-            state.absorb_count += 1
-            # Clear the stagnation counter, or a plateau redraws the basis every step;
-            # the absorb re-anchors the origin, so the old loss history no longer applies.
-            state.stagnation_count = 0
-            state.prev_loss = _cost_mean
+            finish_absorb(opt, state)
         elif _rotation_due(adaptive_sub, state.iteration_count):
             # Re-anchor first: the point is base + P @ coords, so swapping P at non-zero
             # coords moves the weights unevaluated. The basis QR/SVD runs in fp32.
@@ -1100,11 +1053,11 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 )
             invalidate_for_basis_change(opt, state)
 
-    maintain_per_layer_subspace(opt, state, _cost_mean, _pre_step_sub_coords)
+    maintain_per_layer_subspace(opt, state, _pre_step_sub_coords)
 
     # Against the applied rank, not subspace_dim: the latter sums coordinate counts, so
     # comparing them would rebuild the subspace from scratch every step.
-    if opt._rank_schedule is not None and opt.subspace is not None:
+    if opt._rank_schedule is not None:
         current_rank = opt._rank_schedule.at(state.iteration_count)
         if current_rank != opt._applied_rank:
             opt._transition_rank(current_rank)

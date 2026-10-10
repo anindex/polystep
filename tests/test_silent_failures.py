@@ -112,22 +112,6 @@ def test_resume_is_bit_exact(cfg):
     assert torch.equal(uninterrupted, resumed)
 
 
-def test_format_2_checkpoint_still_loads_but_warns():
-    torch.manual_seed(0)
-    model = _small_model()
-    opt = PolyStepOptimizer(model, seed=0, biased_rotation=True)
-    for _ in range(3):
-        opt.step(_quadratic_closure)
-
-    legacy = copy.deepcopy(opt.state_dict())
-    legacy["format"] = 2
-    for key in ("_prev_descent_direction", "_newton_direction", "_loss_decreasing_count"):
-        legacy["control"].pop(key, None)
-
-    with pytest.warns(UserWarning, match="pre-format-3"):
-        opt.load_state_dict(legacy)
-
-
 def test_stagnation_absorb_does_not_fire_every_step():
     """The stagnation counter must reset after each absorb, not fire every step."""
     torch.manual_seed(0)
@@ -505,10 +489,11 @@ def _batch(n=6, d=4, c=3, seed=0):
 class TestAuditSilentFailures:
     """Each of these returned a plausible finite loss while measuring nothing."""
 
-    def test_a_scalar_closure_is_rejected_instead_of_broadcasting(self):
+    @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+    def test_a_scalar_closure_is_rejected_instead_of_broadcasting(self, block_strategy):
         """It broadcast over the slice: every candidate scored alike, so the step was 0."""
         torch.manual_seed(0)
-        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0)
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, block_strategy=block_strategy)
         with pytest.raises(ValueError, match="one loss per candidate"):
             opt.step(lambda bp: torch.tensor(3.0))
 
@@ -528,9 +513,9 @@ class TestAuditSilentFailures:
                 opt.step(_constant_closure(1.0, [0]))
 
     def test_an_all_nonfinite_cost_matrix_is_reported(self):
-        """Sanitize maps it to a constant, giving a uniform plan and a fabricated 1.0."""
+        """Sanitize maps it to a constant, so the step must not report that as a loss."""
         torch.manual_seed(0)
-        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0)
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, use_adaptive_radius=True)
 
         def nan_closure(bp):
             n = next(iter(bp.values())).shape[0]
@@ -538,6 +523,9 @@ class TestAuditSilentFailures:
 
         with pytest.warns(RuntimeWarning, match="carries no ranking information"):
             opt.step(nan_closure)
+        assert opt.state.costs[-1] == float("inf")
+        assert opt.state.linear_convergence[-1] is False
+        assert opt.state.radius_multiplier == 1.0
 
     def test_blockwise_reports_an_all_nonfinite_sweep_too(self):
         """The sanitize penalty must not be reported as a finite loss with convergence."""

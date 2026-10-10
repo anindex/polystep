@@ -13,7 +13,7 @@ import torch.nn as nn
 from polystep import PolyStepOptimizer
 from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep._compiled import _barycentric_projection, _fused_softmax_project
-from polystep.cost_nn import NNCostEvaluator
+from polystep.cost_nn import NNCostEvaluator, SiteVmapEvaluator
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
@@ -129,6 +129,78 @@ class TestMixedPrecisionStep:
         )
         if captured["duals"] is not None:
             assert captured["duals"] == torch.float32, f"duals came back {captured['duals']}"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "batched",
+        "vmap",
+        "loop",
+        "inplace",
+        "site",
+        pytest.param(
+            "compiled",
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="compile_forward needs CUDA"),
+            ],
+        ),
+    ],
+)
+def test_bf16_candidate_losses_reduce_in_fp32(path):
+    """A BF16 mean near 2.37 moves in steps of 2^-6, so candidates whose FP32 cross
+    entropy differs by about 1e-3 would tie."""
+    gen = torch.Generator().manual_seed(0)
+    model = nn.Sequential(nn.Linear(16, 10)).bfloat16()
+    with torch.no_grad():
+        model[0].weight.copy_(0.1 * torch.randn(10, 16, generator=gen))
+        model[0].bias.zero_()
+    inputs, targets = torch.randn(256, 16, generator=gen), torch.zeros(256, dtype=torch.long)
+    bias = torch.zeros(2, 10, dtype=torch.bfloat16)
+    bias[1, 0] = 2.0**-10
+    weight = model[0].weight.detach()
+    reference = [nn.functional.cross_entropy(inputs @ weight.float().t() + b.float(), targets) for b in bias]
+    assert 5e-4 < reference[0] - reference[1] < 2e-3
+
+    device = "cuda" if path == "compiled" else "cpu"
+    evaluator = NNCostEvaluator(model.to(device), nn.CrossEntropyLoss(), use_inplace=path in ("inplace", "compiled"))
+    if path in ("vmap", "loop"):
+        evaluator._batched_linear = None
+        evaluator._vmap_failed = path == "loop"
+    if path == "site":
+        layout = ParamLayout.from_module(model)
+        entry = next(e for e in layout.entries if e.key == "0.bias")
+        site = SiteVmapEvaluator.try_build(evaluator, layout)
+        base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+        losses = site.evaluate(base_sd, entry, torch.tensor([[0]]), bias[:, :1].reshape(1, 2, 1), inputs, targets)
+    else:
+        stacked = {"0.weight": weight.expand(2, *weight.shape).clone(), "0.bias": bias}
+        stacked = {k: v.to(device) for k, v in stacked.items()}
+        losses = evaluator.evaluate(stacked, inputs.to(device), targets.to(device))
+    assert losses[1] < losses[0]
+    assert evaluator._compile_forward_verified is (path == "compiled")
+
+
+@pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
+def test_bf16_batched_regression_losses_reduce_in_fp32(loss_fn):
+    """The batched path averages BF16 outputs in FP32, so each candidate matches its
+    FP32 loss instead of the nearest BF16 value, which is up to 2^-7 away here."""
+    gen = torch.Generator().manual_seed(0)
+    model = nn.Sequential(nn.Linear(16, 1)).bfloat16()
+    with torch.no_grad():
+        model[0].weight.copy_(0.1 * torch.randn(1, 16, generator=gen))
+        model[0].bias.zero_()
+    inputs, targets = torch.randn(256, 16, generator=gen), torch.full((256, 1), 1.5, dtype=torch.bfloat16)
+    bias = torch.tensor([[0.0], [2.0**-8]], dtype=torch.bfloat16)
+    weight = model[0].weight.detach()
+    outputs = [nn.functional.linear(inputs.bfloat16(), weight, b).float() for b in bias]
+    reference = torch.stack([loss_fn(out, targets.float()) for out in outputs])
+
+    evaluator = NNCostEvaluator(model, loss_fn)
+    assert evaluator._batched_linear is not None
+    stacked = {"0.weight": weight.expand(2, *weight.shape).clone(), "0.bias": bias}
+    torch.testing.assert_close(evaluator.evaluate(stacked, inputs, targets), reference, rtol=0, atol=1e-4)
 
 
 def test_projection_dtype_matches_model():
@@ -401,11 +473,13 @@ def test_mixed_dtype_model_runs_in_subspace_mode():
         assert model.big.dtype == torch.float32
 
 
-def test_mixed_dtype_model_computing_in_both_dtypes():
+@pytest.mark.parametrize("minority", [torch.float64, torch.bfloat16])
+def test_mixed_dtype_model_computing_in_both_dtypes(minority):
     """A model whose forward runs in two dtypes, not just holding an unused one. Each
     per-entry projection must be built at its own parameter's dtype or the
-    reconstruction matmul mixes Double and Float, and the evaluator must not cast
-    inputs to the perturbed layer's dtype."""
+    reconstruction matmul mixes dtypes, and the evaluator must not cast inputs to the
+    perturbed layer's dtype. A resync mid-run must keep each projection at its
+    parameter's dtype, and a sparse projection must not promote a narrower one."""
     from polystep.hybrid_subspace import HybridSubspace
     from polystep.cost_nn import NNCostEvaluator
 
@@ -413,15 +487,18 @@ def test_mixed_dtype_model_computing_in_both_dtypes():
         def __init__(self):
             super().__init__()
             self.a = nn.Linear(8, 8)
-            self.b = nn.Linear(8, 4).double()
+            self.b = nn.Linear(8, 4).to(minority)
 
         def forward(self, x):
-            return self.b(self.a(x).double())
+            return self.b(self.a(x).to(minority))
 
     builders = [
         lambda lo: HybridSubspace.from_layout(lo, rank=2),
         lambda lo: HybridSubspace.from_layout(
             lo, rank=2, rotation_interval=1, rotation_mode="displacement", absorb_mode="periodic", absorb_interval=2
+        ),
+        lambda lo: HybridSubspace.from_layout(
+            lo, rank=2, sparse_threshold_bytes=0, absorb_mode="periodic", absorb_interval=2
         ),
     ]
     for build in builders:
@@ -431,13 +508,99 @@ def test_mixed_dtype_model_computing_in_both_dtypes():
         evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
         inputs, targets = torch.randn(8, 8), torch.randint(0, 4, (8,))
         for i in range(4):
+            if i == 2:
+                opt.resync_from_model()
             opt.register_evaluator(evaluator, inputs, targets)
             opt.step(lambda p: evaluator.evaluate(p, inputs, targets), objective_token=i)
 
         sd = model.state_dict()
         assert sd["a.weight"].dtype is torch.float32
-        assert sd["b.weight"].dtype is torch.float64, "the minority dtype was rewritten"
-        assert model(inputs).dtype is torch.float64
+        assert sd["b.weight"].dtype is minority, "the minority dtype was rewritten"
+        assert opt.state.base_params["b.weight"].dtype is minority
+        assert model(inputs).dtype is minority
+
+
+def test_fused_reconstruction_keeps_a_sparse_minority_dtype():
+    """Two FP32 blocks fuse, so the sparse BF16 layer is rebuilt next to the fused
+    matmul and must not be promoted to the coordinates' dtype."""
+    model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8), nn.Linear(8, 64))
+    model[2].bfloat16()
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2, sparse_threshold_bytes=10_000)
+    projections = subspace.init_projections(torch.device("cpu"), torch.float32)
+    subspace.build_fused_projection(projections)
+    assert subspace._fused_P is not None
+    assert [spec.entry_key for spec, _ in subspace._fused_sparse_specs] == ["2.weight"]
+
+    base_sd = model.state_dict()
+    batch = subspace.reconstruct_batch(projections, base_sd, torch.randn(3, subspace.subspace_dim))
+    assert {k: v.dtype for k, v in batch.items()} == {k: v.dtype for k, v in base_sd.items()}
+
+
+def test_bf16_weights_skip_the_factored_low_rank_path_until_cast_back():
+    """The low-rank path adds each candidate's change after the matmul, so BF16 weights
+    would be ranked on changes they round away."""
+    from polystep import FactoredSubspace
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 3))
+    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    opt = PolyStepOptimizer(model, subspace=subspace, mixed_precision=True, seed=0)
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    inputs, targets = torch.randn(8, 6), torch.randint(0, 3, (8,))
+    opt.register_evaluator(evaluator, inputs, targets)
+    assert opt._factored_evaluator is None
+
+    model.float()
+    opt.resync_from_model()
+    opt.register_evaluator(evaluator, inputs, targets)
+    assert opt._factored_evaluator is not None
+    assert opt.state.X.dtype is torch.bfloat16
+    opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    assert model[0].weight.dtype is torch.float32
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
+def test_resync_rebuilds_the_fused_projection_after_a_cast(dtype):
+    """Same-dtype dense blocks share one fused projection, so a resync after a cast has
+    to rebuild it at the new dtype before the next step reconstructs through it."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 16), nn.ReLU(), nn.Linear(16, 4))
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    opt = PolyStepOptimizer(model, subspace=subspace, seed=0)
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    inputs, targets = torch.randn(16, 8), torch.randint(0, 4, (16,))
+    for i in range(4):
+        if i == 2:
+            model.to(dtype)
+            evaluator.reset_vmap()
+            opt.resync_from_model()
+        opt.register_evaluator(evaluator, inputs, targets)
+        opt.step(lambda p: evaluator.evaluate(p, inputs, targets), objective_token=i)
+    assert subspace._fused_P.dtype is dtype
+    assert model(inputs.to(dtype)).dtype is dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
+def test_resync_moves_a_global_projection_and_its_coordinates_with_a_cast(dtype):
+    """One global projection multiplies the coordinates straight into the parameters, so
+    both have to follow the model's dtype."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+    subspace = AdaptiveSubspace.from_layout(ParamLayout.from_module(model), rank=16)
+    opt = PolyStepOptimizer(model, subspace=subspace, use_momentum=True, seed=0)
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    inputs, targets = torch.randn(16, 8), torch.randint(0, 4, (16,))
+    for i in range(4):
+        if i == 2:
+            model.to(dtype)
+            evaluator.reset_vmap()
+            opt.resync_from_model()
+        opt.register_evaluator(evaluator, inputs, targets)
+        opt.step(lambda p: evaluator.evaluate(p, inputs, targets), objective_token=i)
+    assert opt.state.projection.dtype is dtype
+    assert opt.state.X.dtype is dtype
+    assert opt.state.velocity.dtype is dtype
+    assert model[0].weight.dtype is dtype
 
 
 def test_global_vector_modes_reject_a_mixed_dtype_model():

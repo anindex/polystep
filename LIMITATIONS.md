@@ -13,10 +13,12 @@ projection do not apply to those columns.
 `FactoredSubspace` restricts perturbations to the input directions in its fixed
 factor. Rotation changes those directions. Retune radii when switching subspaces.
 
-Momentum is cleared when the basis changes. `AdaptiveSubspace` rotates every step
-by default, so momentum requires a longer rotation interval to accumulate.
-Heavy-ball momentum can amplify the barycentric displacement; `step_radius` bounds
-the displacement before momentum.
+Momentum, the `amortize_steps` coasting direction, and the `biased_rotation`
+direction are cleared when the basis changes. `AdaptiveSubspace` rotates every step
+by default, so these options need a longer rotation interval to take effect; the
+optimizer warns when they meet a rotation every step. Heavy-ball momentum can
+amplify the barycentric displacement; `step_radius` bounds the displacement before
+momentum.
 
 ## Evaluation
 
@@ -26,14 +28,24 @@ the displacement before momentum.
 - Mixed-dtype models require `HybridSubspace` or `FactoredSubspace`. Full-space and
   global-subspace coordinates use one dtype and reject mixed parameter dtypes.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
+  When a candidate's output is FP16 or BF16, whether from the model's dtype or from
+  `candidate_autocast`, an `nn.CrossEntropyLoss`, `nn.MSELoss`, or `nn.L1Loss` left
+  at its defaults reduces it in FP32. Any other loss, including one with class
+  weights, label smoothing, or hooks, keeps the dtype it returns, so candidates
+  closer than its rounding step tie.
   Models needing autocast internally must provide it.
+- With FP16 or BF16 parameters, the subspace-delta and factored evaluators are off
+  so that candidates are scored on the weights they round to. `FactoredSubspace`
+  then materializes every candidate and runs slower.
 - Deferred `trust_region` comparisons require the same objective. `train()` rejects
   this option; use manual steps on a stationary objective.
 - `trust_region` and `use_adaptive_radius` both scale the step. Choose one controller.
 - Multi-fidelity screening imputes dropped costs using an additive offset. This can
   bias the full-fidelity cost estimate and is disabled with quadratic-model options.
-- Blockwise mode does not support every monolithic adaptation option; unsupported
-  options warn at construction.
+- Full-space blockwise mode does not support every monolithic adaptation option;
+  unsupported options warn at construction. With a subspace, `per_layer` and
+  `grouped` run the monolithic step and only split Sinkhorn and KL solves into row
+  segments.
 - The library does not distribute optimizer state across multiple GPUs.
 
 ## Attention and recurrent layers

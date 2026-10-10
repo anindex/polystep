@@ -127,25 +127,18 @@ def test_fused_projection_not_rebuilt_when_static():
 
 
 def test_absorb_reuses_the_seeded_basis_without_redrawing_it():
-    """An absorb re-anchors the origin; the basis is the same seeded draw either way.
+    """Without rotation, an absorb re-anchors the origin and keeps the current basis.
 
-    ``init_projections`` memoizes so the QR does not rerun, and the fused matrix, being a
-    pure function of that basis, is not rebuilt. A cache that returned a *different* basis
-    would move the weights with nothing evaluated behind it.
+    The fused matrix is a pure function of that basis, so it is never rebuilt. A basis
+    swapped at absorb would move the weights with nothing evaluated behind it.
     """
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(32, 8), nn.ReLU(), nn.Linear(8, 4))
     layout = ParamLayout.from_module(model)
     sub = HybridSubspace.from_layout(layout, rank=4, absorb_mode="periodic", absorb_interval=1)
 
-    first = sub.init_projections(torch.device("cpu"), torch.float32)
-    assert sub.init_projections(torch.device("cpu"), torch.float32) is first
-
-    fresh = HybridSubspace.from_layout(layout, rank=4).init_projections(torch.device("cpu"), torch.float32)
-    assert fresh.keys() == first.keys()
-    assert all(torch.equal(first[k], v) for k, v in fresh.items()), "cache must not change the basis"
-
     opt = PolyStepOptimizer(model, subspace=sub, solver="softmax", epsilon=0.5, step_radius=0.3, probe_radius=1.0)
+    first = opt._state.hybrid_projections
     calls = {"n": 0}
     original = sub.build_fused_projection
     sub.build_fused_projection = lambda projections: (calls.__setitem__("n", calls["n"] + 1), original(projections))[1]
@@ -159,9 +152,13 @@ def test_absorb_reuses_the_seeded_basis_without_redrawing_it():
         opt.step(lambda s: ev.evaluate(s, x, y))
 
     assert opt._state.absorb_count > 0, "absorb_interval=1 must absorb"
+    assert opt._state.hybrid_projections is first, "absorb must keep the current basis"
     assert calls["n"] == 0, f"absorb must not rebuild the fused matrix, got {calls['n']}"
     mutated = [k for k, v in snapshot.items() if not torch.equal(first[k], v)]
     assert not mutated, f"cached projections were written in place: {mutated}"
+    fresh = HybridSubspace.from_layout(layout, rank=4).init_projections(torch.device("cpu"), torch.float32)
+    assert fresh.keys() == first.keys()
+    assert all(torch.equal(first[k], v) for k, v in fresh.items()), "absorb must not redraw the basis"
 
 
 def test_rank_transition_rebuilds_the_fused_projection():

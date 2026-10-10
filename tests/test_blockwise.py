@@ -4,13 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from polystep.blockwise import (
-    blocks_to_layout_flat,
-    create_grouped_blocks,
-    create_per_layer_blocks,
-    reassemble_blocks,
-    split_particles,
-)
+from polystep.blockwise import create_grouped_blocks, create_per_layer_blocks
 from polystep.transform import ParamLayout
 
 
@@ -74,31 +68,8 @@ class TestGroupedBlocks:
         assert blocks[0].flat_end - blocks[0].flat_start == padded0
 
 
-class TestSplitReassemble:
-    def test_split_correct_shapes(self):
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        blocks = create_per_layer_blocks(layout)
-        total_flat = sum(b.flat_end - b.flat_start for b in blocks)
-        flat_vec = torch.randn(total_flat)
-        block_parts = split_particles(flat_vec, blocks)
-        assert len(block_parts) == len(blocks)
-        for bp, block in zip(block_parts, blocks):
-            assert bp.shape == (block.num_particles, block.particle_dim)
-
-    def test_reassemble_roundtrip(self):
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        blocks = create_per_layer_blocks(layout)
-        total_flat = sum(b.flat_end - b.flat_start for b in blocks)
-        original = torch.randn(total_flat)
-        block_parts = split_particles(original, blocks)
-        reconstructed = reassemble_blocks(block_parts, blocks, total_flat)
-        torch.testing.assert_close(original, reconstructed)
-
-
 class TestBlockLayoutConversion:
-    """Tests for layout_flat_to_block_flat, blocks_to_layout_flat, and the column map."""
+    """Tests for layout_flat_to_block_flat and blocks_to_layout_flat."""
 
     @pytest.mark.parametrize(
         "make_blocks",
@@ -154,34 +125,24 @@ class TestBlockLayoutConversion:
         assert torch.all(b1_data[:5] == 2.0)
         assert torch.all(b1_data[5:] == 0.0)
 
-    @pytest.mark.parametrize(
-        "make_blocks",
-        [
-            lambda layout: create_per_layer_blocks(layout, particle_dim=2),
-            lambda layout: create_grouped_blocks(layout, group_size=2, particle_dim=2),
-        ],
-        ids=["per_layer", "grouped"],
-    )
-    def test_column_map_scatters_to_the_same_place_as_the_slice_copy(self, make_blocks):
-        """The column map must agree with ``blocks_to_layout_flat``, which builds
-        the same vector by slice copies, or a candidate lands on the wrong parameter.
-        """
-        from polystep.blockwise import block_to_layout_columns
+    def test_grouped_blocks_hold_their_entries_in_order(self):
+        """A wrong but consistent column map still round-trips, so check the values."""
+        from polystep.blockwise import layout_flat_to_block_flat
 
         model = SimpleMLP()
-        layout = ParamLayout.from_module(model, particle_dim=2)
-        blocks = make_blocks(layout)
-        block_flat = torch.randn(blocks[-1].flat_end)
+        layout = ParamLayout.from_module(model, particle_dim=3)
+        blocks = create_grouped_blocks(layout, group_size=2, particle_dim=3)
+        block_flat = layout_flat_to_block_flat(layout.flatten(model).reshape(-1), blocks, layout)
 
-        columns = block_to_layout_columns(blocks, layout, block_flat.device)
-        # One past the end absorbs per-block padding, which has no layout counterpart.
-        scattered = torch.zeros(layout.padded_size + 1)
-        scattered.scatter_(0, columns, block_flat)
-
-        torch.testing.assert_close(scattered[: layout.padded_size], blocks_to_layout_flat(block_flat, blocks, layout))
+        sd = model.state_dict()
+        for block in blocks:
+            expected = torch.cat([sd[layout.entries[i].key].reshape(-1) for i in block.leaf_indices])
+            n = expected.numel()
+            assert torch.equal(block_flat[block.flat_start : block.flat_start + n], expected)
+            assert torch.all(block_flat[block.flat_start + n : block.flat_end] == 0.0)
 
     def test_split_after_conversion_gives_correct_data(self):
-        """split_particles on block-indexed data gives correct per-entry values."""
+        """Splitting block-indexed data by block gives correct per-entry values."""
         from polystep.blockwise import layout_flat_to_block_flat
 
         class TwoLayer(nn.Module):
@@ -201,8 +162,7 @@ class TestBlockLayoutConversion:
 
         flat = layout.flatten(model).reshape(-1)
         block_flat = layout_flat_to_block_flat(flat, blocks, layout)
-        block_2d = block_flat.reshape(-1, pdim)
-        block_parts = split_particles(block_2d, blocks)
+        block_parts = block_flat.view(-1, pdim).split([b.num_particles for b in blocks])
 
         # Block 0 should contain [0..6] + 1 padding zero
         assert block_parts[0].shape == (4, 2)
@@ -217,3 +177,51 @@ class TestBlockLayoutConversion:
             torch.arange(100, 103, dtype=torch.float32),
         )
         assert b1_flat[3].item() == 0.0
+
+
+def test_blockwise_sanitizes_before_averaging_probes_like_the_monolithic_driver():
+    """Averaging first let one non-finite probe carry its whole vertex to the penalty.
+
+    The two drivers then built different cost matrices from identical evaluations, and
+    nothing in the suite ran both.
+    """
+    from types import SimpleNamespace
+
+    from polystep._step_blockwise import _cost_from_losses
+
+    # One particle, two vertices, three probes. Vertex 0's middle probe is +inf.
+    losses = torch.tensor([1.0, float("inf"), 1.0, 2.0, 2.0, 2.0])
+    cost = _cost_from_losses(SimpleNamespace(_all_nonfinite=None), losses, P=1, V=2, K=3)
+
+    assert torch.isfinite(cost).all()
+    # Penalty is 2 * max|finite| + 1 = 5. Vertex 0 must come back as a blend of its two
+    # finite probes and that penalty, not as the penalty itself, which is what averaging
+    # an inf first would give.
+    assert 1.0 < cost[0, 0].item() < 5.0
+    assert cost[0, 0].item() == pytest.approx((1.0 + 5.0 + 1.0) / 3)
+
+
+def test_blockwise_radius_follows_the_best_vertex_mean(monkeypatch):
+    """The radius controller reads the best-vertex mean while ``state.costs`` keeps the full mean."""
+    from torch.func import functional_call, vmap
+
+    import polystep._step_blockwise as step_blockwise
+    from polystep import PolyStepOptimizer
+
+    seen = []
+    update = step_blockwise.update_stagnation_and_radius
+    monkeypatch.setattr(
+        step_blockwise,
+        "update_stagnation_and_radius",
+        lambda opt, state, loss: seen.append(loss) or update(opt, state, loss),
+    )
+    model = SimpleMLP()
+    opt = PolyStepOptimizer(model, block_strategy="per_layer", solver="softmax", use_adaptive_radius=True, seed=0)
+    x, y = torch.randn(16, 4), torch.randn(16, 2)
+
+    def closure(params):
+        return vmap(lambda p: (functional_call(model, p, (x,)) - y).pow(2).mean())(params)
+
+    opt.step(closure)
+    assert len(seen) == 1
+    assert seen[0] < opt._state.costs[-1]

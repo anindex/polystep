@@ -8,8 +8,8 @@
 - `PolyStepOptimizer` raises `TypeError` for a subspace that is not an
   `AdaptiveSubspace`, `HybridSubspace`, or `FactoredSubspace`.
 - Remove `adaptive_probes` and `adaptive_probes_threshold`. Runs that passed a
-  constant `objective_token` now evaluate every step instead of replaying cached
-  probe costs.
+  constant `objective_token` now evaluate candidates on every OT step instead of
+  replaying cached probe costs. Amortized momentum steps still skip evaluation.
 - `objective_token` now only decides whether the pending trust-region comparison
   still applies.
 - Remove `TemperedSoftmaxSolver`, `solver='tempered_softmax'`, and
@@ -47,6 +47,106 @@
   costs can differ from the vmap path in the last bit.
 - `FactoredSubspace.apply_perturbation` returns only the subspace's entries, so a
   frozen parameter edited outside the optimizer keeps the edit.
+- Steps write into the model's current parameters, so a swapped-in layer trains.
+  Call `resync_from_model()` after the swap, or the step overwrites it with the old
+  weights.
+- Optimizer checkpoints use format 6 and restore `candidate_evals`. Older formats
+  raise `ValueError`; rebuild the optimizer from the saved model weights instead.
+- Subspace runs with `block_strategy='per_layer'` or `'grouped'` take the monolithic
+  step and its fast evaluation paths. Sinkhorn and finite-`lam` KL solves still split
+  the particles into up to eight row segments; one-sided solvers run unsplit and warn.
+  Seeded runs draw a different random stream.
+- In those runs, trust region, the quadratic model, screening, probe-count
+  adaptation, and `rank_schedule` now apply instead of being ignored. The adaptive
+  radius follows the best-vertex mean, `scale_cost='mean'` and `'max_cost'` use one
+  divisor for a one-sided solve instead of one per block, and `biased_rotation` warns
+  when it falls back to the transport direction.
+- In those runs, a nonfinite candidate gets the monolithic penalty, twice the
+  largest finite magnitude in its evaluation chunk plus one, instead of a per-block
+  one. One-sided solves recenter the whole cost matrix at once, and
+  `_saturation_log` gets one record per step instead of one per block.
+- With FP16 or BF16 parameters, `HybridSubspace` and `FactoredSubspace` skip the
+  subspace-delta and factored evaluators, and the site-local path rebuilds each
+  changed weight from the base weights as `reconstruct_batch` does, so candidates
+  are scored on the weights they round to. Factored runs in half precision
+  materialize their candidates.
+- Remove `create_subspace_blocks`, `split_subspace_to_blocks`, and
+  `reassemble_blocks_to_subspace`.
+- Remove `split_particles` and `reassemble_blocks` from `polystep.blockwise`.
+- An absorb keeps the step's best-vertex mean as the stagnation baseline. Resetting
+  it to the full cost mean made the next step look like progress, which shrank the
+  adaptive radius.
+- Full-space `per_layer` and `grouped` steps raise `ValueError` when the closure does
+  not return one loss per candidate.
+- With a registered evaluator, those steps also score grouped and padded blocks on
+  the site paths. Particles that straddle two parameters or hold padding still go
+  to the closure.
+- Closure batches in those steps no longer round up to a whole candidate group, so
+  they stay within `chunk_size`.
+- Those steps drive the adaptive radius with the best-vertex mean, like the
+  monolithic step; `state.costs` still records the full cost mean, now averaged on
+  the host in double precision.
+- A step whose candidates are all nonfinite records an infinite cost, reports no
+  convergence, leaves the adaptive radius alone, and keeps the previous warm start
+  in every driver, instead of reporting the sanitize penalty as a loss.
+- Newton refinement runs before momentum, so momentum carries the refined step
+  instead of being overwritten by it, and Sinkhorn keeps its warm-start duals. A
+  particle whose refinement comes out nonfinite keeps its barycentric step; the
+  others stay refined.
+- `adaptive_num_probe` defaults to off under orthoplex `newton_refinement`, which
+  needs `num_probe>=2`. Passing `True` with it warns.
+- The screen calibrates dropped vertices on the finite full-fidelity costs only. A
+  nonfinite kept cost used to give every dropped vertex of its particle the penalty.
+- With a registered evaluator, every evaluation path screens on the
+  `screen_fidelity` slice of the batch; the site-vmap path used to screen on all of
+  it. `candidate_evals` and `state.evals` count screen forwards at that fraction on
+  every path.
+- A `HybridSubspace` or `FactoredSubspace` absorb keeps the current basis instead
+  of reverting to the seeded one, unless `absorb_aligned_active` redraws it, and an
+  absorb that lands on a rotation step also rotates.
+- The trust-region comparison survives absorbs and rotations, which leave the
+  weights unchanged, so `AdaptiveSubspace` with its default rotation every step now
+  adapts the radius.
+- The trust region applies its updated radius on the step that measured the ratio.
+  Every update used to land one step late, so a step that raised the loss was
+  followed by another at the old radius.
+- `PolyStepOptimizer` warns when an `AdaptiveSubspace` that rotates every step is
+  combined with `amortize_steps > 1`, `biased_rotation`, or `use_momentum`, whose
+  state each rotation clears.
+- Sparse `HybridSubspace` projections keep a narrower parameter's dtype instead of
+  promoting it to the coordinates' dtype.
+- `resync_from_model()` keeps each per-layer projection at its parameter's dtype, so
+  a mixed-dtype model keeps training after `train()` restores its best weights. It
+  raises `ValueError` when the model has moved to another device.
+- `train()` scores the weights for `restore_best` and callbacks through the
+  evaluator: inputs are cast to the model's dtype, `candidate_autocast` applies, and
+  an unreduced loss is averaged. FP64 and `mixed_precision` models fed FP32 batches
+  no longer fail there.
+- Half-precision candidate outputs, from an FP16 or BF16 model or from
+  `candidate_autocast`, reduce in FP32 when the loss is an `nn.CrossEntropyLoss`,
+  `nn.MSELoss`, or `nn.L1Loss` left at its defaults, so candidates about 1e-3 apart
+  no longer tie. With `candidate_autocast` on CUDA, the eager in-place and loop costs
+  and the `train()` loss now match the compiled path. Other losses and FP64 models
+  score as before.
+- A `FactoredSubspace` step after `release_evaluator()` scores through the closure
+  instead of failing on the released batch. The release also frees the cast copy of
+  that batch kept by the delta and factored evaluators.
+- With inputs of more than two dimensions, a Sequential MLP without a leading
+  `nn.Flatten` skips the sparse-delta, subspace-delta, and factored evaluators, which
+  flatten each sample, so the step no longer fails on a shape mismatch. Full-space
+  and hybrid candidates go to the site-local path; factored candidates are
+  materialized.
+- `PolyStepES` without a `seed` draws rotations from PyTorch's global RNG, so
+  `torch.manual_seed` controls it. Every unseeded run used to replay one fixed stream.
+- `PowerDecay` requires `0 < gamma <= 0.5`. A larger `gamma` makes the radii
+  summable, which the convergence analysis does not allow.
+- `CosineEpsilon` raises `ValueError` for a negative `decay`, as `LinearEpsilon` does.
+- `rank_schedule` raises `ValueError` at construction unless the subspace is a
+  `HybridSubspace`. Other subspaces used to warn and keep their rank.
+- `max_subspace_dim` also scales weight matrices the rank leaves at full width.
+  They used to count as fixed, so the README quickstart got 132 coordinates and a
+  warning instead of 128. The RL configs' cap of 24 now binds; the recorded
+  CartPole (114 coordinates, full space) and Acrobot (68) runs used the old split.
 
 ## 0.13.0 - 2026-09-22
 

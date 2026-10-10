@@ -293,6 +293,29 @@ class TestShouldAbsorb:
         assert not sub.should_absorb(stagnation_count=100, iteration=100)
 
 
+@pytest.mark.parametrize("kind", ["adaptive", "hybrid"])
+def test_absorb_keeps_the_progress_baseline(model, layout, kind):
+    """The stagnation baseline stays the best-vertex mean the step measured, not the full cost mean."""
+    from torch.func import functional_call, vmap
+
+    from polystep import PolyStepOptimizer
+    from polystep.hybrid_subspace import HybridSubspace
+
+    cls = AdaptiveSubspace if kind == "adaptive" else HybridSubspace
+    sub = cls.from_layout(layout, rank=4, absorb_mode="periodic", absorb_interval=1)
+    opt = PolyStepOptimizer(model, subspace=sub, solver="softmax", seed=0)
+    x, y = torch.randn(16, 20), torch.randn(16, 5)
+
+    def closure(params):
+        return vmap(lambda p: (functional_call(model, p, (x,)) - y).pow(2).mean())(params)
+
+    for absorbs in (1, 2):
+        opt.step(closure)
+        state = opt._state
+        assert state.absorb_count == absorbs
+        assert state.prev_loss < state.costs[-1]
+
+
 class TestFactoryMethods:
     @pytest.mark.parametrize(
         "full_dim, expected",
@@ -487,3 +510,19 @@ def test_rotation_interval_amortizes_the_basis_decomposition(interval, expected_
 
     changes = sum(not torch.equal(a, b) for a, b in zip(seen, seen[1:]))
     assert changes == expected_rotations
+
+
+@pytest.mark.parametrize("option", [{"amortize_steps": 2}, {"biased_rotation": True}, {"use_momentum": True}])
+def test_per_step_rotation_warns_about_the_state_it_clears(option):
+    """A basis change clears the velocity and both cached directions, so a rotation every step leaves them inert."""
+    import warnings
+
+    from polystep.optimizer import PolyStepOptimizer
+
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
+    with pytest.warns(UserWarning, match="changes its basis every step"):
+        PolyStepOptimizer(model, subspace=AdaptiveSubspace.auto_from_params(model), **option)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        PolyStepOptimizer(model, subspace=AdaptiveSubspace.auto_from_params(model, rotation_interval=2), **option)
+    assert not [w for w in caught if "every step" in str(w.message)]

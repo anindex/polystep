@@ -115,54 +115,19 @@ def test_try_build_declines_a_non_mlp():
     assert SubspaceDeltaEvaluator.try_build(model, nn.CrossEntropyLoss(), sub) is None
 
 
-def test_subspace_blockwise_step_scores_through_the_delta_path():
-    """A subspace block-wise step must reach the delta path and agree with the dense one."""
-    from polystep import HybridSubspace, ParamLayout, PolyStepOptimizer
-    from polystep.cost_nn import NNCostEvaluator
-
-    def build():
-        torch.manual_seed(0)
-        model = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 10))
-        gen = torch.Generator().manual_seed(0)
-        inputs = torch.randn(32, 64, generator=gen)
-        targets = torch.randint(0, 10, (32,), generator=gen)
-        evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
-        calls = []
-
-        def closure(batched_params):
-            calls.append(1)
-            return evaluator.evaluate(batched_params, inputs, targets)
-
-        torch.manual_seed(7)
-        opt = PolyStepOptimizer(
-            model,
-            epsilon=0.3,
-            step_radius=0.1,
-            seed=3,
-            subspace=HybridSubspace.auto_from_layout(ParamLayout.from_module(model)),
-            block_strategy="per_layer",
-        )
-        return opt, evaluator, inputs, targets, closure, calls
-
-    opt_dense, _, _, _, dense_closure, dense_calls = build()
-    dense = [opt_dense.step(dense_closure) for _ in range(4)]
-
-    opt_fast, evaluator, inputs, targets, fast_closure, fast_calls = build()
-    opt_fast.register_evaluator(evaluator, inputs, targets)
-    assert opt_fast._subspace_delta_evaluator is not None, "the delta path must be available, or this proves nothing"
-    fast = [opt_fast.step(fast_closure) for _ in range(4)]
-
-    assert len(fast_calls) < len(dense_calls), "some chunks should have skipped reconstruct_batch"
-    torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=1e-5, atol=1e-6)
-
-
 @pytest.mark.parametrize(
-    "mixed,dtype,tol",
-    [(False, torch.float32, 1e-6), (True, torch.bfloat16, 5e-3)],
+    "mixed,dtype,tol,path",
+    [
+        (False, torch.float32, 1e-6, "_subspace_delta_evaluator"),
+        (True, torch.bfloat16, 1e-4, "_site_vmap_evaluator"),
+    ],
     ids=["fp32", "bf16"],
 )
-def test_optimizer_step_matches_the_materializing_path(mixed, dtype, tol):
-    """The step must agree with reconstruct_batch, mixed precision included."""
+def test_optimizer_step_matches_the_materializing_path(mixed, dtype, tol, path):
+    """The step must agree with reconstruct_batch, mixed precision included. BF16 weights
+    skip the delta path, which adds the change after the matmul, for the site path. The
+    BF16 closure scores through vmap like the site path, because the batched path rounds
+    each sample's cross entropy before the FP32 mean."""
     from polystep import HybridSubspace, ParamLayout, PolyStepOptimizer
 
     def build(register):
@@ -172,6 +137,8 @@ def test_optimizer_step_matches_the_materializing_path(mixed, dtype, tol):
         x = torch.randn(32, 64, generator=g).to(dtype)
         y = torch.randint(0, 10, (32,), generator=g)
         ev = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+        if mixed:
+            ev._batched_linear = None
         torch.manual_seed(7)
         opt = PolyStepOptimizer(
             model,
@@ -187,7 +154,8 @@ def test_optimizer_step_matches_the_materializing_path(mixed, dtype, tol):
 
     _, dense = build(register=False)
     opt_fast, fast = build(register=True)
-    assert opt_fast._subspace_delta_evaluator is not None, "the delta path must be built, or this proves nothing"
+    assert getattr(opt_fast, path) is not None, "the fast path must be built, or this proves nothing"
+    assert (opt_fast._subspace_delta_evaluator is None) is mixed
     torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=tol, atol=tol)
 
 

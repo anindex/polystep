@@ -44,7 +44,12 @@ def test_search_cli_uses_one_budget_protocol_and_saves_baseline_only(tmp_path, m
         run_search("mlp", "hybrid_typo", 0)
 
 
-BUDGETS = dict.fromkeys(ARMS, 512) | {"hybrid_newton": 1024, "hybrid_newton_momentum": 1024}
+BUDGETS = dict.fromkeys(ARMS, 512) | {
+    "hybrid_newton": 1024,
+    "hybrid_newton_momentum": 1024,
+    "full_per_layer": 3072,
+    "full_grouped": 3072,
+}
 
 
 @pytest.mark.parametrize("arm", ARMS)

@@ -51,12 +51,15 @@ def main():
             if backend == "site":
                 spec = sub.specs[0]
                 assert spec.flat_start == 0 and spec.flat_end >= 256
+                origin = torch.zeros(sub.subspace_dim, device="cuda")
 
                 def call():
                     parts = []
                     for first in range(0, 32, max(1, chunk // 16)):
                         offsets = u[first : first + max(1, chunk // 16)]
-                        parts.append(site.evaluate_subspace(projections, base, spec, first * 8, offsets, x, y))
+                        parts.append(
+                            site.evaluate_subspace(projections, base, origin, base, spec, first * 8, offsets, x, y)
+                        )
                     return torch.cat(parts)
             else:
 

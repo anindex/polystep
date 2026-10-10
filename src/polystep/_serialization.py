@@ -1,15 +1,10 @@
 """Checkpoint format for :class:`~polystep.optimizer.PolyStepOptimizer`."""
 
-import warnings
-
 import torch
 
 
 # state_dict schema version. Bump when a key changes meaning.
-# 1: SolverState only. 2: adds "control". 3: rotation-bias and quadratic-model state.
-# 4: jitter pool.
-# 5: whole-model (summed) trust prediction and incumbent-only comparisons.
-_STATE_DICT_FORMAT = 5
+_STATE_DICT_FORMAT = 6
 
 # Optimizer attributes outside SolverState that steer the *next* step.
 _SPARSE_TAG = "__sparse_projection__"
@@ -27,12 +22,11 @@ _CONTROL_STATE_KEYS = (
     "_newton_direction",
     "_loss_decreasing_count",
     "_prev_objective_token",
-    # Which estimator _prev_pre_step_loss came from.
-    "_prev_loss_from_center",
     # Which rank the restored X and projections belong to.
     "_applied_rank",
     # Batched jitter draws not yet consumed.
     "_jitter_pool",
+    "candidate_evals",
 )
 
 
@@ -46,7 +40,7 @@ class SerializationMixin:
 
         def _ser(v):
             if isinstance(v, torch.Tensor):
-                return v.detach().to("cpu").clone()
+                return v.detach().to("cpu", copy=True)
             if isinstance(v, SparseRandomProjection):
                 # A pure function of these four numbers; by reference it would keep CUDA storage in the file.
                 return {
@@ -91,11 +85,11 @@ class SerializationMixin:
     def load_state_dict(self, sd: dict) -> None:
         """Restore optimizer state saved by :meth:`state_dict` (in place)."""
         fmt = sd.get("format")
-        if fmt is None or fmt > _STATE_DICT_FORMAT:
+        if fmt != _STATE_DICT_FORMAT:
             raise ValueError(
-                f"Unsupported optimizer state_dict format {fmt!r}; this build writes and "
-                f"reads format {_STATE_DICT_FORMAT}. The checkpoint was written by a newer "
-                "polystep."
+                f"Unsupported optimizer state_dict format {fmt!r}; this build reads format "
+                f"{_STATE_DICT_FORMAT} only. Rebuild the optimizer from the saved model weights "
+                "to continue a run saved by another polystep release."
             )
         device = self._state.X.device
         valid = set(type(self._state).__dataclass_fields__)
@@ -109,8 +103,8 @@ class SerializationMixin:
 
         def _de(v):
             if isinstance(v, torch.Tensor):
-                # clone: a same-device .to() returns the checkpoint's own tensor, which gets written in place.
-                return v.to(device).clone()
+                # copy: a same-device .to() returns the checkpoint's own tensor, which gets written in place.
+                return v.to(device, copy=True)
             if isinstance(v, dict) and v.get(_SPARSE_TAG):
                 return SparseRandomProjection(
                     full_dim=v["full_dim"],
@@ -141,36 +135,18 @@ class SerializationMixin:
         if gs is not None and self._generator is not None:
             self._generator.set_state(gs.to("cpu"))
 
-        # Restore the optimizer-owned control state; format-0 checkpoints drop the caches.
-        control = sd.get("control")
-        if control is None:
-            self._transport_direction_ema = None
-        else:
-            for name in _CONTROL_STATE_KEYS:
-                # `in`, not .get(): an older format missing a key would write None over the live value.
-                if name in control:
-                    setattr(self, name, _de(control[name]))
-            self._ot_step_costs.clear()
-            self._ot_step_costs.extend(control.get("_ot_step_costs", []))
-            if fmt < 3:
-                # Format 2 did not carry the steering state below.
-                warnings.warn(
-                    "Loading a pre-format-3 optimizer state_dict. It predates the rotation-bias "
-                    "and quadratic-model steering state, so the first step after resume can "
-                    "differ from the uninterrupted run when biased_rotation, "
-                    "adaptive_num_probe or use_quadratic_model is enabled. Re-checkpoint to "
-                    "get exact resume.",
-                    stacklevel=2,
-                )
-                self._prev_descent_direction_finite = False
-                self._loss_decreasing_count = 0
-
-        if fmt < 5:
-            if self._prev_loss_from_center and self._prev_predicted_improvement is not None:
-                self._prev_predicted_improvement = self._prev_predicted_improvement.sum()
-            else:
-                self._prev_predicted_improvement = None
-                self._prev_pre_step_loss = None
+        # Restore the optimizer-owned control state.
+        control = sd.get("control", {})
+        for name in _CONTROL_STATE_KEYS:
+            # `in`, not .get(): a missing key would write None over the live value.
+            if name in control:
+                setattr(self, name, _de(control[name]))
+        self._ot_step_costs.clear()
+        self._ot_step_costs.extend(control.get("_ot_step_costs", []))
+        if self._blocks is None:
+            self._state.block_duals = None
+            self._state._prev_prev_block_duals = None
+            self._prev_block_descent_directions = None
 
         # The fused block-diagonal projection caches the step-0 basis; the checkpoint carries a later one.
         if self._hybrid and hasattr(self.subspace, "build_fused_projection"):

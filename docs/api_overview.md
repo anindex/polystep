@@ -20,8 +20,16 @@ optimizer.release_evaluator()
 ```
 
 The evaluator and closure must compute the same objective. After external parameter
-updates, call `optimizer.resync_from_model()`. After replacing layers or buffers,
-call `evaluator.reset_vmap()` and register it again.
+updates, call `optimizer.resync_from_model()`. After replacing layers or buffers, or
+casting the model to another dtype, call `evaluator.reset_vmap()` and register it
+again. A swapped layer also needs `optimizer.resync_from_model()`, or the next step
+overwrites the new layer with the old weights plus the update.
+
+After a dtype cast, that resync moves the subspace projections to the new parameter
+dtypes, and an `AdaptiveSubspace` moves its coordinates along with them.
+`HybridSubspace`, `FactoredSubspace` and full space keep their coordinates in the dtype
+they were built with, so build a new optimizer if those should follow the cast. No
+optimizer follows the model to another device; the resync raises there.
 
 ## Training loop
 
@@ -37,9 +45,11 @@ config = TrainConfig(
 train(model, loader, nn.CrossEntropyLoss(), optimizer, config)
 ```
 
-`restore_best=True` restores the weights with the lowest tracked minibatch loss.
-Best-weight tracking and callbacks require an extra loss evaluation per step.
-This is training-loss selection, not held-out validation selection.
+`restore_best=True` restores the weights with the lowest tracked loss. Each step's
+weights are scored on the batch that step trained on, with the same input cast,
+autocast and loss reduction as the candidates, so the loss is in-sample and leans
+optimistic. Best-weight tracking and callbacks require an extra loss evaluation per
+step. This is training-loss selection, not held-out validation selection.
 
 ## Subspaces
 
@@ -72,8 +82,9 @@ projection = SparseRandomProjection(full_dim=10_000, subspace_dim=64, seed=0)
 
 ### Rank schedules
 
-`RankSchedule` changes the rank after absorbing the current perturbation. It requires
-monolithic mode:
+`RankSchedule` changes the rank after absorbing the current perturbation. It needs a
+`HybridSubspace`, and the constructor raises `ValueError` for any other subspace. It
+works under any `block_strategy`:
 
 ```python
 from polystep.optimizer import RankSchedule
@@ -95,9 +106,9 @@ optimizer = PolyStepOptimizer(
 | `num_probe` | `1` | Probe count; probe `k` uses `k / (num_probe + 1)` of the radius |
 | `polytope_type` | `'simplex'` | Also `'orthoplex'` or `'cube'` |
 | `subspace` | `None` | A constructed subspace instance |
-| `block_strategy` | `'monolithic'` | Also `'per_layer'` or `'grouped'` |
+| `block_strategy` | `'monolithic'` | Also `'per_layer'` or `'grouped'`; with a subspace, only splits Sinkhorn/KL solves into row segments |
 | `chunk_size` | `None` | Automatic candidate chunk estimate |
-| `adaptive_num_probe` | Monolithic, multiple probes | Reduces probe count after decreasing costs |
+| `adaptive_num_probe` | Multiple probes, except full-space blocks and orthoplex Newton refinement | Reduces probe count after decreasing costs |
 
 Scalar radii are multiplied by epsilon. Scheduled radii supply their own scale:
 
@@ -129,13 +140,20 @@ Pass a new `objective_token` whenever the batch or loss changes. A change drops 
 deferred trust-region comparison; `None` or a constant token means a stationary
 objective.
 
-Multi-fidelity screening needs a cheaper closure:
+Multi-fidelity screening needs a cheaper closure. `screen_closure_from` calls the
+closure with the first `screen_fidelity` share of the batch as extra arguments, so
+give the closure the batch as defaults and the same function serves both calls:
 
 ```python
+def closure(params, x=inputs, y=targets):
+    return evaluator.evaluate(params, x, y)
+
 optimizer = PolyStepOptimizer(model, multifidelity_screen=True)
 screen = optimizer.screen_closure_from(closure, inputs, targets)
 optimizer.step(closure, screen_closure=screen)
 ```
+
+A registered evaluator screens on the same leading slice of its batch.
 
 Screening is disabled with quadratic-model options or when its estimated cost is
 at least the full sweep. See [performance](performance.md#radius-models).
@@ -186,7 +204,9 @@ es = minimize(objective, dim=20, steps=200)
 ```
 
 `PolyStepES` defaults to `epsilon=0.5`, `step_radius=0.5`, and `scale_cost='mean'`.
-It accepts neither `probe_radius` nor `num_probe`.
+It accepts neither `probe_radius` nor `num_probe`. With `seed` it draws rotations from
+its own generator; without one it uses PyTorch's global RNG, so `torch.manual_seed`
+reproduces the run.
 
 ## Low-level solver
 
@@ -214,7 +234,8 @@ model.load_state_dict(checkpoint["model"])
 optimizer.load_state_dict(checkpoint["optimizer"])
 ```
 
-Rebuild the optimizer with the original configuration before loading. Format 5
-stores whole-model trust predictions. Older incumbent-based predictions are summed;
-comparisons based on probe minima are discarded. Newer unsupported formats raise.
-Reproducible continuation also requires the same objective and environment.
+Rebuild the optimizer with the original configuration before loading. This release
+reads only format 6 and raises `ValueError` on any other format. To continue a run
+saved by another release, build a fresh optimizer around the saved model weights.
+The checkpoint also restores `candidate_evals`. Reproducible continuation requires
+the same objective and environment.

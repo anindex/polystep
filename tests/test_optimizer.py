@@ -596,3 +596,40 @@ def test_cosine_step_radius_warns_only_on_an_snn(build, expect_warning):
         if any(k in m for k in ("snn", "leaky", "lif", "spik")) and ("step_radius" in m or "cosine" in m)
     ]
     assert bool(hits) is expect_warning, hits
+
+
+def test_a_replaced_layer_receives_the_next_update():
+    torch.manual_seed(0)
+    model = _make_model()
+    evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
+    inputs, targets = torch.randn(16, 4), torch.randn(16, 1)
+    opt = PolyStepOptimizer(model, epsilon=0.1, sinkhorn_max_iters=100, seed=42)
+
+    def closure(batched_params):
+        return evaluator.evaluate(batched_params, inputs, targets)
+
+    opt.register_evaluator(evaluator, inputs, targets)
+    opt.step(closure)
+
+    orphan = model[0]
+    orphan_weight = orphan.weight.detach().clone()
+    model[0] = nn.Linear(4, 8)
+    replacement_weight = model[0].weight.detach().clone()
+    evaluator.reset_vmap()
+    opt.register_evaluator(evaluator, inputs, targets)
+    opt.resync_from_model()
+    opt.step(closure)
+
+    assert not torch.equal(model[0].weight, replacement_weight)
+    assert torch.equal(orphan.weight, orphan_weight)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_resync_refuses_a_model_moved_to_another_device():
+    """resync_from_model() re-reads the weights; it does not move the optimizer state."""
+    model = _make_model()
+    opt = PolyStepOptimizer(model, seed=0)
+    model.cuda()
+    with pytest.raises(ValueError, match="moved from cpu to cuda"):
+        opt.resync_from_model()

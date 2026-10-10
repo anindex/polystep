@@ -57,6 +57,10 @@ class TestCosineEpsilon:
         lin = LinearEpsilon(init=1.0, decay=0.01, target=0.0)
         assert all(cos.at(t) > lin.at(t) for t in range(5, 50))
 
+    def test_rejects_negative_decay(self):
+        with pytest.raises(ValueError, match="decay"):
+            CosineEpsilon(init=1.0, decay=-0.01)
+
     def test_warm_restarts_return_to_init(self):
         s = CosineEpsilon(init=1.0, decay=0.01, target=0.2, total_steps=10, restart_mult=2.0)
         assert s.at(10) == pytest.approx(1.0, rel=0.05), "a restart must climb back toward init"
@@ -288,8 +292,10 @@ def test_power_decay_is_square_summable_but_not_summable():
     vals = [s.at(t) for t in range(50)]
     assert all(a > b > 0 for a, b in zip(vals, vals[1:]))
     assert PowerDecay(init=2.0, gamma=0.1, target=1.0).at(1000) == 1.0
-    with pytest.raises(ValueError):
-        PowerDecay(init=1.0, gamma=0.0)
+    assert PowerDecay(init=1.0, gamma=0.5).at(1) == pytest.approx(0.5)
+    for gamma in (0.0, 0.6):
+        with pytest.raises(ValueError, match="gamma"):
+            PowerDecay(init=1.0, gamma=gamma)
 
 
 class TestRadiusEpsilonSemantics:

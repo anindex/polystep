@@ -371,7 +371,8 @@ def test_the_block_diagonal_correction_matches_the_dense_one(projection_type):
     inputs = torch.randn(5, 24, generator=gen)
     targets = torch.randint(0, 4, (5,), generator=gen)
 
-    got = site.evaluate_subspace(projections, bary_sd, spec, 0, dcoords, inputs, targets)
+    origin = torch.zeros(subspace.subspace_dim)
+    got = site.evaluate_subspace(projections, bary_sd, origin, bary_sd, spec, 0, dcoords, inputs, targets)
     expected = site._vmap_over_site(
         spec.entry_key,
         bary_sd,
@@ -380,3 +381,39 @@ def test_the_block_diagonal_correction_matches_the_dense_one(projection_type):
         targets,
     )
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_a_half_precision_site_holds_the_weights_reconstruct_batch_builds(monkeypatch):
+    """A BF16 bias of 1 at coordinate 0.003 stores 1, so the 0.002 step to a candidate
+    at 0.005 vanishes when added to the stored incumbent, while the base plus 0.005
+    rounds up to 1.0078125. The site must hold what ``reconstruct_batch`` builds from
+    the base and the candidate's full coordinates.
+    """
+    from polystep import HybridSubspace
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8)).bfloat16()
+    layout = ParamLayout.from_module(model)
+    subspace = HybridSubspace.from_layout(layout, rank=1)
+    projections = subspace.init_projections(torch.device("cpu"), torch.bfloat16)
+    base_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    base_sd["0.bias"].fill_(1.0)
+    coords = torch.full((subspace.subspace_dim,), 0.003, dtype=torch.bfloat16)
+    bary_sd = subspace.apply_perturbation(projections, base_sd, coords)
+    assert torch.equal(bary_sd["0.bias"], torch.ones(8, dtype=torch.bfloat16))
+
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    scored = {}
+    monkeypatch.setattr(site, "_vmap_over_site", lambda key, sd, weights, *_: scored.__setitem__(key, weights))
+    pdim, steps = 4, torch.tensor([0.005, 0.0035], dtype=torch.bfloat16)
+    for spec in subspace.specs:
+        n_groups = spec.num_coords // pdim
+        values = steps.view(1, -1, 1).expand(n_groups, -1, pdim)
+        site.evaluate_subspace(projections, base_sd, coords, bary_sd, spec, 0, values, None)
+        full = coords.repeat(n_groups, len(steps), 1)
+        for g in range(n_groups):
+            start = spec.flat_start + g * pdim
+            full[g, :, start : start + pdim] = values[g]
+        expected = subspace.reconstruct_batch(projections, base_sd, full.flatten(0, 1))[spec.entry_key]
+        assert torch.equal(scored[spec.entry_key], expected)
+    assert scored["0.bias"].unique().tolist() == [1.0, 1.0078125]

@@ -164,7 +164,7 @@ class TestBuffersExcluded:
 
 class TestBlockwiseTurboFeatures:
     """Dual momentum, biased rotation and the amortized EMA must
-    work in blockwise and subspace_blockwise step modes, not just monolithic."""
+    work in the blockwise step, not just monolithic."""
 
     def _make_simple_model(self):
         return nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 2))
@@ -852,14 +852,21 @@ class TestAuditCrashes:
         assert all(b.num_particles > 0 for b in blocks)
 
     def test_a_chunk_narrower_than_a_candidate_group_does_not_overrun_the_buffer(self):
-        """The dense fallback inherits the delta path's group-rounded stride."""
+        """The site path rounds its stride to whole groups; the dense fallback keeps the user's cap."""
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 3))
         opt = PolyStepOptimizer(model, block_strategy="per_layer", chunk_size=1, epsilon=0.5, seed=0, solver="softmax")
         inputs, targets = torch.randn(4, 6), torch.randint(0, 3, (4,))
         ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
         opt.register_evaluator(ev, inputs, targets)
-        opt.step(lambda bp: ev.evaluate(bp, inputs, targets))
+        rows = []
+
+        def closure(bp):
+            rows.append(next(iter(bp.values())).shape[0])
+            return ev.evaluate(bp, inputs, targets)
+
+        opt.step(closure)
+        assert rows and max(rows) == 1
         assert torch.isfinite(opt.state.X).all()
 
     def test_a_fully_masked_attention_row_does_not_return_nan(self):

@@ -297,7 +297,7 @@ def parity(args, dims, kind, solver, seed, cap):
 @torch.inference_mode()
 def prefix_bench(args):
     rows = []
-    cap = None if args.kinds else 512
+    cap = None if args.kinds else 1024
     for dims in [args.dims] if args.dims else [(32, width, width, 4) for width in (64, 256)]:
         for kind in args.kinds or ("full", "hybrid"):
             for solver in args.solver or ("softmax",):

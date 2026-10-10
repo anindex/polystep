@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import functools
-import warnings
 from dataclasses import dataclass
 from typing import List, Tuple, TYPE_CHECKING
 
@@ -90,41 +89,6 @@ def create_grouped_blocks(
     return blocks
 
 
-def split_particles(
-    particles: torch.Tensor,
-    blocks: List[BlockConfig],
-) -> List[torch.Tensor]:
-    """Flatten ``particles`` and slice it into one tensor per block."""
-    flat = particles.reshape(-1)
-    result: List[torch.Tensor] = []
-
-    for block in blocks:
-        block_flat = flat[block.flat_start : block.flat_end]
-        result.append(block_flat.reshape(block.num_particles, block.particle_dim))
-
-    return result
-
-
-@torch.inference_mode()
-def reassemble_blocks(
-    block_particles: List[torch.Tensor],
-    blocks: List[BlockConfig],
-    total_flat_size: int,
-) -> torch.Tensor:
-    """Inverse of :func:`split_particles`, into one ``(total_flat_size,)`` vector."""
-    if not block_particles:
-        return torch.zeros(total_flat_size)
-
-    full_flat = torch.zeros(total_flat_size, dtype=block_particles[0].dtype, device=block_particles[0].device)
-
-    for block_X, block in zip(block_particles, blocks):
-        block_flat = block_X.reshape(-1)
-        block_size = block.flat_end - block.flat_start
-        full_flat[block.flat_start : block.flat_end] = block_flat[:block_size]
-
-    return full_flat
-
-
 @functools.lru_cache(maxsize=8)
 def _block_layout_spans(
     blocks: Tuple[BlockConfig, ...],
@@ -149,10 +113,9 @@ def blocks_to_layout_flat(
 ) -> torch.Tensor:
     """``(total_block_flat_size,)`` to ``(layout.padded_size,)``, ready for
     ``layout.batch_unflatten``. Handles per-layer and grouped blocks alike."""
-    layout_flat = torch.zeros(layout.padded_size, dtype=block_flat.dtype, device=block_flat.device)
-    for lo, bo, numel in _block_layout_spans(tuple(blocks), layout):
-        layout_flat[lo : lo + numel] = block_flat[bo : bo + numel]
-    return layout_flat
+    layout_flat = block_flat.new_zeros(layout.padded_size + 1)
+    layout_flat[block_to_layout_columns(blocks, layout, block_flat.device)] = block_flat
+    return layout_flat[:-1]
 
 
 @torch.inference_mode()
@@ -162,11 +125,8 @@ def layout_flat_to_block_flat(
     layout: "ParamLayout",
 ) -> torch.Tensor:
     """Inverse of :func:`blocks_to_layout_flat`; per-block padding stays zero."""
-    total_block_flat_size = blocks[-1].flat_end if blocks else 0
-    block_flat = torch.zeros(total_block_flat_size, dtype=layout_flat.dtype, device=layout_flat.device)
-    for lo, bo, numel in _block_layout_spans(tuple(blocks), layout):
-        block_flat[bo : bo + numel] = layout_flat[lo : lo + numel]
-    return block_flat
+    padded = torch.cat([layout_flat, layout_flat.new_zeros(1)])
+    return padded[block_to_layout_columns(blocks, layout, layout_flat.device)]
 
 
 @functools.lru_cache(maxsize=8)
@@ -192,85 +152,3 @@ def block_to_layout_columns(
     Per-block padding maps one past ``layout.padded_size``; callers must not write to the result.
     """
     return _block_to_layout_columns(tuple(blocks), layout, device)
-
-
-def create_subspace_blocks(
-    subspace_dim: int,
-    num_blocks: int,
-    subspace_particle_dim: int = 8,
-) -> List[BlockConfig]:
-    """Create blocks that divide the subspace coordinate space."""
-    padded_subspace = subspace_dim + (-subspace_dim % subspace_particle_dim)
-    total_particles = padded_subspace // subspace_particle_dim
-
-    if num_blocks > total_particles:
-        warnings.warn(
-            f"num_blocks ({num_blocks}) exceeds total_particles ({total_particles}). Clamping to total_particles.",
-            stacklevel=2,
-        )
-        num_blocks = total_particles
-
-    base_particles_per_block = total_particles // num_blocks
-    remainder = total_particles % num_blocks
-
-    blocks: List[BlockConfig] = []
-    offset = 0
-
-    for i in range(num_blocks):
-        num_particles = base_particles_per_block + (1 if i < remainder else 0)
-        flat_size = num_particles * subspace_particle_dim
-        blocks.append(
-            BlockConfig(
-                name=f"subspace_block_{i}",
-                leaf_indices=(),  # unused for subspace blocks
-                flat_start=offset,
-                flat_end=offset + flat_size,
-                num_particles=num_particles,
-                particle_dim=subspace_particle_dim,
-            )
-        )
-        offset += flat_size
-
-    return blocks
-
-
-def split_subspace_to_blocks(
-    subspace_coords: torch.Tensor,
-    blocks: List[BlockConfig],
-) -> List[torch.Tensor]:
-    """``split_particles`` over subspace coordinates rather than full flat parameters."""
-    flat = subspace_coords.reshape(-1)
-
-    total_block_size = blocks[-1].flat_end if blocks else 0
-    if flat.shape[0] < total_block_size:
-        flat = torch.nn.functional.pad(flat, (0, total_block_size - flat.shape[0]))
-
-    result: List[torch.Tensor] = []
-
-    for block in blocks:
-        block_flat = flat[block.flat_start : block.flat_end]
-        result.append(block_flat.reshape(block.num_particles, block.particle_dim))
-
-    return result
-
-
-def reassemble_blocks_to_subspace(
-    block_particles: List[torch.Tensor],
-    blocks: List[BlockConfig],
-    subspace_dim: int,
-) -> torch.Tensor:
-    """Inverse of :func:`split_subspace_to_blocks`, trimmed back to ``subspace_dim``."""
-    if not block_particles:
-        return torch.zeros(subspace_dim)
-
-    total_padded = sum(b.flat_end - b.flat_start for b in blocks)
-    device = block_particles[0].device
-    dtype = block_particles[0].dtype
-
-    full_flat = torch.zeros(total_padded, dtype=dtype, device=device)
-
-    for block_X, block in zip(block_particles, blocks):
-        block_flat = block_X.reshape(-1)
-        full_flat[block.flat_start : block.flat_end] = block_flat
-
-    return full_flat[:subspace_dim]

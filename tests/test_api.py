@@ -164,6 +164,42 @@ class TestTrain:
         train(model, dl, nn.MSELoss(), opt, config)
         assert counter.count == 3
 
+    @pytest.mark.parametrize("reduction", ["mean", "none"])
+    @pytest.mark.parametrize("precision", ["float64", "mixed_precision", "candidate_autocast"])
+    def test_train_scores_the_incumbent_like_its_candidates(self, precision, reduction):
+        """FP32 batches reach an FP64 or BF16 model through the evaluator's input cast,
+        under candidate_autocast the incumbent is scored in BF16 like every candidate,
+        and an unreduced loss is averaged."""
+        torch.manual_seed(42)
+        model = _make_model()
+        if precision == "float64":
+            model.double()
+        opt = PolyStepOptimizer(
+            model,
+            seed=42,
+            epsilon=0.1,
+            sinkhorn_max_iters=100,
+            mixed_precision=precision == "mixed_precision",
+            candidate_autocast=precision == "candidate_autocast",
+        )
+        dl = _make_dataloader(num_samples=16, batch_size=16)
+        x, y = next(iter(dl))
+
+        class Rescore(TrainCallback):
+            def __init__(self):
+                self.pairs = []
+
+            def on_step_end(self, metrics):
+                with torch.inference_mode(), torch.autocast("cpu", enabled=precision == "candidate_autocast"):
+                    expected = nn.MSELoss()(model(x.to(next(model.parameters()).dtype)), y).item()
+                self.pairs.append((metrics["loss"], expected))
+                return False
+
+        rescore = Rescore()
+        train(model, dl, nn.MSELoss(reduction=reduction), opt, TrainConfig(epochs=3, callbacks=[rescore]))
+        assert len(rescore.pairs) == 3
+        assert all(loss == expected for loss, expected in rescore.pairs), rescore.pairs
+
 
 class TestLoggingCallback:
     def test_logs_at_interval(self, capsys):

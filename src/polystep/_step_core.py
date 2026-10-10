@@ -1,4 +1,4 @@
-"""State reset shared by the step drivers."""
+"""State reset and chunking shared by the step drivers."""
 
 from __future__ import annotations
 
@@ -19,6 +19,34 @@ def warn_all_nonfinite(opt) -> None:
         RuntimeWarning,
         stacklevel=3,
     )
+
+
+def chunk_spans(n_cand: int, chunk: int, bounds=None):
+    """Yield (start, end) chunks of at most ``chunk``, also breaking at ``bounds``.
+
+    Cutting at entry boundaries lets the site-aware paths resolve a site.
+    """
+    stops = sorted(set(bounds or ()) | {n_cand})
+    start = 0
+    for stop in stops:
+        if stop <= start:
+            continue
+        for chunk_start in range(start, stop, chunk):
+            yield chunk_start, min(chunk_start + chunk, stop)
+        start = stop
+
+
+def site_bounds(starts, pdim: int, group: int, total: int) -> list[int]:
+    """Candidate indices where a chunk must break so each site start lands in its own chunk."""
+    # Each start contributes its own group and the next, isolating the
+    # straddling particle in its own chunk.
+    return sorted({min(b, total) for s in starts for b in ((s // pdim) * group, -(-s // pdim) * group)})
+
+
+def check_losses(losses, n: int) -> None:
+    """Raise unless the closure returned one loss per candidate."""
+    if losses.shape != (n,):
+        raise ValueError(f"the closure must return one loss per candidate, shape ({n},), got {tuple(losses.shape)}.")
 
 
 def record_saturation(opt, state, transport, step_radius) -> None:
@@ -94,18 +122,12 @@ def invalidate_for_basis_change(opt, state) -> None:
     state.g = None
     state.prev_prev_f = None
     state.prev_prev_g = None
-    if getattr(state, "block_duals", None) is not None:
-        state.block_duals = [(None, None) for _ in state.block_duals]
-    state._prev_prev_block_duals = None
 
     opt._transport_direction_ema = None
     opt._newton_direction = None
     opt._prev_descent_direction = None
     opt._prev_descent_direction_finite = False
-    opt._prev_block_descent_directions = None
     opt._center_loss = None
-    opt._prev_predicted_improvement = None
-    opt._prev_pre_step_loss = None
 
     if opt.use_momentum and state.velocity is not None:
         state.velocity = torch.zeros_like(state.velocity)

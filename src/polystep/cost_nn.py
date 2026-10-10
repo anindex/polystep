@@ -7,6 +7,7 @@ the one parameter a candidate perturbs.
 
 from __future__ import annotations
 
+import functools
 import warnings
 from bisect import bisect_right
 from contextlib import contextmanager
@@ -152,16 +153,24 @@ def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
     if loss_kind == "cross_entropy":
         tgt = targets.unsqueeze(0).expand(n, *targets.shape).flatten(0, 1)
         losses = torch.nn.functional.cross_entropy(outputs.flatten(0, 1), tgt, reduction="none").reshape(n, -1)
+        losses = losses.to(loss_buffer_dtype(losses.dtype))
         if targets.shape == outputs.shape[1:]:  # Probability targets have no ignored labels.
             return losses.mean(dim=1)
         return losses.sum(dim=1) / (targets != -100).sum()  # All ignored: 0/0 matches mean CE.
 
     # Cast before expand, or the cast materializes the whole (N, *target) tensor;
-    # promote so FP64 targets keep precision.
-    dtype = torch.promote_types(outputs.dtype, targets.dtype)
+    # promote so FP64 targets keep precision and half precision reduces in FP32.
+    dtype = loss_buffer_dtype(torch.promote_types(outputs.dtype, targets.dtype))
     tgt = targets.to(dtype).unsqueeze(0).expand(n, *targets.shape)
     fn = torch.nn.functional.mse_loss if loss_kind == "mse" else torch.nn.functional.l1_loss
     return fn(outputs.to(dtype), tgt, reduction="none").flatten(1).mean(dim=1)  # (N,)
+
+
+def _candidate_loss(loss_fn, loss_kind, output, targets):
+    """``loss_fn`` on one forward's output; a builtin loss reduces half precision in FP32."""
+    if loss_kind is not None and output.dtype in (torch.float16, torch.bfloat16):
+        output = output.float()
+    return loss_fn(output, targets) if targets is not None else loss_fn(output)
 
 
 def cast_inputs_memo(holder, inputs: torch.Tensor, dtype: Optional[torch.dtype]) -> torch.Tensor:
@@ -245,9 +254,9 @@ class NNCostEvaluator:
         model.eval()
 
         # Fast batched-linear evaluator (MLP-only), when the loss has a bmm-friendly form.
-        loss_kind = _batched_loss_kind(loss_fn)
+        self._loss_kind = _batched_loss_kind(loss_fn)
         self._batched_linear = (
-            BatchedLinearEvaluator.try_build(model, loss_fn, loss_kind) if loss_kind is not None else None
+            BatchedLinearEvaluator.try_build(model, loss_fn, self._loss_kind) if self._loss_kind is not None else None
         )
 
         # Pick in-place only when the batched footprint would not fit (not on a
@@ -301,9 +310,11 @@ class NNCostEvaluator:
         self._cast_cache = None
         self._input_dtype_cache = _UNSET
         self._chunk_size_cached = _UNSET
-        loss_kind = _batched_loss_kind(self.loss_fn)
+        self._loss_kind = _batched_loss_kind(self.loss_fn)
         self._batched_linear = (
-            BatchedLinearEvaluator.try_build(self.model, self.loss_fn, loss_kind) if loss_kind is not None else None
+            BatchedLinearEvaluator.try_build(self.model, self.loss_fn, self._loss_kind)
+            if self._loss_kind is not None
+            else None
         )
 
     @property
@@ -429,7 +440,7 @@ class NNCostEvaluator:
         in-place path. Falls back to eager vmap permanently on failure.
         """
         buffers = self._buffers
-        loss_fn = self.loss_fn
+        loss_fn, loss_kind = self.loss_fn, self._loss_kind
         model = self.model
         resolved_chunk = self.chunk_size
         per_sample = self.per_sample
@@ -440,11 +451,7 @@ class NNCostEvaluator:
             # Buffers win on a key collision: frozen model state, not part of the solve.
             full_dict = {**params, **buffers}
             output = functional_call(model, full_dict, (inputs,))
-            if targets is not None:
-                loss = loss_fn(output, targets)
-            else:
-                loss = loss_fn(output)
-            return _fold_candidate_loss(loss, per_sample)
+            return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
         batched = vmap(single_eval, in_dims=(0, None, None), chunk_size=resolved_chunk)
 
@@ -511,14 +518,13 @@ class NNCostEvaluator:
         for i in range(N):
             full_dict = {**{k: v[i] for k, v in stacked_params.items()}, **self._buffers}
             output = functional_call(self.model, full_dict, (inputs,))
-            loss = self.loss_fn(output, targets) if targets is not None else self.loss_fn(output)
+            loss = _candidate_loss(self.loss_fn, self._loss_kind, output, targets)
             losses.append(_fold_candidate_loss(loss, self.per_sample))
         return torch.stack(losses)
 
     def _forward_loss(self, inputs, targets):
-        """Eager forward + reduced scalar loss on the model's current params."""
-        output = self.model(inputs)
-        loss = self.loss_fn(output, targets) if targets is not None else self.loss_fn(output)
+        """Forward + reduced scalar loss on the model's current params."""
+        loss = _candidate_loss(self.loss_fn, self._loss_kind, self.model(inputs), targets)
         if loss.dim() > 0:
             loss = loss.mean()
         return loss
@@ -535,17 +541,10 @@ class NNCostEvaluator:
         if first is None or not first.is_cuda:
             return self._forward_loss  # CUDA-graph capture needs CUDA
         if self._compiled_fwd_loss is None:
-            model, loss_fn = self.model, self.loss_fn
-
-            def fwd_loss(inputs, targets):
-                output = model(inputs)
-                loss = loss_fn(output, targets) if targets is not None else loss_fn(output)
-                if loss.dim() > 0:
-                    loss = loss.mean()
-                return loss
-
             try:
-                self._compiled_fwd_loss = torch.compile(fwd_loss, mode="reduce-overhead", fullgraph=False)
+                self._compiled_fwd_loss = torch.compile(
+                    type(self)._forward_loss, mode="reduce-overhead", fullgraph=False
+                )
             except Exception as e:  # noqa: BLE001
                 self._compile_forward_failed = True
                 self._compiled_fwd_loss = None
@@ -555,7 +554,7 @@ class NNCostEvaluator:
                     stacklevel=2,
                 )
                 return self._forward_loss
-        return self._compiled_fwd_loss
+        return functools.partial(self._compiled_fwd_loss, self)
 
     def _verified_forward_loss_fn(self, inputs, targets):
         """``_forward_loss_fn`` with its first invocation guarded.
@@ -1095,6 +1094,7 @@ class SiteVmapEvaluator:
         self.model = model
         self.loss_fn = loss_fn
         self.per_sample = per_sample
+        self._loss_kind = _batched_loss_kind(loss_fn)
         self._buffers = buffers
         self._owner = owner
         self._entry_by_key = {e.key: e for e in layout.entries}
@@ -1135,18 +1135,39 @@ class SiteVmapEvaluator:
         return None
 
     @torch.inference_mode()
-    def evaluate_subspace(self, projections, bary_sd, spec, col_start, dcoords, inputs, targets=None):
-        """Losses for candidates that offset one spec's coordinates from the barycentre.
+    def evaluate_subspace(self, projections, base_sd, coords, bary_sd, spec, col_start, values, inputs, targets=None):
+        """Losses for candidates that move one particle's run of a spec's coordinates.
 
-        Only the columns ``[col_start, col_start + n_groups*pdim)`` of the projection
-        reach the output, so the correction is a bmm over ``pdim`` columns per group.
+        ``coords`` are the incumbent's coordinates over ``base_sd`` and ``bary_sd`` its
+        weights; ``values`` holds the ``(n_groups, n_cand, pdim)`` candidate coordinates
+        from column ``col_start`` of the spec on. Only those columns of the projection
+        change the weight, so the offset from the incumbent is a bmm over ``pdim``
+        columns per group. A half-precision weight is rebuilt from ``base_sd`` and the
+        candidate's full coordinates instead, as ``reconstruct_batch`` builds it, since
+        an offset added to the rounded incumbent can round differently.
         """
         base = bary_sd[spec.entry_key]
-        n_groups, n_cand, pdim = dcoords.shape
+        n_groups, n_cand, pdim = values.shape
         n = n_groups * n_cand
         n_cols = n_groups * pdim
         P = projections[spec.entry_key] if spec.is_projected else None
+        incumbent = coords[spec.flat_start : spec.flat_end]
 
+        if base.dtype in (torch.float16, torch.bfloat16):
+            base = base_sd[spec.entry_key]
+            cols = torch.arange(col_start, col_start + n_cols, device=values.device)
+            cols = cols.reshape(n_groups, 1, pdim).expand(n_groups, n_cand, pdim).reshape(n, pdim)
+            wide = incumbent.expand(n, -1).clone().scatter_(1, cols, values.reshape(n, pdim))
+            if P is None:
+                delta = wide.to(base.dtype)
+            elif isinstance(P, torch.Tensor):
+                delta = wide.to(P.dtype) @ P.t()
+            else:
+                delta = P.project(wide)
+            site = (base.reshape(1, -1) + delta).to(base.dtype).reshape(-1, *base.shape)
+            return self._vmap_over_site(spec.entry_key, bary_sd, site, inputs, targets)
+
+        dcoords = values - incumbent.narrow(0, col_start, n_cols).view(n_groups, 1, pdim)
         if isinstance(P, torch.Tensor):
             # P is (num_params, num_coords); .t() first so groups lead.
             blk = P.narrow(1, col_start, n_cols).t().reshape(n_groups, pdim, -1)
@@ -1185,7 +1206,7 @@ class SiteVmapEvaluator:
         """
         shared = {k: v for k, v in base_sd.items() if k != key}
         shared.update(self._buffers)
-        model, loss_fn, per_sample = self.model, self.loss_fn, self.per_sample
+        model, loss_fn, loss_kind, per_sample = self.model, self.loss_fn, self._loss_kind, self.per_sample
 
         # Repeat evaluate()'s cast/autocast frame here. Cast to the model's dtype, not
         # the site's: the perturbed layer need not be the one the input reaches first.
@@ -1200,8 +1221,7 @@ class SiteVmapEvaluator:
 
         def single_eval(site_param, shared, inputs, targets):
             output = functional_call(model, {**shared, key: site_param}, (inputs,))
-            loss = loss_fn(output, targets) if targets is not None else loss_fn(output)
-            return _fold_candidate_loss(loss, per_sample)
+            return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
         # No autocast frame: under vmap it casts activations but not a Conv2d bias, so
         # a conv model raises a dtype mismatch.
@@ -1465,7 +1485,7 @@ class SubspaceDeltaEvaluator:
                 return spec if is_weight == spec.is_projected else None
         return None
 
-    def _basis_products(self, spec, P, col_start, n_cols, x, acc_dtype):
+    def _basis_products(self, spec, P, col_start, n_cols, x, dtype):
         """``(n_cols, d_out, B)`` holding ``x @ M_j.T`` for the column run at ``col_start``."""
         d_out, d_in = spec.original_shape
         if isinstance(P, SparseRandomProjection):
@@ -1476,13 +1496,13 @@ class SubspaceDeltaEvaluator:
             out_idx = torch.div(rows, d_in, rounding_mode="floor")  # (n_cols, nnz)
             in_idx = rows.remainder(d_in)
             contrib = x.index_select(1, in_idx.reshape(-1)).reshape(x.shape[0], n_cols, -1)
-            contrib = contrib.permute(1, 2, 0) * vals.unsqueeze(-1).to(acc_dtype)  # (n_cols, nnz, B)
-            g = torch.zeros(n_cols, d_out, x.shape[0], device=x.device, dtype=acc_dtype)
+            contrib = contrib.permute(1, 2, 0) * vals.unsqueeze(-1).to(dtype)  # (n_cols, nnz, B)
+            g = torch.zeros(n_cols, d_out, x.shape[0], device=x.device, dtype=dtype)
             return g.scatter_add_(1, out_idx.unsqueeze(-1).expand_as(contrib), contrib)
         # P.view(d_out, d_in, -1)[o, i, j] is M_j[o, i] with no copy; batching over
         # columns rather than d_out is faster at the same FLOPs.
-        blk = P.view(d_out, d_in, -1).narrow(2, col_start, n_cols).permute(2, 1, 0).to(acc_dtype)
-        return torch.matmul(x.to(acc_dtype), blk).permute(0, 2, 1)  # (n_cols, B, d_out) -> (n_cols, d_out, B)
+        blk = P.view(d_out, d_in, -1).narrow(2, col_start, n_cols).permute(2, 1, 0).to(dtype)
+        return torch.matmul(x.to(dtype), blk).permute(0, 2, 1)  # (n_cols, B, d_out) -> (n_cols, d_out, B)
 
     @torch.inference_mode()
     def evaluate(
@@ -1500,9 +1520,6 @@ class SubspaceDeltaEvaluator:
         n_groups, n_cand, pdim = dcoords.shape
         site_idx, is_weight = self._site[spec.entry_key]
         param_dtype = next(iter(bary_sd.values())).dtype
-        # Accumulate the correction in fp32: a half-precision add would drop the small
-        # delta on top of a full-scale output.
-        acc_dtype = torch.float32 if param_dtype in (torch.float16, torch.bfloat16) else param_dtype
         inputs = cast_inputs_memo(self, inputs, param_dtype)
         x = inputs if inputs.dim() == 2 else inputs.reshape(inputs.shape[0], -1)
         n = n_groups * n_cand
@@ -1542,16 +1559,16 @@ class SubspaceDeltaEvaluator:
             if idx == site_idx:
                 if is_weight:
                     g = self._basis_products(
-                        spec, projections[spec.entry_key], col_start, n_groups * pdim, x, acc_dtype
+                        spec, projections[spec.entry_key], col_start, n_groups * pdim, x, param_dtype
                     ).reshape(n_groups, pdim, weight.shape[0], x.shape[0])
-                    corr = torch.einsum("gcp,gpob->gcbo", dcoords.to(acc_dtype), g)
+                    corr = torch.einsum("gcp,gpob->gcbo", dcoords.to(param_dtype), g)
                 else:
                     # An unprojected bias site: the coordinates are the bias delta.
                     cols = torch.arange(col_start, col_start + n_groups * pdim, device=x.device).view(n_groups, pdim)
-                    corr = torch.zeros(n_groups, n_cand, weight.shape[0], device=x.device, dtype=acc_dtype)
-                    corr.scatter_(2, cols.unsqueeze(1).expand(n_groups, n_cand, pdim), dcoords.to(acc_dtype))
+                    corr = torch.zeros(n_groups, n_cand, weight.shape[0], device=x.device, dtype=param_dtype)
+                    corr.scatter_(2, cols.unsqueeze(1).expand(n_groups, n_cand, pdim), dcoords.to(param_dtype))
                     corr = corr.unsqueeze(2)
-                xn = (out.to(acc_dtype) + corr.reshape(n, -1, weight.shape[0])).to(param_dtype)
+                xn = out + corr.reshape(n, -1, weight.shape[0])
                 continue
             x = out
 

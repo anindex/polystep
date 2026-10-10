@@ -368,7 +368,8 @@ def test_the_per_tensor_control_really_does_disagree():
     assert (got.reshape(-1) - reference).abs().max() > 1e-3
 
 
-def test_blockwise_step_scores_through_the_delta_path():
+@pytest.mark.parametrize("block_strategy", ["per_layer", "grouped"])
+def test_blockwise_step_scores_through_the_delta_path(block_strategy):
     """A block-wise step must reach the delta path and agree with the dense one.
 
     Without it block-wise builds a full model configuration per candidate and calls
@@ -391,7 +392,7 @@ def test_blockwise_step_scores_through_the_delta_path():
             return evaluator.evaluate(batched_params, inputs, targets)
 
         torch.manual_seed(7)
-        opt = PolyStepOptimizer(model, epsilon=0.3, step_radius=0.1, seed=3, block_strategy="per_layer")
+        opt = PolyStepOptimizer(model, epsilon=0.3, step_radius=0.1, seed=3, block_strategy=block_strategy)
         return opt, evaluator, inputs, targets, closure, calls
 
     opt_dense, _, _, _, dense_closure, dense_calls = build()
@@ -404,6 +405,45 @@ def test_blockwise_step_scores_through_the_delta_path():
 
     assert dense_calls, "the dense run must actually call the closure"
     assert not fast_calls, "every chunk should have been scored without materializing a configuration"
+    torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("block_strategy", ["per_layer", "grouped"])
+def test_blockwise_scores_only_the_padded_tails_densely(block_strategy):
+    """At particle_dim 8 both biases end mid-particle; every other particle stays site-local.
+
+    Grouped blocks and the leading particles of a padded block used to go dense whole.
+    """
+
+    def run(register):
+        torch.manual_seed(0)
+        model = _mlp([8, 12, 4])
+        gen = torch.Generator().manual_seed(0)
+        inputs = torch.randn(16, 8, generator=gen)
+        targets = torch.randn(16, 4, generator=gen)
+        evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
+        opt = PolyStepOptimizer(
+            model, particle_dim=8, solver="softmax", epsilon=0.3, step_radius=0.1, seed=3, block_strategy=block_strategy
+        )
+        if register:
+            opt.register_evaluator(evaluator, inputs, targets)
+        calls, rows, losses = [], [], []
+
+        def closure(batched_params):
+            calls.append(next(iter(batched_params.values())).shape[0])
+            return evaluator.evaluate(batched_params, inputs, targets)
+
+        for _ in range(3):
+            losses.append(opt.step(closure))
+            rows.append(sum(calls))
+            calls.clear()
+        return rows, losses, opt._polytope_vertices.shape[0] * opt._probes.numel(), opt.candidate_evals
+
+    dense_rows, dense, group, evals = run(register=False)
+    fast_rows, fast, _, _ = run(register=True)
+
+    assert sum(dense_rows) == evals
+    assert fast_rows == [2 * group] * 3
     torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=1e-5, atol=1e-6)
 
 

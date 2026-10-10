@@ -50,6 +50,15 @@ def test_tell_ignores_a_non_finite_update():
     torch.testing.assert_close(es.X, before)
 
 
+def test_unseeded_population_follows_the_global_rng():
+    def first_population(seed):
+        torch.manual_seed(seed)
+        return PolyStepES(4, num_particles=2).ask()
+
+    torch.testing.assert_close(first_population(0), first_population(0))
+    assert not torch.equal(first_population(0), first_population(1))
+
+
 def test_ask_twice_before_tell_raises():
     es = PolyStepES(4, seed=0)
     es.ask()

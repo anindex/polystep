@@ -1,7 +1,6 @@
 """Tests for optimizer checkpoint/resume and the restore_best training guard."""
 
 import copy
-import math
 
 import pytest
 import torch
@@ -91,6 +90,7 @@ class TestStateDictRoundTrip:
 
         for expected, got in zip(reference, model_c.parameters()):
             assert torch.allclose(expected, got, atol=1e-6), (expected - got).abs().max()
+        assert opt_c.candidate_evals == opt_a.candidate_evals
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -107,6 +107,10 @@ class TestStateDictRoundTrip:
                 id="trust_region",
             ),
             pytest.param({"hybrid": True}, id="hybrid_subspace"),
+            pytest.param(
+                {"hybrid": True, "block_strategy": "per_layer", "solver": "sinkhorn", "dual_momentum_beta": 0.5},
+                id="hybrid_row_segments",
+            ),
             pytest.param({"probe_radius_jitter": 0.2}, id="probe_jitter"),
             pytest.param({"adaptive": True}, id="adaptive_subspace"),
         ],
@@ -159,6 +163,23 @@ class TestStateDictRoundTrip:
         for expected, got in zip(reference, model_c.parameters()):
             assert torch.allclose(expected, got, atol=1e-6), (expected - got).abs().max()
 
+    def test_subspace_load_drops_block_state(self):
+        """Subspace runs keep their duals in state.f and state.g, so per-block state from
+        an older checkpoint must not survive the load."""
+        model, _ = _model_and_closure()
+        opt = PolyStepOptimizer(
+            model, subspace=HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2), epsilon=0.1
+        )
+        sd = opt.state_dict()
+        stale = [(torch.zeros(2), torch.zeros(3))]
+        sd["solver_state"]["block_duals"] = stale
+        sd["prev_prev_block_duals"] = stale
+        sd["control"]["_prev_block_descent_directions"] = [torch.zeros(2)]
+        opt.load_state_dict(sd)
+        assert opt.state.block_duals is None
+        assert opt.state._prev_prev_block_duals is None
+        assert opt._prev_block_descent_directions is None
+
     def test_rejects_a_newer_format(self):
         model, _ = _model_and_closure()
         opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10)
@@ -167,19 +188,13 @@ class TestStateDictRoundTrip:
         with pytest.raises(ValueError, match="Unsupported optimizer state_dict format"):
             opt.load_state_dict(sd)
 
-    def test_accepts_fields_a_newer_schema_dropped(self):
-        """A checkpoint carrying the dropped ``sigma``/``use_csa`` fields must still load."""
-        model, closure = _model_and_closure()
+    def test_rejects_an_older_format(self):
+        model, _ = _model_and_closure()
         opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10)
-        opt.step(closure)
-        sd = copy.deepcopy(opt.state_dict())
-        sd["solver_state"]["sigma"] = 1.0
-        sd["solver_state"]["use_csa"] = False
-
-        opt.load_state_dict(sd)
-
-        assert not hasattr(opt.state, "sigma")
-        assert math.isfinite(opt.step(closure))
+        sd = opt.state_dict()
+        sd["format"] = 5
+        with pytest.raises(ValueError, match="Unsupported optimizer state_dict format"):
+            opt.load_state_dict(sd)
 
     def test_generator_state_restores(self):
         model, closure = _model_and_closure()

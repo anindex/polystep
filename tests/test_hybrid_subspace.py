@@ -479,19 +479,25 @@ class TestRankTransition:
             opt.step(closure)
         assert ranks == [4], f"rebuilt inside a stage, got {ranks}"
 
-    def test_rank_schedule_requires_subspace(self):
-        """ValueError when rank_schedule is provided without subspace."""
+    @pytest.mark.parametrize("kind", [None, "adaptive", "factored"])
+    def test_rank_schedule_requires_a_hybrid_subspace(self, kind):
+        """Only a HybridSubspace can be rebuilt at a new rank, so anything else raises."""
+        from polystep import AdaptiveSubspace, FactoredSubspace, PolyStepOptimizer
+
         torch.manual_seed(42)
         model = nn.Sequential(nn.Linear(10, 5))
-        schedule = RankSchedule(stages=[(0, 2), (10, 4)])
+        layout = ParamLayout.from_module(model)
+        subspace = {
+            None: None,
+            "adaptive": AdaptiveSubspace(full_dim=layout.total_params, subspace_dim=8),
+            "factored": FactoredSubspace.from_layout(layout, rank=2),
+        }[kind]
 
-        from polystep import PolyStepOptimizer
-
-        with pytest.raises(ValueError, match="rank_schedule requires a subspace"):
+        with pytest.raises(ValueError, match="rank_schedule requires a HybridSubspace"):
             PolyStepOptimizer(
                 model,
-                subspace=None,
-                rank_schedule=schedule,
+                subspace=subspace,
+                rank_schedule=RankSchedule(stages=[(0, 2), (10, 4)]),
                 epsilon=0.1,
                 compile=False,
             )
@@ -567,13 +573,21 @@ class TestMaxSubspaceDim:
         assert h.subspace_dim == h.specs[-1].flat_end
 
     def test_an_unreachable_cap_warns(self):
-        """Unprojected width alone can exceed the cap, and that must warn."""
+        """1D width alone can exceed the cap, and that must warn."""
         model = nn.Sequential(nn.Linear(256, 128), nn.Linear(128, 64), nn.Linear(64, 10))
         layout = ParamLayout.from_module(model)
         with pytest.warns(UserWarning, match="unreachable"):
             h = HybridSubspace.from_layout(layout, rank=8, max_subspace_dim=64)
-        unprojected = sum(s.num_coords for s in h.specs if not s.is_projected)
-        assert h.subspace_dim == unprojected + sum(1 for s in h.specs if s.is_projected)
+        fixed = sum(s.num_coords for s in h.specs if len(s.original_shape) < 2)
+        assert h.subspace_dim == fixed + sum(1 for s in h.specs if len(s.original_shape) >= 2)
+
+    @pytest.mark.filterwarnings("error")
+    def test_a_full_width_weight_shares_the_budget(self):
+        """The README model's output weight is full width at rank 4; it must scale with the rest."""
+        model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 3))
+        h = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4, max_subspace_dim=128)
+        assert h.subspace_dim == 128
+        assert all(s.num_coords > 1 for s in h.specs if len(s.original_shape) >= 2)
 
     def test_preserves_proportions(self):
         model = self._make_conv_model()
@@ -741,6 +755,40 @@ def test_rotation_clears_the_coordinate_displacement_history():
         previous_basis = state.hybrid_projections
 
     assert rotations > 0, "no rotation fired, the test proves nothing"
+
+
+@pytest.mark.parametrize("absorb_interval, rotation_interval", [(3, 2), (2, 4)])
+def test_an_absorb_keeps_the_rotated_basis_and_rotates_when_due(absorb_interval, rotation_interval):
+    """An absorb used to restore the seeded basis, undoing the last rotation and skipping
+    a rotation due on the same step."""
+    from polystep import PolyStepOptimizer
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 12), nn.Tanh(), nn.Linear(12, 3))
+    subspace = HybridSubspace.from_layout(
+        ParamLayout.from_module(model),
+        rank=2,
+        rotation_mode="random",
+        rotation_interval=rotation_interval,
+        absorb_mode="periodic",
+        absorb_interval=absorb_interval,
+    )
+    opt = PolyStepOptimizer(model, subspace=subspace, compile=False, seed=0)
+    inputs, targets = torch.randn(16, 8), torch.randn(16, 3)
+    loss_fn = nn.MSELoss()
+
+    def closure(batched):
+        from torch.func import functional_call, vmap
+
+        return vmap(lambda p: loss_fn(functional_call(model, p, (inputs,)), targets))(batched)
+
+    for step in range(1, 7):
+        before = {k: v.clone() for k, v in opt.state.hybrid_projections.items()}
+        opt.step(closure)
+        after = opt.state.hybrid_projections
+        rotated = any(not torch.equal(before[k], after[k]) for k in before)
+        assert rotated == (step % rotation_interval == 0), f"step {step}"
+    assert opt.state.absorb_count == 6 // absorb_interval
 
 
 def test_the_sparse_threshold_is_measured_in_fp32_bytes():

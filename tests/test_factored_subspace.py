@@ -123,3 +123,25 @@ def test_a_frozen_parameter_edited_between_steps_keeps_the_edit():
     opt.step(lambda params: evaluator.evaluate(params, inputs, targets))
 
     assert torch.all(model[0].weight == 0.5)
+
+
+def test_a_closure_step_after_release_evaluator_skips_the_low_rank_path():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    inputs, targets = torch.randn(16, 4, dtype=torch.float64), torch.randn(16, 2)
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    opt = PolyStepOptimizer(model, subspace=subspace, seed=0)
+
+    def closure(params):
+        return evaluator.evaluate(params, inputs, targets)
+
+    opt.register_evaluator(evaluator, inputs, targets)
+    opt.step(closure)
+    factored = opt._factored_evaluator
+    assert factored._cast_cache is not None, "the low-rank path must have run, or this proves nothing"
+    opt.release_evaluator()
+
+    assert factored._cast_cache is None
+    assert torch.isfinite(torch.tensor(opt.step(closure)))
+    assert opt._factored_evaluator is factored

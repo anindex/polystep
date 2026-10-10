@@ -52,7 +52,6 @@ from .blockwise import (
     BlockConfig,
     create_grouped_blocks,
     create_per_layer_blocks,
-    create_subspace_blocks,
 )
 from .epsilon import LinearEpsilon, ProgressiveEpsilon
 from .geometry import POLYTOPE_MAP
@@ -73,7 +72,6 @@ from .transform import ParamLayout, create_generator
 
 from ._step_monolithic import step_monolithic as _step_monolithic_fn
 from ._step_blockwise import step_blockwise as _step_blockwise_fn
-from ._step_blockwise import step_subspace_blockwise as _step_subspace_blockwise_fn
 from ._step_momentum import step_momentum as _step_momentum_fn
 
 _THREAD_WARNING_ISSUED = False
@@ -157,7 +155,8 @@ class PolyStepOptimizer(SerializationMixin):
         kl_softmax_lam: KL penalty for 'kl_softmax'; 0 is softmax, inf is Sinkhorn.
         subspace: Subspace object, or None for full parameter space.
         subspace_particle_dim: OT polytope dimension in subspace mode (default 8).
-        block_strategy: 'monolithic', 'per_layer', or 'grouped'.
+        block_strategy: 'monolithic', 'per_layer', or 'grouped'. With a subspace, the
+            last two only split Sinkhorn and KL solves into row segments.
         block_group_size: Consecutive entries per block group.
         biased_rotation: Align the chart's first axis with the previous descent direction.
         use_momentum: Accumulate a velocity (default False). Heavy-ball, so at steady
@@ -212,7 +211,7 @@ class PolyStepOptimizer(SerializationMixin):
         # Makes the one-step law of the iterate continuous within its plane.
         step_radius_jitter: float = 0.0,
         num_probe: int = 1,
-        # None means "on wherever implemented".
+        # None means "on wherever implemented", except under orthoplex Newton refinement.
         adaptive_num_probe: Optional[bool] = None,
         adaptive_probe_warmup: int = 20,
         max_iterations: int = 50,
@@ -326,19 +325,7 @@ class PolyStepOptimizer(SerializationMixin):
                 stacklevel=2,
             )
 
-        # In combined mode blocks slice subspace coordinates, so entry grouping has
-        # nothing to group.
-        if subspace is not None and block_strategy == "grouped":
-            warnings.warn(
-                "block_strategy='grouped' has no effect in subspace mode: blocks divide the "
-                "subspace coordinates evenly, not the parameter entries, so it produces exactly "
-                "like 'per_layer'. Use block_strategy='per_layer', or drop the subspace to group "
-                "parameter entries.",
-                stacklevel=2,
-            )
-
-        # Global projection compresses to subspace coords, then per-block OT.
-        self._subspace_blockwise = subspace is not None and block_strategy != "monolithic"
+        _full_blockwise = subspace is None and block_strategy != "monolithic"
 
         # Match the model's dtype, not hardcoded fp32, or a float64 model's
         # reconstruct matmul fails on the mismatch.
@@ -402,16 +389,24 @@ class PolyStepOptimizer(SerializationMixin):
                 raise ValueError(f"{_name} must be > 0, got {_value}.")
         # These run only in the monolithic step; default to None so the ignore warning
         # fires on an explicit True, not the default.
-        _savings_default = block_strategy == "monolithic"
-        # Reducing K needs a K above 1, so stay off at the default num_probe=1.
+        _savings_default = not _full_blockwise
+        # Reducing K needs a K above 1, so stay off at the default num_probe=1 and under
+        # Newton refinement, which needs K>=2.
+        _refines = _savings_default and newton_refinement and polytope_type == "orthoplex"
         if adaptive_num_probe is None:
-            adaptive_num_probe = _savings_default and num_probe > 1
+            adaptive_num_probe = _savings_default and num_probe > 1 and not _refines
+        elif adaptive_num_probe and _refines and num_probe > 1:
+            warnings.warn(
+                "adaptive_num_probe drops num_probe to 1 while costs keep falling, and "
+                "newton_refinement needs num_probe>=2, so the refinement pauses on those "
+                "steps. Pass adaptive_num_probe=False to keep it on.",
+                stacklevel=2,
+            )
         self.adaptive_num_probe = adaptive_num_probe
         self._adaptive_probe_warmup = adaptive_probe_warmup
         self._loss_decreasing_count = 0
         # OT-step costs only, to avoid mixing in momentum costs.
         self._ot_step_costs: collections.deque = collections.deque(maxlen=3)
-        self._param_write_cache = None
         self._prev_objective_token: object = None
         self.max_iterations = max_iterations
         if chunk_size is not None and chunk_size <= 0:
@@ -476,8 +471,7 @@ class PolyStepOptimizer(SerializationMixin):
         self.trust_region = trust_region
         self._trust_region_multiplier = 1.0  # Multiplier on step_radius in [0.1, 3.0]
         self._prev_predicted_improvement = None
-        self._prev_pre_step_loss = None  # f(X), or the min-cost proxy when no centre ran
-        self._prev_loss_from_center = False
+        self._prev_pre_step_loss = None  # f(X) at the centre
         # Trust region needs the finite-difference model for its predicted-vs-actual ratio.
         if trust_region and not self.use_quadratic_model:
             self.use_quadratic_model = True
@@ -493,7 +487,7 @@ class PolyStepOptimizer(SerializationMixin):
                 "the stagnation controller contracts on an improving one. Enable one.",
                 stacklevel=2,
             )
-        if trust_region and block_strategy != "monolithic":
+        if trust_region and _full_blockwise:
             warnings.warn(
                 f"trust_region is only applied with block_strategy='monolithic'; "
                 f"ignored for block_strategy='{block_strategy}'.",
@@ -521,16 +515,8 @@ class PolyStepOptimizer(SerializationMixin):
         self.subspace = subspace
         self._subspace_particle_dim = subspace_particle_dim
         self._rank_schedule = rank_schedule
-        if rank_schedule is not None and subspace is None:
-            raise ValueError("rank_schedule requires a subspace")
-        # Rank transitions run only in the monolithic step; make it a clear no-op elsewhere.
-        if rank_schedule is not None and block_strategy != "monolithic":
-            warnings.warn(
-                f"rank_schedule is only applied with block_strategy='monolithic'; "
-                f"ignored for block_strategy='{block_strategy}'.",
-                stacklevel=2,
-            )
-            self._rank_schedule = None
+        if rank_schedule is not None and not isinstance(subspace, HybridSubspace):
+            raise ValueError(f"rank_schedule requires a HybridSubspace, got {type(subspace).__name__}")
         # Rank the subspace was last rebuilt at; None until the first step.
         self._applied_rank = None
         self.block_strategy = block_strategy
@@ -538,7 +524,7 @@ class PolyStepOptimizer(SerializationMixin):
 
         # Read self., not the argument: newton_refinement and trust_region auto-enable
         # the quadratic model above.
-        if self.use_quadratic_model and block_strategy != "monolithic":
+        if self.use_quadratic_model and _full_blockwise:
             warnings.warn(
                 f"use_quadratic_model=True is not supported with "
                 f"block_strategy='{block_strategy}'. Quadratic model will be "
@@ -562,7 +548,7 @@ class PolyStepOptimizer(SerializationMixin):
         self._dual_momentum_beta = dual_momentum_beta
 
         # Blockwise re-evaluates per block, so these save nothing there.
-        if self.block_strategy != "monolithic":
+        if _full_blockwise:
             _ignored = [
                 name
                 for name, on in (
@@ -598,6 +584,24 @@ class PolyStepOptimizer(SerializationMixin):
                 f"use_adaptive_radius=False.",
                 stacklevel=2,
             )
+        if isinstance(subspace, AdaptiveSubspace) and 0 < subspace.rotation_interval <= 1:
+            _cleared = [
+                name
+                for name, on in (
+                    ("amortize_steps", self.amortize_steps > 1),
+                    ("biased_rotation", biased_rotation),
+                    ("use_momentum", use_momentum),
+                )
+                if on
+            ]
+            if _cleared:
+                warnings.warn(
+                    f"AdaptiveSubspace with rotation_interval={subspace.rotation_interval} changes its "
+                    "basis every step, and each change clears the momentum velocity and the coasting "
+                    f"and biased-rotation directions, so nothing from {', '.join(_cleared)} carries "
+                    "over to the next step. Pass a larger rotation_interval to use them.",
+                    stacklevel=2,
+                )
 
         # Shape-keyed scratch buffers, reused across steps and overwritten on use.
         self._step_buffers = None
@@ -671,7 +675,6 @@ class PolyStepOptimizer(SerializationMixin):
 
         if subspace is not None:
             # Subspace coords reshaped to (num_particles, subspace_particle_dim).
-            self._base_params = {k: v.clone() for k, v in model.state_dict().items()}
             sub_dim = subspace.subspace_dim
             pdim = subspace_particle_dim
             # Pad to a multiple of particle_dim.
@@ -694,23 +697,19 @@ class PolyStepOptimizer(SerializationMixin):
         self._particle_dim = particle_dim
         device = X_init.device
 
-        # Polytope in particle_dim space (not full parameter space); skipped in
-        # block-wise mode, where per-block polytopes are used.
-        if block_strategy == "monolithic":
-            self._polytope_vertices = POLYTOPE_MAP[polytope_type](
-                particle_dim,
-                device=device,
-                dtype=X_init.dtype,
-                radius=1.0,
-            )
-        else:
-            self._polytope_vertices = None  # per-block polytopes used instead
+        # Polytope in particle_dim space (not full parameter space).
+        self._polytope_vertices = POLYTOPE_MAP[polytope_type](
+            particle_dim,
+            device=device,
+            dtype=X_init.dtype,
+            radius=1.0,
+        )
 
         # Interior probe positions.
         self._probes = torch.linspace(0, 1, num_probe + 2)[1 : num_probe + 1]
 
         # With one particle, balanced OT pins a uniform plan and the step freezes.
-        _single_particle = X_init.shape[0] == 1 and block_strategy == "monolithic"
+        _single_particle = X_init.shape[0] == 1 and not _full_blockwise
         if _single_particle and solver is None:
             # Never let the default produce a frozen optimizer.
             solver = "softmax"
@@ -805,7 +804,7 @@ class PolyStepOptimizer(SerializationMixin):
         self._state = SolverState(X=X_init.clone(), a=a)
 
         if subspace is not None:
-            self._state.base_params = self._base_params
+            self._state.base_params = {k: v.clone() for k, v in model.state_dict().items()}
             self._state.subspace = subspace
 
         self._init_subspace(subspace, seed, model_device)
@@ -813,19 +812,13 @@ class PolyStepOptimizer(SerializationMixin):
         if use_momentum:
             self._state.velocity = torch.zeros_like(X_init)
 
-        self._init_blocks(
-            subspace,
-            subspace_particle_dim,
-            block_strategy,
-            block_group_size,
-            polytope_type,
-            X_init,
-            device,
-        )
+        self._init_blocks(subspace, block_strategy, block_group_size, _one_shot)
 
         # Transition before the first step so the first sweep runs at the scheduled rank.
-        if self._rank_schedule is not None and self.subspace is not None:
+        if self._rank_schedule is not None:
             self._transition_rank(self._rank_schedule.at(0))
+        if self._applied_rank is None:
+            self._warn_frozen_segments()
 
     def _init_subspace(self, subspace, seed, model_device) -> None:
         """Initialize subspace projections and displacement history."""
@@ -868,57 +861,30 @@ class PolyStepOptimizer(SerializationMixin):
                 dtype=self._model_dtype,
             )
 
-    def _init_blocks(
-        self,
-        subspace,
-        subspace_particle_dim,
-        block_strategy,
-        block_group_size,
-        polytope_type,
-        X_init,
-        device,
-    ) -> None:
-        """Initialize block-wise decomposition: blocks, polytopes, duals."""
+    def _init_blocks(self, subspace, block_strategy, block_group_size, one_shot) -> None:
+        """Initialize block-wise decomposition: blocks, duals, row segments."""
         self._blocks: Optional[List[BlockConfig]] = None
-        self._block_polytopes: Optional[List[torch.Tensor]] = None
-        self._subspace_blocks: Optional[List[BlockConfig]] = None
-        self._subspace_block_polytopes: Optional[List[torch.Tensor]] = None
+        self._row_segments: Optional[int] = None
 
-        if self._subspace_blockwise:
-            sub_dim = subspace.subspace_dim
-            num_blocks = min(len(self.layout.entries), 8)
-            num_blocks = max(2, num_blocks)
-
-            self._subspace_blocks = create_subspace_blocks(
-                subspace_dim=sub_dim,
-                num_blocks=num_blocks,
-                subspace_particle_dim=subspace_particle_dim,
-            )
-
-            self._subspace_block_polytopes = []
-            for block in self._subspace_blocks:
-                self._subspace_block_polytopes.append(
-                    POLYTOPE_MAP[polytope_type](
-                        block.particle_dim,
-                        device=device,
-                        dtype=X_init.dtype,
-                        radius=1.0,
-                    )
+        if subspace is not None:
+            if block_strategy == "monolithic":
+                return
+            if one_shot or block_strategy == "grouped":
+                detail = (
+                    f"{type(self.solver).__name__} is one-sided, so every particle's row is "
+                    "already solved on its own and the step is the monolithic one. Use "
+                    "block_strategy='monolithic'."
+                    if one_shot
+                    else "Segments slice particles, not parameter entries, so Sinkhorn and KL "
+                    "solves split exactly as under 'per_layer'. Use block_strategy='per_layer', "
+                    "or drop the subspace to group parameter entries."
                 )
-
-            self._state.block_duals = [(None, None) for _ in self._subspace_blocks]
-
-            if self._balanced_ot:
-                frozen = sum(1 for b in self._subspace_blocks if b.num_particles == 1)
-                if frozen:
-                    warnings.warn(
-                        f"{frozen} of {len(self._subspace_blocks)} subspace block(s) hold a "
-                        "single particle; with a balanced solver the column marginal forces "
-                        "a uniform plan there, so those blocks will never move. Use "
-                        "solver='softmax', a larger subspace_dim, or a smaller "
-                        "subspace_particle_dim.",
-                        stacklevel=2,
-                    )
+                warnings.warn(
+                    f"block_strategy={block_strategy!r} has no effect in subspace mode. {detail}",
+                    stacklevel=3,
+                )
+            if not one_shot:
+                self._row_segments = max(2, min(len(self.layout.entries), 8))
 
         elif block_strategy != "monolithic":
             if block_strategy == "per_layer":
@@ -936,16 +902,6 @@ class PolyStepOptimizer(SerializationMixin):
                 raise ValueError(
                     f"Unknown block_strategy: {block_strategy!r}. Use 'monolithic', 'per_layer', or 'grouped'."
                 )
-            self._block_polytopes = []
-            for block in self._blocks:
-                self._block_polytopes.append(
-                    POLYTOPE_MAP[polytope_type](
-                        block.particle_dim,
-                        device=device,
-                        dtype=X_init.dtype,
-                        radius=1.0,
-                    )
-                )
             self._state.block_duals = [(None, None) for _ in self._blocks]
 
             # A one-particle block's plan is forced uniform, so that block freezes.
@@ -961,6 +917,22 @@ class PolyStepOptimizer(SerializationMixin):
                         "block_strategy='grouped', or a smaller particle_dim.",
                         stacklevel=2,
                     )
+
+    def _warn_frozen_segments(self) -> None:
+        """Warn when a row segment of the current particle count holds a single particle."""
+        P = self._state.X.shape[0]
+        segments = min(self._row_segments or 0, P)
+        if not self._balanced_ot or segments < 2:
+            return
+        frozen = [P // segments + (i < P % segments) for i in range(segments)].count(1)
+        if frozen:
+            warnings.warn(
+                f"{frozen} of {segments} subspace row segment(s) hold a single particle; "
+                "with a balanced solver the column marginal forces a uniform plan there, "
+                "so those particles will never move. Use solver='softmax', a larger "
+                "subspace_dim, or a smaller subspace_particle_dim.",
+                stacklevel=3,
+            )
 
     @property
     def state(self) -> SolverState:
@@ -1135,6 +1107,7 @@ class PolyStepOptimizer(SerializationMixin):
         # in-place path they exist for. Only an explicit True/False overrides it.
         if self._compile_forward is not None:
             evaluator._compile_forward = self._compile_forward
+        half = any(p.dtype in (torch.float16, torch.bfloat16) for p in evaluator.model.parameters())
         # Rebuild the fast paths when the objective changes; they cache the model and
         # loss_fn they were built from.
         fastpath_key = (
@@ -1144,6 +1117,8 @@ class PolyStepOptimizer(SerializationMixin):
             id(evaluator.loss_fn),
             evaluator._inplace_forced,
             evaluator.autocast_dtype,
+            half,
+            inputs.dim() == 2,
         )
         if getattr(self, "_fastpath_key", None) != fastpath_key:
             self._fastpath_key = fastpath_key
@@ -1228,18 +1203,30 @@ class PolyStepOptimizer(SerializationMixin):
             # A per-layer block maps to one parameter, so the same site argument holds
             # in coordinate space.
             self._site_vmap_evaluator = SiteVmapEvaluator.try_build(evaluator, self.layout)
+        if half:
+            self._factored_evaluator = None
+            self._subspace_delta_evaluator = None
+        if inputs.dim() != 2:
+            for attr in ("_factored_evaluator", "_sparse_delta_evaluator", "_subspace_delta_evaluator"):
+                ev = getattr(self, attr, None)
+                if ev is not None and not any(tag == "flatten" for _, tag, _ in ev._layer_keys):
+                    setattr(self, attr, None)
 
     def release_evaluator(self) -> None:
         """Drop the registered evaluator and its batch data."""
         self._cost_evaluator = None
         self._fused_inputs = None
         self._fused_targets = None
+        for attr in ("_factored_evaluator", "_sparse_delta_evaluator", "_subspace_delta_evaluator"):
+            ev = getattr(self, attr, None)
+            if ev is not None:
+                ev._cast_cache = None
 
-    def _screen_data(self, use_fused: bool):
-        """Low-fidelity ``(inputs, targets)`` for the fused in-place screen pass."""
+    def _screen_data(self):
+        """Low-fidelity ``(inputs, targets)`` the registered evaluator screens on."""
         inputs = getattr(self, "_fused_inputs", None)
         targets = getattr(self, "_fused_targets", None)
-        if not use_fused or inputs is None or not self.multifidelity_screen:
+        if inputs is None or not self.multifidelity_screen:
             return inputs, targets
         n = inputs.shape[0]
         m = max(1, int(round(n * self.screen_fidelity)))
@@ -1248,7 +1235,13 @@ class PolyStepOptimizer(SerializationMixin):
         return inputs[:m], (targets[:m] if targets is not None else None)
 
     def screen_closure_from(self, closure: Callable, inputs: torch.Tensor, targets=None) -> Callable:
-        """Wrap a full-fidelity batch into a cheap screening closure, or return None."""
+        """Wrap a full-fidelity batch into a cheap screening closure, or return None.
+
+        The screen calls ``closure(batched_params, inputs, targets)`` on the first
+        ``screen_fidelity`` share of the batch, while ``step()`` calls
+        ``closure(batched_params)``. One closure serves both when it takes the batch
+        as default arguments, as in ``def closure(params, x=inputs, y=targets)``.
+        """
         if not self.multifidelity_screen:
             return None
         n = inputs.shape[0]
@@ -1302,9 +1295,7 @@ class PolyStepOptimizer(SerializationMixin):
             self._amortize_counter += 1
             return result
 
-        if self._subspace_blockwise:
-            result = self._step_subspace_blockwise(closure)
-        elif self._blocks is not None:
+        if self._blocks is not None:
             result = self._step_blockwise(closure)
         else:
             result = self._step_monolithic(closure, screen_closure)
@@ -1313,7 +1304,7 @@ class PolyStepOptimizer(SerializationMixin):
         return result
 
     def _step_monolithic(self, closure: Callable, screen_closure: Optional[Callable] = None) -> float:
-        """Monolithic step: one OT solve over all particles."""
+        """Monolithic step: one OT solve over all particles, or one per row segment."""
         return _step_monolithic_fn(self, closure, screen_closure)
 
     def _step_blockwise(self, closure: Callable) -> float:
@@ -1322,13 +1313,6 @@ class PolyStepOptimizer(SerializationMixin):
 
         with _reuse_prefixes(getattr(self, "_sparse_delta_evaluator", None)):
             return _step_blockwise_fn(self, closure)
-
-    def _step_subspace_blockwise(self, closure: Callable) -> float:
-        """Combined subspace + block-wise step: per-block OT in subspace coords."""
-        from .cost_nn import _reuse_prefixes
-
-        with _reuse_prefixes(getattr(self, "_subspace_delta_evaluator", None)):
-            return _step_subspace_blockwise_fn(self, closure)
 
     def _step_momentum(self, closure: Callable) -> float:
         """Cheap step: reapply the last direction with decay, no forward passes."""
@@ -1339,12 +1323,6 @@ class PolyStepOptimizer(SerializationMixin):
         state = self._state
 
         old_subspace = self.subspace
-        if not isinstance(old_subspace, HybridSubspace):
-            import warnings
-
-            warnings.warn(f"Rank transition not supported for {type(old_subspace).__name__}, skipping")
-            return
-
         flat_sub = state.X.reshape(-1)[: old_subspace.subspace_dim]
         new_base, _ = old_subspace.absorb(state.hybrid_projections, state.base_params, flat_sub)
         state.base_params = new_base
@@ -1391,23 +1369,21 @@ class PolyStepOptimizer(SerializationMixin):
         if state.velocity is not None:
             state.velocity = torch.zeros_like(new_X)
 
-        if isinstance(self.subspace, HybridSubspace):
-            state.displacement_history = torch.zeros(
-                self.subspace.displacement_history_size,
-                self.subspace.subspace_dim,
-                dtype=state.X.dtype,
-                device=state.X.device,
-            )
-            state.displacement_history_idx = 0
-            state.displacement_history_count = 0
-            state.hybrid_projections = self.subspace.init_projections(
-                state.X.device,
-                state.X.dtype,
-            )
-            # The fused matrix is per basis; rebuild it for the new rank's shape.
-            if hasattr(self.subspace, "build_fused_projection"):
-                self.subspace.build_fused_projection(state.hybrid_projections)
-            self._hybrid_subspace = self.subspace
+        state.displacement_history = torch.zeros(
+            self.subspace.displacement_history_size,
+            self.subspace.subspace_dim,
+            dtype=state.X.dtype,
+            device=state.X.device,
+        )
+        state.displacement_history_idx = 0
+        state.displacement_history_count = 0
+        state.hybrid_projections = self.subspace.init_projections(
+            state.X.device,
+            state.X.dtype,
+        )
+        # The fused matrix is per basis; rebuild it for the new rank's shape.
+        self.subspace.build_fused_projection(state.hybrid_projections)
+        self._hybrid_subspace = self.subspace
 
         num_points = state.X.shape[0]
         state.a = torch.ones(num_points, device=state.X.device, dtype=state.X.dtype) / num_points
@@ -1417,23 +1393,32 @@ class PolyStepOptimizer(SerializationMixin):
 
         # Record only once the rebuild succeeded.
         self._applied_rank = new_rank
+        self._warn_frozen_segments()
 
         logger.info(
             f"Rank transition: rank={new_rank}, subspace_dim={self.subspace.subspace_dim}, particles={num_points}"
         )
 
     def resync_from_model(self) -> None:
-        """Re-read particle state from the model's current weights, after external writes."""
+        """Re-read particle state from the model's current weights, after external writes.
+
+        Subspace projections follow a dtype cast, once ``evaluator.reset_vmap()`` has dropped the evaluator's
+        cached input dtype. Only a global projection moves its coordinates too; per-layer subspaces and full space
+        keep their coordinate dtype. Raises ``ValueError`` if the model moved to another device.
+        """
+        device = next(self.model.parameters()).device
+        if device != self._state.X.device:
+            raise ValueError(
+                f"The model moved from {self._state.X.device} to {device}, and resync_from_model() "
+                "does not move the optimizer state. Build a new optimizer on the moved model."
+            )
         if self.subspace is not None:
-            # Re-anchor the base and zero the coordinates; share one clone so an
-            # absorb update reaches both.
-            base = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
-            self._base_params = base
-            self._state.base_params = base
+            # Re-anchor the base and zero the coordinates.
+            self._state.base_params = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
             self._state.X = torch.zeros_like(self._state.X)
             self._realign_subspace_to_model()
         else:
-            self._state.X = self.layout.flatten(self.model).to(self._state.X.device, self._state.X.dtype)
+            self._state.X = self.layout.flatten(self.model).to(self._state.X.dtype)
         self._state.f = None
         self._state.g = None
         self._state.prev_prev_f = None
@@ -1448,7 +1433,6 @@ class PolyStepOptimizer(SerializationMixin):
         self._prev_block_descent_directions = None
         self._prev_predicted_improvement = None
         self._prev_pre_step_loss = None
-        self._prev_loss_from_center = False
         if self._state.velocity is not None:
             self._state.velocity = torch.zeros_like(self._state.velocity)
         self._state._prev_prev_block_duals = None
@@ -1460,25 +1444,24 @@ class PolyStepOptimizer(SerializationMixin):
         self._ot_step_costs.clear()
 
     def _realign_subspace_to_model(self) -> None:
-        """Move projections and particles onto the model's current dtype/device."""
-        ref = next(iter(self.model.parameters()), None)
-        if ref is None:
-            return
+        """Cast per-layer projections to their parameters' dtypes, or a global projection and the coordinates to
+        the dominant one."""
         state = self._state
-        if state.X.device != ref.device or state.X.dtype != ref.dtype:
-            state.X = state.X.to(device=ref.device, dtype=ref.dtype)
-            if state.velocity is not None:
-                state.velocity = state.velocity.to(device=ref.device, dtype=ref.dtype)
-
-        def _move(p):
-            return p.to(device=ref.device, dtype=ref.dtype) if isinstance(p, torch.Tensor) else p
-
-        if state.hybrid_projections is not None:
-            state.hybrid_projections = {k: _move(v) for k, v in state.hybrid_projections.items()}
+        if self._per_layer_projections:
+            base = state.base_params
+            state.hybrid_projections = {
+                k: v.to(base[k].dtype) if isinstance(v, torch.Tensor) else v
+                for k, v in state.hybrid_projections.items()
+            }
             if hasattr(self.subspace, "build_fused_projection"):
                 self.subspace.build_fused_projection(state.hybrid_projections)
-        if state.projection is not None:
-            state.projection = _move(state.projection)
+            return
+        dtype = ParamLayout.from_module(self.model).dominant_dtype
+        state.X = state.X.to(dtype)
+        if state.velocity is not None:
+            state.velocity = state.velocity.to(dtype)
+        if isinstance(state.projection, torch.Tensor):
+            state.projection = state.projection.to(dtype)
 
     def _write_params(self, sd: dict) -> None:
         """Copy the parameter entries of ``sd`` into the live parameters, once per step.
@@ -1486,10 +1469,7 @@ class PolyStepOptimizer(SerializationMixin):
         Non-parameter keys are skipped, so subspace snapshots do not revert live
         buffers like BatchNorm running stats.
         """
-        cache = self._param_write_cache
-        if cache is None or cache[0] is not self.model:
-            cache = self._param_write_cache = (self.model, dict(self.model.named_parameters()))
-        params = cache[1]
+        params = dict(self.model.named_parameters())
         keys = [k for k in sd if k in params]
         torch._foreach_copy_([params[k].data for k in keys], [sd[k] for k in keys])
 

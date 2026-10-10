@@ -29,7 +29,9 @@ class TrainCallback:
 class TrainConfig:
     """Configuration for the ``train()`` function; optimizer params live on ``PolyStepOptimizer``.
 
-    ``restore_best`` snapshots the weights at the lowest minibatch loss and restores them, since the last step of a noisy run is not the best.
+    ``restore_best`` snapshots the weights at the lowest loss and restores them, since the last step of a noisy run
+    is not the best. The loss is in-sample: it scores each step's weights on the batch that step trained on, with the
+    candidates' input cast, autocast and loss reduction.
     """
 
     epochs: int = 10
@@ -121,9 +123,9 @@ def train(
 
                 # ot_cost averages probes around the pre-step weights, so it doesn't measure the current weights; restore_best keyed on it would snapshot the cheapest probe cloud.
                 if callbacks or config.restore_best:
-                    with torch.inference_mode():
-                        output = model(cost_inputs)
-                        train_loss = loss_fn(output, cost_targets).item()
+                    with torch.inference_mode(), evaluator._autocast(cost_inputs.device):
+                        x = evaluator.cast_inputs(cost_inputs, evaluator._input_dtype(evaluator._param_dict_cache))
+                        train_loss = evaluator._forward_loss(x, cost_targets).item()
                 else:
                     # Nothing reads a per-step loss; skip the forward and its host sync.
                     train_loss = ot_cost

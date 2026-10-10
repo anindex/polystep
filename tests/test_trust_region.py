@@ -145,6 +145,58 @@ def test_the_simplex_model_uses_the_shared_centre_at_multiple_scales():
     assert len(opt._state.trust_region_multipliers) > 0
 
 
+def test_trust_region_runs_under_the_default_adaptive_rotation():
+    """A rotation or absorb leaves the weights where they were, so the pending comparison
+    survives it; AdaptiveSubspace rotates every step, which used to drop every one."""
+    from polystep import AdaptiveSubspace
+
+    torch.manual_seed(0)
+    model = _model()
+    opt = PolyStepOptimizer(
+        model,
+        subspace=AdaptiveSubspace.auto_from_params(model),
+        max_iterations=50,
+        epsilon=0.1,
+        trust_region=True,
+        compile=False,
+        seed=0,
+    )
+    _run(opt, _closure(model), steps=20)
+    assert len(opt._state.trust_region_multipliers) > 0
+
+
+def _second_move(solver, predicted, pre_step_loss):
+    torch.manual_seed(0)
+    model = _model()
+    opt = PolyStepOptimizer(
+        model,
+        solver=solver,
+        max_iterations=50,
+        epsilon=0.1,
+        num_probe=1,
+        polytope_type="simplex",
+        trust_region=True,
+        compile=False,
+        seed=0,
+    )
+    closure = _closure(model)
+    opt.step(closure)
+    opt._prev_predicted_improvement, opt._prev_pre_step_loss = predicted, pre_step_loss
+    before = opt.state.X.clone()
+    opt.step(closure)
+    return opt.state.X - before, opt._state.trust_region_multipliers
+
+
+@pytest.mark.parametrize("solver", ["sinkhorn", "softmax"])
+def test_a_failed_step_shrinks_the_move_of_the_step_that_measured_it(solver):
+    """A promised gain that came out as a loss quarters the radius on the same step, not the one after."""
+    shrunk, mults = _second_move(solver, torch.tensor(-1.0), -1e9)
+    held, _ = _second_move(solver, None, None)
+    assert mults == [0.25]
+    assert held.abs().max() > 0
+    torch.testing.assert_close(shrunk, 0.25 * held)
+
+
 @pytest.mark.parametrize("first, second, recorded", [(0, 0, 1), (None, None, 1), (0, 1, 0)])
 def test_objective_token_change_drops_the_pending_pair(first, second, recorded):
     """A prediction is scored only against the same objective; None or a constant token is stationary."""

@@ -77,6 +77,38 @@ def test_dense_shared_weights_match_materialized_candidates(site):
     torch.testing.assert_close(ev.evaluate({k: v.clone() for k, v in params.items()}, x, y), expected)
 
 
+@pytest.mark.parametrize("flatten", [False, True])
+@pytest.mark.parametrize(
+    "kind, attr",
+    [("full", "_sparse_delta_evaluator"), ("hybrid", "_subspace_delta_evaluator"), ("factored", "_factored_evaluator")],
+)
+def test_3d_inputs_take_the_delta_paths_only_through_a_leading_flatten(kind, attr, flatten):
+    from polystep.factored_subspace import FactoredSubspace
+    from polystep.hybrid_subspace import HybridSubspace
+    from polystep.transform import ParamLayout
+
+    x = torch.randn(8, 5, 4, dtype=torch.float64)
+    y = torch.randn(8, 2, dtype=torch.float64) if flatten else torch.randn(8, 5, 2, dtype=torch.float64)
+    results = []
+    for fast in (False, True):
+        torch.manual_seed(5)
+        head = [nn.Flatten(), nn.Linear(20, 6)] if flatten else [nn.Linear(4, 6)]
+        model = nn.Sequential(*head, nn.Tanh(), nn.Linear(6, 2)).double()
+        subspace = {"full": None, "hybrid": HybridSubspace, "factored": FactoredSubspace}[kind]
+        subspace = subspace and subspace.from_layout(ParamLayout.from_module(model), rank=2)
+        opt = PolyStepOptimizer(model, subspace=subspace, solver="softmax", compile=False, seed=3)
+        ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+        if fast:
+            opt.register_evaluator(ev, x, y)
+            assert (getattr(opt, attr) is not None) is flatten
+        opt.step(lambda p: ev.evaluate(p, x, y))
+        results.append(opt.state.X.clone())
+    torch.testing.assert_close(*results, rtol=1e-10, atol=1e-12)
+    if not flatten:
+        opt.register_evaluator(ev, x[:, 0], y[:, 0])
+        assert getattr(opt, attr) is not None
+
+
 @pytest.mark.parametrize("targets", [[0, -100], [-100, -100]])
 def test_fast_cross_entropy_matches_ignored_target_reduction(targets):
     model = nn.Sequential(nn.Linear(2, 2)).double()
@@ -301,24 +333,6 @@ def test_constant_simplex_losses_have_exactly_zero_model_gradient(dtype):
         get_simplex_vertices(8, dtype=dtype),
     )
     assert torch.count_nonzero(g) == 0
-
-
-@pytest.mark.parametrize("centered", [False, True])
-def test_old_checkpoint_migrates_only_incumbent_based_trust_predictions(centered):
-    model = nn.Linear(4, 1, bias=False)
-    opt = PolyStepOptimizer(model, trust_region=True, compile=False)
-    checkpoint = opt.state_dict()
-    checkpoint["format"] = 4
-    checkpoint["control"].update(
-        _prev_predicted_improvement=torch.tensor([-1.0, -2.0]), _prev_pre_step_loss=5.0, _prev_loss_from_center=centered
-    )
-    opt.load_state_dict(checkpoint)
-    if centered:
-        assert opt._prev_predicted_improvement.item() == -3.0
-        assert opt._prev_pre_step_loss == 5.0
-    else:
-        assert opt._prev_predicted_improvement is None
-        assert opt._prev_pre_step_loss is None
 
 
 @pytest.mark.parametrize(

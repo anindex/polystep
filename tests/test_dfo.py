@@ -147,65 +147,100 @@ def test_trust_region_expands_on_accurate_prediction():
     assert max(opt._state.trust_region_multipliers) > 1.0
 
 
-def test_newton_refinement_invalidates_warmstart_duals():
-    """When Newton refinement moves particles after the solve, the solve's dual
-    potentials are stale and must not be kept as the next warm start."""
-    # Baseline: plain Sinkhorn keeps its duals for warm starting.
-    model, make_closure = _make_model_and_closure()
-    base = PolyStepOptimizer(
-        model,
-        particle_dim=2,
-        epsilon=0.5,
-        solver="sinkhorn",
-        num_probe=3,
-        max_iterations=3,
-        seed=42,
-    )
-    base.step(make_closure(base))
-    assert base._state.f is not None
-
-    # Refinement moves particles after the solve, so the solve's duals encode old
-    # positions and must be cleared instead of kept.
-    model2, make_closure2 = _make_model_and_closure()
-    ref = PolyStepOptimizer(
-        model2,
-        particle_dim=2,
-        epsilon=0.5,
-        solver="sinkhorn",
-        use_quadratic_model=True,
-        polytope_type="orthoplex",
-        newton_refinement=True,
-        num_probe=3,
-        max_iterations=3,
-        seed=42,
-    )
-    ref.step(make_closure2(ref))
-    assert ref._state.f is None
-    assert ref._state.g is None
-
-
-def test_newton_refinement_reconciles_the_momentum_velocity():
-    """Refinement replaces the post-momentum position, so velocity must track the realized move."""
+def test_newton_refinement_keeps_warmstart_duals():
+    """Every step moves particles off the solved positions, refined or not, so the
+    solve's duals stay as the next warm start."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
         model,
         particle_dim=2,
         epsilon=0.5,
-        solver="softmax",
+        solver="sinkhorn",
         use_quadratic_model=True,
         polytope_type="orthoplex",
         newton_refinement=True,
-        use_momentum=True,
-        velocity_lr=1.0,
         num_probe=3,
         max_iterations=3,
         seed=42,
     )
-    X_before = opt._state.X.clone()
     opt.step(make_closure(opt))
-    realized = opt._state.X - X_before
-    assert realized.abs().max() > 0, "the step did not move"
-    torch.testing.assert_close(opt._state.velocity, realized)
+    assert opt._state.f is not None
+    assert opt._state.g is not None
+
+
+def test_newton_refinement_keeps_momentum():
+    """Momentum integrates the refined target, so the refinement still moves it."""
+    final = []
+    for momentum, alpha in ((False, 0.0), (False, 0.3), (True, 0.0), (True, 0.3)):
+        model, make_closure = _make_model_and_closure()
+        opt = PolyStepOptimizer(
+            model,
+            particle_dim=2,
+            epsilon=0.5,
+            solver="softmax",
+            polytope_type="orthoplex",
+            newton_refinement=True,
+            newton_refinement_alpha=alpha,
+            use_momentum=momentum,
+            num_probe=3,
+            max_iterations=3,
+            seed=42,
+        )
+        closure = make_closure(opt)
+        for _ in range(3):
+            opt.step(closure)
+        final.append(opt._state.X.clone())
+    assert not torch.allclose(final[1], final[0])
+    assert not torch.allclose(final[3], final[1])
+    assert not torch.allclose(final[3], final[2])
+
+
+def _bowl(batched):
+    return sum(v.flatten(1).pow(2).sum(dim=1) for v in batched.values())
+
+
+def _bowl_probe_counts(**kwargs):
+    torch.manual_seed(0)
+    opt = PolyStepOptimizer(
+        nn.Linear(4, 2),
+        polytope_type="orthoplex",
+        newton_refinement=True,
+        num_probe=3,
+        adaptive_probe_warmup=0,
+        seed=0,
+        **kwargs,
+    )
+    counts = []
+    for _ in range(10):
+        opt.step(_bowl)
+        counts.append(opt._losses_3d.shape[-1])
+    return opt, counts
+
+
+def test_newton_refinement_keeps_every_probe_by_default():
+    opt, counts = _bowl_probe_counts()
+    assert opt.adaptive_num_probe is False
+    assert counts == [3] * 10
+
+
+def test_adaptive_num_probe_under_newton_refinement_warns():
+    with pytest.warns(UserWarning, match="refinement pauses"):
+        _, counts = _bowl_probe_counts(adaptive_num_probe=True)
+    assert counts[-1] == 1
+
+
+@pytest.mark.parametrize("kwargs", [{"block_strategy": "per_layer"}, {"num_probe": 1}])
+def test_inactive_newton_refinement_skips_the_pause_warning(kwargs):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        PolyStepOptimizer(
+            nn.Linear(4, 2),
+            polytope_type="orthoplex",
+            newton_refinement=True,
+            adaptive_num_probe=True,
+            **kwargs,
+        )
+    assert not any("refinement pauses" in str(w.message) for w in caught)
 
 
 def test_multifidelity_screening_keeps_descending():
@@ -481,6 +516,61 @@ def test_screen_places_full_fidelity_values_at_the_kept_positions():
         dropped = torch.ones(P * V * K, dtype=torch.bool)
         dropped[sel_idx] = False
         assert not torch.isin(out[dropped], kept).any(), "a dropped slot holds a kept vertex's value"
+
+
+def test_screen_calibrates_on_finite_kept_costs():
+    """A nonfinite kept cost must not reach the offset given to the dropped vertices."""
+    from polystep._step_monolithic import _fill_screened_losses
+
+    P, V, K = 3, 4, 2
+    screen_cost = torch.tensor([1.0, 2.0, 3.0, 4.0]).repeat(P, 1)
+    keep_mask = torch.zeros(P, V, dtype=torch.bool)
+    keep_mask[:, :2] = True
+    sel_idx = torch.nonzero(keep_mask.repeat_interleave(K, dim=1).reshape(-1), as_tuple=True)[0]
+    inf, nan = float("inf"), float("nan")
+    kept = torch.tensor([10.0, 12.0, 20.0, 22.0, 10.0, 12.0, inf, 22.0, nan, inf, -inf, nan])
+
+    out = _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P, V, K).reshape(P, V, K)
+    finite_gaps = (torch.tensor([9.0, 11.0, 18.0, 20.0]).mean(), torch.tensor([9.0, 11.0, 20.0]).mean(), 0.0)
+    for p, offset in enumerate(finite_gaps):
+        torch.testing.assert_close(out[p, 2:], (screen_cost[p, 2:] + offset).unsqueeze(-1).expand(2, K))
+
+
+def test_site_vmap_screens_on_the_screen_slice():
+    """A Conv2d model scores full-space candidates on the site-vmap path, which must
+    screen on the same slice as the screen closure, not on the whole batch."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(1, 2, 3), nn.ReLU(), nn.Flatten(), nn.Linear(32, 3))
+    x, y = torch.randn(64, 1, 6, 6), torch.randint(0, 3, (64,))
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    opt = PolyStepOptimizer(
+        model,
+        seed=0,
+        polytope_type="orthoplex",
+        num_probe=1,
+        chunk_size=4,
+        multifidelity_screen=True,
+        screen_keep_ratio=0.5,
+        screen_fidelity=0.25,
+    )
+    opt.register_evaluator(ev, x, y)
+    site = opt._site_vmap_evaluator
+    assert site is not None and opt._sparse_delta_evaluator is None
+    rows = set()
+    evaluate = site.evaluate
+
+    def spy(*args):
+        rows.add(args[4].shape[0])
+        return evaluate(*args)
+
+    site.evaluate = spy
+
+    def closure(bp, _x=x, _y=y):
+        return ev.evaluate(bp, _x, _y)
+
+    opt.step(closure, screen_closure=opt.screen_closure_from(closure, x, y))
+    assert rows == {16, 64}
+    assert opt._last_screen_savings > 0
 
 
 def test_a_2d_cube_is_not_treated_as_an_orthoplex():

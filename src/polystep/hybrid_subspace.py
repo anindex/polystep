@@ -79,34 +79,34 @@ def _scale_specs_to_budget(
     max_dim: "Optional[int]",
     current_dim: int,
 ) -> "Tuple[list, int]":
-    """Scale projected specs so the total stays within ``max_dim``."""
+    """Scale weight specs, full-width ones included, so the total stays within ``max_dim``."""
     if max_dim is None or current_dim <= max_dim:
         return specs, current_dim
 
-    unprojected_dim = sum(s.num_coords for s in specs if not s.is_projected)
-    n_projected = sum(1 for s in specs if s.is_projected)
-    target_projected = max_dim - unprojected_dim
+    fixed_dim = sum(s.num_coords for s in specs if len(s.original_shape) < 2)
+    n_weights = sum(1 for s in specs if len(s.original_shape) >= 2)
+    target_weights = max_dim - fixed_dim
 
-    if target_projected < n_projected:
-        # Unprojected width alone exceeds the budget, so the cap is unreachable.
-        target_projected = n_projected
+    if target_weights < n_weights:
+        # 1D width alone exceeds the budget, so the cap is unreachable.
+        target_weights = n_weights
         warnings.warn(
-            f"max_subspace_dim={max_dim} is unreachable: unprojected parameters take "
-            f"{unprojected_dim} coordinates and {n_projected} projected layers need one "
-            f"each, so the subspace is {unprojected_dim + n_projected}.",
+            f"max_subspace_dim={max_dim} is unreachable: 1D parameters take "
+            f"{fixed_dim} coordinates and {n_weights} weight layers need one "
+            f"each, so the subspace is {fixed_dim + n_weights}.",
             stacklevel=3,
         )
 
-    projected_dim = current_dim - unprojected_dim
-    if projected_dim <= target_projected:
+    weight_dim = current_dim - fixed_dim
+    if weight_dim <= target_weights:
         return specs, current_dim
 
-    scale = target_projected / projected_dim
-    remaining, left = target_projected, n_projected
+    scale = target_weights / weight_dim
+    remaining, left = target_weights, n_weights
     new_specs: list = []
     new_offset = 0
     for spec in specs:
-        if spec.is_projected:
+        if len(spec.original_shape) >= 2:
             left -= 1
             headroom = min(spec.num_params, remaining - left)
             num_coords = min(max(1, round(spec.num_coords * scale)), headroom)
@@ -486,7 +486,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
                 P = projections[spec.entry_key]
                 if isinstance(P, SparseRandomProjection):
                     delta = P.project(chunk)  # (num_params,)
-                    result[spec.entry_key] = (base.reshape(-1) + delta).reshape(spec.original_shape)
+                    result[spec.entry_key] = (base.reshape(-1) + delta).to(base.dtype).reshape(spec.original_shape)
                 else:
                     result_flat = torch.addmm(
                         base.reshape(1, -1),
@@ -672,7 +672,8 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             for spec, P in self._fused_sparse_specs:
                 chunk = flat_subspace_batch[:, spec.flat_start : spec.flat_end]
                 # project() already copies, so adding first fuses the two passes into one.
-                delta = base_sd[spec.entry_key].reshape(1, -1) + P.project(chunk)
+                base = base_sd[spec.entry_key]
+                delta = (base.reshape(1, -1) + P.project(chunk)).to(base.dtype)
                 result[spec.entry_key] = delta.reshape(N, *spec.original_shape)
 
             for spec, P in self._fused_odd_dtype_specs:
@@ -695,7 +696,8 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             if spec.is_projected:
                 P = projections[spec.entry_key]
                 if isinstance(P, SparseRandomProjection):
-                    result[spec.entry_key] = (base.reshape(1, -1) + P.project(chunk)).reshape(N, *spec.original_shape)
+                    delta = (base.reshape(1, -1) + P.project(chunk)).to(base.dtype)
+                    result[spec.entry_key] = delta.reshape(N, *spec.original_shape)
                 else:
                     result[spec.entry_key] = (chunk.to(P.dtype) @ P.t()).reshape(N, *spec.original_shape).add_(base)
             else:

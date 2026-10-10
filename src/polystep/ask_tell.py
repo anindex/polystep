@@ -12,6 +12,7 @@ from ._compiled import _barycentric_projection, _rotate_and_translate
 from .geometry import get_orthoplex_vertices, get_random_rotation_matrices
 from .solvers import SinkhornSolver, SoftmaxSolver
 from .solvers._shared import validate_positive
+from .transform import create_generator
 
 __all__ = ["PolyStepES", "minimize"]
 
@@ -31,7 +32,8 @@ class PolyStepES:
         scale_cost: Cost-matrix scaling passed to the solver ("mean", "max_cost",
             a float divisor, or None).
         x0: Initial position(s), shape ``(dim,)`` or ``(num_particles, dim)``.
-        seed: Seed for the rotation generator.
+        seed: Seed for a private rotation generator. ``None`` draws rotations from
+            PyTorch's global RNG, so ``torch.manual_seed`` reproduces the run.
         device: Tensor device. ``None`` follows ``x0``, else CPU.
         dtype: Tensor dtype.
     """
@@ -77,9 +79,7 @@ class PolyStepES:
                 stacklevel=2,
             )
 
-        self.generator = torch.Generator(device=self.device)
-        if seed is not None:
-            self.generator.manual_seed(seed)
+        self.generator = create_generator(seed, self.device) if seed is not None else None
 
         self.vertices = get_orthoplex_vertices(dim, device=self.device, dtype=dtype)
         self.num_vertices = self.vertices.shape[0]

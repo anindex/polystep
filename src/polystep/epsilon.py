@@ -46,8 +46,10 @@ class PowerDecay:
     target: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.gamma <= 0:
-            raise ValueError(f"gamma must be > 0 for a square-summable schedule, got {self.gamma}")
+        if not 0 < self.gamma <= 0.5:
+            raise ValueError(
+                f"gamma must be in (0, 0.5] for a square-summable, non-summable schedule, got {self.gamma}"
+            )
 
     def at(self, iteration: Optional[int] = None) -> float:
         t = 0 if iteration is None else max(int(iteration), 0)
@@ -120,6 +122,10 @@ class CosineEpsilon:
     decay: float = 0.01
     total_steps: int = 0
     restart_mult: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.decay < 0:
+            raise ValueError(f"decay must be >= 0, got {self.decay}")
 
     def at(self, iteration: Optional[int] = None) -> float:
         if iteration is None:

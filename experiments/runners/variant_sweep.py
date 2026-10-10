@@ -430,7 +430,7 @@ def interaction_configs(env: Env):
         Config(
             "block_x_repr",
             "per_layer_hybrid",
-            "softmax",
+            "sinkhorn",
             subspace=_hybrid(8),
             kwargs={"block_strategy": "per_layer"},
             needs_subspace=True,
@@ -520,6 +520,8 @@ def build_optimizer(env: Env, cfg: Config, model, seed):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         opt = PolyStepOptimizer(model, subspace=subspace, solver=cfg.solver, **kwargs)
+    if subspace is not None and "block_strategy" in cfg.kwargs:
+        assert opt._row_segments is not None, f"{cfg.name}: block_strategy has no effect with {cfg.solver}"
     return opt
 
 
