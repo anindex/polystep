@@ -31,6 +31,7 @@ from polystep.cost_nn import (
     BatchedLinearEvaluator,
     FactoredEvaluator,
     NNCostEvaluator,
+    SiteInplaceEvaluator,
     SiteVmapEvaluator,
     SparseDeltaEvaluator,
     SubspaceDeltaEvaluator,
@@ -50,6 +51,8 @@ SCORERS = (
     (BatchedLinearEvaluator, "evaluate"),
     (SiteVmapEvaluator, "evaluate"),
     (SiteVmapEvaluator, "evaluate_subspace"),
+    (SiteInplaceEvaluator, "evaluate"),
+    (SiteInplaceEvaluator, "evaluate_subspace"),
     (SparseDeltaEvaluator, "evaluate"),
     (SubspaceDeltaEvaluator, "evaluate"),
     (FactoredEvaluator, "evaluate"),
@@ -187,11 +190,12 @@ def candidate_bench(args):
             # Sample an early large site and the last site; prefix work differs sharply.
             keys = dict.fromkeys((max(base, key=lambda k: base[k].numel()), next(reversed(base))))
             for key in keys:
+                entry = next(e for e in layout.entries if e.key == key)
                 site = base[key][None] + 0.02 * torch.randn(args.candidates, *base[key].shape, device=args.device)
                 stacked = {k: v[None].expand(args.candidates, *v.shape) for k, v in base.items()} | {key: site}
                 reference_ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
                 expected = reference_ev._evaluate_loop(stacked, x, y)
-                backends = ["evaluator", "site", "inplace"] + (
+                backends = ["evaluator", "site", "site_inplace", "inplace"] + (
                     ["compiled_evaluator", "compiled_site"] if args.compile else []
                 )
                 for backend in backends:
@@ -202,13 +206,23 @@ def candidate_bench(args):
                     ev = NNCostEvaluator(
                         model,
                         nn.CrossEntropyLoss(),
-                        use_inplace=backend == "inplace",
+                        use_inplace=backend in ("inplace", "site_inplace"),
                         compile_vmap=backend.startswith("compiled"),
                         compile_forward=False,
                     )
                     site_ev = SiteVmapEvaluator.try_build(ev, layout)
 
                     def fn():
+                        if backend == "site_inplace":
+                            n = base[key].numel()
+                            return site_ev.evaluate(
+                                base,
+                                entry,
+                                torch.arange(n, device=args.device)[None],
+                                site.reshape(1, args.candidates, n),
+                                x,
+                                y,
+                            )
                         if backend.endswith("site"):
                             return site_ev._vmap_over_site(key, base, site, x, y)
                         return ev.evaluate(stacked, x, y)
@@ -235,7 +249,9 @@ def candidate_bench(args):
                             ev._compile_failed or (site_ev and site_ev._compile_failed_sites)
                         )
                         row["actual_path"] = (
-                            "site-vmap"
+                            "site-inplace"
+                            if backend == "site_inplace"
+                            else "site-vmap"
                             if backend.endswith("site")
                             else "inplace"
                             if ev._use_inplace

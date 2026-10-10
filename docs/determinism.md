@@ -18,6 +18,10 @@ Warnings remain possible when an operation has no deterministic implementation.
 Use `torch.use_deterministic_algorithms(True, warn_only=False)` to make these errors
 explicit when validating a workload.
 
+Without deterministic algorithms, CUDA scatter-adds sum repeated entries in whatever
+order the threads finish. Hybrid runs with sparse projections use them, so two such
+runs can differ in the last bit.
+
 ## Rotations
 
 The rotation sampler uses batched QR for small particle batches and Householder

@@ -38,6 +38,19 @@ def chunk_spans(n_cand: int, chunk: int, bounds=None):
         start = stop
 
 
+def activation_elements(opt, inputs) -> int:
+    """Activation elements one candidate's forward holds on ``inputs``.
+
+    Scales the ratio the rebuild probe measured, or the widest layer when there is none.
+    """
+    if inputs is None:
+        return 0
+    ratio = getattr(opt, "_act_ratio", None)
+    if ratio is not None:
+        return int(ratio * inputs.numel())
+    return inputs.shape[0] * max((e.shape[0] for e in opt.layout.entries if e.shape), default=0)
+
+
 def site_bounds(starts, pdim: int, group: int, total: int) -> list[int]:
     """Candidate indices where a chunk must break so each site start lands in its own chunk."""
     # Each start contributes its own group and the next, isolating the

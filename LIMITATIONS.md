@@ -23,6 +23,8 @@ momentum.
 ## Evaluation
 
 - `step()` expects `closure(batched_params) -> losses` with shape `(N,)`.
+  The candidate tensors may share storage that the next chunk overwrites, so clone
+  any you keep after the closure returns.
 - Manual loops must register the evaluator and current batch to enable fast paths.
   The evaluator and closure must compute the same objective.
 - Mixed-dtype models require `HybridSubspace` or `FactoredSubspace`. Full-space and
@@ -46,6 +48,9 @@ momentum.
   unsupported options warn at construction. With a subspace, `per_layer` and
   `grouped` run the monolithic step and only split Sinkhorn and KL solves into row
   segments.
+- The automatic chunk size sees only the outputs of layers that own parameters.
+  Attention scores and other intermediates inside a layer are not counted, so set
+  `chunk_size` by hand if such a model runs out of memory.
 - The library does not distribute optimizer state across multiple GPUs.
 
 ## Attention and recurrent layers

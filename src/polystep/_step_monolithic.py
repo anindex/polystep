@@ -10,10 +10,11 @@ from typing import Callable
 import torch
 
 from ._compiled import normalize_rows
-from .cost_nn import _reuse_prefixes
+from .cost_nn import SiteInplaceEvaluator, _reuse_prefixes
 from .solvers._shared import loss_buffer_dtype, recenter_and_scale, sanitize_cost, solver_health
 from .epsilon import feed_solver_stats, radius_epsilon_factor
 from ._step_core import (
+    activation_elements,
     check_losses,
     chunk_spans,
     invalidate_for_basis_change,
@@ -299,20 +300,21 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     if _sparse_delta is not None or _site_vmap is not None:
         _base_sd = opt.layout.unflatten(X)
 
-    _subspace_delta = getattr(opt, "_subspace_delta_evaluator", None) if opt._hybrid else None
+    _subspace_delta = getattr(opt, "_subspace_delta_evaluator", None) if opt._per_layer_projections else None
     # The same site argument in coordinate space: a per-layer block maps to one
     # parameter, so only that one is batched.
     _subspace_site = getattr(opt, "_site_vmap_evaluator", None) if opt._hybrid else None
     _bary_sd = None
     if _fused_inputs is not None and (_subspace_delta is not None or _subspace_site is not None):
         _bary_coords = X.reshape(-1)[:_sub_dim]
-        if any(v.dtype in (torch.float16, torch.bfloat16) for v in state.base_params.values()):
+        _half = [state.base_params[s.entry_key].dtype in (torch.float16, torch.bfloat16) for s in state.subspace.specs]
+        if not any(_half):
+            _bary_sd = state.subspace.apply_perturbation(state.hybrid_projections, state.base_params, _bary_coords)
+        elif not (all(_half) and _subspace_delta is None and isinstance(_subspace_site, SiteInplaceEvaluator)):
             _bary_sd = state.subspace.reconstruct_batch(
                 state.hybrid_projections, state.base_params, _bary_coords.unsqueeze(0)
             )
             _bary_sd = {k: v[0] for k, v in _bary_sd.items()}
-        else:
-            _bary_sd = state.subspace.apply_perturbation(state.hybrid_projections, state.base_params, _bary_coords)
     else:
         _subspace_delta = _subspace_site = None
         _bary_coords = None
@@ -344,36 +346,60 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             stacklevel=3,
         )
 
+    _bary_flat = None
+    if (
+        opt._adaptive
+        and device.type == "cpu"
+        and not _screen_ready
+        and _sub_dim >= pdim
+        and isinstance(state.projection, torch.Tensor)
+        and state.projection.dtype not in (torch.float16, torch.bfloat16)
+    ):
+        _bary_flat = torch.addmv(
+            torch.cat([state.base_params[s.entry_key].reshape(-1) for s in state.subspace._entry_specs]).to(
+                state.projection.dtype
+            ),
+            state.projection,
+            X.reshape(-1)[:_sub_dim],
+        )
+
     # Budget on what a candidate allocates; chunking only splits the loop.
+    _act = activation_elements(opt, _fused_inputs)
+    _local = any(p is not None for p in (_subspace_delta, _sparse_delta, _site_vmap, _subspace_site))
     if opt.chunk_size:
-        chunk = opt.chunk_size
+        chunk_mat = chunk = opt.chunk_size
     else:
         per_candidate = max(1, X.numel())  # P * pdim
-        # Any chunk can straddle a block and fall back, so cover a materialized chunk.
+        # A materialized subspace candidate builds every weight.
         if _is_subspace and not _use_fused_inplace and _factored_eval is None:
             per_candidate += opt.layout.total_params
-        if _fused_inputs is not None and opt.layout.entries:
-            widest = max(e.shape[0] for e in opt.layout.entries if e.shape)
-            per_candidate += _fused_inputs.shape[0] * widest
-        chunk = min(total_evals, max(1, (1 << 26) // per_candidate))
+        chunk_mat = chunk = min(total_evals, max(1, (1 << 26) // (per_candidate + _act)))
+        if _local:
+            per_site = 2 * _act
+            if _site_vmap is not None or _subspace_site is not None:
+                per_site += max(e.numel for e in opt.layout.entries)
+            chunk = min(total_evals, max(1, (1 << 26) // max(1, per_site)))
 
     _group = V * K_eff
-    if _subspace_delta is not None or _sparse_delta is not None or _site_vmap is not None or _subspace_site:
+    if _local or _bary_flat is not None:
         # Keep whole particle groups in one chunk, or the (G, C, pdim) reshape
         # misaligns.
         chunk = max(_group, (chunk // _group) * _group)
+        chunk_mat = min(chunk_mat, chunk)
     # Break chunks where sites do, or a chunk spans entries and resolves to no site.
     if _sparse_delta is not None or _site_vmap is not None:
-        _starts = [e.offset for e in opt.layout.entries]
+        _starts = [e.offset for e in opt.layout.entries] + [opt.layout.total_params]
     elif _subspace_delta is not None or _subspace_site is not None:
-        _starts = [s.flat_start for s in state.subspace.specs]
+        _starts = [s.flat_start for s in state.subspace.specs] + [_sub_dim]
+    elif _bary_flat is not None:
+        _starts = [_sub_dim]
     else:
         _starts = []
     _site_bounds = site_bounds(_starts, pdim, _group, total_evals)
 
     # Shape-determined and fully overwritten each step, so cached on the optimizer.
     _loss_dtype = loss_buffer_dtype(X.dtype)
-    _buf_key = (total_evals, chunk, V, K_eff, X.shape[0], X.shape[1], device, X.dtype)
+    _buf_key = (total_evals, chunk_mat, V, K_eff, X.shape[0], X.shape[1], device, X.dtype)
     _bufs = getattr(opt, "_step_buffers", None)
     if _bufs is None or _bufs[0] != _buf_key:
         _all = torch.arange(total_evals, device=device)
@@ -384,16 +410,19 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             _buf_key,
             torch.empty(total_evals, dtype=_loss_dtype, device=device),
             None,
-            torch.arange(chunk, device=device) if chunk <= total_evals else None,
+            torch.arange(chunk_mat, device=device) if chunk_mat <= total_evals else None,
             _all // (V * K_eff),
             _vk // K_eff,
             _vk % K_eff,
+            None,
         ]
         opt._step_buffers = _bufs
-    _, losses, _, _local_range_full, _i_all, _v_all, _k_all = _bufs
-    _configs_wanted = chunk <= total_evals
+    if _bary_flat is not None and _bufs[7] is None:
+        _bufs[7] = _bary_flat.new_empty(min(chunk, total_evals) // _group, _group, _bary_flat.numel())
+    _, losses, _, _local_range_full, _i_all, _v_all, _k_all, _ = _bufs
+    _configs_wanted = chunk_mat <= total_evals
 
-    @_reuse_prefixes(_sparse_delta, _subspace_delta)
+    @_reuse_prefixes(_sparse_delta, _subspace_delta, _site_vmap, _subspace_site)
     def _evaluate_candidates(
         i_all,
         v_all,
@@ -485,71 +514,91 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                     ).to(out.dtype)
                     continue
 
-            if _configs_wanted and chunk_size_actual == chunk:
-                local_range = _local_range_full
-                if _bufs[2] is None:
-                    # Built from X, so it needs no restore on this pass.
-                    _bufs[2] = X.unsqueeze(0).expand(chunk, -1, -1).clone()
-                    batch_configs = _bufs[2]
-                else:
-                    batch_configs = _bufs[2]
-                    if dirty_rows is None:
-                        batch_configs.copy_(X)  # copy_ broadcasts
-                    else:
-                        batch_configs[local_range, dirty_rows] = X[dirty_rows]
-                dirty_rows = i_idx
-            else:
-                batch_configs = X.unsqueeze(0).expand(chunk_size_actual, -1, -1).clone()
-                local_range = torch.arange(chunk_size_actual, device=device)
-            batch_configs[local_range, i_idx] = probe_src[i_idx, v_idx, k_idx]
-
-            flat_configs = batch_configs.reshape(chunk_size_actual, -1)
-
-            if _use_fused_inplace and _is_subspace and opt._hybrid:
-                # One config at a time via in-place weight swap, never the full
-                # (N, *param_shape) stack.
-                flat_sub = flat_configs[:, :_sub_dim]
-                chunk_losses = opt._cost_evaluator.evaluate_subspace_inplace(
-                    state.subspace,
-                    state.hybrid_projections,
-                    state.base_params,
-                    flat_sub,
-                    fused_inputs,
-                    fused_targets,
-                )
-            elif _factored_eval is not None:
-                chunk_losses = _factored_eval.evaluate(
-                    state.subspace,
-                    state.hybrid_projections,
-                    state.base_params,
-                    flat_configs[:, :_sub_dim],
-                    fused_inputs,
-                    fused_targets,
-                )
-            elif _is_subspace:
-                flat_sub = flat_configs[:, :_sub_dim]
-                if opt._mixed_precision and state.projection is not None:
-                    flat_sub = flat_sub.to(dtype=state.projection.dtype)
-                chunk_params = state.subspace.reconstruct_batch(
-                    state.projection if opt._adaptive else state.hybrid_projections,
-                    state.base_params,
-                    flat_sub,
-                )
-                chunk_losses = closure_fn(chunk_params)
-            else:
-                layout_flat = opt.layout.padded_size
-                if flat_configs.shape[1] >= layout_flat:
-                    flat_for_layout = flat_configs[:, :layout_flat]
-                else:
-                    flat_for_layout = torch.nn.functional.pad(
-                        flat_configs,
-                        (0, layout_flat - flat_configs.shape[1]),
+            if _bary_flat is not None and dense:
+                _g0, _g1 = chunk_start // _group, chunk_end // _group
+                if _g1 * pdim <= _sub_dim:
+                    chunk_losses = closure_fn(
+                        state.subspace.reconstruct_offsets(
+                            state.projection,
+                            _bary_flat,
+                            _g0 * pdim,
+                            (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(_g1 - _g0, _group, pdim),
+                            _bufs[7][: _g1 - _g0],
+                        )
                     )
-                chunk_params = opt.layout.batch_unflatten(flat_for_layout)
-                chunk_losses = closure_fn(chunk_params)
+                    check_losses(chunk_losses, chunk_size_actual)
+                    out[chunk_start:chunk_end] = chunk_losses.to(out.dtype)
+                    continue
 
-            check_losses(chunk_losses, chunk_end - chunk_start)
-            out[chunk_start:chunk_end] = chunk_losses.to(out.dtype)
+            for lo in range(chunk_start, chunk_end, chunk_mat):
+                hi = min(lo + chunk_mat, chunk_end)
+                i_idx = i_all[lo:hi]
+                if _configs_wanted and hi - lo == chunk_mat:
+                    local_range = _local_range_full
+                    if _bufs[2] is None:
+                        # Built from X, so it needs no restore on this pass.
+                        _bufs[2] = X.unsqueeze(0).expand(chunk_mat, -1, -1).clone()
+                        batch_configs = _bufs[2]
+                    else:
+                        batch_configs = _bufs[2]
+                        if dirty_rows is None:
+                            batch_configs.copy_(X)  # copy_ broadcasts
+                        else:
+                            batch_configs[local_range, dirty_rows] = X[dirty_rows]
+                    dirty_rows = i_idx
+                else:
+                    batch_configs = X.unsqueeze(0).expand(hi - lo, -1, -1).clone()
+                    local_range = torch.arange(hi - lo, device=device)
+                batch_configs[local_range, i_idx] = probe_src[i_idx, v_all[lo:hi], k_all[lo:hi]]
+
+                flat_configs = batch_configs.reshape(hi - lo, -1)
+
+                if _use_fused_inplace and _is_subspace and opt._hybrid:
+                    # One config at a time via in-place weight swap, never the full
+                    # (N, *param_shape) stack.
+                    flat_sub = flat_configs[:, :_sub_dim]
+                    chunk_losses = opt._cost_evaluator.evaluate_subspace_inplace(
+                        state.subspace,
+                        state.hybrid_projections,
+                        state.base_params,
+                        flat_sub,
+                        fused_inputs,
+                        fused_targets,
+                    )
+                elif _factored_eval is not None:
+                    chunk_losses = _factored_eval.evaluate(
+                        state.subspace,
+                        state.hybrid_projections,
+                        state.base_params,
+                        flat_configs[:, :_sub_dim],
+                        fused_inputs,
+                        fused_targets,
+                    )
+                elif _is_subspace:
+                    flat_sub = flat_configs[:, :_sub_dim]
+                    if opt._mixed_precision and state.projection is not None:
+                        flat_sub = flat_sub.to(dtype=state.projection.dtype)
+                    chunk_params = state.subspace.reconstruct_batch(
+                        state.projection if opt._adaptive else state.hybrid_projections,
+                        state.base_params,
+                        flat_sub,
+                        *(() if _bary_flat is None else (_bufs[7].flatten(0, 1)[: hi - lo],)),
+                    )
+                    chunk_losses = closure_fn(chunk_params)
+                else:
+                    layout_flat = opt.layout.padded_size
+                    if flat_configs.shape[1] >= layout_flat:
+                        flat_for_layout = flat_configs[:, :layout_flat]
+                    else:
+                        flat_for_layout = torch.nn.functional.pad(
+                            flat_configs,
+                            (0, layout_flat - flat_configs.shape[1]),
+                        )
+                    chunk_params = opt.layout.batch_unflatten(flat_for_layout)
+                    chunk_losses = closure_fn(chunk_params)
+
+                check_losses(chunk_losses, hi - lo)
+                out[lo:hi] = chunk_losses.to(out.dtype)
 
         return out
 

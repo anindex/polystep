@@ -379,3 +379,72 @@ def test_eager_inplace_does_not_spend_an_extra_verification_forward():
     assert len(count) == 3
     for k, v in model.state_dict().items():
         torch.testing.assert_close(v, original[k])
+
+
+@pytest.mark.parametrize("screen", [False, True])
+def test_materialized_fallback_honours_chunk_size(screen):
+    model = nn.Sequential(nn.Linear(3, 2))
+    opt = PolyStepOptimizer(
+        model, particle_dim=3, chunk_size=1, multifidelity_screen=screen, solver="softmax", compile=False, seed=0
+    )
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    x, y = torch.randn(4, 3), torch.randn(4, 2)
+    opt.register_evaluator(ev, x, y)
+    rows = []
+
+    def closure(params):
+        rows.append(next(iter(params.values())).shape[0])
+        return ev.evaluate(params, x, y)
+
+    opt.step(closure, screen_closure=closure if screen else None)
+    assert rows and set(rows) == {1}
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_only_the_padded_tail_particle_falls_back(hybrid):
+    from polystep.hybrid_subspace import HybridSubspace
+    from polystep.transform import ParamLayout
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(3, 101, bias=False))
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model, particle_dim=8), rank=4) if hybrid else None
+    opt = PolyStepOptimizer(
+        model, particle_dim=8, polytope_type="simplex", subspace=subspace, solver="softmax", compile=False, seed=0
+    )
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    x, y = torch.randn(16, 3), torch.randn(16, 101)
+    opt.register_evaluator(ev, x, y)
+    rows = []
+
+    def closure(params):
+        rows.append(next(iter(params.values())).shape[0])
+        return ev.evaluate(params, x, y)
+
+    opt.step(closure)
+    assert sum(rows) == 9
+
+
+@pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+def test_activation_width_counts_conv_outputs(block_strategy):
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        nn.Conv2d(1, 4, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(4, 2)
+    )
+    opt = PolyStepOptimizer(model, block_strategy=block_strategy, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+    x, y = torch.randn(64, 1, 64, 64), torch.randint(0, 2, (64,))
+    opt.register_evaluator(ev, x, y)
+    assert opt._act_ratio == 4.0
+    assert not any(m._forward_hooks for m in model.modules())
+
+    site = opt._site_vmap_evaluator
+    rows = []
+    inner = site._vmap_over_site
+
+    def spy(key, base_sd, candidates, inputs, targets):
+        rows.append(candidates.shape[0])
+        return inner(key, base_sd, candidates, inputs, targets)
+
+    site._vmap_over_site = spy
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    assert rows and max(rows) < 54

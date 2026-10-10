@@ -239,15 +239,19 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         projection,
         base_sd: Dict[str, torch.Tensor],
         flat_subspace_batch: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Vectorized reconstruction for N probe points; entries alias one buffer, treat as read-only."""
+        """Vectorized reconstruction for N probe points; entries alias one buffer, treat as read-only.
+
+        A dense projection writes into a contiguous ``(N, full_dim)`` ``out`` when one is given.
+        """
         from .projection import SparseRandomProjection
 
         if isinstance(projection, SparseRandomProjection):
             # project() returns a transposed result; make it contiguous.
             delta_batch = projection.project(flat_subspace_batch).contiguous()  # (N, full_dim)
         else:
-            delta_batch = flat_subspace_batch @ projection.T  # (N, full_dim)
+            delta_batch = torch.matmul(flat_subspace_batch, projection.T, out=out)  # (N, full_dim)
         result: Dict[str, torch.Tensor] = {}
         for spec in self._entry_specs:
             delta_chunk = delta_batch[:, spec.flat_start : spec.flat_end]
@@ -255,6 +259,29 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             # unflatten keeps this a view; reshape would copy the whole (N, num_params).
             result[spec.entry_key] = delta_chunk.unflatten(1, spec.original_shape)
         return result
+
+    def reconstruct_offsets(
+        self,
+        projection: torch.Tensor,
+        bary_flat: torch.Tensor,
+        col_start: int,
+        dcoords: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Rebuild candidates that each move one particle off the incumbent ``bary_flat``.
+
+        ``dcoords`` is ``(G, C, pdim)``: ``C`` moves for each of ``G`` consecutive particles
+        starting at coordinate ``col_start``, so a candidate reads only its particle's
+        columns of the projection. Entries alias one buffer, as in ``reconstruct_batch``;
+        pass a contiguous ``(G, C, full_dim)`` ``out`` to write into it instead of a new one.
+        """
+        G, C, p = dcoords.shape
+        cols = projection.narrow(1, col_start, G * p).t().reshape(G, p, -1)
+        flat = torch.baddbmm(bary_flat.view(1, 1, -1), dcoords, cols, out=out).reshape(G * C, -1)
+        return {
+            spec.entry_key: flat[:, spec.flat_start : spec.flat_end].unflatten(1, spec.original_shape)
+            for spec in self._entry_specs
+        }
 
     def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
         """Whether to fold the perturbation into the base weights this step."""

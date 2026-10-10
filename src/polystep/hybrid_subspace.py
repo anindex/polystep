@@ -480,7 +480,15 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     ) -> Dict[str, torch.Tensor]:
         """Reconstruct a state_dict from the base weights and one subspace vector."""
         result = {}
+        fused_P = getattr(self, "_fused_P", None)
+        if fused_P is not None and fused_P.dtype in (torch.float16, torch.bfloat16):
+            fused = self._gather_fused_coords(flat_subspace).unsqueeze(0) @ fused_P.t()
+            for spec, offset in self._fused_dense_specs:
+                block = fused[0, offset : offset + spec.num_params].add_(base_sd[spec.entry_key].reshape(-1))
+                result[spec.entry_key] = block.view(spec.original_shape)
         for spec in self.specs:
+            if spec.entry_key in result:
+                continue
             chunk = flat_subspace[spec.flat_start : spec.flat_end]
             base = base_sd[spec.entry_key]
 
@@ -489,6 +497,9 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
                 if isinstance(P, SparseRandomProjection):
                     delta = P.project(chunk)  # (num_params,)
                     result[spec.entry_key] = (base.reshape(-1) + delta).to(base.dtype).reshape(spec.original_shape)
+                elif P.dtype in (torch.float16, torch.bfloat16):
+                    delta = chunk.unsqueeze(0).to(P.dtype) @ P.t()
+                    result[spec.entry_key] = delta.add_(base.reshape(1, -1)).reshape(spec.original_shape)
                 else:
                     result_flat = torch.addmm(
                         base.reshape(1, -1),
@@ -604,7 +615,10 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             if buf is None or buf.shape[1] != fused_P.shape[0] or buf.dtype != fused_P.dtype:
                 buf = fused_P.new_empty((1, fused_P.shape[0]))
                 self._inplace_delta_buffer = buf
-            torch.addmm(self._fused_base_row(base_sd), coords.unsqueeze(0), fused_P.t(), out=buf)
+            if buf.dtype in (torch.float16, torch.bfloat16):
+                torch.mm(coords.unsqueeze(0), fused_P.t(), out=buf).add_(self._fused_base_row(base_sd))
+            else:
+                torch.addmm(self._fused_base_row(base_sd), coords.unsqueeze(0), fused_P.t(), out=buf)
             dsts, srcs = [], []
             for spec, offset in self._fused_dense_specs:
                 param = param_dict.get(spec.entry_key)
@@ -635,6 +649,11 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
                 if isinstance(P, SparseRandomProjection):
                     delta = P.project(chunk)
                     param.data.copy_((base.reshape(-1) + delta).reshape(spec.original_shape))
+                elif P.dtype in (torch.float16, torch.bfloat16):
+                    out = param.data.reshape(1, -1) if param.data.is_contiguous() else None
+                    res = torch.mm(chunk.unsqueeze(0).to(P.dtype), P.t(), out=out).add_(base.reshape(1, -1))
+                    if out is None:
+                        param.data.copy_(res.reshape(spec.original_shape))
                 elif param.data.is_contiguous():
                     torch.addmm(
                         base.reshape(1, -1),

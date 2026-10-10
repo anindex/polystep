@@ -10,7 +10,7 @@ model adds one shared incumbent evaluation when used by rotation or radius adapt
 |---|---|---|
 | Sequential MLP, full space | Sparse delta | Automatic after registration |
 | Sequential MLP, hybrid subspace | Subspace delta | Automatic after registration |
-| Sequential MLP, factored subspace | Factored correction | Automatic after registration |
+| Sequential MLP, factored subspace | Subspace delta, low-rank correction as fallback | Automatic after registration |
 | Convolution, attention, custom forward | Site-local vmap | Automatic when supported |
 | Sequential MLP, dense candidates | Batched matrix multiplication | Automatic |
 | Other models | vmap or sequential fallback | Automatic |
@@ -20,6 +20,23 @@ The delta and factored paths treat each sample as one feature vector, so they ne
 two-dimensional inputs or a leading `nn.Flatten`. A Sequential MLP applied per token
 to `(batch, tokens, features)` inputs takes the site-local path instead in full-space
 and hybrid runs; factored runs materialize its candidates.
+
+`use_inplace=True` runs the model's own forward, one candidate at a time. Each sweep
+writes the incumbent into the model once; a full-space or `HybridSubspace` candidate
+that changes one parameter then rewrites only that parameter, and in full space only
+its own entries. Tied weights share storage, so they move together. The registered
+evaluator's loss scores these candidates. Candidates that span two parameters,
+FP16/BF16 hybrid weights and non-contiguous parameters swap in every weight instead,
+as do screened hybrid candidates and the hybrid incumbent.
+An evaluator that picks the in-place path for memory takes the same route when the
+model ties weights.
+
+A forward that draws its own random numbers, such as injected noise, stays batched:
+vmap gives each candidate its own draw, so identical candidates can score differently
+and a seeded run's stream differs from scoring them one at a time. A forward vmap
+cannot trace, such as one that calls `.item()` on an activation, falls back to a
+sequential loop with a warning. Buffers the refused forward wrote are restored before
+either the retry or the loop runs.
 
 Register the evaluator before each batch; `train()` does this automatically:
 
@@ -51,12 +68,38 @@ that width warns and leaves each matrix one coordinate. Smaller subspaces reduce
 but restrict the search. Retune the radii when changing the representation.
 
 `FactoredSubspace` uses `dW = A @ B`, with fixed `B`, so sequential linear layers can
-compute `x @ W.T + (x @ B.T) @ A.T` without constructing candidate weights. Its
-search is limited to the input directions spanned by `B`; basis rotation changes
-that search space.
+compute `x @ W.T + (x @ B.T) @ A.T` without constructing candidate weights. A
+candidate changes a few consecutive coordinates of one `A`, so the subspace-delta
+path scores it from `x @ B.T` and moves only the output units those coordinates
+belong to. Runs that span two parameters, screened candidates and the incumbent use
+the full low-rank correction. The search is limited to the input directions spanned
+by `B`; basis rotation changes that search space.
 
-`chunk_size` limits candidates held at once. The automatic estimate includes
-parameter and activation storage. Reduce it after an out-of-memory error.
+`AdaptiveSubspace` still builds every candidate's full weights, since its single
+projection `P` spreads each coordinate over every parameter. On the CPU, with a dense
+`P`, it builds them as the incumbent plus `P[:, cols] @ delta`, where `cols` are the
+coordinates of the one particle the candidate moves, so each candidate reads
+`subspace_particle_dim` columns of `P` instead of all of them. The padded last
+particle, screened candidates and the incumbent use the full `base + P @ x`, as do
+sparse projections and FP16/BF16 runs. When `P` is dense FP32 or FP64 and the step
+has no screen, every chunk, the padded particle and the incumbent included, is written
+into one buffer that the optimizer keeps between steps, because a fresh allocation of
+that size costs the CPU a page fault per page. A closure that keeps a candidate
+tensor after it returns therefore has to clone it. CUDA keeps the full product for every
+candidate, since one dense GEMM measured faster there than the many thin batched
+products the offsets need.
+
+`chunk_size` limits candidates held at once. The automatic estimate counts the
+candidate's parameters and its largest layer output, which one forward measures when
+the evaluator is first registered and which then scales with the batch. Delta and
+site paths build no full candidate, so they are budgeted on activations and the
+perturbed parameter alone. Reduce `chunk_size` after an out-of-memory error. Steps
+that score on a delta or site path, or on CPU `AdaptiveSubspace` offsets, keep
+whole particles in each chunk, every vertex and probe of one particle, so
+`chunk_size` drops to a multiple of the vertex count times `num_probe` and never
+goes below one such group. A particle that straddles two parameters, or holds the
+padding at the end, gets a chunk of its own and falls back to materialization, in
+batches of at most `chunk_size`.
 Per-layer blocks reduce the size of each OT solve, but not the forward count.
 With a subspace, a block strategy only splits Sinkhorn and KL solves into at most
 eight row segments; candidates are scored exactly as in the monolithic step.
@@ -86,7 +129,9 @@ With FP16 or BF16 parameters the subspace-delta and factored paths are off. They
 each candidate's change after the matmul, so they would rank changes that the stored
 weights round away. Hybrid candidates go to the site-local path instead, which
 builds the changed weight and the shared ones from the base weights the way a
-materialized candidate is built; factored candidates are materialized.
+materialized candidate is built; factored candidates are materialized. The weights
+swapped into the model under `use_inplace=True`, and the ones a step writes back
+when it ends, round the same way.
 
 ## Radius models
 

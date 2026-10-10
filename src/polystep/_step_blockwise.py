@@ -19,6 +19,7 @@ from .dynamics import (
 from .geometry import apply_biased_rotation, get_random_rotation_matrices
 from .solvers.base import SolverResult
 from ._step_core import (
+    activation_elements,
     check_losses,
     chunk_spans,
     record_saturation,
@@ -302,12 +303,16 @@ def step_blockwise(opt, closure: Callable) -> float:
     pdim_arange = torch.arange(opt._particle_dim, device=device)
 
     group = verts.shape[0] * probes.numel()
+    most = max(b.num_particles for b in blocks) * group
+    act = activation_elements(opt, getattr(opt, "_fused_inputs", None))
     # Budget the chunk on elements; a fixed chunk OOMs on large models.
-    chunk = min(
-        opt.chunk_size or max(1, (1 << 26) // opt.layout.padded_size), max(b.num_particles for b in blocks) * group
-    )
-    # The delta path scores a whole particle's group at once, so a chunk holds whole groups.
-    site_chunk = max(group, chunk // group * group) if site_owner is not None else chunk
+    chunk = min(opt.chunk_size or max(1, (1 << 26) // (opt.layout.padded_size + act)), most)
+    site_chunk = chunk
+    if site_owner is not None:
+        per_site = 2 * act + (max(e.numel for e in opt.layout.entries) if site_vmap is not None else 0)
+        site_chunk = min(opt.chunk_size or max(1, (1 << 26) // max(1, per_site)), most)
+        # The delta path scores a whole particle's group at once, so a chunk holds whole groups.
+        site_chunk = max(group, site_chunk // group * group)
 
     # Candidates are written straight into layout order; the trailing column absorbs per-block padding.
     base_layout = X.reshape(-1)

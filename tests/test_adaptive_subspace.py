@@ -1,5 +1,7 @@
 """Tests for AdaptiveSubspace: rotating projection, displacement-biased rotation, and factory methods."""
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.nn as nn
@@ -532,3 +534,161 @@ def test_per_step_rotation_warns_about_the_state_it_clears(option):
         warnings.simplefilter("always")
         PolyStepOptimizer(model, subspace=AdaptiveSubspace.auto_from_params(model, rotation_interval=2), **option)
     assert not [w for w in caught if "every step" in str(w.message)]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_offsets_match_reconstruct_batch(model, layout, dtype):
+    """A candidate that moves one particle is the incumbent plus that particle's columns of P."""
+    sub = AdaptiveSubspace.from_layout(layout, rank=21)
+    gen = torch.Generator().manual_seed(0)
+    projection = sub.init_projection(generator=gen, dtype=dtype)
+    base = {k: v.detach().to(dtype) for k, v in model.named_parameters()}
+    coords = torch.randn(sub.subspace_dim, generator=gen, dtype=dtype)
+    G, C, pdim = 2, 3, 4
+    col_start = sub.subspace_dim - 1 - G * pdim
+    dcoords = torch.randn(G, C, pdim, generator=gen, dtype=dtype)
+
+    bary = torch.cat([v.reshape(-1) for v in sub.apply_perturbation(projection, base, coords).values()])
+    got = sub.reconstruct_offsets(projection, bary, col_start, dcoords)
+
+    moved = coords.repeat(G * C, 1)
+    for g in range(G):
+        moved[g * C : (g + 1) * C, col_start + g * pdim : col_start + (g + 1) * pdim] += dcoords[g]
+    want = sub.reconstruct_batch(projection, base, moved)
+    out = torch.full((G + 1, C, sub.full_dim), torch.nan, dtype=dtype)
+    into = sub.reconstruct_offsets(projection, bary, col_start, dcoords, out[:G])
+    assert got.keys() == want.keys() == into.keys()
+    for key in want:
+        torch.testing.assert_close(got[key], want[key])
+        assert torch.equal(into[key], got[key])
+        assert into[key].untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
+    assert out[G].isnan().all()
+
+
+@pytest.mark.parametrize("chunk_size", [3, None, 10**6])
+@pytest.mark.parametrize("polytope_type", ["simplex", "orthoplex"])
+def test_step_with_offsets_matches_full_reconstruction(layout, polytope_type, chunk_size):
+    """Offsets cover every whole particle; the padded tail particle keeps reconstruct_batch."""
+    from unittest.mock import patch
+
+    from torch.func import functional_call, vmap
+
+    from polystep import PolyStepOptimizer
+
+    x, y = torch.randn(16, 20), torch.randn(16, 5)
+    runs, delegated, buffers, storages = [], [], [], []
+    for reference in (False, True):
+        torch.manual_seed(42)
+        model = SimpleMLP()
+        sub = AdaptiveSubspace.from_layout(layout, rank=21, rotation_interval=0)
+        opt = PolyStepOptimizer(
+            model,
+            subspace=sub,
+            subspace_particle_dim=4,
+            polytope_type=polytope_type,
+            num_probe=2,
+            chunk_size=chunk_size,
+            solver="softmax",
+            seed=0,
+        )
+
+        captured = {}
+        compute_probe_points = opt._compiled.compute_probe_points
+
+        def capture_probes(X, *args):
+            captured.update(X=X.clone(), probes=compute_probe_points(X, *args), next=0)
+            return captured["probes"]
+
+        opt._compiled.compute_probe_points = capture_probes
+
+        def full_reconstruction(self, projection, bary_flat, col_start, dcoords, out):
+            G, C, p = dcoords.shape
+            buffers.append(out)
+            g0 = captured["next"]
+            assert col_start == g0 * p
+            moved = captured["X"].reshape(-1)[: self.subspace_dim].repeat(G * C, 1)
+            for g in range(G):
+                moved[g * C : (g + 1) * C, (g0 + g) * p : (g0 + g + 1) * p] = captured["probes"][g0 + g].reshape(C, p)
+            captured["next"] = g0 + G
+            delegated.append(G * C)
+            return self.reconstruct_batch(projection, opt.state.base_params, moved)
+
+        seen = set()
+        storages.append(seen)
+
+        def closure(params):
+            seen.add(next(iter(params.values())).untyped_storage().data_ptr())
+            return vmap(lambda p: (functional_call(model, p, (x,)) - y).pow(2).mean())(params)
+
+        with patch.object(AdaptiveSubspace, "reconstruct_offsets", full_reconstruction) if reference else nullcontext():
+            for _ in range(3):
+                opt.step(closure)
+        runs.append(opt)
+
+    group = opt._polytope_vertices.shape[0] * 2
+    assert sum(delegated) == 3 * (opt.state.X.shape[0] - 1) * group
+    assert len({b.untyped_storage().data_ptr() for b in buffers}) == 1
+    assert all(r._step_buffers[7].shape[0] <= r.state.X.shape[0] for r in runs)
+    assert storages[0] == {runs[0]._step_buffers[7].untyped_storage().data_ptr()}
+    torch.testing.assert_close(runs[0].state.X, runs[1].state.X, rtol=1e-5, atol=1e-6)
+    assert runs[0].state.costs == pytest.approx(runs[1].state.costs, rel=1e-6)
+
+
+def test_half_precision_steps_keep_the_full_reconstruction(layout):
+    """bf16 candidates round where they are built, so a cost matrix never mixes two rounding models."""
+    from unittest.mock import patch
+
+    from torch.func import functional_call, vmap
+
+    from polystep import PolyStepOptimizer
+
+    model = SimpleMLP().to(torch.bfloat16)
+    x, y = torch.randn(16, 20, dtype=torch.bfloat16), torch.randn(16, 5, dtype=torch.bfloat16)
+    opt = PolyStepOptimizer(model, subspace=AdaptiveSubspace.from_layout(layout, rank=8), solver="softmax", seed=0)
+
+    def closure(params):
+        return vmap(lambda p: (functional_call(model, p, (x,)) - y).pow(2).mean())(params)
+
+    with patch.object(AdaptiveSubspace, "reconstruct_offsets", side_effect=AssertionError("offsets under bf16")):
+        opt.step(closure)
+    assert torch.isfinite(opt.state.X).all()
+
+
+def test_offsets_follow_the_subspace_layout_when_a_param_is_frozen(model, layout):
+    """The subspace keeps the layout it was built on after a parameter is frozen."""
+    from torch.func import functional_call, vmap
+
+    from polystep import PolyStepOptimizer
+
+    sub = AdaptiveSubspace.from_layout(layout, rank=21, rotation_interval=0)
+    model.fc1.bias.requires_grad_(False)
+    opt = PolyStepOptimizer(model, subspace=sub, subspace_particle_dim=4, solver="softmax", seed=0)
+    x, y = torch.randn(16, 20), torch.randn(16, 5)
+
+    def closure(params):
+        return vmap(lambda p: (functional_call(model, p, (x,)) - y).pow(2).mean())(params)
+
+    for _ in range(2):
+        opt.step(closure)
+    assert torch.isfinite(opt.state.X).all()
+
+
+def test_offsets_build_candidates_at_the_projection_dtype_after_a_partial_cast(model, layout):
+    """Casting one layer and resyncing leaves a mixed-dtype base under one projection."""
+    from torch.func import functional_call, vmap
+
+    from polystep import PolyStepOptimizer
+
+    sub = AdaptiveSubspace.from_layout(layout, rank=21)
+    opt = PolyStepOptimizer(model, subspace=sub, subspace_particle_dim=4, solver="softmax", seed=0)
+    x, y = torch.randn(16, 20), torch.randn(16, 5)
+
+    def closure(params):
+        return vmap(lambda p: (functional_call(model, p, (x,)).float() - y).pow(2).mean())(params)
+
+    opt.step(closure)
+    model.fc2.double()
+    opt.resync_from_model()
+    for _ in range(2):
+        opt.step(closure)
+    assert torch.isfinite(opt.state.X).all()

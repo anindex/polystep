@@ -227,6 +227,87 @@
   intra-op pool instead of one thread: 1.7 times faster at 50000x64 on 2 threads,
   3 times on 24. Seeded runs with such bases round differently and depend on the
   thread count. Rotation QRs stay on one thread.
+- A candidate forward that draws its own random numbers stays batched. vmap retries
+  it once with a separate draw per candidate, compiled or not, instead of falling
+  back to a sequential loop with a warning. Full-space steps on a small noisy MLP
+  run 3.5 times faster on CPU and 40 times on CUDA. Seeded runs of such models draw
+  a different random stream.
+- Buffers that a refused vmap forward wrote are restored before the retry or the
+  sequential fallback runs.
+- The sparse-delta and subspace-delta evaluators share one layer walk. Hybrid biases
+  and full-width weights now change only the output units their coordinates touch,
+  instead of taking a dense correction or the site-local path. Hybrid runs can change
+  in the last bit, as can full-space runs whose `particle_dim` of 3 or more puts
+  several entries on one output unit. On one CPU thread, hybrid steps and full-space
+  steps with a `particle_dim` of 8 run 7 to 15% faster; full-space steps at the
+  default `particle_dim` run at the same speed.
+- `FactoredSubspace` steps with a registered Sequential MLP score candidates on the
+  subspace-delta path, which moves only the output units a candidate's coordinates
+  belong to. Runs that span two parameters, screened candidates and the incumbent
+  keep the low-rank evaluator. Factored runs can change in the last bit. A
+  784-128-10 rank-8 step runs 13 to 25 times faster on one CPU thread. On CUDA at
+  the default chunk size it runs 1.5 to 2 times faster with a fifteenth of the peak
+  memory. With `chunk_size=72` it needs a quarter to half the peak memory but runs
+  1.3 to 1.6 times slower, since such small chunks are bound by kernel launches.
+- Those factored steps keep whole particles in each chunk, as hybrid steps already
+  do, so `chunk_size` drops to a multiple of the vertex count times `num_probe` and
+  never goes below one such group.
+- CPU `AdaptiveSubspace` steps with a dense projection build each candidate from the
+  incumbent plus the projection columns of the one particle it moves, instead of
+  multiplying every candidate's full coordinates. The padded last particle, screened
+  candidates, the incumbent, sparse projections and FP16/BF16 runs keep the full
+  product. Adaptive runs can change in the last bit. A 784-256-10 rank-128 step runs
+  1.1 times faster on one CPU thread with the default rotation every step, and 1.5
+  times faster with `rotation_interval=10`. CUDA steps keep the full product, since
+  the offsets measured up to 13% slower there. These CPU steps also keep whole
+  particles in each chunk, so `chunk_size` rounds as it does for hybrid and factored
+  steps.
+- CPU adaptive steps with a dense FP32 or FP64 projection and no screen write every
+  chunk, the padded particle and the incumbent included, into one candidate buffer
+  that the optimizer keeps between steps, so one chunk of candidate weights stays
+  allocated. The same 784-256-10 step runs 1.7 times faster with
+  `rotation_interval=10` at batch 32, 1.1 times at batch 512, and 1.06 times with
+  rotation every step. A closure that keeps a candidate tensor after it returns must
+  clone it, as full-space closures already had to.
+- With `use_inplace=True` and a registered evaluator, a full-space or
+  `HybridSubspace` candidate that changes one parameter rewrites only that
+  parameter, and in full space only its own entries, instead of swapping in every
+  weight. These candidates are scored with the registered evaluator's loss on the
+  registered batch, as on the other registered paths; full-space ones used to go
+  through the closure. An evaluator that picks the in-place path for memory takes
+  the same route on a model with tied weights. Full-space steps score the same
+  weights as before; hybrid steps can change in the last bit. Screened hybrid
+  candidates, the hybrid incumbent, FP16/BF16 hybrid weights and non-contiguous
+  parameters keep the full swap. A 784-1024-256-10 hybrid step at rank 8 runs 6
+  times faster on CUDA, and small CNN and attention hybrid steps 1.5 to 2.3 times
+  faster.
+- Hybrid candidates on the site-local path with a sparse projection or an
+  unprojected parameter now scatter-add only the entries their particle's columns
+  touch, instead of projecting a full-width coordinate row. A dense projection fuses
+  its offset into the incumbent with one `baddbmm` instead of a separate add. These
+  runs can change in the last bit. On one CPU thread, small CNN hybrid steps run 14
+  to 18% faster, and scoring candidates of a 32,768-entry weight runs 1.15 times
+  faster with a dense projection and twice as fast with a sparse one. On CUDA the
+  sparse case runs 1.6 times faster and the rest at the same speed; with a sparse
+  projection, repeated CUDA runs match bit for bit only under deterministic
+  algorithms.
+- Candidates that a delta, site or offsets chunk sends back to materialization are
+  scored in batches of at most `chunk_size` instead of a whole particle group.
+- Delta and site paths give the padded last particle a chunk of its own, so the
+  particles before it stay on those paths instead of falling back with it.
+- The automatic chunk size counts the widest layer output, measured by one forward
+  when an evaluator is registered, instead of the widest layer's channel count, and
+  delta and site chunks no longer charge a full candidate. On CUDA, a one-conv model
+  on 256x256 inputs at batch 64 peaked at 6.9 GiB and now peaks at 384 MiB; the
+  benchmark's 8x8 CNN steps take 2 to 14 percent longer from the extra chunks.
+- FP16/BF16 hybrid steps on the in-place path no longer build an incumbent weight
+  set that the path never reads. On CUDA, a step of a BF16 2048-2048-4 MLP at rank 4
+  with `use_inplace=True` allocates at most 34 MiB above the model instead of 42 MiB.
+- FP16/BF16 hybrid weights round the projected change before adding the base, as
+  materialized candidates do, whether they are written in place, written back after
+  a step, or folded in by an absorb. One in-place step no longer scores its site and
+  swapped candidates on differently rounded weights, and the model ends each step on
+  the weights that were scored.
 
 ## 0.13.0 - 2026-09-22
 

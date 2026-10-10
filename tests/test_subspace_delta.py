@@ -159,19 +159,51 @@ def test_optimizer_step_matches_the_materializing_path(mixed, dtype, tol, path):
     torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=tol, atol=tol)
 
 
-def test_resolve_site_declines_an_unprojected_weight():
-    """An unprojected weight's coordinates index the flattened weight, not output
-    units, so neither correction branch applies and it must fall back."""
-    torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(64, 16), nn.ReLU(), nn.Linear(16, 10))
-    _, sub, _, _ = _setup(model)
-    ev = SubspaceDeltaEvaluator.try_build(model, nn.CrossEntropyLoss(), sub)
+@pytest.mark.parametrize("pdim", [1, 3, 4, 8])
+@pytest.mark.parametrize("kind", ["hybrid", "factored"])
+def test_confined_sites_match_reconstruct_batch(kind, pdim):
+    """Biases, the full-width hybrid weight and factored weights move only the output
+    units their coordinates name. Runs of 3 cross rows of the 16-wide weight. In the
+    rank-4 factor, runs of 3 and 8 cross rows, so units take merged entries, while
+    runs of 1 and 4 stay within one row."""
+    from polystep.factored_subspace import FactoredSubspace
 
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(64, 16), nn.Tanh(), nn.Linear(16, 3))
+    loss_fn = nn.CrossEntropyLoss()
+    if kind == "hybrid":
+        _, sub, projections, base_sd = _setup(model)
+    else:
+        sub = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=4)
+        projections = sub.init_projections(torch.device("cpu"), torch.float32)
+        base_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    ev = NNCostEvaluator(model, loss_fn)
+    delta_ev = SubspaceDeltaEvaluator.try_build(model, loss_fn, sub)
+    g = torch.Generator().manual_seed(3)
+    x, y = torch.randn(8, 64, generator=g), torch.randint(0, 3, (8,), generator=g)
+    bary = torch.randn(sub.subspace_dim, generator=g) * 0.05
+    bary_sd = sub.apply_perturbation(projections, base_sd, bary)
+
+    n_cand, checked = 2, set()
     for spec in sub.specs:
-        site = ev._site.get(spec.entry_key)
-        if site is None or site[1] == spec.is_projected:
+        if kind == "hybrid" and spec.is_projected:
             continue
-        assert ev.resolve_site(sub, spec.flat_start, spec.flat_start + 2, sub.subspace_dim) is None
+        lo = -(-spec.flat_start // pdim) * pdim
+        n_groups = (spec.flat_end - lo) // pdim
+        if n_groups <= 0:
+            continue
+        hi = lo + n_groups * pdim
+        assert delta_ev.resolve_site(sub, lo, hi, sub.subspace_dim) is spec
+        dcoords = torch.randn(n_groups, n_cand, pdim, generator=g) * 0.1
+        full = bary.repeat(n_groups * n_cand, 1)
+        cols = torch.arange(lo, hi).view(n_groups, 1, pdim).expand(-1, n_cand, -1).reshape(-1, pdim)
+        full.scatter_add_(1, cols, dcoords.reshape(-1, pdim))
+
+        expected = _reference(sub, projections, base_sd, full, ev, x, y)
+        got = delta_ev.evaluate(sub, projections, bary_sd, spec, lo - spec.flat_start, dcoords, x, y)
+        torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+        checked.add(spec.entry_key)
+    assert {"0.weight" if kind == "factored" else "2.weight", "0.bias"} <= checked, checked
 
 
 def test_basis_products_matches_the_materialized_column_block():
@@ -190,13 +222,13 @@ def test_basis_products_matches_the_materialized_column_block():
     col_start, n_cols = 2, 4
     cols = torch.arange(col_start, col_start + n_cols)
     expected = torch.matmul(P.index_select(1, cols).t().reshape(n_cols, d_out, d_in), x.t())
-    got = ev._basis_products(spec, P, col_start, n_cols, x, torch.float32)
+    got = ev._basis_products(spec, P, col_start, n_cols, x)
     torch.testing.assert_close(got, expected)
 
     # A rotation swaps the tensor, so the next call must read the new basis, not a cache.
     P2 = torch.linalg.qr(torch.randn_like(P))[0]
     projections[spec.entry_key] = P2
     expected2 = torch.matmul(P2.index_select(1, cols).t().reshape(n_cols, d_out, d_in), x.t())
-    got2 = ev._basis_products(spec, P2, col_start, n_cols, x, torch.float32)
+    got2 = ev._basis_products(spec, P2, col_start, n_cols, x)
     torch.testing.assert_close(got2, expected2)
     assert not torch.allclose(got2, got), "the two bases must differ, or the test proves nothing"

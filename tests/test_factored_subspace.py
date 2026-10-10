@@ -1,10 +1,12 @@
 """FactoredSubspace and the low-rank evaluator that avoids materializing weights."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.nn as nn
 
-from polystep.cost_nn import FactoredEvaluator, NNCostEvaluator
+from polystep.cost_nn import FactoredEvaluator, NNCostEvaluator, SubspaceDeltaEvaluator
 from polystep.factored_subspace import FactoredSubspace
 from polystep.optimizer import PolyStepOptimizer
 from polystep.transform import ParamLayout
@@ -65,6 +67,34 @@ def test_factored_evaluator_matches_the_materialized_reference():
     got = factored.evaluate(subspace, projections, base, coords, inputs, targets)
 
     assert torch.allclose(reference, got, atol=1e-5)
+
+
+@pytest.mark.parametrize("polytope", ["simplex", "orthoplex"])
+def test_registered_step_matches_the_closure_only_step(polytope):
+    """Contained runs score through the confined delta and runs that straddle two
+    blocks through the low-rank evaluator; both must land where the closure does."""
+
+    def spy(cls):
+        return patch.object(cls, "evaluate", autospec=True, side_effect=cls.evaluate)
+
+    def run(register):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(16, 12), nn.Tanh(), nn.Linear(12, 5))
+        subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=3)
+        x, y = torch.randn(32, 16), torch.randint(0, 5, (32,))
+        evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+        opt = PolyStepOptimizer(model, subspace=subspace, polytope_type=polytope, seed=0)
+        with spy(SubspaceDeltaEvaluator) as delta, spy(FactoredEvaluator) as low_rank:
+            for _ in range(3):
+                if register:
+                    opt.register_evaluator(evaluator, x, y)
+                opt.step(lambda p: evaluator.evaluate(p, x, y))
+        return opt.state.X, delta.call_count, low_rank.call_count
+
+    fast, delta_calls, low_rank_calls = run(register=True)
+    closure_only, _, _ = run(register=False)
+    assert delta_calls and low_rank_calls, "both paths must have run, or this proves nothing"
+    torch.testing.assert_close(fast, closure_only, rtol=0, atol=1e-6)
 
 
 def test_factored_evaluator_declines_unsupported_models():

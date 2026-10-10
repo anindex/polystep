@@ -38,6 +38,11 @@ def _is_vmap_error(e: BaseException) -> bool:
     return any(k in msg for k in ("vmap", "functorch", "torch.func", "batched tensor", "randomness"))
 
 
+def _batchable_draw(e: BaseException, randomness: str) -> bool:
+    """Whether vmap refused a random draw that ``randomness="different"`` can batch."""
+    return randomness == "error" and "randomness" in str(e)
+
+
 def auto_detect_chunk_size(
     model: nn.Module,
     safety_factor: float = 2.0,
@@ -241,6 +246,7 @@ class NNCostEvaluator:
         self._chunk_size_cached = _UNSET  # lazily computed for "auto"
         self._reset_count = 0
         self._vmap_failed = False
+        self._randomness = "error"
         self._warned = False
         self._compile_vmap = compile_vmap
         self._compiled_vmap_fn = None
@@ -302,6 +308,7 @@ class NNCostEvaluator:
         """
         self._reset_count += 1
         self._vmap_failed = False
+        self._randomness = "error"
         self._warned = False
         # A prior compile failure should not stay latched after the model changed.
         self._compile_failed = False
@@ -367,6 +374,40 @@ class NNCostEvaluator:
         """Cast float inputs to ``dtype``, reusing the last result across chunks."""
         return cast_inputs_memo(self, inputs, dtype)
 
+    @torch.inference_mode()
+    def _activation_ratio(self, inputs: torch.Tensor) -> Optional[float]:
+        """Widest output of a module that owns parameters, per input element.
+
+        Runs one real forward under a forked RNG and puts the buffers back; None when
+        that forward raises.
+        """
+        widths = []
+        saved = [b.clone() for b in self._buffers.values()]
+
+        def record(module, args, out):
+            widths.extend(t.numel() for t in (out if isinstance(out, tuple) else (out,)) if isinstance(t, torch.Tensor))
+
+        handles = [
+            m.register_forward_hook(record)
+            for m in self.model.modules()
+            if next(m.parameters(recurse=False), None) is not None
+        ]
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.random.fork_rng(devices=[inputs.device] if inputs.device.type == "cuda" else []):
+                self.model(self.cast_inputs(inputs, self._input_dtype(self._param_dict_cache)))
+        except Exception:
+            return None
+        finally:
+            for h in handles:
+                h.remove()
+            for b, s in zip(self._buffers.values(), saved):
+                b.copy_(s)
+            if was_training:
+                self.model.train()
+        return max(widths, default=0) / max(1, inputs.numel())
+
     def _input_dtype(self, stacked_params) -> Optional[torch.dtype]:
         """Float dtype the first input-consuming layer expects, cached; None to skip."""
         if not stacked_params:
@@ -420,12 +461,19 @@ class NNCostEvaluator:
         if self._vmap_failed:
             result = self._evaluate_loop(stacked_params, inputs, targets)
         else:
+            saved = [b.clone() for b in self._buffers.values()]
             try:
                 result = self._evaluate_vmap(stacked_params, inputs, targets)
             except Exception as e:
                 # Only catch vmap/functorch errors; re-raise real bugs.
                 if not _is_vmap_error(e):
                     raise
+                for b, s in zip(self._buffers.values(), saved):
+                    b.copy_(s)
+                if _batchable_draw(e, self._randomness):
+                    self._randomness = "different"
+                    self._compiled_vmap_fn = None
+                    return self._dispatch(stacked_params, inputs, targets)
                 if not self._warned:
                     warnings.warn(
                         f"vmap failed for {type(self.model).__name__}: {e}. Falling back to sequential "
@@ -459,7 +507,7 @@ class NNCostEvaluator:
             output = functional_call(model, full_dict, (inputs,))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
-        batched = vmap(single_eval, in_dims=(0, None, None), chunk_size=resolved_chunk)
+        batched = vmap(single_eval, in_dims=(0, None, None), chunk_size=resolved_chunk, randomness=self._randomness)
 
         # torch.compile on the vmapped forward for kernel fusion only; lazy on first call.
         if self._compile_vmap and not self._compile_failed:
@@ -484,6 +532,8 @@ class NNCostEvaluator:
                 try:
                     return self._compiled_vmap_fn(stacked_params, inputs, targets)
                 except Exception as e:  # noqa: BLE001
+                    if _batchable_draw(e, self._randomness):
+                        raise
                     # Compiled graph failed at run time; fall back permanently.
                     self._compile_failed = True
                     self._compiled_vmap_fn = None
@@ -764,9 +814,11 @@ _SUPPORTED_LAYERS = tuple(base for base, _ in _TAGGED_LAYERS)
 
 @contextmanager
 def _reuse_prefixes(*evaluators):
-    """Reuse deterministic base activations only within one candidate sweep."""
+    """Reuse deterministic base activations and a primed incumbent only within one candidate sweep."""
     eligible = [
-        ev for ev in evaluators if ev is not None and all(type(m) in _SUPPORTED_LAYERS for _, _, m in ev._layer_keys)
+        ev
+        for ev in evaluators
+        if hasattr(ev, "_layer_keys") and all(type(m) in _SUPPORTED_LAYERS for _, _, m in ev._layer_keys)
     ]
     previous = [getattr(ev, "_prefix_cache", None) for ev in eligible]
     for ev in eligible:
@@ -776,6 +828,9 @@ def _reuse_prefixes(*evaluators):
     finally:
         for ev, cache in zip(eligible, previous):
             ev._prefix_cache = cache
+        for ev in evaluators:
+            if isinstance(ev, SiteInplaceEvaluator):
+                ev._primed = None
 
 
 def _base_prefix(evaluator, params, inputs, end):
@@ -797,6 +852,112 @@ def _base_prefix(evaluator, params, inputs, end):
                 x = module(x)
             cache[i + 1] = x
     return cache[end]
+
+
+def _gather_cols(t, cols):
+    """``(G, 1, B, w)`` holding ``t[:, cols]`` for ``(G, w)`` columns, broadcastable over C.
+
+    Gathers the transposed view, whose copy runs over contiguous rows.
+    """
+    return t.t().index_select(0, cols.reshape(-1)).reshape(*cols.shape, -1).permute(0, 2, 1).unsqueeze(1)
+
+
+def _confined_site(x, j, delta, stride, d_out):
+    """``(dcols, dvals)`` for a Linear site moved by ``delta`` at flat positions ``j``.
+
+    ``j`` is one contiguous ``(G, p)`` run per group and ``stride`` the weight's row
+    length, or None for a bias. ``dW[r, c]`` adds ``x[:, c] * dW[r, c]`` to output unit
+    ``r``, so a run touches at most ``u = min(p, (p - 1) // stride + 2)`` consecutive
+    units. A one-hot contraction sums the entries of each unit, since the activation
+    must see their sum; a unit clamped onto the last row carries exact zeros.
+    """
+    if stride is None:
+        return j, delta.unsqueeze(2).expand(*delta.shape[:2], x.shape[0], delta.shape[2])
+    p = j.shape[1]
+    vals = _gather_cols(x, j % stride) * delta.unsqueeze(2)
+    span = torch.arange(min(p, (p - 1) // stride + 2), device=j.device)
+    first = j[:, :1] // stride
+    onehot = (j // stride - first).unsqueeze(-1) == span
+    return (first + span).clamp_(max=d_out - 1), torch.einsum("gcbp,gpu->gcbu", vals, onehot.to(vals.dtype))
+
+
+def _delta_walk(ev, params, inputs, targets, site_idx, site_fn, n):
+    """Losses of ``n`` candidates that share ``params`` everywhere but layer ``site_idx``.
+
+    ``site_fn(x, out, weight)`` gets the site's input, base output and weight, and
+    returns ``(dcols, dvals)`` for a change confined to output units ``dcols``, or
+    ``(None, xn)`` holding every candidate's output.
+    """
+    x = inputs if inputs.dim() == 2 else inputs.reshape(inputs.shape[0], -1)
+    batch = x.shape[0]
+    # Before the site `x` is shared at batch 1; through the site the candidates
+    # differ only at `dcols` by `dvals`; after it `xn` is dense.
+    dcols = dvals = xn = None
+
+    reuse = getattr(ev, "_prefix_cache", None) is not None
+    if reuse:
+        x = _base_prefix(ev, params, inputs, site_idx)
+    start = site_idx if reuse else 0
+    for idx, (name, tag, module) in enumerate(ev._layer_keys[start:], start):
+        if tag in ("flatten", "dropout"):
+            continue
+
+        if tag != "linear":
+            if xn is not None:
+                xn = module(xn)
+            elif dvals is None:
+                x = module(x)
+            else:
+                # Elementwise: recompute the perturbed entries, then re-express the
+                # delta as a difference.
+                at_cols = _gather_cols(x, dcols)
+                x = module(x)
+                dvals = module(at_cols + dvals) - module(at_cols)
+            continue
+
+        wq, bq = _weight_transforms(module)
+        weight = params[f"{name}.weight"]
+        bias = params.get(f"{name}.bias")
+        if wq is not None:
+            weight = wq(weight)
+        if bias is not None and bq is not None:
+            bias = bq(bias)
+
+        if xn is not None:
+            xn = xn @ weight.t()
+            if bias is not None:
+                xn = xn + bias
+            continue
+
+        if reuse:
+            out = _base_prefix(ev, params, inputs, idx + 1)
+        else:
+            out = x @ weight.t()
+            if bias is not None:
+                out = out + bias
+
+        if dvals is not None:
+            # Mix the confined delta into every output unit: it goes dense here.
+            w_cols = weight.index_select(1, dcols.reshape(-1)).reshape(-1, *dcols.shape)
+            corr = torch.einsum("ogp,gcbp->gcbo", w_cols, dvals)
+            xn = out + corr.reshape(n, batch, -1)
+            dcols = dvals = None
+            continue
+
+        if idx == site_idx:
+            dcols, dvals = site_fn(x, out, weight)
+            if dcols is None:
+                xn, dvals = dvals, None
+                continue
+        x = out
+
+    if xn is None:
+        xn = x.expand(n, batch, x.shape[-1])
+        if dvals is not None:
+            # The site was the last Linear, so nothing mixed the delta back in.
+            index = dcols[:, None, None, :].expand(dvals.shape).reshape(n, batch, -1)
+            xn = xn.clone().scatter_add_(2, index, dvals.reshape(n, batch, -1))
+    return _reduce_per_candidate(xn, targets, ev.loss_fn, ev.loss_kind)
 
 
 def _probe_elementwise(module: nn.Module) -> bool:
@@ -1108,10 +1269,19 @@ class SiteVmapEvaluator:
         self._keys = [e.key for e in layout.entries]
         self._compiled_sites = {}
         self._compile_failed_sites = set()
+        self._randomness = "error"
 
     @classmethod
     def try_build(cls, evaluator: "NNCostEvaluator", layout) -> "SiteVmapEvaluator | None":
-        """Decline where the caller's vmap path is unusable, or on tied weights."""
+        """Decline where the caller's vmap path is unusable, or on tied weights.
+
+        An in-place evaluator that is forced, or that faces tied weights, gets the
+        in-place site path instead, unless it scores per sample.
+        """
+        if evaluator._use_inplace and (evaluator._inplace_forced or layout.shared_groups):
+            if evaluator.per_sample:
+                return None
+            return SiteInplaceEvaluator(evaluator.model, evaluator.loss_fn, layout, evaluator._buffers, owner=evaluator)
         if evaluator._vmap_failed or evaluator._inplace_forced or layout.shared_groups:
             return None
         return cls(
@@ -1147,10 +1317,11 @@ class SiteVmapEvaluator:
         ``coords`` are the incumbent's coordinates over ``base_sd`` and ``bary_sd`` its
         weights; ``values`` holds the ``(n_groups, n_cand, pdim)`` candidate coordinates
         from column ``col_start`` of the spec on. Only those columns of the projection
-        change the weight, so the offset from the incumbent is a bmm over ``pdim``
-        columns per group. A half-precision weight is rebuilt from ``base_sd`` and the
-        candidate's full coordinates instead, as ``reconstruct_batch`` builds it, since
-        an offset added to the rounded incumbent can round differently.
+        change the weight, so a dense projection adds a bmm over ``pdim`` columns per
+        group to the incumbent, and a sparse projection or an unprojected spec adds only
+        the entries those columns touch. A half-precision weight is rebuilt from
+        ``base_sd`` and the candidate's full coordinates instead, as ``reconstruct_batch``
+        builds it, since an offset added to the rounded incumbent can round differently.
         """
         base = bary_sd[spec.entry_key]
         n_groups, n_cand, pdim = values.shape
@@ -1177,20 +1348,18 @@ class SiteVmapEvaluator:
         if isinstance(P, torch.Tensor):
             # P is (num_params, num_coords); .t() first so groups lead.
             blk = P.narrow(1, col_start, n_cols).t().reshape(n_groups, pdim, -1)
-            delta = torch.bmm(dcoords.to(blk.dtype), blk).reshape(n, -1)
+            site = torch.baddbmm(base.reshape(1, 1, -1), dcoords.to(blk.dtype), blk)
         else:
-            # Sparse/unprojected specs take a full-width coordinate row.
-            wide = dcoords.new_zeros(n, spec.flat_end - spec.flat_start)
-            cols = torch.arange(col_start, col_start + n_cols, device=dcoords.device)
-            wide.scatter_(
-                1,
-                cols.reshape(n_groups, 1, pdim).expand(n_groups, n_cand, pdim).reshape(n, pdim),
-                dcoords.reshape(n, pdim),
-            )
-            delta = P.project(wide) if P is not None else wide
-
-        site = (base.reshape(1, -1) + delta.to(base.dtype)).reshape(-1, *base.shape)
-        return self._vmap_over_site(spec.entry_key, bary_sd, site, inputs, targets)
+            cols = torch.arange(col_start, col_start + n_cols, device=dcoords.device).view(n_groups, 1, pdim)
+            if P is None:
+                idx, src = cols, dcoords
+            else:
+                rows, vals = P.columns(cols.reshape(-1), dcoords.device, P.dtype or dcoords.dtype)
+                idx = rows.view(n_groups, 1, -1)
+                src = (dcoords.unsqueeze(-1) * vals.view(n_groups, 1, pdim, -1)).flatten(2)
+            site = base.reshape(1, 1, -1).expand(n_groups, n_cand, -1).clone()
+            site.scatter_add_(2, idx.expand(-1, n_cand, -1), src.to(base.dtype))
+        return self._vmap_over_site(spec.entry_key, bary_sd, site.reshape(-1, *base.shape), inputs, targets)
 
     @torch.inference_mode()
     def evaluate(self, base_sd, entry, local_idx, values, inputs, targets=None):
@@ -1231,8 +1400,9 @@ class SiteVmapEvaluator:
 
         # No autocast frame: under vmap it casts activations but not a Conv2d bias, so
         # a conv model raises a dtype mismatch.
+        saved = [b.clone() for b in self._buffers.values()]
         try:
-            batched = vmap(single_eval, in_dims=(0, None, None, None))
+            batched = vmap(single_eval, in_dims=(0, None, None, None), randomness=self._randomness)
             if self._owner is not None and self._owner._compile_vmap and key not in self._compile_failed_sites:
                 try:
                     if key not in self._compiled_sites:
@@ -1243,16 +1413,24 @@ class SiteVmapEvaluator:
                 except torch.cuda.OutOfMemoryError:
                     raise
                 except Exception as e:
+                    if _batchable_draw(e, self._randomness):
+                        raise
                     self._compiled_sites.pop(key, None)
                     self._compile_failed_sites.add(key)
                     warnings.warn(f"compile_vmap failed at site {key!r} ({e}); using eager vmap.", stacklevel=2)
             return batched(site, shared, inputs, targets)
         except Exception as e:
             # The step calls this directly, so the failure never reaches evaluate()'s
-            # fallback. Usual cause is a forward that draws its own randomness, which
-            # vmap rejects. Score this chunk in a loop; later chunks use the dense path.
+            # fallback. A random draw is retried once, drawing per candidate. Anything
+            # else scores this chunk in a loop; later chunks use the dense path.
             if not _is_vmap_error(e):
                 raise
+            for b, s in zip(self._buffers.values(), saved):
+                b.copy_(s)
+            if _batchable_draw(e, self._randomness):
+                self._randomness = "different"
+                self._compiled_sites.clear()
+                return self._vmap_over_site(key, base_sd, site, inputs, targets)
             if self._owner is not None:
                 self._owner._vmap_failed = True
             warnings.warn(
@@ -1265,6 +1443,134 @@ class SiteVmapEvaluator:
         finally:
             if was_training:
                 model.train()
+
+
+class SiteInplaceEvaluator(SiteVmapEvaluator):
+    """Score a site by writing each candidate into the model's own parameter.
+
+    The incumbent is written into the model once per sweep; a candidate then rewrites
+    only its site and puts it back. The model's real forward runs, so a tied weight
+    moves with every alias and ``use_inplace=True`` keeps its contract.
+    """
+
+    _primed = None
+
+    def _retired(self) -> bool:
+        """Never: this path runs no vmap."""
+        return False
+
+    def _param(self, key: str) -> torch.Tensor:
+        """The model's storage for parameter ``key``."""
+        params = self._owner._param_dict_cache
+        if key not in params:
+            params = self._owner._param_dict_cache = dict(self.model.named_parameters(remove_duplicate=False))
+        return params[key].data
+
+    def resolve_site(self, offsets: torch.Tensor, pdim: int, span=None):
+        """The entry this chunk perturbs, or None when its parameter has no flat view."""
+        entry = super().resolve_site(offsets, pdim, span)
+        return entry if entry is not None and self._param(entry.key).is_contiguous() else None
+
+    def resolve_spec(self, subspace, lo: int, hi: int, sub_dim: int):
+        """The spec owning ``[lo, hi)``, or None for a parameter with no flat view or in FP16/BF16.
+
+        A half-precision weight has to be rebuilt from the base, not offset from the
+        rounded incumbent.
+        """
+        spec = super().resolve_spec(subspace, lo, hi, sub_dim)
+        if spec is None:
+            return None
+        param = self._param(spec.entry_key)
+        return spec if param.is_contiguous() and param.dtype not in (torch.float16, torch.bfloat16) else None
+
+    @contextmanager
+    def _frame(self, sd, inputs, targets, n):
+        """``(losses, score)`` for ``n`` candidates on the model primed with ``sd``, in eval mode."""
+        owner, model = self._owner, self.model
+        if self._primed is not sd:
+            torch._foreach_copy_([self._param(k) for k in sd], list(sd.values()))
+            self._primed = sd
+        inputs = owner.cast_inputs(inputs, owner._input_dtype(sd))
+        losses = torch.empty(n, device=inputs.device, dtype=loss_buffer_dtype(next(iter(sd.values())).dtype))
+        was_training = model.training
+        if was_training:
+            model.eval()
+        try:
+            with owner._autocast(inputs.device):
+                forward = owner._verified_forward_loss_fn(inputs, targets)
+                yield losses, lambda: forward(inputs, targets).detach()
+        finally:
+            if was_training:
+                model.train()
+
+    @torch.inference_mode()
+    def evaluate(self, base_sd, entry, local_idx, values, inputs, targets=None):
+        """Losses of shape ``(G*C,)``; a candidate writes only its ``pdim`` entries."""
+        groups, cand, _ = values.shape
+        flat = self._param(entry.key).view(-1)
+        values = values.to(flat.dtype)
+        with self._frame(base_sd, inputs, targets, groups * cand) as (losses, score):
+            incumbent = flat[local_idx]
+            for g, (idx, group) in enumerate(zip(local_idx, values)):
+                try:
+                    for c, candidate in enumerate(group):
+                        flat.index_copy_(0, idx, candidate)
+                        losses[g * cand + c] = score()
+                finally:
+                    flat.index_copy_(0, idx, incumbent[g])
+        return losses
+
+    @torch.inference_mode()
+    def evaluate_subspace(self, projections, base_sd, coords, bary_sd, spec, col_start, values, inputs, targets=None):
+        """Losses for candidates that move one particle's run of a spec's coordinates.
+
+        Only the spec's parameter is rewritten: ``bary + P[:, cols] @ delta`` for a dense
+        projection; a sparse projection or an unprojected spec writes the incumbent plus
+        its update into the entries its columns touch, summing repeated rows first, and
+        puts them back.
+        """
+        n_groups, n_cand, pdim = values.shape
+        flat = self._param(spec.entry_key).view(-1)
+        bary = bary_sd[spec.entry_key].reshape(-1)
+        P = projections[spec.entry_key] if spec.is_projected else None
+        cols = torch.arange(col_start, col_start + n_groups * pdim, device=values.device)
+        dcoords = values - coords.narrow(0, spec.flat_start + col_start, n_groups * pdim).view(n_groups, 1, pdim)
+        if isinstance(P, torch.Tensor):
+            dcoords = dcoords.to(P.dtype)
+        elif P is None:
+            rows, src = cols.view(n_groups, pdim), dcoords.to(flat.dtype)
+        else:
+            rows, vals = P.columns(cols, flat.device, dcoords.dtype)
+            rows = rows.view(n_groups, -1)
+            src = (dcoords.unsqueeze(-1) * vals.view(n_groups, 1, pdim, -1)).flatten(2).to(flat.dtype)
+            ranked, order = rows.sort(dim=1, stable=True)
+            run = torch.cat([ranked.new_zeros(n_groups, 1), ranked.diff(dim=1).ne(0).cumsum(1)], 1)
+            run = torch.empty_like(run).scatter_(1, order, run).unsqueeze(1).expand_as(src)
+            key = run + rows.shape[1] * torch.arange(n_groups * n_cand, device=rows.device).view(n_groups, n_cand, 1)
+            total = src.new_zeros(src.numel())
+            if total.is_cuda:
+                total.index_put_((key.flatten(),), src.flatten(), accumulate=True)
+            else:
+                total.index_add_(0, key.flatten(), src.flatten())
+            src = total.view_as(run).gather(2, run)
+        with self._frame(bary_sd, inputs, targets, n_groups * n_cand) as (losses, score):
+            try:
+                if isinstance(P, torch.Tensor):
+                    for g, group in enumerate(dcoords):
+                        block = P.narrow(1, col_start + g * pdim, pdim)
+                        for c, delta in enumerate(group):
+                            torch.addmv(bary, block, delta, out=flat)
+                            losses[g * n_cand + c] = score()
+                else:
+                    incumbent = flat[rows]
+                    for g, (idx, group) in enumerate(zip(rows, incumbent.unsqueeze(1) + src)):
+                        for c, write in enumerate(group):
+                            flat.index_copy_(0, idx, write)
+                            losses[g * n_cand + c] = score()
+                        flat.index_copy_(0, idx, incumbent[g])
+            finally:
+                flat.copy_(bary)
+        return losses
 
 
 class SparseDeltaEvaluator:
@@ -1324,13 +1630,10 @@ class SparseDeltaEvaluator:
         The perturbed positions are a function of the particle, not the vertex, so a
         group's ``C`` candidates share one ``local_idx`` row.
         """
-        groups, cand, pdim = values.shape
-        n = groups * cand
+        groups, cand, _ = values.shape
         site_idx, is_weight = self._site[entry_key]
         param_dtype = next(iter(base_sd.values())).dtype
         inputs = cast_inputs_memo(self, inputs, param_dtype)
-        x = inputs if inputs.dim() == 2 else inputs.reshape(inputs.shape[0], -1)
-        batch = x.shape[0]
         # Deltas, not absolute values: the correction adds onto the base output, so a
         # transformed site moves by the difference of the transformed values.
         site_q = _weight_transforms(self._layer_keys[site_idx][2])[0 if is_weight else 1]
@@ -1341,102 +1644,21 @@ class SparseDeltaEvaluator:
         else:
             delta = (values - base_at_site).to(param_dtype)
 
-        def at(t, cols):
-            """``(G, 1, B, pdim)`` holding ``t[:, cols]``, broadcastable over C.
+        def site(x, out, weight):
+            return _confined_site(x, local_idx, delta, weight.shape[1] if is_weight else None, weight.shape[0])
 
-            Gathers the transposed view, whose copy runs over contiguous rows.
-            """
-            return t.t().index_select(0, cols.reshape(-1)).reshape(groups, pdim, batch).permute(0, 2, 1).unsqueeze(1)
-
-        # Before the site `x` is shared at batch 1; through the site the candidates
-        # differ only at `dcols` by `dvals`; after it `xn` is dense.
-        dcols = dvals = xn = None
-
-        reuse = getattr(self, "_prefix_cache", None) is not None
-        params = base_sd
-        if reuse:
-            x = _base_prefix(self, params, inputs, site_idx)
-        start = site_idx if reuse else 0
-        for idx, (name, tag, module) in enumerate(self._layer_keys[start:], start):
-            if tag in ("flatten", "dropout"):
-                continue
-
-            if tag != "linear":
-                if xn is not None:
-                    xn = module(xn)
-                elif dvals is None:
-                    x = module(x)
-                else:
-                    # Elementwise: recompute the perturbed entries, then re-express the
-                    # delta as a difference.
-                    at_cols = at(x, dcols)
-                    x = module(x)
-                    dvals = module(at_cols + dvals) - module(at_cols)
-                continue
-
-            wq, bq = _weight_transforms(module)
-            weight = base_sd[f"{name}.weight"]
-            bias = base_sd.get(f"{name}.bias")
-            if wq is not None:
-                weight = wq(weight)
-            if bias is not None and bq is not None:
-                bias = bq(bias)
-
-            if xn is not None:
-                xn = xn @ weight.t()
-                if bias is not None:
-                    xn = xn + bias
-                continue
-
-            if reuse:
-                out = _base_prefix(self, params, inputs, idx + 1)
-            else:
-                out = x @ weight.t()
-                if bias is not None:
-                    out = out + bias
-
-            if dvals is not None:
-                # Mix the confined delta into every output unit: it goes dense here.
-                w_cols = weight.index_select(1, dcols.reshape(-1)).reshape(-1, groups, pdim)
-                corr = torch.einsum("ogp,gcbp->gcbo", w_cols, dvals)
-                xn = out + corr.reshape(n, batch, -1)
-                dcols = dvals = None
-                continue
-
-            if idx == site_idx:
-                if is_weight:
-                    # dW[r, c] adds x[:, c] * dW[r, c] to output unit r.
-                    d_in = weight.shape[1]
-                    dcols = local_idx // d_in
-                    dvals = at(x, local_idx % d_in) * delta.unsqueeze(2)
-                else:
-                    dcols = local_idx
-                    dvals = delta.unsqueeze(2).expand(groups, cand, batch, pdim)
-                if pdim > 1:
-                    # Several dcols entries can name the same output unit, and the
-                    # nonlinear activation must see their sum.
-                    same = dcols.unsqueeze(2) == dcols.unsqueeze(1)  # (G, pdim, pdim)
-                    dvals = torch.einsum("gpq,gcbq->gcbp", same.to(dvals.dtype), dvals)
-                    earlier = torch.tril(torch.ones_like(same[0]), -1).bool()
-                    dvals = dvals * (~(same & earlier).any(dim=1))[:, None, None, :]
-            x = out
-
-        if xn is None:
-            xn = x.expand(n, batch, x.shape[-1])
-            if dvals is not None:
-                # The site was the last Linear, so nothing mixed the delta back in.
-                index = dcols[:, None, None, :].expand(groups, cand, batch, pdim).reshape(n, batch, pdim)
-                xn = xn.clone().scatter_add_(2, index, dvals.reshape(n, batch, pdim))
-        return _reduce_per_candidate(xn, targets, self.loss_fn, self.loss_kind)
+        return _delta_walk(self, base_sd, inputs, targets, site_idx, site, groups * cand)
 
 
 class SubspaceDeltaEvaluator:
     """Evaluate subspace candidates that each perturb one particle's coordinate run.
 
-    The correction is linear in ``pdim`` coordinates:
+    For a projected hybrid weight the correction is linear in ``pdim`` coordinates:
     ``x @ W_n.T = x @ W_bary.T + sum_j d_nj * (x @ M_j.T)`` with ``M_j = reshape(P[:, j])``,
-    so the ``M_j`` products are computed once per column and reused. Nothing of shape
-    ``(N, d_out, d_in)`` is built.
+    so the ``M_j`` products are computed once per column and reused. Biases, full-width
+    weights and factored weights (``dW = A @ B``, coordinates indexing ``A``, input
+    ``x @ B.T``) move only the few output units their coordinates name, as in
+    :class:`SparseDeltaEvaluator`. Nothing of shape ``(N, d_out, d_in)`` is built.
 
     ``resolve_site`` returns None when the run is not contained in one block, so the
     caller falls back to ``reconstruct_batch``. Handles the same module set as
@@ -1475,23 +1697,15 @@ class SubspaceDeltaEvaluator:
         return cls(model, loss_fn, plan._layer_keys, loss_kind)
 
     def resolve_site(self, subspace, lo: int, hi: int, sub_dim: int):
-        """The spec owning coordinates ``[lo, hi)``, or ``None`` if they straddle.
-
-        Only a projected weight or an unprojected bias matches a correction; an
-        unprojected weight indexes the flattened weight, not output units.
-        """
+        """The spec owning coordinates ``[lo, hi)``, or ``None`` if they straddle."""
         if hi > sub_dim:
             return None
         for spec in subspace.specs:
             if spec.flat_start <= lo and hi <= spec.flat_end:
-                site = self._site.get(spec.entry_key)
-                if site is None:
-                    return None
-                _, is_weight = site
-                return spec if is_weight == spec.is_projected else None
+                return spec if spec.entry_key in self._site else None
         return None
 
-    def _basis_products(self, spec, P, col_start, n_cols, x, dtype):
+    def _basis_products(self, spec, P, col_start, n_cols, x):
         """``(n_cols, d_out, B)`` holding ``x @ M_j.T`` for the column run at ``col_start``."""
         d_out, d_in = spec.original_shape
         if isinstance(P, SparseRandomProjection):
@@ -1502,13 +1716,13 @@ class SubspaceDeltaEvaluator:
             out_idx = torch.div(rows, d_in, rounding_mode="floor")  # (n_cols, nnz)
             in_idx = rows.remainder(d_in)
             contrib = x.index_select(1, in_idx.reshape(-1)).reshape(x.shape[0], n_cols, -1)
-            contrib = contrib.permute(1, 2, 0) * vals.unsqueeze(-1).to(dtype)  # (n_cols, nnz, B)
-            g = torch.zeros(n_cols, d_out, x.shape[0], device=x.device, dtype=dtype)
+            contrib = contrib.permute(1, 2, 0) * vals.unsqueeze(-1)  # (n_cols, nnz, B)
+            g = torch.zeros(n_cols, d_out, x.shape[0], device=x.device, dtype=x.dtype)
             return g.scatter_add_(1, out_idx.unsqueeze(-1).expand_as(contrib), contrib)
         # P.view(d_out, d_in, -1)[o, i, j] is M_j[o, i] with no copy; batching over
         # columns rather than d_out is faster at the same FLOPs.
-        blk = P.view(d_out, d_in, -1).narrow(2, col_start, n_cols).permute(2, 1, 0).to(dtype)
-        return torch.matmul(x.to(dtype), blk).permute(0, 2, 1)  # (n_cols, B, d_out) -> (n_cols, d_out, B)
+        blk = P.view(d_out, d_in, -1).narrow(2, col_start, n_cols).permute(2, 1, 0).to(x.dtype)
+        return torch.matmul(x, blk).permute(0, 2, 1)  # (n_cols, B, d_out) -> (n_cols, d_out, B)
 
     @torch.inference_mode()
     def evaluate(
@@ -1527,60 +1741,24 @@ class SubspaceDeltaEvaluator:
         site_idx, is_weight = self._site[spec.entry_key]
         param_dtype = next(iter(bary_sd.values())).dtype
         inputs = cast_inputs_memo(self, inputs, param_dtype)
-        x = inputs if inputs.dim() == 2 else inputs.reshape(inputs.shape[0], -1)
-        n = n_groups * n_cand
-        xn = None
+        d = dcoords.to(param_dtype)
+        j = torch.arange(col_start, col_start + n_groups * pdim, device=dcoords.device).view(n_groups, pdim)
+        factored = getattr(subspace, "coords_are_factored", False)
 
-        reuse = getattr(self, "_prefix_cache", None) is not None
-        params = bary_sd
-        if reuse:
-            x = _base_prefix(self, params, inputs, site_idx)
-        start = site_idx if reuse else 0
-        for idx, (name, tag, module) in enumerate(self._layer_keys[start:], start):
-            if tag in ("flatten", "dropout"):
-                continue
-            if tag != "linear":
-                if xn is None:
-                    x = module(x)
-                else:
-                    xn = module(xn)
-                continue
+        def site(x, out, weight):
+            d_out = weight.shape[0]
+            if not is_weight:
+                return _confined_site(x, j, d, None, d_out)
+            if not spec.is_projected:
+                return _confined_site(x, j, d, weight.shape[1], d_out)
+            P = projections[spec.entry_key]
+            if factored:
+                return _confined_site(x @ P.to(x.dtype).t(), j, d, subspace.ranks[spec.entry_key], d_out)
+            g = self._basis_products(spec, P, col_start, n_groups * pdim, x)
+            corr = torch.einsum("gcp,gpob->gcbo", d, g.reshape(n_groups, pdim, d_out, x.shape[0]))
+            return None, out + corr.reshape(n_groups * n_cand, -1, d_out)
 
-            weight = bary_sd[f"{name}.weight"]
-            bias = bary_sd.get(f"{name}.bias")
-
-            if xn is not None:
-                xn = xn @ weight.t()
-                if bias is not None:
-                    xn = xn + bias
-                continue
-
-            if reuse:
-                out = _base_prefix(self, params, inputs, idx + 1)
-            else:
-                out = x @ weight.t()
-                if bias is not None:
-                    out = out + bias
-
-            if idx == site_idx:
-                if is_weight:
-                    g = self._basis_products(
-                        spec, projections[spec.entry_key], col_start, n_groups * pdim, x, param_dtype
-                    ).reshape(n_groups, pdim, weight.shape[0], x.shape[0])
-                    corr = torch.einsum("gcp,gpob->gcbo", dcoords.to(param_dtype), g)
-                else:
-                    # An unprojected bias site: the coordinates are the bias delta.
-                    cols = torch.arange(col_start, col_start + n_groups * pdim, device=x.device).view(n_groups, pdim)
-                    corr = torch.zeros(n_groups, n_cand, weight.shape[0], device=x.device, dtype=param_dtype)
-                    corr.scatter_(2, cols.unsqueeze(1).expand(n_groups, n_cand, pdim), dcoords.to(param_dtype))
-                    corr = corr.unsqueeze(2)
-                xn = out + corr.reshape(n, -1, weight.shape[0])
-                continue
-            x = out
-
-        if xn is None:
-            xn = x.unsqueeze(0).expand(n, *x.shape)
-        return _reduce_per_candidate(xn, targets, self.loss_fn, self.loss_kind)
+        return _delta_walk(self, bary_sd, inputs, targets, site_idx, site, n_groups * n_cand)
 
 
 class FactoredEvaluator:

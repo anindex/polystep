@@ -1117,8 +1117,10 @@ class PolyStepOptimizer(SerializationMixin):
             half,
             inputs.dim() == 2,
         )
-        if getattr(self, "_fastpath_key", None) != fastpath_key:
+        rebuild = getattr(self, "_fastpath_key", None) != fastpath_key
+        if rebuild:
             self._fastpath_key = fastpath_key
+            self._act_ratio = None
             for attr in (
                 "_factored_evaluator",
                 "_sparse_delta_evaluator",
@@ -1157,17 +1159,28 @@ class PolyStepOptimizer(SerializationMixin):
                     else ""
                 )
                 warnings.warn(
-                    "use_inplace=True asks for the model's real forward, so the site-aware and "
-                    "delta evaluators are off and candidates are materialized through "
-                    "reconstruct_batch instead." + extra + " Drop use_inplace=True to get "
-                    "them back.",
+                    "use_inplace=True asks for the model's real forward, so the vmap and delta "
+                    "evaluators are off. A full-space candidate, or an unscreened HybridSubspace "
+                    "candidate on FP32/FP64 weights, that changes one parameter is written into it in "
+                    "place; other candidates are scored one full weight set at a time."
+                    + extra
+                    + " Drop use_inplace=True to get them back.",
                     stacklevel=2,
                 )
             self._factored_evaluator = None
             self._sparse_delta_evaluator = None
-            self._site_vmap_evaluator = None
             self._subspace_delta_evaluator = None
+            if not hasattr(self, "_site_vmap_evaluator"):
+                from .cost_nn import SiteVmapEvaluator
+
+                self._site_vmap_evaluator = (
+                    SiteVmapEvaluator.try_build(evaluator, self.layout)
+                    if self.subspace is None or self._hybrid
+                    else None
+                )
             return
+        if rebuild:
+            self._act_ratio = evaluator._activation_ratio(inputs)
         # FactoredSubspace can score through the low-rank identity, never building a
         # candidate weight.
         if self._factored and not hasattr(self, "_factored_evaluator"):
@@ -1191,7 +1204,7 @@ class PolyStepOptimizer(SerializationMixin):
             )
             # Batches only the perturbed tensor; covers what the delta path declines.
             self._site_vmap_evaluator = SiteVmapEvaluator.try_build(evaluator, self.layout)
-        if self._hybrid and not hasattr(self, "_subspace_delta_evaluator"):
+        if self._per_layer_projections and not hasattr(self, "_subspace_delta_evaluator"):
             from .cost_nn import SiteVmapEvaluator, SubspaceDeltaEvaluator
 
             self._subspace_delta_evaluator = SubspaceDeltaEvaluator.try_build(
@@ -1199,7 +1212,8 @@ class PolyStepOptimizer(SerializationMixin):
             )
             # A per-layer block maps to one parameter, so the same site argument holds
             # in coordinate space.
-            self._site_vmap_evaluator = SiteVmapEvaluator.try_build(evaluator, self.layout)
+            if self._hybrid:
+                self._site_vmap_evaluator = SiteVmapEvaluator.try_build(evaluator, self.layout)
         if half:
             self._factored_evaluator = None
             self._subspace_delta_evaluator = None
@@ -1264,7 +1278,9 @@ class PolyStepOptimizer(SerializationMixin):
 
         Args:
             closure: ``closure(batched_params) -> losses``, where ``batched_params``
-                is ``{key: (N, *shape)}`` and ``losses`` has shape ``(N,)``.
+                is ``{key: (N, *shape)}`` and ``losses`` has shape ``(N,)``. The
+                tensors may share storage that the next chunk overwrites, so clone any
+                you keep after the closure returns.
             screen_closure: Cheap-fidelity closure for ``multifidelity_screen``.
             objective_token: Identity of the objective ``closure`` measures; a change
                 drops the pending trust-region comparison. ``None`` or a constant means
@@ -1308,7 +1324,9 @@ class PolyStepOptimizer(SerializationMixin):
         """Block-wise step: per-block OT solve."""
         from .cost_nn import _reuse_prefixes
 
-        with _reuse_prefixes(getattr(self, "_sparse_delta_evaluator", None)):
+        with _reuse_prefixes(
+            getattr(self, "_sparse_delta_evaluator", None), getattr(self, "_site_vmap_evaluator", None)
+        ):
             return _step_blockwise_fn(self, closure)
 
     def _step_momentum(self, closure: Callable) -> float:

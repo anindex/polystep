@@ -576,6 +576,51 @@ def test_mixed_dtype_model_computing_in_both_dtypes(minority):
         assert model(inputs).dtype is minority
 
 
+@pytest.mark.parametrize("fused", [False, True])
+def test_in_place_half_weights_round_as_the_batch_reconstruction(fused):
+    """The in-place path scores the fallback candidates of a step whose site candidates
+    read ``reconstruct_batch`` weights, so a BF16 weight must round the product before
+    adding the base, as that does, not in one fused addmm."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8)).bfloat16()
+    if not fused:
+        model[1].weight.data = model[1].weight.data.t().contiguous().t()
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    projections = subspace.init_projections(torch.device("cpu"), torch.bfloat16)
+    if fused:
+        subspace.build_fused_projection(projections)
+        assert subspace._fused_P is not None
+    base_sd = {k: v.detach().clone() for k, v in model.named_parameters()}
+    coords = torch.randn(subspace.subspace_dim, generator=torch.Generator().manual_seed(1)).bfloat16() * 3
+
+    subspace.apply_perturbation_inplace(projections, model, base_sd, coords)
+    expected = subspace.reconstruct_batch(projections, base_sd, coords.unsqueeze(0))
+    for key, param in model.named_parameters():
+        torch.testing.assert_close(param.data, expected[key][0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_synced_half_weights_are_the_scored_weights(fused):
+    """The step scores ``reconstruct_batch`` weights, which round a half-precision
+    product before adding the base, so the weights it writes back must round the same
+    way, through the fused matmul when there is one."""
+    torch.manual_seed(0)
+    if fused:
+        model = nn.Sequential(nn.Linear(32, 64), nn.Linear(64, 4)).half()
+    else:
+        model = nn.Sequential(nn.Linear(4, 3).bfloat16(), nn.Linear(3, 1))
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+    opt = PolyStepOptimizer(model, subspace=subspace, step_radius=3.0, seed=0)
+    assert (subspace._fused_P is not None) is fused
+    opt.step(lambda p: sum(v.float().flatten(1).sin().sum(1) for v in p.values()))
+
+    coords = opt.state.X.reshape(-1)[: subspace.subspace_dim]
+    assert coords.abs().min() > 0
+    expected = subspace.reconstruct_batch(opt.state.hybrid_projections, opt.state.base_params, coords.unsqueeze(0))
+    for key, param in model.named_parameters():
+        assert torch.equal(param.data, expected[key][0]), key
+
+
 def test_fused_reconstruction_keeps_a_sparse_minority_dtype():
     """Two FP32 blocks fuse, so the sparse BF16 layer is rebuilt next to the fused
     matmul and must not be promoted to the coordinates' dtype."""
@@ -605,11 +650,13 @@ def test_bf16_weights_skip_the_factored_low_rank_path_until_cast_back():
     inputs, targets = torch.randn(8, 6), torch.randint(0, 3, (8,))
     opt.register_evaluator(evaluator, inputs, targets)
     assert opt._factored_evaluator is None
+    assert opt._subspace_delta_evaluator is None
 
     model.float()
     opt.resync_from_model()
     opt.register_evaluator(evaluator, inputs, targets)
     assert opt._factored_evaluator is not None
+    assert opt._subspace_delta_evaluator is not None
     assert opt.state.X.dtype is torch.bfloat16
     opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
     assert model[0].weight.dtype is torch.float32

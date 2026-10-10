@@ -71,6 +71,42 @@ def test_matches_the_dense_path_at_every_perturbation_site(name, dims, loss_fn, 
     assert accepted > 0, "the fast path declined every site"
 
 
+@pytest.mark.parametrize("pdim", [3, 8, 16])
+def test_wide_runs_keep_the_touched_output_units(pdim):
+    """A run wider than a weight row spans several output units, and one ending on the
+    last row names units past it; every site must still match the dense path."""
+    torch.manual_seed(0)
+    model = _mlp([6, 8, 6, 8], act=nn.Tanh)
+    loss_fn = nn.CrossEntropyLoss()
+    layout = ParamLayout.from_module(model, particle_dim=pdim)
+    evaluator = SparseDeltaEvaluator.try_build(model, loss_fn, layout)
+    dense = BatchedLinearEvaluator.try_build(model, loss_fn, "cross_entropy")
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    flat = layout.flatten(model).reshape(-1)
+    inputs, targets = torch.randn(9, 6), torch.randint(0, 8, (9,))
+    gen = torch.Generator().manual_seed(1)
+
+    wide = last_row = 0
+    for entry in layout.entries:
+        lo = -(-entry.offset // pdim) * pdim
+        starts = torch.arange(lo, max(lo, entry.offset + entry.numel - pdim + 1), pdim)
+        if not len(starts):
+            continue
+        site = evaluator.resolve_site(starts, pdim, (int(starts[0]), int(starts[-1]) + pdim))
+        assert site is not None and site.key == entry.key
+        cols = starts.unsqueeze(1) + torch.arange(pdim)
+        values = flat[cols].unsqueeze(1) + 0.5 * torch.randn(len(starts), 2, pdim, generator=gen)
+
+        got = evaluator.evaluate(base_sd, entry.key, cols - entry.offset, values, inputs, targets)
+        configs = flat.repeat(2 * len(starts), 1).scatter_(1, cols.repeat_interleave(2, 0), values.reshape(-1, pdim))
+        expected = dense.evaluate(layout.batch_unflatten(configs), inputs, targets)
+        torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+        if len(entry.shape) == 2:
+            wide += pdim > entry.shape[1]
+            last_row += int(cols[-1, -1] - entry.offset) // entry.shape[1] == entry.shape[0] - 1
+    assert last_row and (wide or pdim < 6), (wide, last_row)
+
+
 def test_a_batch_of_candidates_matches_one_at_a_time():
     """The chunk is evaluated in one call, so N candidates must agree with N calls."""
     torch.manual_seed(0)
