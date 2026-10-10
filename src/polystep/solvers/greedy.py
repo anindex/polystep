@@ -25,31 +25,22 @@ class MinCostGreedySolver:
         scale_cost: Optional[Union[str, float]] = None,
     ) -> SolverResult:
         """Compute the greedy argmin assignment; returns a one-nonzero-per-row transport matrix."""
-        # Sanitize first: argmin over a NaN would hand all mass to a masked vertex.
+        # Mask first: argmin over a NaN would hand all mass to a masked vertex.
         P, V = validate_cost_shape(cost_matrix, "MinCostGreedySolver")
         C_raw = sanitize_cost(cost_matrix)
         device, dtype = C_raw.device, C_raw.dtype
         a = align_marginal(a, P, device, dtype, "a")
+        C_rank = torch.where(torch.isfinite(cost_matrix), C_raw, torch.inf)
 
-        min_indices = C_raw.argmin(dim=-1)  # (P,)
+        min_indices = C_rank.argmin(dim=-1)  # (P,)
         transport = torch.zeros(P, V, device=device, dtype=dtype)
         transport.scatter_(1, min_indices.unsqueeze(1), a.unsqueeze(1))
         # A constant row (all-infeasible) spreads uniformly: the barycentre of the centred polytope is the particle itself.
-        informative = (C_raw.amax(dim=-1) > C_raw.amin(dim=-1)).unsqueeze(1)
+        informative = (C_rank.amax(dim=-1) > C_rank.amin(dim=-1)).unsqueeze(1)
         transport = torch.where(informative, transport, a.unsqueeze(1).expand(P, V) / V)
 
         # scale_cost is unused: argmin is invariant to a positive divisor.
-        ent_cost = (C_raw * transport).sum().item()
-
-        return SolverResult(
-            matrix=transport,
-            cost=ent_cost,
-            f=None,
-            g=None,
-            converged=True,
-            n_iters=1,
-            ent_reg_cost=ent_cost,
-        )
+        return SolverResult(matrix=transport, _ent_reg=(C_raw * transport).sum())
 
 
 @dataclass
@@ -84,28 +75,19 @@ class TopKMeanSolver:
         a = align_marginal(a, P, device, dtype, "a")
 
         k_eff = min(self.k, V)
-        _, topk_indices = C_raw.topk(k_eff, dim=-1, largest=False)  # (P, k_eff)
-
-        # topk does not honour the sanitize mask, so drop infeasible picks and spread mass over what is left; the row still sums to a.
         feasible = torch.isfinite(cost_matrix)
+        C_rank = torch.where(feasible, C_raw, torch.inf)
+        _, topk_indices = C_rank.topk(k_eff, dim=-1, largest=False)  # (P, k_eff)
+
+        # With fewer than k feasible, topk still picks masked ones, so drop them and spread mass over what is left; the row still sums to a.
         keep = feasible.gather(1, topk_indices)
         keep = keep | ~keep.any(dim=1, keepdim=True)
 
         transport = torch.zeros(P, V, device=device, dtype=dtype)
         mass = a.unsqueeze(1) / keep.sum(dim=1, keepdim=True) * keep
         transport.scatter_(1, topk_indices, mass.to(dtype))
-        informative = (C_raw.amax(dim=-1) > C_raw.amin(dim=-1)).unsqueeze(1)
+        informative = (C_rank.amax(dim=-1) > C_rank.amin(dim=-1)).unsqueeze(1)
         transport = torch.where(informative, transport, a.unsqueeze(1).expand(P, V) / V)
 
         # scale_cost is unused: topk is invariant to a positive divisor.
-        ent_cost = (C_raw * transport).sum().item()
-
-        return SolverResult(
-            matrix=transport,
-            cost=ent_cost,
-            f=None,
-            g=None,
-            converged=True,
-            n_iters=1,
-            ent_reg_cost=ent_cost,
-        )
+        return SolverResult(matrix=transport, _ent_reg=(C_raw * transport).sum())

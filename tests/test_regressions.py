@@ -16,8 +16,8 @@ from polystep.geometry import apply_biased_rotation, get_random_rotation_matrice
 def test_vanishing_bias_direction_keeps_the_frame_orthonormal(pdim):
     """A vanishing descent direction must leave the frame orthonormal.
 
-    Normalizing by ``norm.clamp(min=1e-10)`` would skew the frame through
-    Gram-Schmidt, so such a particle keeps its unbiased rotation instead.
+    Normalizing by ``norm.clamp(min=1e-10)`` would aim the first axis at rounding
+    noise, so such a particle keeps its unbiased rotation instead.
     """
     P = 32
     gen = torch.Generator().manual_seed(7)
@@ -371,7 +371,7 @@ class TestLargeCostOffsetStability:
         assert torch.allclose(kl.sum(dim=1), torch.ones(1), atol=1e-5)
         # Recentering shifts C before the solve, so the reported cost has to come
         # back in the raw frame: <C_raw, P> = 1e6 at unit mass.
-        assert kl_result.cost == pytest.approx(1_000_000.0, rel=1e-6)
+        assert kl_result.ent_reg_cost == pytest.approx(1_000_000.0, rel=1e-6)
 
     def test_softmax_no_nan_at_extreme_epsilon(self):
         """A finite cost with a huge negative entry must not NaN the softmax;
@@ -603,6 +603,198 @@ def test_infinite_cost_does_not_flatten_the_plan():
     assert reference[0, 0] > reference[0, 1] > reference[0, 2]
 
 
+@pytest.mark.parametrize("mode", ["mean", "max_cost"])
+def test_a_nan_cost_does_not_set_the_divisor(mode):
+    """The penalty that replaces a NaN used to enter the divisor and flatten the finite plan."""
+    from polystep.solvers import SoftmaxSolver
+
+    clean = SoftmaxSolver(epsilon=0.5).solve(torch.tensor([[0.0, 1.0, 2.0]]), scale_cost=mode).matrix[0]
+    masked = torch.tensor([[0.0, 1.0, 2.0, float("nan")]])
+    finite = SoftmaxSolver(epsilon=0.5).solve(masked, scale_cost=mode).matrix[0, :3]
+
+    torch.testing.assert_close(finite / finite.sum(), clean)
+
+
+@pytest.mark.parametrize("mode", ["mean", "max_cost"])
+@pytest.mark.parametrize("spread", [0.0, 1e-3])
+def test_a_narrow_finite_spread_keeps_sinkhorn_marginals(mode, spread):
+    """The penalty was divided by the finite spread, so a 1e-10 divisor broke FP32 and the plan still converged."""
+    from polystep.solvers import SinkhornSolver
+
+    nan = float("nan")
+    cost = torch.tensor([[100.0, 100.0 + spread], [100.0 + spread, 100.0], [nan, nan]])
+    result = SinkhornSolver(epsilon=0.1).solve(cost, scale_cost=mode)
+
+    assert result.converged
+    torch.testing.assert_close(result.matrix.sum(dim=1), torch.full((3,), 1 / 3))
+    torch.testing.assert_close(result.matrix.sum(dim=0), torch.full((2,), 0.5))
+
+
+@pytest.mark.parametrize("mode", ["mean", "max_cost"])
+@pytest.mark.parametrize(
+    ("solver", "block_strategy"),
+    [("sinkhorn", "monolithic"), ("softmax", "monolithic"), ("sinkhorn", "per_layer"), ("softmax", "per_layer")],
+)
+def test_a_nan_candidate_does_not_set_the_step_divisor(monkeypatch, solver, block_strategy, mode):
+    """Finite losses span under 0.01, so the divisor must too.
+
+    The step used to hand every solver, and the fused softmax, the penalty in place
+    of the NaN, which set the divisor near 0.5 under 'mean' and 3.3 under 'max_cost'.
+    """
+    import polystep.costs as costs
+
+    divisors = []
+    resolve = costs.resolve_cost_scale
+
+    def spy(*args):
+        divisors.append(resolve(*args))
+        return divisors[-1]
+
+    monkeypatch.setattr(costs, "resolve_cost_scale", spy)
+    torch.manual_seed(0)
+    model = nn.Linear(4, 1, bias=False)
+    opt = PolyStepOptimizer(
+        model, solver=solver, scale_cost=mode, use_momentum=False, block_strategy=block_strategy, seed=0
+    )
+
+    def closure(params):
+        w = params["weight"].reshape(-1, 4)
+        loss = 2.30 + 0.01 * torch.sigmoid(w.sum(-1))
+        loss[w[:, 0].argmax()] = float("nan")
+        return loss
+
+    opt.step(closure)
+
+    assert divisors
+    assert max(d.item() for d in divisors) < 0.01
+
+
+@pytest.mark.parametrize("mode", ["mean", "max_cost"])
+def test_a_nan_screen_loss_does_not_set_the_step_divisor(monkeypatch, mode):
+    """The screen sanitized its own losses, so the step took the penalty for a cost.
+
+    It set the divisor, and through the calibration offset it dragged the dropped
+    vertices far below the scored ones.
+    """
+    import polystep.costs as costs
+
+    divisors = []
+    resolve = costs.resolve_cost_scale
+
+    def spy(*args):
+        divisors.append(resolve(*args))
+        return divisors[-1]
+
+    monkeypatch.setattr(costs, "resolve_cost_scale", spy)
+    torch.manual_seed(0)
+    model = nn.Linear(4, 1, bias=False)
+    opt = PolyStepOptimizer(
+        model,
+        solver="sinkhorn",
+        polytope_type="orthoplex",
+        scale_cost=mode,
+        use_momentum=False,
+        seed=0,
+        multifidelity_screen=True,
+        screen_keep_ratio=0.25,
+        screen_fidelity=0.25,
+    )
+
+    def closure(params):
+        return 2.30 + 0.01 * torch.sigmoid(params["weight"].reshape(-1, 4).sum(-1))
+
+    def screen(params):
+        loss = closure(params)
+        loss[params["weight"].reshape(-1, 4)[:, 0].argmax()] = float("nan")
+        return loss
+
+    opt.step(closure, screen_closure=screen)
+
+    assert divisors
+    assert max(d.item() for d in divisors) < 0.01
+
+
+@pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+def test_softmax_steps_away_from_a_vertex_with_a_nan_probe(block_strategy):
+    """Vertex 0 scores -10 on one probe and NaN on the other; every other probe scores 10.
+
+    Averaging the per-probe penalty into it gave vertex 0 a cost of (-10 + 21) / 2,
+    the lowest of the four, so the fused softmax stepped toward an infeasible vertex.
+    """
+    torch.manual_seed(0)
+    model = nn.Linear(2, 1, bias=False)
+    opt = PolyStepOptimizer(
+        model, solver="softmax", polytope_type="orthoplex", num_probe=2, block_strategy=block_strategy, seed=0
+    )
+    start = model.weight.detach().reshape(-1).clone()
+    toward = []
+
+    def closure(params):
+        w = params["weight"].reshape(-1, 2)
+        toward.append(w[0] - start)
+        loss = torch.full((w.shape[0],), 10.0)
+        loss[0], loss[1] = -10.0, float("nan")
+        return loss
+
+    opt.step(closure)
+
+    assert len(toward) == 1
+    assert torch.dot(model.weight.detach().reshape(-1) - start, toward[0]) < 0
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_a_probe_mean_that_overflows_gets_the_penalty(sign):
+    """Vertex 0 scores +-[3e38, 3e38, -3e38], finite on every probe, and the rest score 1.
+
+    The FP32 mean overflows to +-inf, which the step recorded as its loss.
+    """
+    torch.manual_seed(0)
+    model = nn.Linear(2, 1, bias=False)
+    opt = PolyStepOptimizer(model, polytope_type="orthoplex", num_probe=3, seed=0)
+
+    def closure(params):
+        loss = torch.ones(params["weight"].reshape(-1, 2).shape[0])
+        loss[:3] = sign * torch.tensor([3e38, 3e38, -3e38])
+        return loss
+
+    assert opt.step(closure) == pytest.approx(1.5)
+
+
+def test_screen_dropped_vertices_leave_a_clean_run_unchanged():
+    """A selection solver's screen drops vertices as +inf, though every loss is finite.
+
+    Penalizing them per vertex instead of per probe moved the recorded cost that
+    adaptive_num_probe reads, and with it the trajectory. The reference weight was
+    recorded before that change.
+    """
+    torch.manual_seed(3)
+    model = nn.Linear(6, 1, bias=False)
+    target = torch.linspace(-1, 1, 6)
+    opt = PolyStepOptimizer(
+        model,
+        solver="min_cost_greedy",
+        polytope_type="orthoplex",
+        num_probe=3,
+        seed=3,
+        multifidelity_screen=True,
+        screen_keep_ratio=0.5,
+        screen_fidelity=0.25,
+    )
+
+    def closure(params):
+        w = params["weight"].reshape(-1, 6)
+        return ((w - target) ** 2).sum(-1) + 0.5 * torch.sin(9 * w).sum(-1)
+
+    def screen(params):
+        w = params["weight"].reshape(-1, 6)
+        return ((w - target) ** 2).sum(-1) + 0.2 * torch.cos(3 * w).sum(-1)
+
+    for _ in range(60):
+        opt.step(closure, screen_closure=screen)
+
+    assert model.weight[0, 2].item() == pytest.approx(-0.42066213, abs=1e-7)
+
+
 def test_all_infinite_cost_gives_uniform_plan_without_nan():
     from polystep.solvers import SoftmaxSolver
 
@@ -631,9 +823,7 @@ def test_fused_softmax_survives_large_negative_costs():
     verts = torch.tensor([[1.0], [-1.0]])
     rot = torch.eye(1).unsqueeze(0)
     X = torch.zeros(1, 1)
-    X_new, transport = CompiledFunctions(compile=False).fused_softmax_project(
-        cost, 1e-3, torch.ones(1), verts, rot, 0.1, X, scale_cost_mean=False
-    )
+    X_new, transport = CompiledFunctions(compile=False).fused_softmax_project(cost, 1e-3, verts, rot, 0.1, X)
     assert torch.isfinite(X_new).all() and torch.isfinite(transport).all()
     # The cheaper vertex still wins.
     assert transport[0, 0] > transport[0, 1]

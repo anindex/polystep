@@ -30,7 +30,7 @@ momentum.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
   When a candidate's output is FP16 or BF16, whether from the model's dtype or from
   `candidate_autocast`, an `nn.CrossEntropyLoss`, `nn.MSELoss`, or `nn.L1Loss` left
-  at its defaults reduces it in FP32. Any other loss, including one with class
+  at its defaults apart from `reduction` reduces it in FP32. Any other loss, including one with class
   weights, label smoothing, or hooks, keeps the dtype it returns, so candidates
   closer than its rounding step tie.
   Models needing autocast internally must provide it.
@@ -78,8 +78,17 @@ Sinkhorn requires `omega` in `[0.5, 1.95]`. Anderson acceleration and adaptive o
 are inactive in fixed-iteration mode (`threshold <= 0`). Both solver families promote
 FP16/BF16 costs to FP32.
 
-All nonfinite costs are invalid. Their finite replacement can affect global cost
-scaling, including `scale_cost='max_cost'`.
+All nonfinite costs are invalid. `min_cost_greedy` and `top_k_mean` skip a vertex
+with any nonfinite probe, and the solve leaves a particle with no feasible vertex
+where it is. The weighted solvers replace each nonfinite cost with a finite penalty,
+twice the largest finite magnitude plus one, so an infeasible candidate keeps a small
+weight that depends on epsilon. Under `scale_cost='mean'` or `'max_cost'` the penalty
+is computed after scaling; otherwise that weight also depends on the cost offset.
+Balanced Sinkhorn sends every column its prescribed mass, even when all of that
+column's candidates are infeasible. The monolithic step records a vertex's cost as
+the mean of its probes with each nonfinite probe already penalized, so with several
+probes a vertex with only some nonfinite probes can still set the best-vertex
+progress that drives the adaptive radius.
 
 Quadratic fits are finite-radius models. Simplex gradients can be biased on
 anisotropic quadratics, and block models omit cross-block curvature. A fit does not

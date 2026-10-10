@@ -3,6 +3,10 @@
 Reproducibility requires the same configuration, device, software build, and CPU
 thread count. A seed alone does not guarantee identical results across systems.
 
+CPU QR factorizations below 1e8 of `rows * cols**2` work run on one thread. Larger
+subspace bases (adaptive, hybrid, factored) use the whole intra-op pool, so their
+rounding follows the thread count. Random rotation QRs stay on one thread at any size.
+
 `experiments/runners/common.py` sets:
 
 - `CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA initialization, unless already set.

@@ -45,7 +45,7 @@ def test_row_mass_survives_large_row_offsets(epsilon, lam):
     if lam == 0:
         expected = SoftmaxSolver(epsilon=epsilon).solve(costs, a=a)
         torch.testing.assert_close(result.matrix, expected.matrix, rtol=1e-6, atol=0)
-        assert result.cost == pytest.approx(expected.cost)
+        assert result.ent_reg_cost == pytest.approx(expected.ent_reg_cost)
 
 
 def test_lam_huge_recovers_sinkhorn_full_marginals() -> None:
@@ -109,6 +109,7 @@ def test_nan_safe_at_small_epsilon() -> None:
         {"epsilon": 0.1, "lam": -1.0},
         {"epsilon": 0.0, "lam": 1.0},
         {"epsilon": -0.1, "lam": 1.0},
+        {"epsilon": 0.1, "lam": 1.0, "check_every": 0},
     ],
 )
 def test_validation_invalid_constructor_args_raise(kwargs) -> None:
@@ -219,8 +220,18 @@ def test_convergence_is_measured_on_the_dual_step_not_its_magnitude():
     b = torch.tensor([0.6, 0.3, 0.1])
     result = KLSoftmaxSolver(epsilon=0.5, lam=1.0, max_iterations=2000).solve(C, b=b)
     assert result.converged
-    assert result.n_iters < 500
+    assert result.n_iters < 100
     assert result.g.abs().max() > 0.1, "the duals must be off zero, or the test proves nothing"
+
+
+@pytest.mark.parametrize("check_every", [7, 13])
+def test_convergence_is_checked_every_check_every_iterations(check_every):
+    C = torch.tensor([[0.0, 1.0, 2.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]])
+    b = torch.tensor([0.6, 0.3, 0.1])
+    solver = KLSoftmaxSolver(epsilon=0.5, lam=1.0, max_iterations=2000, check_every=check_every)
+    result = solver.solve(C, b=b)
+    assert result.converged
+    assert result.n_iters % check_every == 0
 
 
 def test_denormal_lam_takes_the_softmax_closed_form():

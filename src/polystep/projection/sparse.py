@@ -67,12 +67,12 @@ class SparseRandomProjection:
                     stacklevel=2,
                 )
 
-        self._indices: Optional[torch.Tensor] = None
+        self._rows: Optional[torch.Tensor] = None
         self._values: Optional[torch.Tensor] = None
         self._device: Optional[torch.device] = None
         self._dtype: Optional[torch.dtype] = None
-        self._sparse_matrix: Optional[torch.Tensor] = None
         self._csr_matrix: Optional[torch.Tensor] = None
+        self._csr_rows: Optional[torch.Tensor] = None
 
     def _init_sparse_matrix(self, device: torch.device, dtype: torch.dtype) -> None:
         """Build the sparse projection matrix on first use."""
@@ -92,16 +92,6 @@ class SparseRandomProjection:
             device="cpu",
         )
 
-        col_indices = (
-            torch.arange(self.subspace_dim, device="cpu")
-            .unsqueeze(1)
-            .expand(
-                -1,
-                self._nnz_per_col,
-            )
-            .reshape(-1)
-        )
-
         signs = (
             torch.randint(
                 0,
@@ -115,36 +105,53 @@ class SparseRandomProjection:
         )
         values = signs.to(dtype) * scale
 
-        self._indices = torch.stack([row_indices, col_indices]).to(device)
-        self._values = values.to(device)
+        self._rows = row_indices.view(self.subspace_dim, self._nnz_per_col).to(device)
+        self._values = values.view(self.subspace_dim, self._nnz_per_col).to(device)
         self._device = device
         self._dtype = dtype
-        self._sparse_matrix = None
         self._csr_matrix = None
+        self._csr_rows = None
 
-    def _get_sparse_matrix(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Return the sparse COO matrix, building it on first use."""
-        if self._indices is None or self._device != device or self._dtype != dtype:
+    def _pointers_dominate(self, nnz: int, index_size: int) -> bool:
+        """Whether ``full_dim + 1`` row pointers would outweigh an int64 map and pointers for ``nnz`` rows."""
+        return self.full_dim * index_size > nnz * (index_size + 8)
+
+    def _get_csr_matrix(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """The coalesced matrix in CSR, built on first use.
+
+        When full-height row pointers would outweigh a map of the touched rows, the CSR
+        keeps only the rows that hold an entry and ``_csr_rows`` maps them back.
+        """
+        if self._rows is None or self._device != device or self._dtype != dtype:
             self._init_sparse_matrix(device, dtype)
 
-        if self._sparse_matrix is None:
+        if self._csr_matrix is None:
+            cols = torch.arange(self.subspace_dim, device=device).repeat_interleave(self._nnz_per_col)
             # Indices are in range by construction; the context-manager opt-out is process-global.
-            self._sparse_matrix = torch.sparse_coo_tensor(
-                self._indices,
-                self._values,
+            coo = torch.sparse_coo_tensor(
+                torch.stack([self._rows.reshape(-1), cols]),
+                self._values.reshape(-1),
                 size=(self.full_dim, self.subspace_dim),
                 device=device,
                 dtype=dtype,
                 check_invariants=False,
             ).coalesce()
+            rows, cols = coo.indices()
+            index_dtype = torch.int32 if max(self.full_dim, cols.numel()) < 2**31 else torch.int64
+            if self._pointers_dominate(cols.numel(), index_dtype.itemsize):
+                rows, counts = rows.unique_consecutive(return_counts=True)
+                self._csr_rows = rows.clone()
+            else:
+                counts = torch.bincount(rows, minlength=self.full_dim)
+            self._csr_matrix = torch.sparse_csr_tensor(
+                torch.cat([counts.new_zeros(1), counts.cumsum(0)]).to(index_dtype),
+                cols.to(index_dtype, copy=True),
+                coo.values(),
+                size=(counts.numel(), self.subspace_dim),
+                device=device,
+                check_invariants=False,
+            )
 
-        return self._sparse_matrix
-
-    def _get_csr_matrix(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """The same matrix in CSR, cached beside the COO one."""
-        coo = self._get_sparse_matrix(device, dtype)
-        if self._csr_matrix is None:
-            self._csr_matrix = coo.to_sparse_csr()
         return self._csr_matrix
 
     def columns(self, cols: torch.Tensor, device: torch.device, dtype: torch.dtype):
@@ -153,11 +160,9 @@ class SparseRandomProjection:
         Returns ``(rows, vals)`` shaped ``(len(cols), nnz_per_col)``. Duplicate rows
         within a column stay separate; scatter-add to match what coalesce would sum.
         """
-        if self._indices is None or self._device != device or self._dtype != dtype:
+        if self._rows is None or self._device != device or self._dtype != dtype:
             self._init_sparse_matrix(device, dtype)
-        rows = self._indices[0].view(self.subspace_dim, self._nnz_per_col)
-        vals = self._values.view(self.subspace_dim, self._nnz_per_col)
-        return rows.index_select(0, cols), vals.index_select(0, cols)
+        return self._rows.index_select(0, cols), self._values.index_select(0, cols)
 
     def project(self, coords: torch.Tensor) -> torch.Tensor:
         """Project subspace coordinates to full space: full = P @ coords."""
@@ -167,7 +172,10 @@ class SparseRandomProjection:
 
         # CSR on a contiguous operand is much faster than COO on the transposed view.
         P = self._get_csr_matrix(coords.device, coords.dtype)
-        result = (P @ coords.T.contiguous()).T
+        result = P @ coords.T.contiguous()
+        if self._csr_rows is not None:
+            result = result.new_zeros(self.full_dim, result.shape[1]).index_copy_(0, self._csr_rows, result)
+        result = result.T
 
         if is_1d:
             result = result.squeeze(0)
@@ -186,18 +194,25 @@ class SparseRandomProjection:
 
     @property
     def memory_bytes(self) -> int:
-        """Estimated memory usage in bytes (indices plus values)."""
-        total_nnz = self.nnz
-        indices_bytes = 2 * total_nnz * 8
-        element_size = self._dtype.itemsize if self._dtype else 4
-        values_bytes = total_nnz * element_size
-        return indices_bytes + values_bytes
+        """Bytes held by the entries and the cached CSR, estimated before the first ``project``."""
+        if self._csr_matrix is not None:
+            P = self._csr_matrix
+            held = [self._rows, self._values, P.crow_indices(), P.col_indices(), P.values(), self._csr_rows]
+            return sum(t.untyped_storage().nbytes() for t in held if t is not None)
+        nnz = self.nnz
+        index_size = 4 if max(self.full_dim, nnz) < 2**31 else 8
+        value_size = self._dtype.itemsize if self._dtype else 4
+        if self._pointers_dominate(nnz, index_size):
+            pointers = nnz * 8 + (nnz + 1) * index_size
+        else:
+            pointers = (self.full_dim + 1) * index_size
+        return nnz * (8 + value_size) + nnz * (index_size + value_size) + pointers
 
     @property
     def nnz(self) -> int:
         """Number of nonzeros after coalesce, or the pre-coalesce estimate before build."""
-        if self._sparse_matrix is not None:
-            return self._sparse_matrix._nnz()
+        if self._csr_matrix is not None:
+            return self._csr_matrix._nnz()
         return self._nnz_per_col * self.subspace_dim
 
     def __repr__(self) -> str:

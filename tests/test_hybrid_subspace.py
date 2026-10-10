@@ -133,6 +133,23 @@ class TestHybridInitProjections:
                     actual_std = P.std().item()
                     assert abs(actual_std - expected_std) < 0.1 * expected_std
 
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_cuda_projection_runs_its_qr_on_the_gpu_from_the_cpu_seed(self, hybrid_sub, monkeypatch):
+        """The QR runs on the GPU, but the Gaussian still comes from the CPU seed, so both devices agree up to rounding."""
+        import polystep.hybrid_subspace as hybrid_module
+
+        qr_devices = []
+        real_qr = hybrid_module.thin_qr
+        monkeypatch.setattr(hybrid_module, "thin_qr", lambda m: qr_devices.append(m.device.type) or real_qr(m))
+        on_cpu = hybrid_sub.init_projections(torch.device("cpu"), torch.float32)
+        on_cuda = hybrid_sub.init_projections(torch.device("cuda"), torch.float32)
+
+        assert qr_devices == ["cpu"] * len(on_cpu) + ["cuda"] * len(on_cuda)
+        for key, P in on_cpu.items():
+            assert on_cuda[key].device.type == "cuda"
+            assert torch.allclose(on_cuda[key].cpu(), P, atol=1e-5)
+
 
 def test_apply_inplace_updates_noncontiguous_param(model, hybrid_sub):
     """Non-contiguous param.data makes reshape a copy; apply_perturbation_inplace

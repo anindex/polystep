@@ -174,8 +174,55 @@ def test_half_precision_cost_gives_a_full_precision_plan(solver):
     assert torch.allclose(result.matrix.sum(dim=1), torch.full((5,), 0.2), atol=1e-5)
 
 
+@pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+@pytest.mark.parametrize("num_probe", [1, 3])
+def test_topk_in_the_optimizer_ignores_infeasible_vertices(block_strategy, num_probe):
+    """Only the candidate with the largest first weight scores; every other one is NaN.
+
+    The step handed TopK the sanitize penalty as a finite cost, so it averaged
+    infeasible vertices into the move. A vertex with any infeasible probe is
+    infeasible, so with three probes none is left and the particle stays put.
+    """
+    from polystep.optimizer import PolyStepOptimizer
+
+    torch.manual_seed(0)
+    model = nn.Linear(2, 1, bias=False)
+    opt = PolyStepOptimizer(
+        model,
+        solver="top_k_mean",
+        polytope_type="orthoplex",
+        num_probe=num_probe,
+        use_momentum=False,
+        block_strategy=block_strategy,
+        seed=0,
+    )
+    start = model.weight.detach().reshape(-1).clone()
+    scored = []
+
+    def closure(params):
+        w = params["weight"].reshape(-1, 2)
+        best = w[:, 0].argmax()
+        scored.append(w[best].clone())
+        return torch.full((w.shape[0],), float("nan")).index_fill(0, best, 0.0)
+
+    opt.step(closure)
+
+    assert len(scored) == 1
+    expected = scored[0] if num_probe == 1 else start
+    torch.testing.assert_close(model.weight.detach().reshape(-1), expected)
+
+
 def test_topk_excludes_every_nonfinite_cost_and_freezes_uninformative_rows():
     costs = torch.tensor([[1.0, float("-inf"), float("nan"), float("inf")], [float("nan")] * 4, [2.0] * 4])
     plan = TopKMeanSolver(k=3).solve(costs).matrix
     expected = torch.tensor([[1 / 3, 0.0, 0.0, 0.0], [1 / 12] * 4, [1 / 12] * 4])
     torch.testing.assert_close(plan, expected)
+
+
+@pytest.mark.parametrize("solver", [MinCostGreedySolver(), TopKMeanSolver(k=1)])
+def test_a_cost_at_the_dtype_limit_still_excludes_infeasible_vertices(solver):
+    """The penalty clamps to the dtype max, so ranking on it made the row look flat."""
+    top = torch.finfo(torch.float32).max
+    costs = torch.tensor([[top, float("inf")], [float("nan"), top]])
+    plan = solver.solve(costs).matrix
+    torch.testing.assert_close(plan, torch.tensor([[0.5, 0.0], [0.0, 0.5]]))

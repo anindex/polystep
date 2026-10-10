@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from polystep.costs import compute_cost_matrix, scale_cost_matrix
+from polystep.costs import compute_cost_matrix, resolve_cost_scale, scale_cost_matrix
 
 
 def test_scale_cost_matrix_rejects_nonpositive_float():
@@ -47,6 +47,18 @@ def test_scale_cost_matrix_none():
 def test_scale_cost_matrix_named_modes(mode, divisor):
     C = torch.tensor([[2.0, 4.0], [6.0, 8.0]])  # mean 5, max 8
     assert torch.allclose(scale_cost_matrix(C, mode), C / divisor)
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"))],
+)
+@pytest.mark.parametrize("mode", ["mean", "max_cost"])
+def test_an_all_finite_mask_leaves_the_divisor_unchanged(mode, device):
+    """243 * fl(1/243) is not 1 in fp32, so a ratio of counts would move a clean divisor."""
+    for dtype in (torch.float32, torch.float64):
+        C = torch.rand(81, 3, dtype=dtype, device=device)
+        assert torch.equal(resolve_cost_scale(C, mode, torch.isfinite(C)), resolve_cost_scale(C, mode))
 
 
 def test_scale_cost_matrix_float():

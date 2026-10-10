@@ -13,6 +13,7 @@ from polystep.geometry import (
     _QR_MAX_BATCH,
     get_rotation_matrix_2d,
 )
+from polystep.solvers._shared import thin_qr
 
 
 class TestPolytopes:
@@ -214,3 +215,15 @@ def test_small_batch_takes_qr_and_stays_haar_on_so():
     # Just past the cap the reflection loop takes over and must still be SO(d).
     over = get_random_rotation_matrices(cap + 1, 8, generator=torch.Generator().manual_seed(7))
     torch.testing.assert_close(torch.det(over.double()), torch.ones(cap + 1, dtype=torch.float64), atol=1e-5, rtol=0)
+
+
+@pytest.mark.parametrize("shape, threads", [((784, 64), 1), ((25000, 16), 1), ((50000, 64), 2)])
+def test_thin_qr_pins_only_small_problems(monkeypatch, shape, threads):
+    """Measured on 2 to 24 threads, one thread wins at 784x64 and the whole pool at 50000x64."""
+    torch.set_num_threads(2)
+    seen = []
+    qr = torch.linalg.qr
+    monkeypatch.setattr(torch.linalg, "qr", lambda m, mode: seen.append(torch.get_num_threads()) or qr(m, mode=mode))
+    thin_qr(torch.randn(*shape))
+    assert seen == [threads]
+    assert torch.get_num_threads() == 2

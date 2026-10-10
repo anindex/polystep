@@ -179,11 +179,11 @@ class TestBlockLayoutConversion:
         assert b1_flat[3].item() == 0.0
 
 
-def test_blockwise_sanitizes_before_averaging_probes_like_the_monolithic_driver():
-    """Averaging first let one non-finite probe carry its whole vertex to the penalty.
+def test_blockwise_keeps_a_vertex_with_a_nonfinite_probe_infeasible():
+    """One non-finite probe makes the whole vertex infeasible, as in the monolithic driver.
 
-    The two drivers then built different cost matrices from identical evaluations, and
-    nothing in the suite ran both.
+    It used to come back as a blend of its finite probes and the penalty, so the solve
+    could still pick it.
     """
     from types import SimpleNamespace
 
@@ -193,12 +193,7 @@ def test_blockwise_sanitizes_before_averaging_probes_like_the_monolithic_driver(
     losses = torch.tensor([1.0, float("inf"), 1.0, 2.0, 2.0, 2.0])
     cost = _cost_from_losses(SimpleNamespace(_all_nonfinite=None), losses, P=1, V=2, K=3)
 
-    assert torch.isfinite(cost).all()
-    # Penalty is 2 * max|finite| + 1 = 5. Vertex 0 must come back as a blend of its two
-    # finite probes and that penalty, not as the penalty itself, which is what averaging
-    # an inf first would give.
-    assert 1.0 < cost[0, 0].item() < 5.0
-    assert cost[0, 0].item() == pytest.approx((1.0 + 5.0 + 1.0) / 3)
+    assert cost.tolist() == [[float("inf"), 2.0]]
 
 
 def test_blockwise_radius_follows_the_best_vertex_mean(monkeypatch):

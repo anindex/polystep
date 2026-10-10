@@ -26,9 +26,10 @@ class KLSoftmaxSolver:
     lam: float = float("inf")
     max_iterations: int = 2000
     threshold: float = 1e-6
+    check_every: int = 10
 
     # KL(P^T 1 || b) from the last solve; None until the first solve.
-    last_marginal_violation: Optional[float] = field(default=None, init=False, repr=False)
+    _marginal_kl: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         validate_positive(self.epsilon, "epsilon")
@@ -38,6 +39,15 @@ class KLSoftmaxSolver:
             raise ValueError(f"threshold must be >= 0, got {self.threshold}")
         if self.max_iterations < 1:
             raise ValueError(f"max_iterations must be >= 1, got {self.max_iterations}")
+        if self.check_every < 1:
+            raise ValueError(
+                f"check_every must be >= 1, got {self.check_every}. It is the modulus for periodic convergence checks."
+            )
+
+    @property
+    def last_marginal_violation(self) -> Optional[float]:
+        """Generalized KL(P^T 1 || b) of the last solve, read from the device on access."""
+        return None if self._marginal_kl is None else self._marginal_kl.item()
 
     @property
     def alpha(self) -> float:
@@ -90,7 +100,7 @@ class KLSoftmaxSolver:
             if g is None:
                 g = torch.zeros(m, device=device, dtype=dtype)
             # Drop a non-finite warm start rather than propagate it into the LSE.
-            if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
+            if not (torch.isfinite(f).all() & torch.isfinite(g).all()):
                 f = torch.zeros(n, device=device, dtype=dtype)
                 g = torch.zeros(m, device=device, dtype=dtype)
 
@@ -103,7 +113,7 @@ class KLSoftmaxSolver:
                 converged = False
                 n_iters = self.max_iterations
                 # Sync the convergence flag once per check_every to keep the dual updates GPU-resident.
-                check_every = max(1, self.max_iterations // 20)
+                check_every = self.check_every
                 threshold = float(self.threshold)
                 for it in range(self.max_iterations):
                     # f-update: exact row-marginal enforcement.
@@ -135,20 +145,11 @@ class KLSoftmaxSolver:
             f = eps * (log_a - torch.logsumexp(logits, dim=1)) - row_max.squeeze(1)
 
             # Undo both frame changes so cost is <C_raw, P> (sum(P) == a.sum()).
-            cost = ((C * P).sum() * cost_scale + cost_shift * a.sum()).item()
+            cost = (C * P).sum() * cost_scale + cost_shift * a.sum()
 
             # Generalized KL(P^T 1 || b), the divergence this solver actually penalizes. The -q+b mass terms keep it non-negative when sum(q) != sum(b).
             col_marginal = P.sum(dim=0).clamp(min=1e-30)
             b_safe = b.clamp(min=1e-30)
-            kl = (col_marginal * (col_marginal.log() - b_safe.log()) - col_marginal + b_safe).sum().item()
-            self.last_marginal_violation = float(kl)
+            self._marginal_kl = (col_marginal * (col_marginal.log() - b_safe.log()) - col_marginal + b_safe).sum()
 
-        return SolverResult(
-            matrix=P,
-            cost=cost,
-            f=f,
-            g=g,
-            converged=converged,
-            n_iters=n_iters,
-            ent_reg_cost=cost,
-        )
+        return SolverResult(matrix=P, f=f, g=g, converged=converged, n_iters=n_iters, _ent_reg=cost)

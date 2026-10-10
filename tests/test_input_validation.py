@@ -13,14 +13,14 @@ from polystep.costs import scale_cost_matrix
 from polystep._compiled import _fused_softmax_project
 from polystep.geometry import get_orthoplex_vertices, get_random_rotation_matrices
 from polystep.solvers import KLSoftmaxSolver, SinkhornSolver, SoftmaxSolver
-from polystep.solvers._shared import align_dual, align_marginal, recenter_cost, sanitize_cost
+from polystep.solvers._shared import align_dual, align_marginal, prepare_cost, sanitize_cost
 
 
 @pytest.mark.parametrize("scale_cost", ["mean", "max_cost", 2.0, None])
 @pytest.mark.parametrize("variant", ["finite", "inf", "bf16"])
 def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
-    """The fused path (sanitize_cost -> scale -> kernel) matches SoftmaxSolver.solve
-    for every scale_cost mode, including +inf hard constraints and BF16."""
+    """The fused path (prepare_cost -> kernel) matches SoftmaxSolver.solve for every
+    scale_cost mode, including +inf hard constraints and BF16."""
     torch.manual_seed(0)
     P, dim = 6, 2
     verts = get_orthoplex_vertices(dim)  # (V, dim), V = 2*dim
@@ -38,20 +38,17 @@ def test_fused_softmax_matches_solver_scale_cost(scale_cost, variant):
     # Non-fused reference (sanitizes internally)
     ref = SoftmaxSolver(epsilon=eps).solve(cost, a=a, scale_cost=scale_cost).matrix
 
-    # Recenter before scaling: with a data-dependent divisor the order is not shift-invariant.
-    scaled = scale_cost_matrix(recenter_cost(sanitize_cost(cost))[0], scale_cost)
+    scaled = prepare_cost(cost, None, scale_cost, "SoftmaxSolver")[0]
     _, fused_T = _fused_softmax_project(
         scaled,
         eps,
-        a.float(),
         verts.float(),
         rot.float(),
         0.15,
         X.float(),
-        scale_cost_mean=False,
     )
     assert torch.isfinite(fused_T).all()
-    assert torch.allclose(ref, fused_T, atol=1e-5)
+    assert torch.allclose(ref, fused_T * a[:, None], atol=1e-5)
 
 
 def test_num_probe_zero_raises():

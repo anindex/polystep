@@ -282,9 +282,9 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         )
         _require_tall(spec)
         # geqrf has no bf16/fp16 CPU kernel; orthogonalize in fp32, cast back.
-        qr_in = P_raw.to(decomposition_dtype(P_raw.dtype))
+        qr_in = P_raw.to(device=device, dtype=decomposition_dtype(P_raw.dtype))
         P, _ = thin_qr(qr_in)  # (num_params, num_coords)
-        P = P.to(dtype=P_raw.dtype).to(device=device)
+        P = P.to(dtype=P_raw.dtype)
 
         return P
 
@@ -318,10 +318,12 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
 
         if not use_random:
             # Fall back to random when the history is non-finite or near zero.
-            if not torch.isfinite(displacement_history).all():
-                use_random = True
-            elif (displacement_history * displacement_history).sum().item() < 1e-20:
-                use_random = True
+            disp_norm_sq = torch.where(
+                torch.isfinite(displacement_history).all(),
+                (displacement_history * displacement_history).sum(),
+                torch.nan,
+            ).item()
+            use_random = math.isnan(disp_norm_sq) or disp_norm_sq < 1e-20
 
         if use_random:
             return self._rotate_all_random(device, dtype, step)

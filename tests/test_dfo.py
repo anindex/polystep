@@ -536,6 +536,20 @@ def test_screen_calibrates_on_finite_kept_costs():
         torch.testing.assert_close(out[p, 2:], (screen_cost[p, 2:] + offset).unsqueeze(-1).expand(2, K))
 
 
+def test_screen_calibrates_on_finite_screen_costs():
+    """A nonfinite screen cost stays out of the offset, and a dropped vertex keeps it."""
+    from polystep._step_monolithic import _fill_screened_losses
+
+    nan = float("nan")
+    screen_cost = torch.tensor([[nan, 2.0, 3.0, nan]])
+    keep_mask = torch.tensor([[True, True, False, False]])
+
+    out = _fill_screened_losses(screen_cost, torch.tensor([10.0, 12.0]), torch.tensor([0, 1]), keep_mask, 1, 4, 1)
+
+    assert out[2].item() == 13.0
+    assert out[3].isnan()
+
+
 def test_site_vmap_screens_on_the_screen_slice():
     """A Conv2d model scores full-space candidates on the site-vmap path, which must
     screen on the same slice as the screen closure, not on the whole batch."""

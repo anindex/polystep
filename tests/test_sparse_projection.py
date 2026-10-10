@@ -41,8 +41,9 @@ class TestMemoryEfficiency:
         proj = SparseRandomProjection(full_dim=100_000, subspace_dim=256, seed=42)
 
         assert proj._nnz_per_col == 316  # int(100_000 / sqrt(100_000))
-        # int64 row + col index per nonzero, plus an fp32 value.
-        assert proj.memory_bytes == 316 * 256 * 20
+        # An int64 row and fp32 value per drawn entry, then the CSR's int32 column and
+        # fp32 value per entry and its int32 row pointers.
+        assert proj.memory_bytes == 316 * 256 * 20 + 4 * 100_001
 
     def test_memory_vs_dense(self):
         """Sparse projection uses much less memory than dense equivalent."""
@@ -79,6 +80,30 @@ class TestMemoryEfficiency:
         expected_nnz_per_col = max(1, int(0.01 * 10000))
         assert proj._nnz_per_col == expected_nnz_per_col
         assert proj.nnz == expected_nnz_per_col * 64
+
+
+@pytest.mark.parametrize(
+    "full_dim, subspace_dim, touched_rows_only", [(100_000, 16, True), (100_000, 140, False), (1000, 64, False)]
+)
+def test_projection_matches_the_coalesced_csr(full_dim, subspace_dim, touched_rows_only):
+    """Both cached layouts give the result of the plain int64 CSR, and the size counts what is held."""
+    proj = SparseRandomProjection(full_dim=full_dim, subspace_dim=subspace_dim, seed=0)
+    coords = torch.randn(5, subspace_dim, generator=torch.Generator().manual_seed(0))
+    full = proj.project(coords)
+
+    rows, vals = proj.columns(torch.arange(subspace_dim), torch.device("cpu"), torch.float32)
+    cols = torch.arange(subspace_dim).repeat_interleave(rows.shape[1])
+    reference = torch.sparse_coo_tensor(
+        torch.stack([rows.reshape(-1), cols]), vals.reshape(-1), (full_dim, subspace_dim)
+    )
+    expected = (reference.coalesce().to_sparse_csr() @ coords.T.contiguous()).T
+
+    assert torch.equal(full, expected)
+    assert (proj._csr_rows is not None) is touched_rows_only
+    assert proj._csr_matrix.col_indices().dtype == torch.int32
+    held = [v for v in vars(proj).values() if isinstance(v, torch.Tensor)]
+    parts = [t for h in held for t in ((h.crow_indices(), h.col_indices(), h.values()) if h.is_sparse_csr else (h,))]
+    assert proj.memory_bytes == sum(t.untyped_storage().nbytes() for t in parts)
 
 
 class TestJLTProperty:

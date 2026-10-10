@@ -448,7 +448,6 @@ class PolyStepOptimizer(SerializationMixin):
         self._transport_direction_ema = None
         self.biased_rotation = biased_rotation
         self._prev_descent_direction: Optional[torch.Tensor] = None
-        self._prev_descent_direction_finite: bool = False
         self.use_quadratic_model = use_quadratic_model
         self._losses_3d = None  # (P, V, K) loss tensor
         self._newton_refinement = newton_refinement
@@ -799,9 +798,7 @@ class PolyStepOptimizer(SerializationMixin):
         if seed is not None:
             self._generator = create_generator(seed, device)
 
-        num_points = X_init.shape[0]
-        a = torch.ones(num_points, device=device, dtype=X_init.dtype) / num_points
-        self._state = SolverState(X=X_init.clone(), a=a)
+        self._state = SolverState(X=X_init.clone())
 
         if subspace is not None:
             self._state.base_params = {k: v.clone() for k, v in model.state_dict().items()}
@@ -1214,13 +1211,13 @@ class PolyStepOptimizer(SerializationMixin):
 
     def release_evaluator(self) -> None:
         """Drop the registered evaluator and its batch data."""
-        self._cost_evaluator = None
-        self._fused_inputs = None
-        self._fused_targets = None
-        for attr in ("_factored_evaluator", "_sparse_delta_evaluator", "_subspace_delta_evaluator"):
+        for attr in ("_cost_evaluator", "_factored_evaluator", "_sparse_delta_evaluator", "_subspace_delta_evaluator"):
             ev = getattr(self, attr, None)
             if ev is not None:
                 ev._cast_cache = None
+        self._cost_evaluator = None
+        self._fused_inputs = None
+        self._fused_targets = None
 
     def _screen_data(self):
         """Low-fidelity ``(inputs, targets)`` the registered evaluator screens on."""
@@ -1347,6 +1344,7 @@ class PolyStepOptimizer(SerializationMixin):
             max_subspace_dim=getattr(old_subspace, "_max_subspace_dim", None),
             **carried,
         )
+        self.subspace._entry_dtypes = {k: v.dtype for k, v in state.base_params.items()}
 
         state.subspace = self.subspace
 
@@ -1386,7 +1384,6 @@ class PolyStepOptimizer(SerializationMixin):
         self._hybrid_subspace = self.subspace
 
         num_points = state.X.shape[0]
-        state.a = torch.ones(num_points, device=state.X.device, dtype=state.X.dtype) / num_points
 
         # Duals and directions were measured in the outgoing basis.
         invalidate_for_basis_change(self, state)
@@ -1429,7 +1426,6 @@ class PolyStepOptimizer(SerializationMixin):
         self._transport_direction_ema = None
         self._newton_direction = None
         self._prev_descent_direction = None
-        self._prev_descent_direction_finite = False
         self._prev_block_descent_directions = None
         self._prev_predicted_improvement = None
         self._prev_pre_step_loss = None
@@ -1449,6 +1445,8 @@ class PolyStepOptimizer(SerializationMixin):
         state = self._state
         if self._per_layer_projections:
             base = state.base_params
+            if self._hybrid:
+                self.subspace._entry_dtypes = {k: v.dtype for k, v in base.items()}
             state.hybrid_projections = {
                 k: v.to(base[k].dtype) if isinstance(v, torch.Tensor) else v
                 for k, v in state.hybrid_projections.items()

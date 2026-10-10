@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -15,23 +16,11 @@ if TYPE_CHECKING:
     from .transform import ParamLayout
 
 
-def _spawn_cpu_generator(generator: Optional[torch.Generator]) -> Optional[torch.Generator]:
-    """Mirror a non-CPU generator onto CPU, seeded from a fresh draw."""
-    if generator is None or generator.device.type == "cpu":
-        return generator
-    seed = int(torch.randint(0, 2**31 - 1, (1,), generator=generator, device=generator.device).item())
-    cpu_gen = torch.Generator(device="cpu")
-    cpu_gen.manual_seed(seed)
-    return cpu_gen
-
-
 def _draw_basis_gaussian(rows, cols, device, dtype, generator):
-    """Draw a ``(rows, cols)`` Gaussian for basis construction."""
+    """Draw a ``(rows, cols)`` Gaussian on the generator's device and move it to ``device``."""
     target = torch.device(device)
-    if generator is None:
-        return torch.randn(rows, cols, device=target, dtype=dtype)
-    Z = torch.randn(rows, cols, generator=_spawn_cpu_generator(generator), device="cpu", dtype=dtype)
-    return Z.to(device=target) if target.type != "cpu" else Z
+    draw_device = target if generator is None else generator.device
+    return torch.randn(rows, cols, generator=generator, device=draw_device, dtype=dtype).to(target)
 
 
 @dataclass(frozen=True)
@@ -106,7 +95,7 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         P, R = thin_qr(Z)
         # Positive diagonal in R removes the QR sign ambiguity.
         d = torch.sign(torch.diagonal(R))
-        d[d == 0] = 1.0
+        d = torch.where(d == 0, 1.0, d)
         P = (P * d)[:, :cols]  # QR may return a full square Q; slice back to cols
         if dtype != compute_dtype:
             P = P.to(dtype=dtype)
@@ -133,12 +122,12 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         )
 
         if not use_random:
-            if not torch.isfinite(displacement_history).all():
-                use_random = True
-            else:
-                disp_norm_sq = (displacement_history * displacement_history).sum().item()
-                if disp_norm_sq < 1e-20:
-                    use_random = True
+            disp_norm_sq = torch.where(
+                torch.isfinite(displacement_history).all(),
+                (displacement_history * displacement_history).sum(),
+                torch.nan,
+            ).item()
+            use_random = math.isnan(disp_norm_sq) or disp_norm_sq < 1e-20
 
         if use_random:
             return self._rotate_random(device, dtype, generator)
@@ -194,10 +183,9 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             D_full = displacement_history.T
         else:
             D_full = projection @ displacement_history.T
-
-        # Fall back to random on non-finite history.
-        if not torch.isfinite(D_full).all():
-            return self._rotate_random(device, dtype, generator)
+            # Fall back to random on non-finite history.
+            if not torch.isfinite(D_full).all():
+                return self._rotate_random(device, dtype, generator)
 
         compute_dtype = decomposition_dtype(dtype)
         D_full = D_full.to(compute_dtype)
@@ -215,7 +203,7 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         combined = torch.cat([U_top, Z_random], dim=1)
         P_new, R = thin_qr(combined)
         d = torch.sign(torch.diagonal(R))
-        d[d == 0] = 1.0
+        d = torch.where(d == 0, 1.0, d)
         P_new = P_new * d
         P_new = P_new[:, : self.subspace_dim]
         if P_new.dtype != dtype:

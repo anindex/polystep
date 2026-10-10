@@ -12,12 +12,12 @@ from .costs import compute_cost_matrix
 from .epsilon import feed_solver_stats, resolve_radius, LinearEpsilon, ProgressiveEpsilon
 from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
 from .solvers import SinkhornSolver, SoftmaxSolver
-from .solvers._shared import solver_health, validate_positive
+from .solvers._shared import sanitize_cost, solver_health, validate_positive
 
 
 @dataclass
 class SolverState:
-    """State of the Sinkhorn Step solver. ``costs`` is the mean over all ``P * V`` probe vertices, not a best-seen value."""
+    """State of the Sinkhorn Step solver. ``costs`` is the mean over all ``P * V`` probe vertices after ``sanitize_cost``, ``inf`` when every vertex cost is nonfinite and ``nan`` when ``X`` is, not a best-seen value."""
 
     X: torch.Tensor
     costs: List[float] = field(default_factory=list)
@@ -26,7 +26,6 @@ class SolverState:
     evals: List[int] = field(default_factory=list)
     linear_convergence: List[bool] = field(default_factory=list)
     displacement_sqnorms: List[float] = field(default_factory=list)
-    a: Optional[torch.Tensor] = None
     iteration_count: int = 0
     f: Optional[torch.Tensor] = None
     g: Optional[torch.Tensor] = None
@@ -99,6 +98,7 @@ class PolyStep:
 
         self.polytope_vertices = POLYTOPE_MAP[self.polytope_type](self.dim, radius=1.0)
         self.probes = torch.linspace(0, 1, self.num_probe + 2)[1 : self.num_probe + 1]
+        self._templates = {}
         self.sinkhorn_solver = SinkhornSolver(
             max_iterations=self.sinkhorn_max_iters,
             compile=self.compile,
@@ -120,12 +120,11 @@ class PolyStep:
 
     def init_state(self, X_init: torch.Tensor) -> SolverState:
         """Initialize solver state from ``X_init``."""
-        # Normalize a 1-D point to one particle so the marginal ``a`` is sized by particle count, not dim.
+        # Normalize a 1-D point to one particle so the particle count is not read from dim.
         if X_init.dim() == 1:
             X_init = X_init.unsqueeze(0)
 
         num_points = X_init.shape[0]
-        a = torch.ones(num_points, device=X_init.device, dtype=X_init.dtype) / num_points
 
         # One particle forces a uniform plan, so the step ignores the cost and never
         # moves. Only warn here; ``_solver_for`` makes the substitution per step, so a
@@ -137,7 +136,7 @@ class PolyStep:
                 stacklevel=2,
             )
 
-        return SolverState(X=X_init.clone(), a=a)
+        return SolverState(X=X_init.clone())
 
     def _solver_for(self, state: SolverState):
         """The solver this state's particle count needs, without mutating ``self``.
@@ -183,8 +182,13 @@ class PolyStep:
         step_radius = resolve_radius(self.step_radius, iteration, current_eps)
         probe_radius = resolve_radius(self.probe_radius, iteration, current_eps)
 
-        polytope_verts = self.polytope_vertices.to(device=device, dtype=X.dtype)
-        probes = self.probes.to(device=device, dtype=X.dtype)
+        templates = self._templates.get((device, X.dtype))
+        if templates is None:
+            templates = self._templates[(device, X.dtype)] = (
+                self.polytope_vertices.to(device=device, dtype=X.dtype),
+                self.probes.to(device=device, dtype=X.dtype),
+            )
+        polytope_verts, probes = templates
 
         # Pre-normalize to avoid a shape branch in the compiled fn.
         if X.dim() == 1:
@@ -220,8 +224,6 @@ class PolyStep:
             chunk_size=self.chunk_size,
         )
 
-        # No sanitize here: prepare_cost does it; a second pass would double-penalize.
-
         ent_eps = self._get_ent_epsilon(iteration)
         ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
@@ -245,18 +247,22 @@ class PolyStep:
             X_vertices,
         )
         ess, rho = solver_health(transport_matrix, X_new - X, step_radius)
+        cost_mean = torch.where(torch.isfinite(cost_matrix).any(), sanitize_cost(cost_matrix).mean(), torch.inf)
+        finite, disp_sqnorm, cost_mean, ess, rho = torch.stack(
+            [torch.isfinite(X_new).all().to(X.dtype), ((X_new - X) ** 2).sum(-1).mean(), cost_mean, ess, rho]
+        ).tolist()
 
         # NaN-safe: revert if X_new has NaN.
-        _nan_reverted = not torch.isfinite(X_new).all()
+        _nan_reverted = not finite
         if _nan_reverted:
             X_new = X.clone()
-
-        disp_sqnorm = torch.mean(torch.sum((X_new - X) ** 2, dim=-1)).item()
+            disp_sqnorm = 0.0
+            if not torch.isfinite(X).all():
+                cost_mean = disp_sqnorm = math.nan
 
         state.X = X_new
-        # Raw mean objective, not the regularized dual, so min(costs) is the best objective.
-        state.costs.append(cost_matrix.mean().item())
-        state.record_solver_health(ess.item(), rho.item(), X_probe[..., 0].numel())
+        state.costs.append(cost_mean)
+        state.record_solver_health(ess, rho, X_probe[..., 0].numel())
         state.linear_convergence.append(ot_result.converged)
         feed_solver_stats(self.epsilon, ot_solver, ot_result.n_iters, ot_result.converged)
         state.displacement_sqnorms.append(disp_sqnorm)

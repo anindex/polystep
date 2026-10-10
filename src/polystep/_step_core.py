@@ -6,16 +6,18 @@ import warnings
 
 import torch
 
+from ._compiled import normalize_rows
+
 
 def warn_all_nonfinite(opt) -> None:
-    """Warn once when every candidate of a step evaluated to NaN or inf."""
+    """Warn once when every vertex cost of a step is NaN or inf."""
     if getattr(opt, "_nonfinite_warned", False):
         return
     opt._nonfinite_warned = True
     warnings.warn(
-        "every candidate evaluated to NaN or inf this step, so the cost matrix "
+        "every vertex cost was NaN or inf this step, so the cost matrix "
         "carries no ranking information: the plan is uniform, the step is exactly "
-        "zero, and the reported cost is the sanitize penalty rather than a loss.",
+        "zero, and the step records an infinite cost.",
         RuntimeWarning,
         stacklevel=3,
     )
@@ -55,7 +57,7 @@ def record_saturation(opt, state, transport, step_radius) -> None:
     if log is None:
         return
     V = transport.shape[-1]
-    p = transport / transport.sum(-1, keepdim=True).clamp_min(1e-30)
+    p = normalize_rows(transport)
     omega = (p - 1.0 / V).abs().amax(-1) * V
     # At lambda = 0 the row is softmax(-C/eps), so log(p_max/p_min) is the exact cost-row spread.
     # Rows whose smallest weight underflows float32 are counted, not trusted: their spread is a floor.
@@ -126,7 +128,6 @@ def invalidate_for_basis_change(opt, state) -> None:
     opt._transport_direction_ema = None
     opt._newton_direction = None
     opt._prev_descent_direction = None
-    opt._prev_descent_direction_finite = False
     opt._center_loss = None
 
     if opt.use_momentum and state.velocity is not None:

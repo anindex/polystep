@@ -148,7 +148,8 @@ class TestMixedPrecisionStep:
         ),
     ],
 )
-def test_bf16_candidate_losses_reduce_in_fp32(path):
+@pytest.mark.parametrize("reduction", ["mean", "none"])
+def test_bf16_candidate_losses_reduce_in_fp32(path, reduction):
     """A BF16 mean near 2.37 moves in steps of 2^-6, so candidates whose FP32 cross
     entropy differs by about 1e-3 would tie."""
     gen = torch.Generator().manual_seed(0)
@@ -164,7 +165,9 @@ def test_bf16_candidate_losses_reduce_in_fp32(path):
     assert 5e-4 < reference[0] - reference[1] < 2e-3
 
     device = "cuda" if path == "compiled" else "cpu"
-    evaluator = NNCostEvaluator(model.to(device), nn.CrossEntropyLoss(), use_inplace=path in ("inplace", "compiled"))
+    evaluator = NNCostEvaluator(
+        model.to(device), nn.CrossEntropyLoss(reduction=reduction), use_inplace=path in ("inplace", "compiled")
+    )
     if path in ("vmap", "loop"):
         evaluator._batched_linear = None
         evaluator._vmap_failed = path == "loop"
@@ -180,6 +183,26 @@ def test_bf16_candidate_losses_reduce_in_fp32(path):
         losses = evaluator.evaluate(stacked, inputs.to(device), targets.to(device))
     assert losses[1] < losses[0]
     assert evaluator._compile_forward_verified is (path == "compiled")
+
+
+def test_bf16_batched_cross_entropy_matches_vmap():
+    """Zero logits put both candidates on one BF16 cross entropy; FP32 logits keep
+    the 2e-3 bias gap, and the batched path scores them as vmap does."""
+    model = nn.Sequential(nn.Linear(1, 2)).bfloat16()
+    nn.init.zeros_(model[0].weight)
+    nn.init.zeros_(model[0].bias)
+    inputs, targets = torch.zeros(4, 1), torch.zeros(4, dtype=torch.long)
+    weight = model[0].weight.detach()
+    stacked = {
+        "0.weight": weight.expand(2, *weight.shape).clone(),
+        "0.bias": torch.tensor([[0.0, 0.0], [0.002, 0.0]], dtype=torch.bfloat16),
+    }
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    assert evaluator._batched_linear is not None
+    batched = evaluator.evaluate(stacked, inputs, targets)
+    evaluator._batched_linear = None
+    torch.testing.assert_close(batched, evaluator.evaluate(stacked, inputs, targets), rtol=0, atol=1e-7)
+    assert batched[1] < batched[0]
 
 
 @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
@@ -258,6 +281,40 @@ class TestProjectionDtype:
         )
         for P in projections.values():
             assert P.dtype == dtype and torch.isfinite(P).all()
+
+    def test_an_fp16_history_whose_squares_overflow_still_rotates_by_displacement(self):
+        """Only nonfinite entries trigger the random fallback, so an FP16 squared-norm overflow still rotates by displacement."""
+        model = nn.Sequential(nn.Linear(16, 12), nn.Linear(12, 4))
+        layout = ParamLayout.from_module(model)
+        full_dim = sum(p.numel() for p in model.parameters())
+        cpu = torch.device("cpu")
+
+        adaptive = AdaptiveSubspace(full_dim=full_dim, subspace_dim=8, svd_ratio_init=0.5, svd_ratio_final=0.5)
+        projection = adaptive.init_projection(dtype=torch.float16)
+        history = torch.randn(5, full_dim, generator=torch.Generator().manual_seed(0)).mul(30).half()
+        history[0, 0] = 300
+        assert torch.isinf(history.square()).any()
+        rotated = adaptive.rotate(
+            projection, 1, 10, history, generator=torch.Generator().manual_seed(1), history_is_full=True
+        )
+        expected = adaptive._rotate_displacement(
+            projection, history, 0.5, cpu, torch.float16, torch.Generator().manual_seed(1), True
+        )
+        assert torch.equal(rotated, expected)
+
+        hybrid = HybridSubspace.from_layout(
+            layout, rank=4, rotation_mode="displacement", rotation_interval=1, svd_ratio_init=0.5
+        )
+        projections = hybrid.init_projections(cpu, torch.float16)
+        history = torch.randn(5, hybrid.subspace_dim, generator=torch.Generator().manual_seed(2)).mul(30).half()
+        history[0, 0] = 300
+        assert torch.isinf(history.square()).any()
+        rotated = hybrid.rotate_all(projections, step=1, total_steps=10, displacement_history=history)
+        expected = hybrid._rotate_all_displacement(
+            projections, history, hybrid.get_svd_ratio(1, 10), cpu, torch.float16, 1
+        )
+        assert rotated.keys() == expected.keys()
+        assert all(torch.equal(rotated[k], expected[k]) for k in expected)
 
 
 @pytest.mark.gpu
@@ -371,8 +428,7 @@ def test_fused_softmax_project_keeps_the_geometry_dtype():
     pv = torch.randn(V, d, dtype=torch.bfloat16)
     rot = torch.eye(d, dtype=torch.bfloat16).expand(b, d, d).contiguous()
     X = torch.randn(b, d, dtype=torch.bfloat16)
-    a = torch.full((b,), 1.0 / b)
-    X_new, transport = _fused_softmax_project(C, 0.1, a, pv, rot, 1.0, X, scale_cost_mean=False)
+    X_new, transport = _fused_softmax_project(C, 0.1, pv, rot, 1.0, X)
     assert X_new.dtype == torch.bfloat16
     assert torch.isfinite(X_new.float()).all()
 
@@ -580,6 +636,44 @@ def test_resync_rebuilds_the_fused_projection_after_a_cast(dtype):
     assert model(inputs.to(dtype)).dtype is dtype
 
 
+@pytest.mark.parametrize("rotate", [False, True])
+def test_projections_drawn_after_a_resync_follow_the_cast(rotate):
+    """A rank transition or a rotation after the cast draws each projection at its
+    parameter's new dtype, not at the coordinates' or the construction-time one."""
+    from polystep import RankSchedule
+
+    class Mixed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Linear(8, 8)
+            self.b = nn.Linear(8, 4).bfloat16()
+
+        def forward(self, x):
+            return self.b(self.a(x.to(self.a.weight.dtype)).to(self.b.weight.dtype))
+
+    torch.manual_seed(0)
+    model = Mixed()
+    layout = ParamLayout.from_module(model)
+    if rotate:
+        subspace = HybridSubspace.from_layout(layout, rank=1, rotation_interval=1, rotation_mode="random")
+        schedule = None
+    else:
+        subspace, schedule = HybridSubspace.from_layout(layout, rank=1), RankSchedule([(0, 1), (3, 2)])
+    opt = PolyStepOptimizer(model, subspace=subspace, rank_schedule=schedule, seed=0)
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    inputs, targets = torch.randn(16, 8), torch.randint(0, 4, (16,))
+    for i in range(5):
+        if i == 2:
+            model.double()
+            evaluator.reset_vmap()
+            opt.resync_from_model()
+        opt.register_evaluator(evaluator, inputs, targets)
+        opt.step(lambda p: evaluator.evaluate(p, inputs, targets), objective_token=i)
+    assert opt._applied_rank == (None if rotate else 2)
+    dtypes = {p.dtype for p in opt.state.hybrid_projections.values() if isinstance(p, torch.Tensor)}
+    assert dtypes == {torch.float64}
+
+
 @pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
 def test_resync_moves_a_global_projection_and_its_coordinates_with_a_cast(dtype):
     """One global projection multiplies the coordinates straight into the parameters, so
@@ -623,3 +717,38 @@ def test_global_vector_modes_reject_a_mixed_dtype_model():
     for kwargs in ({}, {"subspace": AdaptiveSubspace.from_layout(ParamLayout.from_module(Mixed()), rank=8)}):
         with pytest.raises(ValueError, match="mixes parameter dtypes"):
             PolyStepOptimizer(Mixed(), seed=0, **kwargs)
+
+
+def _biased_fallback_step(dtype):
+    torch.manual_seed(0)
+    model = nn.Linear(6, 3).to(dtype)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(3.0)
+    X, Y = torch.randn(64, 6), torch.randn(64, 3)
+
+    def closure(bp):
+        pred = torch.einsum("cij,nj->cni", bp["weight"].float(), X) + bp["bias"].float()[:, None, :]
+        return ((pred - Y) ** 2).mean(dim=(1, 2))
+
+    opt = PolyStepOptimizer(
+        model, particle_dim=3, biased_rotation=True, polytope_type="simplex", epsilon=0.3, step_radius=0.05, seed=0
+    )
+    before = nn.utils.parameters_to_vector(model.parameters()).float()
+    with pytest.warns(UserWarning, match="OT barycenter"):
+        opt.step(closure)
+    step = nn.utils.parameters_to_vector(model.parameters()).float() - before
+    return opt._prev_descent_direction, step.view_as(opt._prev_descent_direction)
+
+
+def test_biased_rotation_fallback_follows_the_barycentre_step():
+    direction, step = _biased_fallback_step(torch.float32)
+    torch.testing.assert_close(direction, step)
+
+
+def test_biased_rotation_fallback_keeps_steps_below_the_bf16_grid():
+    """Near 3 a bf16 parameter rounds some 0.05 steps to zero; the bias direction must not."""
+    direction, step = _biased_fallback_step(torch.bfloat16)
+    assert direction.dtype == torch.float32
+    assert (step.abs().amax(-1) == 0).any()
+    assert (direction.abs().amax(-1) > 0).all()

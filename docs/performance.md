@@ -77,16 +77,16 @@ limit can cause later calls to run eagerly.
 
 CPU attention uses native scaled-dot-product attention; CUDA uses explicit matmuls.
 BF16/FP16 solver costs accumulate in FP32. An `nn.CrossEntropyLoss`, `nn.MSELoss`,
-or `nn.L1Loss` left at its defaults also reduces half-precision candidate outputs
-in FP32, whether they come from an FP16/BF16 model or from `candidate_autocast`.
+or `nn.L1Loss` left at its defaults apart from `reduction` also reduces
+half-precision candidate outputs in FP32, whether they come from an FP16/BF16 model or from `candidate_autocast`.
 Other losses keep their own dtype. Mixed-dtype models require per-entry subspaces;
 see [limitations](../LIMITATIONS.md).
 
 With FP16 or BF16 parameters the subspace-delta and factored paths are off. They add
 each candidate's change after the matmul, so they would rank changes that the stored
 weights round away. Hybrid candidates go to the site-local path instead, which
-rebuilds the changed weight from the base weights the way a materialized candidate
-is built; factored candidates are materialized.
+builds the changed weight and the shared ones from the base weights the way a
+materialized candidate is built; factored candidates are materialized.
 
 ## Radius models
 

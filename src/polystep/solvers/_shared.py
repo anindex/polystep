@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 
+from .._compiled import normalize_rows
 from .base import SolverResult
 
 
@@ -22,8 +23,8 @@ def validate_positive(value: float, name: str, context: str = "") -> float:
 
 def solver_health(transport: torch.Tensor, displacement: torch.Tensor, step_radius: float):
     """Return ``(ess, rho)``, the two OT health numbers, as 0-dim tensors."""
-    w = transport / transport.sum(dim=1, keepdim=True).clamp(min=1e-12)
-    ess = (1.0 / (w * w).sum(dim=1).clamp(min=1e-12)).mean() / transport.shape[1]
+    w = normalize_rows(transport)
+    ess = (1.0 / (w * w).sum(dim=1)).mean() / transport.shape[1]
     rho = (displacement.norm(dim=1) / max(step_radius, 1e-12)).mean()
     return ess, rho
 
@@ -46,8 +47,13 @@ def single_thread_cpu(device: torch.device):
             torch.set_num_threads(prev)
 
 
+QR_PIN_MAX_WORK = 10**8
+
+
 def thin_qr(matrix: torch.Tensor):
-    """Reduced QR, pinned to one CPU thread."""
+    """Reduced QR, pinned to one CPU thread below ``QR_PIN_MAX_WORK`` of rows * cols**2 work."""
+    if matrix.numel() * matrix.shape[-1] >= QR_PIN_MAX_WORK:
+        return torch.linalg.qr(matrix, mode="reduced")
     with single_thread_cpu(matrix.device):
         return torch.linalg.qr(matrix, mode="reduced")
 
@@ -167,16 +173,31 @@ def align_dual(
     return init.to(device=device, dtype=dtype).clone()
 
 
-def prepare_cost(cost_matrix, a, scale_cost, solver: str):
-    """Shared solver preamble: validate, sanitize, align, recenter, then scale. Recenter before scaling so mean/max scaling is shift-invariant."""
+def recenter_and_scale(cost_matrix, raw, scale_cost):
+    """Recenter a sanitized cost, then scale it.
+
+    Data-dependent modes read only the entries finite in ``raw``, then penalize the rest
+    at twice the largest scaled finite cost plus one, so a narrow finite spread cannot
+    inflate the penalty.
+    """
     from ..costs import resolve_cost_scale
 
-    rows, _ = validate_cost_shape(cost_matrix, solver)
-    cost_matrix = sanitize_cost(cost_matrix)
-    a = align_marginal(a, rows, cost_matrix.device, cost_matrix.dtype)
+    finite = torch.isfinite(raw) if isinstance(scale_cost, str) else None
     C, cost_shift = recenter_cost(cost_matrix)
-    cost_scale = resolve_cost_scale(C, scale_cost)
-    return C / cost_scale, a, cost_shift, cost_scale
+    cost_scale = resolve_cost_scale(C, scale_cost, finite)
+    C = C / cost_scale
+    if finite is not None:
+        C = torch.where(finite, C, C.where(finite, 0).amax() * 2 + 1)
+    return C, cost_shift, cost_scale
+
+
+def prepare_cost(cost_matrix, a, scale_cost, solver: str):
+    """Shared solver preamble: validate, sanitize, align, recenter, then scale. Recenter before scaling so mean/max scaling is shift-invariant."""
+    rows, _ = validate_cost_shape(cost_matrix, solver)
+    safe = sanitize_cost(cost_matrix)
+    a = align_marginal(a, rows, safe.device, safe.dtype)
+    C, cost_shift, cost_scale = recenter_and_scale(safe, cost_matrix, scale_cost)
+    return C, a, cost_shift, cost_scale
 
 
 def solve_softmax(solver_obj, cost_matrix, a, temperature: float, scale_cost, solver: str, name: str):
@@ -185,15 +206,7 @@ def solve_softmax(solver_obj, cost_matrix, a, temperature: float, scale_cost, so
     C, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, solver)
     warn_tiny_temperature(solver_obj, temperature, C, solver, name)
     transport, ent_cost = softmax_plan(C, a, temperature, cost_shift, cost_scale)
-    return SolverResult(
-        matrix=transport,
-        cost=ent_cost,
-        f=None,
-        g=None,
-        converged=True,
-        n_iters=1,
-        ent_reg_cost=ent_cost,
-    )
+    return SolverResult(matrix=transport, _ent_reg=ent_cost)
 
 
 def softmax_plan(C, a, temperature: float, cost_shift, cost_scale):
@@ -202,5 +215,5 @@ def softmax_plan(C, a, temperature: float, cost_shift, cost_scale):
         W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / temperature, dim=-1)
         transport = W * a.to(W.dtype).unsqueeze(-1)
         # Undo both frame changes so the reported cost is <C_raw, transport>.
-        ent_cost = ((C * transport).sum() * cost_scale + cost_shift * a.to(W.dtype).sum()).item()
+        ent_cost = (C * transport).sum() * cost_scale + cost_shift * a.to(W.dtype).sum()
     return transport, ent_cost

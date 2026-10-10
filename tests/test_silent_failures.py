@@ -73,7 +73,7 @@ def test_fused_softmax_row_above_global_minimum_does_not_underflow_to_nan():
     C = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
     verts = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
     rot = torch.eye(2).expand(2, 2, 2).contiguous()
-    X_new, transport = _fused_softmax_project(C, 1e-45, torch.full((2,), 0.5), verts, rot, 0.1, torch.zeros(2, 2), True)
+    X_new, transport = _fused_softmax_project(C, 1e-45, verts, rot, 0.1, torch.zeros(2, 2))
     assert torch.isfinite(transport).all()
     assert torch.isfinite(X_new).all()
 
@@ -478,7 +478,7 @@ def test_sparse_projection_ignores_default_device():
     finally:
         torch.set_default_device("cpu")
 
-    assert projection._indices.shape == (2, projection.nnz)
+    assert projection._rows.shape == (8, projection._nnz_per_col)
 
 
 def _batch(n=6, d=4, c=3, seed=0):
@@ -541,6 +541,24 @@ class TestAuditSilentFailures:
             opt.step(nan_closure)
         assert opt.state.costs[-1] == float("inf")
         assert opt.state.linear_convergence[-1] is False
+
+    @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer", "grouped"])
+    def test_a_step_with_no_feasible_vertex_is_reported(self, block_strategy):
+        """Every vertex has one finite probe, so the flag read the probes as feasible."""
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
+        opt = PolyStepOptimizer(model, block_strategy=block_strategy, num_probe=3, seed=0, use_adaptive_radius=True)
+
+        def closure(bp):
+            losses = torch.full((next(iter(bp.values())).shape[0],), float("nan"))
+            losses[0::3] = 0.0
+            return losses
+
+        with pytest.warns(RuntimeWarning, match="carries no ranking information"):
+            assert opt.step(closure) == float("inf")
+        assert opt.state.costs[-1] == float("inf")
+        assert opt.state.linear_convergence[-1] is False
+        assert opt.state.radius_multiplier == 1.0
 
     def test_a_rank_zero_subspace_is_rejected(self):
         """num_coords=0 made every reconstruction add exactly zeros, silently."""

@@ -57,14 +57,6 @@ class TestInitProjection:
 
         assert torch.allclose(P1, P2, atol=1e-6), "Same seed should produce same P"
 
-    def test_spawn_cpu_generator_passthrough_and_none(self):
-        """CPU generators pass through unchanged; None stays None."""
-        from polystep.adaptive_subspace import _spawn_cpu_generator
-
-        assert _spawn_cpu_generator(None) is None
-        g = torch.Generator().manual_seed(7)
-        assert _spawn_cpu_generator(g) is g
-
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_cuda_generator_does_not_freeze_basis(self, adaptive_sub):
@@ -443,19 +435,33 @@ def test_displacement_mode_productivity():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_cuda_generator_creates_cpu_fallback():
-    """CUDA generator should silently create a CPU generator for reproducibility."""
+def test_cuda_generator_draws_on_its_own_device():
+    """A CUDA generator draws the Gaussian on the GPU; the basis comes back on the projection's device."""
     sub = AdaptiveSubspace(
         full_dim=100,
         subspace_dim=10,
         rotation_mode="random",
     )
     P = sub.init_projection(generator=torch.Generator().manual_seed(0))
-    cuda_gen = torch.Generator(device="cuda").manual_seed(42)
-    # Must not warn: a CPU generator is derived from the CUDA seed.
-    P_rotated = sub.rotate(P, step=0, total_steps=100, generator=cuda_gen)
-    assert P_rotated.shape == P.shape
-    assert torch.isfinite(P_rotated).all()
+    P_rotated = sub.rotate(P, step=0, total_steps=100, generator=torch.Generator(device="cuda").manual_seed(42))
+
+    Z = torch.randn(100, 10, generator=torch.Generator(device="cuda").manual_seed(42), device="cuda").cpu()
+    Q, R = torch.linalg.qr(Z)
+    assert P_rotated.device == P.device
+    assert torch.allclose(P_rotated, Q * torch.sign(torch.diagonal(R)), atol=1e-5)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_nonfinite_history_redraws_a_random_basis(bad):
+    """The history's squared norm catches a nonfinite entry, so the rotation redraws from the generator."""
+    sub = AdaptiveSubspace(full_dim=50, subspace_dim=6, svd_ratio_init=0.5, svd_ratio_final=0.5)
+    projection = sub.init_projection(generator=torch.Generator().manual_seed(0))
+    history = torch.randn(3, 50, generator=torch.Generator().manual_seed(1))
+    history[1, 7] = bad
+
+    rotated = sub.rotate(projection, 5, 10, history, generator=torch.Generator().manual_seed(2), history_is_full=True)
+    expected = sub._rotate_random(projection.device, projection.dtype, torch.Generator().manual_seed(2))
+    assert torch.equal(rotated, expected)
 
 
 def test_rotation_keeps_the_uncentered_displacement_direction():

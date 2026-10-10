@@ -107,6 +107,73 @@ def test_invalid_marginal_raises(a):
         solver.solve(torch.zeros(2, 3), a=a)
 
 
+class TestSharedIteration:
+    """Both modes run ``_sinkhorn_iteration``, and the check reports the plan's marginal error."""
+
+    def test_convergence_loop_runs_the_shared_iteration(self):
+        torch.manual_seed(0)
+        solver = SinkhornSolver(epsilon=0.1, threshold=1e-6, check_every=5)
+        calls = []
+        shared = solver._compiled.sinkhorn_iter
+
+        def counting(*args):
+            calls.append(1)
+            return shared(*args)
+
+        solver._compiled.sinkhorn_iter = counting
+        result = solver.solve(torch.rand(12, 7))
+        assert result.converged
+        assert len(calls) == result.n_iters
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"omega": 1.0, "max_iterations": 10},
+            {"omega": 1.5, "max_iterations": 10},
+            {"anderson_depth": 3, "check_every": 1, "max_iterations": 6},
+        ],
+    )
+    def test_reported_error_matches_the_plan_marginals(self, kwargs):
+        torch.manual_seed(0)
+        n, m = 12, 7
+        C = torch.rand(n, m, dtype=torch.float64)
+        solver = SinkhornSolver(epsilon=0.05, threshold=1e-12, **kwargs)
+        result = solver.solve(C)
+        P = result.matrix
+        row = (P.sum(dim=1) - 1.0 / n).abs().max()
+        col = (P.sum(dim=0) - 1.0 / m).abs().max()
+        assert not result.converged
+        assert abs(result.errors[-1] - max(row, col).item()) < 1e-12
+
+    @pytest.mark.filterwarnings("ignore:SinkhornSolver epsilon.*very small:UserWarning")
+    def test_nonfinite_duals_are_reset_while_checking(self):
+        torch.manual_seed(0)
+        with pytest.warns(UserWarning, match="went non-finite"):
+            result = SinkhornSolver(epsilon=1e-40, threshold=1e-6).solve(torch.rand(5, 4) * 1e3)
+        assert not result.converged
+        assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all()
+
+    def test_duals_near_the_float32_limit_are_kept(self):
+        C = torch.tensor([[1.8255e36, 1.5541e38, 6.1981e37, 2.3055e37], [1.8135e38, 8.4998e37, 2.8427e38, 3.5292e37]])
+        result = SinkhornSolver(epsilon=1.7183182677327684e38, threshold=1e-6).solve(C)
+        assert result.converged
+        assert result.f.abs().max() + result.g.abs().max() == float("inf")
+
+    def test_inductor_matches_eager(self):
+        from polystep._compiled import _sinkhorn_iteration
+
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        C = torch.rand(64, 9)
+        eager = SinkhornSolver(epsilon=0.05).solve(C)
+        solver = SinkhornSolver(epsilon=0.05)
+        solver._compiled.sinkhorn_iter = torch.compile(_sinkhorn_iteration, fullgraph=True)
+        compiled = solver.solve(C)
+        torch.testing.assert_close(compiled.matrix, eager.matrix, rtol=0, atol=1e-6)
+        assert compiled.converged == eager.converged
+        assert abs(compiled.n_iters - eager.n_iters) <= solver.check_every
+
+
 class TestOverrelaxation:
     def test_omega_default(self):
         """SinkhornSolver() with default omega=1.0 produces same result as standard Sinkhorn."""

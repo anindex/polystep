@@ -417,3 +417,48 @@ def test_a_half_precision_site_holds_the_weights_reconstruct_batch_builds(monkey
         expected = subspace.reconstruct_batch(projections, base_sd, full.flatten(0, 1))[spec.entry_key]
         assert torch.equal(scored[spec.entry_key], expected)
     assert scored["0.bias"].unique().tolist() == [1.0, 1.0078125]
+
+
+def test_a_half_precision_subspace_step_matches_the_materializing_path():
+    """The shared BF16 weights come from ``reconstruct_batch`` as well: the fused
+    ``addmm`` in ``apply_perturbation`` rounds once where the candidates round twice,
+    so the two paths scored the same candidate differently and could swap a ranking.
+    """
+    from polystep import HybridSubspace
+
+    def build(register):
+        torch.manual_seed(1)
+        model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Tanh(), nn.Linear(4, 4, bias=False)).bfloat16()
+        gen = torch.Generator().manual_seed(2)
+        inputs, targets = torch.randn(32, 4, generator=gen), torch.randint(0, 4, (32,), generator=gen)
+        evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+        evaluator._batched_linear = None
+        subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+        opt = PolyStepOptimizer(model, epsilon=0.5, step_radius=0.1, seed=3, subspace=subspace)
+        if register:
+            opt.register_evaluator(evaluator, inputs, targets)
+        return opt, [opt.step(lambda bp: evaluator.evaluate(bp, inputs, targets)) for _ in range(6)]
+
+    _, dense = build(register=False)
+    opt_fast, fast = build(register=True)
+    assert opt_fast._site_vmap_evaluator is not None, "the site path must be available, or this proves nothing"
+    assert fast == dense
+
+
+def test_release_evaluator_drops_the_cast_batch_the_site_path_reaches():
+    """The site path casts through its owner evaluator and keeps it across a release,
+    so the release has to drop the owner's cast copy of the batch as well."""
+    from polystep import HybridSubspace
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(6, 5), nn.Tanh(), nn.Linear(5, 3)).bfloat16()
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+    opt = PolyStepOptimizer(model, seed=0, subspace=subspace)
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    inputs, targets = _small_batch()
+    opt.register_evaluator(evaluator, inputs, targets)
+    opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    assert opt._site_vmap_evaluator._owner is evaluator
+    assert evaluator._cast_cache is not None
+    opt.release_evaluator()
+    assert evaluator._cast_cache is None

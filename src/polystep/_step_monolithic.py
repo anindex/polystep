@@ -9,9 +9,9 @@ from typing import Callable
 
 import torch
 
+from ._compiled import normalize_rows
 from .cost_nn import _reuse_prefixes
-from .costs import scale_cost_matrix
-from .solvers._shared import loss_buffer_dtype, recenter_cost, sanitize_cost, solver_health
+from .solvers._shared import loss_buffer_dtype, recenter_and_scale, sanitize_cost, solver_health
 from .epsilon import feed_solver_stats, radius_epsilon_factor
 from ._step_core import (
     check_losses,
@@ -38,8 +38,9 @@ def _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P, V, K_eff, ma
     """Assemble the (P*V*K_eff,) loss vector from a screened evaluation.
 
     Kept vertices carry full-fidelity values; dropped ones get a cheap value
-    calibrated on the finite kept entries for weighted solvers, or ``+inf``
-    (``mask_dropped``) for selection solvers.
+    calibrated on the kept entries finite at both fidelities for weighted solvers,
+    or ``+inf`` (``mask_dropped``) for selection solvers. A dropped vertex with a
+    non-finite screen value stays non-finite.
     """
     losses = screen_cost.new_empty(P * V * K_eff)
     losses[sel_idx] = kept
@@ -48,14 +49,15 @@ def _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P, V, K_eff, ma
     mask_3d = keep_mask.unsqueeze(-1)
     if mask_dropped:
         return torch.where(mask_3d, full_3d, torch.full_like(full_3d, float("inf"))).reshape(-1)
-    ok = mask_3d & torch.isfinite(full_3d)
+    screen_ok = torch.isfinite(screen_cost)
+    ok = mask_3d & torch.isfinite(full_3d) & screen_ok.unsqueeze(-1)
     w = ok.sum(dim=-1).to(screen_cost.dtype) / K_eff
     n_kept = w.sum(dim=1, keepdim=True)
     n_kept = torch.where(n_kept > 0, n_kept, torch.ones_like(n_kept))
     # Zero dropped positions before summing, or 0 * inf becomes NaN.
     full_kept = torch.where(ok, full_3d, torch.zeros_like(full_3d))
     full_mean = full_kept.sum(dim=(1, 2)).unsqueeze(1) / (n_kept * K_eff)
-    screen_mean = (screen_cost * w).sum(dim=1, keepdim=True) / n_kept
+    screen_mean = (torch.where(screen_ok, screen_cost, 0) * w).sum(dim=1, keepdim=True) / n_kept
     calibrated = (screen_cost + (full_mean - screen_mean)).unsqueeze(-1).expand(P, V, K_eff)
 
     return torch.where(mask_3d, full_3d, calibrated).reshape(-1)
@@ -75,7 +77,6 @@ def _solve_segments(solver, segments, cost_matrix, init_f, init_g, scale_cost) -
     parts = [solver.solve(cost_matrix=c, init_f=f, init_g=g, scale_cost=scale_cost) for c, f, g in zip(costs, fs, gs)]
     return SolverResult(
         matrix=torch.cat([r.matrix for r in parts]),
-        cost=0.0,
         f=torch.cat([r.f for r in parts]),
         g=torch.stack([r.g for r in parts]),
         converged=all(r.converged for r in parts),
@@ -253,7 +254,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         opt.biased_rotation
         and opt._prev_descent_direction is not None
         and opt._prev_descent_direction.shape == (P, pdim)
-        and opt._prev_descent_direction_finite
     ):
         rot_mats = apply_biased_rotation(rot_mats, opt._prev_descent_direction)
 
@@ -271,8 +271,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         probe_r,
     )
 
-    # Cleared per step, or a stale flag would read as this step's verdict.
-    opt._all_nonfinite = None
     # Every (particle, vertex, probe) candidate, evaluated in chunks to bound memory.
     total_evals = P * V * K_eff
     _evals_this_step = total_evals
@@ -307,12 +305,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     _subspace_site = getattr(opt, "_site_vmap_evaluator", None) if opt._hybrid else None
     _bary_sd = None
     if _fused_inputs is not None and (_subspace_delta is not None or _subspace_site is not None):
-        _bary_sd = state.subspace.apply_perturbation(
-            state.hybrid_projections,
-            state.base_params,
-            X.reshape(-1)[:_sub_dim],
-        )
         _bary_coords = X.reshape(-1)[:_sub_dim]
+        if any(v.dtype in (torch.float16, torch.bfloat16) for v in state.base_params.values()):
+            _bary_sd = state.subspace.reconstruct_batch(
+                state.hybrid_projections, state.base_params, _bary_coords.unsqueeze(0)
+            )
+            _bary_sd = {k: v[0] for k, v in _bary_sd.items()}
+        else:
+            _bary_sd = state.subspace.apply_perturbation(state.hybrid_projections, state.base_params, _bary_coords)
     else:
         _subspace_delta = _subspace_site = None
         _bary_coords = None
@@ -402,10 +402,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         fused_inputs,
         fused_targets,
         out,
-        sanitize=True,
         dense=False,
         probes_src=None,
-        track_nonfinite=True,
     ):
         """Evaluate an explicit list of (particle, vertex, probe) candidates.
 
@@ -553,19 +551,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             check_losses(chunk_losses, chunk_end - chunk_start)
             out[chunk_start:chunk_end] = chunk_losses.to(out.dtype)
 
-        # Over every candidate at once, not per chunk: the 2*max|finite|+1 penalty
-        # is relative to what it is handed, so per-chunk could rank an infeasible
-        # vertex above a legal one from another chunk.
-        # AND across calls, and outside the sanitize gate: the screened path fills
-        # the cost matrix in two passes and the promoted one does not sanitize, so
-        # gating on sanitize would leave the flag reporting the screen alone.
-        # Centre evaluations are not part of the cost matrix and opt out.
-        if track_nonfinite:
-            seen = opt._all_nonfinite
-            flag = ~torch.isfinite(out).any()
-            opt._all_nonfinite = flag if seen is None else seen & flag
-        if sanitize:
-            out.copy_(sanitize_cost(out))
         return out
 
     if not _screen_ready:
@@ -584,13 +569,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             screen_targets,
             X_probe.new_empty(P * V, dtype=_loss_dtype),
         )
-        screen_cost = screen_flat.reshape(P, V)
+        screen_raw = screen_flat.reshape(P, V)
+        screen_cost = sanitize_cost(screen_raw)
 
         # Stage 2: full fidelity only where it can still matter, ranked per particle.
         keep_mask = torch.zeros(P, V, dtype=torch.bool, device=device)
         if _selection_solver:
-            # A floor at k, not a cap: dropped vertices sanitize back to a finite
-            # penalty, so TopKMeanSolver would average ones never scored.
+            # A floor at k, not a cap: TopKMeanSolver skips the dropped vertices, so a
+            # cap would leave it fewer than k scored ones to average.
             keep_v = min(V, max(1, int(round(V * opt.screen_keep_ratio)), min(getattr(opt.solver, "k", 1), V)))
             keep_idx = torch.topk(screen_cost, keep_v, dim=1, largest=False).indices
             keep_mask.scatter_(1, keep_idx, True)
@@ -620,17 +606,13 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             _fused_inputs,
             _fused_targets,
             X_probe.new_empty(sel_idx.numel(), dtype=_loss_dtype),
-            sanitize=False,
         )
 
         # Offset the dropped entries by the per-particle difference on the kept ones,
         # or the solve ranks by fidelity rather than by cost.
         losses = _fill_screened_losses(
-            screen_cost, kept, sel_idx, keep_mask, P, V, K_eff, mask_dropped=_selection_solver
+            screen_raw, kept, sel_idx, keep_mask, P, V, K_eff, mask_dropped=_selection_solver
         )
-        # One penalty over the merged population, or the two fidelities get different
-        # 2*max|finite|+1 substitutes and compare wrong.
-        losses = sanitize_cost(losses)
         # Screen forwards see part of the data, so weight them by the realized slice
         # (or the configured fraction when there is none).
         _fidelity = (
@@ -647,14 +629,16 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             P * V,
         )
 
-    losses_3d_full = losses.reshape(P, V, K_eff)
-    # No sanitize here: `losses` was sanitized per chunk, and a mean of finite values is
-    # finite.
-    cost_matrix = losses.reshape(P, V) if K_eff == 1 else losses_3d_full.mean(dim=-1)
+    solve_cost = losses.reshape(P, V) if K_eff == 1 else losses.reshape(P, V, K_eff).mean(dim=-1)
+    # One penalty over the merged population, or the two fidelities get different
+    # 2*max|finite|+1 substitutes and compare wrong.
+    safe = sanitize_cost(losses)
+    cost_matrix = safe.reshape(P, V) if K_eff == 1 else sanitize_cost(safe.reshape(P, V, K_eff).mean(dim=-1))
+    _nonfinite = ~torch.isfinite(solve_cost).any()
     opt._center_loss = None
     if opt.use_quadratic_model:
         # The step buffer is overwritten next time; the model owns a snapshot.
-        opt._losses_3d = losses_3d_full.detach().clone()
+        opt._losses_3d = safe.reshape(P, V, K_eff).detach()
     if _center_wanted:
         # Every centre candidate equals X, so evaluate once, not once per block.
         _one = torch.zeros(1, dtype=torch.long, device=device)
@@ -667,8 +651,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             _fused_targets,
             X.new_empty(1, dtype=_loss_dtype),
             probes_src=X.reshape(P, 1, 1, -1),
-            sanitize=False,
-            track_nonfinite=False,
         ).detach()
         opt._center_loss = _center.expand(P).clone()
         _evals_this_step += 1
@@ -681,15 +663,15 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # comparing it against that step's prediction gives a real ratio. Both ends must
     # use the same estimator, so a step with a centre and one without never compare.
     _center_now = opt._center_loss is not None
+    _center_value = opt._center_loss[0].item() if _center_now else None
     if (
         opt.trust_region
         and opt._prev_predicted_improvement is not None
         and opt._prev_pre_step_loss is not None
         and _center_now
     ):
-        current_loss = opt._center_loss[0].item()
         # Negative means loss decreased.
-        actual_improvement = torch.tensor([current_loss - opt._prev_pre_step_loss])
+        actual_improvement = torch.tensor([_center_value - opt._prev_pre_step_loss])
         from .quadratic_model import update_trust_region
 
         opt._trust_region_multiplier = update_trust_region(
@@ -734,31 +716,22 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     opt.solver.epsilon = ot_epsilon
     if opt._use_fused_softmax:
         # Scale outside the kernel so every scale_cost mode matches the non-fused solvers.
-        scaled_cost = scale_cost_matrix(recenter_cost(cost_matrix)[0], opt.scale_cost)
+        solve_safe = cost_matrix if K_eff == 1 else sanitize_cost(solve_cost)
+        scaled_cost = recenter_and_scale(solve_safe, solve_cost, opt.scale_cost)[0]
         X_new_fused, transport_matrix = opt._compiled.fused_softmax_project(
             scaled_cost,
             ot_epsilon,
-            state.a,
             opt._polytope_vertices,
             rot_mats,
             step_r,
             X,
-            scale_cost_mean=False,
         )
         # state.costs tracks cost_matrix.mean, so the OT cost is unused here.
-        ot_result = SolverResult(
-            matrix=transport_matrix,
-            cost=0.0,
-            f=None,
-            g=None,
-            converged=True,
-            n_iters=1,
-            ent_reg_cost=0.0,
-        )
+        ot_result = SolverResult(matrix=transport_matrix)
     else:
         # prev_epsilon lets the solver rescale warm-started duals across an epsilon change.
         solve_kwargs = dict(
-            cost_matrix=cost_matrix,
+            cost_matrix=solve_cost,
             init_f=init_f_for_solve,
             init_g=init_g_for_solve,
             scale_cost=opt.scale_cost,
@@ -791,7 +764,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         opt.use_quadratic_model
         and opt._losses_3d is not None
         and opt._losses_3d.shape == (P, V, K_eff)
-        and (_center_loss is None or bool(torch.isfinite(_center_loss).all()))
+        and (_center_loss is None or math.isfinite(_center_value))
         and (_center_loss is not None or (K_eff >= 2 and _antithetic))
     )
     _fd_grad = _fd_hess = None
@@ -821,7 +794,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             newton_rot = compute_newton_step(_fd_grad, _fd_hess, max_step_norm=step_r, hessian_reg=1e-4)
             grad_orig = torch.einsum("bij,bj->bi", rot_mats, _fd_grad)  # (P, pdim)
             opt._prev_descent_direction = -grad_orig.detach()
-            opt._prev_descent_direction_finite = bool(torch.isfinite(grad_orig).all())
             newton_orig = torch.einsum("bij,bj->bi", rot_mats, newton_rot)
             opt._newton_direction = newton_orig.detach()
     elif opt.biased_rotation:
@@ -836,13 +808,10 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 "then evaluates one shared f(X) for the curvature.",
                 stacklevel=3,
             )
-        transport_weights = ot_result.matrix  # (P, V)
         vertex_offsets = X_vertices - X.unsqueeze(1)  # (P, V, pdim)
-        weight_sums = transport_weights.sum(dim=1, keepdim=True).clamp(min=1e-10)
-        normalized_weights = transport_weights / weight_sums  # (P, V)
+        normalized_weights = normalize_rows(ot_result.matrix)  # (P, V)
         weighted_dir = (normalized_weights.unsqueeze(-1) * vertex_offsets).sum(dim=1)  # (P, pdim)
         opt._prev_descent_direction = weighted_dir.detach()
-        opt._prev_descent_direction_finite = bool(torch.isfinite(weighted_dir).all())
 
     if opt._use_fused_softmax:
         X_bary = X_new_fused
@@ -907,19 +876,20 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         realized_rot = torch.einsum("bij,bj->bi", rot_mats.transpose(-1, -2), state.X - X)
         # Rows are disjoint parameter blocks of one objective, not independent losses.
         opt._prev_predicted_improvement = compute_predicted_improvement(_fd_grad, _fd_hess, realized_rot).sum().detach()
-        opt._prev_pre_step_loss = _center_loss[0].item()
+        opt._prev_pre_step_loss = _center_value
 
-    # One transfer for all three, not three device syncs a step.
-    _nonfinite = opt._all_nonfinite
-    _cost_mean, _ess, _rho, _all_nonfinite, _progress = torch.stack(
+    # One transfer for all of these, not a device sync each.
+    _cost_mean, _ess, _rho, _all_nonfinite, _progress, _x_finite, _disp = torch.stack(
         [
             cost_matrix.mean(),
             _ess_tensor,
             _rho_tensor,
-            _nonfinite.to(cost_matrix.dtype) if _nonfinite is not None else cost_matrix.new_zeros(()),
+            _nonfinite.to(cost_matrix.dtype),
             # Mean of each particle's best vertex; the full-matrix mean would partly
             # measure the radius controller's own last move.
             cost_matrix.min(dim=1).values.mean(),
+            torch.isfinite(state.X).all(),
+            torch.mean(torch.sum((state.X - X) ** 2, dim=-1)),
         ]
     ).tolist()
     _fabricated = bool(_all_nonfinite)
@@ -933,30 +903,25 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     state.record_solver_health(_ess, _rho, _evals_this_step)
     update_stagnation_and_radius(opt, state, _progress)
 
-    _nan_reverted = False
-    if not torch.isfinite(state.X).all():
+    _nan_reverted = not _x_finite
+    if _nan_reverted:
         # Revert to pre-step X if it was finite, else to the coordinate origin.
         state.X = X.clone() if torch.isfinite(X).all() else torch.zeros_like(X)
         if opt.use_momentum and state.velocity is not None:
             state.velocity = torch.zeros_like(state.velocity)
-        _nan_reverted = True
-
-    if _nan_reverted and opt.biased_rotation:
-        opt._prev_descent_direction = None
-        opt._prev_descent_direction_finite = False
-    if _nan_reverted:
+        if opt.biased_rotation:
+            opt._prev_descent_direction = None
         opt._newton_direction = None
+        _disp = torch.mean(torch.sum((state.X - X) ** 2, dim=-1)).item()
 
     # From X_bary, not state.X: the coasting direction must not re-carry momentum/Newton.
     update_amortized_direction(opt, (X_bary - X).detach(), _nan_reverted)
 
     # Trust-region update is deferred to the next step's pre-OT measurement.
 
-    per_particle_disp_sqnorms = torch.sum((state.X - X) ** 2, dim=-1)  # (P,)
-    disp_sqnorm_tensor = torch.mean(per_particle_disp_sqnorms)
     state.costs.append(_cost_mean)
     state.linear_convergence.append(_converged)
-    state.displacement_sqnorms.append(disp_sqnorm_tensor.item())
+    state.displacement_sqnorms.append(_disp)
     state.iteration_count += 1
     opt._ot_step_costs.append(_cost_mean)
 

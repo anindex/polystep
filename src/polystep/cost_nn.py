@@ -109,13 +109,13 @@ def _uniform_float_dtype(*param_sources) -> Optional[torch.dtype]:
     return seen.pop()
 
 
-def _batched_loss_kind(loss_fn) -> Optional[str]:
-    """Name the per-sample reduction the batched-linear path can reproduce, else None.
+def _builtin_loss_kind(loss_fn) -> Optional[str]:
+    """Name an unmodified cross-entropy, MSE, or L1 loss at any reduction, else None.
 
     A configured loss has no reproduction and falls back to vmap; a subclass that
     overrides ``forward`` would score candidates on a different objective.
     """
-    if getattr(loss_fn, "reduction", None) != "mean" or _has_hooks(loss_fn):
+    if _has_hooks(loss_fn):
         return None
     for base, kind in ((nn.CrossEntropyLoss, "cross_entropy"), (nn.MSELoss, "mse"), (nn.L1Loss, "l1")):
         if not isinstance(loss_fn, base):
@@ -128,6 +128,11 @@ def _batched_loss_kind(loss_fn) -> Optional[str]:
             return None
         return kind
     return None
+
+
+def _batched_loss_kind(loss_fn) -> Optional[str]:
+    """Name the per-sample reduction the batched-linear path can reproduce, else None."""
+    return _builtin_loss_kind(loss_fn) if getattr(loss_fn, "reduction", None) == "mean" else None
 
 
 def _fold_candidate_loss(loss, per_sample):
@@ -152,8 +157,9 @@ def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
     n = outputs.shape[0]
     if loss_kind == "cross_entropy":
         tgt = targets.unsqueeze(0).expand(n, *targets.shape).flatten(0, 1)
-        losses = torch.nn.functional.cross_entropy(outputs.flatten(0, 1), tgt, reduction="none").reshape(n, -1)
-        losses = losses.to(loss_buffer_dtype(losses.dtype))
+        logits = outputs.flatten(0, 1)
+        logits = logits.to(loss_buffer_dtype(logits.dtype))
+        losses = torch.nn.functional.cross_entropy(logits, tgt, reduction="none").reshape(n, -1)
         if targets.shape == outputs.shape[1:]:  # Probability targets have no ignored labels.
             return losses.mean(dim=1)
         return losses.sum(dim=1) / (targets != -100).sum()  # All ignored: 0/0 matches mean CE.
@@ -254,9 +260,9 @@ class NNCostEvaluator:
         model.eval()
 
         # Fast batched-linear evaluator (MLP-only), when the loss has a bmm-friendly form.
-        self._loss_kind = _batched_loss_kind(loss_fn)
+        self._loss_kind = _builtin_loss_kind(loss_fn)
         self._batched_linear = (
-            BatchedLinearEvaluator.try_build(model, loss_fn, self._loss_kind) if self._loss_kind is not None else None
+            BatchedLinearEvaluator.try_build(model, loss_fn, self._loss_kind) if _batched_loss_kind(loss_fn) else None
         )
 
         # Pick in-place only when the batched footprint would not fit (not on a
@@ -310,10 +316,10 @@ class NNCostEvaluator:
         self._cast_cache = None
         self._input_dtype_cache = _UNSET
         self._chunk_size_cached = _UNSET
-        self._loss_kind = _batched_loss_kind(self.loss_fn)
+        self._loss_kind = _builtin_loss_kind(self.loss_fn)
         self._batched_linear = (
             BatchedLinearEvaluator.try_build(self.model, self.loss_fn, self._loss_kind)
-            if self._loss_kind is not None
+            if _batched_loss_kind(self.loss_fn)
             else None
         )
 
@@ -1094,7 +1100,7 @@ class SiteVmapEvaluator:
         self.model = model
         self.loss_fn = loss_fn
         self.per_sample = per_sample
-        self._loss_kind = _batched_loss_kind(loss_fn)
+        self._loss_kind = _builtin_loss_kind(loss_fn)
         self._buffers = buffers
         self._owner = owner
         self._entry_by_key = {e.key: e for e in layout.entries}

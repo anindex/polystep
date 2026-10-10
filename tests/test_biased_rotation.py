@@ -1,8 +1,9 @@
 """apply_biased_rotation must point the first search axis along the requested
-bias, stay a proper rotation, and work in bf16. QR fixes a column only up to
-sign, so the biased axis needs an explicit sign correction.
+bias, stay a proper rotation, and work in bf16. The Householder reflection lands
+the first axis on the bias only up to sign, so the columns need a sign fix.
 """
 
+import pytest
 import torch
 
 from polystep.geometry import apply_biased_rotation, get_random_rotation_matrices
@@ -66,17 +67,47 @@ def test_bfloat16_actually_applies_the_bias():
         assert rate16 >= rate32 - 0.02, f"dim={dim}: bf16 kept {rate16:.3f} vs fp32 {rate32:.3f}"
 
 
-def test_collapsed_column_falls_back_to_an_orthonormal_frame():
-    """A bias parallel to an existing axis must not yield duplicate columns.
-
-    Gram-Schmidt annihilates the axis the bias replaced, so the fallback must
-    rebuild an orthonormal frame instead of restoring the original column.
-    """
+def test_axis_aligned_bias_is_applied():
+    """A bias along an existing axis must land in column 0, not be dropped."""
     for dim in (2, 3, 8):
         for k in range(dim):
-            bias = torch.zeros(1, dim)
-            bias[0, k] = 1.0
-            Q = apply_biased_rotation(torch.eye(dim).unsqueeze(0), bias)[0]
-            gram = Q.T @ Q
-            assert torch.allclose(gram, torch.eye(dim), atol=1e-4), f"dim={dim} k={k}:\n{gram}"
-            assert torch.det(Q) > 0.9, f"dim={dim} k={k}: det={torch.det(Q)}"
+            for sign in (1.0, -1.0):
+                bias = torch.zeros(1, dim)
+                bias[0, k] = sign
+                Q = apply_biased_rotation(torch.eye(dim).unsqueeze(0), bias)[0]
+                assert torch.equal(Q[:, 0], bias[0]), f"dim={dim} k={k} sign={sign}"
+                assert torch.allclose(Q.T @ Q, torch.eye(dim), atol=1e-6)
+                assert torch.allclose(torch.det(Q), torch.tensor(1.0), atol=1e-6)
+
+
+@pytest.mark.parametrize("dim", [2, 8, 32])
+def test_near_aligned_bias_keeps_column_zero_in_fp32(dim):
+    gen = torch.Generator().manual_seed(dim)
+    R = get_random_rotation_matrices(512, dim, generator=gen)
+    sign = torch.where(torch.rand(512, 1, generator=gen) < 0.5, -1.0, 1.0)
+    b = sign * R[:, :, 0] + 1e-6 * torch.randn(512, dim, generator=gen)
+    out = apply_biased_rotation(R, b)
+    b = b / b.norm(dim=1, keepdim=True)
+    assert (out[:, :, 0] - b).abs().max() < 1e-5
+    assert (out.mT @ out - torch.eye(dim)).abs().max() < 1e-5
+    assert (torch.det(out) - 1).abs().max() < 1e-5
+
+
+def test_complement_axes_stay_haar():
+    R = get_random_rotation_matrices(20000, 3, generator=torch.Generator().manual_seed(0))
+    out = apply_biased_rotation(R, torch.tensor([[1.0, 0.0, 0.0]]).expand(20000, 3))
+    x = out[:, 1:, 1].double()
+    assert x.mean(dim=0).abs().max() < 0.02
+    assert (x.T @ x / len(x) - torch.eye(2, dtype=torch.float64) / 2).abs().max() < 0.02
+
+
+def test_nonfinite_bias_row_keeps_only_its_own_frame():
+    torch.manual_seed(2)
+    R = get_random_rotation_matrices(4, 3)
+    b = torch.randn(4, 3)
+    b = b / b.norm(dim=1, keepdim=True)
+    b[1, 0] = float("nan")
+    b[2, 2] = float("inf")
+    out = apply_biased_rotation(R, b)
+    assert torch.equal(out[1:3], R[1:3])
+    assert torch.allclose(out[[0, 3], :, 0], b[[0, 3]], atol=1e-5)

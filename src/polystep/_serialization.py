@@ -17,7 +17,6 @@ _CONTROL_STATE_KEYS = (
     "_prev_pre_step_loss",
     # Read before they are written on the next step.
     "_prev_descent_direction",
-    "_prev_descent_direction_finite",
     "_prev_block_descent_directions",
     "_newton_direction",
     "_loss_decreasing_count",

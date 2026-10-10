@@ -199,17 +199,17 @@ class SinkhornSolver:
         errors: List[float] = []
 
         omega = self.omega
+        sinkhorn_iter = self._compiled.sinkhorn_iter
 
         # Disable autocast so a bfloat16 caller cannot demote the log-sum-exp intermediates.
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
             if fixed_mode:
                 # NaN check after the loop; a periodic isfinite() would sync every check.
-                sinkhorn_iter = self._compiled.sinkhorn_iter
                 for i in range(self.max_iterations):
                     f, g = sinkhorn_iter(f, g, log_K, log_a, log_b, eps, omega)
                     n_iters = i + 1
                 # Fixed mode checks no residual, so converged reports numerical validity only; reporting False on a finite result would make ProgressiveEpsilon inflate epsilon.
-                if not (torch.isfinite(f).all() and torch.isfinite(g).all()):
+                if not (torch.isfinite(f).all() & torch.isfinite(g).all()):
                     f.zero_()
                     g.zero_()
                     _warn_dual_reset()
@@ -239,10 +239,7 @@ class SinkhornSolver:
                     return (fv * a).sum() + (gv * b).sum() - eps * mass_p
 
                 for i in range(self.max_iterations):
-                    f_target = eps * (log_a - torch.logsumexp(log_K + g.unsqueeze(0) / eps, dim=1))
-                    f_new = (1 - omega) * f + omega * f_target
-                    g_target = eps * (log_b - torch.logsumexp(log_K + f_new.unsqueeze(1) / eps, dim=0))
-                    g_new = (1 - omega) * g + omega * g_target
+                    f_new, g_new = sinkhorn_iter(f, g, log_K, log_a, log_b, eps, omega)
 
                     # Anderson acceleration
                     if self.anderson_depth > 0 and (i + 1) % self.check_every == 0:
@@ -322,26 +319,23 @@ class SinkhornSolver:
 
                     # Batch all scalars into one device->host transfer; always check the last iteration or ProgressiveEpsilon inflates epsilon.
                     if (i + 1) % self.check_every == 0 or i == self.max_iterations - 1:
-                        # Divergence check.
-                        # One sync, not four: a Python or would sync per .any().
-                        if not (torch.isfinite(f).all() & torch.isfinite(g).all()):
+                        log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
+                        err_a_t = torch.max(torch.abs(torch.exp(torch.logsumexp(log_P_row, dim=1)) - a))
+                        if omega != 1.0 or self.anderson_depth > 0 or self.adaptive_omega:
+                            err_b_t = torch.max(torch.abs(torch.exp(torch.logsumexp(log_P_row, dim=0)) - b))
+                        else:
+                            err_b_t = err_a_t
+
+                        # Batch all scalar measurements into one transfer; a dual's max is nonfinite exactly when the dual is.
+                        err_a, err_b, f_max, g_max = torch.stack(
+                            [err_a_t, err_b_t, f.abs().max(), g.abs().max()]
+                        ).tolist()
+                        if not (math.isfinite(f_max) and math.isfinite(g_max)):
                             f.zero_()
                             g.zero_()
                             _warn_dual_reset()
                             break
-
-                        log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
-                        marginal_a = torch.exp(torch.logsumexp(log_P_row, dim=1))
-                        marginal_b = torch.exp(torch.logsumexp(log_P_row, dim=0))
-
-                        # Batch all scalar measurements into one transfer.
-                        err_a_t = torch.max(torch.abs(marginal_a - a))
-                        err_b_t = torch.max(torch.abs(marginal_b - b))
-                        if omega > 1.5:
-                            dual_norm_t = f.abs().max() + g.abs().max()
-                        else:
-                            dual_norm_t = err_a_t  # placeholder, value unused
-                        err_a, err_b, dual_norm_v = torch.stack([err_a_t, err_b_t, dual_norm_t]).tolist()
+                        dual_norm_v = f_max + g_max
                         err = max(err_a, err_b)
 
                         # omega <= 1.5 is safe on well-conditioned C, so only monitor above it; require three checks of sustained growth.

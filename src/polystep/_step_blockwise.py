@@ -10,8 +10,7 @@ from typing import Callable
 import torch
 
 from .blockwise import block_to_layout_columns, blocks_to_layout_flat, layout_flat_to_block_flat
-from .costs import scale_cost_matrix
-from .solvers._shared import loss_buffer_dtype, recenter_cost, sanitize_cost, solver_health
+from .solvers._shared import loss_buffer_dtype, recenter_and_scale, sanitize_cost, solver_health
 from .epsilon import feed_solver_stats, radius_epsilon_factor
 from .dynamics import (
     apply_momentum,
@@ -84,12 +83,15 @@ def _prepare_probes(opt, block, block_X, verts, block_idx, probes, step_r, probe
 
 
 def _cost_from_losses(opt, losses, P, V, K):
-    """Sanitize the losses, average the probe axis away, record an all-non-finite block."""
-    flag = ~torch.isfinite(losses).any()
+    """Average the probe axis away, record an all-non-finite block.
+
+    A vertex with any non-finite probe keeps a non-finite cost, so the solve reads it as infeasible.
+    """
+    cost = losses.reshape(P, V) if K == 1 else losses.reshape(P, V, K).mean(dim=-1)
+    flag = ~torch.isfinite(cost).any()
     seen = opt._all_nonfinite
     opt._all_nonfinite = flag if seen is None else seen & flag
-    safe = sanitize_cost(losses)
-    return safe.reshape(P, V) if K == 1 else safe.reshape(P, V, K).mean(dim=-1)
+    return cost
 
 
 def _block_loop_setup(opt, X_probe):
@@ -119,22 +121,17 @@ def _finish_block(opt, state, block_idx, losses, P, V, K, block_X, verts, rot_ma
     )
 
 
-def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon, evals):
+def _solve_block(opt, state, block_idx, solve_cost, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon, evals):
     """Solve one block's OT problem and project it onto the barycentre."""
-    device, dtype = block_X.device, block_X.dtype
-    P_block = block_X.shape[0]
     opt.solver.epsilon = ot_epsilon
+    cost_matrix = sanitize_cost(solve_cost)
 
     if opt._use_fused_softmax:
-        # Only the fused kernel reads the marginal; the projection normalises by the realised row sum.
-        block_a = torch.ones(P_block, device=device, dtype=dtype) / P_block
-        scaled_cost = scale_cost_matrix(recenter_cost(cost_matrix)[0], opt.scale_cost)
+        scaled_cost = recenter_and_scale(cost_matrix, solve_cost, opt.scale_cost)[0]
         X_new_block, transport_matrix = opt._compiled.fused_softmax_project(
-            scaled_cost, ot_epsilon, block_a, verts, rot_mats, step_r, block_X, scale_cost_mean=False
+            scaled_cost, ot_epsilon, verts, rot_mats, step_r, block_X
         )
-        ot_result = SolverResult(
-            matrix=transport_matrix, cost=0.0, f=None, g=None, converged=True, n_iters=1, ent_reg_cost=0.0
-        )
+        ot_result = SolverResult(matrix=transport_matrix)
     else:
         init_f, init_g = state.block_duals[block_idx]
         if (
@@ -150,7 +147,7 @@ def _solve_block(opt, state, block_idx, cost_matrix, block_X, verts, rot_mats, X
                 init_g = init_g + opt._dual_momentum_beta * (init_g - ppg)
 
         # a defaults to uniform 1/P_block inside the solver; pass None to skip host-sync validation.
-        kwargs = dict(cost_matrix=cost_matrix, init_f=init_f, init_g=init_g, scale_cost=opt.scale_cost)
+        kwargs = dict(cost_matrix=solve_cost, init_f=init_f, init_g=init_g, scale_cost=opt.scale_cost)
         ot_result = opt.solver.solve(**kwargs)
         X_new_block = opt._compiled.barycentric_projection(ot_result.matrix, X_vertices)
 
@@ -230,7 +227,6 @@ def _finish_step(opt, state, X, X_new_full, outcomes, iteration, current_eps, ot
         # Clear cached state that would propagate the NaN-producing direction.
         opt._transport_direction_ema = None
         opt._prev_descent_direction = None
-        opt._prev_descent_direction_finite = False
         if opt._dual_momentum_beta > 0.0:
             state._prev_prev_block_duals = None
         if opt.biased_rotation:

@@ -149,7 +149,11 @@ def get_random_rotation_matrices(
 
 
 def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir: torch.Tensor) -> torch.Tensor:
-    """Bias the first rotation axis toward ``bias_dir`` and re-orthonormalize via Gram-Schmidt."""
+    """Point each frame's first axis along ``bias_dir`` with one Householder reflection.
+
+    A column sign fix keeps det +1, and the other axes stay Haar on the complement
+    of the bias. Rows with a zero or nonfinite ``bias_dir`` come back unchanged.
+    """
     dim = rot_mats.shape[-1]
     if dim == 1:
         # SO(1) = {[[1]]}: a sign flip is a reflection, so bias is not representable.
@@ -160,34 +164,13 @@ def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir: torch.Tensor) -> tor
         rot_mats = rot_mats.float()
         bias_dir = bias_dir.float()
 
-    # Column 0 must be unit; zero (don't clamp) tiny directions so they hit the fallback.
     norms = torch.linalg.vector_norm(bias_dir, dim=-1, keepdim=True)
-    bias_dir_norm = torch.where(norms > 1e-8, bias_dir / norms.clamp(min=1e-10), torch.zeros_like(bias_dir))
-
-    out = rot_mats.clone()
-    out[:, :, 0] = bias_dir_norm
-    for col in range(1, dim):
-        v = out[:, :, col].clone()
-        # Two sweeps: one pass loses orthogonality when a column is nearly in the span of earlier ones.
-        for _ in range(2):
-            for prev in range(col):
-                proj = (v * out[:, :, prev]).sum(dim=-1, keepdim=True)
-                v = v - proj * out[:, :, prev]
-        raw_norm = torch.norm(v, dim=-1, keepdim=True)
-        # A collapsed column carries no direction; keep the original.
-        keep = raw_norm > 1e-6
-        out[:, :, col] = torch.where(keep, v / raw_norm.clamp(min=1e-10), rot_mats[:, :, col])
-
-    # A zero or non-finite bias leaves column 0 degenerate; fall back to unbiased.
-    bias_ok = torch.isfinite(bias_dir_norm).all(dim=-1) & (bias_dir_norm.abs().amax(dim=-1) > 0)
-    # Orthonormality, not just finiteness; the Gram check catches duplicate directions.
-    gram = out.transpose(-2, -1) @ out
-    eye = torch.eye(dim, device=out.device, dtype=out.dtype)
-    orthonormal = (gram - eye).abs().amax(dim=-1).amax(dim=-1) < 1e-3
-    valid = torch.isfinite(out).all(dim=-1).all(dim=-1) & bias_ok & orthonormal  # (batch,)
-    out = torch.where(valid[:, None, None], out, rot_mats)
-
-    # Flip the last column for det = +1.
-    flip = (torch.det(out) < 0).unsqueeze(-1)
-    out[:, :, -1] = torch.where(flip, -out[:, :, -1], out[:, :, -1])
-    return out.to(out_dtype)
+    valid = torch.isfinite(norms) & (norms > 1e-8)
+    b = torch.where(valid, bias_dir / norms.clamp(min=1e-10), torch.zeros_like(bias_dir))
+    r0 = rot_mats[:, :, 0]
+    s = torch.ones_like(norms).copysign((r0 * b).sum(dim=-1, keepdim=True))
+    w = r0 + s * b
+    scale = (2 / (w * w).sum(dim=-1, keepdim=True)).unsqueeze(-1)
+    out = rot_mats - scale * w.unsqueeze(-1) * (w.unsqueeze(1) @ rot_mats)
+    out = out * torch.cat([-s, torch.ones_like(r0[:, 2:]), s], dim=-1).unsqueeze(1)
+    return torch.where(valid.unsqueeze(-1), out, rot_mats).to(out_dtype)

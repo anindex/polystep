@@ -50,6 +50,21 @@ def test_tell_ignores_a_non_finite_update():
     torch.testing.assert_close(es.X, before)
 
 
+def test_unconverged_sinkhorn_row_keeps_its_particle():
+    """A row left with almost no mass still averages its own vertices instead of collapsing to the origin."""
+    x0 = torch.tensor([[0.0], [10.0]])
+    es = PolyStepES(
+        1,
+        num_particles=2,
+        x0=x0,
+        scale_cost=None,
+        solver=SinkhornSolver(epsilon=1.0, omega=0.5, max_iterations=1),
+    )
+    es.ask()
+    es.tell(torch.tensor([0.0, 0.0, 100.0, 100.0]))
+    torch.testing.assert_close(es.X, x0)
+
+
 def test_unseeded_population_follows_the_global_rng():
     def first_population(seed):
         torch.manual_seed(seed)

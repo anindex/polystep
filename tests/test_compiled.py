@@ -100,40 +100,30 @@ def _make_fused_softmax_args(device, P=10, V=8, dim=4, seed=42):
     torch.manual_seed(seed)
     cost_matrix = torch.rand(P, V, device=device) + 0.01
     epsilon = 0.1
-    a = torch.ones(P, device=device) / P
     polytope_verts = torch.randn(V, dim, device=device)
     raw = torch.randn(P, dim, dim, device=device)
     Q, _ = torch.linalg.qr(raw)
     rot_mats = Q
     step_radius = 0.5
     X = torch.randn(P, dim, device=device)
-    return cost_matrix, epsilon, a, polytope_verts, rot_mats, step_radius, X
+    return cost_matrix, epsilon, polytope_verts, rot_mats, step_radius, X
 
 
 class TestFusedSoftmaxProjectEquivalence:
     """The fused kernel must equal the two-step softmax solve plus barycentric projection."""
 
     def test_fused_matches_two_step_path(self):
-        cost, eps, a, verts, rot, step_r, X = _make_fused_softmax_args(torch.device("cpu"))
-        X_fused, transport = _fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=False)
+        cost, eps, verts, rot, step_r, X = _make_fused_softmax_args(torch.device("cpu"))
+        X_fused, transport = _fused_softmax_project(cost, eps, verts, rot, step_r, X)
 
         # Two-step reference: per-row softmax weighting, then project onto the
         # rotated, translated vertices.
         W = torch.softmax(-(cost - cost.amin(dim=-1, keepdim=True)) / eps, dim=-1)
         X_vertices, _ = _rotate_and_translate(rot, verts, X, step_r)
-        X_ref = _barycentric_projection(W * a.unsqueeze(-1), X_vertices)
+        X_ref = _barycentric_projection(W, X_vertices)
 
         torch.testing.assert_close(X_fused, X_ref, atol=1e-5, rtol=1e-5)
-        # The transport rows must carry the source marginal.
-        torch.testing.assert_close(transport.sum(dim=-1), a, atol=1e-6, rtol=1e-6)
-
-    def test_no_scaling_leaves_the_cost_untouched(self):
-        cost, eps, a, verts, rot, step_r, X = _make_fused_softmax_args(torch.device("cpu"))
-        _, t_raw = _fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=False)
-        _, t_scaled = _fused_softmax_project(cost, eps, a, verts, rot, step_r, X, scale_cost_mean=True)
-        # Dividing the cost by its mean changes the effective temperature, so the two
-        # plans must differ; identical output would mean the flag does nothing.
-        assert not torch.allclose(t_raw, t_scaled, atol=1e-6)
+        torch.testing.assert_close(transport.sum(dim=-1), torch.ones(cost.shape[0]), atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize(
@@ -167,3 +157,24 @@ def test_compiles_without_graph_breaks(fn, make_args):
             torch.testing.assert_close(g, w, atol=1e-5, rtol=1e-5)
     else:
         torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "fn,make_args,floats",
+    [
+        (_rotate_and_translate, _make_rotate_args, [(0.5,), (0.25,), (0.125,)]),
+        (_sinkhorn_iteration, _make_sinkhorn_args, [(0.1, 1.0), (0.05, 1.5), (0.2, 1.2)]),
+    ],
+    ids=["rotate_and_translate", "sinkhorn_iteration"],
+)
+def test_new_float_compiles_at_most_once_more(fn, make_args, floats):
+    """A float argument goes symbolic after one recompile, so a scheduled radius or epsilon stays compiled."""
+    from torch._dynamo.testing import CompileCounter
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled = torch.compile(fn, backend=counter, fullgraph=True)
+    tensors = make_args(torch.device("cpu"))[:-1]
+    for values in floats:
+        compiled(*tensors, *values)
+    assert counter.frame_count <= 2

@@ -506,8 +506,16 @@ def kernel_bench(args):
                 for seed in args.seeds:
                     torch.manual_seed(seed)
                     matrix = torch.randn(height, width, device=args.device)
-                    for pinned, fn in ((True, lambda: thin_qr(matrix)), (False, lambda: torch.linalg.qr(matrix))):
-                        record(fn, kernel="qr", shape=[height, width], work=height * width**2, pinned=pinned, seed=seed)
+                    for pinned in (True, False):
+                        with patch("polystep.solvers._shared.QR_PIN_MAX_WORK", float("inf") if pinned else 0):
+                            record(
+                                lambda: thin_qr(matrix),
+                                kernel="qr",
+                                shape=[height, width],
+                                work=height * width**2,
+                                pinned=pinned,
+                                seed=seed,
+                            )
     if "rotation" in args.kernels:
         gen = torch.Generator(device=args.device).manual_seed(0)
         for dim in (2, 8, 32):
