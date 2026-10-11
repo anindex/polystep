@@ -97,6 +97,25 @@ def test_registered_step_matches_the_closure_only_step(polytope):
     torch.testing.assert_close(fast, closure_only, rtol=0, atol=1e-6)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("chunk_size, uses_delta", [(None, False), (72, True)])
+def test_cuda_keeps_the_low_rank_evaluator_when_one_chunk_holds_every_candidate(chunk_size, uses_delta):
+    """A one-chunk low-rank pass beats one delta pass per parameter on a launch-bound GPU."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 4)).cuda()
+    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=4)
+    x, y = torch.randn(32, 32, device="cuda"), torch.randint(0, 4, (32,), device="cuda")
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    opt = PolyStepOptimizer(model, subspace=subspace, chunk_size=chunk_size, seed=0)
+    with patch.object(
+        SubspaceDeltaEvaluator, "evaluate", autospec=True, side_effect=SubspaceDeltaEvaluator.evaluate
+    ) as delta:
+        opt.register_evaluator(evaluator, x, y)
+        opt.step(lambda p: evaluator.evaluate(p, x, y))
+    assert bool(delta.call_count) is uses_delta
+
+
 def test_factored_evaluator_declines_unsupported_models():
     conv = nn.Sequential(nn.Conv2d(1, 4, 3), nn.Flatten(), nn.Linear(4 * 26 * 26, 10))
     assert FactoredEvaluator.try_build(conv, nn.CrossEntropyLoss()) is None

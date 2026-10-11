@@ -631,6 +631,18 @@ def test_a_narrow_finite_spread_keeps_sinkhorn_marginals(mode, spread):
 
 
 @pytest.mark.parametrize("mode", ["mean", "max_cost"])
+@pytest.mark.parametrize("name", ["SoftmaxSolver", "SinkhornSolver"])
+def test_a_nan_vertex_loses_to_a_flat_feasible_row(mode, name):
+    """Equal finite costs recenter to 0, so only the +1 keeps the penalty above them."""
+    import polystep.solvers as solvers
+
+    cost = torch.tensor([[1.0, 1.0, float("nan")], [1.0, 1.0, 1.0]])
+    row = getattr(solvers, name)(epsilon=0.1).solve(cost, scale_cost=mode).matrix[0]
+
+    assert row[2] < 1e-3 * row[0]
+
+
+@pytest.mark.parametrize("mode", ["mean", "max_cost"])
 @pytest.mark.parametrize(
     ("solver", "block_strategy"),
     [("sinkhorn", "monolithic"), ("softmax", "monolithic"), ("sinkhorn", "per_layer"), ("softmax", "per_layer")],

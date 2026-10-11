@@ -774,18 +774,39 @@ def test_rotation_clears_the_coordinate_displacement_history():
     assert rotations > 0, "no rotation fired, the test proves nothing"
 
 
+@pytest.mark.parametrize("rotation_mode", ["random", "displacement"])
 @pytest.mark.parametrize("absorb_interval, rotation_interval", [(3, 2), (2, 4)])
-def test_an_absorb_keeps_the_rotated_basis_and_rotates_when_due(absorb_interval, rotation_interval):
+def test_an_absorb_keeps_the_rotated_basis_and_rotates_when_due(
+    absorb_interval, rotation_interval, rotation_mode, monkeypatch
+):
     """An absorb used to restore the seeded basis, undoing the last rotation and skipping
-    a rotation due on the same step."""
-    from polystep import PolyStepOptimizer
+    a rotation due on the same step. A basis change must also leave base + P @ coords
+    where it was."""
+    from polystep import PolyStepOptimizer, _step_monolithic
+
+    maintain = _step_monolithic.maintain_per_layer_subspace
+
+    def point(state):
+        coords = state.X.reshape(-1)[: subspace.subspace_dim]
+        return subspace.apply_perturbation(state.hybrid_projections, state.base_params, coords)
+
+    def checked_maintain(opt, state, pre_step_sub_coords):
+        before, basis, absorbs = point(state), state.hybrid_projections, state.absorb_count
+        maintain(opt, state, pre_step_sub_coords)
+        if state.hybrid_projections is not basis or state.absorb_count != absorbs:
+            assert torch.count_nonzero(state.X) == 0
+        after = point(state)
+        for key in before:
+            torch.testing.assert_close(after[key], before[key])
+
+    monkeypatch.setattr(_step_monolithic, "maintain_per_layer_subspace", checked_maintain)
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(8, 12), nn.Tanh(), nn.Linear(12, 3))
     subspace = HybridSubspace.from_layout(
         ParamLayout.from_module(model),
         rank=2,
-        rotation_mode="random",
+        rotation_mode=rotation_mode,
         rotation_interval=rotation_interval,
         absorb_mode="periodic",
         absorb_interval=absorb_interval,

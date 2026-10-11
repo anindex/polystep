@@ -11,8 +11,9 @@ runs the layers ahead of it once per step instead of once per candidate.
 Chunks break at parameter boundaries so a chunk can name a single site.
 
 Only the probe radius is scheduled, cosine from 10 to 2, sized from
-``--epochs``; epsilon and step radius stay flat. Checkpoints are selected
-on a held-out tenth of the training data, then evaluated on the test set.
+``--epochs``. Epsilon stays at 10 and ``step_radius=0.5``, which the optimizer
+multiplies by epsilon, giving an effective radius of 5. Checkpoints are selected on
+a held-out tenth of the training data, then evaluated on the test set.
 
 Run:
   python examples/10_cnn_mnist.py --epochs 10
@@ -37,7 +38,7 @@ from torch.utils.data import random_split
 
 from polystep import PolyStepOptimizer  # noqa: E402
 from polystep.cost_nn import NNCostEvaluator  # noqa: E402
-from polystep.epsilon import CosineEpsilon, LinearEpsilon  # noqa: E402
+from polystep.epsilon import CosineEpsilon  # noqa: E402
 from polystep.hybrid_subspace import HybridSubspace  # noqa: E402
 from polystep.transform import ParamLayout  # noqa: E402
 
@@ -85,10 +86,8 @@ def build_optimizer(model: nn.Module, total_steps: int, seed: int) -> PolyStepOp
         subspace=subspace,
         solver="softmax",
         num_probe=1,
-        # Epsilon stays flat; step_radius is a schedule only because epsilon
-        # multiplies float radii and not scheduled ones: a bare 5.0 would step at 50.
         epsilon=10.0,
-        step_radius=LinearEpsilon(init=5.0, target=5.0, decay=0.0),
+        step_radius=0.5,
         probe_radius=CosineEpsilon(init=10.0, target=2.0, total_steps=total_steps),
         # Four momentum steps between OT steps, so only every fifth pays for probes.
         amortize_steps=5,

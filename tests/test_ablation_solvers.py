@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from polystep.solvers.base import SolverResult
 from polystep.solvers.greedy import MinCostGreedySolver, TopKMeanSolver
+from polystep.solvers.kl_softmax import KLSoftmaxSolver
 from polystep.solvers.sinkhorn import SinkhornSolver
 from polystep.solvers.softmax import SoftmaxSolver
 
@@ -172,6 +173,16 @@ def test_half_precision_cost_gives_a_full_precision_plan(solver):
     result = solver.solve(C)
     assert result.matrix.dtype == torch.float32
     assert torch.allclose(result.matrix.sum(dim=1), torch.full((5,), 0.2), atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "solver",
+    [MinCostGreedySolver(), TopKMeanSolver(k=1), SoftmaxSolver(), KLSoftmaxSolver(), SinkhornSolver()],
+    ids=["min_cost", "top_k", "softmax", "kl_softmax", "sinkhorn"],
+)
+def test_integer_cost_gives_the_float_plan(solver):
+    C = torch.tensor([[1, 2], [3, 0]])
+    assert torch.equal(solver.solve(C).matrix, solver.solve(C.float()).matrix)
 
 
 @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])

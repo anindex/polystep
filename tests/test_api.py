@@ -213,6 +213,11 @@ class TestLoggingCallback:
         assert "[Step 1]" not in captured
         assert "[Step 3]" not in captured
 
+    def test_small_displacement_is_visible(self, capsys):
+        cb = LoggingCallback(log_every=1)
+        cb.on_step_end({"step": 0, "loss": 0.5, "ot_cost": 1.0, "displacement": 6.5e-7, "converged": True})
+        assert "disp_sq=6.500e-07" in capsys.readouterr().out
+
     def test_never_stops(self):
         cb = LoggingCallback(log_every=1)
         metrics = {"step": 0, "loss": 0.5, "ot_cost": 1.0, "displacement": 0.001, "converged": True}

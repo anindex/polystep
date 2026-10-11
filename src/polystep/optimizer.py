@@ -88,10 +88,11 @@ def _warn_thread_oversubscription() -> None:
         _THREAD_WARNING_ISSUED = True
         warnings.warn(
             f"torch.get_num_threads()={threads} on {ncpu} cores saturates the intra-op "
-            f"pool, where OpenMP spin-wait dominates PolyStep's many small forwards. "
-            f"Call torch.set_num_threads({max(1, ncpu - 8)}) "
-            f"before building the optimizer, or set OMP_WAIT_POLICY=PASSIVE. "
-            f"See docs/performance.md.",
+            f"pool, where OpenMP spin-wait can dominate PolyStep's many small forwards, "
+            f"most of all when other processes share the CPU. Small models often run as "
+            f"fast on one thread: call torch.set_num_threads(1) before building the "
+            f"optimizer, or run `python -m polystep.benchmarks.threads` to find the "
+            f"fastest count on this machine. See docs/performance.md.",
             stacklevel=3,
         )
 

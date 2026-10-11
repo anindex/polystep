@@ -95,35 +95,9 @@ def _cost_from_losses(opt, losses, P, V, K):
     return cost
 
 
-def _block_loop_setup(opt, X_probe):
-    """``(P, V, K, D, total_evals, losses)`` for one block."""
-    P, V, K, D = X_probe.shape
-    total_evals = P * V * K
-    # Counted here because the site-aware evaluators bypass the closure.
-    opt.candidate_evals += int(total_evals)
-    losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
-    return P, V, K, D, total_evals, losses
-
-
-def _finish_block(opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon):
-    """Cost matrix and OT solve for one block."""
-    return _solve_block(
-        opt,
-        state,
-        block_idx,
-        _cost_from_losses(opt, losses, P, V, K),
-        block_X,
-        verts,
-        rot_mats,
-        X_vertices,
-        step_r,
-        ot_epsilon,
-        P * V * K,
-    )
-
-
-def _solve_block(opt, state, block_idx, solve_cost, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon, evals):
+def _solve_block(opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon):
     """Solve one block's OT problem and project it onto the barycentre."""
+    solve_cost = _cost_from_losses(opt, losses, P, V, K)
     opt.solver.epsilon = ot_epsilon
     cost_matrix = sanitize_cost(solve_cost)
 
@@ -170,19 +144,11 @@ def _solve_block(opt, state, block_idx, solve_cost, block_X, verts, rot_mats, X_
         progress=cost_matrix.min(dim=1).values.mean().detach(),
         ess=ess,
         rho=rho,
-        evals=evals,
+        evals=P * V * K,
         converged=ot_result.converged,
         n_iters=ot_result.n_iters,
         weight=cost_matrix.numel(),
     )
-
-
-def _delta_context(opt):
-    """The delta evaluator and the batch it scores against, or ``None`` for the materializing path."""
-    fused_inputs = getattr(opt, "_fused_inputs", None)
-    if fused_inputs is None:
-        return None, None, None
-    return getattr(opt, "_sparse_delta_evaluator", None), fused_inputs, getattr(opt, "_fused_targets", None)
 
 
 def _reset_dual_momentum_on_epsilon_jump(state, ot_epsilon):
@@ -295,7 +261,9 @@ def step_blockwise(opt, closure: Callable) -> float:
         opt._probes = opt._probes.to(device=device, dtype=X.dtype)
     probes = opt._probes
 
-    sparse_delta, fused_inputs, fused_targets = _delta_context(opt)
+    fused_inputs = getattr(opt, "_fused_inputs", None)
+    fused_targets = getattr(opt, "_fused_targets", None)
+    sparse_delta = getattr(opt, "_sparse_delta_evaluator", None) if fused_inputs is not None else None
     # Covers the blocks the Linear-only sparse delta declines (conv, norm, attention, custom).
     site_vmap = getattr(opt, "_site_vmap_evaluator", None) if fused_inputs is not None else None
     site_owner = sparse_delta if sparse_delta is not None else site_vmap
@@ -304,7 +272,7 @@ def step_blockwise(opt, closure: Callable) -> float:
 
     group = verts.shape[0] * probes.numel()
     most = max(b.num_particles for b in blocks) * group
-    act = activation_elements(opt, getattr(opt, "_fused_inputs", None))
+    act = activation_elements(opt, fused_inputs)
     # Budget the chunk on elements; a fixed chunk OOMs on large models.
     chunk = min(opt.chunk_size or max(1, (1 << 26) // (opt.layout.padded_size + act)), most)
     site_chunk = chunk
@@ -329,7 +297,11 @@ def step_blockwise(opt, closure: Callable) -> float:
             opt, block, block_X, verts, block_idx, probes, step_r, probe_r, descent_dirs
         )
 
-        P, V, K, D, total_evals, losses = _block_loop_setup(opt, X_probe)
+        P, V, K, D = X_probe.shape
+        total_evals = P * V * K
+        # Counted here because the site-aware evaluators bypass the closure.
+        opt.candidate_evals += total_evals
+        losses = X_probe.new_empty(total_evals, dtype=loss_buffer_dtype(X_probe.dtype))
         candidates = X_probe.reshape(total_evals, D)
         block_columns = layout_columns[block.flat_start : block.flat_end].view(P, D)
         # Layout entries are contiguous, so a block maps to the layout by a constant shift.
@@ -376,7 +348,7 @@ def step_blockwise(opt, closure: Callable) -> float:
                 losses[lo:hi] = chunk_losses.to(losses.dtype)
 
         outcomes.append(
-            _finish_block(
+            _solve_block(
                 opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mats, X_vertices, step_r, ot_epsilon
             )
         )

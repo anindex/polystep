@@ -39,7 +39,7 @@ jobs:
           citation = re.search(r'^version: (.+)$', Path('CITATION.cff').read_text(), re.M).group(1).strip()
           assert os.environ['GITHUB_REF_NAME'] == f'v{version}', 'release tag must match the package version'
           assert citation == version, 'CITATION.cff version must match the package version'
-          assert any(line.startswith(f'## {version} ') for line in Path('CHANGELOG.md').read_text().splitlines()), 'missing changelog entry'
+          assert any(re.fullmatch(rf'## {re.escape(version)} - \d{{4}}-\d{{2}}-\d{{2}}', line) for line in Path('CHANGELOG.md').read_text().splitlines()), 'missing dated changelog entry'
           PY
       - name: Lint and test the release commit
         run: |

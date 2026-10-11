@@ -1,5 +1,7 @@
 """Checkpoint format for :class:`~polystep.optimizer.PolyStepOptimizer`."""
 
+import warnings
+
 import torch
 
 
@@ -132,7 +134,14 @@ class SerializationMixin:
 
         gs = sd.get("generator_state")
         if gs is not None and self._generator is not None:
-            self._generator.set_state(gs.to("cpu"))
+            if gs.numel() == self._generator.get_state().numel():
+                self._generator.set_state(gs.to("cpu"))
+            else:
+                warnings.warn(
+                    "Checkpoint generator state was saved on another device type; keeping the freshly "
+                    "seeded generator, so the resumed random stream differs from the original run.",
+                    stacklevel=2,
+                )
 
         # Restore the optimizer-owned control state.
         control = sd.get("control", {})

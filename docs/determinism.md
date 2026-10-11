@@ -22,11 +22,32 @@ Without deterministic algorithms, CUDA scatter-adds sum repeated entries in what
 order the threads finish. Hybrid runs with sparse projections use them, so two such
 runs can differ in the last bit.
 
-## Rotations
+## Random streams
 
 The rotation sampler uses batched QR for small particle batches and Householder
 reflections for larger batches. Both sample Haar rotations but consume different
 random streams. Changing the particle count or device can change the sequence.
+
+`PolyStepES` with a `seed` draws from its own generator. Without one it draws from
+PyTorch's global RNG, so `torch.manual_seed` before construction reproduces the run.
+
+Dense subspace bases depend on the device as well as the seed. A dense
+`AdaptiveSubspace` samples its bases on its generator's device, so a seeded CUDA run
+draws a different stream from the same seed on the CPU. A dense `HybridSubspace`
+basis is drawn on the CPU but orthogonalized by a QR on the model's device, so its
+CUDA bases round differently. Sparse projections draw their rows and signs from their
+own seeded CPU generator and skip the QR, so every device gets the same projection.
+
+A candidate forward that draws its own random numbers, such as injected noise, is
+retried under vmap with `randomness="different"`, which gives each candidate its own
+draw. That stream differs from scoring the candidates one at a time, so a run whose
+forward falls back to the sequential loop does not match one that stays batched.
+
+## Closure tensors
+
+The candidate tensors passed to a closure are borrowed: the next chunk may overwrite
+their storage. A closure that keeps them after it returns, for logging or caching,
+must clone them, or it reads later candidates' values.
 
 ## Checks
 

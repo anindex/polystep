@@ -169,7 +169,7 @@ class TestJLTProperty:
         assert error <= 1e-6 * torch.linalg.vector_norm(projected_then_scaled), f"linearity broken: {error}"
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.float16])
 def test_preserves_input_dtype(dtype):
     """The projection must come back at the coordinate dtype, not the buffer's."""
     proj = SparseRandomProjection(full_dim=1000, subspace_dim=32, seed=42)
@@ -210,6 +210,23 @@ class TestCUDA:
         full2 = proj2.project(coords)
 
         assert torch.allclose(full1, full2)
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_csr_build_holds_only_what_it_counts(self):
+        """Building the CSR keeps nothing of the COO it sorted, and its peak stays near the CSR."""
+        proj = SparseRandomProjection(full_dim=1_000_000, subspace_dim=1024, seed=0)
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["requested_bytes.all.current"]
+        torch.cuda.reset_peak_memory_stats()
+        proj._get_csr_matrix(torch.device("cuda"), torch.float32)
+        torch.cuda.synchronize()
+
+        stats = torch.cuda.memory_stats()
+        held = stats["requested_bytes.all.current"] - before
+        peak = stats["requested_bytes.all.peak"] - before
+        assert held - proj.memory_bytes < 2**12
+        assert peak < 64 * proj.nnz
 
 
 def test_repr():

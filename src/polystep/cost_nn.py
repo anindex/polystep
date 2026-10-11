@@ -98,6 +98,13 @@ def _reusable(buffer: torch.Tensor, target: torch.Tensor) -> bool:
     return buffer.shape == target.shape and buffer.dtype == target.dtype and buffer.device == target.device
 
 
+def _max_norm_weights(model: nn.Module) -> list[torch.Tensor]:
+    """Weights that an embedding with ``max_norm`` renormalizes inside its forward."""
+    return [
+        m.weight for m in model.modules() if isinstance(m, (nn.Embedding, nn.EmbeddingBag)) and m.max_norm is not None
+    ]
+
+
 def _uniform_float_dtype(*param_sources) -> Optional[torch.dtype]:
     """The one float dtype every parameter shares, or None if they differ.
 
@@ -204,18 +211,25 @@ def cast_inputs_memo(holder, inputs: torch.Tensor, dtype: Optional[torch.dtype])
 class NNCostEvaluator:
     """Vectorized NN cost evaluation via vmap + functional_call.
 
-    Evaluates a model at N batched parameter configurations, falling back to a
-    sequential loop if vmap fails.
+    Evaluates a model at N batched parameter configurations. If vmap refuses a
+    random draw, it retries with ``randomness="different"``; if vmap still fails,
+    it falls back to a sequential loop.
 
     Args:
         model: The ``nn.Module`` to evaluate, put in eval mode.
         loss_fn: ``loss_fn(output, targets) -> scalar`` or ``loss_fn(output) -> scalar``.
         chunk_size: vmap ``chunk_size`` (``None`` = no chunking, ``"auto"`` = detect).
         compile_vmap: Wrap vmap in ``torch.compile(mode="default")`` (fusion only).
+        use_inplace: Run the model's own forward one candidate at a time, writing
+            each candidate into the parameters in place. ``None`` picks this on CUDA
+            when eight weight copies would take more than half the free memory;
+            ``True`` forces it and turns off the vmap, delta and factored paths.
         compile_forward: Compile the in-place path's forward with
             ``mode="reduce-overhead"`` (CUDA graphs); ``None`` enables it there.
         per_sample: Return unreduced ``(N, B)`` losses instead of ``(N,)``. Needs
             ``loss_fn.reduction == "none"``.
+        autocast_dtype: Run the candidate forward under autocast in this dtype
+            (``None`` = off). Builtin losses reduce half-precision outputs in FP32.
     """
 
     def __init__(
@@ -378,11 +392,12 @@ class NNCostEvaluator:
     def _activation_ratio(self, inputs: torch.Tensor) -> Optional[float]:
         """Widest output of a module that owns parameters, per input element.
 
-        Runs one real forward under a forked RNG and puts the buffers back; None when
-        that forward raises.
+        Runs one real forward under a forked RNG and puts back the buffers and any
+        weight a ``max_norm`` embedding renormalizes; None when that forward raises.
         """
         widths = []
-        saved = [b.clone() for b in self._buffers.values()]
+        state = [*self._buffers.values(), *_max_norm_weights(self.model)]
+        saved = [t.clone() for t in state]
 
         def record(module, args, out):
             widths.extend(t.numel() for t in (out if isinstance(out, tuple) else (out,)) if isinstance(t, torch.Tensor))
@@ -402,8 +417,8 @@ class NNCostEvaluator:
         finally:
             for h in handles:
                 h.remove()
-            for b, s in zip(self._buffers.values(), saved):
-                b.copy_(s)
+            for t, s in zip(state, saved):
+                t.copy_(s)
             if was_training:
                 self.model.train()
         return max(widths, default=0) / max(1, inputs.numel())
@@ -1276,10 +1291,11 @@ class SiteVmapEvaluator:
         """Decline where the caller's vmap path is unusable, or on tied weights.
 
         An in-place evaluator that is forced, or that faces tied weights, gets the
-        in-place site path instead, unless it scores per sample.
+        in-place site path instead, unless it scores per sample or its forward
+        renormalizes an embedding with ``max_norm``.
         """
         if evaluator._use_inplace and (evaluator._inplace_forced or layout.shared_groups):
-            if evaluator.per_sample:
+            if evaluator.per_sample or _max_norm_weights(evaluator.model):
                 return None
             return SiteInplaceEvaluator(evaluator.model, evaluator.loss_fn, layout, evaluator._buffers, owner=evaluator)
         if evaluator._vmap_failed or evaluator._inplace_forced or layout.shared_groups:
@@ -1385,7 +1401,7 @@ class SiteVmapEvaluator:
 
         # Repeat evaluate()'s cast/autocast frame here. Cast to the model's dtype, not
         # the site's: the perturbed layer need not be the one the input reaches first.
-        cast_to = _uniform_float_dtype(shared, site)
+        cast_to = self._owner._input_dtype(base_sd) if self._owner is not None else _uniform_float_dtype(shared, site)
         if cast_to is not None and inputs.is_floating_point() and inputs.dtype != cast_to:
             inputs = self._owner.cast_inputs(inputs, cast_to) if self._owner is not None else inputs.to(cast_to)
 
@@ -1488,7 +1504,8 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
         """``(losses, score)`` for ``n`` candidates on the model primed with ``sd``, in eval mode."""
         owner, model = self._owner, self.model
         if self._primed is not sd:
-            torch._foreach_copy_([self._param(k) for k in sd], list(sd.values()))
+            keys = [k for k in sd if k in self._entry_by_key]
+            torch._foreach_copy_([self._param(k) for k in keys], [sd[k] for k in keys])
             self._primed = sd
         inputs = owner.cast_inputs(inputs, owner._input_dtype(sd))
         losses = torch.empty(n, device=inputs.device, dtype=loss_buffer_dtype(next(iter(sd.values())).dtype))

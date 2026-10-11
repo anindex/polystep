@@ -22,9 +22,9 @@ preferred-citation:
   authors:
     - family-names: Le
       given-names: An T.
-  journal: "arXiv preprint arXiv:2605.01928"
+  journal: "Transactions on Machine Learning Research"
   year: 2026
-  url: "https://arxiv.org/abs/2605.01928"
+  url: "https://openreview.net/forum?id=8mlcqTTMuU"
 references:
   - type: conference-paper
     title: "Accelerating Motion Planning via Optimal Transport"

@@ -32,9 +32,9 @@ momentum.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
   When a candidate's output is FP16 or BF16, whether from the model's dtype or from
   `candidate_autocast`, an `nn.CrossEntropyLoss`, `nn.MSELoss`, or `nn.L1Loss` left
-  at its defaults apart from `reduction` reduces it in FP32. Any other loss, including one with class
-  weights, label smoothing, or hooks, keeps the dtype it returns, so candidates
-  closer than its rounding step tie.
+  at its defaults apart from `reduction` reduces it in FP32. Any other loss,
+  including one with class weights, label smoothing, or hooks, keeps the dtype it
+  returns, so candidates closer than its rounding step tie.
   Models needing autocast internally must provide it.
 - With FP16 or BF16 parameters, the subspace-delta and factored evaluators are off
   so that candidates are scored on the weights they round to. `FactoredSubspace`
@@ -43,7 +43,8 @@ momentum.
   this option; use manual steps on a stationary objective.
 - `trust_region` and `use_adaptive_radius` both scale the step. Choose one controller.
 - Multi-fidelity screening imputes dropped costs using an additive offset. This can
-  bias the full-fidelity cost estimate and is disabled with quadratic-model options.
+  bias the full-fidelity cost estimate. Screening does not run with
+  `use_quadratic_model`, `newton_refinement` or `trust_region`.
 - Full-space blockwise mode does not support every monolithic adaptation option;
   unsupported options warn at construction. With a subspace, `per_layer` and
   `grouped` run the monolithic step and only split Sinkhorn and KL solves into row

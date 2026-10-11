@@ -195,6 +195,48 @@ def test_the_in_place_site_path_accepts_tied_weights(forced):
     assert torch.equal(got, evaluator.evaluate(layout.batch_unflatten(candidates), inputs, targets))
 
 
+class BufferAliasNet(nn.Module):
+    def __init__(self, persistent):
+        super().__init__()
+        self.a, self.b = nn.Linear(4, 8), nn.Linear(8, 3)
+        alias = self.a.weight.detach()
+        self.register_buffer("alias", alias, persistent=persistent)
+        self.b.register_buffer("alias", alias, persistent=persistent)
+
+    def forward(self, x):
+        return self.b(torch.tanh(self.a(x)))
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("use_inplace", [None, True])
+def test_a_persistent_buffer_aliasing_a_parameter_trains_it(hybrid, use_inplace):
+    """The state_dict lists the root's buffers before its children's parameters, yet
+    the parameter must stay canonical: a persistent alias trains like a
+    non-persistent one, on every path.
+    """
+    from polystep import HybridSubspace
+
+    def run(persistent):
+        torch.manual_seed(0)
+        model = BufferAliasNet(persistent)
+        inputs, targets = torch.randn(16, 4), torch.randint(0, 3, (16,))
+        layout = ParamLayout.from_module(model, particle_dim=PDIM)
+        subspace = HybridSubspace.from_layout(layout, rank=2) if hybrid else None
+        opt = PolyStepOptimizer(model, solver="softmax", seed=0, subspace=subspace)
+        evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=use_inplace, compile_forward=False)
+        losses = []
+        for _ in range(3):
+            opt.register_evaluator(evaluator, inputs, targets)
+            losses.append(float(opt.step(lambda p: evaluator.evaluate(p, inputs, targets))))
+        assert model.alias.data_ptr() == model.a.weight.data_ptr()
+        return losses, model.a.weight.detach()
+
+    losses, weight = run(True)
+    want_losses, want_weight = run(False)
+    torch.testing.assert_close(torch.tensor(losses), torch.tensor(want_losses))
+    torch.testing.assert_close(weight, want_weight)
+
+
 def test_sparse_delta_still_wins_where_it_applies():
     """Both paths accept a plain MLP, so they must agree on it."""
     torch.manual_seed(0)
@@ -325,6 +367,52 @@ def test_forced_inplace_keeps_only_the_in_place_site_path(subspace, block_strate
     assert opt._site_vmap_evaluator is site
     opt.step(lambda bp: forced.evaluate(bp, inputs, targets))
     assert site._primed is None
+
+
+@pytest.mark.parametrize("kind, width", [(nn.Embedding, 12), (nn.EmbeddingBag, 4)])
+def test_forced_inplace_on_a_max_norm_embedding_matches_the_default_path(kind, width):
+    """A ``max_norm`` lookup renormalizes rows inside the forward; that write must not
+    carry from one candidate into the next.
+    """
+    gen = torch.Generator().manual_seed(1)
+    inputs, targets = torch.randint(0, 6, (16, 3), generator=gen), torch.randint(0, 3, (16,), generator=gen)
+    weights = []
+    for inplace in (True, None):
+        torch.manual_seed(0)
+        embedding = kind(6, 4, max_norm=1.0)
+        with torch.no_grad():
+            embedding.weight.mul_(0.98 / embedding.weight.norm(dim=1, keepdim=True))
+        model = nn.Sequential(embedding, nn.Flatten(), nn.Linear(width, 3))
+        opt = PolyStepOptimizer(model, solver="softmax", seed=0, epsilon=0.3)
+        evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=inplace, compile_forward=False)
+        for _ in range(3):
+            opt.register_evaluator(evaluator, inputs, targets)
+            opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+        weights.append(torch.cat([p.detach().flatten() for p in model.parameters()]))
+    torch.testing.assert_close(weights[0], weights[1], atol=1e-5, rtol=0)
+
+
+def test_forced_inplace_restores_a_max_norm_embedding_after_a_raising_loss():
+    """A step that raises mid-sweep must leave every renormalized row as it was."""
+    model = nn.Embedding(2, 4, max_norm=1.0)
+    with torch.no_grad():
+        model.weight.copy_(torch.arange(2.0, 10.0).reshape(2, 4))
+    before = model.weight.detach().clone()
+    calls = []
+
+    def loss(output):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("failed loss")
+        return output.square().mean()
+
+    opt = PolyStepOptimizer(model, solver="softmax", particle_dim=2, seed=0)
+    evaluator = NNCostEvaluator(model, loss, use_inplace=True, compile_forward=False)
+    inputs = torch.tensor([0, 1])
+    opt.register_evaluator(evaluator, inputs)
+    with pytest.raises(RuntimeError, match="failed loss"):
+        opt.step(lambda p: evaluator.evaluate(p, inputs))
+    assert torch.equal(model.weight, before)
 
 
 def test_swapping_back_to_an_unforced_evaluator_rearms():

@@ -52,7 +52,7 @@ def train(
     optimizer: PolyStepOptimizer,
     config: TrainConfig,
 ) -> nn.Module:
-    """Train a model with the Sinkhorn Step optimizer; builds the OT closure internally."""
+    """Train a model with the PolyStep optimizer; builds the OT closure internally."""
     if getattr(optimizer, "model", model) is not model:
         raise ValueError("train() got a different model than the optimizer was built on.")
     if getattr(optimizer, "trust_region", False):
@@ -202,7 +202,7 @@ class LoggingCallback(TrainCallback):
                 f"[Step {metrics['step']}] "
                 f"loss={metrics['loss']:.4f} "
                 f"ot_cost={metrics['ot_cost']:.4f} "
-                f"disp={metrics['displacement']:.6f} "
+                f"disp_sq={metrics['displacement']:.3e} "
                 f"converged={metrics['converged']}"
             )
         return False

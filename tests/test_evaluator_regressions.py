@@ -320,6 +320,28 @@ def test_mixed_dtype_site_does_not_cast_inputs_to_an_unrelated_scalar():
     torch.testing.assert_close(got, nn.functional.mse_loss(model(x), y).expand(2))
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_grouped_site_casts_inputs_past_a_float32_buffer(dtype):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(2, 2).to(dtype)
+            self.register_buffer("extra", torch.zeros(()))
+
+        def forward(self, x):
+            return self.fc(x) + self.extra
+
+    torch.manual_seed(0)
+    model, loss_fn = Model(), nn.MSELoss()
+    x, y = torch.randn(8, 2), torch.randn(8, 2)
+    opt = PolyStepOptimizer(model, block_strategy="grouped", seed=0)
+    opt.register_evaluator(NNCostEvaluator(model, loss_fn), x, y)
+    with torch.no_grad():
+        loss = opt.step(lambda *_: loss_fn(model(x.to(dtype)).float(), y))
+    assert torch.isfinite(torch.as_tensor(loss)).all()
+    assert model.fc.weight.dtype is dtype
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_constant_simplex_losses_have_exactly_zero_model_gradient(dtype):
     from polystep.geometry import get_simplex_vertices
@@ -400,19 +422,27 @@ def test_materialized_fallback_honours_chunk_size(screen):
     assert rows and set(rows) == {1}
 
 
+@pytest.mark.parametrize(
+    "layers, out, expected",
+    [
+        (lambda: (nn.Linear(3, 101, bias=False),), 101, 9),
+        (lambda: (nn.Linear(3, 101), nn.Tanh(), nn.Linear(101, 5)), 5, 36),
+    ],
+    ids=["tail", "interior"],
+)
 @pytest.mark.parametrize("hybrid", [False, True])
-def test_only_the_padded_tail_particle_falls_back(hybrid):
+def test_only_the_padded_tail_particle_falls_back(hybrid, layers, out, expected):
     from polystep.hybrid_subspace import HybridSubspace
     from polystep.transform import ParamLayout
 
     torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(3, 101, bias=False))
+    model = nn.Sequential(*layers())
     subspace = HybridSubspace.from_layout(ParamLayout.from_module(model, particle_dim=8), rank=4) if hybrid else None
     opt = PolyStepOptimizer(
         model, particle_dim=8, polytope_type="simplex", subspace=subspace, solver="softmax", compile=False, seed=0
     )
     ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
-    x, y = torch.randn(16, 3), torch.randn(16, 101)
+    x, y = torch.randn(16, 3), torch.randn(16, out)
     opt.register_evaluator(ev, x, y)
     rows = []
 
@@ -421,7 +451,7 @@ def test_only_the_padded_tail_particle_falls_back(hybrid):
         return ev.evaluate(params, x, y)
 
     opt.step(closure)
-    assert sum(rows) == 9
+    assert sum(rows) == expected
 
 
 @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
@@ -448,3 +478,43 @@ def test_activation_width_counts_conv_outputs(block_strategy):
     site._vmap_over_site = spy
     opt.step(lambda p: ev.evaluate(p, x, y))
     assert rows and max(rows) < 54
+
+
+@pytest.mark.parametrize("kind", [nn.Embedding, nn.EmbeddingBag])
+def test_registering_leaves_a_max_norm_embedding_untouched(kind):
+    model = kind(2, 4, max_norm=1.0)
+    with torch.no_grad():
+        model.weight.copy_(torch.arange(2.0, 10.0).reshape(2, 4))
+    before = model.weight.detach().clone()
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    opt.register_evaluator(ev, torch.tensor([[0], [1]]), torch.zeros(2, 4))
+    assert opt._act_ratio is not None
+    assert torch.equal(model.weight, before)
+
+
+class _Noisy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("calls", torch.zeros((), dtype=torch.long))
+
+    def forward(self, x):
+        self.calls += 1
+        return x + 0 * torch.randn_like(x)
+
+
+def test_registering_leaves_train_mode_stats_and_rng_untouched():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.BatchNorm1d(8), _Noisy(), nn.ReLU(), nn.Linear(8, 2))
+    opt = PolyStepOptimizer(model, compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    model.train()
+    x, y = torch.randn(32, 4) + 3, torch.randn(32, 2)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    rng = torch.get_rng_state()
+    opt.register_evaluator(ev, x, y)
+    assert opt._act_ratio is not None
+    assert model.training
+    assert torch.equal(torch.get_rng_state(), rng)
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, before[k]), k

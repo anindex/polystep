@@ -169,6 +169,24 @@ def test_polystep_reports_inf_when_every_candidate_is_nonfinite():
     torch.testing.assert_close(state.X, X)
 
 
+def test_polystep_step_flags_an_all_nonfinite_solve_and_keeps_its_duals():
+    from polystep.epsilon import ProgressiveEpsilon
+
+    objective = {"fn": lambda x: x.pow(2).sum(-1)}
+    eps = ProgressiveEpsilon(init=1.0)
+    solver = PolyStep(objective_fn=lambda x: objective["fn"](x), dim=2, epsilon=eps, scale_cost=None)
+    state = solver.step(solver.init_state(torch.tensor([[1.0, 2.0], [3.0, 4.0]])), torch.Generator().manual_seed(0))
+    f, g, before = state.f.clone(), state.g.clone(), eps._current
+
+    objective["fn"] = lambda x: torch.full(x.shape[:-1], torch.inf)
+    state = solver.step(state, torch.Generator().manual_seed(1))
+    assert state.costs[-1] == math.inf
+    assert state.linear_convergence[-1] is False
+    assert eps._current > before
+    torch.testing.assert_close(state.f, f)
+    torch.testing.assert_close(state.g, g)
+
+
 def test_polystep_reports_a_nonfinite_particle_as_diverged():
     solver = PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, threshold=1e-12)
     X = torch.randn(8, 2, generator=torch.Generator().manual_seed(0))

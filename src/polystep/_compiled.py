@@ -1,4 +1,4 @@
-"""Compiled function variants for hot paths in the Sinkhorn Step solver."""
+"""Compiled function variants for hot paths in the PolyStep solver."""
 
 import warnings
 from typing import Callable, Optional, Tuple

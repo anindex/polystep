@@ -1,5 +1,6 @@
 """Tests for NNCostEvaluator, ParamLayout.batch_unflatten(), chunked eval, and cost matrix."""
 
+import inspect
 import warnings
 
 import pytest
@@ -517,3 +518,8 @@ def test_inplace_activations_defer_to_vmap(model):
     assert losses.shape == (3,) and torch.isfinite(losses).all()
     # Same weights in every row, so the same loss in every row.
     assert losses.std() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_docstring_names_every_constructor_argument():
+    params = [p for p in inspect.signature(NNCostEvaluator.__init__).parameters if p != "self"]
+    assert [p for p in params if f"{p}:" not in NNCostEvaluator.__doc__] == []

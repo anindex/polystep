@@ -18,14 +18,15 @@ __all__ = ["PolyStepES", "minimize"]
 
 
 class PolyStepES:
-    """Ask/tell wrapper around the Sinkhorn Step update.
+    """Ask/tell wrapper around the PolyStep update.
 
     Args:
         dim: Dimensionality of a solution vector.
         num_particles: Number of independent particles. Population size is
             ``num_particles * 2 * dim``.
         epsilon: Entropic OT temperature (drives the default solver only).
-        step_radius: Geometric step size along the polytope directions.
+        step_radius: Step length in solution space along the polytope directions.
+            Unlike ``PolyStepOptimizer``, it is not multiplied by ``epsilon``.
         solver: OT solver. Defaults to :class:`SoftmaxSolver`; pass a
             :class:`SinkhornSolver` for the full entropic-OT plan. A caller-supplied
             solver keeps its own ``epsilon``.

@@ -2,6 +2,50 @@
 
 ## 1.0.0 (unreleased)
 
+### Upgrading from 0.13
+
+These changes need code or workflow updates. Details follow under Changes.
+
+- `CMAAdaptiveSubspace` and the CMA helpers are gone; use `AdaptiveSubspace`.
+- `TemperedSoftmaxSolver` is gone; use `solver='softmax'` with `ent_epsilon` for a
+  fixed temperature.
+- `auto_epsilon` is gone; pass a `ProgressiveEpsilon` as `epsilon`.
+- `PolyStep` no longer trains networks. Its `subspace`, `nn_evaluator`,
+  `train_inputs`, and `train_targets` fields and `init_state(base_params=...)` are
+  gone; use `PolyStepOptimizer`.
+- `create_hybrid_blocks` and `LayerProjectionSpec` are gone; use
+  `polystep.subspace.ProjectionSpec`.
+- Low-level helpers such as `BlockConfig`, `CompiledFunctions`, and
+  `compute_cost_matrix` are no longer exported from `polystep`; import them from
+  their submodules, listed under Changes.
+- `TrainConfig.batch_size` and `log_every` are gone; set the batch size on the
+  `DataLoader` and the interval with `LoggingCallback(log_every=...)`.
+- `SolverResult.cost` is gone; read `ent_reg_cost`.
+- Removed without a replacement: `adaptive_probes`, `adaptive_probes_threshold`,
+  `data_dependent_init`, the `compile` field of the softmax, greedy, top-k, and KL
+  solvers, the block-splitting helpers, and `BenchmarkResult`. Runs that relied on
+  `adaptive_probes` now evaluate candidates on every OT step.
+- Optimizer checkpoints use format 6. Older checkpoints raise `ValueError`; rebuild
+  the optimizer from the saved model weights.
+- `PolyStepOptimizer` raises `TypeError` for a subspace that is not an
+  `AdaptiveSubspace`, `HybridSubspace`, or `FactoredSubspace`.
+- These now raise `ValueError`: `ProgressiveEpsilon` together with `ent_epsilon`,
+  `rank_schedule` with any subspace but a `HybridSubspace`, `PowerDecay` with a
+  `gamma` outside `(0, 0.5]`, `CosineEpsilon` with a negative `decay`, and a
+  full-space `per_layer` or `grouped` closure that does not return one loss per
+  candidate.
+- After swapping a layer into the model, call `resync_from_model()`. Steps write into
+  the model's current parameters and would otherwise restore the old weights.
+- A closure that keeps a candidate tensor after it returns must clone it. CPU
+  `AdaptiveSubspace` steps now reuse one candidate buffer, as full-space steps
+  already did.
+- Seeded results change for `per_layer` and `grouped` subspace runs,
+  `biased_rotation`, KL solves, noisy forwards, and seeded subspaces on CUDA or MPS.
+  Unseeded `PolyStepES` now follows `torch.manual_seed`. Many other changes move
+  results only in the last bit.
+
+### Changes
+
 - Remove `CMAAdaptiveSubspace`, `compute_cma_hyperparameters`,
   `use_covariance_adaptation`, and the CMA fields of `SolverState`; use
   `AdaptiveSubspace`.
@@ -52,10 +96,13 @@
   weights.
 - Optimizer checkpoints use format 6 and restore `candidate_evals`. Older formats
   raise `ValueError`; rebuild the optimizer from the saved model weights instead.
+- Loading a seeded checkpoint on another device type, such as a CUDA run resumed
+  on CPU, warns and keeps the freshly seeded generator instead of raising.
 - Subspace runs with `block_strategy='per_layer'` or `'grouped'` take the monolithic
-  step and its fast evaluation paths. Sinkhorn and finite-`lam` KL solves still split
-  the particles into up to eight row segments; one-sided solvers run unsplit and warn.
-  Seeded runs draw a different random stream.
+  step and its fast evaluation paths. Sinkhorn and KL solves with `lam > 0` still split
+  the particles into up to eight row segments, and `'grouped'` splits them exactly like
+  `'per_layer'` but warns. One-sided solvers, including KL with `lam=0`, run unsplit
+  and warn. Seeded runs draw a different random stream.
 - In those runs, trust region, the quadratic model, screening, probe-count
   adaptation, and `rank_schedule` now apply instead of being ignored. The adaptive
   radius follows the best-vertex mean, `scale_cost='mean'` and `'max_cost'` use one
@@ -128,9 +175,9 @@
 - Half-precision candidate outputs, from an FP16 or BF16 model or from
   `candidate_autocast`, reduce in FP32 when the loss is an `nn.CrossEntropyLoss`,
   `nn.MSELoss`, or `nn.L1Loss` left at its defaults apart from `reduction`, so
-  candidates about 1e-3 apart no longer tie. With `candidate_autocast` on CUDA, the eager in-place and loop costs
-  and the `train()` loss now match the compiled path. Other losses and FP64 models
-  score as before.
+  candidates about 1e-3 apart no longer tie. With `candidate_autocast` on CUDA, the
+  eager in-place and loop costs and the `train()` loss now match the compiled path.
+  Other losses and FP64 models score as before.
 - A `FactoredSubspace` step after `release_evaluator()` scores through the closure
   instead of failing on the released batch. The release also frees the cast copy of
   that batch kept by the registered, delta, and factored evaluators.
@@ -153,13 +200,17 @@
 - `AdaptiveSubspace` draws its bases on its generator's own device instead of
   reseeding a CPU generator from a CUDA or MPS one, and `HybridSubspace` runs its
   projection QR on the model's device. Seeded runs on non-CPU devices change; CPU
-  runs are unchanged.
+  runs are unchanged. On CUDA, a rank-128 `AdaptiveSubspace` step of a 784-256-10
+  MLP takes 11 ms instead of about 80 ms.
 - `SparseRandomProjection` keeps a single CSR copy with 32-bit indices and, when
   a row map is smaller than full row pointers, stores only the rows its columns touch.
   Projections are unchanged. With 1e8 rows and 256 columns it holds 82 MB instead
   of 902 MB and projects twice as fast on CUDA; on one CPU thread it projects 3 to
   6 times faster at 1e6 to 1e7 rows. `memory_bytes` counts everything it holds, so
-  it reads higher than before.
+  it reads higher than before. The CSR build on the first `project` peaks lower
+  too: 472 MiB instead of 1627 MiB at 1e8 by 256 on CUDA. The rank-4
+  `HybridSubspace` projection of a 2048 by 2048 BF16 layer peaks at 1856 MiB
+  instead of 1920 MiB and then holds 536 MiB instead of 1192 MiB.
 - `fused_softmax_project` in `polystep._compiled` drops its `a` and
   `scale_cost_mean` arguments and returns weights whose rows sum to one; callers
   recenter and scale the cost first. `SolverState` drops the unused marginal `a`.
@@ -168,7 +219,8 @@
   on the softmax solver without the quadratic model can change in the last bit.
 - `SinkhornSolver(compile=True)` also compiles the iteration when it checks
   convergence, not only when `threshold <= 0`. Each check costs one host sync
-  instead of two.
+  instead of two, and a compiled 10-iteration solve on CUDA takes 0.77 ms instead
+  of 1.33 ms.
 - At `omega=1` without Anderson or adaptive omega, the convergence check reads only
   the row marginal, since the column update leaves the column exact up to rounding.
   `errors` loses that rounding floor, so a solve whose floor sat above `threshold`
@@ -216,8 +268,6 @@
   displacement, so `run()` stops as diverged instead of converging on a stuck state.
 - `biased_rotation` checks the previous descent direction one particle at a time,
   so a nonfinite row leaves only its own frame unbiased instead of every particle's.
-  Checkpoints no longer store `_prev_descent_direction_finite`, and one that has it
-  still loads.
 - `apply_biased_rotation` turns each frame with one Householder reflection instead
   of a Gram-Schmidt loop, 10 times faster at 8 dimensions and over 100 times at 32
   on CUDA. A bias along another axis of the frame is now applied; it used to fall
@@ -230,25 +280,35 @@
 - A candidate forward that draws its own random numbers stays batched. vmap retries
   it once with a separate draw per candidate, compiled or not, instead of falling
   back to a sequential loop with a warning. Full-space steps on a small noisy MLP
-  run 3.5 times faster on CPU and 40 times on CUDA. Seeded runs of such models draw
-  a different random stream.
+  run 3.5 times faster on CPU and about 35 times on CUDA. Seeded runs of such models
+  draw a different random stream.
 - Buffers that a refused vmap forward wrote are restored before the retry or the
   sequential fallback runs.
 - The sparse-delta and subspace-delta evaluators share one layer walk. Hybrid biases
   and full-width weights now change only the output units their coordinates touch,
   instead of taking a dense correction or the site-local path. Hybrid runs can change
   in the last bit, as can full-space runs whose `particle_dim` of 3 or more puts
-  several entries on one output unit. On one CPU thread, hybrid steps and full-space
-  steps with a `particle_dim` of 8 run 7 to 15% faster; full-space steps at the
-  default `particle_dim` run at the same speed.
+  several entries on one output unit. On one CPU thread with `chunk_size=72`, hybrid
+  steps and full-space steps with a `particle_dim` of 8 run 7 to 15% faster, and
+  full-space steps at the default `particle_dim` run at the same speed. At the
+  default chunk size, a full-space step of a 32-64-64-4 MLP at batch 32 takes 13 to
+  15% longer (36 to 41 ms); wider layers and larger batches keep their speed. With
+  `chunk_size=1024` that step takes about 21 ms before and after.
 - `FactoredSubspace` steps with a registered Sequential MLP score candidates on the
   subspace-delta path, which moves only the output units a candidate's coordinates
   belong to. Runs that span two parameters, screened candidates and the incumbent
   keep the low-rank evaluator. Factored runs can change in the last bit. A
-  784-128-10 rank-8 step runs 13 to 25 times faster on one CPU thread. On CUDA at
-  the default chunk size it runs 1.5 to 2 times faster with a fifteenth of the peak
-  memory. With `chunk_size=72` it needs a quarter to half the peak memory but runs
-  1.3 to 1.6 times slower, since such small chunks are bound by kernel launches.
+  784-128-10 rank-8 step runs 13 to 25 times faster on one CPU thread. On CUDA the
+  delta path scores each parameter in its own pass, so it runs only when the
+  low-rank evaluator would need more than one chunk or `chunk_size` is below the
+  candidate count. At the default chunk size such steps, 784-256-10 rank 8 at batch
+  256 among them, run 1.2 to 2.3 times faster and allocate a thirtieth to a fiftieth of the peak memory above
+  what the model and data already hold. Smaller CUDA steps, 784-128-10 rank 8 at
+  batch 128 among them, keep the low-rank evaluator and its speed. With
+  `chunk_size=72` the delta path allocates a quarter to a seventh of the peak memory.
+  It runs 1.3 to 1.4 times slower, since such small chunks are bound by kernel
+  launches, until the batch reaches 1024 on 784-128-10 or 512 on 784-256-10, where
+  both paths take the same time.
 - Those factored steps keep whole particles in each chunk, as hybrid steps already
   do, so `chunk_size` drops to a multiple of the vertex count times `num_probe` and
   never goes below one such group.
@@ -277,10 +337,10 @@
   through the closure. An evaluator that picks the in-place path for memory takes
   the same route on a model with tied weights. Full-space steps score the same
   weights as before; hybrid steps can change in the last bit. Screened hybrid
-  candidates, the hybrid incumbent, FP16/BF16 hybrid weights and non-contiguous
-  parameters keep the full swap. A 784-1024-256-10 hybrid step at rank 8 runs 6
-  times faster on CUDA, and small CNN and attention hybrid steps 1.5 to 2.3 times
-  faster.
+  candidates, the hybrid incumbent, FP16/BF16 hybrid weights, non-contiguous
+  parameters and models with a `max_norm` embedding keep the full swap. A
+  784-1024-256-10 hybrid step at rank 8 runs 6 times faster on CUDA, and small CNN
+  and attention hybrid steps 1.5 to 2.3 times faster.
 - Hybrid candidates on the site-local path with a sparse projection or an
   unprojected parameter now scatter-add only the entries their particle's columns
   touch, instead of projecting a full-width coordinate row. A dense projection fuses
@@ -294,12 +354,22 @@
 - Candidates that a delta, site or offsets chunk sends back to materialization are
   scored in batches of at most `chunk_size` instead of a whole particle group.
 - Delta and site paths give the padded last particle a chunk of its own, so the
-  particles before it stay on those paths instead of falling back with it.
+  particles before it stay on those paths instead of falling back with it. These
+  runs can change in the last bit.
 - The automatic chunk size counts the widest layer output, measured by one forward
   when an evaluator is registered, instead of the widest layer's channel count, and
-  delta and site chunks no longer charge a full candidate. On CUDA, a one-conv model
-  on 256x256 inputs at batch 64 peaked at 6.9 GiB and now peaks at 384 MiB; the
-  benchmark's 8x8 CNN steps take 2 to 14 percent longer from the extra chunks.
+  delta and site chunks no longer charge a full candidate. That forward puts back
+  the buffers and any weight a `max_norm` embedding renormalizes. On CUDA, a
+  one-conv model on 256x256 inputs at batch 64 peaked at 6.8 GiB and now peaks at
+  384 MiB.
+- Those two changes slow small models down. The benchmark's 8x8 CNN full-space step
+  now runs five site forwards instead of three: the activation budget splits its
+  largest weight across two chunks, and the bias particle that used to fall back with
+  the padded one gets a site forward of its own. Each of those forwards is bound by
+  kernel launches, so on CUDA the step takes 17 to 19% longer than in 0.13 with
+  Sinkhorn (3.5 to about 4.15 ms) and 30% longer with softmax (2.15 to 2.8 ms). CPU
+  steps take 2 to 5% longer. A `chunk_size` at or above the candidate count wins back
+  about half of it.
 - FP16/BF16 hybrid steps on the in-place path no longer build an incumbent weight
   set that the path never reads. On CUDA, a step of a BF16 2048-2048-4 MLP at rank 4
   with `use_inplace=True` allocates at most 34 MiB above the model instead of 42 MiB.
@@ -314,6 +384,8 @@
   the iterate into NaN.
 - `zscore` rescales losses large enough to overflow its mean or variance, so
   float32 losses near `1e38` no longer turn every utility into NaN.
+- Solvers promote integer cost matrices to the default float dtype instead of
+  raising `TypeError`, and `zscore` shaping accepts integer losses.
 - `Objective` enforces the deadline only through `remaining`, so a generation that
   starts before the deadline finishes instead of raising `BudgetExhausted`.
 - `random_search` scores the incumbent and the candidate in the same call, two
@@ -356,6 +428,18 @@
   `experiments/runners/common.py`.
 - The fairness runner's progress line shows the validation score. It looked up a
   key the trajectory never stores, so the score was never printed.
+- The thread-oversubscription warning suggests `torch.set_num_threads(1)` or
+  `python -m polystep.benchmarks.threads` instead of a fixed `ncpu - 8` thread count.
+- Grouped steps cast inputs the way `NNCostEvaluator.evaluate` does. A BF16 or FP64
+  model with an FP32 buffer no longer fails with a dtype mismatch.
+- `ParamLayout` keeps the parameter canonical when a persistent buffer shares its
+  storage. A root-level buffer used to take its place, so the parameter never
+  trained, and the in-place path raised `KeyError` on it.
+- `SparseRandomProjection` on CPU runs its sparse matmul in FP32 for BF16 and FP16
+  coordinates and returns the input dtype. An all-BF16 or all-FP16 CPU model whose
+  `HybridSubspace` used sparse projections used to fail with `NotImplementedError`.
+- `LoggingCallback` prints the squared displacement as `disp_sq` in scientific
+  notation. The old `disp` field showed small steps as `0.000000`.
 
 ## 0.13.0 - 2026-09-22
 

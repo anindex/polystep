@@ -332,7 +332,6 @@ def test_all_dfo_features_compose():
         epsilon=0.5,
         use_quadratic_model=True,
         polytope_type="orthoplex",
-        trust_region=True,
         biased_rotation=True,
         amortize_steps=3,
         amortize_ema=0.7,

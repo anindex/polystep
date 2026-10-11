@@ -650,9 +650,11 @@ class TestAuditSilentFailures:
 
         es = PolyStepES(dim=3, num_particles=2, seed=0)
         f = torch.full((es.popsize,), float("-inf"))
-        es.ask()
+        f[1], f[2] = 2.0, 3.0
+        candidates = es.ask()
         es.tell(f)
-        assert math.isfinite(es.best_fitness) or es.best_fitness == float("inf")
+        assert es.best_fitness == 2.0
+        assert torch.equal(es.best_solution, candidates[1])
 
     def test_a_negative_kl_penalty_is_rejected_at_solve_time(self):
         """A finite negative lam gave alpha<0 and took the softmax-limit branch."""

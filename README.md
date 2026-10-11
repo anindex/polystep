@@ -17,7 +17,7 @@ backpropagation is usually faster.
 
 [Paper](https://arxiv.org/abs/2605.01928) ·
 [Interactive visualization](https://vietngth.github.io/polystep-visualization/) ·
-[API reference](docs/api_overview.md) ·
+[API reference](https://github.com/anindex/polystep/blob/main/docs/api_overview.md) ·
 [Julia package](https://github.com/anindex/PolyStep.jl)
 
 <p align="center">
@@ -59,7 +59,7 @@ train(model, loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 
 Replace the generated data with your dataset. Limit `max_subspace_dim` to control
 the forward budget. In manual loops, call `register_evaluator()` before each batch;
-`train()` does this automatically. See [performance](docs/performance.md) for
+`train()` does this automatically. See [performance](https://github.com/anindex/polystep/blob/main/docs/performance.md) for
 candidate paths, thread counts, compilation, and memory settings.
 
 ### Ask/tell
@@ -110,13 +110,13 @@ result = openai_es(objective, sigma=0.05, lr=0.1, popsize=32)
 
 The paper runners support `--fair` for matched search spaces and evaluation budgets.
 EGGROLL uses a factored representation to retain matrix perturbations. See the
-[reproduction protocol](docs/reproducibility.md) for tuning and budget details.
+[reproduction protocol](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md) for tuning and budget details.
 
 ## Benchmarks
 
 Five-seed mean ± sample standard deviation. These architecture tables compare
 validation-tuned methods at matched optimizer steps. Evaluation- and time-matched
-studies are reported separately in the [experiment index](experiments/EXPERIMENT_INDEX.md).
+studies are reported separately in the [experiment index](https://github.com/anindex/polystep/blob/main/experiments/EXPERIMENT_INDEX.md).
 
 <!-- BENCH:START -->
 ### Non-differentiable tasks
@@ -149,16 +149,16 @@ Test accuracy %. A dash means the result is not in this release.
 
 The SNN surrogate-gradient baseline varies substantially across seeds. Adam leads
 on the differentiable tasks, and specialized solvers lead on MAX-SAT. See
-[limitations](LIMITATIONS.md) for unsupported configurations and comparison limits.
+[limitations](https://github.com/anindex/polystep/blob/main/LIMITATIONS.md) for unsupported configurations and comparison limits.
 
 ## Documentation
 
-- [API reference](docs/api_overview.md)
-- [Performance](docs/performance.md)
-- [Examples](examples/README.md)
-- [Experiments](experiments/README.md) and [reproduction](docs/reproducibility.md)
-- [Determinism](docs/determinism.md)
-- [Contributing](CONTRIBUTING.md) and [changelog](CHANGELOG.md)
+- [API reference](https://github.com/anindex/polystep/blob/main/docs/api_overview.md)
+- [Performance](https://github.com/anindex/polystep/blob/main/docs/performance.md)
+- [Examples](https://github.com/anindex/polystep/blob/main/examples/README.md)
+- [Experiments](https://github.com/anindex/polystep/blob/main/experiments/README.md) and [reproduction](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md)
+- [Determinism](https://github.com/anindex/polystep/blob/main/docs/determinism.md)
+- [Contributing](https://github.com/anindex/polystep/blob/main/CONTRIBUTING.md) and [changelog](https://github.com/anindex/polystep/blob/main/CHANGELOG.md)
 
 ## Citation
 
@@ -166,8 +166,9 @@ on the differentiable tasks, and specialized solvers lead on MAX-SAT. See
 @article{le2026training,
   title={Training Non-Differentiable Networks via Optimal Transport},
   author={Le, An T},
-  journal={arXiv preprint arXiv:2605.01928},
-  year={2026}
+  journal={Transactions on Machine Learning Research},
+  year={2026},
+  url={https://openreview.net/forum?id=8mlcqTTMuU}
 }
 ```
 
@@ -178,4 +179,4 @@ Thanks to [Viet T. Nguyen](https://vietngth.github.io/) for the
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](https://github.com/anindex/polystep/blob/main/LICENSE).

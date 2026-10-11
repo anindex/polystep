@@ -17,7 +17,7 @@ from .solvers._shared import sanitize_cost, solver_health, validate_positive
 
 @dataclass
 class SolverState:
-    """State of the Sinkhorn Step solver. ``costs`` is the mean over all ``P * V`` probe vertices after ``sanitize_cost``, ``inf`` when every vertex cost is nonfinite and ``nan`` when ``X`` is, not a best-seen value."""
+    """State of the PolyStep solver. ``costs`` is the mean over all ``P * V`` probe vertices after ``sanitize_cost``, ``inf`` when every vertex cost is nonfinite and ``nan`` when ``X`` is, not a best-seen value."""
 
     X: torch.Tensor
     costs: List[float] = field(default_factory=list)
@@ -66,7 +66,7 @@ class SolverState:
 
 @dataclass
 class PolyStep:
-    """Batch gradient-free solver for non-convex objectives using Sinkhorn Step; use ``PolyStepOptimizer`` for neural network training."""
+    """Batch gradient-free PolyStep solver for non-convex objectives; use ``PolyStepOptimizer`` for neural network training."""
 
     objective_fn: Callable
     dim: int
@@ -172,7 +172,7 @@ class PolyStep:
         state: SolverState,
         generator: Optional[torch.Generator] = None,
     ) -> SolverState:
-        """Run one Sinkhorn Step iteration."""
+        """Run one PolyStep iteration."""
         iteration = state.iteration_count
         X = state.X
         device = X.device
@@ -247,9 +247,17 @@ class PolyStep:
             X_vertices,
         )
         ess, rho = solver_health(transport_matrix, X_new - X, step_radius)
-        cost_mean = torch.where(torch.isfinite(cost_matrix).any(), sanitize_cost(cost_matrix).mean(), torch.inf)
-        finite, disp_sqnorm, cost_mean, ess, rho = torch.stack(
-            [torch.isfinite(X_new).all().to(X.dtype), ((X_new - X) ** 2).sum(-1).mean(), cost_mean, ess, rho]
+        feasible = torch.isfinite(cost_matrix).any()
+        cost_mean = torch.where(feasible, sanitize_cost(cost_matrix).mean(), torch.inf)
+        finite, feasible, disp_sqnorm, cost_mean, ess, rho = torch.stack(
+            [
+                torch.isfinite(X_new).all().to(X.dtype),
+                feasible.to(X.dtype),
+                ((X_new - X) ** 2).sum(-1).mean(),
+                cost_mean,
+                ess,
+                rho,
+            ]
         ).tolist()
 
         # NaN-safe: revert if X_new has NaN.
@@ -263,14 +271,15 @@ class PolyStep:
         state.X = X_new
         state.costs.append(cost_mean)
         state.record_solver_health(ess, rho, X_probe[..., 0].numel())
-        state.linear_convergence.append(ot_result.converged)
-        feed_solver_stats(self.epsilon, ot_solver, ot_result.n_iters, ot_result.converged)
+        converged = ot_result.converged and bool(feasible)
+        state.linear_convergence.append(converged)
+        feed_solver_stats(self.epsilon, ot_solver, ot_result.n_iters, converged)
         state.displacement_sqnorms.append(disp_sqnorm)
         state.iteration_count += 1
         if _nan_reverted:
             state.f = None
             state.g = None
-        else:
+        elif feasible:
             # None on the one-particle SoftmaxSolver path, which has no duals.
             state.f = ot_result.f.detach() if ot_result.f is not None else None
             state.g = ot_result.g.detach() if ot_result.g is not None else None

@@ -93,7 +93,7 @@ class ParamLayout:
 
         all_keys: list[str] = []
 
-        for key, tensor in sd.items():
+        for key, tensor in sorted(sd.items(), key=lambda item: item[0] not in param_grad):
             # Only trainable params belong here: buffers are frozen, and a running stat would drift with no signal.
             # Tied params may be absent from named_parameters(), so fall back to data_ptr.
             requires_grad = param_grad.get(key, False)

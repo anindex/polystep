@@ -64,14 +64,16 @@ def loss_buffer_dtype(particle_dtype: torch.dtype) -> torch.dtype:
 
 
 def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
-    """Promote half precision to FP32 and replace non-finite costs on-device.
+    """Promote half precision to FP32 and integer costs to the default float, then replace non-finite costs on-device.
 
     Every non-finite cost is invalid, ``-inf`` included, and becomes ``2*max|finite| + 1``,
     below every finite one. ``ask_tell.tell`` and ``baselines.core`` read ``-inf`` the same way.
     """
+    if not cost_matrix.is_floating_point():
+        cost_matrix = cost_matrix.to(torch.get_default_dtype())
     if cost_matrix.dtype in (torch.bfloat16, torch.float16):
         cost_matrix = cost_matrix.to(torch.float32)
-    if cost_matrix.numel() == 0 or not cost_matrix.is_floating_point():
+    if cost_matrix.numel() == 0:
         return cost_matrix
     finite = torch.isfinite(cost_matrix)
     max_finite = torch.where(finite, cost_matrix, cost_matrix.new_zeros(())).abs().amax()

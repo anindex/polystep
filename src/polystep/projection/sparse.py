@@ -6,6 +6,8 @@ from typing import Optional
 
 import torch
 
+from ..solvers._shared import decomposition_dtype
+
 
 # Below this subspace-to-source ratio the projection stops preserving distances.
 _EXTREME_COMPRESSION_RATIO = 1e-5
@@ -126,17 +128,20 @@ class SparseRandomProjection:
             self._init_sparse_matrix(device, dtype)
 
         if self._csr_matrix is None:
-            cols = torch.arange(self.subspace_dim, device=device).repeat_interleave(self._nnz_per_col)
+            sub = self.subspace_dim
             # Indices are in range by construction; the context-manager opt-out is process-global.
             coo = torch.sparse_coo_tensor(
-                torch.stack([self._rows.reshape(-1), cols]),
+                (self._rows * sub).add_(torch.arange(sub, device=device)[:, None]).view(1, -1),
                 self._values.reshape(-1),
-                size=(self.full_dim, self.subspace_dim),
+                size=(self.full_dim * sub,),
                 device=device,
-                dtype=dtype,
+                dtype=decomposition_dtype(dtype) if device.type == "cpu" else dtype,
                 check_invariants=False,
             ).coalesce()
-            rows, cols = coo.indices()
+            keys, values = coo.indices()[0], coo.values().clone()
+            del coo
+            rows, cols = keys // sub, keys % sub
+            del keys
             index_dtype = torch.int32 if max(self.full_dim, cols.numel()) < 2**31 else torch.int64
             if self._pointers_dominate(cols.numel(), index_dtype.itemsize):
                 rows, counts = rows.unique_consecutive(return_counts=True)
@@ -145,8 +150,8 @@ class SparseRandomProjection:
                 counts = torch.bincount(rows, minlength=self.full_dim)
             self._csr_matrix = torch.sparse_csr_tensor(
                 torch.cat([counts.new_zeros(1), counts.cumsum(0)]).to(index_dtype),
-                cols.to(index_dtype, copy=True),
-                coo.values(),
+                cols.to(index_dtype),
+                values,
                 size=(counts.numel(), self.subspace_dim),
                 device=device,
                 check_invariants=False,
@@ -172,10 +177,10 @@ class SparseRandomProjection:
 
         # CSR on a contiguous operand is much faster than COO on the transposed view.
         P = self._get_csr_matrix(coords.device, coords.dtype)
-        result = P @ coords.T.contiguous()
+        result = P @ coords.T.to(P.dtype).contiguous()
         if self._csr_rows is not None:
             result = result.new_zeros(self.full_dim, result.shape[1]).index_copy_(0, self._csr_rows, result)
-        result = result.T
+        result = result.T.to(coords.dtype)
 
         if is_1d:
             result = result.squeeze(0)

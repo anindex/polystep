@@ -436,3 +436,27 @@ def test_resume_across_a_rank_transition():
     actual = resumed.step(closure_for(resumed_model))
 
     assert actual == pytest.approx(expected, abs=1e-9)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("src,dst", [("cuda", "cpu"), ("cpu", "cuda")])
+def test_seeded_checkpoint_moves_between_device_types(src, dst):
+    inputs, targets = torch.randn(8, 4), torch.randint(0, 3, (8,))
+
+    def build(device):
+        torch.manual_seed(0)
+        model = nn.Linear(4, 3).to(device)
+        evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+        x, y = inputs.to(device), targets.to(device)
+        return model, PolyStepOptimizer(model, seed=0, solver="softmax"), lambda p: evaluator.evaluate(p, x, y)
+
+    saved_model, saved, saved_closure = build(src)
+    saved.step(saved_closure)
+    checkpoint = saved.state_dict()
+
+    model, resumed, closure = build(dst)
+    model.load_state_dict(saved_model.state_dict())
+    with pytest.warns(UserWarning, match="another device type"):
+        resumed.load_state_dict(checkpoint)
+    assert torch.isfinite(torch.as_tensor(resumed.step(closure)))

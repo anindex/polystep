@@ -300,7 +300,14 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     if _sparse_delta is not None or _site_vmap is not None:
         _base_sd = opt.layout.unflatten(X)
 
+    _act = activation_elements(opt, _fused_inputs)
     _subspace_delta = getattr(opt, "_subspace_delta_evaluator", None) if opt._per_layer_projections else None
+    if (
+        _factored_eval is not None
+        and device.type != "cpu"
+        and total_evals <= (opt.chunk_size or (1 << 26) // (X.numel() + _act))
+    ):
+        _subspace_delta = None
     # The same site argument in coordinate space: a per-layer block maps to one
     # parameter, so only that one is batched.
     _subspace_site = getattr(opt, "_site_vmap_evaluator", None) if opt._hybrid else None
@@ -364,7 +371,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         )
 
     # Budget on what a candidate allocates; chunking only splits the loop.
-    _act = activation_elements(opt, _fused_inputs)
     _local = any(p is not None for p in (_subspace_delta, _sparse_delta, _site_vmap, _subspace_site))
     if opt.chunk_size:
         chunk_mat = chunk = opt.chunk_size

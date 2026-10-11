@@ -1,4 +1,4 @@
-"""Cost matrix computation for Sinkhorn Step."""
+"""Cost matrix computation for PolyStep."""
 
 import math
 from typing import Callable, Optional, Union

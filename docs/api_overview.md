@@ -72,13 +72,23 @@ Factored evaluation avoids candidate weight construction for supported sequentia
 MLPs; other models use reconstructed candidates. Mixed-dtype models need a per-entry
 subspace. See [performance](performance.md#subspaces-and-memory).
 
-Sparse projections can also be constructed directly:
+`AdaptiveSubspace` uses a dense projection unless the optimizer asks for a sparse
+one. `projection_type='sparse'` switches it to sparse signed columns, and `'auto'`
+picks sparse for models with at least 1,000,000 parameters on the CPU or 2,000,000
+on CUDA. Models under 10,000 parameters keep the dense projection either way:
 
 ```python
-from polystep import SparseRandomProjection
-
-projection = SparseRandomProjection(full_dim=10_000, subspace_dim=64, seed=0)
+optimizer = PolyStepOptimizer(
+    model,
+    subspace=AdaptiveSubspace.from_layout(layout, rank=128),
+    projection_type="auto",
+)
 ```
+
+`HybridSubspace` ignores `projection_type`; it gives sparse columns to any layer with
+`num_params * num_coords * 4 > sparse_threshold_bytes` (1 GB by default). The estimate
+counts four bytes per entry whatever the parameter dtype, so an FP64 layer's dense
+projection can reach twice the threshold.
 
 ### Rank schedules
 
@@ -105,10 +115,16 @@ optimizer = PolyStepOptimizer(
 | `probe_radius` | `2.0` | Outer probe radius |
 | `num_probe` | `1` | Probe count; probe `k` uses `k / (num_probe + 1)` of the radius |
 | `polytope_type` | `'simplex'` | Also `'orthoplex'` or `'cube'` |
+| `particle_dim` | `2` | Coordinates per particle in full space |
+| `subspace_particle_dim` | `8` | Coordinates per particle with a subspace |
 | `subspace` | `None` | A constructed subspace instance |
 | `block_strategy` | `'monolithic'` | Also `'per_layer'` or `'grouped'`; with a subspace, only splits Sinkhorn/KL solves into row segments |
 | `chunk_size` | `None` | Automatic candidate chunk estimate |
 | `adaptive_num_probe` | Multiple probes, except full-space blocks and orthoplex Newton refinement | Reduces probe count after decreasing costs |
+
+A step scores one candidate per particle, vertex and probe. With `d` coordinates per
+particle the simplex has `d + 1` vertices, the orthoplex `2d` and the cube `2^d`; see
+[performance](performance.md) for a worked count.
 
 Scalar radii are multiplied by epsilon. Scheduled radii supply their own scale:
 
@@ -134,7 +150,7 @@ marginals; softmax constrains only the source marginal.
 | `compile` | `False` | CUDA geometry and solver kernels |
 | `compile_evaluator` | `False` | Dense and site-local candidate vmap |
 | `compile_forward` | `None` | Automatic compilation on the in-place forward path |
-| `candidate_autocast` | `None` | Candidate forward precision |
+| `candidate_autocast` | `False` | Candidate forward precision |
 
 Pass a new `objective_token` whenever the batch or loss changes. A change drops the
 deferred trust-region comparison; `None` or a constant token means a stationary
@@ -155,8 +171,9 @@ optimizer.step(closure, screen_closure=screen)
 
 A registered evaluator screens on the same leading slice of its batch.
 
-Screening is disabled with quadratic-model options or when its estimated cost is
-at least the full sweep. See [performance](performance.md#radius-models).
+Screening does not run with `use_quadratic_model`, `newton_refinement` or
+`trust_region`, or when its estimated cost is at least the full sweep. See
+[performance](performance.md#radius-models).
 
 ## Custom layers
 
@@ -204,9 +221,10 @@ es = minimize(objective, dim=20, steps=200)
 ```
 
 `PolyStepES` defaults to `epsilon=0.5`, `step_radius=0.5`, and `scale_cost='mean'`.
-It accepts neither `probe_radius` nor `num_probe`. With `seed` it draws rotations from
-its own generator; without one it uses PyTorch's global RNG, so `torch.manual_seed`
-reproduces the run.
+Its `step_radius` is a distance in solution space; unlike the optimizer's scalar
+radii, it is not multiplied by epsilon. It accepts neither `probe_radius` nor
+`num_probe`. With `seed` it draws rotations from its own generator; without one it
+uses PyTorch's global RNG, so `torch.manual_seed` reproduces the run.
 
 ## Low-level solver
 
@@ -238,4 +256,6 @@ Rebuild the optimizer with the original configuration before loading. This relea
 reads only format 6 and raises `ValueError` on any other format. To continue a run
 saved by another release, build a fresh optimizer around the saved model weights.
 The checkpoint also restores `candidate_evals`. Reproducible continuation requires
-the same objective and environment.
+the same objective and environment. A checkpoint can move between CPU and CUDA, but
+a seeded run then keeps the new optimizer's generator and warns, because the two
+generator types cannot share state.

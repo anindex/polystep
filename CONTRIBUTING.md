@@ -41,7 +41,9 @@ uvx twine check --strict dist/*
 ## Releases
 
 Update `polystep.__version__`, the version and date in `CITATION.cff`, and
-`CHANGELOG.md`. `pyproject.toml` reads the package version automatically.
+`CHANGELOG.md`, whose heading must read `## X.Y.Z - YYYY-MM-DD`. `pyproject.toml`
+reads the package version automatically, but its `Development Status` classifier
+needs a manual update when the release changes the project's maturity.
 
 Publishing a GitHub Release tagged `vX.Y.Z` triggers the PyPI workflow. It checks
 version consistency, lint, tests, and package metadata before publishing. The
