@@ -7,6 +7,7 @@ from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import torch
 
+from ..solvers._shared import sanitize_cost
 from .core import Objective, Result, centered_rank, zscore
 
 __all__ = ["METHODS", "cma_es", "eggroll", "mezo", "openai_es", "random_search", "spsa"]
@@ -44,14 +45,6 @@ class _Trace(list):
             self.stride *= 2
 
 
-def _record(history, obj: Objective, k: int) -> None:
-    """Append a trace point, thinning if ``history`` is a :class:`_Trace`."""
-    if isinstance(history, _Trace):
-        history.record(obj, k)
-    else:
-        history.append((obj.evals, obj.best_loss_t))
-
-
 def _result(name: str, obj: Objective, x: torch.Tensor, iters: int, history) -> Result:
     # History entries are device tensors so the per-generation append costs no
     # sync; materialize the whole trace once, here, at the end of the run.
@@ -70,6 +63,7 @@ def _result(name: str, obj: Objective, x: torch.Tensor, iters: int, history) -> 
 
 def _shaped(losses: torch.Tensor, shaping: str) -> torch.Tensor:
     """Utilities from losses (lower is better), so a larger weight means better."""
+    losses = sanitize_cost(losses)
     if shaping == "rank":
         return centered_rank(-losses)
     if shaping == "zscore":
@@ -88,7 +82,7 @@ def openai_es(
     shaping: str = "rank",
     seed: int = 0,
 ) -> Result:
-    """OpenAI Evolution Strategy (Salimans et al. 2017, arXiv:1703.03864). Antithetic sampling and fitness shaping; costs ``popsize`` evaluations per generation."""
+    """OpenAI Evolution Strategy (Salimans et al. 2017, arXiv:1703.03864), the SGD form of Algorithm 1. Antithetic sampling and fitness shaping; costs ``popsize`` evaluations per generation. The default ``lr=0.01`` is the reference implementation's Adam stepsize, used here as an SGD rate."""
     if popsize < 2:
         raise ValueError(f"popsize must be >= 2, got {popsize}.")
     if antithetic and popsize % 2:
@@ -108,7 +102,7 @@ def openai_es(
         x = x + (lr / (popsize * sigma)) * (eps.t() @ _shaped(losses, shaping))
         obj.iterate = x
         it += 1
-        _record(history, obj, it)
+        history.record(obj, it)
 
     return _result("openai_es", obj, x, it, history)
 
@@ -139,9 +133,10 @@ def spsa(
         delta = torch.randint(0, 2, (obj.dim,), generator=gen, device=x.device, dtype=x.dtype) * 2 - 1
         losses = obj(torch.stack([x + c_k * delta, x - c_k * delta]))
         # g_hat_i = (L+ - L-) / (2 c_k delta_i); keep the scalar a 0-dim tensor to avoid a sync per step.
-        x = x - (a_k / (2.0 * c_k)) * (losses[0] - losses[1]) * delta
+        d = losses[0] - losses[1]
+        x = x - (a_k / (2.0 * c_k)) * torch.where(torch.isfinite(d), d, 0.0) * delta
         obj.iterate = x
-        _record(history, obj, k)
+        history.record(obj, k)
 
     return _result("spsa", obj, x, k, history)
 
@@ -171,14 +166,14 @@ def mezo(
         del z  # regenerated below; never held across the evaluation.
         losses = obj(candidates)
         # 0-dim tensor, not a float: see the note in spsa.
-        projected_grad = (losses[0] - losses[1]) / (2.0 * eps)
+        d = losses[0] - losses[1]
+        projected_grad = d / (2.0 * eps)
         z = z_from(step_seed)
-        if weight_decay:
-            x = x * (1.0 - lr * weight_decay)
-        x = x - (lr * projected_grad) * z
+        step = x * (1.0 - lr * weight_decay) if weight_decay else x
+        x = torch.where(torch.isfinite(d), step - (lr * projected_grad) * z, x)
         obj.iterate = x
         k += 1
-        _record(history, obj, k)
+        history.record(obj, k)
 
     return _result("mezo", obj, x, k, history)
 
@@ -190,22 +185,19 @@ def random_search(
     sigma: float = 0.1,
     seed: int = 0,
 ) -> Result:
-    """Random search: one random direction per step, accepted if the loss drops."""
+    """Random search: each step scores the incumbent and one random candidate in the same call and moves if the candidate's loss is lower. Two evaluations per step."""
     x = _init(obj, x0)
     gen = torch.Generator(device=x.device).manual_seed(seed)
-    fx = obj(x.unsqueeze(0))[0]
-    history, k = _Trace([(obj.evals, obj.best_loss_t)]), 0
+    history, k = _Trace(), 0
 
-    while obj.remaining >= 1:
+    while obj.remaining >= 2:
         cand = x + sigma * torch.randn(obj.dim, generator=gen, device=x.device, dtype=x.dtype)
-        f = obj(cand.unsqueeze(0))[0]
+        losses = obj(torch.stack([x, cand]))
         # Accept-on-improvement, resolved on-device to avoid a sync per candidate.
-        better = f < fx
-        x = torch.where(better, cand, x)
+        x = torch.where(losses[1] < losses[0], cand, x)
         obj.iterate = x
-        fx = torch.where(better, f, fx)
         k += 1
-        _record(history, obj, k)
+        history.record(obj, k)
 
     return _result("random_search", obj, x, k, history)
 
@@ -263,7 +255,7 @@ def eggroll(
         l_plus, l_minus = losses[:pairs], losses[pairs:]
         if shaping == "sign":
             # Fitness is -loss, so sign(s+ - s-) == sign(loss- - loss+).
-            w = torch.sign(l_minus - l_plus)
+            w = torch.sign(l_minus - l_plus).nan_to_num(0.0)
         else:
             # Shape both halves; the -E half contributes with a flipped sign.
             u = _shaped(losses, shaping)
@@ -271,7 +263,7 @@ def eggroll(
         x = x + (lr / pairs) * (E.t() @ w)
         obj.iterate = x
         it += 1
-        _record(history, obj, it)
+        history.record(obj, it)
 
     return _result("eggroll", obj, x, it, history)
 
@@ -327,7 +319,7 @@ def cma_es(
             # pycma's distribution mean.
             obj.iterate = torch.as_tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
             it += 1
-            _record(history, obj, it)
+            history.record(obj, it)
 
         best = torch.tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
         if obj.remaining < es.popsize:

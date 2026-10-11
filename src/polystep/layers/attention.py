@@ -152,11 +152,13 @@ class VmapSafeMultiHeadAttention(nn.Module):
             # Keep the established CUDA/vmap path until fused dispatch is measured
             # across the supported torch versions (including the 2.8 floor).
             scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-            if attn_mask is not None:
+            if attn_mask is None:
+                weights = F.softmax(scores, dim=-1)
+            else:
                 scores = scores + attn_mask
-            fully_masked = torch.isneginf(scores).all(dim=-1, keepdim=True)
-            weights = F.softmax(scores.masked_fill(fully_masked, 0.0), dim=-1)
-            weights = weights.masked_fill(fully_masked, 0.0)
+                fully_masked = torch.isneginf(scores).all(dim=-1, keepdim=True)
+                weights = F.softmax(scores.masked_fill(fully_masked, 0.0), dim=-1)
+                weights = weights.masked_fill(fully_masked, 0.0)
             context = torch.matmul(self.attn_dropout(weights), V)
 
         # reshape, not .contiguous().view(): the latter copies once per candidate under vmap.

@@ -40,7 +40,14 @@ from polystep.hybrid_subspace import HybridSubspace
 from polystep.objectives.synthetic import Ackley, Rastrigin, Rosenbrock, Sphere
 from polystep.transform import ParamLayout
 
-from experiments.runners.fairness import TUNING_GRID, make_subspace, run_baseline, tuning_configs, tuning_cost
+from experiments.runners.fairness import (
+    TUNING_GRID,
+    evals_per_step,
+    make_subspace,
+    run_baseline,
+    tuning_configs,
+    tuning_cost,
+)
 
 SEEDS = [42, 123, 456, 789, 1337]
 DEFAULT_RESULTS_DIR = os.path.join(
@@ -684,6 +691,13 @@ def _probe_scale(env, device: str) -> float:
     return BASELINE_PROBE_SCALE / math.sqrt(dim)
 
 
+def _polystep_steps(env, device: str) -> int:
+    """Steps the baseline PolyStep config takes on this env before the budget or step cap binds."""
+    model, _, _ = env.build(device)
+    opt = build_optimizer(env, Config("baseline", "baseline", env.default_solver), model, seed=0)
+    return min(env.max_steps, -(-env.budget // evals_per_step(opt)))
+
+
 def run_baseline_one(env: Env, method: str, hp: dict, name: str, seed: int, device: str, probe_scale: float = None):
     """One baseline configuration on one env, at the env's eval budget.
 
@@ -712,6 +726,7 @@ def run_baseline_one(env: Env, method: str, hp: dict, name: str, seed: int, devi
         hp=hp,
         probe_scale=probe_scale if probe_scale is not None else _probe_scale(env, device),
         quality_key=env.quality_name,
+        polystep_steps=_polystep_steps(env, device),
     )
     key = f"val_{env.quality_name}"
     curve = [(pt["evals"], pt[key]) for pt in out["step_logs"]]

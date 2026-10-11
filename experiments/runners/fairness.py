@@ -219,7 +219,8 @@ def fair_hyperparams(method: str, *, probe_scale: float, seed: int, popsize: int
     notion of "how far from the current iterate do I sample" gets that same number:
     ``sigma`` for the ES family, ``c`` for SPSA, ``eps`` for MeZO, ``sigma0`` for
     CMA-ES. Step sizes stay at each method's own published default, since they are not
-    the same quantity.
+    the same quantity. OpenAI-ES's ``lr=0.01`` is the reference implementation's Adam
+    stepsize, used here as a plain SGD rate.
     """
     hp = {
         "openai_es": dict(sigma=probe_scale, lr=0.01, popsize=popsize, shaping="rank"),
@@ -233,7 +234,7 @@ def fair_hyperparams(method: str, *, probe_scale: float, seed: int, popsize: int
 
 
 #: Candidates a single generation of each method costs. The population methods draw
-#: ``popsize``; the rest are sequential by construction and draw one or two whatever the
+#: ``popsize``; the rest are sequential by construction and draw two whatever the
 #: dimension. This is the number that makes a step budget and an evaluation budget
 #: different questions.
 EVALS_PER_GENERATION = {
@@ -242,7 +243,7 @@ EVALS_PER_GENERATION = {
     "cma_es": None,  # popsize
     "spsa": 2,  # f(x + c*delta), f(x - c*delta)
     "mezo": 2,  # the same two-point estimate
-    "random_search": 1,
+    "random_search": 2,
 }
 
 # Step budgets cap the expensive MoE/attention population runs and the untuned
@@ -440,9 +441,8 @@ TUNING_GRID: Dict[str, List[dict]] = {
     "cma_es": [dict(sigma0=s, popsize=p) for s in _RADIUS_MULT for p in (16, 32, 64)],
 }
 #: Grid entries are multiplicative on ``fair_hyperparams``' probe scale for the radius
-#: keys; see :func:`tuning_configs`.
+#: keys; see :func:`apply_point`.
 RADIUS_KEYS = ("sigma", "sigma0", "c", "eps")
-_RADIUS_KEYS = RADIUS_KEYS  # back-compat for callers of the private name
 
 #: PolyStep's grid, the same size as every baseline's so tuning cost stays comparable.
 #: Entries are *multipliers* on whatever config the runner already holds, applied by
@@ -528,13 +528,7 @@ def tuning_configs(
     recentred round-two points without a second code path.
     """
     base = fair_hyperparams(method, probe_scale=probe_scale, seed=seed, popsize=popsize)
-    out = []
-    for point in points if points is not None else TUNING_GRID[method]:
-        cfg = dict(base)
-        for k, v in point.items():
-            cfg[k] = v * probe_scale if k in _RADIUS_KEYS else v
-        out.append(cfg)
-    return out
+    return [apply_point(base, p, probe_scale) for p in (points if points is not None else TUNING_GRID[method])]
 
 
 def tuning_cost(
@@ -883,6 +877,7 @@ def run_baseline(
     log_points: int = 25,
     quality_key: str = "accuracy",
     deadline_s: Optional[float] = None,
+    polystep_steps: Optional[int] = None,
 ) -> dict:
     """Run one :mod:`polystep.baselines` method and report it like a runner does.
 
@@ -912,6 +907,10 @@ def run_baseline(
         quality_key: Name for the recorded quality, e.g. ``"accuracy"`` or ``"mse"``.
         deadline_s: Wall-clock seconds the method may spend, or ``None``. Used by the
             wall-clock-matched runs; the objective stops the run when it passes.
+        polystep_steps: PolyStep's step count on the same cell. Unless ``hp`` sets
+            ``A``, SPSA's gain offset is a tenth of it on every axis, the schedule
+            ``tune_gallery.py`` tunes. Without either, SPSA under a deadline raises and
+            a budgeted SPSA run keeps the library default, a tenth of ``budget // 2``.
 
     Returns:
         ``{"metrics", "hyperparameters", "epoch_logs", "step_logs"}``, ready to splat
@@ -1032,7 +1031,7 @@ def run_baseline(
             # cannot help when nothing is written.
             pct = 100.0 * objective.evals / max(budget, 1)
             head = f"      {pct:5.1f}%  evals={objective.evals:,}/{budget:,}"
-            q = trajectory[-1].get(quality_key) if trajectory else None
+            q = trajectory[-1].get(f"val_{quality_key}") if trajectory else None
             print(head if q is None else f"{head}  {quality_key}={q:.4f}", flush=True)
         # One call == one generation, for every method: run_baseline's contract is that
         # loss_batch is "called once per generation". Incremented *after* the logging
@@ -1059,6 +1058,11 @@ def run_baseline(
     override = os.environ.get("POLYSTEP_HP_OVERRIDE")
     if override:
         kwargs.update(json.loads(override))
+    if method == "spsa" and "A" not in kwargs:
+        if polystep_steps is not None:
+            kwargs["A"] = 0.1 * polystep_steps
+        elif deadline_s is not None:
+            raise ValueError("SPSA under a deadline needs polystep_steps or an explicit A")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     result = METHODS[method](objective, x0=x0, **kwargs)

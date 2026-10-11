@@ -8,6 +8,7 @@ from typing import Dict
 
 import torch
 
+from .gym_evaluator import _batched_mlp_logits
 from .policies import count_stacked_candidates
 
 
@@ -76,25 +77,6 @@ class CartPoleRolloutResult:
     successes: torch.Tensor  # episode survived full horizon
 
 
-def _batched_mlp_logits(
-    obs: torch.Tensor,
-    stacked_params: Dict[str, torch.Tensor],
-    n_candidates: int,
-    rollouts: int,
-) -> torch.Tensor:
-    """Apply N policies to (N, R, 4) observations via bmm. Returns (N, R, 2)."""
-
-    x = obs  # (N, R, 4)
-    linear_indices = sorted(int(k.split(".")[1]) for k in stacked_params if k.endswith(".weight"))
-    for j, idx in enumerate(linear_indices):
-        w = stacked_params[f"net.{idx}.weight"]  # (N, out, in)
-        b = stacked_params[f"net.{idx}.bias"]  # (N, out)
-        x = torch.bmm(x, w.transpose(1, 2)) + b.unsqueeze(1)
-        if j < len(linear_indices) - 1:
-            x = torch.tanh(x)
-    return x
-
-
 class CartPoleEvaluator:
     """Vectorized evaluator for stacked MLP policies on CartPole-v1."""
 
@@ -108,10 +90,12 @@ class CartPoleEvaluator:
         rollouts_per_candidate: int = 32,
         horizon: int = DEFAULT_HORIZON,
         device: str = "cpu",
+        activation: str = "tanh",
     ):
         self.rollouts_per_candidate = int(rollouts_per_candidate)
         self.horizon = int(horizon)
         self.device = torch.device(device)
+        self.activation = str(activation)
         # See GymVectorEvaluator.env_steps.
         self.env_steps = 0
 
@@ -144,7 +128,7 @@ class CartPoleEvaluator:
         # Check active.any() every early_stop_check steps to amortize the sync.
         early_stop_check = max(1, self.horizon // 8)
         for t in range(self.horizon):
-            logits = _batched_mlp_logits(states, sp, n_candidates, R)  # (N, R, 2)
+            logits = _batched_mlp_logits(states, sp, activation=self.activation)  # (N, R, 2)
             actions = logits.argmax(dim=-1)  # (N, R)
             flat_states = states.reshape(-1, OBS_DIM)
             flat_actions = actions.reshape(-1)
@@ -161,8 +145,6 @@ class CartPoleEvaluator:
                 break
 
         successes = active  # survived all horizon steps
-        # Real environment steps taken; see GymVectorEvaluator.env_steps.
-        self.env_steps += int(lengths.sum().item())
         return CartPoleRolloutResult(returns=returns, lengths=lengths, successes=successes)
 
     def loss_for_stacked_params(
@@ -172,6 +154,7 @@ class CartPoleEvaluator:
         step: int,
     ) -> torch.Tensor:
         result = self.rollout_stacked_params(stacked_params, seed=seed, step=step)
+        self.env_steps += int(result.lengths.sum().item())
         return -result.returns.mean(dim=1).to(dtype=torch.float32)
 
     def summarize_stacked_params(

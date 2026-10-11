@@ -1,8 +1,7 @@
 """Shared experiment utilities for paper experiments.
 
 Seed management, result saving (JSON), environment info, accuracy evaluation,
-parameter flattening, GPU memory tracking, and dataset loading (MNIST,
-DVS-Gesture, N-MNIST, SHD via Tonic).
+GPU memory tracking, and dataset loading (MNIST, Fashion-MNIST).
 """
 
 from __future__ import annotations
@@ -29,22 +28,10 @@ from torch.utils.data import DataLoader
 
 from polystep.benchmarks.utils import (
     seeded_loader_kwargs,
-    BenchmarkResult,
     get_environment_info as _base_get_environment_info,
     get_mnist_loaders as _base_get_mnist_loaders,
     MNISTNet,
 )
-
-
-_HAS_TONIC = False
-try:
-    # The submodule import is what makes tonic.transforms resolvable below.
-    import tonic
-    import tonic.transforms  # noqa: F401
-
-    _HAS_TONIC = True
-except ImportError:
-    pass
 
 
 SEEDS: List[int] = [42, 123, 456, 789, 1337]
@@ -222,29 +209,6 @@ def evaluate_accuracy(
     return correct / total if total > 0 else 0.0
 
 
-def load_flat_params(model: nn.Module) -> torch.Tensor:
-    """Flatten all model parameters into a single 1D tensor."""
-    return torch.cat([p.data.reshape(-1) for p in model.parameters()])
-
-
-def set_flat_params(model: nn.Module, flat_params: torch.Tensor) -> None:
-    """Set model parameters from a flat 1D tensor. Raises ValueError on size mismatch."""
-    total_params = sum(p.numel() for p in model.parameters())
-    if flat_params.numel() != total_params:
-        raise ValueError(f"flat_params has {flat_params.numel()} elements, but model has {total_params} parameters")
-
-    offset = 0
-    for p in model.parameters():
-        numel = p.numel()
-        p.data.copy_(flat_params[offset : offset + numel].reshape(p.shape))
-        offset += numel
-
-
-def get_loss_fn(benchmark: str) -> nn.Module:
-    """CrossEntropyLoss, the standard loss for all current benchmarks."""
-    return nn.CrossEntropyLoss()
-
-
 def pin_threads() -> None:
     """Keep the intra-op pool clear of the core count.
 
@@ -394,276 +358,14 @@ def load_fashion_mnist(
     return train_loader, test_loader
 
 
-def load_dvs_gesture(
-    data_dir: str = "data/",
-    num_steps: int = 25,
-    batch_size: int = 16,
-) -> Tuple[DataLoader, DataLoader]:
-    """DVS-Gesture via Tonic (Denoise + ToFrame transforms).
-
-    No synthetic fallback: raises RuntimeError if Tonic is missing or loading
-    fails. Data format: (batch, num_steps, 2, 128, 128), labels (batch,).
-    """
-    if not _HAS_TONIC:
-        raise RuntimeError(
-            "DVS-Gesture dataset not available. Install tonic "
-            "(pip install tonic) and ensure data directory exists at "
-            f"{data_dir}. For manual download, see "
-            "https://research.ibm.com/interactive/dvsgesture/"
-        )
-
-    dvs_dir = os.path.join(data_dir, "dvs_gesture")
-    sensor_size = tonic.datasets.DVSGesture.sensor_size
-
-    transform = tonic.transforms.Compose(
-        [
-            tonic.transforms.Denoise(filter_time=10000),
-            tonic.transforms.ToFrame(
-                sensor_size=sensor_size,
-                n_time_bins=num_steps,
-            ),
-        ]
-    )
-
-    try:
-        train_ds = tonic.datasets.DVSGesture(
-            save_to=dvs_dir,
-            train=True,
-            transform=transform,
-        )
-        test_ds = tonic.datasets.DVSGesture(
-            save_to=dvs_dir,
-            train=False,
-            transform=transform,
-        )
-    except Exception as e:
-        raise RuntimeError(
-            f"DVS-Gesture dataset loading failed: {e}. "
-            "Install tonic (pip install tonic) and ensure data directory "
-            f"exists at {dvs_dir}. For manual download, see "
-            "https://research.ibm.com/interactive/dvsgesture/"
-        ) from e
-
-    collate_fn = tonic.collation.PadTensors()
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
-        **seeded_loader_kwargs(),
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
-        **seeded_loader_kwargs(),
-    )
-    return train_loader, test_loader
-
-
-def load_nmnist(
-    data_dir: str = "data/",
-    num_steps: int = 25,
-    batch_size: int = 64,
-) -> Tuple[DataLoader, DataLoader]:
-    """N-MNIST via Tonic (Denoise + ToFrame transforms).
-
-    No synthetic fallback: raises RuntimeError if Tonic is missing or loading
-    fails. Data format: (batch, num_steps, 2, 34, 34), labels (batch,).
-    """
-    if not _HAS_TONIC:
-        raise RuntimeError(
-            "N-MNIST dataset not available. Install tonic "
-            "(pip install tonic) and ensure data directory exists at "
-            f"{data_dir}. See https://tonic.readthedocs.io/ for details."
-        )
-
-    nmnist_dir = os.path.join(data_dir, "nmnist")
-    sensor_size = tonic.datasets.NMNIST.sensor_size
-
-    transform = tonic.transforms.Compose(
-        [
-            tonic.transforms.Denoise(filter_time=10000),
-            tonic.transforms.ToFrame(
-                sensor_size=sensor_size,
-                n_time_bins=num_steps,
-            ),
-        ]
-    )
-
-    try:
-        train_ds = tonic.datasets.NMNIST(
-            save_to=nmnist_dir,
-            train=True,
-            transform=transform,
-        )
-        test_ds = tonic.datasets.NMNIST(
-            save_to=nmnist_dir,
-            train=False,
-            transform=transform,
-        )
-    except Exception as e:
-        raise RuntimeError(
-            f"N-MNIST dataset loading failed: {e}. "
-            "Install tonic (pip install tonic) and ensure data directory "
-            f"exists at {nmnist_dir}."
-        ) from e
-
-    collate_fn = tonic.collation.PadTensors()
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
-        **seeded_loader_kwargs(),
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
-        **seeded_loader_kwargs(),
-    )
-    return train_loader, test_loader
-
-
-class _ClampedToFrame:
-    """ToFrame wrapper that clamps out-of-bounds SHD event indices (else IndexError)."""
-
-    def __init__(self, to_frame, sensor_size):
-        self.to_frame = to_frame
-        self.sensor_size = sensor_size
-
-    def __call__(self, events):
-        import numpy as np
-
-        if isinstance(events, np.ndarray) and "x" in events.dtype.names:
-            events = events.copy()
-            events["x"] = np.clip(events["x"], 0, self.sensor_size[0] - 1)
-            if "y" in events.dtype.names and len(self.sensor_size) > 1:
-                events["y"] = np.clip(events["y"], 0, self.sensor_size[1] - 1)
-        return self.to_frame(events)
-
-
-def _shd_collate_fn(batch):
-    """Custom collate for SHD: (batch, time, 700), squeeze extra channel dim."""
-    data_list, label_list = [], []
-    for frames, label in batch:
-        t = torch.tensor(frames, dtype=torch.float32)
-        # SHD ToFrame produces (time, 1, 700): squeeze channel dim
-        if t.dim() == 3:
-            t = t.squeeze(1)
-        data_list.append(t)
-        label_list.append(label)
-    data = torch.stack(data_list, dim=0)
-    labels = torch.tensor(label_list, dtype=torch.long)
-    return data, labels
-
-
-def load_shd(
-    data_dir: str = "data/",
-    num_steps: int = 100,
-    batch_size: int = 64,
-) -> Tuple[DataLoader, DataLoader]:
-    """SHD (Spiking Heidelberg Digits) via Tonic (ToFrame transform).
-
-    No synthetic fallback: raises RuntimeError if Tonic/h5py is missing or
-    loading fails. Data format: (batch, num_steps, 700), labels (batch,).
-    """
-    if not _HAS_TONIC:
-        raise RuntimeError("SHD dataset not available. Install tonic and h5py (pip install tonic h5py).")
-
-    shd_dir = os.path.join(data_dir, "shd")
-    sensor_size = tonic.datasets.SHD.sensor_size
-
-    base_transform = tonic.transforms.ToFrame(
-        sensor_size=sensor_size,
-        n_time_bins=num_steps,
-    )
-    # Clamp event indices: SHD has occasional out-of-bounds events.
-    transform = _ClampedToFrame(base_transform, sensor_size)
-
-    try:
-        train_ds = tonic.datasets.SHD(
-            save_to=shd_dir,
-            train=True,
-            transform=transform,
-        )
-        test_ds = tonic.datasets.SHD(
-            save_to=shd_dir,
-            train=False,
-            transform=transform,
-        )
-    except Exception as e:
-        raise RuntimeError(f"SHD dataset loading failed: {e}. Install tonic and h5py (pip install tonic h5py).") from e
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=_shd_collate_fn,
-        **seeded_loader_kwargs(),
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=_shd_collate_fn,
-        **seeded_loader_kwargs(),
-    )
-    return train_loader, test_loader
-
-
-class FunctionEvalCounter:
-    """Wraps a loss function to count forward-pass evaluations.
-
-    One count per call, not per sample, so methods with different batching
-    (polystep's vmapped closure, OpenAI-ES per perturbation, SPSA two per
-    iteration) compare fairly.
-    """
-
-    def __init__(self, loss_fn):
-        self.loss_fn = loss_fn
-        self.count = 0
-
-    def __call__(self, outputs, targets):
-        self.count += 1
-        return self.loss_fn(outputs, targets)
-
-    def reset(self):
-        self.count = 0
-
-    def to(self, device):
-        if hasattr(self.loss_fn, "to"):
-            self.loss_fn = self.loss_fn.to(device)
-        return self
-
-
 __all__ = [
     "SEEDS",
     "save_result",
     "get_environment_info",
     "evaluate_accuracy",
-    "load_flat_params",
-    "set_flat_params",
     "track_gpu_memory",
-    "get_loss_fn",
     "set_seed",
-    "BenchmarkResult",
     "MNISTNet",
     "load_mnist",
     "load_fashion_mnist",
-    "load_dvs_gesture",
-    "load_nmnist",
-    "load_shd",
-    "FunctionEvalCounter",
 ]

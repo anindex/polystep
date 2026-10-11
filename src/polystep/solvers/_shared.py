@@ -71,7 +71,7 @@ def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
     """
     if cost_matrix.dtype in (torch.bfloat16, torch.float16):
         cost_matrix = cost_matrix.to(torch.float32)
-    if cost_matrix.numel() == 0:
+    if cost_matrix.numel() == 0 or not cost_matrix.is_floating_point():
         return cost_matrix
     finite = torch.isfinite(cost_matrix)
     max_finite = torch.where(finite, cost_matrix, cost_matrix.new_zeros(())).abs().amax()

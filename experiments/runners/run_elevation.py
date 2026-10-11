@@ -517,6 +517,7 @@ def run_gradient_free(
         hp=hp,
         probe_scale=probe_scale,
         deadline_s=deadline_s,
+        polystep_steps=epochs * len(train_loader),
     )
     out["hyperparameters"]["fair"] = fair
     out["hyperparameters"]["tuned"] = selected["name"] if selected else None

@@ -6,7 +6,6 @@ from .utils import (
     LIFNeuron,
     SpikingNet,
     evaluate_accuracy,
-    BenchmarkResult,
     get_environment_info,
 )
 
@@ -16,6 +15,5 @@ __all__ = [
     "LIFNeuron",
     "SpikingNet",
     "evaluate_accuracy",
-    "BenchmarkResult",
     "get_environment_info",
 ]

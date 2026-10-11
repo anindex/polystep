@@ -28,15 +28,26 @@ class TestVmapSafeMultiHeadAttention:
         out.sum().backward()
         assert attn.W_q.weight.grad.abs().max() > 0
 
+    @pytest.mark.parametrize("mask", [None, "attn_mask", "key_padding_mask"])
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")],
+            ),
+        ],
+    )
     @pytest.mark.parametrize("num_heads", [1, 4])
-    def test_attention_matches_upstream_mha(self, num_heads):
-        """The class is a drop-in for nn.MultiheadAttention, so the values must agree;
-        the upstream module is an independent oracle for the scaling, head split, and
-        output projection."""
+    def test_attention_matches_upstream_mha(self, num_heads, device, mask):
+        """The class is a drop-in for nn.MultiheadAttention, so the values must agree on
+        the CPU and CUDA paths, with and without masks; the upstream module is an
+        independent oracle for the scaling, head split, masking, and output projection."""
         torch.manual_seed(0)
         embed = 32
-        reference = nn.MultiheadAttention(embed, num_heads, batch_first=True)
-        ours = VmapSafeMultiHeadAttention(embed_dim=embed, num_heads=num_heads)
+        reference = nn.MultiheadAttention(embed, num_heads, batch_first=True).double().to(device)
+        ours = VmapSafeMultiHeadAttention(embed_dim=embed, num_heads=num_heads).double().to(device)
 
         with torch.no_grad():
             q_w, k_w, v_w = reference.in_proj_weight.chunk(3, dim=0)
@@ -47,9 +58,16 @@ class TestVmapSafeMultiHeadAttention:
             ours.W_o.weight.copy_(reference.out_proj.weight)
             ours.W_o.bias.copy_(reference.out_proj.bias)
 
-        query, key = torch.randn(2, 6, embed), torch.randn(2, 9, embed)
-        expected, _ = reference(query, key, key, need_weights=False)
-        torch.testing.assert_close(ours(query, key, key), expected, rtol=1e-5, atol=1e-6)
+        query = torch.randn(2, 6, embed, dtype=torch.float64, device=device)
+        key = torch.randn(2, 9, embed, dtype=torch.float64, device=device)
+        masks = {}
+        if mask == "attn_mask":
+            masks[mask] = torch.ones(6, 9, dtype=torch.bool, device=device).triu(1)
+        elif mask == "key_padding_mask":
+            masks[mask] = torch.zeros(2, 9, dtype=torch.bool, device=device)
+            masks[mask][1, 7:] = True
+        expected, _ = reference(query, key, key, need_weights=False, **masks)
+        torch.testing.assert_close(ours(query, key, key, **masks), expected)
 
     def test_a_causal_mask_hides_later_positions(self, attn):
         """Under a causal mask, position i attends only to 0..i, so changing the tail

@@ -1,20 +1,22 @@
 """Shared test fixtures and pytest configuration for polystep tests."""
 
-import contextlib
-import gzip
 import os
-import shutil
-import struct as pystruct
 import sysconfig
+from http.client import HTTPException
 from urllib.error import URLError
-from urllib.request import urlopen
 
-import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from polystep.benchmarks.utils import (
+    MNIST_FILES,
+    _download_mnist,
+    _load_mnist_images,
+    _load_mnist_labels,
+    seeded_loader_kwargs,
+)
 from polystep.cost_nn import NNCostEvaluator
 
 
@@ -142,28 +144,7 @@ def make_closure():
     return _make_closure
 
 
-MNIST_URL = "https://storage.googleapis.com/cvdf-datasets/mnist/"
 MNIST_DIR = "/tmp/mnist"
-MNIST_FILES = {
-    "train_images": "train-images-idx3-ubyte.gz",
-    "train_labels": "train-labels-idx1-ubyte.gz",
-    "test_images": "t10k-images-idx3-ubyte.gz",
-    "test_labels": "t10k-labels-idx1-ubyte.gz",
-}
-
-
-def _read_idx_images(path):
-    with gzip.open(path, "rb") as f:
-        _magic, num, rows, cols = pystruct.unpack(">IIII", f.read(16))
-        images = np.frombuffer(f.read(), dtype=np.uint8).reshape(num, 1, rows, cols)
-    return images.astype(np.float32) / 255.0
-
-
-def _read_idx_labels(path):
-    with gzip.open(path, "rb") as f:
-        _magic, _num = pystruct.unpack(">II", f.read(8))
-        labels = np.frombuffer(f.read(), dtype=np.uint8)
-    return labels.astype(np.int64)
 
 
 @pytest.fixture(scope="session")
@@ -173,25 +154,16 @@ def mnist_arrays():
     Skips only on download failure; a gzip or IDX parse error is a real bug and must
     propagate.
     """
-    os.makedirs(MNIST_DIR, exist_ok=True)
-    for filename in MNIST_FILES.values():
-        path = os.path.join(MNIST_DIR, filename)
-        if not os.path.exists(path):
-            try:
-                # Timeout, or a dead mirror hangs the session fixture.
-                with contextlib.closing(urlopen(MNIST_URL + filename, timeout=30)) as src:
-                    with open(path, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-            except (URLError, OSError) as exc:
-                if os.path.exists(path):
-                    os.remove(path)
-                pytest.skip(f"MNIST download failed ({exc}); needs network access")
+    try:
+        _download_mnist(MNIST_DIR)
+    except (URLError, OSError, HTTPException) as exc:
+        pytest.skip(f"MNIST download failed ({exc}); needs network access")
 
     mean, std = 0.1307, 0.3081
-    train_x = (_read_idx_images(os.path.join(MNIST_DIR, MNIST_FILES["train_images"])) - mean) / std
-    test_x = (_read_idx_images(os.path.join(MNIST_DIR, MNIST_FILES["test_images"])) - mean) / std
-    train_y = _read_idx_labels(os.path.join(MNIST_DIR, MNIST_FILES["train_labels"]))
-    test_y = _read_idx_labels(os.path.join(MNIST_DIR, MNIST_FILES["test_labels"]))
+    train_x = (_load_mnist_images(os.path.join(MNIST_DIR, MNIST_FILES["train_images"])) - mean) / std
+    test_x = (_load_mnist_images(os.path.join(MNIST_DIR, MNIST_FILES["test_images"])) - mean) / std
+    train_y = _load_mnist_labels(os.path.join(MNIST_DIR, MNIST_FILES["train_labels"]))
+    test_y = _load_mnist_labels(os.path.join(MNIST_DIR, MNIST_FILES["test_labels"]))
     return train_x, train_y, test_x, test_y
 
 
@@ -214,12 +186,6 @@ def mnist_loaders(mnist_arrays):
         # A per-loader generator is seeded once at construction and advances per
         # epoch, so the Nth run in a process sees the Nth stream and only
         # reseed_loaders can rewind it.
-        try:
-            from experiments.runners.common import seeded_loader_kwargs
-        except ModuleNotFoundError:
-            # An sdist ships no experiments/, so skip rather than error the whole run.
-            pytest.skip("experiments/runners not present (running outside the repo)")
-
         return (
             DataLoader(
                 train_ds,

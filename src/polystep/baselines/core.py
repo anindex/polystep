@@ -135,20 +135,15 @@ class Objective:
         return self.budget - self.evals
 
     def __call__(self, X: torch.Tensor) -> torch.Tensor:
-        """Score ``(N, dim)`` candidates, charging ``N`` to the budget."""
+        """Score ``(N, dim)`` candidates, charging ``N`` to the budget. Nonfinite losses come back as ``+inf``."""
         if self._t0 is None:
             self._t0 = time.perf_counter()
         X = X.reshape(-1, X.shape[-1]) if X.dim() > 1 else X.reshape(1, -1)
         n = X.shape[0]
         if X.shape[1] != self.dim:
             raise ValueError(f"candidates have width {X.shape[1]}, expected {self.dim}.")
-        if n > self.remaining:
-            if self.out_of_time:
-                raise BudgetExhausted(
-                    f"wall-clock deadline of {self.deadline_s:.0f}s passed at {self.elapsed_s:.0f}s "
-                    f"after {self.evals} candidates."
-                )
-            raise BudgetExhausted(f"{n} candidates requested, {self.remaining} of {self.budget} left.")
+        if n > self.budget - self.evals:
+            raise BudgetExhausted(f"{n} candidates requested, {self.budget - self.evals} of {self.budget} left.")
         losses = torch.as_tensor(self._fn(X)).reshape(n)
         self.evals += n
         # NaN would win argmin, -inf would win forever.
@@ -167,8 +162,7 @@ class Objective:
             better = cand_loss < self._best_loss_t
             self._best_loss_t = torch.where(better, cand_loss, self._best_loss_t)
             self._best_x_t = torch.where(better, cand_x, self._best_x_t)
-        # Return losses on the candidates' device; methods combine them with state that lives there.
-        return losses.to(X.device) if losses.device != X.device else losses
+        return finite
 
     @property
     def best_loss_t(self) -> torch.Tensor:
@@ -205,6 +199,8 @@ def centered_rank(x: torch.Tensor) -> torch.Tensor:
 
 def zscore(x: torch.Tensor) -> torch.Tensor:
     """Zero-mean unit-variance shaping; zeros when the population is flat."""
+    m = x.abs().amax()
+    x = x / torch.where(m > math.sqrt(torch.finfo(x.dtype).max / x.numel()) / 2, m, 1.0)
     s = x.std()
     if s < 1e-8:
         return torch.zeros_like(x)

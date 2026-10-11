@@ -9,9 +9,8 @@ import platform
 import random
 import struct as pystruct
 import tempfile
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.request import urlretrieve
+from typing import Any, Dict, Optional, Tuple
+from urllib.request import urlopen
 
 import numpy as np
 from collections import OrderedDict
@@ -50,10 +49,19 @@ MNIST_FILES = {
 
 
 def download_file(url: str, filepath: str) -> None:
-    """Download a file from URL if not already present."""
+    """Download a file from URL if not already present; a failed download leaves no partial file at ``filepath``."""
     if not os.path.exists(filepath):
         print(f"  Downloading {os.path.basename(filepath)}...")
-        urlretrieve(url, filepath)
+        with urlopen(url, timeout=60) as response:
+            data = response.read()
+        partial = f"{filepath}.{os.urandom(8).hex()}.part"
+        try:
+            with open(partial, "wb") as f:
+                f.write(data)
+            os.replace(partial, filepath)
+        finally:
+            if os.path.exists(partial):
+                os.remove(partial)
 
 
 def _download_mnist(data_dir: str) -> None:
@@ -163,23 +171,6 @@ def evaluate_accuracy(model: nn.Module, dataloader: DataLoader) -> float:
 
     model.train()
     return correct / total if total > 0 else 0.0
-
-
-@dataclass
-class BenchmarkResult:
-    """Single optimizer run result."""
-
-    optimizer: str
-    seed: int
-    final_accuracy: float
-    best_accuracy: float
-    final_loss: Optional[float]
-    wall_time_seconds: float
-    peak_gpu_memory_mb: float
-    total_steps: int
-    function_evals: int
-    convergence_epoch: Optional[int]
-    epoch_logs: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def get_environment_info() -> Dict[str, Any]:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
@@ -86,7 +86,7 @@ class GymVectorEvaluator:
         self.env_id = str(env_id)
         self.rollouts_per_candidate = int(rollouts_per_candidate)
         self.device = torch.device(device)
-        # Real steps taken, since episodes terminate early.
+        # Real steps taken by loss_for_stacked_params rollouts, since episodes terminate early.
         self.env_steps = 0
         # Probe env for spec metadata.
         probe = gym.make(self.env_id)
@@ -110,28 +110,21 @@ class GymVectorEvaluator:
 
         self.success_fn = success_fn
         self.activation = str(activation)
-        # Cache vector env across calls; lazily (re)created when n_candidates changes.
-        self._cached_n_candidates: Optional[int] = None
-        self._venv = None
+        self._venvs: Dict[int, Any] = {}
 
-    def _ensure_venv(self, n_candidates: int) -> None:
-        n_total = int(n_candidates) * self.rollouts_per_candidate
-        if self._venv is None or self._cached_n_candidates != n_candidates:
-            if self._venv is not None:
-                try:
-                    self._venv.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            self._venv = _make_vector_env(self.env_id, n_total)
-            self._cached_n_candidates = int(n_candidates)
+    def _venv_for(self, n_candidates: int):
+        venv = self._venvs.get(n_candidates)
+        if venv is None:
+            venv = self._venvs[n_candidates] = _make_vector_env(self.env_id, n_candidates * self.rollouts_per_candidate)
+        return venv
 
     def close(self) -> None:
-        if self._venv is not None:
+        for venv in self._venvs.values():
             try:
-                self._venv.close()
+                venv.close()
             except Exception:  # noqa: BLE001
                 pass
-            self._venv = None
+        self._venvs.clear()
 
     def __del__(self):  # best-effort cleanup
         try:
@@ -149,12 +142,12 @@ class GymVectorEvaluator:
         n_candidates = count_stacked_candidates(stacked_params)
         R = self.rollouts_per_candidate
         N = n_candidates
-        self._ensure_venv(N)
+        venv = self._venv_for(N)
 
         # Key on rollout index so every candidate sees the same initial states.
         base_seed = int(seed) + 1009 * int(step)
         seeds = [base_seed + (i % R) for i in range(N * R)]
-        obs_np, _ = self._venv.reset(seed=seeds)
+        obs_np, _ = venv.reset(seed=seeds)
 
         # State tensors, on CPU then moved to device per step for policy inference.
         returns = torch.zeros(N, R, dtype=torch.float32)
@@ -170,7 +163,7 @@ class GymVectorEvaluator:
                 logits = _batched_mlp_logits(obs_t, sp, activation=self.activation)  # (N, R, action_dim)
                 actions = logits.argmax(dim=-1)  # (N, R)
             actions_np = actions.cpu().numpy().reshape(N * R).astype(np.int64)
-            obs_np, rewards_np, terminated_np, truncated_np, _ = self._venv.step(actions_np)
+            obs_np, rewards_np, terminated_np, truncated_np, _ = venv.step(actions_np)
             done_np = np.logical_or(terminated_np, truncated_np)
 
             r_active = active.astype(np.float32)
@@ -189,7 +182,6 @@ class GymVectorEvaluator:
         else:
             successes = lengths >= float(self.horizon)
 
-        self.env_steps += int(lengths.sum().item())
         return GymRolloutResult(
             returns=returns.to(self.device),
             lengths=lengths.to(self.device),
@@ -203,6 +195,7 @@ class GymVectorEvaluator:
         step: int,
     ) -> torch.Tensor:
         result = self.rollout_stacked_params(stacked_params, seed=seed, step=step)
+        self.env_steps += int(result.lengths.sum().item())
         return -result.returns.mean(dim=1).to(dtype=torch.float32)
 
     def summarize_stacked_params(
@@ -252,9 +245,9 @@ def random_policy_baseline(
         if not active.any():
             break
     venv.close()
-    # "Survived to horizon", matching GymVectorEvaluator's default.
+    successes = lengths < float(horizon) if _is_goal_reaching(env_id) else lengths >= float(horizon)
     return {
         "mean_return": float(returns.mean()),
-        "success_rate": float((lengths >= float(horizon)).mean()),
+        "success_rate": float(successes.mean()),
         "episode_length": float(lengths.mean()),
     }

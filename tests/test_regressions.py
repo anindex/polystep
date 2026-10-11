@@ -1059,14 +1059,24 @@ class TestAuditCrashes:
         assert rows and max(rows) == 1
         assert torch.isfinite(opt.state.X).all()
 
-    def test_a_fully_masked_attention_row_does_not_return_nan(self):
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")],
+            ),
+        ],
+    )
+    def test_a_fully_masked_attention_row_does_not_return_nan(self, device):
         """Softmax of an all -inf row is NaN, which spread through the value mix."""
         from polystep.layers.attention import VmapSafeMultiHeadAttention
 
         torch.manual_seed(0)
-        attn = VmapSafeMultiHeadAttention(embed_dim=8, num_heads=2)
-        x = torch.randn(2, 3, 8)
-        mask = torch.zeros(2, 3, dtype=torch.bool)
+        attn = VmapSafeMultiHeadAttention(embed_dim=8, num_heads=2).to(device)
+        x = torch.randn(2, 3, 8, device=device)
+        mask = torch.zeros(2, 3, dtype=torch.bool, device=device)
         mask[1] = True  # every key of the second sequence is padding
         assert torch.isfinite(attn(x, x, x, key_padding_mask=mask)).all()
 

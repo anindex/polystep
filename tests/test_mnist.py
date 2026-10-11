@@ -13,6 +13,8 @@ model evaluations per step. Downsampling the images to 7x7 keeps that tractable 
 
 from __future__ import annotations
 
+import io
+
 import pytest
 from collections import OrderedDict
 
@@ -43,6 +45,49 @@ def test_capped_mnist_matches_full_data(tmp_path):
     for loader, reference, count in zip(capped, full, (2, 3)):
         for actual, expected in zip(loader.dataset.tensors, reference.dataset.tensors):
             assert torch.equal(actual, expected[:count])
+
+
+def test_a_truncated_download_leaves_no_file(tmp_path, monkeypatch):
+    from http.client import IncompleteRead
+
+    from polystep.benchmarks import utils
+
+    class Truncated(io.BytesIO):
+        def read(self, *args):
+            raise IncompleteRead(b"par", 4)
+
+    target = tmp_path / "train-labels-idx1-ubyte.gz"
+    monkeypatch.setattr(utils, "urlopen", lambda url, timeout: Truncated())
+    with pytest.raises(IncompleteRead):
+        utils.download_file("https://example.invalid/" + target.name, str(target))
+    assert not list(tmp_path.iterdir())
+
+    monkeypatch.setattr(utils, "urlopen", lambda url, timeout: io.BytesIO(b"payload"))
+    utils.download_file("https://example.invalid/" + target.name, str(target))
+    assert [p.name for p in tmp_path.iterdir()] == [target.name]
+    assert target.read_bytes() == b"payload"
+
+
+def test_overlapping_downloads_do_not_share_a_temporary_file(tmp_path, monkeypatch):
+    from polystep.benchmarks import utils
+
+    target = tmp_path / "train-labels-idx1-ubyte.gz"
+    url = "https://example.invalid/" + target.name
+    monkeypatch.setattr(utils, "urlopen", lambda url, timeout: io.BytesIO(b"payload"))
+    replace = utils.os.replace
+    sources = []
+
+    def overlapped(src, dst):
+        sources.append(src)
+        if len(sources) == 1:
+            utils.download_file(url, str(target))
+        replace(src, dst)
+
+    monkeypatch.setattr(utils.os, "replace", overlapped)
+    utils.download_file(url, str(target))
+    assert len(set(sources)) == 2
+    assert [p.name for p in tmp_path.iterdir()] == [target.name]
+    assert target.read_bytes() == b"payload"
 
 
 class SmallMNISTNet(nn.Sequential):

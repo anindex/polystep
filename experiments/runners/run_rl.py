@@ -18,6 +18,8 @@ import torch
 
 from experiments.runners.common import SEEDS, save_result, set_seed, track_gpu_memory
 from polystep import PolyStepOptimizer
+from polystep.baselines import centered_rank
+from polystep.benchmarks.rl.gym_evaluator import _is_goal_reaching
 from polystep.benchmarks.rl.metrics import build_rl_metrics, normalize_score
 from polystep.benchmarks.rl.policies import (
     DiscreteMLPPolicy,
@@ -202,7 +204,7 @@ def run_random_cartpole(
         # One policy, evaluated over `eval_episodes` rollouts.
         function_evals=int(eval_episodes),
         total_steps=1,
-        rl_env_steps=eval_episodes * horizon,
+        rl_env_steps=0,
         success_rate=summary["success_rate"],
         episode_length=summary["episode_length"],
     )
@@ -329,6 +331,27 @@ def _gym_normalized_score(env_short: str, mean_return: float) -> float:
     )
 
 
+def _make_evaluator(
+    env_short: str, env_id: str, *, rollouts_per_candidate: int, horizon: int, device: str, activation: str
+):
+    if env_short == "cartpole":
+        return CartPoleEvaluator(
+            rollouts_per_candidate=rollouts_per_candidate,
+            horizon=horizon,
+            device=device,
+            activation=activation,
+        )
+    from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
+
+    return GymVectorEvaluator(
+        env_id,
+        rollouts_per_candidate=rollouts_per_candidate,
+        horizon=horizon,
+        device=device,
+        activation=activation,
+    )
+
+
 def run_polystep_gym(
     *,
     env_short: str,
@@ -355,10 +378,8 @@ def run_polystep_gym(
 
     ``nondiff_mode`` in {"float32", "int8", "binary"} swaps the inner activation
     for the non-differentiable op; PolyStep sees only forward losses, PPO/DQN collapse.
-    Float32 CartPole runs on the analytic vectorized evaluator, which needs no gym.
+    CartPole runs on the analytic vectorized evaluator, which needs no gym.
     """
-
-    from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
 
     cfg = GYM_ENV_REGISTRY[env_short]
     pcfg = cfg["polystep"]
@@ -398,20 +419,14 @@ def run_polystep_gym(
         ).to(device)
         eval_activation = nondiff_mode
     param_count = sum(p.numel() for p in model.parameters())
-    if env_short == "cartpole" and nondiff_mode == "float32":
-        evaluator = CartPoleEvaluator(
-            rollouts_per_candidate=rollouts_per_candidate,
-            horizon=horizon,
-            device=device,
-        )
-    else:
-        evaluator = GymVectorEvaluator(
-            env_id,
-            rollouts_per_candidate=rollouts_per_candidate,
-            horizon=horizon,
-            device=device,
-            activation=eval_activation,
-        )
+    evaluator = _make_evaluator(
+        env_short,
+        env_id,
+        rollouts_per_candidate=rollouts_per_candidate,
+        horizon=horizon,
+        device=device,
+        activation=eval_activation,
+    )
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
         layout,
@@ -513,9 +528,7 @@ def run_polystep_gym(
                         "time": time.time() - start,
                         "step_wall_time": step_wall,
                         "candidates_evaluated": counted.count,
-                        "env_steps_cumulative": getattr(
-                            evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon
-                        ),
+                        "env_steps_cumulative": evaluator.env_steps,
                     }
                 )
                 print(
@@ -541,7 +554,7 @@ def run_polystep_gym(
         peak_gpu_memory_mb=mem["peak_gpu_memory_mb"],
         function_evals=counted.count,
         total_steps=total_steps,
-        rl_env_steps=getattr(evaluator, "env_steps", counted.count * rollouts_per_candidate * horizon),
+        rl_env_steps=evaluator.env_steps,
         success_rate=final_summary["success_rate"],
         episode_length=final_summary["episode_length"],
         best_success_rate=best_summary.get("success_rate", 0.0),
@@ -617,7 +630,7 @@ def run_random_gym(
         # One policy, evaluated over `eval_episodes` rollouts.
         function_evals=int(eval_episodes),
         total_steps=1,
-        rl_env_steps=int(eval_episodes) * horizon,
+        rl_env_steps=0,
         success_rate=summary["success_rate"],
         episode_length=summary["episode_length"],
     )
@@ -731,6 +744,8 @@ def run_sb3_gym(
     env.close()
 
     mean_return = float(np.mean(returns)) if returns else 0.0
+    lengths_np = np.asarray(lengths)
+    successes = lengths_np < horizon if _is_goal_reaching(env_id) else lengths_np >= horizon
     best_return = max([mean_return] + [c["mean_return"] for c in curve], default=mean_return)
     metrics = build_rl_metrics(
         final_return=mean_return,
@@ -743,8 +758,8 @@ def run_sb3_gym(
         # kept under its own key.
         function_evals=float("nan"),
         total_steps=int(total_timesteps),
-        rl_env_steps=int(total_timesteps) + int(eval_episodes) * horizon,
-        success_rate=float(sum(1 for length in lengths if length >= horizon) / max(1, len(lengths))),
+        rl_env_steps=int(total_timesteps),
+        success_rate=float(successes.sum() / max(1, len(lengths))),
         episode_length=float(np.mean(lengths)) if lengths else 0.0,
     )
     save_result(
@@ -840,11 +855,9 @@ def run_es_gym(
 ) -> None:
     """Hand-rolled OpenAI-ES baseline (antithetic sampling, rank centering, cosine sigma decay).
 
-    Evaluates the population in parallel via GymVectorEvaluator's stacked-params
+    Evaluates the population in parallel through the evaluator's stacked-params
     interface; ``nondiff_mode`` swaps the policy activation for a non-diff op.
     """
-
-    from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
 
     cfg = GYM_ENV_REGISTRY[env_short]
     env_id = cfg["env_id"]
@@ -878,7 +891,8 @@ def run_es_gym(
         ).to(device)
         eval_activation = nondiff_mode
     param_count = sum(p.numel() for p in model.parameters())
-    evaluator = GymVectorEvaluator(
+    evaluator = _make_evaluator(
+        env_short,
         env_id,
         rollouts_per_candidate=rollouts_per_candidate,
         horizon=horizon,
@@ -901,7 +915,6 @@ def run_es_gym(
     best_summary: dict[str, float] = {}
     start = time.time()
     eval_interval = 1
-    env_steps_cumulative = 0
 
     def _make_stacked(noise: dict[str, torch.Tensor], sigma: float) -> dict[str, torch.Tensor]:
         # Stacked params: theta_i = theta + sigma * noise_i, shape (popsize, *param_shape).
@@ -950,15 +963,10 @@ def run_es_gym(
             noise[name] = torch.cat([eps_half, -eps_half], dim=0)  # (popsize, *)
 
         stacked = _make_stacked(noise, sigma)
-        # Use evaluator: returns (popsize, R) -> mean over R is fitness per candidate.
-        result = evaluator.rollout_stacked_params(stacked, seed=seed, step=gen)
-        fitness = result.returns.mean(dim=1).detach().cpu()  # (popsize,)
-        env_steps_cumulative += int(popsize) * rollouts_per_candidate * horizon
+        fitness = -evaluator.loss_for_stacked_params(stacked, seed=seed, step=gen).detach().cpu()  # (popsize,)
 
         # Rank-centered weights (standardized -> sum to 0).
-        ranks = torch.empty_like(fitness)
-        ranks[fitness.argsort()] = torch.arange(popsize, dtype=fitness.dtype)
-        centered = (ranks - (popsize - 1) / 2.0) / max(1.0, (popsize - 1) / 2.0)  # in [-1, 1]
+        centered = 2 * centered_rank(fitness)  # in [-1, 1]
 
         # Update theta: theta <- theta + (lr / (popsize * sigma)) * sum_i (w_i * noise_i)
         scale = lr / (popsize * max(sigma, 1e-8))
@@ -992,7 +1000,7 @@ def run_es_gym(
                     "episode_length": summary["episode_length"],
                     "loss": -mean_return,
                     "time": time.time() - start,
-                    "env_steps_cumulative": env_steps_cumulative,
+                    "env_steps_cumulative": evaluator.env_steps,
                     "sigma": float(sigma),
                 }
             )
@@ -1020,7 +1028,7 @@ def run_es_gym(
         peak_gpu_memory_mb=0.0,
         function_evals=int(generations) * popsize,
         total_steps=int(generations),
-        rl_env_steps=env_steps_cumulative,
+        rl_env_steps=evaluator.env_steps,
         success_rate=final_summary["success_rate"],
         episode_length=final_summary["episode_length"],
         best_success_rate=best_summary.get("success_rate", 0.0),
@@ -1052,7 +1060,8 @@ def run_es_gym(
         step_logs=step_logs,
         results_dir=results_dir or DEFAULT_RESULTS_DIR,
     )
-    evaluator.close()
+    if hasattr(evaluator, "close"):
+        evaluator.close()
 
 
 # Method dispatch tables for new envs (DQN excluded for LunarLander per plan).
@@ -1149,8 +1158,6 @@ def main() -> None:
             if args.env == "cartpole":
                 if method not in _CARTPOLE_METHODS:
                     raise ValueError(f"Unknown CartPole method: {method!r}. Valid: {sorted(_CARTPOLE_METHODS)}")
-                # Non-differentiable CartPole runs route through the generic
-                # GymVectorEvaluator path; float32 keeps the fast analytic path.
                 if args.nondiff_mode != "float32":
                     if method == "polystep":
                         run_polystep_gym(
@@ -1170,7 +1177,7 @@ def main() -> None:
                             nondiff_mode=args.nondiff_mode,
                         )
                     elif method == "random_policy":
-                        run_random_gym(env_short="cartpole", seed=seed, results_dir=args.results_dir)
+                        run_random_cartpole(seed=seed, results_dir=args.results_dir)
                     elif method in {"dqn", "ppo"}:
                         cfg = GYM_ENV_REGISTRY["cartpole"]
                         total_timesteps = cfg["sb3_total_timesteps"][args.mode]

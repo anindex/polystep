@@ -353,6 +353,7 @@ def run_gradient_free(
         shared_subspace_dim=shared_dim if fair else None,
         hp=hp,
         probe_scale=probe_scale,
+        polystep_steps=epochs * len(train_loader),
     )
     out["hyperparameters"]["fair"] = fair
     out["hyperparameters"]["match_axis"] = match_axis

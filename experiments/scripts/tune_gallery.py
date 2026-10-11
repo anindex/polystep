@@ -175,11 +175,6 @@ def main() -> int:
                     flush=True,
                 )
                 for i, hp in enumerate(configs):
-                    # SPSA's gain is a_k = a / (A + k)^alpha, and A defaults to 10% of
-                    # the affordable iterations. Pin A to the budget the cell is
-                    # reported at, so the schedule tuned is the schedule run.
-                    if method == "spsa":
-                        hp = {**hp, "A": 0.1 * (budget // 2)}
                     name = "_".join(f"{k}{v:g}" for k, v in sorted(points[i].items()))
                     set_seed(args.seed)
                     # setup() builds the loaders once and every cell shares them, so
@@ -208,6 +203,7 @@ def main() -> int:
                             subspace_rank=cfg["rank"],
                             hp=hp,
                             probe_scale=scale,
+                            polystep_steps=polystep_steps,
                         )
                     except Exception as e:  # one bad cell must not lose the sweep
                         print(f"  {i:>2} {name:<28} ERROR {type(e).__name__}: {e}", flush=True)

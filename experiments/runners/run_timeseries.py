@@ -681,6 +681,7 @@ def run_gradient_free(
         probe_scale=probe_scale_of(cfg, dim=subspace.subspace_dim if subspace else layout.total_params),
         quality_key="mse",
         deadline_s=deadline_s,
+        polystep_steps=epochs * len(train_loader),
     )
     # Score the validation-selected checkpoint on test once.
     final = evaluate_regression(model, test_data, device=device)

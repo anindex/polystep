@@ -308,6 +308,54 @@
   a step, or folded in by an absorb. One in-place step no longer scores its site and
   swapped candidates on differently rounded weights, and the model ends each step on
   the weights that were scored.
+- The baselines' `Objective` returns NaN and infinite losses as `+inf`. Rank and
+  z-score shaping give them the lowest utility, and SPSA and MeZO skip a step when
+  either loss of the pair is nonfinite. A NaN loss used to get the top rank or turn
+  the iterate into NaN.
+- `zscore` rescales losses large enough to overflow its mean or variance, so
+  float32 losses near `1e38` no longer turn every utility into NaN.
+- `Objective` enforces the deadline only through `remaining`, so a generation that
+  starts before the deadline finishes instead of raising `BudgetExhausted`.
+- `random_search` scores the incumbent and the candidate in the same call, two
+  evaluations per step, so both see the same minibatch. It used to compare each
+  candidate with the incumbent's loss on an earlier batch, which kept the luckiest
+  draw and stalled the search. Random search results change.
+- `GymVectorEvaluator` and `CartPoleEvaluator` count `env_steps` only in
+  `loss_for_stacked_params`, so evaluation rollouts no longer add to it.
+- `GymVectorEvaluator` keeps one vector env per candidate count instead of
+  rebuilding it whenever the count changes, and `close()` closes them all.
+- `CartPoleEvaluator` takes the same `activation` argument as `GymVectorEvaluator`.
+- The Gym `random_policy_baseline` counts reaching the goal before the horizon as
+  success on Acrobot and MountainCar. It used to report the timeout rate.
+- In the RL runner, ES averages the ranks of tied returns, so a population whose
+  returns all tie no longer moves. Every CartPole arm except PPO and DQN runs on
+  the analytic simulator. `rl_env_steps` counts training steps only: the real
+  steps for PolyStep and ES, `total_timesteps` for PPO and DQN, and 0 for random
+  policies. PPO and DQN success on Acrobot means reaching the goal. RL results
+  change.
+- The experiment runners set SPSA's gain offset `A` to a tenth of PolyStep's step
+  count, the schedule the gallery tuning uses, on every match axis. On the
+  evaluation and wall-clock axes it came from the evaluation budget or the
+  wall-clock cap, so SPSA took far smaller steps than the schedule it was tuned
+  on. An SPSA run with a deadline and neither `polystep_steps` nor `A` raises
+  `ValueError`. SPSA results on those axes change; the library's `spsa` keeps its
+  default.
+- `download_file` in `polystep.benchmarks.utils` times out after 60 seconds without
+  data and writes through its own temporary file next to the target, so an
+  interrupted MNIST download no longer leaves a truncated file that later runs load,
+  and two processes fetching the same file no longer collide. The test fixtures use
+  the same downloader and readers, so tests run from the sdist no longer skip the
+  MNIST checks.
+- `VmapSafeMultiHeadAttention` on CUDA skips the fully masked row guard when no mask
+  is given. Outputs are unchanged, and unmasked forwards of 16 vmapped candidates
+  run 1.4 times faster at sequence length 64 and twice as fast at 128.
+- Remove `BenchmarkResult` from `polystep.benchmarks`; nothing used it.
+- Remove the unused `experiments/baselines/openai_es.py` and `spsa.py`, which
+  `polystep.baselines` replaced, and the flat-parameter helpers, `get_loss_fn`,
+  `FunctionEvalCounter`, and Tonic dataset loaders from
+  `experiments/runners/common.py`.
+- The fairness runner's progress line shows the validation score. It looked up a
+  key the trajectory never stores, so the score was never printed.
 
 ## 0.13.0 - 2026-09-22
 

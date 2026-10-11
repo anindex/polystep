@@ -41,7 +41,7 @@ PER_ITER = {
     "openai_es": 16,
     "spsa": 2,
     "mezo": 2,
-    "random_search": 1,
+    "random_search": 2,
     "eggroll": 16,
     "cma_es": 16,
 }
@@ -123,9 +123,32 @@ def test_objective_refuses_to_overspend():
 
 def test_objective_tracks_best_and_ignores_nan():
     obj = Objective(lambda X: torch.tensor([float("nan"), -1.0, 5.0]), dim=DIM, budget=10)
-    obj(torch.arange(3 * DIM, dtype=torch.float32).reshape(3, DIM))
+    losses = obj(torch.arange(3 * DIM, dtype=torch.float32).reshape(3, DIM))
+    assert losses.tolist() == [float("inf"), -1.0, 5.0]
     assert obj.best_loss == -1.0
     assert obj.best_x is not None
+
+
+@pytest.mark.parametrize("name", METHOD_NAMES)
+def test_nan_candidates_keep_the_iterate_finite(name):
+    def fn(X):
+        return quadratic()(X).masked_fill(X[:, 0] > 0.2, float("nan"))
+
+    obj = Objective(fn, dim=DIM, budget=BUDGET, shapes=[(3, 4)])
+    result = METHODS[name](obj, **HYPERPARAMS[name])
+    assert torch.isfinite(result.x).all()
+    assert math.isfinite(result.best_loss)
+
+
+def test_random_search_compares_on_the_same_call():
+    """A shift that changes from call to call, like a fresh minibatch, must not decide acceptance."""
+    gen = torch.Generator().manual_seed(0)
+
+    def fn(X):
+        return quadratic()(X) + 10.0 * torch.rand((), generator=gen)
+
+    result = METHODS["random_search"](Objective(fn, dim=DIM, budget=BUDGET), **HYPERPARAMS["random_search"])
+    assert quadratic()(result.x[None])[0] < 0.5 * quadratic()(torch.zeros(1, DIM))[0]
 
 
 def test_objective_rejects_bad_shapes():
@@ -141,6 +164,30 @@ def test_shaping_helpers():
     assert centered_rank(x).tolist() == [0.5, -0.5, 0.0]
     assert torch.allclose(zscore(torch.ones(4)), torch.zeros(4))
     assert zscore(x).mean().abs() < 1e-6
+
+
+@pytest.mark.parametrize("shaping", ["rank", "zscore"])
+def test_shaping_puts_nonfinite_losses_last(shaping):
+    from polystep.baselines.methods import _shaped
+
+    for bad in (float("nan"), float("inf")):
+        u = _shaped(torch.tensor([1.0, bad, 0.0]), shaping)
+        assert torch.isfinite(u).all()
+        assert u.argmin() == 1
+
+
+def test_zscore_rescales_losses_that_would_overflow():
+    from polystep.baselines.methods import _shaped
+
+    u = _shaped(torch.tensor([1e38, 1e38, float("inf"), float("inf")]), "zscore")
+    assert torch.isfinite(u).all()
+    assert (u[:2] > u[2:]).all()
+
+
+def test_integer_losses_rank_shape():
+    obj = Objective(lambda X: (X > 0).sum(1), dim=3, budget=4)
+    result = METHODS["openai_es"](obj, popsize=4)
+    assert torch.isfinite(result.x).all()
 
 
 # Subspace parity
@@ -256,3 +303,10 @@ def test_mezo_regenerates_the_same_perturbation():
     # x0 is zeros, so plus = +eps*z and minus = -eps*z.
     assert torch.allclose(plus, -minus)
     assert torch.allclose(result.x, torch.zeros(DIM)), "lr=0 must not move x"
+
+
+def test_mezo_skips_weight_decay_on_a_nonfinite_pair():
+    obj = Objective(lambda X: torch.tensor([float("inf"), 1.0]), dim=1, budget=2)
+    result = METHODS["mezo"](obj, x0=torch.ones(1), lr=0.01, weight_decay=1.0)
+    assert result.x.tolist() == [1.0]
+    assert (result.evals, result.iters) == (2, 1)

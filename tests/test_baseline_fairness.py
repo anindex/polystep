@@ -348,20 +348,70 @@ def test_eggroll_factors_over_factored_coordinates_only():
 def test_wallclock_deadline_stops_every_method():
     """A deadline stops a run through ``remaining``, without touching any method."""
 
-    from polystep.baselines.core import BudgetExhausted, Objective
+    from polystep.baselines.core import Objective
 
     obj = Objective(lambda X: torch.zeros(X.shape[0]), 4, budget=10**9, deadline_s=0.2)
     assert obj.elapsed_s == 0.0, "clock starts on the first call, not at construction"
-    # remaining and the call check the clock separately, so the deadline can fall
-    # between them. Either exit is correct; the test is that one of them happens.
-    try:
-        while obj.remaining > 0:
-            obj(torch.zeros(2, 4))
-    except BudgetExhausted:
-        pass
-    assert obj.out_of_time and obj.evals > 0
-    with pytest.raises(BudgetExhausted, match="deadline"):
+    while obj.remaining > 0:
         obj(torch.zeros(2, 4))
+    assert obj.out_of_time and obj.remaining == 0 and obj.evals > 0
+    evals = obj.evals
+    obj(torch.zeros(2, 4))
+    assert obj.evals == evals + 2, "a generation that started before the deadline finishes"
+
+
+def _spsa_run(**kwargs):
+    sys.path.insert(0, str(REPO_ROOT))
+    import torch.nn as nn
+
+    from experiments.runners.fairness import run_baseline
+    from polystep.cost_nn import NNCostEvaluator
+    from polystep.transform import ParamLayout
+
+    torch.manual_seed(0)
+    X, Y = torch.randn(8, 6), torch.randint(0, 3, (8,))
+    model = nn.Sequential(nn.Linear(6, 8), nn.Tanh(), nn.Linear(8, 3))
+    evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+    out = run_baseline(
+        "spsa",
+        model=model,
+        layout=ParamLayout.from_module(model),
+        loss_batch=lambda stacked: evaluator.evaluate(stacked, X, Y),
+        budget=200,
+        val_fn=lambda m: -float(nn.functional.cross_entropy(m(X), Y)),
+        test_fn=lambda m: -float(nn.functional.cross_entropy(m(X), Y)),
+        probe_scale=0.5,
+        log_points=4,
+        **kwargs,
+    )
+    return out["hyperparameters"], [p["loss"] for p in out["step_logs"]]
+
+
+def test_spsa_gain_offset_follows_polystep_steps():
+    """``polystep_steps`` sets ``A``; without it a budgeted run keeps the library's ``budget // 2`` offset."""
+    generic_hp, generic = _spsa_run()
+    assert "A" not in generic_hp
+    assert _spsa_run(hp={"A": 0.1 * (200 // 2)})[1] == generic
+    assert _spsa_run(polystep_steps=100)[1] == generic
+
+    steps_hp, steps = _spsa_run(polystep_steps=7)
+    assert steps_hp["A"] == pytest.approx(0.7)
+    assert steps != generic
+    assert _spsa_run(polystep_steps=7, hp={"A": 3.0})[0]["A"] == 3.0
+
+
+def test_spsa_deadline_needs_polystep_steps_or_A():
+    """A deadline gives no iteration count to derive ``A`` from, so the run refuses to guess."""
+    with pytest.raises(ValueError, match="polystep_steps"):
+        _spsa_run(deadline_s=60.0)
+    assert _spsa_run(deadline_s=60.0, polystep_steps=7)[0]["A"] == pytest.approx(0.7)
+    assert _spsa_run(deadline_s=60.0, hp={"A": 3.0})[0]["A"] == 3.0
+
+
+def test_progress_line_prints_the_validation_score(capsys):
+    """The evaluation-budget progress line reads the ``val_`` key the trajectory stores."""
+    _spsa_run()
+    assert "accuracy=" in capsys.readouterr().out
 
 
 def test_matched_budget_records_the_axis_it_used():
