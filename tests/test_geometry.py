@@ -205,3 +205,11 @@ def test_thin_qr_pins_only_small_problems(monkeypatch, shape, threads):
     thin_qr(torch.randn(*shape))
     assert seen == [threads]
     assert torch.get_num_threads() == 2
+
+
+def test_rotation_accepts_device_string():
+    torch.manual_seed(7)
+    actual = get_random_rotation_matrices(4, 3, device="cpu")
+    torch.manual_seed(7)
+    expected = get_random_rotation_matrices(4, 3, device=torch.device("cpu"))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -380,3 +380,20 @@ class TestVmapSafeLSTM:
         packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
         with pytest.raises(NotImplementedError, match="PackedSequence"):
             lstm(packed)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_half_attention_accepts_float_masks():
+    for dtype in (torch.float16, torch.bfloat16):
+        model = VmapSafeMultiHeadAttention(8, 2).to(device="cuda", dtype=dtype).eval()
+        x = torch.randn(2, 3, 8, device="cuda", dtype=dtype)
+        expected = model(x, x, x)
+        actual = model(
+            x,
+            x,
+            x,
+            attn_mask=torch.zeros(3, 3, device="cuda"),
+            key_padding_mask=torch.zeros(2, 3, device="cuda"),
+        )
+        torch.testing.assert_close(actual, expected)

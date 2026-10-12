@@ -83,7 +83,7 @@ def get_rotation_matrix_2d(theta: torch.Tensor) -> torch.Tensor:
 def get_random_rotation_matrices(
     batch: int,
     dim: int,
-    device: Optional[torch.device] = None,
+    device: Optional[torch.device | str] = None,
     dtype: Optional[torch.dtype] = None,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
@@ -101,7 +101,7 @@ def get_random_rotation_matrices(
         return get_rotation_matrix_2d(angles).to(device=device, dtype=dtype)
 
     # The QR runs on the sample's device, not the requested output device.
-    work_device = sample_device if sample_device is not None else torch.device("cpu")
+    work_device = torch.device(sample_device) if sample_device is not None else torch.device("cpu")
     if batch <= _QR_MAX_BATCH[work_device.type == "cuda"]:
         # Keep the whole branch: the batched det oversubscribes like the QR.
         with single_thread_cpu(work_device):

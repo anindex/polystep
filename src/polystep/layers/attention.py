@@ -158,7 +158,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
                 fully_masked = torch.isneginf(scores).all(dim=-1, keepdim=True)
                 weights = F.softmax(scores.masked_fill(fully_masked, 0.0), dim=-1)
                 weights = weights.masked_fill(fully_masked, 0.0)
-            context = torch.matmul(self.attn_dropout(weights), V)
+            context = torch.matmul(self.attn_dropout(weights).to(V.dtype), V)
 
         # reshape, not .contiguous().view(): the latter copies once per candidate under vmap.
         context = context.transpose(1, 2).reshape(batch_size, seq_q, self.embed_dim)

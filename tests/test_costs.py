@@ -12,12 +12,12 @@ def test_scale_cost_matrix_rejects_invalid_divisor(divisor):
         scale_cost_matrix(torch.tensor([[0.0, 1.0]]), divisor)
 
 
-def test_compute_cost_matrix_averages_probes():
-    batch, verts, probes, dim = 2, 3, 4, 2
-    X = torch.ones(batch, verts, probes, dim)
-    # Identity sum: each point sums to dim=2, mean over probes = 2
-    C = compute_cost_matrix(lambda x: x.sum(dim=-1), X)
-    assert torch.allclose(C, torch.full((batch, verts), 2.0))
+@pytest.mark.parametrize("dtype", [torch.int64, torch.float16, torch.bfloat16, torch.float64])
+def test_compute_cost_matrix_averages_probes(dtype):
+    values = torch.arange(12, dtype=dtype).reshape(2, 3, 2, 1)
+    actual = compute_cost_matrix(lambda x: x[:, 0], values, chunk_size=5)
+    expected = values.squeeze(-1).to(torch.float64 if dtype == torch.float64 else torch.float32).mean(-1)
+    torch.testing.assert_close(actual, expected)
 
 
 def test_compute_cost_matrix_chunked_matches_unchunked():
@@ -46,7 +46,13 @@ def test_scale_cost_matrix_named_modes(mode, divisor):
 
 @pytest.mark.parametrize(
     "device",
-    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"))],
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")],
+        ),
+    ],
 )
 @pytest.mark.parametrize("mode", ["mean", "max_cost"])
 def test_all_finite_mask_keeps_divisor(mode, device):

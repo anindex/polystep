@@ -21,7 +21,8 @@ def compute_cost_matrix(
         raw_costs_flat = objective_fn(flat_X)
 
     raw_costs = raw_costs_flat.reshape(batch, num_verts, num_probe)
-    cost_matrix = raw_costs.mean(dim=-1)
+    dtype = torch.float64 if raw_costs.dtype == torch.float64 else torch.float32
+    cost_matrix = raw_costs.mean(dim=-1, dtype=dtype)
 
     return cost_matrix
 
