@@ -71,8 +71,6 @@ def load_single_result(path: str) -> Dict[str, Any]:
         "total_steps": metrics.get("total_steps", 0),
         "epoch_logs": data.get("epoch_logs", []),
         "step_logs": data.get("step_logs", []),
-        # Which budget this cell was matched on: evals, steps, wallclock, or None for
-        # PolyStep and Adam, which set the budget rather than receive one.
         "rl_env_steps": metrics.get("rl_env_steps"),
         "match_axis": (data.get("hyperparameters") or {}).get("match_axis"),
         "deadline_s": (data.get("hyperparameters") or {}).get("deadline_s"),

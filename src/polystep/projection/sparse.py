@@ -73,6 +73,7 @@ class SparseRandomProjection:
         self._dtype: Optional[torch.dtype] = None
         self._csr_matrix: Optional[torch.Tensor] = None
         self._csr_rows: Optional[torch.Tensor] = None
+        self._batched_coo: Optional[torch.Tensor] = None
 
     def _init_sparse_matrix(self, device: torch.device, dtype: torch.dtype) -> None:
         """Build the sparse projection matrix on first use."""
@@ -111,6 +112,7 @@ class SparseRandomProjection:
         self._dtype = dtype
         self._csr_matrix = None
         self._csr_rows = None
+        self._batched_coo = None
 
     def _pointers_dominate(self, nnz: int, index_size: int) -> bool:
         """Whether ``full_dim + 1`` row pointers would outweigh an int64 map and pointers for ``nnz`` rows."""
@@ -157,6 +159,19 @@ class SparseRandomProjection:
 
         return self._csr_matrix
 
+    def _get_batched_coo(self) -> torch.Tensor:
+        """The CSR as a one-batch COO, whose CUDA ``bmm`` sums in a fixed order."""
+        if self._batched_coo is None:
+            P = self._csr_matrix
+            coo = P.to_sparse_coo()
+            index = torch.cat([coo.indices().new_zeros(1, coo._nnz()), coo.indices()])
+            values = coo.values().to(decomposition_dtype(P.dtype))
+            del coo
+            self._batched_coo = torch.sparse_coo_tensor(
+                index, values, (1, *P.shape), is_coalesced=True, check_invariants=False
+            )
+        return self._batched_coo
+
     def columns(self, cols: torch.Tensor, device: torch.device, dtype: torch.dtype):
         """Row indices and values for the requested columns.
 
@@ -175,7 +190,12 @@ class SparseRandomProjection:
 
         # CSR on a contiguous operand is much faster than COO on the transposed view.
         P = self._get_csr_matrix(coords.device, coords.dtype)
-        result = P @ coords.T.to(P.dtype).contiguous()
+        dense = coords.T.to(P.dtype).contiguous()
+        if dense.is_cuda and torch.are_deterministic_algorithms_enabled():
+            batched = self._get_batched_coo()
+            result = torch.bmm(batched, dense.to(batched.dtype).unsqueeze(0))[0].to(P.dtype)
+        else:
+            result = P @ dense
         if self._csr_rows is not None:
             result = result.new_zeros(self.full_dim, result.shape[1]).index_copy_(0, self._csr_rows, result)
         result = result.T.to(coords.dtype)
@@ -197,11 +217,14 @@ class SparseRandomProjection:
 
     @property
     def memory_bytes(self) -> int:
-        """Bytes held by the entries and the cached CSR, estimated before the first ``project``."""
+        """Bytes held by the entries and the cached CSR and COO, estimated before the first ``project``."""
         if self._csr_matrix is not None:
             P = self._csr_matrix
             held = [self._rows, self._values, P.crow_indices(), P.col_indices(), P.values(), self._csr_rows]
-            return sum(t.untyped_storage().nbytes() for t in held if t is not None)
+            if self._batched_coo is not None:
+                held += [self._batched_coo.indices(), self._batched_coo.values()]
+            storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in held if t is not None}
+            return sum(storages.values())
         nnz = self.nnz
         index_size = 4 if max(self.full_dim, nnz) < 2**31 else 8
         value_size = self._dtype.itemsize if self._dtype else 4

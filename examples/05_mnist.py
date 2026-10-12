@@ -4,8 +4,10 @@ Recommended configuration: a ``HybridSubspace`` with cosine-scheduled epsilon,
 step_radius, and probe_radius, plus validation-based checkpoint selection. MNIST is
 downloaded directly (no torchvision) and stays on the device, so each epoch reads
 the loss back once. On CUDA the model and data run in BF16, which speeds up each
-step; CPU keeps FP32, where BF16 is slower. BF16 CUDA runs are not bit-reproducible,
-so repeated runs differ by a few tenths of a point in test accuracy.
+step; CPU keeps FP32, where BF16 is slower. The first layer's basis is a sparse
+projection, so CUDA runs repeat exactly only under deterministic algorithms (see
+docs/determinism.md); otherwise repeated runs differ by a few tenths of a point in
+test accuracy.
 
 Run:
   python examples/05_mnist.py

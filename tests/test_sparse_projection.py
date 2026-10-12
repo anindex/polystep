@@ -1,11 +1,22 @@
 """Unit tests for SparseRandomProjection: shapes, memory, JLT, determinism."""
 
+import contextlib
 import warnings
 
 import pytest
 import torch
 
 from polystep.projection import SparseRandomProjection
+
+
+@contextlib.contextmanager
+def _deterministic():
+    saved = torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
 
 
 class TestCoreProjection:
@@ -185,6 +196,31 @@ class TestCUDA:
         full2 = proj2.project(coords)
 
         assert torch.allclose(full1, full2)
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_deterministic_mode_repeats_bitwise(self, dtype):
+        proj = SparseRandomProjection(full_dim=100_352, subspace_dim=7296, seed=0)
+        coords = torch.randn(64, 7296, device="cuda", dtype=dtype)
+        with _deterministic():
+            outs = [proj.project(coords) for _ in range(3)]
+        assert outs[0].dtype == dtype
+        assert all(torch.equal(outs[0], out) for out in outs[1:])
+        torch.testing.assert_close(outs[0], proj.project(coords))
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_deterministic_mode_holds_counted_bytes(self):
+        proj = SparseRandomProjection(full_dim=100_352, subspace_dim=7296, seed=0)
+        coords = torch.randn(1, 7296, device="cuda")
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["requested_bytes.all.current"]
+        with _deterministic():
+            out = proj.project(coords)
+        torch.cuda.synchronize()
+        held = torch.cuda.memory_stats()["requested_bytes.all.current"] - before - out.untyped_storage().nbytes()
+        assert abs(held - proj.memory_bytes) < 2**12
 
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

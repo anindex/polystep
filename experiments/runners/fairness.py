@@ -137,8 +137,8 @@ def make_subspace(layout, *, rank: int, seed: int, method: str = "polystep", **k
     Same class, same rank, same seed for everything except EGGROLL, which gets
     ``FactoredSubspace``: its perturbations are ``A B^T`` on weight matrices, and
     ``HybridSubspace`` coordinates carry no matrix structure, so EGGROLL there
-    degenerates to dense Gaussian ES (see ``README.md``). ``FactoredSubspace`` is that
-    parameterization and takes the same ``rank``/``seed``.
+    degenerates to dense Gaussian ES (see ``docs/reproducibility.md``).
+    ``FactoredSubspace`` is that parameterization and takes the same ``rank``/``seed``.
     """
     cls = FactoredSubspace if method == "eggroll" else HybridSubspace
     return cls.from_layout(layout, rank=rank, seed=seed, **kwargs)

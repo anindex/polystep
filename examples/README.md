@@ -19,14 +19,15 @@ python examples/01_quickstart_2d.py
 | [10_cnn_mnist.py](10_cnn_mnist.py) | Convolutional MNIST classifier |
 | [11_transformer_selective_copy.py](11_transformer_selective_copy.py) | Attention-based selective copying |
 
-Examples set CPU thread counts; override with `POLYSTEP_THREADS`. Examples 02, 04,
-05, 06, 10, and 11 use CUDA when available, and 05 trains in BF16 there. Example 03
-accepts `--device cuda`. Use `--device cpu` for 02, 05, 06, 10, and 11; use `--small`
-for a smaller MAX-SAT task.
+Examples run on one CPU thread, except 07, which uses eight; set `POLYSTEP_THREADS` to
+change it. Examples 02, 04, 05, 06, 10, and 11 use CUDA when available, and 05 trains
+in BF16 there. Example 03 accepts `--device cuda`. Use `--device cpu` for 02, 05, 06,
+10, and 11; use `--small` for a smaller MAX-SAT task.
 
 Examples 10 and 11 support `--compare` to check loss agreement and time registered
 evaluation against materialized candidates, including first-call setup. See
-[performance](../docs/performance.md) for subspace and amortization settings.
+[performance](../docs/performance.md) for subspace settings and the
+[API reference](../docs/api_overview.md#evaluation-controls) for amortization.
 
 Examples 05, 06, 10, and 11 select checkpoints on validation data and report
 test accuracy afterward. The Loihi example runs a CPU simulation; its hardware

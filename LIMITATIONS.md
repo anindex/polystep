@@ -27,33 +27,33 @@ momentum.
   any you keep after the closure returns.
 - Manual loops must register the evaluator and current batch to enable fast paths.
   The evaluator and closure must compute the same objective.
+- `NNCostEvaluator` and `train()` score candidates in eval mode: dropout is off and
+  batch-norm running statistics never update. A custom closure that runs the model in
+  train mode compares candidates under different dropout masks.
 - Mixed-dtype models require `HybridSubspace` or `FactoredSubspace`. Full-space and
   global-subspace coordinates use one dtype and reject mixed parameter dtypes.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
-  When a candidate's output is FP16 or BF16, whether from the model's dtype or from
-  `candidate_autocast`, an `nn.CrossEntropyLoss`, `nn.MSELoss`, or `nn.L1Loss` left
-  at its defaults apart from `reduction` reduces it in FP32. Any other loss,
-  including one with class weights, label smoothing, or hooks, keeps the dtype it
-  returns, so candidates closer than its rounding step tie.
-  Models needing autocast internally must provide it.
-- With FP16 or BF16 parameters, the subspace-delta and factored evaluators are off
-  so that candidates are scored on the weights they round to. `FactoredSubspace`
-  then materializes every candidate and runs slower.
-- Deferred `trust_region` comparisons require the same objective. `train()` rejects
-  this option; use manual steps on a stationary objective.
-- `trust_region` and `use_adaptive_radius` both scale the step. Choose one controller.
+  Models needing autocast internally must provide it. Half-precision candidate outputs
+  reduce in FP32 only under the builtin cross-entropy, MSE and L1 losses at their
+  defaults apart from `reduction`, so other losses tie candidates closer than their
+  rounding step. With FP16 or BF16 parameters, `FactoredSubspace` materializes every
+  candidate and runs slower. See
+  [precision](docs/performance.md#compilation-and-precision).
+- `train()` rejects `trust_region`. See
+  [radius control](docs/api_overview.md#quadratic-model-and-radius-control) for its
+  manual-step use.
+- `trust_region` and `use_adaptive_radius` both scale the step. Choose one; the
+  optimizer warns when both are on.
 - Multi-fidelity screening imputes dropped costs using an additive offset. This can
-  bias the full-fidelity cost estimate. Screening does not run with
-  `use_quadratic_model`, `newton_refinement` or `trust_region`.
+  bias the full-fidelity cost estimate.
 - Full-space blockwise mode does not support every monolithic adaptation option;
-  unsupported options warn at construction. With a subspace, `per_layer` and
-  `grouped` run the monolithic step and only split Sinkhorn and KL solves into row
-  segments.
+  unsupported options warn at construction.
 - The automatic chunk size sees only module outputs: those of layers that own
-  parameters, and on a site path whose forward draws no random numbers, those of
-  every module from the perturbed layer on. Attention scores and other intermediates
-  inside a module's forward are not counted, so set `chunk_size` by hand if such a
-  model runs out of memory.
+  parameters, and on a site-local path whose forward draws no random numbers, those of
+  every module from the perturbed layer on, unless the forward reads the perturbed
+  parameter before calling that layer. Attention scores and other intermediates inside
+  a module's forward are not counted, so set `chunk_size` by hand if such a model runs
+  out of memory.
 - The library does not distribute optimizer state across multiple GPUs.
 
 ## Attention and recurrent layers
@@ -67,9 +67,7 @@ Boolean masks use `True` for masked positions; float masks are additive. Attenti
 masks accept `(query, key)`, `(batch * heads, query, key)`, and broadcastable 4D shapes.
 The wrapper also accepts `(batch, query, key)` masks.
 
-CPU uses native scaled-dot-product attention; CUDA uses explicit matmuls. CPU vmap
-may emit a batching-fallback warning. Evaluate dropout layers in `model.eval()` mode
-for deterministic candidate comparisons.
+CPU vmap may emit a batching-fallback warning.
 
 [`VmapSafeLSTM`](src/polystep/layers/rnn.py) requires batch-first dense inputs. It does
 not support bidirectional recurrence, projection, or `PackedSequence`. Its explicit
@@ -112,4 +110,5 @@ The SNN surrogate-gradient baseline has substantial variation across seeds. MAX-
 search heuristics use flip budgets, which are not equivalent to neural candidate
 budgets. Head-only GPT-2 experiments do not establish full-model fine-tuning results.
 
-See the [experiment index](experiments/EXPERIMENT_INDEX.md) for protocols and results.
+The [reproducibility guide](docs/reproducibility.md#protocol) gives the protocols, and the
+[experiment index](experiments/EXPERIMENT_INDEX.md) has the results.

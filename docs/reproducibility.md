@@ -4,12 +4,16 @@ Run commands from the repository root. Install Python 3.11+, a compatible PyTorc
 build, and the experiment dependencies:
 
 ```bash
-pip install -e ".[experiments]"
+pip install -e ".[experiments,rl]"
 ```
 
+`rl` adds stable-baselines3 for the PPO and DQN arms. `run_revision.sh` uses
+`.venv/bin/python`; set `PY` to use another interpreter.
+
 Record hardware, PyTorch version, seeds, and selected configurations with results.
-MNIST and SST-2 runners download their datasets. The controlled-study runner expects
-MNIST under `data/mnist`; see its [protocol](../experiments/CONTROLLED_EXPERIMENTS.md).
+The MNIST, ETTh1 and SST-2 runners download their datasets. The controlled-study
+runner expects MNIST under `data/mnist`; see the
+[controlled hard-LIF comparison](../experiments/CONTROLLED_EXPERIMENTS.md).
 
 ## Protocol
 
@@ -20,15 +24,30 @@ MNIST under `data/mnist`; see its [protocol](../experiments/CONTROLLED_EXPERIMEN
   the final training budget.
 - Report the comparison axis: optimizer steps, candidate evaluations, or elapsed time.
 
-The architecture tables compare optimizer steps.
-`--theory-mode` selects the reference configuration with jitter and without
-amortization. Projection assumptions still need to be checked for each task.
+Population methods (OpenAI-ES, CMA-ES, EGGROLL) get PolyStep's candidate-evaluation
+budget. SPSA, MeZO and random search, which score at most two candidates per step, get
+its step count. On argmax attention, hard MoE and ETTh1, the population methods instead
+get 32 evaluations per PolyStep step, spent at their own population size, so their
+step counts differ from PolyStep's. Adam trains for PolyStep's 30 epochs there, except
+on ETTh1, where it trains for 50. On MAX-SAT, CMA-ES and OpenAI-ES get 50 evaluations
+per PolyStep step. OpenAI-ES scores 50 candidates at each of PolyStep's steps; CMA-ES
+doubles its population at each restart, so it takes fewer generations. probSAT and RC2
+run once per instance size. Set `POLYSTEP_MATCH_AXIS=evals` or `wallclock` to force
+one axis. Gradient-free baseline records from `run_elevation.py`, `run_moe.py`,
+`run_mnist.py` and `run_timeseries.py` store the axis as `hyperparameters.match_axis`;
+PolyStep, Adam, persistence, MAX-SAT and RL records carry none.
+
+`--theory-mode` runs the unaccelerated reference configuration: jittered probe and
+step radii, independent rotations, flat epsilon, a decaying step radius, orthoplex
+probes, and no momentum, amortization or Anderson acceleration.
 
 ## Architecture experiments
 
 ```bash
-python experiments/scripts/tune_gallery.py
-python experiments/scripts/tune_polystep.py
+python experiments/scripts/tune_gallery.py --showcases snn int8 argmax staircase mnist moe
+for showcase in snn int8 argmax staircase mnist moe; do
+    python experiments/scripts/tune_polystep.py --showcase "$showcase"
+done
 bash experiments/scripts/run_revision.sh
 python experiments/scripts/check_grid_complete.py experiments/results/revision
 python experiments/scripts/generate_tables.py \
@@ -36,7 +55,9 @@ python experiments/scripts/generate_tables.py \
     --readme README.md --index experiments/EXPERIMENT_INDEX.md
 ```
 
-The table generator updates Markdown only and rejects test-selected results.
+`run_elevation.py`, `run_mnist.py` and `run_moe.py` record the tuning settings they
+applied under `hyperparameters.tuning_provenance`; the other runners do not. The table
+generator updates Markdown only and rejects test-selected results.
 
 Individual runners accept `--methods` and `--seeds`:
 
@@ -49,6 +70,12 @@ python experiments/runners/run_timeseries.py
 python experiments/runners/run_rl.py --mode full --env cartpole
 python experiments/runners/run_gpt2_finetune.py
 ```
+
+They write to `experiments/results/revision` unless given `--results-dir`; the GPT-2
+runner writes to `experiments/results`. `run_revision.sh` writes to
+`experiments/results/revision` and its theory-mode runs to `theory/` there. It passes
+`--fair` to every runner that accepts it, which excludes `run_maxsat.py` and
+`run_rl.py`, and `--force` to every job except the RL ones.
 
 MAX-SAT's optional probSAT comparison requires a separately built executable at
 `experiments/scripts/probsat`:
@@ -64,58 +91,61 @@ cp probSAT/probSAT experiments/scripts/probsat
 Results are untracked JSON files under `experiments/results/`. Architecture runs
 store one file per benchmark, method, and seed under `revision/`. Fields include
 metrics, trajectories, hyperparameters, environment, and evaluation protocol.
-Standard aggregation rejects test-selected records. Rerunning a cell overwrites its
-file; copy existing results before repeating a campaign.
+Standard aggregation rejects test-selected records. The runners above skip a cell
+whose result file exists; all but `run_gpt2_finetune.py` take `--force` to rerun it.
+`run_revision.sh` refuses to start while `experiments/results/revision` holds
+results; move them aside first.
 
 ```bash
 python experiments/scripts/aggregate_results.py experiments/results/revision --benchmark snn
 python experiments/scripts/aggregate_results.py experiments/results/revision --write summary
 ```
 
+The `theory/`, `evalmatched/` and `wallclock/` subdirectories of
+`experiments/results/revision` hold the separate protocols. `run_revision.sh` fills
+`theory/`. For the other two, rerun the runners with `--fair` and
+`--results-dir experiments/results/revision/evalmatched` under
+`POLYSTEP_MATCH_AXIS=evals` (raise `POLYSTEP_FAIR_POPSIZE` there, so the population
+methods keep their throughput), or with `.../wallclock` under
+`POLYSTEP_MATCH_AXIS=wallclock`. The wall-clock runs read PolyStep's time for the same
+cell from the parent directory. `run_elevation.py`, `run_moe.py`, and
+`run_timeseries.py` read the variable; `run_maxsat.py` takes `--es-eval-budget`.
+
 See [determinism](determinism.md), [controlled experiments](../experiments/CONTROLLED_EXPERIMENTS.md),
 and [forward benchmarks](performance.md#benchmarks) for their specific checks.
 
-With the datasets and CUDA available, run the practical-study update checks with
-`PYTHONPATH=src:. pytest tests/test_practical.py -m gpu`.
+## Changes since the published tables
 
-## Results recorded before 1.0
+The tables in the README and the experiment index, and the RL and variant-sweep
+results, were recorded before 1.0. Fixes to the harness and the library since then
+change the following results, so a rerun does not reproduce them:
 
-The tables in the README and the experiment index were recorded before 1.0. Fixes to
-the harness and the library since then change the following results, so a rerun
-will not reproduce them:
-
-- Random search now scores the incumbent and the candidate on the same minibatch,
-  two evaluations per step. The recorded column compared each candidate with the
+- Random search scores the incumbent and the candidate on the same minibatch, two
+  evaluations per step. The published column compared each candidate with the
   incumbent's loss on an earlier batch.
-- SPSA on the evaluation- and wall-clock-matched axes took its gain offset `A` from
-  the evaluation budget or the time cap. The runners now use a tenth of PolyStep's
-  step count on every axis, so the step-matched rows are unchanged.
-- The RL results predate four runner fixes. ES now averages the ranks of tied
-  returns, `rl_env_steps` counts training steps only, success on Acrobot and
-  MountainCar means reaching the goal, and every CartPole arm except PPO and DQN
-  runs on the analytic simulator.
+- The ES baselines average the ranks of tied returns and losses. The published RL and
+  architecture runs ranked ties in sorting order.
+- The RL results predate three more runner fixes: `rl_env_steps` counts training
+  steps only, success on Acrobot means reaching the goal, and every CartPole arm
+  except PPO and DQN runs on the analytic simulator.
 - Capped `HybridSubspace` runs used the old budget split, which kept full-width
   weight matrices out of `max_subspace_dim`. The RL configurations set a cap of 24,
   yet CartPole searched all 114 parameters and Acrobot 68 coordinates.
-- For the same reason, the 0.12 hybrid timing row in
-  [performance](performance.md#cpu-measurements) was labelled 512 coordinates but
-  measured 1,542. That table has since been remeasured at 1,024.
 - The SNN/LIF and hard-MoE PolyStep configurations use `biased_rotation` and
   periodic absorbs, and 1.0 changes both, so their seeded trajectories differ.
-- The variant sweep lost its CMA arms (`cma_subspace`, `covariance`, and the
-  `cma_x_adaptive` pair), the `tempered_softmax` solver arm, and the data-dependent
-  Sinkhorn initialization arm, because 1.0 removes those features. Its
-  `quadratic/multifidelity` arm is gone as well: it never ran the screen and repeated
-  the baseline. The sweep's `block_x_repr`/`per_layer_hybrid` arm now runs the
-  Sinkhorn solver instead of softmax, so that row changes too.
+- The variant sweep (`experiments/runners/variant_sweep.py`) has lost its CMA arms
+  (`cma_subspace`, `covariance`, and the `cma_x_adaptive` pair), the
+  `tempered_softmax` solver arm, and the data-dependent Sinkhorn initialization arm,
+  because 1.0 removes those features. Its `quadratic/multifidelity` arm is gone as
+  well: it never ran the screen and repeated the baseline. The sweep's
+  `block_x_repr`/`per_layer_hybrid` arm runs the Sinkhorn solver instead of softmax,
+  so that row changes too.
 - The surviving `quadratic/trust_region`, `trust_x_quad/trust_quad_k3`,
   `quadratic/biased_rotation`, and `quadratic/newton` sweep arms change as well. The
-  trust region now applies its new radius on the step that measured the ratio
-  instead of one step later, `biased_rotation` turns each frame with a single
-  Householder reflection, and Newton refinement runs before momentum and keeps the
-  Sinkhorn warm start.
-- The architecture runs ranked ES populations in sorting order; the ES baselines
-  now average tied ranks.
+  trust region applies its new radius on the step that measured the ratio instead of
+  one step later, `biased_rotation` turns each frame with a single Householder
+  reflection, and Newton refinement runs before momentum and keeps the Sinkhorn warm
+  start.
 
 Several other 1.0 changes move results in the last bit (see the
 [changelog](../CHANGELOG.md)), so the remaining rows need not match bit for bit

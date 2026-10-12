@@ -104,7 +104,7 @@ def markdown_tables(runs, full):
     what the README carries.
     """
     methods = FULL_METHODS if full else BRIEF_METHODS
-    md = ["### Non-differentiable tasks", "", "Test accuracy %. A dash means the result is not in this release.", ""]
+    md = ["### Non-differentiable tasks", "", "Test accuracy %. A dash means the method was not run on that task.", ""]
 
     head = ["Task"] + [n for _, n in methods] + ["Adam (surrogate)", "Non-diff op"]
     md.append("| " + " | ".join(head) + " |")

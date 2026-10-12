@@ -1,13 +1,16 @@
 # Experiment results
 
 Architecture results use seeds 42, 123, 456, 789, and 1337, with validation-selected
-configurations and checkpoints. Tables compare optimizer steps. Evaluation- and
-time-matched results are reported separately.
+configurations and checkpoints. Entries are five-seed means ± sample standard
+deviation, except the probSAT and RC2 columns, which are single runs; the
+[protocol](../docs/reproducibility.md#protocol) gives the budget each method gets.
+
+## Results
 
 <!-- BENCH:START -->
 ### Non-differentiable tasks
 
-Test accuracy %. A dash means the result is not in this release.
+Test accuracy %. A dash means the method was not run on that task.
 
 | Task | PolyStep | OpenAI-ES | CMA-ES | EGGROLL | MeZO | SPSA | Random search | Adam (surrogate) | Non-diff op |
 |---|---|---|---|---|---|---|---|---|---|
@@ -36,30 +39,13 @@ Test accuracy %. A dash means the result is not in this release.
 | ETTh1 (LSTM, MSE; lower is better) | 0.253 ± 0.023 | 0.247 ± 0.023 |
 <!-- BENCH:END -->
 
-Adam uses surrogate gradients where necessary and is a gradient-based reference.
-Specialized MAX-SAT solvers use different work units; their flip budgets do not equal
-neural candidate budgets.
+Adam uses surrogate gradients where necessary and is a gradient-based reference. See
+[limitations](../LIMITATIONS.md#benchmark-comparisons) for the MAX-SAT flip budgets
+and the SNN baseline's variance.
 
 ## Reproduction
 
-See the [runner list](README.md#runners), [protocol](../docs/reproducibility.md), and
+The [reproducibility guide](../docs/reproducibility.md) gives the commands that
+produce these results and regenerate these tables. See also the
+[runner list](README.md#runners) and the
 [controlled hard-LIF comparison](CONTROLLED_EXPERIMENTS.md).
-
-Regenerate these tables and the README from result files:
-
-```bash
-python experiments/scripts/generate_tables.py \
-    --results-dir experiments/results/revision \
-    --readme README.md --index experiments/EXPERIMENT_INDEX.md
-```
-
-Architecture results live in `results/revision/`, with `theory/`, `evalmatched/`, and
-`wallclock/` subdirectories for separate protocols. Outputs are not tracked in Git.
-
-`run_revision.sh` fills `theory/`. For the other two, rerun the runners with `--fair`
-and `--results-dir experiments/results/revision/evalmatched` under
-`POLYSTEP_MATCH_AXIS=evals` (raise `POLYSTEP_FAIR_POPSIZE` there, so the population
-methods keep their throughput), or with `.../wallclock` under
-`POLYSTEP_MATCH_AXIS=wallclock`. The wall-clock runs read PolyStep's time for the same
-cell from the parent directory. `run_elevation.py`, `run_moe.py`, and
-`run_timeseries.py` read the variable; `run_maxsat.py` takes `--es-eval-budget`.

@@ -29,7 +29,7 @@ backpropagation is usually faster.
 
 ```bash
 pip install polystep
-pip install "polystep[examples]"  # optional demo dependencies
+pip install "polystep[examples]"  # dependencies for the repository's examples
 ```
 
 Python 3.11+ and PyTorch 2.8+ are required. Choose a CUDA build compatible with your
@@ -42,8 +42,7 @@ For development, install `pip install -e ".[dev]"` from a checkout.
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
-from polystep import HybridSubspace, PolyStepOptimizer, TrainConfig, train
-from polystep.transform import ParamLayout
+from polystep import HybridSubspace, ParamLayout, PolyStepOptimizer, TrainConfig, train
 
 model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 3))
 loader = DataLoader(
@@ -57,10 +56,11 @@ optimizer = PolyStepOptimizer(model, subspace=subspace, solver="softmax")
 train(model, loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 ```
 
-Replace the generated data with your dataset. Limit `max_subspace_dim` to control
-the forward budget. In manual loops, call `register_evaluator()` before each batch;
-`train()` does this automatically. See [performance](https://github.com/anindex/polystep/blob/main/docs/performance.md) for
-candidate paths, thread counts, compilation, and memory settings.
+Replace the generated data with your dataset. `max_subspace_dim=128` caps the search
+at 128 coordinates, so each step scores 144 candidates. In manual loops, call
+`register_evaluator()` before each batch; `train()` does this automatically. See
+[performance](https://github.com/anindex/polystep/blob/main/docs/performance.md)
+for candidate paths, thread counts, compilation, and memory settings.
 
 ### Ask/tell
 
@@ -77,6 +77,7 @@ print(es.best_fitness, es.best_solution)
 ### Synthetic objectives
 
 ```python
+import torch
 from polystep import Ackley
 from polystep.solver import PolyStep
 
@@ -88,7 +89,8 @@ state = solver.run(torch.randn(100, 10))
 
 Each step samples a rotated polytope, evaluates its vertices, computes transport
 weights, and moves to their barycenter. Subspaces reduce the number of coordinates
-searched. Softmax treats blocks independently; Sinkhorn also constrains target mass.
+searched. Softmax normalizes each particle's vertex weights; Sinkhorn also enforces
+the target marginal.
 
 Finite-radius probes can cross flat regions of discontinuous losses. Performance
 depends on the radius, representation, and evaluation budget. PolyStep's optional
@@ -98,8 +100,8 @@ inherit classical direct-search or trust-region guarantees.
 ## Baselines
 
 `polystep.baselines` provides `openai_es`, `spsa`, `mezo`, `random_search`, `eggroll`,
-and `cma_es`. One evaluation means one candidate scored, even when candidates are
-batched:
+and `cma_es`, which needs `pip install cma`. One evaluation means one candidate
+scored, even when candidates are batched:
 
 ```python
 from polystep.baselines import Objective, openai_es
@@ -108,20 +110,30 @@ objective = Objective(lambda x: x.square().sum(1), dim=64, budget=10_000)
 result = openai_es(objective, sigma=0.05, lr=0.1, popsize=32)
 ```
 
-The paper runners support `--fair` for matched search spaces and evaluation budgets.
-EGGROLL uses a factored representation to retain matrix perturbations. See the
-[reproduction protocol](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md) for tuning and budget details.
+The paper runners match search spaces, budgets and tuning as the
+[reproducibility guide](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md#protocol) describes.
 
 ## Benchmarks
 
-Five-seed mean ± sample standard deviation. These architecture tables compare
-validation-tuned methods at matched optimizer steps. Evaluation- and time-matched
-studies are reported separately in the [experiment index](https://github.com/anindex/polystep/blob/main/experiments/EXPERIMENT_INDEX.md).
+Five-seed mean ± sample standard deviation, with configurations and checkpoints
+selected on validation data; the probSAT and RC2 columns are single runs. In the
+architecture tables, OpenAI-ES, CMA-ES and EGGROLL get PolyStep's candidate-evaluation
+budget, and SPSA, MeZO and random search get its step count. On argmax attention, hard
+MoE and ETTh1, the population methods instead get 32 evaluations per PolyStep step,
+spent at their own population size, and Adam trains for PolyStep's 30 epochs, except
+50 on ETTh1. On MAX-SAT, CMA-ES and OpenAI-ES get 50 evaluations per PolyStep step.
+OpenAI-ES scores 50 candidates at each of PolyStep's steps, while CMA-ES doubles its
+population at each restart and takes fewer generations. The tables were recorded
+before 1.0; the
+[reproducibility guide](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md#changes-since-the-published-tables)
+lists the rows that 1.0 changes. The
+[experiment index](https://github.com/anindex/polystep/blob/main/experiments/EXPERIMENT_INDEX.md)
+has the full tables.
 
 <!-- BENCH:START -->
 ### Non-differentiable tasks
 
-Test accuracy %. A dash means the result is not in this release.
+Test accuracy %. A dash means the method was not run on that task.
 
 | Task | PolyStep | CMA-ES | OpenAI-ES | SPSA | Adam (surrogate) | Non-diff op |
 |---|---|---|---|---|---|---|
@@ -149,7 +161,8 @@ Test accuracy %. A dash means the result is not in this release.
 
 The SNN surrogate-gradient baseline varies substantially across seeds. Adam leads
 on the differentiable tasks, and specialized solvers lead on MAX-SAT. See
-[limitations](https://github.com/anindex/polystep/blob/main/LIMITATIONS.md) for unsupported configurations and comparison limits.
+[limitations](https://github.com/anindex/polystep/blob/main/LIMITATIONS.md)
+for unsupported configurations and comparison limits.
 
 ## Documentation
 

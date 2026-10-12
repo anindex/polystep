@@ -492,8 +492,7 @@ class _SNNStub(nn.Module):
 
 @pytest.mark.parametrize("build, expect_warning", [(_SNNStub, True), (_make_model, False)])
 def test_cosine_step_radius_warns_only_for_snn(build, expect_warning):
-    """Scheduling step_radius on an SNN collapsed accuracy from ~93% to 10-47%
-    (experiments/EXPERIMENT_INDEX.md), so the combination must warn, and only there."""
+    """A cosine step_radius schedule collapses hard-LIF SNN accuracy, so it warns only there."""
     cosine = CosineEpsilon(init=5.0, target=1.0, decay=0.01)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

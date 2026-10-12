@@ -8,6 +8,14 @@ coordinates, so at the default `num_probe=1` a step scores 16 particles times th
 simplex vertices, 144 candidates. The quadratic model adds one shared incumbent
 evaluation when `biased_rotation` or `trust_region` uses it.
 
+## Quick checklist
+
+- Pick the thread count with `python -m polystep.benchmarks.threads`.
+- Register the evaluator for each batch, or use `train()`.
+- Cap `max_subspace_dim`.
+- On a small CUDA model, try a `chunk_size` at or above the candidate count.
+- Time compilation separately from steady-state steps.
+
 ## Candidate evaluation
 
 | Model | Path | Selection |
@@ -34,10 +42,11 @@ space only its own entries. Tied weights share storage, so they move together. T
 registered evaluator's loss scores these candidates. Candidates that span two
 parameters, FP16/BF16 hybrid weights and non-contiguous parameters swap in every
 weight instead, as do screened hybrid candidates, the hybrid incumbent and models
-with a `max_norm` embedding, whose forward rewrites the rows it looks up. An
-evaluator that picks the in-place path for memory keeps the site-local, delta and
-factored paths, and writes one parameter in place only when the model ties weights.
-Candidates those paths do not take are still swapped into the model one at a time.
+with a `max_norm` embedding, whose forward rewrites the rows it looks up. When the
+evaluator picks the in-place path on its own to save memory, it still uses the
+site-local, delta and factored paths where they apply and swaps the remaining
+candidates in one at a time. It rewrites a single parameter in place only when the
+model ties weights.
 
 A forward that draws its own random numbers, such as injected noise, stays batched.
 vmap refuses the draw at first, so the evaluator retries once with
@@ -55,10 +64,8 @@ optimizer.register_evaluator(evaluator, inputs, targets)
 optimizer.step(lambda p: evaluator.evaluate(p, inputs, targets))
 ```
 
-The closure and evaluator must compute the same objective, including regularization.
-Call `evaluator.reset_vmap()` after replacing layers, parameters, or buffers, then
-register it again. Call `optimizer.resync_from_model()` after external weight changes,
-including a swapped layer or parameter.
+The [API reference](api_overview.md#optimizer) covers the closure contract and what
+to call after replacing layers, parameters or buffers.
 
 Delta paths reuse base activations within each candidate sweep. Reuse applies to
 supported builtin layers and ends before the next batch or fidelity level.
@@ -83,25 +90,24 @@ path scores it from `x @ B.T` and moves only the output units those coordinates
 belong to. Runs that span two parameters, screened candidates and the incumbent use
 the full low-rank correction, which computes `x @ W.T` and `x @ B.T` for the first
 perturbed layer once per candidate sweep and reuses them across its chunks.
-Screening and incumbent scoring are separate sweeps. The delta path scores
-each parameter in its own pass and launches more kernels per chunk than the low-rank
-correction, which a GPU pays for while its chunks are too small to keep it busy. On
-CUDA it therefore runs only when one chunk of the default budget cannot hold every
-candidate and `chunk_size`, or the candidate count when it is unset, times a
-candidate's largest layer output reaches 2^24, about 16.8 million, elements. Other
-CUDA steps use the low-rank correction, which needs more peak memory per chunk. On
-an RTX 5090 the delta steps this rule picks at the default chunk size ran up to 5
-times faster, though only a few percent faster close to the threshold, with 4 to 54
-times less peak memory. A batch of one on a 784-512-512-10 or 3072-1024-10 MLP stays
-below it, and there the delta path ran up to 1.35 times slower. The threshold sits
-where shallow MLPs stop losing on the delta path: on 784-128-10 at batch 512 it ran
-up to 17% slower with `chunk_size` from 184 to 216, about even at 234 to 243, 4%
-faster at 256, where the rule switches to it, and 11% faster at 288, with a
-fourteenth of the peak memory. Below the threshold the low-rank correction ran up
-to 1.4 times faster on small or shallow MLPs, but wider, deeper and larger-batch
-ones favor the delta path from smaller chunks on, so with a `chunk_size` set they
-may step faster with a larger one. The search is limited to the input directions
-spanned by `B`; basis rotation changes that search space.
+Screening and incumbent scoring are separate sweeps. The search is limited to the
+input directions spanned by `B`; basis rotation changes that search space.
+
+The delta path scores each parameter in its own pass and launches more kernels per
+chunk than the low-rank correction, which a GPU pays for while its chunks are too
+small to keep it busy. On CUDA it therefore runs only when one chunk of the default
+budget cannot hold every candidate and `chunk_size`, or the candidate count when it is
+unset, times a candidate's largest layer output reaches 2^24, about 16.8 million,
+elements. Other CUDA steps use the low-rank correction, which needs more peak memory
+per chunk. The threshold is where the delta path stops losing on shallow MLPs
+(784-128-10 at batch 512 on an RTX 5090). On that GPU the delta steps this rule picks
+at the default chunk size ran up to 5 times faster, though only a few percent faster
+close to the threshold, with 4 to 54 times less peak memory. A batch of one on a
+784-512-512-10 or 3072-1024-10 MLP stays below the threshold, and there the delta
+path ran up to 1.35 times slower. Below the threshold the low-rank correction ran up
+to 1.4 times faster on small or shallow MLPs, but wider, deeper and larger-batch ones
+favor the delta path from smaller chunks on, so with a `chunk_size` set they may step
+faster with a larger one.
 
 `AdaptiveSubspace` still builds every candidate's full weights, since its single
 projection `P` spreads each coordinate over every parameter. On the CPU, with a dense
@@ -112,49 +118,45 @@ particle, screened candidates and the incumbent use the full `base + P @ x`, as 
 sparse projections and FP16/BF16 runs. When `P` is dense FP32 or FP64 and the step
 has no screen, every chunk, the padded particle and the incumbent included, is written
 into one buffer that the optimizer keeps between steps, because a fresh allocation of
-that size costs the CPU a page fault per page. A closure that keeps a candidate
-tensor after it returns therefore has to clone it. CUDA keeps the full product for every
-candidate, since one dense GEMM measured faster there than the many thin batched
-products the offsets need.
+that size costs the CPU a page fault per page, so a closure must
+[clone any candidate tensor it keeps](../LIMITATIONS.md#evaluation). CUDA keeps the
+full product for every candidate, since one dense GEMM measured faster there than the
+many thin batched products the offsets need.
 
 `chunk_size` limits candidates held at once. The automatic estimate counts the
 candidate's parameters and its largest layer output, which one forward measures when
 the evaluator is first registered and which then scales with the batch. Delta and
-site paths build no full candidate, so they are budgeted on activations and the
-perturbed parameter alone. A site path batches only the layers from the perturbed one
-on, so each site is budgeted on the module outputs from its own layer on. A forward
-that draws random numbers is batched from the draw on, so its sites keep the
-whole-model budget. In example 10's LeNet-5 at batch 256, a chunk holds 27 candidates
-on the first convolution, whose output fills the budget, 72 on the second and up to 729
-on the fully connected layers, so a step scores its 4,833 candidates in 36 forwards.
-Reduce `chunk_size` after an out-of-memory error. Steps that score on a delta or site
-path, or on CPU `AdaptiveSubspace` offsets, keep whole particles in each chunk, every
-vertex and probe of one particle, so `chunk_size` drops to a multiple of the vertex
-count times `num_probe` and never goes below one such group. A particle that straddles
-two parameters gets a chunk of its own and falls back to materialization, in batches of
-at most `chunk_size`. So does the padded particle at the end of the CPU offsets, or of
-a per-layer or grouped block other than the last. On the delta and site paths the
-padded last particle stays with the particles before it, since its padding moves no
-parameter. Each chunk costs one forward, so a small CUDA model, whose forwards are
-bound by kernel launches, can step faster with a `chunk_size` at or above the candidate
-count than with the automatic one. Per-layer blocks reduce the size of each OT solve,
-but not the forward count. With a subspace, a block strategy only splits Sinkhorn and
-KL solves into at most eight row segments; candidates are scored exactly as in the
-monolithic step.
+site-local paths build no full candidate, so they are budgeted on activations and the
+perturbed parameter alone. A site-local path batches only the layers from the
+perturbed one on, so each site is budgeted on the module outputs from its own layer
+on. A forward that draws random numbers is batched from the draw on, so its sites
+keep the whole-model budget, as does a parameter the forward reads before calling its
+layer. In example 10's LeNet-5 at batch 256, a chunk holds 27 candidates on the first
+convolution, whose output fills the budget, 72 on the second and up to 729 on the
+fully connected layers, so a step scores its 4,833 candidates in 36 forwards. Reduce
+`chunk_size` after an out-of-memory error.
+
+Steps that score on a delta or site-local path, or on CPU `AdaptiveSubspace` offsets,
+keep whole particles in each chunk, every vertex and probe of one particle, so
+`chunk_size` drops to a multiple of the vertex count times `num_probe` and never goes
+below one such group. A particle that straddles two parameters gets a chunk of its
+own and falls back to materialization, in batches of at most `chunk_size`. So does the
+padded particle at the end of the CPU offsets, or of a per-layer or grouped block
+other than the last. On the delta and site-local paths the padded last particle stays
+with the particles before it, since its padding moves no parameter. Each chunk costs
+one forward, so a small CUDA model, whose forwards are bound by kernel launches, can
+step faster with a `chunk_size` at or above the candidate count than with the
+automatic one. Per-layer blocks reduce the size of each OT solve, but not the forward
+count. With a subspace, a block strategy only splits Sinkhorn and KL solves into at
+most eight row segments; candidates are scored exactly as in the monolithic step.
 
 ## Compilation and precision
 
-| Option | Default | Scope |
-|---|---|---|
-| `compile` | `False` | Geometry and solver kernels on CUDA |
-| `compile_evaluator` | `False` | Dense and site-local vmap evaluation |
-| `compile_forward` | `None` | Single-candidate in-place forward; automatic on that path |
-| `candidate_autocast` | `False` | Candidate forward precision; disables incompatible fast paths |
-
-Measure compilation separately from steady-state execution. Each site compiles
-independently and falls back to eager execution on compilation failure. Profiler
-output confirms whether a compiled region actually ran. PyTorch's recompilation
-limit can cause later calls to run eagerly.
+The [API reference](api_overview.md#evaluation-controls) lists the compilation and
+autocast options. Measure compilation separately from steady-state execution. Each
+site compiles independently and falls back to eager execution on compilation failure.
+Profiler output confirms whether a compiled region actually ran. PyTorch's
+recompilation limit can cause later calls to run eagerly.
 
 CPU attention uses native scaled-dot-product attention; CUDA uses explicit matmuls.
 BF16/FP16 solver costs accumulate in FP32. An `nn.CrossEntropyLoss`, `nn.MSELoss`, or
@@ -171,49 +173,13 @@ materialized candidate is built; factored candidates are materialized. The weigh
 swapped into the model under `use_inplace=True`, and the ones a step writes back
 when it ends, round the same way.
 
-## Radius models
-
-The quadratic model reads a centred unit-radius tight frame with `V` vertices `v` in
-dimension `d`. Probe `k` of `K` places the vertices at distance `s r` from the
-incumbent `X`, where `r` is the probe radius after epsilon scaling and
-`s = k / (K + 1)`. With `L_v` the loss at vertex `v` on that probe and `f(X)` the
-incumbent's loss:
-
-```text
-g       = d / (V s r) * sum_v (L_v - L_reference) v
-tr(H)/d = 2 * (mean_v L_v - f(X)) / (s r)^2
-```
-
-Both estimates are averaged over the `K` probes. `L_reference` can be any loss shared
-by every vertex, because `sum_v v = 0`. The generic path subtracts the first vertex's
-loss so that a large constant objective does not round into a gradient. The orthoplex
-path takes the central difference `L(+e_i) - L(-e_i)` for each coordinate instead.
-
-The curvature identity is exact for quadratic objectives. Simplex gradient fits can
-have an `O(r)` bias on anisotropic quadratics, which comes from the second-order term
-`(s r)^2 / 2 * v^T H v`. Centrally symmetric templates (orthoplex, cube) remove it:
-`v^T H v` is the same at `v` and `-v`, so its contributions cancel in pairs. Their
-remaining bias comes from third-order terms, is `O(r^2)`, and is zero on a quadratic.
-Block models omit cross-block Hessian terms.
-
-`trust_region` compares consecutive incumbents and sums block predictions. Pass a
-new `objective_token` whenever the objective changes. Minibatch changes and
-momentum-only steps invalidate the deferred comparison; `train()` rejects this
-controller. Use a stationary objective with the manual step API.
-
-`amortize_steps` skips evaluations between sampled updates. `multifidelity_screen`
-uses a smaller batch to select candidates for full evaluation; it requires
-`screen_fidelity / num_probe + screen_keep_ratio < 1` and does not run with
-`use_quadratic_model`, `newton_refinement` or `trust_region`. Measure quality at
-equal evaluation and time budgets.
-
 ## CPU measurements
 
-PyTorch 2.13 on one thread of an Intel Core Ultra 9 285K. Complete steps of a 32-w-w-4
-MLP at batch 32 with `solver="softmax"`, `chunk_size=72` and a registered evaluator, the
-median over five seeds of the median of seven timed steps after one cold step and two
-warmup steps. The subspace row is a `HybridSubspace` at rank 4 capped at 1,024
-coordinates:
+PyTorch 2.13 on one performance-core thread of an Intel Core Ultra 9 285K. Complete
+steps of a 32-w-w-4 MLP at batch 32 with `solver="softmax"`, `chunk_size=72` and a
+registered evaluator, the median over five seeds of the median of seven timed steps
+after one cold step and two warmup steps. The subspace row is a `HybridSubspace` at
+rank 4 capped at 1,024 coordinates:
 
 | Hidden width `w` | Search | Without prefix reuse | With reuse |
 |---|---|---:|---:|
@@ -242,9 +208,10 @@ step. On the machine above, the README quickstart step takes about 1.1 ms on one
 thread and about the same on 24, while the full-space 784-64-10 step that
 `python -m polystep.benchmarks.threads` times drops from 227 ms on one thread to
 77 ms on 16 and 79 ms on 24. A pool that covers every core also slows down when
-other processes compete for the CPU, so the fast test suite and every example except
-07 default to one thread. Example 07 uses eight, and the slow tests use up to 16. The
-optimizer warns once when the pool covers every core or all but one.
+other processes compete for the CPU, so the fast test suite and the examples default
+to one thread; [CONTRIBUTING](../CONTRIBUTING.md#tests) and the
+[examples](../examples/README.md) list the exceptions. The optimizer warns once when
+the pool covers every core or all but one.
 
 To choose a count, run `python -m polystep.benchmarks.threads`, which times that
 step at several thread counts in separate processes and prints the fastest, or time
@@ -261,9 +228,10 @@ PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --profile
 PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --prefix --repeats 7 --warmup 2
 PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --attention --batch 16
 PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --compile --profile
-PYTHONPATH=src:. python experiments/scripts/bench_polytope.py --seeds 0 1 2 3 4 --budget 4096 --wall
 ```
 
 Use `--device cuda` for GPU measurements and `--output` to keep separate result files.
 Forward benchmarks check loss parity and report cold time, median, IQR, and executed
-operators. GPU peak allocation is measured; CPU allocation is left unreported.
+operators. GPU peak allocation is measured; CPU allocation is left unreported. The
+[search benchmarks](../experiments/README.md#search-benchmarks) measure search
+quality rather than speed.

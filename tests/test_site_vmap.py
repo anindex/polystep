@@ -989,6 +989,20 @@ def test_materialized_fallback_honours_chunk_size(block_strategy, screen):
     assert torch.isfinite(opt.state.X).all()
 
 
+def _record_site_batches(opt):
+    """Candidate count of every site-path forward, keyed by parameter name."""
+    site = opt._site_vmap_evaluator
+    rows = {}
+    inner = site._vmap_over_site
+
+    def spy(key, base_sd, candidates, inputs, targets):
+        rows.setdefault(key, []).append(candidates.shape[0])
+        return inner(key, base_sd, candidates, inputs, targets)
+
+    site._vmap_over_site = spy
+    return rows
+
+
 @pytest.mark.parametrize("route", ["monolithic", "per_layer", "hybrid"])
 def test_site_chunk_budgets_downstream_activations(route):
     from polystep.hybrid_subspace import HybridSubspace
@@ -1009,19 +1023,69 @@ def test_site_chunk_budgets_downstream_activations(route):
     assert opt._act_ratios == {None: 4.0, "0.weight": 4.0, "0.bias": 4.0, "4.weight": head, "4.bias": head}
     assert not any(m._forward_hooks or m._forward_pre_hooks for m in model.modules())
 
-    site = opt._site_vmap_evaluator
-    rows = {}
-    inner = site._vmap_over_site
-
-    def spy(key, base_sd, candidates, inputs, targets):
-        rows.setdefault(key, []).append(candidates.shape[0])
-        return inner(key, base_sd, candidates, inputs, targets)
-
-    site._vmap_over_site = spy
+    rows = _record_site_batches(opt)
     opt.step(lambda p: ev.evaluate(p, x, y))
     conv_chunk = max(rows["0.weight"])
     assert 2 * 4 * x.numel() * conv_chunk <= 1 << 26
     assert max(rows["4.weight"]) > conv_chunk
+
+
+@pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+def test_explicit_chunk_size_caps_site_batches(block_strategy):
+    """Six is a whole number of particle groups, so rounding keeps it."""
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        nn.Conv2d(1, 4, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(4), nn.Flatten(), nn.Linear(64, 8)
+    )
+    opt = PolyStepOptimizer(model, chunk_size=6, block_strategy=block_strategy, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+    x, y = torch.randn(64, 1, 64, 64), torch.randint(0, 8, (64,))
+    opt.register_evaluator(ev, x, y)
+    rows = _record_site_batches(opt)
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    assert set(rows) == {"0.weight", "0.bias", "4.weight", "4.bias"}
+    assert max(map(max, rows.values())) == 6
+
+
+def test_unaligned_site_keeps_downstream_chunk():
+    """The head starts at coordinate 27, inside a two-coordinate particle."""
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        nn.Conv2d(1, 3, 3, bias=False), nn.AdaptiveAvgPool2d(4), nn.Flatten(), nn.Linear(48, 16, bias=False)
+    )
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+    x, y = torch.randn(64, 1, 64, 64), torch.randint(0, 16, (64,))
+    opt.register_evaluator(ev, x, y)
+    rows = _record_site_batches(opt)
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    assert len(rows["3.weight"]) == 1
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_delta_paths_skip_site_chunks(monkeypatch, hybrid):
+    import polystep._step_monolithic as monolithic
+    from polystep.hybrid_subspace import HybridSubspace
+
+    plans = []
+    spans = monolithic.chunk_spans
+
+    def spy(n, chunk, bounds, chunks):
+        plans.append(chunks)
+        return spans(n, chunk, bounds, chunks)
+
+    monkeypatch.setattr(monolithic, "chunk_spans", spy)
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2) if hybrid else None
+    opt = PolyStepOptimizer(model, subspace=subspace, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    x, y = torch.randn(32, 8), torch.randn(32, 4)
+    opt.register_evaluator(ev, x, y)
+    delta = opt._subspace_delta_evaluator if hybrid else opt._sparse_delta_evaluator
+    assert delta is not None
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    assert plans and all(c is None for c in plans)
 
 
 def test_site_budget_unexecuted_module_uses_global_max():
@@ -1042,6 +1106,25 @@ def test_site_budget_unexecuted_module_uses_global_max():
     opt.register_evaluator(NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False), x, torch.zeros(8).long())
     assert "head.weight" not in opt._act_ratios
     assert activation_elements(opt, x, "head.weight") == activation_elements(opt, x) == 4 * x.numel()
+
+
+def test_site_budget_weight_read_before_module_uses_global_max():
+    class Reuse(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.prefix = nn.Conv2d(2, 4, 1, bias=False)
+            self.early = nn.Conv2d(2, 2, 1, bias=False)
+            self.late = nn.Conv2d(2, 2, 1, bias=False)
+
+        def forward(self, x):
+            x = nn.functional.conv2d(self.prefix(x)[:, :2], self.late.weight)
+            return self.late(self.early(x).mean((2, 3), keepdim=True)).flatten(1)
+
+    model = Reuse()
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    x = torch.randn(4, 2, 8, 8)
+    opt.register_evaluator(NNCostEvaluator(model, nn.MSELoss(), use_inplace=False), x, torch.zeros(4, 2))
+    assert opt._act_ratios == {None: 2.0, "prefix.weight": 2.0, "early.weight": 1.0}
 
 
 class InputNoise(nn.Module):

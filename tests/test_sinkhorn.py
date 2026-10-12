@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from polystep.costs import resolve_cost_scale
-from polystep.solvers import SinkhornSolver
+from polystep.solvers import KLSoftmaxSolver, SinkhornSolver
 from polystep.solvers._shared import recenter_cost
 
 
@@ -77,12 +77,14 @@ class TestSinkhornSolver:
         assert torch.isfinite(torch.tensor(result.ent_reg_cost)), f"ent_reg_cost not finite: {result.ent_reg_cost}"
 
 
-def test_warmstart_shape_mismatch_warns():
-    solver = SinkhornSolver(threshold=1e-3, max_iterations=10)
+@pytest.mark.parametrize("solver_cls", [SinkhornSolver, KLSoftmaxSolver])
+def test_warmstart_shape_mismatch_warns_at_caller(solver_cls):
+    solver = solver_cls(threshold=1e-3, max_iterations=10)
     cost = torch.rand(5, 8)
     wrong_f = torch.zeros(99)  # wrong shape, should be (5,)
-    with pytest.warns(UserWarning, match="warm-start.*shape mismatch"):
+    with pytest.warns(UserWarning, match="warm-start.*shape mismatch") as caught:
         solver.solve(cost, init_f=wrong_f)
+    assert {w.filename for w in caught if "shape mismatch" in str(w.message)} == {__file__}
 
 
 def test_zero_max_iterations_raises():

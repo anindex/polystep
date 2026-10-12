@@ -169,7 +169,7 @@ def align_dual(
     if init.shape != (n,):
         warnings.warn(
             f"warm-start {name} shape mismatch: expected ({n},), got {tuple(init.shape)}. Falling back to zeros.",
-            stacklevel=2,
+            stacklevel=3,
         )
         return None
     return init.to(device=device, dtype=dtype).clone()

@@ -8,6 +8,7 @@ the one parameter a candidate perturbs.
 from __future__ import annotations
 
 import functools
+import itertools
 import warnings
 from bisect import bisect_right
 from contextlib import contextmanager
@@ -16,6 +17,8 @@ from typing import Callable, Optional, TYPE_CHECKING, Union
 import torch
 import torch.nn as nn
 from torch.func import functional_call, vmap
+from torch.overrides import TorchFunctionMode
+from torch.utils._pytree import tree_leaves
 
 from .projection import SparseRandomProjection
 from .solvers._shared import loss_buffer_dtype
@@ -103,6 +106,20 @@ def _max_norm_weights(model: nn.Module) -> list[torch.Tensor]:
     return [
         m.weight for m in model.modules() if isinstance(m, (nn.Embedding, nn.EmbeddingBag)) and m.max_norm is not None
     ]
+
+
+class _FirstParameterUse(TorchFunctionMode):
+    """Stamps each parameter's first torch call with the next tick of ``clock``."""
+
+    def __init__(self):
+        super().__init__()
+        self.clock, self.first = itertools.count(), {}
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        for t in tree_leaves((args, kwargs)):
+            if isinstance(t, nn.Parameter):
+                self.first.setdefault(id(t), next(self.clock))
+        return func(*args, **(kwargs or {}))
 
 
 def _builtin_loss_kind(loss_fn) -> Optional[str]:
@@ -379,12 +396,12 @@ class NNCostEvaluator:
         The ``None`` key holds the widest output of a module that owns parameters. A
         parameter's key holds the widest output of any module from its own module's
         first call on, the activations a site path batches. A parameter whose module
-        never runs has no key, and no parameter has one when the forward draws random
-        numbers, since vmap then batches everything from the draw on. Runs one real
-        forward under a forked RNG and puts back the buffers and any weight a
-        ``max_norm`` embedding renormalizes; None when that forward raises. A scripted
-        module takes no hooks, so a parameter-free one goes unmeasured and one that owns
-        parameters gives None.
+        never runs, or that the forward reads before that call, has no key, and no
+        parameter has one when the forward draws random numbers, since vmap then
+        batches everything from the draw on. Runs one real forward under a forked RNG
+        and puts back the buffers and any weight a ``max_norm`` embedding renormalizes;
+        None when that forward raises. A scripted module takes no hooks, so a
+        parameter-free one goes unmeasured and one that owns parameters gives None.
         """
         widths, owned, starts = [], [], {}
         state = [*self._buffers.values(), *_max_norm_weights(self.model)]
@@ -394,8 +411,10 @@ class NNCostEvaluator:
         if not owners.issubset(hooked):
             return None
 
+        uses = _FirstParameterUse()
+
         def start(module, args):
-            starts.setdefault(module, len(widths))
+            starts.setdefault(module, (len(widths), next(uses.clock)))
 
         def record(module, args, out):
             sizes = [t.numel() for t in (out if isinstance(out, tuple) else (out,)) if isinstance(t, torch.Tensor)]
@@ -415,7 +434,9 @@ class NNCostEvaluator:
         try:
             with torch.random.fork_rng(devices=devices):
                 before = rng_state()
-                self.model(self.cast_inputs(inputs, self._input_dtype(self._param_dict_cache)))
+                inputs = self.cast_inputs(inputs, self._input_dtype(self._param_dict_cache))
+                with uses:
+                    self.model(inputs)
                 drew = not all(map(torch.equal, before, rng_state()))
         except Exception:
             return None
@@ -430,10 +451,10 @@ class NNCostEvaluator:
         ratios = {None: max(owned, default=0) / scale}
         if drew:
             return ratios
-        for name, _ in self.model.named_parameters(remove_duplicate=False):
+        for name, p in self.model.named_parameters(remove_duplicate=False):
             owner = self.model.get_submodule(name.rpartition(".")[0])
-            if owner in starts:
-                ratios[name] = max(widths[starts[owner] :], default=0) / scale
+            if owner in starts and uses.first.get(id(p), float("inf")) > starts[owner][1]:
+                ratios[name] = max(widths[starts[owner][0] :], default=0) / scale
         return ratios
 
     def _input_dtype(self, stacked_params) -> Optional[torch.dtype]:

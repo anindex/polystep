@@ -6,10 +6,12 @@
 a dictionary of batched parameters and returns one loss per candidate:
 
 ```python
+import torch
 from torch import nn
 from polystep import NNCostEvaluator, PolyStepOptimizer
 
 model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 3))
+loader = [(torch.randn(32, 16), torch.randint(0, 3, (32,))) for _ in range(8)]
 optimizer = PolyStepOptimizer(model, epsilon=0.1, step_radius=0.15)
 evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
 
@@ -19,11 +21,16 @@ for x, y in loader:
 optimizer.release_evaluator()
 ```
 
-The evaluator and closure must compute the same objective. After external parameter
-updates, call `optimizer.resync_from_model()`. After replacing layers or buffers, or
-casting the model to another dtype, call `evaluator.reset_vmap()` and register it
-again. A swapped layer also needs `optimizer.resync_from_model()`, or the next step
-overwrites the new layer with the old weights plus the update.
+The evaluator and closure must compute the same objective, including regularization.
+`NNCostEvaluator` puts the model in eval mode when it is constructed and scores every
+candidate in eval mode, so dropout stays off and batch-norm running statistics do not
+update.
+
+After external parameter updates, call `optimizer.resync_from_model()`. After
+replacing layers, parameters or buffers, or casting the model to another dtype, call
+`evaluator.reset_vmap()` and register it again. A swapped layer or parameter also
+needs `optimizer.resync_from_model()`, or the next step overwrites it with the old
+weights plus the update.
 
 After a dtype cast, that resync moves the subspace projections to the new parameter
 dtypes, and an `AdaptiveSubspace` moves its coordinates along with them.
@@ -45,17 +52,16 @@ config = TrainConfig(
 train(model, loader, nn.CrossEntropyLoss(), optimizer, config)
 ```
 
-`restore_best=True` restores the weights with the lowest tracked loss. Each step's
-weights are scored on the batch that step trained on, with the same input cast,
-autocast and loss reduction as the candidates, so the loss is in-sample and leans
-optimistic. Best-weight tracking and callbacks require an extra loss evaluation per
-step. This is training-loss selection, not held-out validation selection.
+`restore_best` (on by default) restores the weights with the lowest tracked loss.
+Each step's weights are scored on the batch that step trained on, with the same input
+cast, autocast and loss reduction as the candidates, so the loss is in-sample and
+leans optimistic. Best-weight tracking and callbacks require an extra loss evaluation
+per step. This is training-loss selection, not held-out validation selection.
 
 ## Subspaces
 
 ```python
-from polystep import HybridSubspace, FactoredSubspace, AdaptiveSubspace
-from polystep.transform import ParamLayout
+from polystep import HybridSubspace, FactoredSubspace, AdaptiveSubspace, ParamLayout
 
 layout = ParamLayout.from_module(model)
 subspace = HybridSubspace.from_layout(layout, rank=4, max_subspace_dim=256)
@@ -85,10 +91,10 @@ optimizer = PolyStepOptimizer(
 )
 ```
 
-`HybridSubspace` ignores `projection_type`; it gives sparse columns to any layer with
-`num_params * num_coords * 4 > sparse_threshold_bytes` (1 GB by default). The estimate
-counts four bytes per entry whatever the parameter dtype, so an FP64 layer's dense
-projection can reach twice the threshold.
+`projection_type` applies only to `AdaptiveSubspace`. `HybridSubspace` gives sparse
+columns to any layer with `num_params * num_coords * 4 > sparse_threshold_bytes` (1 GB
+by default). The estimate counts four bytes per entry whatever the parameter dtype, so
+an FP64 layer's dense projection can reach twice the threshold.
 
 ### Rank schedules
 
@@ -97,7 +103,7 @@ projection can reach twice the threshold.
 works under any `block_strategy`:
 
 ```python
-from polystep.optimizer import RankSchedule
+from polystep import RankSchedule
 
 optimizer = PolyStepOptimizer(
     model,
@@ -120,7 +126,7 @@ optimizer = PolyStepOptimizer(
 | `subspace` | `None` | A constructed subspace instance |
 | `block_strategy` | `'monolithic'` | Also `'per_layer'` or `'grouped'`; with a subspace, only splits Sinkhorn/KL solves into row segments |
 | `chunk_size` | `None` | Automatic candidate chunk estimate |
-| `adaptive_num_probe` | Multiple probes, except full-space blocks and orthoplex Newton refinement | Reduces probe count after decreasing costs |
+| `adaptive_num_probe` | `None`: on when `num_probe > 1`, except full-space `per_layer`/`grouped` and orthoplex `newton_refinement` | Drops the probe count to 1 while costs keep falling |
 
 A step scores one candidate per particle, vertex and probe. With `d` coordinates per
 particle the simplex has `d + 1` vertices, the orthoplex `2d` and the cube `2^d`; see
@@ -143,6 +149,38 @@ Solver choices are `sinkhorn` (full-space default), `softmax` (subspace default)
 `kl_softmax`, `min_cost_greedy`, and `top_k_mean`. Sinkhorn constrains both
 marginals; softmax constrains only the source marginal.
 
+## Quadratic model and radius control
+
+The quadratic model (`use_quadratic_model=True`) reads a centred unit-radius tight
+frame with `V` vertices `v` in dimension `d`. Probe `k` of `K` places the vertices at
+distance `s r` from the incumbent `X`, where `r` is the probe radius after epsilon
+scaling and `s = k / (K + 1)`. With `L_v` the loss at vertex `v` on that probe and
+`f(X)` the incumbent's loss:
+
+```text
+g       = d / (V s r) * sum_v (L_v - L_reference) v
+tr(H)/d = 2 * (mean_v L_v - f(X)) / (s r)^2
+```
+
+Both estimates are averaged over the `K` probes. `L_reference` can be any loss shared
+by every vertex, because `sum_v v = 0`. The generic path subtracts the first vertex's
+loss so that a large constant objective does not round into a gradient. The orthoplex
+path takes the central difference `L(+e_i) - L(-e_i)` for each coordinate instead.
+
+The curvature identity is exact for quadratic objectives. Simplex gradient fits can
+have an `O(r)` bias on anisotropic quadratics, which comes from the second-order term
+`(s r)^2 / 2 * v^T H v`. Centrally symmetric templates (orthoplex, cube) remove it:
+`v^T H v` is the same at `v` and `-v`, so its contributions cancel in pairs. Their
+remaining bias comes from third-order terms, is `O(r^2)`, and is zero on a quadratic.
+Block models omit cross-block Hessian terms.
+
+`trust_region` compares consecutive incumbents and sums block predictions. Minibatch
+changes and momentum-only steps invalidate the deferred comparison; `train()` rejects
+this controller. Use a stationary objective with the manual step API, and pass
+`optimizer.step(closure, objective_token=token)` a new token whenever the batch or
+loss changes; a change drops the pending trust-region comparison, and `None` or a
+constant token means a stationary objective.
+
 ## Evaluation controls
 
 | Option | Default | Scope |
@@ -150,17 +188,20 @@ marginals; softmax constrains only the source marginal.
 | `compile` | `False` | CUDA geometry and solver kernels |
 | `compile_evaluator` | `False` | Dense and site-local candidate vmap |
 | `compile_forward` | `None` | Automatic compilation on the in-place forward path |
-| `candidate_autocast` | `False` | Candidate forward precision |
+| `candidate_autocast` | `False` | Candidate forward precision; disables incompatible fast paths |
 
-Pass a new `objective_token` whenever the batch or loss changes. A change drops the
-deferred trust-region comparison; `None` or a constant token means a stationary
-objective.
+`amortize_steps` skips evaluations between sampled updates. `multifidelity_screen`
+scores candidates on a smaller batch and evaluates only the `screen_keep_ratio` share
+it keeps on the full batch. Measure the quality of either at equal evaluation and time
+budgets.
 
-Multi-fidelity screening needs a cheaper closure. `screen_closure_from` calls the
-closure with the first `screen_fidelity` share of the batch as extra arguments, so
-give the closure the batch as defaults and the same function serves both calls:
+Screening needs a cheaper closure. `screen_closure_from` calls the closure with the
+first `screen_fidelity` share of the batch as extra arguments, so give the closure the
+batch as defaults and the same function serves both calls:
 
 ```python
+inputs, targets = loader[0]
+
 def closure(params, x=inputs, y=targets):
     return evaluator.evaluate(params, x, y)
 
@@ -169,11 +210,10 @@ screen = optimizer.screen_closure_from(closure, inputs, targets)
 optimizer.step(closure, screen_closure=screen)
 ```
 
-A registered evaluator screens on the same leading slice of its batch.
-
-Screening does not run with `use_quadratic_model`, `newton_refinement` or
-`trust_region`, or when its estimated cost is at least the full sweep. See
-[performance](performance.md#radius-models).
+A registered evaluator screens on the same leading slice of its batch. Screening runs
+only when `screen_fidelity / num_probe + screen_keep_ratio < 1`, where it costs less
+than the full sweep, and not with `use_quadratic_model`, `newton_refinement` or
+`trust_region`.
 
 ## Custom layers
 
@@ -212,6 +252,7 @@ see [unsupported options](../LIMITATIONS.md#attention-and-recurrent-layers).
 ```python
 from polystep import PolyStepES, minimize
 
+objective = lambda x: x.square().sum(dim=1)
 es = PolyStepES(dim=20, epsilon=0.5, step_radius=0.5)
 for _ in range(200):
     es.tell(objective(es.ask()))
@@ -229,9 +270,11 @@ uses PyTorch's global RNG, so `torch.manual_seed` reproduces the run.
 ## Low-level solver
 
 ```python
+import torch
 from polystep import Ackley
 from polystep.solver import PolyStep
 
+X_init = torch.randn(100, 10)
 solver = PolyStep.create(Ackley(dim=10), epsilon=0.5, max_iterations=100)
 state = solver.run(X_init)
 ```
@@ -252,8 +295,9 @@ model.load_state_dict(checkpoint["model"])
 optimizer.load_state_dict(checkpoint["optimizer"])
 ```
 
-Rebuild the optimizer with the original configuration before loading. This release
-reads only format 6 and raises `ValueError` on any other format. To continue a run
+Rebuild the optimizer with the original configuration before loading.
+`load_state_dict` reads only checkpoint format 6, written since 1.0, and raises
+`ValueError` on any other format. To continue a run
 saved by another release, build a fresh optimizer around the saved model weights.
 The checkpoint also restores `candidate_evals`. Reproducible continuation requires
 the same objective and environment. A checkpoint can move between CPU and CUDA, but

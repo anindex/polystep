@@ -10,6 +10,15 @@ import torch
 from polystep import SoftmaxSolver
 
 
+@pytest.fixture
+def cost_grid():
+    """Yield a 16-cell (cost, eps) grid covering small-eps explosion and large-eps
+    near-uniform regimes."""
+    cost_ranges = (1.0, 10.0, 100.0, 1000.0)
+    eps_values = (0.01, 0.1, 1.0, 10.0)
+    return [(c, e) for c in cost_ranges for e in eps_values]
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_softmax_overflow_grid(cost_grid, dtype):
     """No NaN / Inf for any combination of cost-range x epsilon."""

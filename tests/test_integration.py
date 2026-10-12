@@ -16,6 +16,41 @@ from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
 
+@pytest.fixture
+def simple_mlp():
+    """Small MLP for fast testing: Linear(4,8) -> ReLU -> Linear(8,2)."""
+    torch.manual_seed(42)
+    return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+
+
+@pytest.fixture
+def make_closure():
+    """Factory fixture: ``make_closure(model)`` returns a closure mapping batched
+    params to losses."""
+
+    def _make_closure(model, loss_fn=None, num_samples=16, input_dim=4, output_dim=None):
+        torch.manual_seed(42)
+        if loss_fn is None:
+            loss_fn = nn.MSELoss()
+        if output_dim is None:
+            for m in reversed(list(model.modules())):
+                if isinstance(m, nn.Linear):
+                    output_dim = m.out_features
+                    break
+            else:
+                output_dim = 1
+        evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
+        inputs = torch.randn(num_samples, input_dim)
+        targets = torch.randn(num_samples, output_dim)
+
+        def closure(batched_params):
+            return evaluator.evaluate(batched_params, inputs, targets)
+
+        return closure
+
+    return _make_closure
+
+
 class TestFeatureInteractions:
     def test_subspace_with_momentum(self, simple_mlp, make_closure):
         """Subspace + momentum runs 5 steps without crash, produces non-zero velocity."""
