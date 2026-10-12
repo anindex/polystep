@@ -14,19 +14,17 @@ Run:
 
 from __future__ import annotations
 
-import os
-import sys
+from pathlib import Path
+
 import torch
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from polystep import PolyStepES
 
-from _openai_es import OpenAIES, run  # noqa: E402
+from _openai_es import OpenAIES, run
 
 HIDDEN = 8
 GENERATIONS = 200
@@ -53,18 +51,10 @@ def param_dim(hidden=HIDDEN, d_in=2):
 
 def _signnet_logits(flat, X, hidden):
     """Sign-activation MLP output for a batch of flat param vectors: (B, N)."""
-    B = flat.shape[0]
     d_in = X.shape[1]
-    i = 0
-    W1 = flat[:, i : i + d_in * hidden].reshape(B, hidden, d_in)
-    i += d_in * hidden
-    b1 = flat[:, i : i + hidden]
-    i += hidden
-    W2 = flat[:, i : i + hidden].reshape(B, 1, hidden)
-    i += hidden
-    b2 = flat[:, i : i + 1]
-    h = torch.sign(torch.einsum("bhi,ni->bnh", W1, X) + b1[:, None, :])
-    return torch.einsum("boh,bnh->bno", W2, h).squeeze(-1) + b2
+    W1, b1, W2, b2 = flat.split([d_in * hidden, hidden, hidden, 1], dim=1)
+    h = torch.sign(torch.einsum("bhi,ni->bnh", W1.reshape(-1, hidden, d_in), X) + b1[:, None, :])
+    return torch.einsum("bh,bnh->bn", W2, h) + b2
 
 
 def f1_error(flat, X, y, hidden=HIDDEN):
@@ -107,27 +97,21 @@ def adam_ste_f1(X, y, hidden=HIDDEN, steps=1500, seed=0):
         out = (_STESign.apply(X @ W1.t() + b1) @ W2.t()).squeeze(-1) + b2
         loss_fn(out, y).backward()
         opt.step()
-    with torch.no_grad():
-        out = (torch.sign(X @ W1.t() + b1) @ W2.t()).squeeze(-1) + b2
-    pred = (out > 0).float()
-    tp = (pred * y).sum()
-    fp = (pred * (1 - y)).sum()
-    fn = ((1 - pred) * y).sum()
-    return 100.0 * (2 * tp / (2 * tp + fp + fn + 1e-9)).item()
+    flat = torch.cat([W1.flatten(), b1, W2.flatten(), b2]).detach()
+    return 100.0 * (1.0 - f1_error(flat[None], X, y, hidden)).item()
 
 
 def solve_seed(seed):
     X, y = make_checkerboard_imbalanced(seed=seed)
     dim = param_dim()
-    popsize = 2 * dim  # PolyStep orthoplex population for one particle
     x0 = 0.5 * torch.randn(dim, generator=torch.Generator().manual_seed(seed + 100))
 
     ps = PolyStepES(dim, num_particles=1, epsilon=0.05, step_radius=1.5, x0=x0, seed=seed)
-    es = OpenAIES(dim, popsize=popsize, x0=x0, sigma=0.5, lr=0.2, seed=seed)
+    es = OpenAIES(dim, popsize=ps.popsize, x0=x0, sigma=0.25, lr=0.5, seed=seed)
     ps_curve = run(ps, lambda f: f1_error(f, X, y), GENERATIONS)
     es_curve = run(es, lambda f: f1_error(f, X, y), GENERATIONS)
     adam_f1 = adam_ste_f1(X, y, seed=seed)
-    return ps_curve, es_curve, adam_f1, popsize
+    return ps_curve, es_curve, adam_f1, ps.popsize
 
 
 def _mean_std(vals):
@@ -137,19 +121,17 @@ def _mean_std(vals):
 
 def main():
     print("Direct loss minimization: sign-activation net, maximize F1 on imbalanced checkerboard")
-    print(f"  params={param_dim()}  hidden={HIDDEN}  generations={GENERATIONS}  seeds={SEEDS}  (no subspace)")
+    print(f"  params={param_dim()}  hidden={HIDDEN}  generations={GENERATIONS}  seeds={SEEDS}")
 
-    ps_final, es_final, adam_final = [], [], []
-    last_curves = None
+    ps_curves, es_curves, adam_final = [], [], []
     for seed in range(SEEDS):
         ps_curve, es_curve, adam_f1, popsize = solve_seed(seed)
-        ps_final.append(ps_curve[-1])
-        es_final.append(es_curve[-1])
+        ps_curves.append(ps_curve)
+        es_curves.append(es_curve)
         adam_final.append(adam_f1)
-        last_curves = (ps_curve, es_curve, popsize)
 
-    ps_m, ps_s = _mean_std(ps_final)
-    es_m, es_s = _mean_std(es_final)
+    ps_m, ps_s = _mean_std([c[-1] for c in ps_curves])
+    es_m, es_s = _mean_std([c[-1] for c in es_curves])
     ad_m, ad_s = _mean_std(adam_final)
     print(f"  {'method':<28}{'F1 (%)':>16}")
     print("  " + "-" * 44)
@@ -161,18 +143,17 @@ def main():
     try:
         import matplotlib.pyplot as plt
 
-        ps_curve, es_curve, popsize = last_curves
         evals = [popsize * (i + 1) for i in range(GENERATIONS)]
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(evals, ps_curve, label=f"PolyStepES on F1 ({ps_curve[-1]:.1f}%)", lw=2)
-        ax.plot(evals, es_curve, label=f"OpenAI-ES on F1 ({es_curve[-1]:.1f}%)", lw=2)
-        ax.axhline(adam_final[-1], ls="--", color="gray", label=f"Adam+STE ({adam_final[-1]:.1f}%)")
+        ax.plot(evals, torch.tensor(ps_curves).mean(0), label=f"PolyStepES on F1 ({ps_m:.1f}%)", lw=2)
+        ax.plot(evals, torch.tensor(es_curves).mean(0), label=f"OpenAI-ES on F1 ({es_m:.1f}%)", lw=2)
+        ax.axhline(ad_m, ls="--", color="gray", label=f"Adam+STE ({ad_m:.1f}%)")
         ax.set_xlabel("forward evaluations")
-        ax.set_ylabel("best F1 (%)")
-        ax.set_title("Direct F1 minimization on imbalanced checkerboard")
+        ax.set_ylabel(f"best F1 (%), mean of {SEEDS} seeds")
+        ax.set_title("Direct F1 optimization on imbalanced checkerboard")
         ax.legend()
         fig.tight_layout()
-        out = "examples/figures/direct_loss_minimization.png"
+        out = Path(__file__).parent / "figures" / "direct_loss_minimization.png"
         fig.savefig(out, dpi=110)
         print(f"  saved figure: {out}")
     except Exception as e:  # plotting is optional / headless-safe

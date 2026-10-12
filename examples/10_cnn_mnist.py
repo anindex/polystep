@@ -7,13 +7,13 @@ layers, 61,706 parameters. No gradients are computed anywhere.
 A plain ``nn.Module`` with convolutions and a hand-written ``forward`` runs on
 the site-aware path: a candidate perturbs one contiguous coordinate run, so
 ``SiteVmapEvaluator`` batches only the one parameter tensor that differs and
-runs the layers ahead of it once per step instead of once per candidate.
-Chunks break at parameter boundaries so a chunk can name a single site.
+runs the layers ahead of it once per chunk of candidates instead of once per
+candidate. Chunks break at parameter boundaries so a chunk can name a single site.
 
-Only the probe radius is scheduled, cosine from 10 to 2, sized from
-``--epochs``. Epsilon stays at 10 and ``step_radius=0.5``, which the optimizer
-multiplies by epsilon, giving an effective radius of 5. Checkpoints are selected on
-a held-out tenth of the training data, then evaluated on the test set.
+Only the probe radius is scheduled, cosine from 10 to 2, sized from ``--epochs``.
+Epsilon stays at 10 and ``step_radius=0.5``, which the optimizer multiplies by
+epsilon, giving an effective radius of 5. Checkpoints are selected on a held-out
+tenth of the training data, then evaluated on the test set.
 
 Run:
   python examples/10_cnn_mnist.py --epochs 10
@@ -24,26 +24,23 @@ Run:
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import time
 
 import torch
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
-import torch.nn as nn  # noqa: E402
+import torch.nn as nn
 from torch.utils.data import random_split
 
-from polystep import PolyStepOptimizer  # noqa: E402
-from polystep.cost_nn import NNCostEvaluator  # noqa: E402
-from polystep.epsilon import CosineEpsilon  # noqa: E402
-from polystep.hybrid_subspace import HybridSubspace  # noqa: E402
-from polystep.transform import ParamLayout  # noqa: E402
+from polystep import PolyStepOptimizer
+from polystep.cost_nn import NNCostEvaluator
+from polystep.epsilon import CosineEpsilon
+from polystep.hybrid_subspace import HybridSubspace
+from polystep.transform import ParamLayout
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mnist_data import get_mnist_tensors  # noqa: E402
+from _mnist_data import get_mnist_tensors
 
 
 class LeNet5(nn.Module):
@@ -95,19 +92,17 @@ def build_optimizer(model: nn.Module, total_steps: int, seed: int) -> PolyStepOp
     )
 
 
-def run_epoch(optimizer, evaluator, x, y, batch_size, register=True):
+def run_epoch(optimizer, evaluator, x, y, batch_size):
     order = torch.randperm(x.shape[0])
     total, batches = 0.0, 0
     for start in range(0, x.shape[0], batch_size):
         idx = order[start : start + batch_size]
         xb, yb = x[idx], y[idx]
-        if register:
-            # Register so candidates are scored directly, not through the closure.
-            optimizer.register_evaluator(evaluator, xb, yb)
+        # Register so candidates are scored directly, not through the closure.
+        optimizer.register_evaluator(evaluator, xb, yb)
         total += optimizer.step(lambda params, _x=xb, _y=yb: evaluator.evaluate(params, _x, _y))
         batches += 1
-    if register:
-        optimizer.release_evaluator()
+    optimizer.release_evaluator()
     return total / max(batches, 1)
 
 

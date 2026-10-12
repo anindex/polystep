@@ -12,19 +12,17 @@ Run:
 
 from __future__ import annotations
 
-import os
-import sys
+from pathlib import Path
+
 import torch
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from polystep import PolyStepES
 
-from _openai_es import OpenAIES  # noqa: E402
+from _openai_es import OpenAIES
 
 DEPTH = 4  # complete binary tree: 15 internal nodes, 16 leaves
 TOTAL_EVALS = 40_000  # matched forward-pass budget for the gradient-free methods
@@ -131,27 +129,20 @@ def adam_soft_tree(X, y, depth=DEPTH, steps=800, temp=0.2, seed=0):
     torch.manual_seed(seed)
     d_in = X.shape[1]
     D = param_dim(d_in, depth)
-    n_internal, n_leaves = tree_shape(depth)
+    _, n_leaves = tree_shape(depth)
     flat = torch.nn.Parameter(0.3 * torch.randn(D))
     opt = torch.optim.Adam([flat], lr=0.05)
+    turns = (torch.arange(n_leaves)[:, None] >> torch.arange(depth - 1, -1, -1)) & 1
+    path = torch.zeros(n_leaves, depth, dtype=torch.long)
+    for level in range(1, depth):
+        path[:, level] = 2 * path[:, level - 1] + 1 + turns[:, level - 1]
 
     for _ in range(steps):
         W, b, leaf = _unpack(flat.unsqueeze(0), d_in, depth)
         node_logits = (torch.einsum("bnd,md->bnm", W, X) + b[:, :, None]).squeeze(0)  # (n_internal, N)
-        p_right = torch.sigmoid(node_logits / temp)  # (n_internal, N)
-        leaf_probs = []  # per-leaf reach probability, kept out of place for autograd
-        for leaf_id in range(n_leaves):
-            node = 0
-            p = torch.ones(X.shape[0])
-            for level in range(depth):
-                bit = (leaf_id >> (depth - 1 - level)) & 1
-                pr = p_right[node]
-                p = p * (pr if bit else (1.0 - pr))
-                node = 2 * node + 1 + bit
-            leaf_probs.append(p)
-        prob = torch.stack(leaf_probs, 0)  # (n_leaves, N)
-        leaf_logit = leaf.squeeze(0)  # (n_leaves,)
-        soft_logit = (prob * leaf_logit[:, None]).sum(0)  # (N,)
+        p_right = torch.sigmoid(node_logits / temp)[path]  # (n_leaves, depth, N)
+        prob = torch.where(turns[:, :, None].bool(), p_right, 1.0 - p_right).prod(dim=1)  # (n_leaves, N)
+        soft_logit = (prob * leaf[0, :, None]).sum(0)  # (N,)
         p1 = torch.sigmoid(soft_logit)
         loss = torch.nn.functional.binary_cross_entropy(p1, y)
         opt.zero_grad()
@@ -164,16 +155,15 @@ def adam_soft_tree(X, y, depth=DEPTH, steps=800, temp=0.2, seed=0):
 def solve(X, y, seed=0):
     D = param_dim(X.shape[1])
     x0 = 0.3 * torch.randn(D, generator=torch.Generator().manual_seed(1))
-    ps_pop = 2 * D  # one PolyStep particle: orthoplex has 2*D vertices
     ps = PolyStepES(D, num_particles=1, epsilon=0.02, step_radius=1.5, x0=x0, seed=seed)
-    es = OpenAIES(D, popsize=ps_pop, x0=x0, sigma=0.3, lr=0.15, seed=seed)
+    es = OpenAIES(D, popsize=ps.popsize, x0=x0, sigma=0.3, lr=0.15, seed=seed)
     spsa = SPSA(D, x0=x0, seed=seed)
 
     def fit(flat):
         return hard_error(flat, X, y)
 
-    ps_evals, ps_curve = run_to_budget(ps, fit, ps_pop)
-    es_evals, es_curve = run_to_budget(es, fit, ps_pop)
+    ps_evals, ps_curve = run_to_budget(ps, fit, ps.popsize)
+    es_evals, es_curve = run_to_budget(es, fit, es.popsize)
     spsa_evals, spsa_curve = run_to_budget(spsa, fit, 2)
     adam_hard = adam_soft_tree(X, y)
     return {
@@ -185,7 +175,6 @@ def solve(X, y, seed=0):
 
 
 def main():
-    torch.manual_seed(0)
     X, y = make_checkerboard()
     D = param_dim(X.shape[1])
     n_internal, n_leaves = tree_shape()
@@ -217,7 +206,7 @@ def main():
         ax.set_title("Hard oblique decision tree on XOR checkerboard")
         ax.legend()
         fig.tight_layout()
-        out = "examples/figures/hard_decision_tree.png"
+        out = Path(__file__).parent / "figures" / "hard_decision_tree.png"
         fig.savefig(out, dpi=110)
         print(f"  saved figure: {out}")
     except Exception as e:  # plotting is optional / headless-safe

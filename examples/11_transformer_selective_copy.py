@@ -3,18 +3,19 @@
 Each sequence is six tokens; the first is a pointer ``p``, and the label is the
 token at position ``p``. The attention head learns to retrieve that token.
 
-The site-aware path applies unchanged: a candidate perturbs one contiguous run
-of the flat parameter vector, so exactly one parameter tensor differs from the
-base, and everything ahead of it is computed once per step instead of once per
-candidate.
+As in example 10, the site-aware path applies: a candidate perturbs one
+contiguous run of the flat parameter vector, so exactly one parameter tensor
+differs from the base, and everything ahead of it is computed once per chunk of
+candidates instead of once per candidate.
 
-Attention uses ``polystep.layers.VmapSafeMultiHeadAttention``: stock
-``nn.MultiheadAttention`` fuses its projections in a way ``vmap`` cannot trace
-and would drop the model onto the sequential fallback. See LIMITATIONS.md.
+Attention uses ``polystep.layers.VmapSafeMultiHeadAttention``: ``vmap`` has no
+batching rule for the fused kernel of stock ``nn.MultiheadAttention``, so it
+runs that kernel once per candidate, which makes a CUDA step two to three times
+slower. See LIMITATIONS.md.
 
 Run:
   python examples/11_transformer_selective_copy.py
-  python examples/11_transformer_selective_copy.py --epochs 100 --device cpu
+  python examples/11_transformer_selective_copy.py --device cpu
   python examples/11_transformer_selective_copy.py --compare   # time both paths
 """
 
@@ -25,16 +26,16 @@ import time
 
 import torch
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
-import torch.nn as nn  # noqa: E402
+import torch.nn as nn
 
-from polystep import PolyStepOptimizer  # noqa: E402
-from polystep.cost_nn import NNCostEvaluator  # noqa: E402
-from polystep.hybrid_subspace import HybridSubspace  # noqa: E402
-from polystep.layers import VmapSafeMultiHeadAttention  # noqa: E402
-from polystep.transform import ParamLayout  # noqa: E402
+from polystep import PolyStepOptimizer
+from polystep.cost_nn import NNCostEvaluator
+from polystep.hybrid_subspace import HybridSubspace
+from polystep.layers import VmapSafeMultiHeadAttention
+from polystep.transform import ParamLayout
 
 SEQ_LEN = 6
 NUM_CLASSES = 8
@@ -81,7 +82,7 @@ def build_optimizer(model: nn.Module, seed: int) -> PolyStepOptimizer:
         subspace=subspace,
         epsilon=0.5,
         step_radius=6.0,
-        probe_radius=1.0,
+        probe_radius=3.0,
         seed=seed,
         # A momentum step reuses the EMA transport direction and evaluates nothing,
         # so only every fifth step pays for probes. It spends step budget rather than
@@ -89,8 +90,6 @@ def build_optimizer(model: nn.Module, seed: int) -> PolyStepOptimizer:
         # doubles the steps per epoch to cover that.
         amortize_steps=5,
         amortize_ema=0.7,
-        # CPU compilation costs more than this small model's forward passes.
-        compile_evaluator=next(model.parameters()).is_cuda,
     )
 
 
@@ -146,7 +145,7 @@ def compare_paths(x, y, device, batch_size, steps=6):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--train-size", type=int, default=2000)
     parser.add_argument("--test-size", type=int, default=1000)
@@ -184,13 +183,12 @@ def main():
     for epoch in range(1, args.epochs + 1):
         loss = run_epoch(optimizer, evaluator, train_x, train_y, args.batch_size)
         val_acc = accuracy(model, val_x, val_y)
-        if val_acc > best:
+        if val_acc >= best:
             best, best_state = val_acc, {k: v.detach().clone() for k, v in model.state_dict().items()}
         if epoch % 5 == 0 or epoch == 1:
             print(f"  epoch {epoch:3d}  loss {loss:.4f}  val {val_acc:5.1f}%")
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    model.load_state_dict(best_state)
     print(f"\n  test accuracy: {accuracy(model, test_x, test_y):.1f}%  ({time.perf_counter() - started:.1f} s)")
 
 

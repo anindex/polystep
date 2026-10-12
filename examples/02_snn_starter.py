@@ -1,8 +1,10 @@
 """02 - SNN starter: train a tiny spiking network without gradients.
 
 A small spiking neural network with hard-threshold LIF spikes (zero gradient
-almost everywhere, so no backprop) trained via PolyStep. Saves a loss/accuracy
-figure to examples/figures/snn_starter.png.
+almost everywhere, so no backprop) trained via PolyStep. The radii sit above
+the defaults because the LIF dynamics make the loss rugged on the scale of a
+few weight units, and momentum carries the step direction across minibatches.
+Saves a loss/accuracy figure to examples/figures/snn_starter.png.
 
 Run: python examples/02_snn_starter.py
 """
@@ -11,27 +13,19 @@ from __future__ import annotations
 
 import importlib.util
 import argparse
-import os
-import sys
 import time
 from pathlib import Path
 
 import torch
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _snn_demo import (  # noqa: E402  (sys.path mutation above)
-    TinySNN,
-    evaluate_accuracy,
-    make_loaders,
-    make_optimizer,
-)
-from polystep.cost_nn import NNCostEvaluator  # noqa: E402
+from _snn_demo import TinySNN, evaluate_accuracy, make_loaders
+from polystep import PolyStepOptimizer
+from polystep.cost_nn import NNCostEvaluator
 
 
 def main():
@@ -53,7 +47,15 @@ def main():
     print(f"  parameters: {num_params:,}")
     print(f"  train/test: {len(train_loader.dataset)}/{len(test_loader.dataset)} samples")
 
-    optimizer = make_optimizer(model, seed=seed)
+    optimizer = PolyStepOptimizer(
+        model,
+        seed=seed,
+        epsilon=0.5,
+        step_radius=2.0,
+        probe_radius=4.0,
+        use_momentum=True,
+        solver="softmax",
+    )
     loss_fn = nn.CrossEntropyLoss()
     evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
 
@@ -80,8 +82,10 @@ def main():
             def closure(stacked_params, _in=inputs, _tgt=targets):
                 return evaluator.evaluate(stacked_params, _in, _tgt)
 
-            # Hand-rolled loops must register the evaluator; api.train() does it for you.
-            optimizer.register_evaluator(evaluator, inputs, targets)
+            # Registering scores each parameter's candidates in its own forward: faster
+            # on CPU, slower on CUDA than one batched closure forward for this net.
+            if device.type == "cpu":
+                optimizer.register_evaluator(evaluator, inputs, targets)
             optimizer.step(closure)
 
             with torch.no_grad():
@@ -136,7 +140,7 @@ def main():
     ax_acc.legend(loc="lower right", fontsize=7)
 
     out = Path(__file__).parent / "figures" / "snn_starter.png"
-    os.makedirs(out.parent, exist_ok=True)
+    out.parent.mkdir(exist_ok=True)
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"saved figure: {out}")

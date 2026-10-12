@@ -34,7 +34,7 @@ class OpenAIES:
 
 
 def run(opt, fit_fn, generations):
-    """Best-accuracy-so-far curve over ``generations`` ask/tell rounds."""
+    """Best-score-so-far curve over ``generations`` ask/tell rounds."""
     curve = []
     for _ in range(generations):
         opt.tell(fit_fn(opt.ask()))

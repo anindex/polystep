@@ -2,15 +2,16 @@
 
 PolyStep optimizes the policy directly against the (non-differentiable)
 total episode return. The CartPole-v1 dynamics are vectorized in pure
-PyTorch and match the official Gym thresholds; after training, a
-Gymnasium render window shows the trained policy.
+PyTorch and match the official Gym thresholds. After training, Gymnasium
+renders one episode of the trained policy to a GIF.
 
 Output:
   examples/figures/rl_cartpole.png
+  examples/figures/rl_cartpole_policy.gif
 
 Run:
   python examples/03_rl_cartpole.py
-  python examples/03_rl_cartpole.py --no-render   # headless
+  python examples/03_rl_cartpole.py --no-render   # skip the GIF
 """
 
 from __future__ import annotations
@@ -23,21 +24,18 @@ from pathlib import Path
 
 import torch
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
 
-
-from polystep import PolyStepOptimizer  # noqa: E402
-from polystep.benchmarks.rl.cartpole import (  # noqa: E402
+from polystep import PolyStepOptimizer
+from polystep.benchmarks.rl.cartpole import (
     CartPoleEvaluator,
     evaluate_policy_module,
     random_policy_baseline,
 )
-from polystep.benchmarks.rl.policies import DiscreteMLPPolicy  # noqa: E402
-from polystep.epsilon import CosineEpsilon  # noqa: E402
-from polystep.hybrid_subspace import HybridSubspace  # noqa: E402
-from polystep.transform import ParamLayout  # noqa: E402
+from polystep.benchmarks.rl.policies import DiscreteMLPPolicy
+from polystep.epsilon import CosineEpsilon
 
 
 def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
@@ -89,8 +87,8 @@ def main():
 
     seed = 42
     device = args.device
-    target_steps = 40
-    rollouts_per_candidate = 16
+    target_steps = 32
+    rollouts_per_candidate = 8
     horizon = 200  # below the 500 max to keep the demo quick on CPU
     eval_episodes = 32
 
@@ -110,17 +108,11 @@ def main():
         device=device,
     )
 
-    # Mirrors experiments/runners/run_rl.py::run_polystep_cartpole:
-    # HybridSubspace + softmax solver + small radii.
-    layout = ParamLayout.from_module(policy)
-    subspace = HybridSubspace.from_layout(layout, rank=4)
-
     epsilon_init, epsilon_target = 1.0, 0.3
     optimizer = PolyStepOptimizer(
         policy,
         solver="softmax",
-        subspace=subspace,
-        compile=False,
+        particle_dim=8,
         seed=seed,
         epsilon=CosineEpsilon(
             init=epsilon_init,
@@ -128,9 +120,7 @@ def main():
             decay=(epsilon_init - epsilon_target) / target_steps,
         ),
         step_radius=0.1,
-        probe_radius=0.4,
-        num_probe=1,
-        chunk_size=256,
+        probe_radius=1.6,
     )
 
     rand_summary = random_policy_baseline(
@@ -156,18 +146,9 @@ def main():
     print("training...")
     start = time.time()
 
-    # Shared closure; the optimizer's own iteration counter advances the
-    # CRN seed correctly each step.
-    def closure(stacked_params):
-        step = optimizer.state.iteration_count if optimizer.state is not None else 0
-        return evaluator.loss_for_stacked_params(
-            stacked_params,
-            seed=seed,
-            step=step,
-        )
-
     for step in range(target_steps):
-        optimizer.step(closure)
+        # Candidates in one step share their rollout seeds; the seeds change each step.
+        optimizer.step(lambda params: evaluator.loss_for_stacked_params(params, seed=seed, step=step))
 
         if step % 4 == 0 or step == target_steps - 1:
             summary = evaluate_policy_module(

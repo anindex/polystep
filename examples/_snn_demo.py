@@ -1,25 +1,19 @@
 """Shared tiny-SNN demo helpers.
 
-Small spiking network (~1-3K parameters) used by
-``examples/02_snn_starter.py``; tiny enough to finish in a couple of
-minutes on CPU.
+Small spiking network (508 parameters at the defaults) used by
+``examples/02_snn_starter.py``.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from polystep import PolyStepOptimizer
-
 
 __all__ = [
     "LIFNeuron",
     "TinySNN",
-    "SNNDemoConfig",
     "DEFAULT_INPUT_DIM",
     "DEFAULT_HIDDEN",
     "DEFAULT_NUM_CLASSES",
@@ -29,7 +23,6 @@ __all__ = [
     "DEFAULT_BATCH_SIZE",
     "make_dataset",
     "make_loaders",
-    "make_optimizer",
     "evaluate_accuracy",
 ]
 
@@ -157,37 +150,6 @@ def make_loaders(
         num_workers=0,
     )
     return train_loader, test_loader
-
-
-@dataclass
-class SNNDemoConfig:
-    """Hyperparameters for the tiny SNN demo. Tuned for fast CPU runs."""
-
-    epsilon: float = 0.5
-    step_radius: float = 2.0
-    probe_radius: float = 4.0
-    num_probe: int = 1
-    sinkhorn_max_iters: int = 100
-
-
-def make_optimizer(model: nn.Module, *, seed: int = 42, config: SNNDemoConfig | None = None) -> PolyStepOptimizer:
-    """Build the PolyStepOptimizer with SNN-tuned hyperparameters.
-
-    Larger radii than typical NN settings because the LIF temporal
-    dynamics make the loss landscape rugged on the scale of a few
-    weight units.
-    """
-    cfg = config or SNNDemoConfig()
-    return PolyStepOptimizer(
-        model,
-        compile=False,
-        seed=seed,
-        epsilon=cfg.epsilon,
-        step_radius=cfg.step_radius,
-        probe_radius=cfg.probe_radius,
-        num_probe=cfg.num_probe,
-        sinkhorn_max_iters=cfg.sinkhorn_max_iters,
-    )
 
 
 @torch.no_grad()

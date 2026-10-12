@@ -1,10 +1,10 @@
 """06 - PolyStep on Loihi 2 (skeleton): MNIST SNN + on-chip readout adaptation.
 
-Stage 1 pretrains a rate-coded SNN on clean MNIST with the paper's SNN
-config; Stage 2 freezes the hidden layer and adapts only the chip-writable
-subset (``fc2`` plus per-population LIF ``vth``/``beta``) under Gaussian
-input shift, with no backpropagation. The default ``cpu_sim`` backend runs
-the same host loop the on-chip path would.
+Stage 1 pretrains a rate-coded SNN on clean MNIST off-chip; Stage 2 freezes
+the hidden layer and adapts only the chip-writable subset (``fc2`` plus
+per-population LIF ``vth``/``beta``) under Gaussian input shift, with no
+backpropagation. The default ``cpu_sim`` backend runs the same host loop the
+on-chip path would.
 
 Run::
 
@@ -22,18 +22,17 @@ from pathlib import Path
 
 import torch
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
-
-from polystep import PolyStepOptimizer  # noqa: E402
-from polystep.benchmarks.utils import get_mnist_loaders  # noqa: E402
-from polystep.cost_nn import NNCostEvaluator  # noqa: E402
-from polystep.hybrid_subspace import HybridSubspace  # noqa: E402
-from polystep.transform import ParamLayout  # noqa: E402
+from polystep import PolyStepOptimizer
+from polystep.benchmarks.utils import get_mnist_loaders
+from polystep.cost_nn import NNCostEvaluator
+from polystep.hybrid_subspace import HybridSubspace
+from polystep.transform import ParamLayout
 
 
 try:
@@ -113,15 +112,8 @@ class MnistSpikingNet(nn.Module):
         return total  # (batch, 10): raw spike counts (rate code)
 
 
-class CpuSimEvaluator:
-    """CPU forward evaluator. Identical interface to the on-chip path."""
-
-    def __init__(self, model: nn.Module, loss_fn: nn.Module):
-        self.model = model
-        self._evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-
-    def evaluate(self, stacked_params, inputs, targets):
-        return self._evaluator.evaluate(stacked_params, inputs, targets)
+class CpuSimEvaluator(NNCostEvaluator):
+    """Simulated forward evaluator, with the same ``evaluate`` interface as the on-chip path."""
 
 
 class LoihiSpikeEvaluator:
@@ -159,16 +151,12 @@ def freeze_to_writable_subset(model: MnistSpikingNet) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def make_pretrain_optimizer(
-    model: nn.Module,
-    *,
-    seed: int,
-    device: torch.device,
-) -> PolyStepOptimizer:
-    """Stage 1 optimizer (off-chip pretrain): paper SNN config from ``run_elevation.py``.
+def make_pretrain_optimizer(model: nn.Module, *, seed: int) -> PolyStepOptimizer:
+    """Stage 1 optimizer (off-chip pretrain): the SNN settings of ``experiments/runners/run_elevation.py``.
 
-    Flat epsilon / step_radius / probe_radius: ``CosineEpsilon``
-    scheduling on any of them collapses SNN accuracy.
+    The runner's ``biased_rotation`` and fixed chunk size are left out. Flat
+    epsilon / step_radius / probe_radius: ``CosineEpsilon`` scheduling on any of
+    them collapses SNN accuracy.
     """
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
@@ -181,15 +169,12 @@ def make_pretrain_optimizer(
     )
     return PolyStepOptimizer(
         model,
-        compile=(device.type == "cuda"),
         seed=seed,
         epsilon=0.5,
         step_radius=2.0,
         probe_radius=1.0,
         num_probe=1,
         subspace=subspace,
-        chunk_size=1024,
-        biased_rotation=True,  # orient each polytope along the previous OT displacement
         solver="softmax",
     )
 
@@ -198,7 +183,6 @@ def make_adapt_optimizer(
     model: nn.Module,
     *,
     seed: int,
-    device: torch.device,
     rank: int = 8,
     num_probe: int = 2,
     step_radius: float = 1.5,
@@ -220,15 +204,13 @@ def make_adapt_optimizer(
     )
     return PolyStepOptimizer(
         model,
-        compile=(device.type == "cuda"),
         seed=seed,
         epsilon=0.5,
         step_radius=step_radius,
         probe_radius=probe_radius,
         num_probe=num_probe,
         subspace=subspace,
-        chunk_size=1024,
-        biased_rotation=True,
+        chunk_size=4096,
         solver="softmax",
     )
 
@@ -296,8 +278,8 @@ def train_loop(
             def closure(stacked_params, _x=x, _y=y):
                 return evaluator.evaluate(stacked_params, _x, _y)
 
-            # No register_evaluator: vmapping this net's timestep loop
-            # per site costs more than the materializing path.
+            if isinstance(evaluator, NNCostEvaluator):
+                optimizer.register_evaluator(evaluator, x, y)
             optimizer.step(closure)
             last_x, last_y = x, y
             step += 1
@@ -680,9 +662,9 @@ def main():
     print(f"  init test acc (clean): {100 * init_clean:.1f}%")
 
     print()
-    print("Stage 1: off-chip PolyStep pretrain (paper SNN config)")
+    print("Stage 1: off-chip PolyStep pretrain")
     print("-" * 70)
-    pre_opt = make_pretrain_optimizer(model, seed=args.seed, device=device)
+    pre_opt = make_pretrain_optimizer(model, seed=args.seed)
     pre_eval = CpuSimEvaluator(model, loss_fn=loss_fn)
     train_loop(
         model,
@@ -732,7 +714,6 @@ def main():
     ad_opt = make_adapt_optimizer(
         model,
         seed=args.seed,
-        device=device,
         rank=args.adapt_rank,
         num_probe=args.adapt_num_probe,
     )

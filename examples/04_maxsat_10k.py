@@ -1,9 +1,9 @@
 """04 - MAX-SAT at scale: 10,000 variables.
 
 Random 3-SAT at the phase-transition density (clause/variable ratio 4.27),
-optimized gradient-free on the assignment vector; the integer rounding step
-is treated as a black box. Hyperparameters are sqrt-scaled from the 100K row
-of experiments/runners/run_maxsat.py.
+optimized gradient-free on the assignment vector; the sign threshold that
+hardens it is treated as a black box. Hyperparameters are sqrt-scaled from
+the 100K row of experiments/runners/run_maxsat.py.
 
 Default: 10,000 variables (GPU recommended). ``--small``: 2,000 variables,
 CPU-friendly.
@@ -16,50 +16,44 @@ Run:
 from __future__ import annotations
 
 import argparse
-import math
-import random
 import importlib.util
+import math
 import os
+import random
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
 
-from polystep import PolyStepOptimizer  # noqa: E402
-from polystep.epsilon import CosineEpsilon  # noqa: E402
+from polystep import PolyStepOptimizer
+from polystep.epsilon import CosineEpsilon
 
 
 def generate_maxsat_instance(num_vars, k=3, ratio=4.27, seed=42):
     """A random k-SAT instance at the critical clause-to-variable ratio."""
     rng = random.Random(seed)
     num_clauses = int(num_vars * ratio)
-    clause_vars, clause_signs = [], []
+    literals = []
     for _ in range(num_clauses):
-        chosen = rng.sample(range(num_vars), k)
-        clause_vars.append(chosen)
-        clause_signs.append([1.0 if rng.random() < 0.5 else 0.0 for _ in chosen])
+        literals.append([v + num_vars * (rng.random() < 0.5) for v in rng.sample(range(num_vars), k)])
     return {
-        "clause_vars": torch.tensor(clause_vars, dtype=torch.long),
-        "clause_signs": torch.tensor(clause_signs, dtype=torch.float),
+        "literals": torch.tensor(literals, dtype=torch.long).T.contiguous(),
         "num_vars": num_vars,
         "num_clauses": num_clauses,
     }
 
 
 class MaxSATModel(nn.Module):
-    """Continuous relaxation of a MAX-SAT assignment, hardened by round()."""
+    """Continuous relaxation of a MAX-SAT assignment; variable v is true where ``assignments[v] > 0``."""
 
     def __init__(self, num_vars: int):
         super().__init__()
         self.assignments = nn.Parameter(torch.randn(num_vars) * 0.1)
-
-    def forward(self, clause_vars: torch.Tensor, clause_signs: torch.Tensor) -> torch.Tensor:
-        return 1.0 - satisfied_clauses(self.assignments, clause_vars, clause_signs).float().mean()
 
 
 # Hyperparameter reference: sqrt-scaled from the 100K row of run_maxsat.py.
@@ -80,20 +74,25 @@ def scaled_radii(num_vars: int):
     )
 
 
-def satisfied_clauses(assignments: torch.Tensor, clause_vars: torch.Tensor, clause_signs: torch.Tensor):
-    """Which clauses each assignment satisfies, shape ``assignments.shape[:-1] + (C,)``.
+def satisfied_clauses(assignments: torch.Tensor, literals: torch.Tensor) -> torch.Tensor:
+    """Which clauses each row of ``assignments`` satisfies, shape ``(C, rows)``.
 
-    Kept as a boolean equality because the gathered ``(..., C, k)`` tensor is the
-    largest allocation in the step and bool is a quarter the memory traffic.
+    ``literals`` has shape ``(k, C)``: entry ``v`` reads "variable v is false" and
+    ``num_vars + v`` reads "variable v is true". They index the rows of a
+    ``(2 * num_vars, rows)`` truth table, so each gather copies whole contiguous rows.
     """
-    hard = assignments > 0
-    return (hard[..., clause_vars] == clause_signs).any(dim=-1)
+    hard = assignments.reshape(-1, assignments.shape[-1]).T.contiguous() > 0
+    table = torch.cat([~hard, hard])
+    satisfied = table[literals[0]]
+    for column in literals[1:]:
+        satisfied |= table[column]
+    return satisfied
 
 
 @torch.no_grad()
-def sat_ratio(model: MaxSATModel, clause_vars: torch.Tensor, clause_signs: torch.Tensor) -> float:
-    satisfied = satisfied_clauses(model.assignments, clause_vars, clause_signs)
-    return float(satisfied.sum().item()) / clause_vars.shape[0]
+def sat_ratio(model: MaxSATModel, literals: torch.Tensor) -> float:
+    satisfied = satisfied_clauses(model.assignments, literals)
+    return satisfied.sum().item() / satisfied.numel()
 
 
 def main():
@@ -103,7 +102,7 @@ def main():
         "--steps",
         type=int,
         default=1500,
-        help="Number of PolyStep iterations. 1500 gives comfortable margin above 98%% SAT.",
+        help="Number of PolyStep iterations; 1500 reaches about 98%% SAT.",
     )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -111,48 +110,41 @@ def main():
         parser.error("--steps must be positive")
 
     num_vars = 2_000 if args.small else 10_000
-    seed = args.seed
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    torch.manual_seed(seed)
+    torch.manual_seed(args.seed)
 
     print("=" * 60)
     print(f"MAX-SAT (3-SAT): {num_vars} vars at phase-transition density")
     print("=" * 60)
 
-    instance = generate_maxsat_instance(num_vars=num_vars, ratio=4.27, seed=seed)
+    instance = generate_maxsat_instance(num_vars=num_vars, seed=args.seed)
     print(f"  variables: {instance['num_vars']:,}")
     print(f"  clauses:   {instance['num_clauses']:,}")
     print(f"  device:    {device}")
 
-    clause_vars = instance["clause_vars"].to(device)
-    clause_signs = instance["clause_signs"].to(device).bool()  # 1 = positive literal
+    literals = instance["literals"].to(device)
 
     model = MaxSATModel(num_vars=num_vars).to(device)
 
     sr_init, sr_tgt, pr_init, pr_tgt = scaled_radii(num_vars)
     optimizer = PolyStepOptimizer(
         model,
-        compile=False,
-        seed=seed,
+        seed=args.seed,
         epsilon=CosineEpsilon(init=5.0, target=0.5),
         step_radius=CosineEpsilon(init=sr_init, target=sr_tgt),
         probe_radius=CosineEpsilon(init=pr_init, target=pr_tgt),
-        num_probe=1,
         chunk_size=256,
         amortize_steps=3,
-        amortize_ema=0.7,
         use_momentum=True,
-        momentum_init=0.5,
-        momentum_final=0.95,
     )
 
     def closure(stacked_params):
         # cost = fraction of unsatisfied clauses per candidate
-        satisfied = satisfied_clauses(stacked_params["assignments"], clause_vars, clause_signs)
-        return 1.0 - satisfied.sum(dim=-1) / clause_vars.shape[0]
+        satisfied = satisfied_clauses(stacked_params["assignments"], literals)
+        return 1.0 - satisfied.sum(dim=0, dtype=torch.int32) / satisfied.shape[0]
 
-    print(f"  initial SAT ratio: {sat_ratio(model, clause_vars, clause_signs):.3f}")
+    print(f"  initial SAT ratio: {sat_ratio(model, literals):.3f}")
     print()
 
     sat_log: list[float] = []
@@ -164,7 +156,7 @@ def main():
     for step in range(args.steps):
         optimizer.step(closure)
         if step % max(1, args.steps // 50) == 0 or step == args.steps - 1:
-            r = sat_ratio(model, clause_vars, clause_signs)
+            r = sat_ratio(model, literals)
             sat_log.append(r)
             step_log.append(step)
             best_sat = max(best_sat, r)

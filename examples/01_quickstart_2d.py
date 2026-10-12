@@ -14,72 +14,43 @@ from pathlib import Path
 
 import torch
 
-import _env  # noqa: E402
+import _env
 
 _env.setup()
 
-
-from polystep.solver import PolyStep  # noqa: E402
-
-
-# Piecewise-constant in concentric annuli; gradient zero almost everywhere.
+from polystep.solver import PolyStep
 
 
 def staircase_radial(X: torch.Tensor) -> torch.Tensor:
-    """Piecewise-constant radial staircase. ``X`` shape: ``(..., 2)``."""
-    r = torch.linalg.vector_norm(X, dim=-1)
-    return torch.floor(r * 2.0)  # 0.5-wide concentric steps
-
-
-class StaircaseObjective:
-    """Wraps the staircase as a polystep-compatible callable."""
-
-    dim = 2
-
-    def __call__(self, X: torch.Tensor) -> torch.Tensor:
-        return staircase_radial(X)
-
-    def evaluate(self, X: torch.Tensor) -> torch.Tensor:
-        return staircase_radial(X)
+    """Concentric 0.5-wide steps, ``floor(2 * ||x||)``; the gradient is zero almost everywhere."""
+    return torch.floor(torch.linalg.vector_norm(X, dim=-1) * 2.0)
 
 
 def main():
-    seed = 42
-    torch.manual_seed(seed)
-    generator = torch.Generator().manual_seed(seed)
+    generator = torch.Generator().manual_seed(42)
 
-    # probe_radius > step_radius so probes cross a staircase boundary per step
-    objective = StaircaseObjective()
+    # Radii scale with epsilon; at 1.0 each probe lands 0.75 out, past a 0.5-wide step.
     solver = PolyStep.create(
-        objective,
+        staircase_radial,
         dim=2,
-        epsilon=0.3,
+        epsilon=1.0,
         step_radius=0.5,
         probe_radius=1.5,
         num_probe=1,
-        max_iterations=50,
-        min_iterations=50,
-        compile=False,
+        max_iterations=25,
     )
 
     X_init = 4.0 * (torch.rand(16, 2, generator=generator) - 0.5)
     state = solver.init_state(X_init)
 
     cloud_history = [state.X.clone()]
-    cost_history = []
     for _ in range(solver.max_iterations):
         state = solver.step(state, generator=generator)
         cloud_history.append(state.X.clone())
-        cost_history.append(state.costs[-1])
 
-    best_traj = []
-    for c in cloud_history:
-        best_traj.append(c[staircase_radial(c).argmin()])
-    best_traj = torch.stack(best_traj)
-
-    final_mean = float(staircase_radial(state.X).mean())
-    init_mean = float(staircase_radial(X_init).mean())
-    print(f"final mean cost = {final_mean:.3f} (started ~{init_mean:.3f})")
+    best_traj = torch.stack([c[staircase_radial(c).argmin()] for c in cloud_history])
+    cost_history = [float(staircase_radial(c).mean()) for c in cloud_history]
+    print(f"final mean cost = {cost_history[-1]:.3f} (started at {cost_history[0]:.3f})")
 
     if importlib.util.find_spec("matplotlib") is None:
         print("matplotlib not installed; skipping the figure (pip install matplotlib).")
@@ -121,10 +92,10 @@ def main():
     )
     ax_left.legend(loc="upper right", fontsize=7, frameon=True, framealpha=0.9)
 
-    ax_right.plot(range(1, len(cost_history) + 1), cost_history, color="#0072B2", lw=1.4)
+    ax_right.plot(range(len(cost_history)), cost_history, color="#0072B2", lw=1.4)
     ax_right.set_xlabel("PolyStep iteration")
-    ax_right.set_ylabel("Entropic OT cost")
-    ax_right.set_title("OT cost across iterations", fontsize=9)
+    ax_right.set_ylabel("Mean particle cost")
+    ax_right.set_title("Staircase value across iterations", fontsize=9)
     ax_right.grid(True, alpha=0.3)
 
     out = Path(__file__).parent / "figures" / "quickstart_2d.png"
