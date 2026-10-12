@@ -250,7 +250,7 @@ class SpikingNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass over timesteps; supports temporal and static inputs."""
-        # Static input broadcasts one fc1 call (bit-identical to per-timestep); temporal input keeps per-timestep calls. Check feature count first: a static batch of num_steps images looks temporal on shape alone.
+        # Check feature count to distinguish temporal inputs from a static batch of num_steps images.
         _static_features = x.dim() >= 2 and math.prod(x.shape[1:]) == self.input_dim
         if _static_features:
             batch = x.shape[0]

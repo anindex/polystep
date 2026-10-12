@@ -15,10 +15,10 @@ factor. Rotation changes those directions. Retune radii when switching subspaces
 
 Momentum, the `amortize_steps` coasting direction, and the `biased_rotation`
 direction are cleared when the basis changes. `AdaptiveSubspace` rotates every step
-by default, so these options need a longer rotation interval to take effect; the
-optimizer warns when they meet a rotation every step. Heavy-ball momentum can
-amplify the barycentric displacement; `step_radius` bounds the displacement before
-momentum.
+by default. These options need a longer rotation interval to take effect.
+The optimizer warns when you combine them with rotation on every step.
+Heavy-ball momentum can amplify the barycentric displacement.
+`step_radius` bounds the displacement before momentum.
 
 ## Evaluation
 
@@ -35,9 +35,9 @@ momentum.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
   Models needing autocast internally must provide it. Half-precision candidate outputs
   reduce in FP32 only under the builtin cross-entropy, MSE and L1 losses at their
-  defaults apart from `reduction`, so other losses tie candidates closer than their
-  rounding step. With FP16 or BF16 parameters, `FactoredSubspace` materializes every
-  candidate and runs slower. See
+  defaults apart from `reduction`. Other losses may round nearby candidate scores
+  to the same value. With FP16 or BF16 parameters, `FactoredSubspace` materializes
+  every candidate and runs slower. See
   [precision](docs/performance.md#compilation-and-precision).
 - `train()` rejects `trust_region`. See
   [radius control](docs/api_overview.md#quadratic-model-and-radius-control) for its
@@ -48,12 +48,11 @@ momentum.
   bias the full-fidelity cost estimate.
 - Full-space blockwise mode does not support every monolithic adaptation option;
   unsupported options warn at construction.
-- The automatic chunk size sees only module outputs: those of layers that own
-  parameters, and on a site-local path whose forward draws no random numbers, those of
-  every module from the perturbed layer on, unless the forward reads the perturbed
-  parameter before calling that layer. Attention scores and other intermediates inside
-  a module's forward are not counted, so set `chunk_size` by hand if such a model runs
-  out of memory.
+- Automatic chunk sizing counts outputs of layers with parameters. On a site-local
+  path, it counts all module outputs from the perturbed layer onward, provided the
+  forward neither draws random numbers nor reads the perturbed parameter before
+  calling its layer. Attention scores and other temporary tensors inside a module's
+  forward are not counted. Set `chunk_size` by hand if such a model runs out of memory.
 - The library does not distribute optimizer state across multiple GPUs.
 
 ## Attention and recurrent layers
@@ -82,14 +81,17 @@ a common direction across particles.
 
 Sinkhorn requires `omega` in `[0.5, 1.95]`. Anderson acceleration and adaptive omega
 are inactive in fixed-iteration mode (`threshold <= 0`). Both solver families promote
-FP16/BF16 costs to FP32.
+FP16/BF16 costs to FP32. Cost differences and reductions must also fit the solver's
+dtype: finite FP32 inputs near its limits can still overflow when recentered or
+averaged. Rescale the objective before evaluation or return FP64 costs in that case.
 
 All nonfinite costs are invalid. `min_cost_greedy` and `top_k_mean` skip a vertex
 with any nonfinite probe, and the solve leaves a particle with no feasible vertex
-where it is. The weighted solvers replace each nonfinite cost with a finite penalty,
-twice the largest finite magnitude plus one, so an infeasible candidate keeps a small
-weight that depends on epsilon. Under `scale_cost='mean'` or `'max_cost'` the penalty
-is computed after scaling; otherwise that weight also depends on the cost offset.
+where it is. The weighted solvers replace each nonfinite cost with twice the largest
+finite magnitude plus one, clamped to the dtype limit. An infeasible candidate can
+therefore retain weight, depending on epsilon. With `scale_cost='mean'` or
+`'max_cost'`, the solvers compute the penalty after scaling. Otherwise, that weight
+also depends on the cost offset.
 Balanced Sinkhorn sends every column its prescribed mass, even when all of that
 column's candidates are infeasible. The monolithic step records a vertex's cost as
 the mean of its probes with each nonfinite probe already penalized, so with several

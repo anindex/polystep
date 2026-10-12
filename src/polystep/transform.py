@@ -77,7 +77,7 @@ class ParamLayout:
                 _all_keys=(),
             )
 
-        # Key shared storage on the storage, not data_ptr: views at different offsets would look independent and write the same bytes twice.
+        # Storage identity catches aliases whose data pointers have different offsets.
         seen_storage: dict[int, list[tuple[str, int, int, tuple]]] = {}
         canonical_entries: list[ParamEntry] = []
         shared_map: dict[str, list[str]] = {}  # canonical_key -> [alias keys]

@@ -26,17 +26,17 @@ The evaluator and closure must compute the same objective, including regularizat
 candidate in eval mode, so dropout stays off and batch-norm running statistics do not
 update.
 
-After external parameter updates, call `optimizer.resync_from_model()`. After
-replacing layers, parameters or buffers, or casting the model to another dtype, call
-`evaluator.reset_vmap()` and register it again. A swapped layer or parameter also
-needs `optimizer.resync_from_model()`, or the next step overwrites it with the old
-weights plus the update.
+After external parameter updates, call `optimizer.resync_from_model()`.
+After you replace layers, parameters, or buffers, call `evaluator.reset_vmap()`.
+Do the same after a dtype cast. Then register the evaluator again.
+For a new layer or parameter, also call `optimizer.resync_from_model()`.
+Otherwise, the next step overwrites it with the old weights plus the update.
 
-After a dtype cast, that resync moves the subspace projections to the new parameter
-dtypes, and an `AdaptiveSubspace` moves its coordinates along with them.
-`HybridSubspace`, `FactoredSubspace` and full space keep their coordinates in the dtype
-they were built with, so build a new optimizer if those should follow the cast. No
-optimizer follows the model to another device; the resync raises there.
+After a dtype cast, resync moves the subspace projections to the new parameter dtypes.
+An `AdaptiveSubspace` also moves its coordinates to the new dtype.
+`HybridSubspace`, `FactoredSubspace` and full space keep their original coordinate dtype.
+If the coordinates must use the new dtype, build a new optimizer.
+If the model moves to another device, build a new optimizer. Resync cannot change devices.
 
 ## Training loop
 
@@ -53,10 +53,10 @@ train(model, loader, nn.CrossEntropyLoss(), optimizer, config)
 ```
 
 `restore_best` (on by default) restores the weights with the lowest tracked loss.
-Each step's weights are scored on the batch that step trained on, with the same input
-cast, autocast and loss reduction as the candidates, so the loss is in-sample and
-leans optimistic. Best-weight tracking and callbacks require an extra loss evaluation
-per step. This is training-loss selection, not held-out validation selection.
+After each step, `train()` scores the updated weights on that step's training batch.
+It uses the same input cast, autocast and loss reduction as the candidates.
+Checkpoint selection uses training loss, which can be optimistic on unseen data.
+Best-weight tracking and callbacks require an extra loss evaluation per step.
 
 ## Subspaces
 
@@ -195,9 +195,9 @@ scores candidates on a smaller batch and evaluates only the `screen_keep_ratio` 
 it keeps on the full batch. Measure the quality of either at equal evaluation and time
 budgets.
 
-Screening needs a cheaper closure. `screen_closure_from` calls the closure with the
-first `screen_fidelity` share of the batch as extra arguments, so give the closure the
-batch as defaults and the same function serves both calls:
+Screening needs a cheaper closure. `screen_closure_from` passes the first
+`screen_fidelity` fraction of the batch as extra arguments to the closure. Give those
+arguments defaults so the same closure can score both the full and reduced batch:
 
 ```python
 inputs, targets = loader[0]
@@ -286,7 +286,7 @@ transport statistics for the optimizer API.
 
 ## Checkpoints
 
-Save model weights and optimizer state separately:
+Save model weights and optimizer state in separate checkpoint entries:
 
 ```python
 torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, "checkpoint.pt")
@@ -297,9 +297,94 @@ optimizer.load_state_dict(checkpoint["optimizer"])
 
 Rebuild the optimizer with the original configuration before loading.
 `load_state_dict` reads only checkpoint format 6, written since 1.0, and raises
-`ValueError` on any other format. To continue a run
-saved by another release, build a fresh optimizer around the saved model weights.
+`ValueError` on any other format. To continue a run saved by another release, build
+a fresh optimizer around the saved model weights.
 The checkpoint also restores `candidate_evals`. Reproducible continuation requires
-the same objective and environment. A checkpoint can move between CPU and CUDA, but
-a seeded run then keeps the new optimizer's generator and warns, because the two
-generator types cannot share state.
+the same objective and environment. Checkpoints can move between CPU and CUDA.
+When a seeded checkpoint crosses devices, loading keeps the new optimizer's
+generator and warns because the two generator types cannot share state.
+
+## Upgrading from 0.13
+
+Version 1.0 removes unused APIs and changes the checkpoint format. Update callers
+before loading a model into a new optimizer.
+
+- `CMAAdaptiveSubspace`, `compute_cma_hyperparameters`, `use_covariance_adaptation` and
+  the CMA fields of `SolverState` (`p_c`, `p_sigma`, `C_diag`, `generation`) are gone;
+  use `AdaptiveSubspace`. `TemperedSoftmaxSolver`, `solver='tempered_softmax'`
+  and `tempered_softmax_tau` are gone; use `solver='softmax'` with `ent_epsilon`.
+- `auto_epsilon` and `auto_epsilon_config` are gone; pass a `ProgressiveEpsilon` as
+  `epsilon`. To match the old schedule for a numeric `epsilon=e`, use
+  `ProgressiveEpsilon(init=e, target=max(0.01, 0.1 * e), max_epsilon=5 * e)`.
+  For a `LinearEpsilon`, reuse its `init` and `target` with `max_epsilon=5 * init`;
+  for other schedules, use `ProgressiveEpsilon()`. Pass `auto_epsilon_config` keys
+  as keyword arguments. An existing `ProgressiveEpsilon` works as before.
+- `PolyStep` no longer trains networks: `subspace`, `nn_evaluator`, `train_inputs`,
+  `train_targets` and `init_state(base_params=...)` are gone. Use `PolyStepOptimizer`.
+- `polystep` no longer exports low-level helpers; import them from `subspace`
+  (`ProjectionSpec`, which replaces `create_hybrid_blocks` and `LayerProjectionSpec`),
+  `_compiled` (`CompiledFunctions`, `try_compile`), `dynamics` (`apply_momentum`,
+  `compute_momentum_coefficient`, `update_radius_multiplier`, `update_stagnation`),
+  `blockwise` (`BlockConfig`, `create_per_layer_blocks`, `create_grouped_blocks`),
+  `cost_nn` (`auto_detect_chunk_size`), `transform` (`ParamEntry`, `create_generator`)
+  and `costs` (`compute_cost_matrix`, `scale_cost_matrix`).
+- `TrainConfig.batch_size` and `log_every` are gone; set them on the `DataLoader` and
+  `LoggingCallback`, which now prints `disp_sq` in scientific notation, not `disp`.
+- `SolverResult.cost` is gone; read `ent_reg_cost`, no longer a constructor argument.
+  `KLSoftmaxSolver.last_marginal_violation` is read-only. `SolverState` and
+  `CompiledFunctions.fused_softmax_project` drop the marginal `a`. The latter expects
+  the caller to recenter and scale costs; its `scale_cost_mean` argument is gone.
+  It returns `(X_new, W)` with rows of `W` summing to one; multiply by the marginal
+  to get the old transport plan.
+- Removed without replacement: `BenchmarkResult`, `data_dependent_init`, unused solver
+  `compile` fields, the block-splitting helpers in `polystep.blockwise`, and
+  `adaptive_probes` with its threshold. Candidates are scored on every OT step, and
+  `objective_token` only gates a pending trust-region check.
+- `get_simplex_vertices`, `get_orthoplex_vertices` and `get_cube_vertices` raise
+  `TypeError` on unknown keyword arguments. `CartPoleRolloutResult` is gone;
+  `CartPoleEvaluator.rollout_stacked_params` returns a `GymRolloutResult` with the same
+  fields. `NonDiffMLPPolicy.mode` is gone; read it from the policy's `NonDiffActivation`
+  layers. `SiteVmapEvaluator` takes a required keyword-only `owner`, and `PolyStep.step`
+  leaves `state.last_solve_eps` at `None`.
+- `experiments/baselines/openai_es.py` and `spsa.py` are gone; use `polystep.baselines`.
+  `evaluate_accuracy` moved from `experiments.runners.common` to
+  `polystep.benchmarks.utils` and reads the device from the model. With no replacement,
+  `common.py` drops `FunctionEvalCounter`, `get_loss_fn`, `load_flat_params`,
+  `set_flat_params` and the Tonic loaders; `nondiff_models.py` drops the soft MoE,
+  permutation and binary-convolution models, `cra_penalty`, `evaluate_sat_loss` and
+  `compute_expert_utilization`; `nondiff_data.py` drops `generate_sorting_data`; and
+  `sls_pysat.py`, `bench_ask_tell.py`, `run_maxsat_softmax_scaling.py`,
+  `bench_large_net_inplace.py` and `profile_controlled.py` are gone.
+- The elevation, MNIST, MoE, timeseries, MAX-SAT and RL runners write to
+  `experiments/results/revision` by default, not `results/softmax/main`
+  (`results/softmax/rl` for RL). Baseline runs given neither `--fair` nor `--budget`
+  record `match_axis` as `"unmatched"`. `run_gpt2_finetune.py` keeps only the
+  hard-quantized head experiment and drops `--steps`, `--subspace-dim`, `--head-only`
+  and `--measure-memory`. `bench_polytope.py` drops `--suite`, and the variant sweep
+  drops its `quadratic/multifidelity` arm. The `[experiments]` extra no longer installs
+  snntorch, and `[rl]` installs plain gymnasium without Box2D or swig.
+- Checkpoints use format 6 and restore `candidate_evals`. Older ones, including the
+  format 5 that 0.13 writes, raise `ValueError`; rebuild the optimizer from the model.
+- New errors: `TypeError` for a subspace that is not an `AdaptiveSubspace`,
+  `HybridSubspace` or `FactoredSubspace`; `ValueError` for `ProgressiveEpsilon` with
+  `ent_epsilon`, `rank_schedule` without a `HybridSubspace`, `PowerDecay` with `gamma`
+  outside `(0, 0.5]`, a negative `CosineEpsilon` decay, a blockwise closure that does
+  not return one loss per candidate, and `resync_from_model()` on a moved model.
+- New warnings cover two configurations: `AdaptiveSubspace` rotating every step
+  with `amortize_steps > 1`, `biased_rotation` or `use_momentum`, because rotation
+  clears their state; and `adaptive_num_probe=True` under orthoplex
+  `newton_refinement`. The thread-oversubscription warning suggests
+  `torch.set_num_threads(1)` or `python -m polystep.benchmarks.threads` instead of
+  `ncpu - 8` threads.
+- Call `resync_from_model()` after swapping a layer into the model, or steps restore the
+  old weights. A closure that keeps a candidate tensor must clone it, since CPU
+  `AdaptiveSubspace` steps now reuse one buffer, as full-space steps did.
+- With `use_inplace=True` and a registered evaluator, full-space candidates that change
+  one parameter are scored with the registered loss and batch, not the closure. Move
+  any term the closure adds, such as a penalty, into that loss.
+- Subspace `per_layer` and `grouped` runs with `num_probe > 1` now default
+  `adaptive_num_probe` to on; pass `False` to keep a fixed probe count.
+
+Random streams and floating-point rounding can differ from earlier releases. Keep
+the version, configuration, device, and thread count fixed for repeatable runs; see
+[determinism](determinism.md).

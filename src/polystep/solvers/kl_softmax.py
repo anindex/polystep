@@ -104,7 +104,7 @@ class KLSoftmaxSolver:
                 f = torch.zeros(n, device=device, dtype=dtype)
                 g = torch.zeros(m, device=device, dtype=dtype)
 
-            # Softmax limit, closed form in one iteration. The bound is the dtype's smallest normal: below it the /alpha residual becomes 0/0 = NaN.
+            # Use the softmax limit before the residual divided by alpha can underflow to 0/0.
             if alpha < torch.finfo(dtype).tiny:
                 g = torch.zeros_like(g)
                 converged = True
@@ -147,7 +147,7 @@ class KLSoftmaxSolver:
             # Undo both frame changes so cost is <C_raw, P> (sum(P) == a.sum()).
             cost = (C * P).sum() * cost_scale + cost_shift * a.sum()
 
-            # Generalized KL(P^T 1 || b), the divergence this solver actually penalizes. The -q+b mass terms keep it non-negative when sum(q) != sum(b).
+            # Generalized KL includes -q+b because the marginals may have unequal mass.
             col_marginal = P.sum(dim=0).clamp(min=1e-30)
             b_safe = b.clamp(min=1e-30)
             self._marginal_kl = (col_marginal * (col_marginal.log() - b_safe.log()) - col_marginal + b_safe).sum()

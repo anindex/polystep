@@ -308,7 +308,7 @@ def cma_es(
     history, it = _Trace(), 0
     best = torch.tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
 
-    # IPOP restarts (Auger & Hansen 2005): pycma stops early on its own criteria, so double the population and resume from the incumbent on each stop.
+    # IPOP restart: double the population and resume from the incumbent (Auger & Hansen 2005).
     while obj.remaining >= es.popsize:
         while obj.remaining >= es.popsize and not es.stop():
             solutions = es.ask()

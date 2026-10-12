@@ -3,10 +3,10 @@
 Reproducibility requires the same configuration, device, software build, and CPU
 thread count. A seed alone does not guarantee identical results across systems.
 
-CPU QR factorizations with less than 1e8 `rows * cols**2` work run on one thread.
+CPU QR factorizations run on one thread when `rows * cols**2 < 1e8`.
 Larger subspace bases (adaptive, hybrid, factored) use the whole intra-op pool, so
-their rounding follows the thread count. Random rotation QRs stay on one thread at any
-size.
+their results can change with the thread count. Random rotation QRs stay on one
+thread at any size.
 
 `experiments/runners/common.py` sets:
 
@@ -46,9 +46,8 @@ basis is drawn on the CPU but orthogonalized by a QR on the model's device, so i
 CUDA bases round differently. Sparse projections draw their rows and signs from their
 own seeded CPU generator and skip the QR, so every device gets the same projection.
 
-A candidate forward that draws its own random numbers gives each candidate its own
-draw under vmap, so a run whose forward falls back to the sequential loop does not
-match one that stays batched; see
+Under vmap, a stochastic forward draws separate random numbers for each candidate.
+Its random stream differs from a run that falls back to sequential evaluation; see
 [candidate evaluation](performance.md#candidate-evaluation).
 
 ## Checks

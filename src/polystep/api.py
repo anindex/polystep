@@ -14,7 +14,7 @@ from .optimizer import PolyStepOptimizer
 
 
 class TrainCallback:
-    """Base class for training callbacks; override ``on_step_end``/``on_epoch_end``, return ``True`` to stop early."""
+    """Training hooks; return ``True`` from ``on_step_end`` to stop early."""
 
     def on_step_end(self, metrics: dict) -> bool:
         """Called after each step; return True to stop training."""
@@ -109,7 +109,7 @@ def train(
                 def closure(batched_params, _in=cost_inputs, _tgt=cost_targets):
                     return evaluator.evaluate(batched_params, _in, _tgt)
 
-                # Without this the fused in-place, factored and sparse-delta evaluators never run.
+                # Registration enables the specialized candidate evaluators.
                 optimizer.register_evaluator(evaluator, cost_inputs, cost_targets)
 
                 optimizer.step(
@@ -121,7 +121,7 @@ def train(
                 state = optimizer.state
                 ot_cost = state.costs[-1] if state.costs else 0.0
 
-                # ot_cost averages probes around the pre-step weights, so it doesn't measure the current weights; restore_best keyed on it would snapshot the cheapest probe cloud.
+                # Score the updated weights; the probe cost describes the pre-step neighborhood.
                 if callbacks or config.restore_best:
                     with torch.inference_mode(), evaluator._autocast(cost_inputs.device):
                         x = evaluator.cast_inputs(cost_inputs, evaluator._input_dtype(evaluator._param_dict_cache))
@@ -176,7 +176,7 @@ def train(
                 cb.on_epoch_end(epoch_metrics)
 
     finally:
-        # Re-anchor the optimizer on the restored weights; otherwise the next step writes the last-step weights back over them.
+        # Re-anchor so the next step starts from the restored weights.
         if config.restore_best and best_state is not None:
             model.load_state_dict(best_state)
             optimizer.resync_from_model()

@@ -79,7 +79,7 @@ class TopKMeanSolver:
         C_rank = torch.where(feasible, C_raw, torch.inf)
         _, topk_indices = C_rank.topk(k_eff, dim=-1, largest=False)  # (P, k_eff)
 
-        # With fewer than k feasible, topk still picks masked ones, so drop them and spread mass over what is left; the row still sums to a.
+        # Drop masked top-k entries and redistribute their mass over feasible ones.
         keep = feasible.gather(1, topk_indices)
         keep = keep | ~keep.any(dim=1, keepdim=True)
 

@@ -67,7 +67,7 @@ def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
     """Promote half precision to FP32 and integer costs to the default float, then replace non-finite costs on-device.
 
     Every non-finite cost is invalid, ``-inf`` included, and becomes ``2*max|finite| + 1``,
-    below every finite one. ``ask_tell.tell`` and ``baselines.core`` read ``-inf`` the same way.
+    clamped to the dtype limit. ``ask_tell.tell`` and ``baselines.core`` read ``-inf`` the same way.
     """
     if not cost_matrix.is_floating_point():
         cost_matrix = cost_matrix.to(torch.get_default_dtype())

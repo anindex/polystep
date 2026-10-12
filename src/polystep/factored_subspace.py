@@ -1,4 +1,4 @@
-"""Low-rank subspace whose candidates never materialize a weight.
+"""Low-rank coordinates for matrix perturbations.
 
 ``dW = A @ B`` with ``B`` fixed random orthonormal rows; see arXiv:2511.16652.
 """

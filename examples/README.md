@@ -19,10 +19,12 @@ python examples/01_quickstart_2d.py
 | [10_cnn_mnist.py](10_cnn_mnist.py) | Convolutional MNIST classifier |
 | [11_transformer_selective_copy.py](11_transformer_selective_copy.py) | Attention-based selective copying |
 
-Examples run on one CPU thread, except 07, which uses eight; set `POLYSTEP_THREADS` to
-change it. Examples 02, 04, 05, 06, 10, and 11 use CUDA when available, and 05 trains
-in BF16 there. Example 03 accepts `--device cuda`. Use `--device cpu` for 02, 05, 06,
-10, and 11; use `--small` for a smaller MAX-SAT task.
+Examples run on one CPU thread, except 07, which uses eight.
+To change the thread count, set `POLYSTEP_THREADS`.
+Examples 02, 04, 05, 06, 10, and 11 use CUDA when available. Example 05 uses BF16 on CUDA.
+Example 03 accepts `--device cuda`. To skip its GIF, use `--no-render`.
+For CPU runs of 02, 05, 06, 10, and 11, use `--device cpu`.
+For a smaller MAX-SAT task, use `--small`.
 
 Examples 10 and 11 support `--compare` to check loss agreement and time registered
 evaluation against materialized candidates, including first-call setup. See
@@ -30,8 +32,8 @@ evaluation against materialized candidates, including first-call setup. See
 [API reference](../docs/api_overview.md#evaluation-controls) for amortization.
 
 Examples 05, 06, 10, and 11 select checkpoints on validation data and report
-test accuracy afterward. The Loihi example runs a CPU simulation; its hardware
-evaluator is a deployment sketch.
+test accuracy afterward. The Loihi example simulates the SNN in PyTorch on the
+selected device; its hardware evaluator is a deployment sketch.
 
 Examples 07 and 08 report the mean over five seeds. Their OpenAI-ES baselines use
 the noise scale and learning rate that scored best on 20 seeds the examples do not

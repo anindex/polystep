@@ -111,7 +111,7 @@ class SinkhornSolver:
             "epsilon",
             "A zero/negative epsilon divides by zero in log-domain Sinkhorn.",
         )
-        # Balanced Sinkhorn needs sum(a) == sum(b). Check when either marginal is given; a=b=None is balanced by construction, so the hot path stays sync-free.
+        # Default marginals are balanced; validate caller-supplied masses.
         marginals_given = a is not None or b is not None
         cost_matrix, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, "Sinkhorn")
         n, m = cost_matrix.shape
@@ -188,7 +188,7 @@ class SinkhornSolver:
                 for i in range(self.max_iterations):
                     f, g = sinkhorn_iter(f, g, log_K, log_a, log_b, eps, omega)
                     n_iters = i + 1
-                # Fixed mode checks no residual, so converged reports numerical validity only; reporting False on a finite result would make ProgressiveEpsilon inflate epsilon.
+                # In fixed mode, converged reports numerical validity for ProgressiveEpsilon.
                 if not (torch.isfinite(f).all() & torch.isfinite(g).all()):
                     f.zero_()
                     g.zero_()
@@ -338,7 +338,7 @@ class SinkhornSolver:
                                 _divergence_growth_count = 0
                             _divergence_prev_norm = dual_norm_v
 
-                        # Lehmann residual-ratio estimator (arXiv:2012.12562): read the linear rate off successive marginal errors. Only while omega is 1.0.
+                        # Estimate the linear rate from residual ratios at omega=1 (arXiv:2012.12562).
                         _on_cycle = (i + 1) % self.check_every == 0
                         if self.adaptive_omega and _on_cycle and not _omega_capped and omega == 1.0:
                             # Only estimate while the unrelaxed iteration is contracting.

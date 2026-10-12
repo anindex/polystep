@@ -68,10 +68,10 @@ class Objective:
         if covered != self.dim:
             raise ValueError(f"shapes cover {covered} entries but dim is {self.dim}.")
         self.evals = 0
-        # Best-so-far is tracked on-device to avoid per-call host syncs. Read best_loss once at the end; use best_loss_t in a loop.
+        # Keep best_loss_t on-device; reading best_loss synchronizes with the host.
         self._best_loss_t: Optional[torch.Tensor] = None
         self._best_x_t: Optional[torch.Tensor] = None
-        #: The method's own current iterate. This is NOT best_x: for a population method, best_x is a sampled candidate displaced from the mean. Score both and select on validation.
+        #: Current iterate; best_x is a sampled candidate. Select between them on validation.
         self.iterate: Optional[torch.Tensor] = None
 
     @classmethod
@@ -94,7 +94,7 @@ class Objective:
         def fn(coords: torch.Tensor) -> torch.Tensor:
             return loss_batch(subspace.reconstruct_batch(projections, base_sd, coords))
 
-        # shapes tells EGGROLL's low-rank sampler where the matrix structure is in coordinate space: flat for HybridSubspace, (d_out, r) for FactoredSubspace.
+        # EGGROLL samples flat hybrid coordinates or matrix-shaped factored coordinates.
         factored = bool(getattr(subspace, "coords_are_factored", False))
         shapes = tuple(_coord_shape(spec, factored) for spec in subspace.specs)
         return cls(fn, subspace.subspace_dim, budget, shapes=shapes, subspace=subspace, deadline_s=deadline_s)
