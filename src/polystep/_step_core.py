@@ -7,6 +7,13 @@ import warnings
 import torch
 
 from ._compiled import normalize_rows
+from .dynamics import update_radius_multiplier, update_stagnation
+
+
+def epsilon_jumped(state, ot_epsilon: float) -> bool:
+    """Whether the solve epsilon moved more than 2x since the last solve, which stales the dual-momentum history."""
+    last = state.last_solve_eps
+    return last is not None and (ot_epsilon / last > 2.0 or last / ot_epsilon > 2.0)
 
 
 def warn_all_nonfinite(opt) -> None:
@@ -115,8 +122,6 @@ def record_saturation(opt, state, transport, step_radius) -> None:
 
 def update_stagnation_and_radius(opt, state, loss: float) -> None:
     """Advance the stagnation counter and, if enabled, the adaptive radius."""
-    from .dynamics import update_radius_multiplier, update_stagnation
-
     prev_loss = state.prev_loss
     state.stagnation_count, state.prev_loss = update_stagnation(
         loss,

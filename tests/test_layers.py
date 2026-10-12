@@ -17,7 +17,7 @@ class TestVmapSafeMultiHeadAttention:
         """Create a test attention module."""
         return VmapSafeMultiHeadAttention(embed_dim=64, num_heads=4)
 
-    def test_cross_attention_takes_the_query_length(self, attn):
+    def test_cross_attention_keeps_query_length(self, attn):
         """The upstream comparison below is self-attention only; cross-attention has to
         keep the query's sequence length, and the gradient has to reach the projections."""
         torch.manual_seed(0)
@@ -69,7 +69,7 @@ class TestVmapSafeMultiHeadAttention:
         expected, _ = reference(query, key, key, need_weights=False, **masks)
         torch.testing.assert_close(ours(query, key, key, **masks), expected)
 
-    def test_a_causal_mask_hides_later_positions(self, attn):
+    def test_causal_mask_hides_later_positions(self, attn):
         """Under a causal mask, position i attends only to 0..i, so changing the tail
         of the sequence must leave the earlier outputs bit-identical."""
         torch.manual_seed(0)
@@ -87,7 +87,7 @@ class TestVmapSafeMultiHeadAttention:
         torch.testing.assert_close(out_perturbed[:, :-3], out[:, :-3])
         assert not torch.allclose(out_perturbed[:, -1], out[:, -1]), "the tail should have moved"
 
-    def test_a_key_padding_mask_excludes_those_keys(self, attn):
+    def test_key_padding_mask_excludes_masked_keys(self, attn):
         """Masked keys must not reach the output, so changing them must change nothing."""
         torch.manual_seed(0)
         x = torch.randn(2, 10, 64)
@@ -133,6 +133,70 @@ class TestVmapSafeMultiHeadAttention:
         for i in range(num_models):
             single = forward_fn({k: v[i] for k, v in batched_params.items()}, x)
             torch.testing.assert_close(out[i], single, rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.parametrize("heads_mask", [False, True])
+    def test_float_padding_head_mask_match_pytorch(self, heads_mask):
+        reference = nn.MultiheadAttention(8, 2, batch_first=True).double().eval()
+        ours = VmapSafeMultiHeadAttention(8, 2).double().eval()
+        with torch.no_grad():
+            for index, layer in enumerate((ours.W_q, ours.W_k, ours.W_v)):
+                layer.weight.copy_(reference.in_proj_weight.chunk(3)[index])
+                layer.bias.copy_(reference.in_proj_bias.chunk(3)[index])
+            ours.W_o.load_state_dict(reference.out_proj.state_dict())
+        q, kv = torch.randn(2, 3, 8, dtype=torch.float64), torch.randn(2, 5, 8, dtype=torch.float64)
+        mask = torch.randn(4, 3, 5, dtype=torch.float64) if heads_mask else torch.zeros(3, 5, dtype=torch.float64)
+        padding = torch.tensor([[0.0, 0.0, -float("inf"), -0.4, 0.0], [0.0, -0.2, 0.0, 0.0, 0.0]], dtype=torch.float64)
+        expected = reference(q, kv, kv, attn_mask=mask, key_padding_mask=padding, need_weights=False)[0]
+        torch.testing.assert_close(ours(q, kv, kv, attn_mask=mask, key_padding_mask=padding), expected)
+
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")],
+            ),
+        ],
+    )
+    def test_fully_masked_attention_row_stays_finite(self, device):
+        """Softmax of an all -inf row is NaN, which would spread through the value mix."""
+        torch.manual_seed(0)
+        attn = VmapSafeMultiHeadAttention(embed_dim=8, num_heads=2).to(device)
+        x = torch.randn(2, 3, 8, device=device)
+        mask = torch.zeros(2, 3, dtype=torch.bool, device=device)
+        mask[1] = True  # every key of the second sequence is padding
+        assert torch.isfinite(attn(x, x, x, key_padding_mask=mask)).all()
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            dict(kdim=16),
+            dict(vdim=16),
+            dict(add_bias_kv=True),
+            dict(add_zero_attn=True),
+            dict(batch_first=False),
+        ],
+    )
+    def test_attention_rejects_unsupported_kwargs(self, kwargs):
+        """Constructor must raise a clear NotImplementedError for any
+        unsupported nn.MultiheadAttention argument."""
+        with pytest.raises(NotImplementedError, match="VmapSafeMultiHeadAttention"):
+            VmapSafeMultiHeadAttention(embed_dim=32, num_heads=4, **kwargs)
+
+    @pytest.mark.parametrize(
+        "forward_kwargs",
+        [
+            dict(need_weights=True),
+            dict(is_causal=True),
+        ],
+    )
+    def test_attention_rejects_forward_kwargs(self, forward_kwargs):
+        """Forward must reject need_weights / is_causal explicitly."""
+        attn = VmapSafeMultiHeadAttention(embed_dim=32, num_heads=4)
+        x = torch.randn(2, 5, 32)
+        with pytest.raises(NotImplementedError, match="VmapSafeMultiHeadAttention"):
+            attn(x, x, x, **forward_kwargs)
 
 
 class TestVmapSafeLSTMCell:
@@ -192,7 +256,6 @@ class TestVmapSafeLSTM:
         assert not torch.allclose(h_n, h0)
 
     def test_lstm_with_dropout(self):
-        """Test LSTM with dropout between layers."""
         lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=3, dropout=0.5)
         lstm.train()  # Enable dropout
         x = torch.randn(4, 10, 32)
@@ -270,3 +333,50 @@ class TestVmapSafeLSTM:
             row = forward_fn({k: v[i] for k, v in batched_params.items()}, x)
             torch.testing.assert_close(out[i], row, atol=1e-5, rtol=1e-5)
         assert not torch.allclose(out[0], out[1], atol=1e-6)
+
+    def test_lstm_state_deeper_than_layers_raises(self):
+        """Extra (h, c) layers would otherwise be dropped silently."""
+        lstm = VmapSafeLSTM(input_size=4, hidden_size=3, num_layers=1)
+        h = torch.zeros(2, 5, 3)
+        with pytest.raises(ValueError, match="initial h and c"):
+            lstm(torch.randn(5, 2, 4), (h, h.clone()))
+
+    def test_upstream_nn_lstm_fails_under_vmap(self):
+        """Documented PyTorch issue #105982, the reason VmapSafeLSTM exists.
+
+        Matching the specific error keeps this honest. A bare ``except Exception: pass``
+        passes on any failure, including a typo in the test itself, so it could never fail.
+        """
+        lstm = nn.LSTM(4, 8, num_layers=1, batch_first=True)
+        params = {k: v.detach() for k, v in lstm.named_parameters()}
+        buffers = {k: v.detach() for k, v in lstm.named_buffers()}
+        x = torch.randn(2, 5, 4)
+
+        def call(p):
+            return torch.func.functional_call(lstm, {**p, **buffers}, (x,))[0]
+
+        stacked = {k: torch.stack([v, v, v], dim=0) for k, v in params.items()}
+        with pytest.raises(
+            RuntimeError, match="Batching rule not implemented|does not support|Cannot access data pointer"
+        ):
+            torch.vmap(call, in_dims=(0,))(stacked)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            dict(bidirectional=True),
+            dict(proj_size=4),
+            dict(batch_first=False),
+        ],
+    )
+    def test_lstm_rejects_unsupported_kwargs(self, kwargs):
+        with pytest.raises(NotImplementedError, match="VmapSafeLSTM"):
+            VmapSafeLSTM(input_size=4, hidden_size=8, **kwargs)
+
+    def test_lstm_rejects_packed_sequence(self):
+        lstm = VmapSafeLSTM(input_size=4, hidden_size=8)
+        x = torch.randn(3, 5, 4)
+        lengths = torch.tensor([5, 3, 2])
+        packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        with pytest.raises(NotImplementedError, match="PackedSequence"):
+            lstm(packed)

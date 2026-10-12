@@ -20,6 +20,7 @@ from experiments.runners.run_controlled import (
     source_manifest,
 )
 from experiments.runners.run_practical import OUT, make_engine, host_data, points
+from experiments.scripts.controlled_diagnostics import arms_complete
 import torch
 
 
@@ -166,22 +167,8 @@ def result_path(task, axis, method, cfg, seed, stage):
 def campaign():
     manifest = [dict(task=t, axis=a, method=m, configs=list(points(t, m))) for t, a, m in groups()]
     atomic_json(OUT / "manifest.json", manifest)
-    # First complete the already-running controlled campaign. A PID alone is not
-    # a completion record, so a crashed predecessor leaves this queue waiting.
-    controlled = json.loads((RESULTS / "campaign_process.json").read_text())
-    while True:
-        ready = True
-        for arm in controlled["arms"]:
-            selected = RESULTS / "selected" / f"{arm}.json"
-            if not selected.exists():
-                ready = False
-                break
-            cfg = json.loads(selected.read_text())["config"]
-            if not all((RESULTS / "final" / arm / config_id(cfg) / f"{s}.json").exists() for s in FINAL_SEEDS):
-                ready = False
-                break
-        if ready:
-            break
+    # Wait for every controlled arm's selection and final seeds.
+    while not arms_complete():
         time.sleep(30)
     while not (RESULTS / "diagnostics/complete.json").exists():
         time.sleep(30)

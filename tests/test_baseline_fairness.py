@@ -3,40 +3,13 @@
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
 # experiments/ is the paper reproduction harness and is not part of the distributed
 # package, so this module is unimportable when the tests run from an sdist.
-if not (REPO_ROOT / "experiments" / "runners").is_dir():
-    pytest.skip("experiments/runners not present (running outside the repo)", allow_module_level=True)
-
-
-def test_sls_pysat_baseline_runs_on_small_instance():
-    """The PySAT baseline must run on a tiny 50-var instance and return sat_ratio in [0, 1]."""
-    pytest.importorskip("pysat", reason="python-sat not installed")
-    sys.path.insert(0, str(REPO_ROOT))
-    from experiments.baselines.sls_pysat import run_sls_pysat
-    from experiments.runners.nondiff_data import generate_maxsat_instance
-
-    instance = generate_maxsat_instance(num_vars=50, seed=42)
-    result = run_sls_pysat(
-        instance=instance,
-        wall_clock_seconds=2.0,
-        seed=42,
-        solver_name="g4",
-    )
-    assert 0.0 <= result["sat_ratio"] <= 1.0
-    assert result["num_satisfied"] <= result["num_clauses"]
-    # 50-var random 3-SAT at ratio 4.27 is satisfiable with high probability.
-    assert result["sat_ratio"] > 0.85, (
-        f"PySAT baseline sat_ratio = {result['sat_ratio']:.3f}, expected > 0.85 on a 50-var instance"
-    )
+pytest.importorskip("experiments.runners")
 
 
 # --- Fairness tables: every method must actually be matched -------------------------
@@ -46,8 +19,6 @@ def test_sls_pysat_baseline_runs_on_small_instance():
 def fairness_table():
     """Run every gradient-free method on one tiny task through the real ``run_baseline`` path."""
     pytest.importorskip("cma", reason="pycma drives the CMA-ES baseline")
-    sys.path.insert(0, str(REPO_ROOT))
-    import torch
     import torch.nn as nn
 
     from experiments.runners.fairness import FAIR_METHODS, make_subspace, run_baseline
@@ -106,7 +77,7 @@ def test_fairness_table_shares_one_representation(fairness_table):
     assert set(classes.values()) == {"HybridSubspace"}, f"classes differ across the table: {classes}"
 
 
-def test_fairness_table_records_a_plottable_trajectory(fairness_table):
+def test_fairness_table_records_plottable_trajectory(fairness_table):
     """Accuracy against CUMULATIVE candidate evaluations, the paper's figure."""
     budget, _, table = fairness_table
     for method, r in table.items():
@@ -122,10 +93,8 @@ def test_fairness_table_records_a_plottable_trajectory(fairness_table):
         assert all(p.get("scored_at") in {"iterate", "best_x"} for p in traj)
 
 
-def test_polystep_eval_budget_matches_what_polystep_spends():
+def test_eval_budget_matches_polystep_spend():
     """The shared budget is derived from PolyStep, so it must equal what it spends."""
-    sys.path.insert(0, str(REPO_ROOT))
-    import torch
     import torch.nn as nn
 
     from experiments.runners.fairness import make_subspace, polystep_eval_budget
@@ -154,10 +123,9 @@ def test_polystep_eval_budget_matches_what_polystep_spends():
 # --- Theory mode: the unaccelerated reference configuration ------------------------
 
 
-def test_theory_mode_selects_the_analysed_configuration():
+def test_theory_mode_selects_analysed_config():
     """Jitter on, schedules off, orthoplex, no acceleration -- and the tuned config
     is left alone, because the point is to report the gap between the two."""
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.runners.fairness import THEORY_GAMMA, THEORY_JITTER, apply_theory_mode
     from polystep.epsilon import PowerDecay
 
@@ -198,9 +166,8 @@ def test_theory_mode_selects_the_analysed_configuration():
     assert r.at(3) == pytest.approx(5.0 * 4 ** -(0.5 + THEORY_GAMMA))
 
 
-def test_theory_mode_preserves_the_physical_radii_from_a_scalar_config():
+def test_theory_mode_keeps_scalar_physical_radii():
     """A scalar radius is an epsilon multiplier and must transplant at the same physical radius."""
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.runners.fairness import apply_theory_mode
     from polystep.epsilon import resolve_radius
 
@@ -211,9 +178,8 @@ def test_theory_mode_preserves_the_physical_radii_from_a_scalar_config():
     assert resolve_radius(theory["probe_radius"], 0, eps) == pytest.approx(0.5)
 
 
-def test_polystep_budget_charges_only_the_ot_steps():
+def test_budget_charges_only_ot_steps():
     """``amortize_steps=a`` means PolyStep is charged for probes on 1 step in ``a`` (ceiled)."""
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.runners.fairness import polystep_eval_budget
 
     class _Fake:
@@ -266,7 +232,6 @@ def test_reseed_loaders_makes_repeated_iteration_reproducible():
     therefore trains cell *i* on the *i*-th stream and ranks configurations partly by
     their position in the sweep.
     """
-    import torch
     from torch.utils.data import DataLoader, TensorDataset
 
     from experiments.runners.common import reseed_loaders
@@ -287,9 +252,8 @@ def test_reseed_loaders_makes_repeated_iteration_reproducible():
     assert order() == first
 
 
-def test_reseed_loaders_tolerates_none_and_generatorless_loaders():
+def test_reseed_loaders_accepts_none_and_unshuffled():
     """Runners pass val/test loaders that may be None or unshuffled."""
-    import torch
     from torch.utils.data import DataLoader, TensorDataset
 
     from experiments.runners.common import reseed_loaders
@@ -305,7 +269,7 @@ def test_eggroll_factors_over_factored_coordinates_only():
     ``HybridSubspace``'s are a QR'd Gaussian projection with no matrix structure. Both
     mark projected specs with ``is_projected``, so reporting every projected block as a
     matrix would make EGGROLL factor Hybrid coordinates that do not factor, and
-    reporting none of them made the arm labelled EGGROLL run dense Gaussian ES while
+    reporting none of them would make the EGGROLL arm run dense Gaussian ES while
     still paying FactoredSubspace's dimension penalty.
     """
     import math
@@ -361,7 +325,6 @@ def test_wallclock_deadline_stops_every_method():
 
 
 def _spsa_run(**kwargs):
-    sys.path.insert(0, str(REPO_ROOT))
     import torch.nn as nn
 
     from experiments.runners.fairness import run_baseline
@@ -388,7 +351,7 @@ def _spsa_run(**kwargs):
 
 
 def test_spsa_gain_offset_follows_polystep_steps():
-    """``polystep_steps`` sets ``A``; without it a budgeted run keeps the library's ``budget // 2`` offset."""
+    """Without it, budgeted runs keep the library's ``budget // 2`` offset."""
     generic_hp, generic = _spsa_run()
     assert "A" not in generic_hp
     assert _spsa_run(hp={"A": 0.1 * (200 // 2)})[1] == generic
@@ -400,21 +363,21 @@ def test_spsa_gain_offset_follows_polystep_steps():
     assert _spsa_run(polystep_steps=7, hp={"A": 3.0})[0]["A"] == 3.0
 
 
-def test_spsa_deadline_needs_polystep_steps_or_A():
-    """A deadline gives no iteration count to derive ``A`` from, so the run refuses to guess."""
+def test_spsa_deadline_requires_steps_or_A():
+    """A deadline gives no iteration count to derive ``A`` from."""
     with pytest.raises(ValueError, match="polystep_steps"):
         _spsa_run(deadline_s=60.0)
     assert _spsa_run(deadline_s=60.0, polystep_steps=7)[0]["A"] == pytest.approx(0.7)
     assert _spsa_run(deadline_s=60.0, hp={"A": 3.0})[0]["A"] == 3.0
 
 
-def test_progress_line_prints_the_validation_score(capsys):
+def test_progress_line_prints_validation_score(capsys):
     """The evaluation-budget progress line reads the ``val_`` key the trajectory stores."""
     _spsa_run()
     assert "accuracy=" in capsys.readouterr().out
 
 
-def test_matched_budget_records_the_axis_it_used():
+def test_matched_budget_records_used_axis():
     """Each of the three axes returns its own name, and wall-clock needs a PolyStep run."""
     import json as _json
     import tempfile

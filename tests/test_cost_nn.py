@@ -2,6 +2,8 @@
 
 import inspect
 import warnings
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -14,6 +16,7 @@ from polystep.cost_nn import (
     BatchedLinearEvaluator,
     NNCostEvaluator,
     auto_detect_chunk_size,
+    cast_inputs_memo,
 )
 
 
@@ -97,7 +100,6 @@ class VmapIncompatibleModel(nn.Module):
 
 
 def test_batch_unflatten_shape():
-    """batch_unflatten returns correct shapes."""
     model = SimpleMLP()
     layout = ParamLayout.from_module(model)
     particle = layout.flatten(model)
@@ -153,9 +155,7 @@ class TestBatchUnflattenSharedParams:
         # unflatten still carries the alias: it feeds load_state_dict.
         assert "fc2.weight" in layout.unflatten(particle)
 
-    def test_a_tied_weight_evaluates_on_both_paths(self):
-        from polystep.cost_nn import NNCostEvaluator
-
+    def test_tied_weight_inplace_matches_vmap(self):
         torch.manual_seed(0)
         model = SharedWeightsModel()
         layout = ParamLayout.from_module(model)
@@ -180,8 +180,6 @@ class TestBatchUnflattenSharedParams:
 
 def test_evaluator_unsupervised():
     """Unsupervised loss (targets=None) works."""
-    from polystep.cost_nn import NNCostEvaluator
-
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
     layout = ParamLayout.from_module(model)
     particle = layout.flatten(model)
@@ -199,9 +197,6 @@ def test_evaluator_unsupervised():
 
 
 def test_evaluator_different_params_different_losses():
-    """Different params produce different losses."""
-    from polystep.cost_nn import NNCostEvaluator
-
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
     layout = ParamLayout.from_module(model)
     particle = layout.flatten(model)
@@ -221,8 +216,6 @@ def test_evaluator_different_params_different_losses():
 
 def test_evaluator_batchnorm():
     """Evaluator handles BatchNorm (frozen buffers)."""
-    from polystep.cost_nn import NNCostEvaluator
-
     model = MLPWithBatchNorm()
     # Run a forward pass in train mode to populate running stats
     model.train()
@@ -248,8 +241,6 @@ def test_evaluator_batchnorm():
 
 def test_evaluator_fallback_warning():
     """Fallback to loop with warning for vmap-incompatible model."""
-    from polystep.cost_nn import NNCostEvaluator
-
     model = VmapIncompatibleModel()
     layout = ParamLayout.from_module(model)
     particle = layout.flatten(model)
@@ -275,8 +266,6 @@ def test_evaluator_fallback_warning():
 
 def test_evaluator_no_grad():
     """Evaluation does not attach gradients to model params."""
-    from polystep.cost_nn import NNCostEvaluator
-
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
     layout = ParamLayout.from_module(model)
     particle = layout.flatten(model)
@@ -303,7 +292,7 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
         assert evaluator._batched_linear is not None
 
-    def test_use_inplace_wins_over_the_bmm_path(self):
+    def test_use_inplace_wins_over_bmm_path(self):
         """``use_inplace`` is a memory contract and must outrank the bmm fast path."""
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
@@ -322,7 +311,7 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         torch.testing.assert_close(evaluator.evaluate(params, x, y), reference)
 
     @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
-    def test_regression_losses_use_fast_path_and_match_vmap(self, loss_fn):
+    def test_regression_losses_fast_path_matches_vmap(self, loss_fn):
         """The bmm forward is loss-independent; only the reduction differs."""
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
@@ -416,7 +405,6 @@ def test_auto_detect_chunk_size_cpu():
 
 
 def test_evaluator_auto_chunk_size():
-    """NNCostEvaluator with chunk_size='auto' works correctly."""
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
     layout = ParamLayout.from_module(model)
     particle = layout.flatten(model)
@@ -440,7 +428,6 @@ def test_evaluator_auto_chunk_size():
 
 
 def test_auto_chunk_size_cached():
-    """Auto chunk_size should be computed once and cached."""
     model = nn.Linear(4, 2)
     evaluator = NNCostEvaluator(model, nn.MSELoss(), chunk_size="auto")
     cs1 = evaluator.chunk_size
@@ -450,20 +437,6 @@ def test_auto_chunk_size_cached():
     from polystep.cost_nn import _UNSET
 
     assert evaluator._chunk_size_cached is not _UNSET
-
-
-def _make_probe_setup(in_dim=4, hidden=8, out_dim=2, P=10, V=4, K=3):
-    """Helper: create model, layout, evaluator, and probe array."""
-    model = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, out_dim))
-    layout = ParamLayout.from_module(model)
-    p = layout.flatten(model)
-    D = p.shape[0] * p.shape[1]
-    X_probe = p.reshape(1, 1, 1, D).expand(P, V, K, D).clone()
-    X_probe += torch.randn(P, V, K, D) * 0.01
-    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
-    inputs = torch.randn(16, in_dim)
-    targets = torch.randint(0, out_dim, (16,))
-    return model, layout, evaluator, X_probe, inputs, targets
 
 
 def _chunk_bound_step(chunk_size):
@@ -487,7 +460,6 @@ def _chunk_bound_step(chunk_size):
 
 
 def test_fullspace_default_chunk_matches_explicit_chunk():
-    """Bounded default chunk must produce the same result as an explicit chunk."""
     loss_default = _chunk_bound_step(None)
     loss_explicit = _chunk_bound_step(500)
     assert abs(loss_default - loss_explicit) < 1e-4
@@ -523,3 +495,115 @@ def test_inplace_activations_defer_to_vmap(model):
 def test_docstring_names_every_constructor_argument():
     params = [p for p in inspect.signature(NNCostEvaluator.__init__).parameters if p != "self"]
     assert [p for p in params if f"{p}:" not in NNCostEvaluator.__doc__] == []
+
+
+class TestEvalModeEnforced:
+    """NNCostEvaluator must enforce eval mode even if user calls model.train()."""
+
+    def test_eval_mode_enforced_during_evaluation(self):
+        model = nn.Sequential(
+            nn.Linear(10, 20),
+            nn.BatchNorm1d(20),
+            nn.ReLU(),
+            nn.Linear(20, 2),
+        )
+        loss_fn = nn.CrossEntropyLoss()
+        evaluator = NNCostEvaluator(model, loss_fn)
+
+        model.train()
+        assert model.training
+
+        layout = ParamLayout.from_module(model)
+        flat = layout.flatten(model)
+        N = 4
+        flat_batch = flat.unsqueeze(0).repeat(N, 1, 1) + torch.randn(N, *flat.shape) * 0.01
+        stacked = layout.batch_unflatten(flat_batch)
+
+        inputs = torch.randn(8, 10)
+        targets = torch.randint(0, 2, (8,))
+
+        rm_before = model.state_dict()["1.running_mean"].clone()
+        evaluator.evaluate(stacked, inputs, targets)
+        rm_after = model.state_dict()["1.running_mean"]
+
+        assert torch.equal(rm_before, rm_after), "BatchNorm running stats were mutated during evaluation!"
+        assert model.training, "Model should be restored to train mode after evaluate()"
+
+    def test_eval_mode_restored_on_error(self):
+        model = nn.Linear(10, 2)
+
+        def bad_loss(output, targets):
+            raise ValueError("intentional")
+
+        evaluator = NNCostEvaluator(model, bad_loss)
+        model.train()
+        assert model.training
+
+        layout = ParamLayout.from_module(model)
+        flat = layout.flatten(model)
+        stacked = layout.batch_unflatten(flat.unsqueeze(0))
+
+        with pytest.raises(ValueError, match="intentional"):
+            evaluator.evaluate(stacked, torch.randn(1, 10), torch.zeros(1, dtype=torch.long))
+
+        assert model.training, "Model mode should be restored even after error"
+
+
+def test_inplace_evaluator_rejects_unknown_parameter_keys():
+    model = nn.Linear(4, 2)
+    evaluator = NNCostEvaluator(model, nn.MSELoss(), use_inplace=True)
+    stacked = {
+        "weight": model.weight.detach().unsqueeze(0).repeat(2, 1, 1),
+        "ghost": torch.zeros(2, 3),
+    }
+    with pytest.raises(ValueError, match="ghost"):
+        evaluator.evaluate(stacked, torch.randn(5, 4), torch.randn(5, 2))
+
+
+def test_dense_activation_batches_respect_chunk_size():
+    model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2))
+    ev = NNCostEvaluator(model, nn.MSELoss(), chunk_size=3, use_inplace=False)
+    params = {k: v.detach()[None] + torch.randn(8, *v.shape) * 0.1 for k, v in model.named_parameters()}
+    x, y = torch.randn(5, 3), torch.randn(5, 2)
+    with patch("torch.baddbmm", wraps=torch.baddbmm) as matmul:
+        got = ev.evaluate(params, x, y)
+    assert max(call.args[1].shape[0] for call in matmul.call_args_list) <= 3
+    torch.testing.assert_close(got, ev._evaluate_loop(params, x, y))
+
+
+@pytest.mark.parametrize("chunk", [0, -1, True, 2.5, "invalid"])
+def test_evaluator_rejects_invalid_chunks(chunk):
+    with pytest.raises(ValueError, match="chunk_size"):
+        NNCostEvaluator(nn.Linear(3, 2), nn.MSELoss(), chunk_size=chunk)
+
+
+def test_reset_recomputes_automatic_chunk_size():
+    ev = NNCostEvaluator(nn.Linear(3, 2), nn.MSELoss(), chunk_size="auto")
+    with patch("polystep.cost_nn.auto_detect_chunk_size", side_effect=[8, 2]):
+        assert ev.chunk_size == 8
+        ev.reset_vmap()
+        assert ev.chunk_size == 2
+
+
+@pytest.mark.parametrize("site", ["0.weight", "0.bias", "2.weight", "2.bias"])
+def test_dense_shared_weights_match_materialized_candidates(site):
+    model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2)).double()
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    params = {k: v.detach()[None].expand(8, *v.shape) for k, v in model.named_parameters()}
+    params[site] = params[site] + torch.randn_like(params[site]) * 0.1
+    x, y = torch.randn(5, 3).double(), torch.randn(5, 2).double()
+    expected = ev._evaluate_loop(params, x, y)
+    torch.testing.assert_close(ev.evaluate(params, x, y), expected, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(ev.evaluate({k: v.clone() for k, v in params.items()}, x, y), expected)
+
+
+@pytest.mark.parametrize("inference_tensor", [False, True])
+def test_cast_cache_observes_input_mutation(inference_tensor):
+    holder = SimpleNamespace()
+    with torch.inference_mode(inference_tensor):
+        inputs = torch.ones(2, dtype=torch.float64)
+        first = cast_inputs_memo(holder, inputs, torch.float32)
+        if not inference_tensor:
+            assert cast_inputs_memo(holder, inputs, torch.float32) is first
+        inputs.fill_(7)
+        torch.testing.assert_close(cast_inputs_memo(holder, inputs, torch.float32), torch.full((2,), 7.0))

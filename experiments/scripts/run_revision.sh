@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Full run of the benchmark grid under the honest protocol and matched budgets.
+# Full run of the benchmark grid under the validation-selected protocol and matched budgets.
 #
 # Harness settings are measured, not guessed (docs/performance.md):
-#   POLYSTEP_THREADS=8   fastest on this box; the torch default of nproc
+#   POLYSTEP_THREADS=8   fastest on a 24-core host; the torch default of nproc
 #                        oversubscribes the pool against the main thread and
 #                        OpenMP spin-wait takes over.
 #   OMP_WAIT_POLICY      set to PASSIVE in common.py at import, before torch
 #                        initializes its pool.
 #   3 workers            the step is GPU-bound at low memory, so concurrency
-#                        buys throughput; 3 x 8 threads fills the 24 cores.
+#                        buys throughput; 3 x 8 threads fill 24 cores.
 #
 # Every job runs --fair (same subspace, same candidate-evaluation budget, same
-# minibatch stream across gradient-free methods) and the default honest protocol
+# minibatch stream across gradient-free methods) and the default protocol
 # (val-selected checkpoint, test scored once).
 set -uo pipefail
 

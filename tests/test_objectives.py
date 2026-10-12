@@ -34,7 +34,7 @@ IDS = ["ackley2", "ackley5", "rosenbrock", "rastrigin", "styblinski", "levy", "g
 
 
 @pytest.mark.parametrize("factory,tol", ALL, ids=IDS)
-def test_declared_optimum_is_the_actual_optimum(factory, tol):
+def test_declared_optimum_is_actual_optimum(factory, tol):
     """``evaluate(optimizers)`` returns ``optimal_value``, at every declared optimizer."""
     obj = factory()
     values = obj.evaluate(obj.optimizers)
@@ -58,7 +58,7 @@ def test_optimum_beats_random_points_in_bounds(factory, tol):
 
 
 @pytest.mark.parametrize("factory,tol", ALL, ids=IDS)
-def test_declared_bounds_contain_the_declared_optimizers(factory, tol):
+def test_declared_bounds_contain_optimizers(factory, tol):
     obj = factory()
     assert obj.bounds.shape == (obj.dim, 2)
     assert obj.optimizers.shape[1] == obj.dim
@@ -75,14 +75,14 @@ def test_evaluate_is_batch_shape_preserving(factory, tol):
     assert obj.evaluate(X).shape == (3, 5)
 
 
-def test_negate_flips_the_sign():
+def test_negate_flips_sign():
     """``negate=True`` turns the minimization into a maximization."""
     plain, flipped = Sphere(dim=3), Sphere(dim=3, negate=True)
     X = torch.randn(8, 3, generator=torch.Generator().manual_seed(2))
     torch.testing.assert_close(flipped(X), -plain(X))
 
 
-def test_noise_is_additive_zero_mean_and_generator_seeded():
+def test_noise_additive_zero_mean_seeded():
     """``noise_std`` perturbs the cost reproducibly for a given generator."""
     clean, noisy = Sphere(dim=3), Sphere(dim=3, noise_std=0.5)
     X = torch.randn(4096, 3, generator=torch.Generator().manual_seed(3))
@@ -97,7 +97,7 @@ def test_noise_is_additive_zero_mean_and_generator_seeded():
     assert abs(residual.std().item() - 0.5) < 0.05
 
 
-def test_zero_noise_std_is_a_no_op():
+def test_zero_noise_std_is_noop():
     """``noise_std=0`` must take the clean path, not draw a zero-width normal."""
     X = torch.randn(16, 3, generator=torch.Generator().manual_seed(4))
     torch.testing.assert_close(Sphere(dim=3, noise_std=0.0)(X), Sphere(dim=3)(X))
@@ -107,3 +107,22 @@ def test_objective_fn_is_abstract():
     """``evaluate`` is the required hook; the base class must not be instantiable."""
     with pytest.raises(TypeError):
         ObjectiveFn(dim=2)
+
+
+def test_rosenbrock_dim1_raises():
+    """dim=1 makes Rosenbrock the zero function."""
+    with pytest.raises(ValueError, match="dim >= 2"):
+        Rosenbrock(dim=1)
+
+
+def test_cpu_generator_drives_noise_on_any_device():
+    """normal_ needs the generator on the tensor's device; the docs show a CPU one."""
+    fn = Sphere(dim=3, noise_std=0.5)
+    gen = torch.Generator().manual_seed(7)
+    assert torch.isfinite(fn(torch.zeros(4, 3), generator=gen)).all()
+
+
+def test_negated_objective_negates_optimum():
+    """An unnegated optimum puts regret of cost - optimal_value off by 2*optimal_value."""
+    plain, flipped = Rastrigin(dim=2), Rastrigin(dim=2, negate=True)
+    assert flipped.optimal_value == -plain.optimal_value

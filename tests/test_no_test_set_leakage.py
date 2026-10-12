@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+pytest.importorskip("experiments.runners")
 
 
 # --- (a) the val split reaches every method, not only polystep -------------
@@ -22,9 +22,8 @@ def _tiny_loaders():
     return DataLoader(ds, batch_size=2), DataLoader(ds, batch_size=2)
 
 
-def test_run_mnist_dispatch_gives_every_method_a_val_split(require_experiments, monkeypatch, tmp_path):
+def test_every_mnist_method_gets_val_split(monkeypatch, tmp_path):
     """run_method must hand the held-out split to every method, not only polystep."""
-    sys.path.insert(0, str(REPO_ROOT))
     import experiments.runners.run_mnist as run_mnist
 
     monkeypatch.setattr(run_mnist, "load_mnist", lambda **kwargs: _tiny_loaders())
@@ -48,7 +47,6 @@ def test_run_mnist_dispatch_gives_every_method_a_val_split(require_experiments, 
 
 
 def _write_result(results_dir, leaked):
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.runners.common import save_result
 
     return save_result(
@@ -68,9 +66,8 @@ def _write_result(results_dir, leaked):
     )
 
 
-def test_leaked_run_is_stamped_and_refused_by_the_aggregator(require_experiments, tmp_path):
+def test_aggregator_refuses_stamped_leaked_run(tmp_path):
     pytest.importorskip("pandas")
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.scripts.aggregate_results import LeakedResultError, aggregate_results
 
     path = _write_result(tmp_path, leaked=True)
@@ -80,9 +77,8 @@ def test_leaked_run_is_stamped_and_refused_by_the_aggregator(require_experiments
         aggregate_results(str(tmp_path))
 
 
-def test_honest_run_aggregates_on_the_selected_checkpoint(require_experiments, tmp_path):
+def test_honest_run_aggregates_selected_checkpoint(tmp_path):
     pytest.importorskip("pandas")
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.scripts.aggregate_results import aggregate_results
 
     path = _write_result(tmp_path, leaked=False)
@@ -95,7 +91,7 @@ def test_honest_run_aggregates_on_the_selected_checkpoint(require_experiments, t
     assert df.loc[0, "mean_accuracy"] == 0.9, "reported metric is not test_accuracy_at_selected"
 
 
-def test_markdown_tables_use_the_selected_checkpoint(require_experiments, tmp_path, monkeypatch):
+def test_markdown_tables_use_selected_checkpoint(tmp_path, monkeypatch):
     pytest.importorskip("pandas")
     from experiments.scripts import generate_tables as tables
 

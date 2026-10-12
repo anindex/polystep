@@ -37,7 +37,7 @@ def test_b_factors_have_orthonormal_rows():
         assert torch.allclose(B @ B.t(), torch.eye(r), atol=1e-5)
 
 
-def test_perturbation_is_linear_in_the_coordinates():
+def test_perturbation_linear_in_coordinates():
     """Linearity is what lets absorb and the displacement history stay valid."""
     _, subspace, projections, base = _setup()
     c1 = torch.randn(subspace.subspace_dim) * 0.1
@@ -52,8 +52,8 @@ def test_perturbation_is_linear_in_the_coordinates():
         assert torch.allclose(psum[key], expected, atol=1e-5)
 
 
-def test_factored_evaluator_matches_the_materialized_reference():
-    """The whole point: same losses, without ever building a candidate weight."""
+def test_factored_evaluator_matches_materialized_reference():
+    """Same losses without building a candidate weight."""
     model, subspace, projections, base = _setup()
     coords = torch.randn(5, subspace.subspace_dim) * 0.05
     inputs, targets = torch.randn(16, 1, 28, 28), torch.randint(0, 10, (16,))
@@ -70,7 +70,7 @@ def test_factored_evaluator_matches_the_materialized_reference():
 
 
 @pytest.mark.parametrize("polytope", ["simplex", "orthoplex"])
-def test_registered_step_matches_the_closure_only_step(polytope):
+def test_registered_step_matches_closure_step(polytope):
     """Contained runs score through the confined delta and runs that straddle two
     blocks through the low-rank evaluator; both must land where the closure does."""
 
@@ -112,7 +112,7 @@ def test_registered_step_matches_the_closure_only_step(polytope):
         (2048, 1, None, True),
     ],
 )
-def test_cuda_takes_the_delta_path_only_for_large_chunks(width, batch, chunk_size, uses_delta):
+def test_cuda_delta_path_only_for_large_chunks(width, batch, chunk_size, uses_delta):
     """The delta path launches more kernels per chunk, so on CUDA it waits until one
     default chunk cannot hold every candidate and each chunk carries enough activations."""
     torch.manual_seed(0)
@@ -134,7 +134,7 @@ def test_factored_evaluator_declines_unsupported_models():
     assert FactoredEvaluator.try_build(conv, nn.CrossEntropyLoss()) is None
 
 
-def test_rotation_is_disabled_by_default_and_deterministic_when_on():
+def test_rotation_defaults_off_and_is_deterministic():
     _, subspace, projections, _ = _setup()
     assert subspace.rotate_all(projections, step=5) is projections  # interval 0
 
@@ -150,7 +150,7 @@ def test_rotation_is_disabled_by_default_and_deterministic_when_on():
         assert torch.equal(once[key], twice[key])  # same step -> same basis
 
 
-def test_optimizer_falls_back_and_warns_for_an_unsupported_model():
+def test_unsupported_model_warns_and_falls_back():
     torch.manual_seed(0)
     model = nn.Sequential(nn.Conv2d(1, 2, 3), nn.Flatten(), nn.Linear(2 * 26 * 26, 10))
     layout = ParamLayout.from_module(model)
@@ -170,7 +170,7 @@ def test_optimizer_falls_back_and_warns_for_an_unsupported_model():
 
 
 @pytest.mark.filterwarnings("ignore:FactoredSubspace is in use:UserWarning")
-def test_a_frozen_parameter_edited_between_steps_keeps_the_edit():
+def test_frozen_param_edit_survives_step():
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
     model[0].weight.requires_grad_(False)
@@ -187,7 +187,7 @@ def test_a_frozen_parameter_edited_between_steps_keeps_the_edit():
     assert torch.all(model[0].weight == 0.5)
 
 
-def test_a_closure_step_after_release_evaluator_skips_the_low_rank_path():
+def test_closure_after_release_skips_low_rank():
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
     subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=2)
@@ -207,3 +207,20 @@ def test_a_closure_step_after_release_evaluator_skips_the_low_rank_path():
     assert factored._cast_cache is None
     assert torch.isfinite(torch.tensor(opt.step(closure)))
     assert opt._factored_evaluator is factored
+
+
+def test_vector_only_model_rotation_noop():
+    """Every parameter unprojected leaves ``init_projections()`` empty, so the
+    rotation must not reach for ``next(iter(...))`` on it.
+    """
+    model = nn.Module()
+    model.bias_only = nn.Parameter(torch.zeros(5))
+    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=2, rotation_interval=1)
+    projections = subspace.init_projections(device=torch.device("cpu"), dtype=torch.float32)
+
+    assert subspace.rotate_all(projections, step=1) is projections
+
+
+def test_factored_subspace_rejects_nonpositive_rank():
+    with pytest.raises(ValueError, match="rank"):
+        FactoredSubspace.from_layout(ParamLayout.from_module(nn.Linear(3, 2)), rank=0)

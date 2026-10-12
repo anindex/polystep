@@ -16,6 +16,15 @@ from polystep.geometry import (
 from polystep.solvers._shared import thin_qr
 
 
+def _mezzadri_qr(batch, d, generator):
+    Z = torch.randn(batch, d, d, generator=generator)
+    Q, R = torch.linalg.qr(Z)
+    diag = torch.diagonal(R, dim1=-2, dim2=-1)
+    Q = Q * torch.where(diag == 0, torch.ones_like(diag), torch.sign(diag)).unsqueeze(-2)
+    Q[:, :, 0] = Q[:, :, 0] * torch.where(torch.det(Q) < 0, -1.0, 1.0).unsqueeze(-1)
+    return Q
+
+
 class TestPolytopes:
     @pytest.mark.parametrize("dim", [2, 3, 4])
     @pytest.mark.parametrize(
@@ -30,7 +39,7 @@ class TestPolytopes:
 
     @pytest.mark.parametrize("dim", [2, 3, 5])
     @pytest.mark.parametrize("gen", [get_orthoplex_vertices, get_simplex_vertices, get_cube_vertices])
-    def test_every_vertex_sits_at_the_requested_radius(self, gen, dim):
+    def test_every_vertex_at_requested_radius(self, gen, dim):
         """step_radius is a distance, so the templates must be unit-norm before scaling.
 
         A template whose vertices are not all at radius 1 makes the realized step depend
@@ -42,14 +51,12 @@ class TestPolytopes:
         torch.testing.assert_close(norms, torch.full_like(norms, 2.5), rtol=1e-5, atol=1e-6)
 
     def test_orthoplex_centered_at_origin(self):
-        """Orthoplex vertices are centered at the origin."""
         dim = 5
         verts = get_orthoplex_vertices(dim, radius=1.0)
         mean = verts.mean(dim=0)
         assert torch.allclose(mean, torch.zeros(dim), atol=1e-6), f"Mean: {mean}"
 
     def test_simplex_equidistant(self):
-        """Simplex vertices are pairwise equidistant."""
         dim = 4
         verts = get_simplex_vertices(dim, radius=1.0)
 
@@ -67,8 +74,8 @@ class TestPolytopes:
 
 
 class TestRotations:
-    @pytest.mark.parametrize("dim", [3, 5, 8])
-    def test_rotation_matrix_is_in_so_d(self, dim):
+    @pytest.mark.parametrize("dim", [2, 3, 5, 8])
+    def test_rotation_matrix_in_so_d(self, dim):
         """Random rotation matrices are orthogonal (``R R^T = I``) and
         have determinant ``+1`` (SO(d), not O(d))."""
         gen = torch.Generator().manual_seed(42)
@@ -88,18 +95,10 @@ class TestRotations:
 
         Moments alone would pass on samplers that are merely orthogonal, so
         compare full distributions: a two-sample KS statistic on ``tr(R)`` and on
-        individual entries, against an old-vs-old control drawn from the
+        individual entries, against a reference-vs-reference control drawn from the
         reference sampler itself.
         """
         n = 20000
-
-        def reference(batch, d, generator):
-            Z = torch.randn(batch, d, d, generator=generator)
-            Q, R = torch.linalg.qr(Z)
-            diag = torch.diagonal(R, dim1=-2, dim2=-1)
-            Q = Q * torch.where(diag == 0, torch.ones_like(diag), torch.sign(diag)).unsqueeze(-2)
-            Q[:, :, 0] = Q[:, :, 0] * torch.where(torch.det(Q) < 0, -1.0, 1.0).unsqueeze(-1)
-            return Q
 
         def ks(a, b):
             a = a.sort().values
@@ -110,8 +109,8 @@ class TestRotations:
             return (fa - fb).abs().max().item()
 
         actual = get_random_rotation_matrices(n, dim, generator=torch.Generator().manual_seed(1))
-        expected = reference(n, dim, torch.Generator().manual_seed(2))
-        control = reference(n, dim, torch.Generator().manual_seed(3))
+        expected = _mezzadri_qr(n, dim, torch.Generator().manual_seed(2))
+        control = _mezzadri_qr(n, dim, torch.Generator().manual_seed(3))
 
         # KS 99.9% critical value for two samples of size n.
         crit = 1.95 * (2.0 / n) ** 0.5
@@ -120,9 +119,9 @@ class TestRotations:
             ("R[0,0]", lambda Q: Q[:, 0, 0]),
             ("R[2,1]", lambda Q: Q[:, 2, 1]),
         ):
-            d_new = ks(stat(actual), stat(expected))
+            d_actual = ks(stat(actual), stat(expected))
             d_ctl = ks(stat(control), stat(expected))
-            assert d_new < crit, f"{name}: KS={d_new:.5f} exceeds {crit:.5f} (control {d_ctl:.5f})"
+            assert d_actual < crit, f"{name}: KS={d_actual:.5f} exceeds {crit:.5f} (control {d_ctl:.5f})"
 
     def test_rotation_is_haar_distributed(self):
         """The Householder subgroup algorithm produces Haar-distributed ``O(d)``,
@@ -146,20 +145,7 @@ class TestRotations:
         rel_err = ((var - expected).abs() / expected).max().item()
         assert rel_err < 0.05, f"Var[R_ij] differs from 1/d by {rel_err * 100:.1f}%"
 
-    def test_rotation_2d_uses_analytical(self):
-        """Dim=2 rotation uses the analytical SO(2) path and produces
-        valid orthogonal matrices with ``det = +1``."""
-        gen = torch.Generator().manual_seed(42)
-        R = get_random_rotation_matrices(batch=3, dim=2, generator=gen)
-        assert R.shape == (3, 2, 2)
-
-        eye = torch.eye(2).unsqueeze(0).expand(3, -1, -1)
-        RtR = torch.bmm(R.transpose(-1, -2), R)
-        assert torch.allclose(RtR, eye, atol=1e-6)
-        assert torch.allclose(torch.det(R), torch.ones(3), atol=1e-6)
-
     def test_rotation_deterministic_with_generator(self):
-        """Same generator seed produces identical rotation matrices."""
         gen1 = torch.Generator().manual_seed(123)
         R1 = get_random_rotation_matrices(batch=5, dim=4, generator=gen1)
 
@@ -184,7 +170,7 @@ def test_rotation_matrix_2d_against_known_angles(theta, expected):
     assert torch.det(R) == pytest.approx(1.0, abs=1e-6)
 
 
-def test_small_batch_takes_qr_and_stays_haar_on_so():
+def test_small_batch_qr_matches_haar_sampler():
     """At or below ``_QR_MAX_BATCH`` one batched QR takes over from the reflection loop.
 
     The substitute has to be the same distribution, not merely orthogonal: assert it
@@ -193,17 +179,9 @@ def test_small_batch_takes_qr_and_stays_haar_on_so():
     """
     cap = _QR_MAX_BATCH[False]
 
-    def reference(batch, d, generator):
-        Z = torch.randn(batch, d, d, generator=generator)
-        Q, R = torch.linalg.qr(Z)
-        diag = torch.diagonal(R, dim1=-2, dim2=-1)
-        Q = Q * torch.where(diag == 0, torch.ones_like(diag), torch.sign(diag)).unsqueeze(-2)
-        Q[:, :, 0] = Q[:, :, 0] * torch.where(torch.det(Q) < 0, -1.0, 1.0).unsqueeze(-1)
-        return Q
-
     for dim in (3, 4, 8, 16):
         got = get_random_rotation_matrices(cap, dim, generator=torch.Generator().manual_seed(7))
-        want = reference(cap, dim, torch.Generator().manual_seed(7))
+        want = _mezzadri_qr(cap, dim, torch.Generator().manual_seed(7))
         torch.testing.assert_close(got, want, atol=0, rtol=0)
 
         eye = torch.eye(dim).expand(cap, dim, dim)

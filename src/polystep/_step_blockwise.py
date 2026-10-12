@@ -11,7 +11,7 @@ import torch
 
 from .blockwise import block_to_layout_columns, blocks_to_layout_flat, layout_flat_to_block_flat
 from .solvers._shared import loss_buffer_dtype, recenter_and_scale, sanitize_cost, solver_health
-from .epsilon import feed_solver_stats, radius_epsilon_factor
+from .epsilon import feed_solver_stats, radius_epsilon_factor, resolve_epsilon
 from .dynamics import (
     apply_momentum,
     compute_momentum_coefficient,
@@ -22,6 +22,7 @@ from ._step_core import (
     activation_elements,
     check_losses,
     chunk_spans,
+    epsilon_jumped,
     record_saturation,
     site_bounds,
     site_chunks,
@@ -53,13 +54,13 @@ class _BlockOutcome:
 
 def _resolve_geometry(opt, state, iteration):
     """Epsilon, OT epsilon and the two radii for this step."""
-    current_eps = opt._get_epsilon(iteration)
+    current_eps = resolve_epsilon(opt.epsilon, iteration, "epsilon")
     radius_mult = state.radius_multiplier if opt.use_adaptive_radius else 1.0
     step_r = opt._get_step_radius(iteration) * radius_epsilon_factor(opt.step_radius, current_eps) * radius_mult
     probe_r = opt._get_probe_radius(iteration) * radius_epsilon_factor(opt.probe_radius, current_eps) * radius_mult
     # Probe-radius jitter; no-op when probe_radius_jitter == 0.
     probe_r = opt._apply_probe_radius_jitter(probe_r)
-    ent_eps = opt._get_ent_epsilon(iteration)
+    ent_eps = resolve_epsilon(opt.ent_epsilon, iteration, "ent_epsilon")
     return current_eps, ent_eps if ent_eps is not None else current_eps, step_r, probe_r
 
 
@@ -123,8 +124,7 @@ def _solve_block(opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mat
                 init_g = init_g + opt._dual_momentum_beta * (init_g - ppg)
 
         # a defaults to uniform 1/P_block inside the solver; pass None to skip host-sync validation.
-        kwargs = dict(cost_matrix=solve_cost, init_f=init_f, init_g=init_g, scale_cost=opt.scale_cost)
-        ot_result = opt.solver.solve(**kwargs)
+        ot_result = opt.solver.solve(cost_matrix=solve_cost, init_f=init_f, init_g=init_g, scale_cost=opt.scale_cost)
         X_new_block = opt._compiled.barycentric_projection(ot_result.matrix, X_vertices)
 
     record_saturation(opt, state, ot_result.matrix, step_r)
@@ -150,14 +150,6 @@ def _solve_block(opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mat
         n_iters=ot_result.n_iters,
         weight=cost_matrix.numel(),
     )
-
-
-def _reset_dual_momentum_on_epsilon_jump(state, ot_epsilon):
-    """A large epsilon change makes the stored duals a bad extrapolation base."""
-    if state.last_solve_eps is not None and (
-        ot_epsilon / state.last_solve_eps > 2.0 or state.last_solve_eps / ot_epsilon > 2.0
-    ):
-        state._prev_prev_block_duals = None
 
 
 def _finish_step(opt, state, X, X_new_full, outcomes, iteration, current_eps, ot_epsilon) -> float:
@@ -288,7 +280,8 @@ def step_blockwise(opt, closure: Callable) -> float:
     layout_columns = block_to_layout_columns(blocks, opt.layout, device)
     batch_buf = None
 
-    _reset_dual_momentum_on_epsilon_jump(state, ot_epsilon)
+    if epsilon_jumped(state, ot_epsilon):
+        state._prev_prev_block_duals = None
     descent_dirs = getattr(opt, "_prev_block_descent_directions", None)
     outcomes = []
 

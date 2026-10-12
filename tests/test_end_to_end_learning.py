@@ -48,7 +48,7 @@ def _subspace(kind, model):
 
 
 @pytest.mark.parametrize("kind", [None, "adaptive", "hybrid", "factored"])
-def test_optimizer_learns_a_separable_classification_task(kind):
+def test_optimizer_learns_separable_classification(kind):
     """Loss falls and accuracy beats chance, through every subspace path."""
     X, y = _blobs()
     model = _model()
@@ -82,7 +82,7 @@ def test_optimizer_learns_a_separable_classification_task(kind):
     assert final_acc > start_acc, f"accuracy did not improve: {start_acc:.3f} -> {final_acc:.3f}"
 
 
-def test_a_zero_step_radius_does_not_learn():
+def test_zero_step_radius_does_not_learn():
     """Guards the test above: with no movement allowed, its thresholds must not be met.
 
     The weights still drift by ~1e-7 at ``step_radius=0``: reconstructing

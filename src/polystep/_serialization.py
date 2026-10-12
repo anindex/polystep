@@ -4,13 +4,15 @@ import warnings
 
 import torch
 
+from .projection import SparseRandomProjection
+
 
 # state_dict schema version. Bump when a key changes meaning.
 _STATE_DICT_FORMAT = 6
 
-# Optimizer attributes outside SolverState that steer the *next* step.
 _SPARSE_TAG = "__sparse_projection__"
 
+# Optimizer attributes outside SolverState that steer the *next* step.
 _CONTROL_STATE_KEYS = (
     "_amortize_counter",
     "_transport_direction_ema",
@@ -36,8 +38,6 @@ class SerializationMixin:
 
     def state_dict(self) -> dict:
         """Serialize the resumable optimizer state (not the model weights)."""
-
-        from .projection import SparseRandomProjection
 
         def _ser(v):
             if isinstance(v, torch.Tensor):
@@ -100,8 +100,6 @@ class SerializationMixin:
         if saved_rank is not None and saved_rank != self._applied_rank and self.subspace is not None:
             self._transition_rank(saved_rank)
 
-        from .projection import SparseRandomProjection
-
         def _de(v):
             if isinstance(v, torch.Tensor):
                 # copy: a same-device .to() returns the checkpoint's own tensor, which gets written in place.
@@ -157,7 +155,7 @@ class SerializationMixin:
             self._prev_block_descent_directions = None
 
         # The fused block-diagonal projection caches the step-0 basis; the checkpoint carries a later one.
-        if self._hybrid and hasattr(self.subspace, "build_fused_projection"):
+        if self._hybrid:
             projections = self._state.hybrid_projections
             if projections:
                 self.subspace.build_fused_projection(projections)

@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from aggregate_results import load_single_result  # noqa: E402
+from aggregate_results import load_single_result
 
 
 DEFAULT_CUTOFF = "2026-08-01T11:02:28Z"

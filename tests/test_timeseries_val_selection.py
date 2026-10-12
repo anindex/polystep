@@ -4,26 +4,22 @@ ETTh1 is a regression benchmark, so ES/SPSA reach it via their ``eval_fn`` rathe
 than the classification baselines' ``val_loader``; these checks guard that plumbing.
 """
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+pytest.importorskip("experiments.runners")
 
 
 @pytest.fixture
-def rt(require_experiments):
-    sys.path.insert(0, str(REPO_ROOT))
+def rt():
     import experiments.runners.run_timeseries as module
 
     return module
 
 
-def test_dispatch_gives_every_method_the_val_split_and_the_guard(rt, monkeypatch, tmp_path):
+def test_dispatch_passes_val_split_and_guard(rt, monkeypatch, tmp_path):
     """audit_no_leakage and the val split must reach every method, not only polystep."""
     series = np.zeros(300, dtype=np.float32)
     monkeypatch.setattr(rt, "load_etth1", lambda: (series, series + 1, series + 2, {}))
@@ -54,7 +50,7 @@ class _ConstantForecaster(nn.Module):
         return self.c.expand(x.shape[0], 96)
 
 
-def test_selector_picks_the_best_val_checkpoint_not_the_best_test_one(rt):
+def test_selector_picks_best_val_not_test(rt):
     """A checkpoint worse on val must not be reported, however good it looks on test.
 
     val is the all-zero series and test the all-ten series, so the constant that

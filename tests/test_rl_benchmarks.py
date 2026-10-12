@@ -7,7 +7,7 @@ import pytest
 import torch
 
 
-def test_rl_metrics_include_save_result_required_keys():
+def test_rl_metrics_include_save_result_keys():
     from polystep.benchmarks.rl.metrics import build_rl_metrics
 
     metrics = build_rl_metrics(
@@ -72,7 +72,7 @@ def test_gym_vector_evaluator_crn_determinism():
     ev.close()
 
 
-def test_gym_vector_evaluator_reuses_envs_per_size():
+def test_gym_evaluator_reuses_envs_per_size():
     pytest.importorskip("gymnasium")
     from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
     from polystep.benchmarks.rl.policies import DiscreteMLPPolicy, stack_module_params
@@ -304,15 +304,13 @@ def test_hardened_env_smoke(require_experiments):
         e.close()
 
 
-def test_goal_reaching_success_is_not_inverted():
+def test_acrobot_success_means_goal_reached():
     """Acrobot success must mean reaching the goal, not timing out at the horizon.
 
     The default flag is ``lengths >= horizon``, which is right for balancing
     tasks and exactly backwards for goal-reaching ones.
     """
     pytest.importorskip("gymnasium")
-    import torch
-
     from polystep.benchmarks.rl.gym_evaluator import GymVectorEvaluator
 
     acrobot = GymVectorEvaluator("Acrobot-v1", rollouts_per_candidate=2)

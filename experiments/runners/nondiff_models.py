@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from polystep.benchmarks.utils import LIFNeuron
+
 
 __all__ = [
     "LIFNeuron",
@@ -28,8 +30,6 @@ __all__ = [
     "STETernary",
     "BinaryLinearSTE",
     "TernaryLinearSTE",
-    "BinaryConv2d",
-    "BinaryConv2dSTE",
     "BinaryMNISTNetSTE",
     "TernaryMNISTNetSTE",
     "DiscreteAttention",
@@ -39,38 +39,12 @@ __all__ = [
     "HardMoELayer",
     "HardMoENet",
     "MaxSATModel",
-    "evaluate_sat_loss",
-    "cra_penalty",
     "SmoothLIFNeuron",
     "SmoothSpikingMNISTNet",
     "SmoothQuantizedMLP",
     "SmoothDiscreteAttentionNet",
     "SmoothStaircaseNet",
-    "SoftMoELayer",
-    "SoftMoENet",
-    "compute_expert_utilization",
-    "HardPermutationNet",
-    "SoftPermutationNet",
-    "PermutationLoss",
 ]
-
-
-class LIFNeuron(nn.Module):
-    """Leaky Integrate-and-Fire neuron with hard threshold spike.
-
-    d(spike)/d(membrane) = 0 everywhere except at the discontinuity.
-    """
-
-    def __init__(self, beta: float = 0.95, threshold: float = 1.0):
-        super().__init__()
-        self.beta = beta
-        self.threshold = threshold
-
-    def forward(self, x: torch.Tensor, mem: torch.Tensor):
-        mem = self.beta * mem + x
-        spike = (mem >= self.threshold).float()  # NON-DIFFERENTIABLE
-        mem = mem * (1.0 - spike)
-        return spike, mem
 
 
 INIT_SCALE = 0.1  # every quantizing layer below initializes at randn * INIT_SCALE
@@ -212,34 +186,6 @@ class TernaryLinearSTE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w_t = STETernary.apply(self.weight, self.threshold)  # STE in backward pass
         return x @ w_t.t() + self.bias
-
-
-class BinaryConv2dSTE(nn.Module):
-    """Conv2d with binary weights via STE for gradient-based training."""
-
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, padding: int = 0):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.1)
-        self.bias = nn.Parameter(torch.zeros(out_channels))
-        self.padding = padding
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_b = STESign.apply(self.weight)  # STE in backward pass
-        return F.conv2d(x, w_b, self.bias, padding=self.padding)
-
-
-class BinaryConv2d(nn.Module):
-    """Conv2d with binary weights via sign(). NON-DIFFERENTIABLE."""
-
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, padding: int = 0):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.1)
-        self.bias = nn.Parameter(torch.zeros(out_channels))
-        self.padding = padding
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_b = torch.sign(self.weight)  # NON-DIFFERENTIABLE
-        return F.conv2d(x, w_b, self.bias, padding=self.padding)
 
 
 class DiscreteAttention(nn.Module):
@@ -594,168 +540,6 @@ class SmoothStaircaseNet(nn.Sequential):
         )
 
 
-class SoftMoELayer(nn.Module):
-    """Differentiable analog of HardMoELayer: softmax gating instead of top-1 argmax."""
-
-    def __init__(self, input_dim: int, hidden_dim: int, num_experts: int = 4):
-        super().__init__()
-        self.gate = nn.Linear(input_dim, num_experts)
-        self.experts = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(input_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, hidden_dim),
-                )
-                for _ in range(num_experts)
-            ]
-        )
-        self.num_experts = num_experts
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_logits = self.gate(x)  # (batch, num_experts)
-        weights = F.softmax(gate_logits, dim=-1)  # DIFFERENTIABLE soft routing
-        all_outputs = torch.stack([e(x) for e in self.experts], dim=1)  # (batch, num_experts, hidden_dim)
-        return (all_outputs * weights.unsqueeze(-1)).sum(dim=1)  # (batch, hidden_dim)
-
-
-class SoftMoENet(nn.Module):
-    """HardMoENet with SoftMoELayer, same parameter count; Adam ceiling."""
-
-    def __init__(
-        self,
-        input_dim: int = 784,
-        hidden_dim: int = 128,
-        num_classes: int = 20,
-        num_experts: int = 4,
-    ):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.relu = nn.ReLU()
-        self.moe = SoftMoELayer(hidden_dim, hidden_dim, num_experts)
-        self.fc_out = nn.Linear(hidden_dim, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.reshape(x.shape[0], -1)
-        x = self.relu(self.fc1(x))
-        x = self.moe(x)  # DIFFERENTIABLE softmax gating
-        return self.fc_out(x)
-
-
-@torch.no_grad()
-def compute_expert_utilization(model, test_loader, device):
-    """Per-expert routing statistics for a HardMoENet-style model on the test set.
-
-    Returns per-expert shares, the max share, a collapse flag (max share > 0.40),
-    and routing entropy (raw and normalized).
-    """
-    import math
-
-    model.eval()
-    expert_counts = {}
-    total = 0
-
-    for data, _ in test_loader:
-        data = data.to(device)
-        x = data.reshape(data.shape[0], -1)
-        x = torch.relu(model.fc1(x))
-        gate_logits = model.moe.gate(x)
-        expert_idx = gate_logits.argmax(dim=-1)  # (batch,)
-        for idx in expert_idx.tolist():
-            expert_counts[idx] = expert_counts.get(idx, 0) + 1
-        total += data.shape[0]
-
-    utilization = {f"expert_{k}": v / total for k, v in sorted(expert_counts.items())}
-    max_share = max(utilization.values()) if utilization else 0.0
-    collapsed = max_share > 0.40
-
-    # Routing entropy: -sum(p * log(p)), clamped to 0 for numerical stability
-    entropy = max(0.0, -sum(p * math.log(p + 1e-10) for p in utilization.values()))
-    num_experts = len(utilization) if utilization else 1
-    max_entropy = math.log(num_experts) if num_experts > 1 else 1.0
-
-    model.train()
-
-    return {
-        "expert_utilization": utilization,
-        "max_expert_share": max_share,
-        "collapsed": collapsed,
-        "routing_entropy": entropy,
-        "normalized_entropy": entropy / max_entropy if max_entropy > 0 else 0.0,
-    }
-
-
-class HardPermutationNet(nn.Module):
-    """Maps an input sequence to a sorting permutation via a shared MLP + row-wise argmax.
-
-    NON-DIFFERENTIABLE.
-    """
-
-    def __init__(self, N, hidden_dim=64):
-        super().__init__()
-        self.N = N
-        self.mlp = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, N),
-        )
-
-    def forward(self, x):
-        # x: (batch, N) sequences of numbers
-        batch = x.shape[0]
-        x_flat = x.reshape(-1, 1)  # (batch*N, 1)
-        scores = self.mlp(x_flat)  # (batch*N, N)
-        score_matrix = scores.reshape(batch, self.N, self.N)  # (batch, N, N)
-        # Transpose: we need score_matrix[output_pos][input_pos] so argmax gives
-        # "which input goes to this output position" (argsort convention).
-        score_matrix = score_matrix.transpose(-1, -2)
-        perm = score_matrix.argmax(dim=-1)  # NON-DIFFERENTIABLE
-        return perm  # (batch, N) long
-
-
-class SoftPermutationNet(nn.Module):
-    """Soft permutation via log-domain Sinkhorn normalization (Gumbel-Sinkhorn Adam baseline).
-
-    Same MLP as HardPermutationNet, but produces a doubly-stochastic matrix,
-    converted to a hard permutation at evaluation via the Hungarian algorithm.
-    """
-
-    def __init__(self, N, hidden_dim=64, n_sinkhorn_iters=20, tau=1.0):
-        super().__init__()
-        self.N = N
-        self.n_iters = n_sinkhorn_iters
-        self.tau = tau
-        self.mlp = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, N),
-        )
-
-    def sinkhorn_normalize(self, log_alpha):
-        """Log-domain Sinkhorn: alternating row/col logsumexp normalization."""
-        for _ in range(self.n_iters):
-            log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)
-            log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)
-        return torch.exp(log_alpha)
-
-    def forward(self, x):
-        batch = x.shape[0]
-        x_flat = x.reshape(-1, 1)
-        scores = self.mlp(x_flat)
-        score_matrix = scores.reshape(batch, self.N, self.N)
-        # Transpose: Sinkhorn + bmm(P, x) needs P[output_pos][input_pos].
-        soft_perm = self.sinkhorn_normalize(score_matrix.transpose(-1, -2) / self.tau)
-        return soft_perm  # (batch, N, N) doubly-stochastic
-
-
-class PermutationLoss(nn.Module):
-    """Fraction of incorrect position assignments; non-differentiable."""
-
-    def forward(self, pred_perm, target_perm):
-        # pred_perm, target_perm: (batch, N) long tensors
-        return (pred_perm != target_perm).float().mean()
-
-
 class MaxSATModel(nn.Module):
     """MAX-SAT via continuous relaxation: sigmoid for [0,1], round() for hard {0,1} evaluation."""
 
@@ -786,34 +570,3 @@ class MaxSATModel(nn.Module):
 
         unsat_ratio = 1.0 - satisfied.mean()
         return unsat_ratio
-
-
-def cra_penalty(
-    soft_assignments: torch.Tensor,
-    alpha: int = 2,
-) -> torch.Tensor:
-    """Continuous Relaxation Annealing penalty: pushes assignments toward {0, 1}.
-
-    (1 - (2*x - 1)^alpha).sum(): 0 at x in {0, 1}, 1 per element at x = 0.5.
-    """
-    return (1.0 - (2.0 * soft_assignments - 1.0) ** alpha).sum()
-
-
-def evaluate_sat_loss(
-    assignments_soft: torch.Tensor,
-    clause_vars: torch.Tensor,
-    clause_signs: torch.Tensor,
-    cra_lambda: float = 0.1,
-    cra_alpha: int = 2,
-) -> torch.Tensor:
-    """Combined MAX-SAT loss: unsat_ratio + cra_lambda * CRA penalty."""
-    hard = torch.round(assignments_soft)  # {0, 1}
-
-    gathered = hard[clause_vars]
-    literals = gathered * clause_signs + (1.0 - clause_signs) * (1.0 - gathered)
-    satisfied = (literals > 0.5).any(dim=-1).float()
-    unsat_ratio = 1.0 - satisfied.mean()
-
-    penalty = cra_penalty(assignments_soft, alpha=cra_alpha)
-
-    return unsat_ratio + cra_lambda * penalty

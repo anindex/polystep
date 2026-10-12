@@ -9,7 +9,7 @@ from polystep.cost_nn import NNCostEvaluator
 
 
 def test_amortize_steps_alternates_ot_and_momentum():
-    """With amortize_steps=3, only steps 0 and 3 evaluate the objective (closure calls counted)."""
+    """With amortize_steps=3, only steps 0 and 3 call the closure."""
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     optimizer = PolyStepOptimizer(
@@ -39,44 +39,6 @@ def test_amortize_steps_alternates_ot_and_momentum():
             evaluated_on.append(step)
 
     assert evaluated_on == [0, 3], f"expected OT on steps 0 and 3, got {evaluated_on}"
-
-
-def test_amortize_steps_model_updates_on_momentum():
-    """Model params should change on momentum steps too."""
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
-    optimizer = PolyStepOptimizer(
-        model,
-        epsilon=0.5,
-        step_radius=0.5,
-        num_probe=1,
-        compile=False,
-        seed=42,
-        amortize_steps=2,
-    )
-
-    inputs = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    loss_fn = nn.CrossEntropyLoss()
-
-    def closure(batched_params):
-        evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
-        return evaluator.evaluate(batched_params, inputs, targets)
-
-    cost1 = optimizer.step(closure)
-    assert torch.isfinite(torch.tensor(cost1)), f"Cost is not finite: {cost1}"
-    params_after_ot = {k: v.clone() for k, v in model.named_parameters()}
-
-    cost2 = optimizer.step(closure)
-    assert torch.isfinite(torch.tensor(cost2)), f"Cost is not finite: {cost2}"
-    params_after_momentum = {k: v.clone() for k, v in model.named_parameters()}
-
-    changed = False
-    for k in params_after_ot:
-        if not torch.equal(params_after_ot[k], params_after_momentum[k]):
-            changed = True
-            break
-    assert changed, "Model params should change on momentum step"
 
 
 def test_ema_transport_direction_stored():
@@ -168,10 +130,12 @@ def test_momentum_step_reuses_last_cost():
     assert torch.isfinite(torch.tensor(cost1)), f"Cost is not finite: {cost1}"
 
     X_before = optimizer._state.X.clone()
+    params_before = [p.detach().clone() for p in model.parameters()]
     cost2 = optimizer.step(closure)
     assert torch.isfinite(torch.tensor(cost2)), f"Cost is not finite: {cost2}"
     assert cost2 == cost1
     assert not torch.equal(X_before, optimizer._state.X)
+    assert any(not torch.equal(a, b) for a, b in zip(params_before, model.parameters()))
 
 
 def test_adaptive_probe_reduces_probes():
@@ -207,7 +171,7 @@ def test_adaptive_probe_reduces_probes():
     assert optimizer._loss_decreasing_count >= 1, "decreasing-loss tracking never fired"
 
 
-def test_amortize_cost_batch_and_biased_rotation_compose():
+def test_amortize_cost_batch_biased_rotation_compose():
     torch.manual_seed(42)
     model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 2))
     loss_fn = nn.CrossEntropyLoss()
@@ -235,3 +199,96 @@ def test_amortize_cost_batch_and_biased_rotation_compose():
         costs.append(cost)
 
     assert not all(c == costs[0] for c in costs), "Cost should change over steps"
+
+
+def test_noamort_never_takes_momentum_step():
+    """With amortize_steps=1, every step should be a full OT step."""
+    model = nn.Sequential(nn.Linear(10, 5), nn.ReLU(), nn.Linear(5, 2))
+    optimizer = PolyStepOptimizer(
+        model,
+        epsilon=0.5,
+        step_radius=1.0,
+        num_probe=1,
+        sinkhorn_max_iters=20,
+        amortize_steps=1,
+    )
+    loss_fn = nn.CrossEntropyLoss()
+    evaluator = NNCostEvaluator(model, loss_fn)
+    inputs = torch.randn(4, 10)
+    targets = torch.randint(0, 2, (4,))
+
+    def closure(bp):
+        return evaluator.evaluate(bp, inputs, targets)
+
+    n_steps = 5
+    for _ in range(n_steps):
+        optimizer.step(closure)
+
+    assert optimizer._transport_direction_ema is None, "amortize_steps=1 should never populate _transport_direction_ema"
+    assert optimizer._state.iteration_count == n_steps, (
+        f"Expected {n_steps} OT iterations, got {optimizer._state.iteration_count}"
+    )
+
+
+def test_resync_forces_next_step_evaluation():
+    """resync_from_model clears the amortized state."""
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2)
+    opt = PolyStepOptimizer(model, seed=0, amortize_steps=2)
+    calls = [0]
+
+    def counting(params):
+        calls[0] += 1
+        v = next(iter(params.values()))
+        return v.reshape(v.shape[0], -1).pow(2).sum(1)
+
+    opt.step(counting)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.fill_(7.0)
+    opt.resync_from_model()
+    # Both must clear, or the next step coasts along a direction measured at the
+    # old anchor.
+    assert opt._transport_direction_ema is None
+    assert opt._amortize_counter == 0
+
+    calls[0] = 0
+    opt.step(counting)
+    assert calls[0] > 0
+
+
+def test_probe_count_drops_on_negative_descent():
+    """K reduction keys off descent, not sign.
+
+    RL returns and margin losses are routinely negative. Gating the trigger on
+    ``all(c > 0)`` would make those objectives pay the full ``K`` forward passes forever.
+    """
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2)
+    opt = PolyStepOptimizer(
+        model,
+        compile=False,
+        num_probe=3,
+        adaptive_num_probe=True,
+        adaptive_probe_warmup=0,
+        seed=0,
+    )
+
+    # A quadratic offset below zero: minimizable, and always negative.
+    def closure(batched):
+        return sum(v.flatten(1).pow(2).sum(dim=1) for v in batched.values()) - 1000.0
+
+    for _ in range(8):
+        opt.step(closure)
+
+    assert all(c < 0 for c in opt._ot_step_costs), "objective was meant to stay negative"
+    assert opt._loss_decreasing_count >= 3, "descent on a negative objective never registered"
+
+
+def test_amortized_step_reports_no_convergence():
+    """No solve runs, so True would mislead early-stop callbacks."""
+    torch.manual_seed(0)
+    opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, amortize_steps=2)
+    for _ in range(3):
+        opt.step(lambda p: torch.full((next(iter(p.values())).shape[0],), 1.0))
+    assert not all(opt.state.linear_convergence)

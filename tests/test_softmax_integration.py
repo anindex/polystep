@@ -58,13 +58,11 @@ class TestSolverSelection:
     """Verify default solver auto-selection and explicit overrides."""
 
     def test_full_space_defaults_to_sinkhorn(self):
-        """No subspace -> SinkhornSolver by default."""
         model = _make_model()
         opt = PolyStepOptimizer(model)
         assert isinstance(opt.solver, SinkhornSolver)
 
-    def test_a_subspace_defaults_to_softmax(self, model, layout):
-        """Subspace -> SoftmaxSolver by default."""
+    def test_subspace_defaults_to_softmax(self, model, layout):
         sub = HybridSubspace.from_layout(layout, rank=4, rotation_interval=0)
         opt = PolyStepOptimizer(model, subspace=sub)
         assert isinstance(opt.solver, SoftmaxSolver)
@@ -74,13 +72,11 @@ class TestProgressiveEpsilonBlocking:
     """Verify ProgressiveEpsilon is blocked with softmax solver."""
 
     def test_progressive_epsilon_with_softmax_raises(self, model):
-        """ProgressiveEpsilon with solver='softmax' raises ValueError."""
         eps = ProgressiveEpsilon(init=0.1, target=0.01, max_epsilon=0.5)
         with pytest.raises(ValueError, match="ProgressiveEpsilon"):
             PolyStepOptimizer(model, solver="softmax", epsilon=eps)
 
     def test_progressive_epsilon_with_sinkhorn_ok(self, model):
-        """ProgressiveEpsilon with solver='sinkhorn' does NOT raise."""
         eps = ProgressiveEpsilon(init=0.1, target=0.01, max_epsilon=0.5)
         opt = PolyStepOptimizer(model, solver="sinkhorn", epsilon=eps)
         assert opt._progressive_epsilon is eps
@@ -96,35 +92,14 @@ class TestProgressiveEpsilonBlocking:
 class TestSoftmaxFunctionalStep:
     """Verify softmax solver works through full optimizer step pipeline."""
 
-    def test_step_with_softmax_returns_finite(self, model, closure):
-        """Softmax step returns finite loss value."""
-        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
-        loss = opt.step(closure)
-        assert math.isfinite(loss)
-        assert not (loss != loss), "Loss is NaN"
-
-    def test_step_updates_model_params(self, model, closure):
-        """Softmax step actually updates model parameters."""
-        initial_params = {k: v.clone() for k, v in model.state_dict().items()}
-        opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
-        opt.step(closure)
-        changed = False
-        for k, v in model.state_dict().items():
-            if not torch.equal(v, initial_params[k]):
-                changed = True
-                break
-        assert changed, "Model parameters did not change after softmax step"
-
-    def test_state_f_g_none_after_softmax_solve(self, model, closure):
-        """After softmax solve step, state.f and state.g are None."""
+    def test_softmax_step_leaves_duals_none(self, model, closure):
         opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         opt.step(closure)
         state = opt._state
         assert state.f is None, "state.f should be None after softmax solve"
         assert state.g is None, "state.g should be None after softmax solve"
 
-    def test_state_f_g_tensor_after_sinkhorn_solve(self, model, closure):
-        """After sinkhorn solve step, state.f and state.g are tensors."""
+    def test_sinkhorn_step_stores_dual_tensors(self, model, closure):
         opt = PolyStepOptimizer(model, solver="sinkhorn", epsilon=0.5)
         opt.step(closure)
         state = opt._state
@@ -166,7 +141,6 @@ class TestSubspaceModes:
             assert math.isfinite(loss)
 
     def test_hybrid_subspace_with_sinkhorn_override(self, model, layout):
-        """HybridSubspace with solver='sinkhorn' override works."""
         sub = HybridSubspace.from_layout(layout, rank=4, rotation_interval=0)
         opt = PolyStepOptimizer(model, subspace=sub, solver="sinkhorn", epsilon=0.5)
         assert isinstance(opt.solver, SinkhornSolver)
@@ -176,7 +150,6 @@ class TestSubspaceModes:
 
 
 def test_fixed_epsilon_with_softmax(model):
-    """Fixed float epsilon works with softmax solver."""
     opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
     closure = _make_closure(model)
     loss = opt.step(closure)
@@ -201,7 +174,7 @@ def test_dual_momentum_with_softmax_keeps_stepping(model, closure):
 class TestFusedSoftmaxDispatch:
     """Verify fused softmax fast path activation and correctness."""
 
-    def test_fused_softmax_path_active_with_softmax_solver(self, model, layout):
+    def test_fused_softmax_path_active_for_softmax(self, model, layout):
         """Fused path is active when solver='softmax' with subspace."""
         sub = HybridSubspace.from_layout(layout, rank=4)
         opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.5)
@@ -215,12 +188,10 @@ class TestFusedSoftmaxDispatch:
         assert not torch.equal(before, _flat_params(model))
 
     def test_fused_softmax_path_inactive_with_sinkhorn(self, model):
-        """Fused path is NOT active when solver='sinkhorn'."""
         opt = PolyStepOptimizer(model, solver="sinkhorn", epsilon=0.5)
         assert opt._use_fused_softmax is False, "_use_fused_softmax should be False for sinkhorn solver"
 
-    def test_fused_path_with_turbo_features(self, model, layout):
-        """Fused path works with biased_rotation + amortization."""
+    def test_fused_path_with_biased_rotation_amortization(self, model, layout):
         sub = HybridSubspace.from_layout(layout, rank=4)
         opt = PolyStepOptimizer(
             model,
@@ -238,7 +209,6 @@ class TestFusedSoftmaxDispatch:
         assert not torch.equal(before, _flat_params(model))
 
     def test_fused_path_monolithic_no_subspace(self, model):
-        """Fused path works in monolithic mode without subspace."""
         opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         assert opt._use_fused_softmax is True
         closure = _make_closure(model)
@@ -271,7 +241,6 @@ class TestSoftmaxEdgeCases:
 
         loss = optimizer.step(closure)
         assert math.isfinite(loss)
-        assert loss == loss, "Loss should not be NaN"
 
     def test_no_gradient_leakage(self):
         """After softmax optimizer.step(), all param.grad is None."""

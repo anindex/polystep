@@ -7,13 +7,46 @@ import logging
 import os
 import warnings
 from dataclasses import dataclass, fields as dataclass_fields
-from typing import Callable, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-if TYPE_CHECKING:
-    from .cost_nn import NNCostEvaluator
+from ._compiled import CompiledFunctions
+from ._step_core import invalidate_for_basis_change
+from .blockwise import (
+    BlockConfig,
+    create_grouped_blocks,
+    create_per_layer_blocks,
+)
+from .cost_nn import (
+    FactoredEvaluator,
+    NNCostEvaluator,
+    SiteVmapEvaluator,
+    SparseDeltaEvaluator,
+    SubspaceDeltaEvaluator,
+    _reuse_prefixes,
+)
+from .epsilon import LinearEpsilon, ProgressiveEpsilon
+from .geometry import POLYTOPE_MAP
+from .projection import SparseRandomProjection
+from .solvers import (
+    KLSoftmaxSolver,
+    MinCostGreedySolver,
+    SinkhornSolver,
+    SoftmaxSolver,
+    TopKMeanSolver,
+)
+from .solver import SolverState
+from .adaptive_subspace import AdaptiveSubspace
+from .factored_subspace import FactoredSubspace
+from .hybrid_subspace import HybridSubspace
+from ._serialization import SerializationMixin
+from .transform import ParamLayout, create_generator
+
+from ._step_monolithic import step_monolithic as _step_monolithic_fn
+from ._step_blockwise import step_blockwise as _step_blockwise_fn
+from ._step_momentum import step_momentum as _step_momentum_fn
 
 logger = logging.getLogger(__name__)
 
@@ -45,34 +78,6 @@ def _select_projection_type(
     else:
         return "dense"
 
-
-from ._compiled import CompiledFunctions
-from ._step_core import invalidate_for_basis_change
-from .blockwise import (
-    BlockConfig,
-    create_grouped_blocks,
-    create_per_layer_blocks,
-)
-from .epsilon import LinearEpsilon, ProgressiveEpsilon
-from .geometry import POLYTOPE_MAP
-from .solvers import (
-    KLSoftmaxSolver,
-    MinCostGreedySolver,
-    SinkhornSolver,
-    SoftmaxSolver,
-    TopKMeanSolver,
-)
-from .solver import SolverState
-from .solvers._shared import validate_positive
-from .adaptive_subspace import AdaptiveSubspace
-from .factored_subspace import FactoredSubspace
-from .hybrid_subspace import HybridSubspace
-from ._serialization import SerializationMixin
-from .transform import ParamLayout, create_generator
-
-from ._step_monolithic import step_monolithic as _step_monolithic_fn
-from ._step_blockwise import step_blockwise as _step_blockwise_fn
-from ._step_momentum import step_momentum as _step_momentum_fn
 
 _THREAD_WARNING_ISSUED = False
 
@@ -654,7 +659,6 @@ class PolyStepOptimizer(SerializationMixin):
         self._adaptive = isinstance(subspace, AdaptiveSubspace)
 
         self._hybrid = isinstance(subspace, HybridSubspace)
-        self._hybrid_subspace = subspace if self._hybrid else None
 
         # FactoredSubspace shares HybridSubspace's per-layer projection protocol.
         self._factored = isinstance(subspace, FactoredSubspace)
@@ -792,7 +796,7 @@ class PolyStepOptimizer(SerializationMixin):
         # the compiled kernel.
         self._use_fused_softmax = isinstance(self.solver, SoftmaxSolver)
 
-        self._compiled = CompiledFunctions(compile=compile and torch.cuda.is_available())
+        self._compiled = CompiledFunctions(compile=compile)
 
         # Created early so AdaptiveSubspace init can use it.
         self._generator: Optional[torch.Generator] = None
@@ -825,8 +829,6 @@ class PolyStepOptimizer(SerializationMixin):
 
         if self._adaptive:
             if self._actual_projection_type == "sparse":
-                from .projection import SparseRandomProjection
-
                 self._state.projection = SparseRandomProjection(
                     full_dim=subspace.full_dim,
                     subspace_dim=subspace.subspace_dim,
@@ -952,12 +954,6 @@ class PolyStepOptimizer(SerializationMixin):
         """Actual projection type in use ('dense' or 'sparse')."""
         return self._actual_projection_type
 
-    def _get_epsilon(self, iteration: int) -> float:
-        """Resolve epsilon at current iteration."""
-        if hasattr(self.epsilon, "at"):
-            return validate_positive(self.epsilon.at(iteration), "epsilon")
-        return validate_positive(self.epsilon, "epsilon")
-
     def _get_step_radius(self, iteration: int) -> float:
         """Resolve step_radius at current iteration (supports schedule objects)."""
         if hasattr(self.step_radius, "at"):
@@ -1046,27 +1042,14 @@ class PolyStepOptimizer(SerializationMixin):
         )
         return X + (1.0 + etas) * (X_bary - X)
 
-    def _get_ent_epsilon(self, iteration: int) -> Optional[float]:
-        """Resolve ent_epsilon at current iteration."""
-        if self.ent_epsilon is None:
-            return None
-        if hasattr(self.ent_epsilon, "at"):
-            return validate_positive(self.ent_epsilon.at(iteration), "ent_epsilon")
-        return validate_positive(self.ent_epsilon, "ent_epsilon")
-
     def _bf16_supported(self) -> bool:
         """Whether BF16 is supported on the model's device."""
         try:
             device = next(self.model.parameters()).device
         except StopIteration:
             return False
-        if device.type == "cuda":
-            # Also covers emulated bf16 on older cards.
-            return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        elif device.type == "cpu":
-            return True  # may be slower without AMX
-        else:
-            return True  # let PyTorch error if unsupported
+        # Also covers emulated bf16 on older cards.
+        return device.type != "cuda" or (torch.cuda.is_available() and torch.cuda.is_bf16_supported())
 
     @property
     def compile_evaluator(self) -> bool:
@@ -1172,8 +1155,6 @@ class PolyStepOptimizer(SerializationMixin):
             self._sparse_delta_evaluator = None
             self._subspace_delta_evaluator = None
             if not hasattr(self, "_site_vmap_evaluator"):
-                from .cost_nn import SiteVmapEvaluator
-
                 self._site_vmap_evaluator = (
                     SiteVmapEvaluator.try_build(evaluator, self.layout)
                     if self.subspace is None or self._hybrid
@@ -1185,8 +1166,6 @@ class PolyStepOptimizer(SerializationMixin):
         # FactoredSubspace can score through the low-rank identity, never building a
         # candidate weight.
         if self._factored and not hasattr(self, "_factored_evaluator"):
-            from .cost_nn import FactoredEvaluator
-
             self._factored_evaluator = FactoredEvaluator.try_build(evaluator.model, evaluator.loss_fn)
             if self._factored_evaluator is None:
                 warnings.warn(
@@ -1198,16 +1177,12 @@ class PolyStepOptimizer(SerializationMixin):
         # Full-space candidates perturb one contiguous run, so only the perturbed tensor
         # needs batching.
         if self.subspace is None and not hasattr(self, "_sparse_delta_evaluator"):
-            from .cost_nn import SiteVmapEvaluator, SparseDeltaEvaluator
-
             self._sparse_delta_evaluator = SparseDeltaEvaluator.try_build(
                 evaluator.model, evaluator.loss_fn, self.layout
             )
             # Batches only the perturbed tensor; covers what the delta path declines.
             self._site_vmap_evaluator = SiteVmapEvaluator.try_build(evaluator, self.layout)
         if self._per_layer_projections and not hasattr(self, "_subspace_delta_evaluator"):
-            from .cost_nn import SiteVmapEvaluator, SubspaceDeltaEvaluator
-
             self._subspace_delta_evaluator = SubspaceDeltaEvaluator.try_build(
                 evaluator.model, evaluator.loss_fn, self.subspace
             )
@@ -1305,34 +1280,24 @@ class PolyStepOptimizer(SerializationMixin):
             # trust-region comparison.
             self._prev_predicted_improvement = None
             self._prev_pre_step_loss = None
-            result = self._step_momentum(closure)
+            result = _step_momentum_fn(self)
             self._amortize_counter += 1
             return result
 
         if self._blocks is not None:
             result = self._step_blockwise(closure)
         else:
-            result = self._step_monolithic(closure, screen_closure)
+            result = _step_monolithic_fn(self, closure, screen_closure)
 
         self._amortize_counter += 1
         return result
 
-    def _step_monolithic(self, closure: Callable, screen_closure: Optional[Callable] = None) -> float:
-        """Monolithic step: one OT solve over all particles, or one per row segment."""
-        return _step_monolithic_fn(self, closure, screen_closure)
-
     def _step_blockwise(self, closure: Callable) -> float:
         """Block-wise step: per-block OT solve."""
-        from .cost_nn import _reuse_prefixes
-
         with _reuse_prefixes(
             getattr(self, "_sparse_delta_evaluator", None), getattr(self, "_site_vmap_evaluator", None)
         ):
             return _step_blockwise_fn(self, closure)
-
-    def _step_momentum(self, closure: Callable) -> float:
-        """Cheap step: reapply the last direction with decay, no forward passes."""
-        return _step_momentum_fn(self, closure)
 
     def _transition_rank(self, new_rank: int) -> None:
         """Absorb the perturbation, then rebuild the subspace at ``new_rank``."""
@@ -1400,7 +1365,6 @@ class PolyStepOptimizer(SerializationMixin):
         )
         # The fused matrix is per basis; rebuild it for the new rank's shape.
         self.subspace.build_fused_projection(state.hybrid_projections)
-        self._hybrid_subspace = self.subspace
 
         num_points = state.X.shape[0]
 

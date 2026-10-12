@@ -75,7 +75,6 @@ class TestFeatureInteractions:
         assert len(opt.state.costs) == 5
 
     def test_subspace_blockwise_combined(self, simple_mlp, make_closure):
-        """Subspace + blockwise combined mode runs without error."""
         torch.manual_seed(42)
         model = simple_mlp
         layout = ParamLayout.from_module(model)
@@ -93,7 +92,6 @@ class TestFeatureInteractions:
         assert opt.state.iteration_count == 1
 
     def test_blockwise_with_adaptive_via_train_api(self):
-        """Blockwise + adaptive radius via high-level train() API."""
         torch.manual_seed(42)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
         X = torch.randn(32, 4)
@@ -119,7 +117,6 @@ class TestFeatureInteractions:
         assert 0.5 <= opt.state.radius_multiplier <= 3.0
 
     def test_subspace_momentum_via_train_api(self):
-        """Subspace + momentum via high-level train() API."""
         torch.manual_seed(42)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
         layout = ParamLayout.from_module(model)

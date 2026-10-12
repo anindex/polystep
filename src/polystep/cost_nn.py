@@ -105,22 +105,6 @@ def _max_norm_weights(model: nn.Module) -> list[torch.Tensor]:
     ]
 
 
-def _uniform_float_dtype(*param_sources) -> Optional[torch.dtype]:
-    """The one float dtype every parameter shares, or None if they differ.
-
-    None means the model casts internally, so the caller must not touch dtypes.
-    """
-    seen = set()
-    for src in param_sources:
-        values = src.values() if isinstance(src, dict) else [src]
-        for v in values:
-            if isinstance(v, torch.Tensor) and v.is_floating_point():
-                seen.add(v.dtype)
-    if len(seen) != 1:
-        return None
-    return seen.pop()
-
-
 def _builtin_loss_kind(loss_fn) -> Optional[str]:
     """Name an unmodified cross-entropy, MSE, or L1 loss at any reduction, else None.
 
@@ -1304,6 +1288,28 @@ def _resolve_layout_entry(self, offsets: torch.Tensor, pdim: int, span=None):
     return entry
 
 
+def _owning_spec(subspace, lo: int, hi: int, sub_dim: int):
+    """The per-layer spec owning coordinates ``[lo, hi)``, or None if they straddle.
+
+    Coordinates past ``sub_dim`` are particle padding with nothing behind them.
+    """
+    hi = min(hi, sub_dim)
+    for spec in subspace.specs:
+        if spec.flat_start <= lo and hi <= spec.flat_end:
+            return spec
+    return None
+
+
+def _linear_sites(layer_keys) -> dict:
+    """``entry_key -> (index into layer_keys, is_weight)`` for every Linear weight and bias."""
+    sites = {}
+    for idx, (name, tag, _) in enumerate(layer_keys):
+        if tag == "linear":
+            sites[f"{name}.weight"] = (idx, True)
+            sites[f"{name}.bias"] = (idx, False)
+    return sites
+
+
 class SiteVmapEvaluator:
     """Evaluate candidates that all perturb one parameter tensor, batching only it.
 
@@ -1319,7 +1325,8 @@ class SiteVmapEvaluator:
         layout,
         buffers: dict,
         per_sample: bool = False,
-        owner: "NNCostEvaluator | None" = None,
+        *,
+        owner: NNCostEvaluator,
     ):
         self.model = model
         self.loss_fn = loss_fn
@@ -1354,7 +1361,7 @@ class SiteVmapEvaluator:
 
     def _retired(self) -> bool:
         """Whether a vmap failure has sent this path back to the dense one."""
-        return self._owner is not None and self._owner._vmap_failed
+        return self._owner._vmap_failed
 
     def resolve_site(self, offsets: torch.Tensor, pdim: int, span=None):
         """The one layout entry this chunk perturbs, or None to use the dense path."""
@@ -1363,17 +1370,10 @@ class SiteVmapEvaluator:
         return _resolve_layout_entry(self, offsets, pdim, span)
 
     def resolve_spec(self, subspace, lo: int, hi: int, sub_dim: int):
-        """The per-layer spec owning coordinates ``[lo, hi)``, or None if they straddle.
-
-        Coordinates past ``sub_dim`` are particle padding with nothing behind them.
-        """
+        """The per-layer spec owning coordinates ``[lo, hi)``, or None if they straddle or this path is retired."""
         if self._retired():
             return None
-        hi = min(hi, sub_dim)
-        for spec in subspace.specs:
-            if spec.flat_start <= lo and hi <= spec.flat_end:
-                return spec
-        return None
+        return _owning_spec(subspace, lo, hi, sub_dim)
 
     @torch.inference_mode()
     def evaluate_subspace(self, projections, base_sd, coords, bary_sd, spec, col_start, values, inputs, targets=None):
@@ -1473,9 +1473,7 @@ class SiteVmapEvaluator:
 
         # Repeat evaluate()'s cast/autocast frame here. Cast to the model's dtype, not
         # the site's: the perturbed layer need not be the one the input reaches first.
-        cast_to = self._owner._input_dtype(base_sd) if self._owner is not None else _uniform_float_dtype(shared, site)
-        if cast_to is not None and inputs.is_floating_point() and inputs.dtype != cast_to:
-            inputs = self._owner.cast_inputs(inputs, cast_to) if self._owner is not None else inputs.to(cast_to)
+        inputs = self._owner.cast_inputs(inputs, self._owner._input_dtype(base_sd))
 
         # Repeat evaluate()'s eval-mode frame, or train-mode dropout stays live.
         was_training = model.training
@@ -1491,7 +1489,7 @@ class SiteVmapEvaluator:
         saved = [b.clone() for b in self._buffers.values()]
         try:
             batched = vmap(single_eval, in_dims=(0, None, None, None), randomness=self._randomness)
-            if self._owner is not None and self._owner._compile_vmap and key not in self._compile_failed_sites:
+            if self._owner._compile_vmap and key not in self._compile_failed_sites:
                 try:
                     if key not in self._compiled_sites:
                         # Shared weights, buffers and data are explicit arguments: no
@@ -1519,8 +1517,7 @@ class SiteVmapEvaluator:
                 self._randomness = "different"
                 self._compiled_sites.clear()
                 return self._vmap_over_site(key, base_sd, site, inputs, targets)
-            if self._owner is not None:
-                self._owner._vmap_failed = True
+            self._owner._vmap_failed = True
             warnings.warn(
                 f"vmap failed on the site-aware path for {type(model).__name__}: {e}. "
                 "Falling back to a sequential loop; later chunks use the dense path.",
@@ -1686,12 +1683,7 @@ class SparseDeltaEvaluator:
         self.loss_fn = loss_fn
         self.loss_kind = loss_kind
         self._layer_keys = layer_keys
-        # entry_key -> (index into _layer_keys, is_weight)
-        self._site = {}
-        for idx, (name, tag, _) in enumerate(layer_keys):
-            if tag == "linear":
-                self._site[f"{name}.weight"] = (idx, True)
-                self._site[f"{name}.bias"] = (idx, False)
+        self._site = _linear_sites(layer_keys)
         self._entry_by_key = {e.key: e for e in layout.entries}
         # Flat spans of the entries this path can perturb, for the containment test.
         self._starts = [e.offset for e in layout.entries]
@@ -1771,12 +1763,7 @@ class SubspaceDeltaEvaluator:
         self.loss_fn = loss_fn
         self.loss_kind = loss_kind
         self._layer_keys = layer_keys
-        # entry_key -> (index into _layer_keys, is_weight)
-        self._site = {}
-        for idx, (name, tag, _) in enumerate(layer_keys):
-            if tag == "linear":
-                self._site[f"{name}.weight"] = (idx, True)
-                self._site[f"{name}.bias"] = (idx, False)
+        self._site = _linear_sites(layer_keys)
 
     @classmethod
     def try_build(cls, model: nn.Module, loss_fn: Callable, subspace) -> "SubspaceDeltaEvaluator | None":
@@ -1802,11 +1789,8 @@ class SubspaceDeltaEvaluator:
 
         Coordinates past ``sub_dim`` are particle padding with nothing behind them.
         """
-        hi = min(hi, sub_dim)
-        for spec in subspace.specs:
-            if spec.flat_start <= lo and hi <= spec.flat_end:
-                return spec if spec.entry_key in self._site else None
-        return None
+        spec = _owning_spec(subspace, lo, hi, sub_dim)
+        return spec if spec is not None and spec.entry_key in self._site else None
 
     def _basis_products(self, spec, P, col_start, n_cols, x):
         """``(n_cols, d_out, B)`` holding ``x @ M_j.T`` for the column run at ``col_start``.
@@ -1952,8 +1936,6 @@ class FactoredEvaluator:
                         shared = False
                     else:
                         base = base + torch.bmm(x @ B.t(), A.transpose(1, 2))
-                elif not shared:
-                    pass  # unperturbed layer, base already has the candidate dim
                 x = base
 
                 if b_key in base_sd:

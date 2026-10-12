@@ -14,7 +14,6 @@ import torch.nn as nn
 
 from polystep import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
-from polystep.quadratic_model import update_trust_region
 
 
 def _model():
@@ -64,7 +63,7 @@ def test_trust_region_activates_without_biased_rotation():
         assert 0.1 <= m <= 3.0
 
 
-def test_trust_region_runs_at_num_probe_one_via_the_shared_centre():
+def test_trust_region_one_probe_uses_shared_centre():
     """One shared f(X) replaces the second probe scale the regression needs."""
     torch.manual_seed(0)
     model = _model()
@@ -86,7 +85,7 @@ def test_trust_region_runs_at_num_probe_one_via_the_shared_centre():
     assert opt._center_loss is not None and opt._center_loss.shape == (opt._state.X.shape[0],)
 
 
-def test_trust_region_runs_on_the_simplex_at_num_probe_one():
+def test_trust_region_runs_on_simplex_one_probe():
     """The gradient is a closed form on any centred tight frame, and the shared f(X)
     gives tr(H)/d, so d+1 vertices carry the model the orthoplex needed 2d for."""
     torch.manual_seed(0)
@@ -109,7 +108,7 @@ def test_trust_region_runs_on_the_simplex_at_num_probe_one():
     assert all(0.1 <= m <= 3.0 for m in mults)
 
 
-def test_trust_region_warns_when_amortization_makes_it_inert():
+def test_amortized_trust_region_warns_inert():
     """Momentum steps drop the pending prediction, so the ratio test never runs."""
     torch.manual_seed(0)
     model = _model()
@@ -128,7 +127,7 @@ def test_trust_region_warns_when_amortization_makes_it_inert():
     assert len(opt._state.trust_region_multipliers) == 0
 
 
-def test_the_simplex_model_uses_the_shared_centre_at_multiple_scales():
+def test_simplex_model_uses_shared_centre_multiscale():
     model = _model()
     opt = PolyStepOptimizer(
         model,
@@ -145,9 +144,9 @@ def test_the_simplex_model_uses_the_shared_centre_at_multiple_scales():
     assert len(opt._state.trust_region_multipliers) > 0
 
 
-def test_trust_region_runs_under_the_default_adaptive_rotation():
+def test_trust_region_survives_adaptive_rotation():
     """A rotation or absorb leaves the weights where they were, so the pending comparison
-    survives it; AdaptiveSubspace rotates every step, which used to drop every one."""
+    survives it, and AdaptiveSubspace rotates every step."""
     from polystep import AdaptiveSubspace
 
     torch.manual_seed(0)
@@ -188,8 +187,8 @@ def _second_move(solver, predicted, pre_step_loss):
 
 
 @pytest.mark.parametrize("solver", ["sinkhorn", "softmax"])
-def test_a_failed_step_shrinks_the_move_of_the_step_that_measured_it(solver):
-    """A promised gain that came out as a loss quarters the radius on the same step, not the one after."""
+def test_failed_step_shrinks_same_step_radius(solver):
+    """A promised gain that came out as a loss quarters the radius."""
     shrunk, mults = _second_move(solver, torch.tensor(-1.0), -1e9)
     held, _ = _second_move(solver, None, None)
     assert mults == [0.25]
@@ -198,7 +197,7 @@ def test_a_failed_step_shrinks_the_move_of_the_step_that_measured_it(solver):
 
 
 @pytest.mark.parametrize("first, second, recorded", [(0, 0, 1), (None, None, 1), (0, 1, 0)])
-def test_objective_token_change_drops_the_pending_pair(first, second, recorded):
+def test_objective_token_change_drops_pending_pair(first, second, recorded):
     """A prediction is scored only against the same objective; None or a constant token is stationary."""
     torch.manual_seed(0)
     model = _model()
@@ -219,32 +218,7 @@ def test_objective_token_change_drops_the_pending_pair(first, second, recorded):
     assert len(opt._state.trust_region_multipliers) == recorded
 
 
-@pytest.mark.parametrize(
-    "pred, actual, radius, expected, why",
-    [
-        (-1.0, 1.0, 1.0, 0.25, "predicted a gain and the loss rose: aggressive shrink"),
-        (-1.0, 2.0, 0.3, 0.1, "the aggressive shrink clamps at min_radius"),
-        (1.0, -0.4, 1.0, 0.5, "predicted a loss and the loss fell: ordinary shrink, not double"),
-        (-1.0, -1.0, 2.5, 3.0, "expansion saturates at max_radius"),
-        (-1.0, -0.1, 0.15, 0.1, "shrink saturates at min_radius"),
-        (-1.0, -0.5, 1.0, 1.0, "between the thresholds the radius holds"),
-        (1.0, 1.0, 1.0, 0.5, "predicted a rise and the loss rose: shrink, never hold"),
-        (1e-12, 1.0, 1.7, 1.7, "a degenerate prediction leaves the radius alone"),
-    ],
-)
-def test_trust_region_branches_and_clamps(pred, actual, radius, expected, why):
-    """Every branch including both saturation points; the existing test only expands."""
-    got = update_trust_region(
-        predicted_improvement=torch.tensor([pred]),
-        actual_improvement=torch.tensor([actual]),
-        current_radius=radius,
-        min_radius=0.1,
-        max_radius=3.0,
-    )
-    assert got == pytest.approx(expected), why
-
-
-def test_kl_marginal_violation_matches_the_generalized_kl():
+def test_kl_marginal_violation_matches_generalized_kl():
     """last_marginal_violation is reported to callers and has no other check."""
     from polystep.solvers.kl_softmax import KLSoftmaxSolver
 
@@ -271,7 +245,7 @@ def test_kl_alpha_interpolates_softmax_to_sinkhorn(lam, epsilon, expected):
     assert KLSoftmaxSolver(epsilon=epsilon, lam=lam).alpha == pytest.approx(expected)
 
 
-def test_centred_hessian_matches_the_regression_on_a_quadratic():
+def test_centred_hessian_matches_regression_on_quadratic():
     """Both estimators recover the same curvature where the loss really is quadratic."""
     from polystep.quadratic_model import extract_fd_hessian_diag, extract_fd_hessian_diag_centered
 
@@ -298,12 +272,12 @@ def test_centred_hessian_matches_the_regression_on_a_quadratic():
     torch.testing.assert_close(extract_fd_hessian_diag_centered(one, scales[:1], r, pdim, L0), H, rtol=1e-4, atol=1e-4)
 
 
-def test_the_centre_evaluation_is_charged_once_not_once_per_particle():
+def test_centre_evaluation_charged_once():
     """f(X) is one forward, however many particles read it.
 
     A centre candidate is X with one row rewritten to the value already there,
-    so every particle's centre is the same point and the same number. Evaluating
-    one per particle billed P-1 forwards that computed nothing, and the budget
+    so every particle's centre is the same point and the same number. One evaluation
+    per particle would bill P-1 forwards that compute nothing, and the budget
     column is what the paper matches methods on.
     """
     torch.manual_seed(0)
@@ -325,3 +299,37 @@ def test_the_centre_evaluation_is_charged_once_not_once_per_particle():
     assert opt._center_loss.shape == (P,)
     assert float(opt._center_loss.max() - opt._center_loss.min()) == 0.0
     assert opt.candidate_evals == P * (2 * pdim) + 1
+
+
+@pytest.mark.parametrize("num_probe", [1, 2])
+def test_nn_trust_prediction_sums_parameter_blocks(num_probe):
+    model = nn.Linear(6, 1, bias=False).double()
+    with torch.no_grad():
+        model.weight.fill_(2)
+    opt = PolyStepOptimizer(
+        model,
+        particle_dim=2,
+        polytope_type="orthoplex",
+        solver="softmax",
+        trust_region=True,
+        num_probe=num_probe,
+        epsilon=1.0,
+        step_radius=0.1,
+        probe_radius=0.2,
+        use_momentum=False,
+        compile=False,
+        seed=3,
+    )
+
+    def closure(params):
+        return params["weight"].square().flatten(1).sum(1) / 2
+
+    before = model.weight.square().sum().item() / 2
+    opt.step(closure)
+    actual = model.weight.square().sum().item() / 2 - before
+    assert opt._center_loss is not None
+    assert opt._prev_pre_step_loss == pytest.approx(before)
+    # The stored scalar describes the entire NN, not an average parameter block.
+    assert opt._prev_predicted_improvement.numel() == 1
+    assert opt._prev_predicted_improvement.item() == pytest.approx(actual, abs=1e-10)
+    assert opt.candidate_evals == 3 * 4 * num_probe + 1

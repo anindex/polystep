@@ -89,7 +89,7 @@ def test_matches_reconstruct_batch(model_fn, name, sparse, batch):
     assert kinds == {True, False}, f"{name}: covered only {kinds}, want a projected and a bias site"
 
 
-def test_resolve_site_rejects_a_run_straddling_two_blocks():
+def test_resolve_site_rejects_run_straddling_blocks():
     """A run crossing a coordinate-block boundary has no single owning layer."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(64, 16), nn.ReLU(), nn.Linear(16, 10))
@@ -99,7 +99,7 @@ def test_resolve_site_rejects_a_run_straddling_two_blocks():
     assert ev.resolve_site(sub, boundary - 2, boundary + 2, sub.subspace_dim) is None
 
 
-def test_resolve_site_gives_particle_padding_to_the_last_spec():
+def test_last_spec_owns_particle_padding():
     """Coordinates past subspace_dim have no parameter behind them, so the last spec owns a run into them."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(64, 16), nn.ReLU(), nn.Linear(16, 10))
@@ -110,7 +110,7 @@ def test_resolve_site_gives_particle_padding_to_the_last_spec():
     assert ev.resolve_site(sub, boundary - 2, sub.subspace_dim + 2, sub.subspace_dim) is None
 
 
-def test_try_build_declines_a_non_mlp():
+def test_try_build_declines_non_mlp():
     """Conv models fall back rather than being scored by the MLP-only forward."""
     model = nn.Sequential(nn.Conv2d(1, 4, 3), nn.ReLU(), nn.Flatten(), nn.Linear(4 * 6 * 6, 10))
     _, sub, _, _ = _setup(model)
@@ -125,12 +125,12 @@ def test_try_build_declines_a_non_mlp():
     ],
     ids=["fp32", "bf16"],
 )
-def test_optimizer_step_matches_the_materializing_path(mixed, dtype, tol, path):
+def test_optimizer_step_matches_materializing_path(mixed, dtype, tol, path):
     """The step must agree with reconstruct_batch, mixed precision included. BF16 weights
     skip the delta path, which adds the change after the matmul, for the site path. The
     BF16 closure scores through vmap like the site path, because the batched path rounds
     each sample's cross entropy before the FP32 mean."""
-    from polystep import HybridSubspace, ParamLayout, PolyStepOptimizer
+    from polystep import PolyStepOptimizer
 
     def build(register):
         torch.manual_seed(0)
@@ -208,7 +208,7 @@ def test_confined_sites_match_reconstruct_batch(kind, pdim):
     assert {"0.weight" if kind == "factored" else "2.weight", "0.bias"} <= checked, checked
 
 
-def test_basis_products_matches_the_materialized_column_block():
+def test_basis_products_match_materialized_columns():
     """``P`` is ``(d_out*d_in, num_coords)`` row-major, so
     ``P.view(d_out, d_in, -1)[o, i, j]`` is ``M_j[o, i]``; wrong index arithmetic
     there silently scores against a transposed basis."""

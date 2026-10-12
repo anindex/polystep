@@ -12,7 +12,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from .solvers._shared import thin_qr
-from .subspace import ProjectedAbsorbMixin, ProjectionSpec, _stable_entry_seed, absorb_due
+from .subspace import ProjectedAbsorbMixin, ProjectionSpec, _stable_entry_seed
 
 from .hybrid_subspace import _require_positive_rank
 
@@ -121,16 +121,6 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         device = next(iter(projections.values())).device
         dtype = next(iter(projections.values())).dtype
         return self.init_projections(device, dtype, step=step)
-
-    def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
-        """Whether to fold the perturbation into the base weights this step."""
-        return absorb_due(
-            self.absorb_mode,
-            self.absorb_patience,
-            self.absorb_interval,
-            stagnation_count,
-            iteration,
-        )
 
     def _delta(self, spec: ProjectionSpec, B: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
         """``dW`` for one entry from its coordinate slice."""

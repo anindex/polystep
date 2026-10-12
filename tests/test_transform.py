@@ -1,10 +1,11 @@
 """Tests for ParamLayout flatten/unflatten round-trip correctness.
 
 Covers MLP, CNN, tied weights, BatchNorm, float64, parameterless modules,
-particle shape, metadata, device handling, and deterministic generators.
+particle shape and padding, metadata, device handling, and deterministic generators.
 """
 
 import dataclasses
+import logging
 
 import pytest
 import torch
@@ -36,6 +37,20 @@ class SimpleCNN(nn.Module):
         return self.fc(x)
 
 
+class _TiedHead(nn.Module):
+    """embedding.weight = lm_head.weight: classic transformer tie."""
+
+    def __init__(self, vocab=8, dim=4):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab, dim)
+        self.lm_head = nn.Linear(dim, vocab, bias=False)
+        self.lm_head.weight = self.embedding.weight  # tie
+
+    def forward(self, ids):
+        h = self.embedding(ids)
+        return self.lm_head(h)
+
+
 class SharedWeightsModel(nn.Module):
     """Model where fc2.weight is tied to fc1.weight (shared storage)."""
 
@@ -50,7 +65,6 @@ class SharedWeightsModel(nn.Module):
 
 
 def test_roundtrip_mlp():
-    """Round-trip flatten/unflatten for a simple MLP."""
     model = SimpleMLP()
     layout = ParamLayout.from_module(model)
     particles = layout.flatten(model)
@@ -101,8 +115,57 @@ def test_roundtrip_shared_params():
     )
 
 
+def test_tied_weights_deduplicated_with_info_log(caplog):
+    """ParamLayout.from_module must deduplicate tied weights into a single
+    flat-param slot and emit a log message so users know the tie was detected.
+    """
+    model = _TiedHead(vocab=8, dim=4)
+    with caplog.at_level(logging.DEBUG, logger="polystep.transform"):
+        layout = ParamLayout.from_module(model, particle_dim=2)
+
+    # Embedding.weight is shared with lm_head.weight: one canonical entry.
+    canonical_keys = [e.key for e in layout.entries]
+    assert "embedding.weight" in canonical_keys
+    assert "lm_head.weight" not in canonical_keys, (
+        "lm_head.weight should be aliased to embedding.weight, not a separate flat-param entry"
+    )
+
+    # The canonical entry must record the alias.
+    canonical = next(e for e in layout.entries if e.key == "embedding.weight")
+    assert "lm_head.weight" in canonical.shared_with
+
+    # The dedup must be visible in the log at any level.
+    all_msgs = [r.getMessage().lower() for r in caplog.records]
+    assert any("tied" in m or "shared" in m or "alias" in m or "dedup" in m for m in all_msgs), (
+        f"expected a log message mentioning the tied weight; got: {all_msgs}"
+    )
+
+
+def test_bf16_tied_state_dict_roundtrip():
+    """flatten -> unflatten -> load_state_dict -> flatten must reproduce
+    the original flat tensor bit-for-bit on BF16 weights, with tied
+    weights aliased through the round-trip."""
+    model = _TiedHead(vocab=8, dim=4).to(dtype=torch.bfloat16)
+    layout = ParamLayout.from_module(model, particle_dim=2)
+
+    flat1 = layout.flatten(model)
+    sd1 = layout.unflatten(flat1)
+
+    # Reload into a fresh model with identical architecture.
+    fresh = _TiedHead(vocab=8, dim=4).to(dtype=torch.bfloat16)
+    # Drop strict=True since aliased keys may appear extra
+    fresh.load_state_dict(sd1, strict=False)
+    flat2 = layout.flatten(fresh)
+
+    assert torch.equal(flat1, flat2), (
+        f"BF16 round-trip not bitwise stable: max diff {(flat1.float() - flat2.float()).abs().max().item():.3e}"
+    )
+
+    # Aliased: only one flat-param slot for both keys.
+    assert sd1["embedding.weight"].data_ptr() == sd1["lm_head.weight"].data_ptr()
+
+
 def test_paramlayout_frozen():
-    """ParamLayout is a frozen dataclass."""
     model = nn.Linear(2, 2)
     layout = ParamLayout.from_module(model)
     with pytest.raises((dataclasses.FrozenInstanceError, AttributeError)):
@@ -120,8 +183,48 @@ def test_particle_shape():
     assert particles.shape[0] * particles.shape[1] >= layout.total_params
 
 
+# nn.Linear(13, 7) is 98 params: pdim 1 needs no padding, 3 and 8 do.
+@pytest.mark.parametrize("particle_dim", [1, 3, 8])
+def test_roundtrip_various_particle_dims(particle_dim):
+    model = nn.Linear(13, 7)
+    layout = ParamLayout.from_module(model, particle_dim=particle_dim)
+
+    assert layout.padded_size % particle_dim == 0
+    flat = layout.flatten(model)
+    assert flat.shape[1] == particle_dim
+
+    recovered = layout.unflatten(flat)
+    sd = model.state_dict()
+    for key in recovered:
+        assert torch.equal(sd[key], recovered[key])
+
+
+def test_padded_roundtrip_preserves_state_dict():
+    """flatten -> unflatten must produce a state_dict identical to the
+    original (within dtype rounding) and must not expose padding bytes
+    as state_dict keys."""
+    model = nn.Sequential(nn.Linear(3, 1, bias=True), nn.Linear(1, 1, bias=False))
+    # 4 + 1 = 5 params; padded to 6 with particle_dim=2 -> 1 element of padding
+
+    layout = ParamLayout.from_module(model, particle_dim=2)
+    assert layout.total_params == 5
+    assert layout.padded_size == 6, f"expected padded_size=6 for 5 params with particle_dim=2; got {layout.padded_size}"
+
+    flat = layout.flatten(model)
+    assert flat.numel() == 6
+    sd = layout.unflatten(flat)
+
+    # Padding must not appear as a state_dict key.
+    expected_keys = {"0.weight", "0.bias", "1.weight"}
+    assert set(sd.keys()) == expected_keys, f"state_dict keys leaked padding: {set(sd.keys()) - expected_keys}"
+
+    # Values round-trip exactly.
+    orig = model.state_dict()
+    for k in expected_keys:
+        assert torch.allclose(sd[k], orig[k]), f"value mismatch on {k}"
+
+
 def test_empty_module():
-    """Empty module does not crash."""
     model = nn.Module()
     layout = ParamLayout.from_module(model)
     particles = layout.flatten(model)
@@ -163,7 +266,6 @@ HAS_CUDA = torch.cuda.is_available()
 
 
 def test_flatten_device_cpu():
-    """``flatten`` produces particles on CPU when the model is on CPU."""
     model = SimpleMLP()
     layout = ParamLayout.from_module(model)
     particles = layout.flatten(model)
@@ -173,7 +275,6 @@ def test_flatten_device_cpu():
 @pytest.mark.gpu
 @pytest.mark.skipif(not HAS_CUDA, reason="CUDA not available")
 def test_flatten_device_cuda():
-    """``flatten`` produces particles on CUDA when the model is on CUDA."""
     model = SimpleMLP().cuda()
     layout = ParamLayout.from_module(model)
     particles = layout.flatten(model)
@@ -181,7 +282,6 @@ def test_flatten_device_cuda():
 
 
 def test_unflatten_preserves_device():
-    """``unflatten`` returns tensors on the same device as the particles."""
     model = SimpleMLP()
     layout = ParamLayout.from_module(model)
     particles = layout.flatten(model)
@@ -238,7 +338,7 @@ def test_solver_determinism():
     assert torch.equal(s1.X, s2.X), "Solver must be deterministic with same seed"
 
 
-def test_differently_shaped_views_of_one_buffer_are_rejected():
+def test_differently_shaped_buffer_views_rejected():
     """data_ptr alone does not make two tensors the same parameter."""
 
     class ReshapedAlias(nn.Module):
@@ -256,10 +356,10 @@ def test_differently_shaped_views_of_one_buffer_are_rejected():
         ParamLayout.from_module(ReshapedAlias())
 
 
-def test_transposed_view_of_one_buffer_is_rejected():
-    """A square weight and its transpose match on data_ptr AND shape, so the tie
-    test passed and unflatten wrote the canonical tensor to both, silently
-    transposing one of them.
+def test_transposed_alias_rejected():
+    """A square weight and its transpose match on data_ptr AND shape, so a tie test
+    on those alone would pass and unflatten would write the canonical tensor to
+    both, silently transposing one of them.
     """
 
     class TransposedAlias(nn.Module):

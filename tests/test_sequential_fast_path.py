@@ -32,14 +32,14 @@ def _builds(model):
         ),
     ],
 )
-def test_shipped_mlps_take_the_fast_path_without_renaming_parameters(factory, expected_keys):
+def test_shipped_mlps_take_fast_path_keep_keys(factory, expected_keys):
     """The Sequential conversion must not move state_dict keys, or checkpoints break."""
     model = factory()
     assert _builds(model), f"{type(model).__name__} does not take the batched path"
     assert list(model.state_dict()) == expected_keys
 
 
-def test_subspace_delta_accepts_a_shipped_mlp():
+def test_subspace_delta_accepts_shipped_mlp():
     """The subspace delta path needs the same Sequential check as the bmm path."""
     model = MNISTNet(hidden=8)
     layout = ParamLayout.from_module(model)
@@ -55,7 +55,7 @@ def _warns(model):
     return any("built from Linear/activation layers only" in str(w.message) for w in caught)
 
 
-def test_warns_on_a_handwritten_forward_over_module_children():
+def test_warns_on_handwritten_forward_over_children():
     class Handwritten(nn.Module):
         def __init__(self):
             super().__init__()
@@ -67,7 +67,7 @@ def test_warns_on_a_handwritten_forward_over_module_children():
     assert _warns(Handwritten())
 
 
-def test_warns_on_a_thin_wrapper_around_a_sequential():
+def test_warns_on_thin_sequential_wrapper():
     class Wrapper(nn.Module):
         def __init__(self):
             super().__init__()
@@ -97,7 +97,7 @@ def test_silent_when_activations_are_applied_inline():
     assert not _warns(InlineMLP())
 
 
-def test_silent_on_an_unsupported_layer_and_on_extra_parameters():
+def test_silent_on_unsupported_layer_or_extra_params():
     class HasConv(nn.Module):
         def __init__(self):
             super().__init__()
@@ -119,7 +119,7 @@ def test_silent_on_an_unsupported_layer_and_on_extra_parameters():
     assert not _warns(ExtraParam())
 
 
-def test_sequential_subclass_is_numerically_identical_to_the_handwritten_form():
+def test_sequential_subclass_matches_handwritten_form():
     """The conversion is a speed change, not a model change."""
     torch.manual_seed(0)
     seq = MNISTNet(hidden=8)
@@ -138,22 +138,18 @@ def test_sequential_subclass_is_numerically_identical_to_the_handwritten_form():
     torch.testing.assert_close(seq(x), hand(x))
 
 
-def test_ordereddict_form_keeps_the_children_walkable():
+def test_ordereddict_form_keeps_children_walkable():
     """try_build walks one level of nn.Sequential; a named child must still resolve."""
     model = nn.Sequential(OrderedDict([("a", nn.Linear(4, 4)), ("act", nn.ReLU()), ("b", nn.Linear(4, 2))]))
     assert _builds(model)
 
 
-def test_subspace_inplace_matches_the_materializing_path():
+def test_subspace_inplace_matches_materializing_path():
     """``evaluate_subspace_inplace`` must match ``reconstruct_batch`` plus ``evaluate``.
 
     It must also leave the model weights where it found them.
     """
-    import torch.nn as nn
-
     from polystep.cost_nn import NNCostEvaluator
-    from polystep.hybrid_subspace import HybridSubspace
-    from polystep.transform import ParamLayout
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Flatten(), nn.Linear(20, 12), nn.ReLU(), nn.Linear(12, 4))
@@ -177,8 +173,8 @@ def test_subspace_inplace_matches_the_materializing_path():
 
 
 # Each nn.Sequential model is paired with a twin holding the equivalent hand-written
-# forward, so a conversion that changed the model rather than its speed shows up as a
-# forward or state_dict difference.
+# forward, so a Sequential form that computes something else shows up as a forward or
+# state_dict difference.
 class _HandStaircase(nn.Module):
     def __init__(self, levels=5):
         super().__init__()
@@ -219,7 +215,7 @@ def _hand_two_layer(layer_cls):
     return Hand
 
 
-def _converted_models():
+def _sequential_twins():
     """The model pairs, or one skipped param when the harness is absent.
 
     ``experiments/`` ships in the repo but not the distribution, so this skips from
@@ -240,43 +236,43 @@ def _converted_models():
     ]
 
 
-_CONVERTED_MODELS = _converted_models()
+_SEQUENTIAL_TWINS = _sequential_twins()
 
 
 @pytest.mark.parametrize(
-    "name,new_cls,old_cls,on_fast_path", _CONVERTED_MODELS, ids=lambda v: getattr(v, "__name__", v)
+    "name,seq_cls,hand_cls,on_fast_path", _SEQUENTIAL_TWINS, ids=lambda v: getattr(v, "__name__", v)
 )
-def test_converted_models_are_bit_identical_to_their_handwritten_form(name, new_cls, old_cls, on_fast_path):
-    """Same seed, same weights, same keys, same output. Only the dispatch changed.
+def test_sequential_models_match_handwritten_twin(name, seq_cls, hand_cls, on_fast_path):
+    """Same seed, same weights, same keys, same output. Only the dispatch differs.
 
     Parameter names seed the random projections and parameter order fixes the flat
     layout, so a rename or a reorder changes the trajectory even at identical weights.
     """
     torch.manual_seed(0)
-    new = new_cls()
+    seq = seq_cls()
     torch.manual_seed(0)
-    old = old_cls()
-    assert list(new.state_dict()) == list(old.state_dict()), name
-    for key, value in new.state_dict().items():
-        assert torch.equal(value, old.state_dict()[key]), f"{name}.{key}"
-    assert _builds(new) is on_fast_path, name
+    hand = hand_cls()
+    assert list(seq.state_dict()) == list(hand.state_dict()), name
+    for key, value in seq.state_dict().items():
+        assert torch.equal(value, hand.state_dict()[key]), f"{name}.{key}"
+    assert _builds(seq) is on_fast_path, name
 
 
 @pytest.mark.parametrize(
-    "name,new_cls,old_cls,on_fast_path", _CONVERTED_MODELS, ids=lambda v: getattr(v, "__name__", v)
+    "name,seq_cls,hand_cls,on_fast_path", _SEQUENTIAL_TWINS, ids=lambda v: getattr(v, "__name__", v)
 )
-def test_converted_models_forward_bit_identically(name, new_cls, old_cls, on_fast_path):
+def test_sequential_models_forward_match_handwritten_twin(name, seq_cls, hand_cls, on_fast_path):
     """Forward equality at shared weights, which is what a dropped activation breaks."""
     torch.manual_seed(0)
-    new = new_cls()
-    old = old_cls()
-    old.load_state_dict(new.state_dict())
+    seq = seq_cls()
+    hand = hand_cls()
+    hand.load_state_dict(seq.state_dict())
     torch.manual_seed(1)
     for inputs in (torch.randn(4, 1, 28, 28), torch.randn(3, 784)):
-        assert torch.equal(new(inputs), old(inputs)), name
+        assert torch.equal(seq(inputs), hand(inputs)), name
 
 
-def test_a_weight_transforming_layer_reaches_the_bmm_path_but_not_the_subspace_one(require_experiments):
+def test_weight_transform_keeps_bmm_declines_subspace(require_experiments):
     """The subspace and factored paths keep a correction that is linear in the delta.
 
     A piecewise-constant weight transform breaks that linearity, and rebuilding the
@@ -293,7 +289,7 @@ def test_a_weight_transforming_layer_reaches_the_bmm_path_but_not_the_subspace_o
     assert FactoredEvaluator.try_build(model, nn.CrossEntropyLoss()) is None
 
 
-def test_ternary_threshold_leaves_the_layer_alive(require_experiments):
+def test_ternary_threshold_keeps_layer_alive(require_experiments):
     """A threshold several sigma past the initialization zeroes every effective weight.
 
     The layer then returns its bias for any input and the benchmark measures nothing.
@@ -322,7 +318,7 @@ def _record_fc1_shapes(net):
     return shapes
 
 
-def test_spiking_net_applies_fc1_per_timestep_on_temporal_input():
+def test_spiking_net_loops_fc1_on_temporal_input():
     """Temporal input keeps fc1 inside the timestep loop.
 
     Hoisting fc1 to one (T*B, F) GEMM changes BLAS blocking, and the LIF threshold

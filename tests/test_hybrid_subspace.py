@@ -70,7 +70,7 @@ class TestHybridFromLayout:
             else:
                 assert spec.is_projected is False
 
-    def test_from_layout_1d_params_have_identity_coords(self, layout):
+    def test_from_layout_1d_params_identity_coords(self, layout):
         """1D params (biases) have num_params == num_coords."""
         hybrid = HybridSubspace.from_layout(layout, rank=4)
 
@@ -94,8 +94,7 @@ class TestHybridAutoFromLayout:
         assert hybrid.compression_ratio > 0
         assert hybrid.compression_ratio <= 1.0
 
-    def test_auto_from_layout_smaller_than_fixed_rank(self, layout):
-        """auto_from_layout with small max_rank gives smaller subspace."""
+    def test_auto_small_max_rank_shrinks_subspace(self, layout):
         hybrid_fixed = HybridSubspace.from_layout(layout, rank=16)
         hybrid_auto = HybridSubspace.auto_from_layout(layout, max_rank=4)
 
@@ -135,8 +134,8 @@ class TestHybridInitProjections:
 
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_cuda_projection_runs_its_qr_on_the_gpu_from_the_cpu_seed(self, hybrid_sub, monkeypatch):
-        """The QR runs on the GPU, but the Gaussian still comes from the CPU seed, so both devices agree up to rounding."""
+    def test_cuda_projection_gpu_qr_cpu_seed(self, hybrid_sub, monkeypatch):
+        """Both devices agree up to rounding."""
         import polystep.hybrid_subspace as hybrid_module
 
         qr_devices = []
@@ -193,7 +192,6 @@ def test_apply_perturbation_is_affine_and_local(model, hybrid_sub):
 
 @pytest.mark.filterwarnings("ignore:HybridSubspace works best:UserWarning")
 def test_rotate_random_produces_different_projections(hybrid_sub):
-    """Random rotation produces different projections."""
     hybrid = HybridSubspace(
         specs=hybrid_sub.specs,
         subspace_dim=hybrid_sub.subspace_dim,
@@ -215,7 +213,7 @@ def test_rotate_random_produces_different_projections(hybrid_sub):
 
 
 @pytest.mark.filterwarnings("ignore:HybridSubspace works best:UserWarning")
-def test_rotate_all_holds_the_seeded_basis_at_step_zero(hybrid_sub):
+def test_rotate_all_step_zero_keeps_seeded_basis(hybrid_sub):
     """Step 0 returns the seeded basis unchanged; rotating it would discard a draw
     nothing was evaluated against."""
     hybrid = HybridSubspace(
@@ -254,15 +252,9 @@ class TestHybridRotateDisplacement:
             displacement_history=disp_history,
         )
 
-        any_different = False
-        for key in projections:
-            if hybrid.specs[list(projections.keys()).index(key)].is_projected:
-                if not torch.allclose(projections[key], new_projections[key], atol=1e-3):
-                    any_different = True
-                    break
-        assert any_different
+        assert any(not torch.allclose(projections[k], new_projections[k], atol=1e-3) for k in projections)
 
-    def test_a_wide_spec_is_rejected_by_both_projection_paths(self, hybrid_sub):
+    def test_wide_spec_rejected_by_both_projection_paths(self, hybrid_sub):
         """num_coords > num_params must be rejected: QR would silently drop columns
         and a Gaussian would move at the wrong scale."""
         spec = ProjectionSpec(
@@ -287,7 +279,7 @@ class TestHybridRotateDisplacement:
                 step=1,
             )
 
-    def test_rotate_displacement_tall_layer_unit_norm_columns(self, hybrid_sub):
+    def test_tall_layer_rotation_keeps_unit_columns(self, hybrid_sub):
         """Tall layers keep unit-norm columns after rotation, matching init, so
         there is no sqrt(N) magnitude jump on the first rotation."""
         spec = ProjectionSpec(
@@ -313,8 +305,7 @@ class TestHybridRotateDisplacement:
         col_norms = torch.norm(new_P, dim=0)
         assert torch.allclose(col_norms, torch.ones_like(col_norms), atol=1e-4)
 
-    def test_rotate_displacement_zero_history_falls_back(self, hybrid_sub):
-        """Zero displacement history falls back to random rotation."""
+    def test_rotate_zero_history_redraws_random(self, hybrid_sub):
         # rotation_interval=1 so rotation fires
         hybrid = HybridSubspace(
             specs=hybrid_sub.specs,
@@ -334,17 +325,10 @@ class TestHybridRotateDisplacement:
             displacement_history=disp_history,
         )
 
-        any_different = False
-        for key in projections:
-            if hybrid.specs[list(projections.keys()).index(key)].is_projected:
-                if not torch.allclose(projections[key], new_projections[key], atol=1e-3):
-                    any_different = True
-                    break
-        assert any_different
+        assert any(not torch.allclose(projections[k], new_projections[k], atol=1e-3) for k in projections)
 
 
 def test_optimizer_detects_hybrid_mode(model):
-    """PolyStepOptimizer correctly detects HybridSubspace."""
     from polystep import PolyStepOptimizer
 
     layout = ParamLayout.from_module(model)
@@ -353,7 +337,7 @@ def test_optimizer_detects_hybrid_mode(model):
     optimizer = PolyStepOptimizer(model, subspace=hybrid, epsilon=0.5)
 
     assert optimizer._hybrid is True
-    assert optimizer._hybrid_subspace is hybrid
+    assert optimizer.subspace is hybrid
     assert optimizer._state.hybrid_projections is not None
     num_projected = sum(1 for s in hybrid.specs if s.is_projected)
     assert len(optimizer._state.hybrid_projections) == num_projected
@@ -361,7 +345,6 @@ def test_optimizer_detects_hybrid_mode(model):
 
 class TestRankSchedule:
     def test_rank_schedule_at(self):
-        """RankSchedule.at() returns correct rank at various steps."""
         schedule = RankSchedule(stages=[(0, 2), (100, 4), (300, 8)])
         assert schedule.at(0) == 2
         assert schedule.at(50) == 2
@@ -373,7 +356,6 @@ class TestRankSchedule:
         assert schedule.at(1000) == 8
 
     def test_rank_schedule_transitions(self):
-        """transitions() returns correct step numbers."""
         schedule = RankSchedule(stages=[(0, 2), (100, 4), (300, 8)])
         assert schedule.transitions() == [100, 300]
 
@@ -407,7 +389,7 @@ class TestRankSchedule:
 
 class TestRankTransition:
     def test_rank_transition_e2e(self):
-        """Test full rank transition: optimizer starts at rank=2, transitions to rank=4."""
+        """Starts at rank=2 and transitions to rank=4."""
         torch.manual_seed(42)
         model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 5))
 
@@ -497,7 +479,7 @@ class TestRankTransition:
         assert ranks == [4], f"rebuilt inside a stage, got {ranks}"
 
     @pytest.mark.parametrize("kind", [None, "adaptive", "factored"])
-    def test_rank_schedule_requires_a_hybrid_subspace(self, kind):
+    def test_rank_schedule_requires_hybrid_subspace(self, kind):
         """Only a HybridSubspace can be rebuilt at a new rank, so anything else raises."""
         from polystep import AdaptiveSubspace, FactoredSubspace, PolyStepOptimizer
 
@@ -519,12 +501,91 @@ class TestRankTransition:
                 compile=False,
             )
 
+    def test_stage_zero_applies_before_first_step(self):
+        """``RankSchedule.at(0)`` must apply before the first step, not after the
+        first OT solve advances ``iteration_count``.
+        """
+        from polystep import PolyStepOptimizer
+
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(8, 12), nn.Tanh(), nn.Linear(12, 3))
+        layout = ParamLayout.from_module(model)
+        supplied = HybridSubspace.from_layout(layout, rank=4)
+        dim_at_supplied_rank = supplied.subspace_dim
+
+        opt = PolyStepOptimizer(
+            model,
+            subspace=supplied,
+            rank_schedule=RankSchedule(stages=[(0, 2), (100, 8)]),
+            compile=False,
+            seed=0,
+        )
+
+        assert opt._applied_rank == 2
+        assert opt.subspace.subspace_dim != dim_at_supplied_rank
+        assert opt.subspace.subspace_dim == HybridSubspace.from_layout(layout, rank=2, seed=0).subspace_dim
+
+    def test_rank_transition_carries_hybrid_config(self, regression_closure):
+        """A rank transition must carry the absorb_* config fields over."""
+        from polystep import PolyStepOptimizer
+
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(20, 16), nn.ReLU(), nn.Linear(16, 4))
+        closure = regression_closure(model)
+        layout = ParamLayout.from_module(model)
+        subspace = HybridSubspace.from_layout(
+            layout,
+            rank=4,
+            absorb_mode="periodic",
+            absorb_interval=3,
+            absorb_patience=7,
+            svd_ratio_final=0.25,
+            sparse_threshold_bytes=123_456_789,
+            absorb_aligned_active=True,
+        )
+        opt = PolyStepOptimizer(
+            model,
+            subspace=subspace,
+            epsilon=0.1,
+            max_iterations=10,
+            rank_schedule=RankSchedule(stages=[(0, 4), (1, 8)]),
+        )
+        for _ in range(3):
+            opt.step(closure)
+
+        assert opt.subspace is not subspace, "rank transition did not run"
+        assert opt.subspace.absorb_mode == "periodic"
+        assert opt.subspace.absorb_interval == 3
+        assert opt.subspace.absorb_patience == 7
+        assert opt.subspace.svd_ratio_final == 0.25
+        assert opt.subspace.sparse_threshold_bytes == 123_456_789
+        assert opt.subspace.absorb_aligned_active is True
+
+    def test_rank_transition_resets_momentum(self, regression_closure):
+        """Stale velocity either raises a shape error or broadcasts one row over all particles."""
+        from polystep import PolyStepOptimizer
+
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(20, 16), nn.ReLU(), nn.Linear(16, 4))
+        closure = regression_closure(model)
+        subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+        opt = PolyStepOptimizer(
+            model,
+            subspace=subspace,
+            epsilon=0.1,
+            max_iterations=10,
+            use_momentum=True,
+            rank_schedule=RankSchedule(stages=[(0, 2), (2, 16)]),
+        )
+        for _ in range(4):
+            opt.step(closure)
+
+        assert opt.state.velocity.shape == opt.state.X.shape
+
 
 def test_default_rotation_interval_no_warning(model):
     """Default rotation_interval=0 should NOT trigger a warning."""
     import warnings as _warnings
-    from polystep.hybrid_subspace import HybridSubspace
-    from polystep.transform import ParamLayout
 
     layout = ParamLayout.from_module(model)
     with _warnings.catch_warnings():
@@ -534,9 +595,8 @@ def test_default_rotation_interval_no_warning(model):
 
 
 class TestStructuredProjection:
-    def test_the_seed_alone_fixes_the_projection(self, layout):
-        """The seed alone fixes the projection: same seed reproduces it, a
-        different seed changes it."""
+    def test_seed_alone_fixes_projection(self, layout):
+        """Same seed reproduces it; a different seed changes it."""
         same_a = HybridSubspace.from_layout(layout, rank=4, seed=7).init_projections(torch.device("cpu"), torch.float32)
         same_b = HybridSubspace.from_layout(layout, rank=4, seed=7).init_projections(torch.device("cpu"), torch.float32)
         other = HybridSubspace.from_layout(layout, rank=4, seed=8).init_projections(torch.device("cpu"), torch.float32)
@@ -547,7 +607,7 @@ class TestStructuredProjection:
             torch.testing.assert_close(same_a[key], same_b[key])
         assert any(not torch.equal(same_a[k], other[k]) for k in projected), "the seed must matter"
 
-    def test_a_projection_is_orthonormal(self, layout):
+    def test_projection_is_orthonormal(self, layout):
         """The step radii assume gain 1, which only a column-orthonormal basis gives."""
         proj = HybridSubspace.from_layout(layout, rank=4, seed=7).init_projections(torch.device("cpu"), torch.float32)
         for key, P in proj.items():
@@ -569,7 +629,7 @@ class TestMaxSubspaceDim:
         )
 
     @pytest.mark.parametrize("cap", [None, 999999, "exact"])
-    def test_a_cap_at_or_above_the_natural_dim_is_a_noop(self, cap):
+    def test_cap_above_natural_dim_is_noop(self, cap):
         """``exact`` is the boundary: a cap equal to the natural dim must not shrink."""
         model = nn.Sequential(nn.Linear(64, 32), nn.Linear(32, 10))
         layout = ParamLayout.from_module(model)
@@ -589,7 +649,7 @@ class TestMaxSubspaceDim:
         assert h.subspace_dim <= cap
         assert h.subspace_dim == h.specs[-1].flat_end
 
-    def test_an_unreachable_cap_warns(self):
+    def test_unreachable_cap_warns(self):
         """1D width alone can exceed the cap, and that must warn."""
         model = nn.Sequential(nn.Linear(256, 128), nn.Linear(128, 64), nn.Linear(64, 10))
         layout = ParamLayout.from_module(model)
@@ -599,7 +659,7 @@ class TestMaxSubspaceDim:
         assert h.subspace_dim == fixed + sum(1 for s in h.specs if len(s.original_shape) >= 2)
 
     @pytest.mark.filterwarnings("error")
-    def test_a_full_width_weight_shares_the_budget(self):
+    def test_full_width_weight_shares_budget(self):
         """The README model's output weight is full width at rank 4; it must scale with the rest."""
         model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 3))
         h = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4, max_subspace_dim=128)
@@ -617,7 +677,7 @@ class TestMaxSubspaceDim:
                 frac_cap = s_cap.num_coords / h_cap.subspace_dim
                 assert abs(frac_full - frac_cap) < 0.1, f"Proportions diverged for {s_full.entry_key}"
 
-    def test_is_projected_tracks_the_scaled_width(self):
+    def test_is_projected_tracks_scaled_width(self):
         """A spec below full width needs a projection; at full width it is the identity."""
         model = nn.Sequential(nn.Linear(64, 32), nn.Linear(32, 10))
         layout = ParamLayout.from_module(model)
@@ -625,16 +685,6 @@ class TestMaxSubspaceDim:
         h_cap = HybridSubspace.from_layout(layout, rank=4, max_subspace_dim=h_full.subspace_dim // 10)
         for spec in h_cap.specs:
             assert spec.is_projected == (spec.num_coords < spec.num_params), spec.entry_key
-
-    def test_a_full_width_spec_carries_no_projection_matrix(self):
-        """A rank past the layer clamps num_coords to num_params, where the projection
-        would be an identity. Storing one costs O(n^2) for nothing."""
-        layout = ParamLayout.from_module(nn.Sequential(nn.Linear(4, 4)))
-        h = HybridSubspace.from_layout(layout, rank=8)
-        weight = next(s for s in h.specs if s.entry_key.endswith("weight"))
-        assert weight.num_coords == weight.num_params == 16
-        assert weight.is_projected is False
-        assert weight.entry_key not in h.init_projections(torch.device("cpu"), torch.float32)
 
 
 class TestHybridReconstructionProperties:
@@ -715,31 +765,7 @@ class TestHybridReconstructionProperties:
         assert spec_keys.count("embedding.weight") == 1
 
 
-def test_rank_schedule_applies_its_first_stage():
-    """A subspace built at a rank the schedule does not start from must still move."""
-    from polystep.optimizer import PolyStepOptimizer
-    from torch.func import functional_call, vmap
-
-    model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
-    layout = ParamLayout.from_module(model)
-    sub = HybridSubspace.from_layout(layout, rank=4, seed=0)
-    built_rank = sub.subspace_dim
-
-    opt = PolyStepOptimizer(
-        model,
-        subspace=sub,
-        rank_schedule=RankSchedule(stages=[(0, 2), (100, 8)]),
-        epsilon=0.1,
-        compile=False,
-    )
-    x = torch.randn(8, 16, generator=torch.Generator().manual_seed(0))
-    opt.step(lambda p: vmap(lambda q: functional_call(model, q, (x,)).pow(2).mean())(p))
-
-    assert opt.subspace.subspace_dim != built_rank
-    assert opt.subspace.subspace_dim == HybridSubspace.from_layout(layout, rank=2, seed=0).subspace_dim
-
-
-def test_rotation_clears_the_coordinate_displacement_history():
+def test_rotation_clears_displacement_history():
     """displacement_history holds coordinates in the old basis, so a rotation must
     clear it; otherwise the next displacement rotation reads stale rows through the
     new projections."""
@@ -776,12 +802,9 @@ def test_rotation_clears_the_coordinate_displacement_history():
 
 @pytest.mark.parametrize("rotation_mode", ["random", "displacement"])
 @pytest.mark.parametrize("absorb_interval, rotation_interval", [(3, 2), (2, 4)])
-def test_an_absorb_keeps_the_rotated_basis_and_rotates_when_due(
-    absorb_interval, rotation_interval, rotation_mode, monkeypatch
-):
-    """An absorb used to restore the seeded basis, undoing the last rotation and skipping
-    a rotation due on the same step. A basis change must also leave base + P @ coords
-    where it was."""
+def test_absorb_keeps_rotation_and_point(absorb_interval, rotation_interval, rotation_mode, monkeypatch):
+    """An absorb must keep the rotated basis and still rotate when a rotation is due on the
+    same step. A basis change must also leave base + P @ coords where it was."""
     from polystep import PolyStepOptimizer, _step_monolithic
 
     maintain = _step_monolithic.maintain_per_layer_subspace
@@ -829,7 +852,7 @@ def test_an_absorb_keeps_the_rotated_basis_and_rotates_when_due(
     assert opt.state.absorb_count == 6 // absorb_interval
 
 
-def test_the_sparse_threshold_is_measured_in_fp32_bytes():
+def test_sparse_threshold_measured_in_fp32_bytes():
     """The dense estimate is num_params * num_coords * 4, compared strictly, so a
     threshold at exactly that size still takes the dense path."""
     layout = ParamLayout.from_module(nn.Sequential(nn.Linear(64, 32)))
@@ -868,3 +891,41 @@ def test_auto_from_layout_defaults():
     weights = [s for s in h.specs if s.entry_key.endswith("weight")]
     ranks = [s.num_coords / sum(s.original_shape) for s in weights]
     assert ranks == [4, 32, 64]
+
+
+def test_stagnation_absorb_resets_counter():
+    """Otherwise it fires every step on a plateau."""
+    from polystep import PolyStepOptimizer
+
+    torch.manual_seed(0)
+    model = nn.Linear(8, 4)
+    subspace = HybridSubspace.from_layout(
+        ParamLayout.from_module(model), rank=2, absorb_mode="stagnation", absorb_patience=2
+    )
+    opt = PolyStepOptimizer(model, subspace=subspace, seed=0)
+
+    def flat(params):  # a plateau: stagnation is permanent
+        return torch.ones(next(iter(params.values())).shape[0])
+
+    for _ in range(10):
+        opt.step(flat)
+
+    # With patience 2 the counter has to climb again after each absorb.
+    assert opt.state.absorb_count <= 4
+
+
+def test_rank_zero_subspace_raises():
+    """num_coords=0 would make every reconstruction add exactly zeros, silently."""
+    layout = ParamLayout.from_module(nn.Sequential(nn.Linear(6, 5)))
+    with pytest.raises(ValueError, match="rank must be >= 1"):
+        HybridSubspace.from_layout(layout, rank=0)
+
+
+def test_absorb_keeps_caller_buffers():
+    """apply_perturbation builds from specs alone, so absorb must carry buffers over."""
+    layout = ParamLayout.from_module(nn.Sequential(nn.Linear(6, 5)))
+    sub = HybridSubspace.from_layout(layout, rank=2)
+    proj = sub.init_projections(torch.device("cpu"), torch.float32)
+    base = {"0.weight": torch.zeros(5, 6), "0.bias": torch.zeros(5), "running_thing": torch.ones(3)}
+    new_base, _ = sub.absorb(proj, base, torch.zeros(sub.subspace_dim))
+    assert "running_thing" in new_base

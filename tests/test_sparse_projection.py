@@ -17,7 +17,6 @@ class TestCoreProjection:
         ],
     )
     def test_project_shape_1d(self, input_shape, expected_shape):
-        """Projection produces correct output shape."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
         coords = torch.randn(*input_shape)
         full = proj.project(coords)
@@ -25,8 +24,7 @@ class TestCoreProjection:
         assert full.dtype == coords.dtype
 
     @pytest.mark.parametrize("seed2, same", [(123, True), (456, False)])
-    def test_the_seed_alone_fixes_the_projection(self, seed2, same):
-        """A run is reproducible from its seed, and only from its seed."""
+    def test_seed_alone_fixes_projection(self, seed2, same):
         coords = torch.randn(64)
         a = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=123).project(coords)
         b = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=seed2).project(coords)
@@ -45,36 +43,17 @@ class TestMemoryEfficiency:
         # fp32 value per entry and its int32 row pointers.
         assert proj.memory_bytes == 316 * 256 * 20 + 4 * 100_001
 
-    def test_memory_vs_dense(self):
-        """Sparse projection uses much less memory than dense equivalent."""
-        full_dim = 100_000
-        subspace_dim = 256
-        proj = SparseRandomProjection(full_dim, subspace_dim, seed=42)
-
-        # Dense would be full_dim * subspace_dim * 4 bytes (float32)
-        dense_bytes = full_dim * subspace_dim * 4
-        sparse_bytes = proj.memory_bytes
-
-        # At default density 1/sqrt(100K) ~ 0.316%, should be >50x smaller
-        ratio = dense_bytes / sparse_bytes
-        assert ratio > 50, f"Expected >50x reduction, got {ratio:.1f}x"
-
     @pytest.mark.filterwarnings("ignore:SparseRandomProjection.*below the empirical floor:UserWarning")
     def test_large_scale_memory(self):
         """Memory stays bounded for large parameter counts."""
         # Simulate 100M params with rank-256
         proj = SparseRandomProjection(full_dim=100_000_000, subspace_dim=256, seed=42)
 
-        # Dense: 100M * 256 * 4 = 100GB
-        dense_gb = 100_000_000 * 256 * 4 / 1e9
-
         sparse_gb = proj.memory_bytes / 1e9
 
         assert sparse_gb < 1.0, f"Expected <1 GB, got {sparse_gb:.3f} GB"
-        assert dense_gb > 90, f"Dense baseline should be ~100GB, got {dense_gb:.1f}GB"
 
     def test_custom_density(self):
-        """Custom density is respected."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, density=0.01, seed=42)
 
         expected_nnz_per_col = max(1, int(0.01 * 10000))
@@ -85,8 +64,8 @@ class TestMemoryEfficiency:
 @pytest.mark.parametrize(
     "full_dim, subspace_dim, touched_rows_only", [(100_000, 16, True), (100_000, 140, False), (1000, 64, False)]
 )
-def test_projection_matches_the_coalesced_csr(full_dim, subspace_dim, touched_rows_only):
-    """Both cached layouts give the result of the plain int64 CSR, and the size counts what is held."""
+def test_projection_matches_coalesced_csr(full_dim, subspace_dim, touched_rows_only):
+    """Both cached layouts match the int64 CSR; the size counts what is held."""
     proj = SparseRandomProjection(full_dim=full_dim, subspace_dim=subspace_dim, seed=0)
     coords = torch.randn(5, subspace_dim, generator=torch.Generator().manual_seed(0))
     full = proj.project(coords)
@@ -124,7 +103,6 @@ class TestJLTProperty:
         assert 0.5 < ratio < 2.0, f"Distance ratio {ratio} outside [0.5, 2.0]"
 
     def test_multiple_distance_preservation(self):
-        """Distance preservation holds across multiple pairs."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=128, seed=42)
 
         torch.manual_seed(999)
@@ -143,7 +121,6 @@ class TestJLTProperty:
         assert 0.7 < mean_ratio < 1.5, f"Mean distance ratio {mean_ratio} too far from 1"
 
     def test_zero_vector_maps_to_zero(self):
-        """Zero vector maps to zero (linearity check)."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
 
         zero = torch.zeros(64)
@@ -189,7 +166,6 @@ class TestCUDA:
         ],
     )
     def test_cuda_projection(self, input_shape, expected_shape):
-        """Projection works on GPU."""
         proj = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=42)
 
         coords = torch.randn(*input_shape, device="cuda")
@@ -201,7 +177,6 @@ class TestCUDA:
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_determinism(self):
-        """Same seed produces same results on GPU."""
         proj1 = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=777)
         proj2 = SparseRandomProjection(full_dim=10000, subspace_dim=64, seed=777)
 
@@ -213,7 +188,7 @@ class TestCUDA:
 
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_csr_build_holds_only_what_it_counts(self):
+    def test_csr_build_holds_only_counted_bytes(self):
         """Building the CSR keeps nothing of the COO it sorted, and its peak stays near the CSR."""
         proj = SparseRandomProjection(full_dim=1_000_000, subspace_dim=1024, seed=0)
         torch.cuda.synchronize()
@@ -230,7 +205,6 @@ class TestCUDA:
 
 
 def test_repr():
-    """Repr contains useful info."""
     proj = SparseRandomProjection(full_dim=100000, subspace_dim=256, seed=42)
     r = repr(proj)
 
@@ -266,3 +240,36 @@ def test_warns_at_extreme_compression():
     assert any("compression" in m or "below the empirical floor" in m for m in msgs), (
         f"expected extreme-compression warning; got {msgs}"
     )
+
+
+def test_sparse_projection_ignores_default_device():
+    """The index/sign factories draw from a CPU generator, so without ``device="cpu"``
+    ``torch.set_default_device`` would send them to the default device and the
+    generator would mismatch.
+    """
+    target = torch.device("cuda" if torch.cuda.is_available() else "meta")
+    torch.set_default_device(target)
+    try:
+        projection = SparseRandomProjection(full_dim=64, subspace_dim=8, seed=0)
+        projection._init_sparse_matrix(torch.device("cpu"), torch.float32)
+    finally:
+        torch.set_default_device("cpu")
+
+    assert projection._rows.shape == (8, projection._nnz_per_col)
+
+
+def test_sparse_columns_dtype_change_invalidates_csr():
+    projection = SparseRandomProjection(16, 8, density=0.5, seed=2)
+    projection.project(torch.ones(8))  # populate the float32 CSR cache
+    projection.columns(torch.arange(8), torch.device("cpu"), torch.float64)
+    actual = projection.project(torch.ones(8, dtype=torch.float64))
+    expected = SparseRandomProjection(16, 8, density=0.5, seed=2).project(torch.ones(8, dtype=torch.float64))
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"full_dim": 0}, {"subspace_dim": -1}, {"density": 0}, {"density": float("nan")}, {"density": 2}]
+)
+def test_sparse_projection_rejects_invalid_configuration(kwargs):
+    with pytest.raises(ValueError):
+        SparseRandomProjection(**({"full_dim": 16, "subspace_dim": 8} | kwargs))

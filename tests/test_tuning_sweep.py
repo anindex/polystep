@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+pytest.importorskip("experiments.runners")
 
 
 @pytest.fixture
-def fairness(require_experiments):
-    sys.path.insert(0, str(REPO_ROOT))
+def fairness():
     from experiments.runners import fairness
 
     return fairness
@@ -22,7 +18,7 @@ def fairness(require_experiments):
 # --- 1. the test split is unreachable from a sweep --------------------------------
 
 
-def test_tripwire_raises_on_both_ways_a_split_gets_read(fairness):
+def test_tripwire_raises_on_iterate_and_unpack(fairness):
     """A DataLoader is iterated; an ``(x, y)`` split is unpacked. Both hit ``__iter__``."""
     trap = fairness.TestSplitTripwire()
     with pytest.raises(AssertionError, match="touched the test split"):
@@ -41,15 +37,14 @@ def _tiny_head_splits(device="cpu", n=64):
 
 
 @pytest.fixture
-def headquant(require_experiments):
+def headquant():
     pytest.importorskip("transformers", reason="run_gpt2_finetune imports the GPT-2 stack")
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.runners import run_gpt2_finetune
 
     return run_gpt2_finetune
 
 
-def test_headquant_sweep_cannot_read_the_test_split(headquant, tmp_path, fairness):
+def test_headquant_sweep_never_reads_test_split(headquant, tmp_path, fairness):
     """A sweep trial runs to completion with the test split booby-trapped.
 
     The trial is handed a tripwire *by the caller*, so this is not a check that the
@@ -75,10 +70,10 @@ def test_headquant_sweep_cannot_read_the_test_split(headquant, tmp_path, fairnes
     )
 
 
-def test_the_tripwire_check_is_not_vacuous(headquant, tmp_path, fairness):
+def test_tripwire_check_is_not_vacuous(headquant, tmp_path, fairness):
     """The same run with tuning off *does* read the test split, and so trips the wire.
 
-    Without this, ``test_headquant_sweep_cannot_read_the_test_split`` would still pass
+    Without this, ``test_headquant_sweep_never_reads_test_split`` would still pass
     if the runner had stopped scoring the test set entirely.
     """
     splits = {**_tiny_head_splits(), "test": fairness.TestSplitTripwire()}
@@ -100,14 +95,14 @@ def test_the_tripwire_check_is_not_vacuous(headquant, tmp_path, fairness):
 # --- 2. equal tuning budget -------------------------------------------------------
 
 
-def test_every_swept_method_gets_the_same_grid_size(fairness):
+def test_swept_methods_share_grid_size(fairness):
     """Equal tuning effort is the claim; equal grid size is what makes it checkable."""
     sizes = {m: len(g) for m, g in fairness.TUNING_GRID.items()}
     assert len(set(sizes.values())) == 1, f"grids differ in size, so tuning effort is not matched: {sizes}"
     assert "polystep" in sizes, "PolyStep must be swept on the same footing as the baselines"
 
 
-def test_tuning_cost_is_the_number_the_paper_quotes(fairness):
+def test_tuning_cost_matches_paper_quote(fairness):
     """configs x seeds x evals-per-config, and equal across methods at equal budget."""
     costs = [fairness.tuning_cost(m, 25_000, seeds=1) for m in fairness.TUNING_GRID]
     assert len({c["tuning_evals"] for c in costs}) == 1, costs
@@ -129,7 +124,7 @@ def test_selection_breaks_ties_by_grid_order(fairness):
     assert fairness.select_best(list(reversed(trials)))["index"] == 0, "selection depends on input order"
 
 
-def test_an_all_ties_sweep_is_flagged_uninformative(fairness, tmp_path):
+def test_all_ties_sweep_flagged_uninformative(fairness, tmp_path):
     """Nine configs at the same score means the tie-break returned the untuned prior.
 
     That happens for real -- a reduced sweep budget can land below the horizon where a
@@ -164,14 +159,14 @@ def test_selection_roundtrips_through_disk(fairness, tmp_path):
 # --- how a grid point becomes hyperparameters -------------------------------------
 
 
-def test_radius_keys_are_multipliers_on_the_shared_probe_scale(fairness):
+def test_radius_keys_multiply_shared_probe_scale(fairness):
     """PolyStep's radius is a norm, a baseline's sigma is per-coordinate; the grid is
     expressed in units of the shared scale so the two stay comparable."""
     out = fairness.apply_point({"sigma": 9.0, "lr": 0.01, "popsize": 32}, {"sigma": 2.0, "lr": 0.03}, probe_scale=0.5)
     assert out == {"sigma": 1.0, "lr": 0.03, "popsize": 32}
 
 
-def test_polystep_multipliers_scale_both_ends_of_a_schedule(fairness):
+def test_polystep_multipliers_scale_schedule_ends(fairness):
     """A cosine-scheduled radius must keep its shape and only change scale."""
     cfg = {"epsilon_init": 5.0, "epsilon_target": 0.3, "step_radius": 8.0, "num_probe": 1}
     out = fairness.apply_polystep_multipliers(cfg, {"epsilon": 2.0, "step_radius": 0.5})
@@ -182,7 +177,7 @@ def test_polystep_multipliers_scale_both_ends_of_a_schedule(fairness):
 # --- the two recorded asymmetries -------------------------------------------------
 
 
-def test_eggroll_dimension_gap_is_recorded_not_hidden(fairness):
+def test_eggroll_dimension_gap_recorded(fairness):
     """EGGROLL matches on rank, not dimension. The JSON has to say so.
 
     Matching dimension would force ``FactoredSubspace`` to rank 1, and a ``(d_out, 1)``
@@ -200,7 +195,7 @@ def test_eggroll_dimension_gap_is_recorded_not_hidden(fairness):
     tag = fairness.subspace_tag(factored, 4, shared_dim=shared.subspace_dim)
     assert tag["subspace_class"] == "FactoredSubspace"
     assert tag["subspace_rank"] == 4, "rank is the axis that IS matched"
-    assert tag["subspace_dim"] != tag["subspace_dim_shared"], "the fixture no longer exercises the gap"
+    assert tag["subspace_dim"] != tag["subspace_dim_shared"], "the fixture does not exercise the gap"
     assert tag["subspace_dim_matched"] is False
     assert tag["matched_on"] == "rank"
 
@@ -208,7 +203,7 @@ def test_eggroll_dimension_gap_is_recorded_not_hidden(fairness):
     assert same["subspace_dim_matched"] is True and same["matched_on"] == "rank+dimension"
 
 
-def test_headquant_search_space_is_matched_and_eggrolls_rank_is_recorded(headquant):
+def test_headquant_space_matched_records_eggroll_rank(headquant):
     """Nothing is projected on the head-quant experiment, so there is no gap to report.
 
     The EGGROLL question only bites inside a projected subspace. Here every method
@@ -229,7 +224,7 @@ def test_headquant_search_space_is_matched_and_eggrolls_rank_is_recorded(headqua
     assert "eggroll_rank" not in headquant._headquant_search_space("mezo", 1538)
 
 
-def test_eggroll_grid_tunes_sigma_learning_rate_and_population(fairness):
+def test_eggroll_grid_tunes_sigma_lr_popsize(fairness):
     """All three of EGGROLL's knobs must move somewhere in its nine configurations."""
     grid = fairness.TUNING_GRID["eggroll"]
     for axis in ("sigma", "lr", "popsize"):
@@ -237,12 +232,12 @@ def test_eggroll_grid_tunes_sigma_learning_rate_and_population(fairness):
     assert all(p["popsize"] % 2 == 0 for p in grid), "EGGROLL samples antithetic pairs; popsize must be even"
 
 
-def test_mezo_grid_tunes_eps_and_learning_rate(fairness):
+def test_mezo_grid_tunes_eps_and_lr(fairness):
     grid = fairness.TUNING_GRID["mezo"]
     assert len({p["eps"] for p in grid}) == 3 and len({p["lr"] for p in grid}) == 3
 
 
-def test_binary_head_is_labelled_as_a_partial_control(headquant):
+def test_binary_head_labelled_partial_control(headquant):
     """``BinaryLinear`` does not quantize its bias, so Adam keeps a live gradient there.
 
     int8 quantizes both and gives backprop *exactly* nothing. The rows are not the
@@ -261,7 +256,7 @@ def test_binary_head_is_labelled_as_a_partial_control(headquant):
         assert (grad > 0.0) is bias_live, f"{name}: bias gradient {grad} contradicts backprop_sees_the_bias={bias_live}"
 
 
-def test_round_two_gives_every_method_the_same_cell_count(fairness):
+def test_round_two_keeps_cell_count(fairness):
     """Both tuning rounds use nine configurations per method."""
     for method, grid in fairness.TUNING_GRID.items():
         for winner in grid:
@@ -282,7 +277,7 @@ def test_round_two_integer_axes_stay_even(fairness):
             )
 
 
-def test_tuning_cost_quotes_the_cells_that_ran(fairness):
+def test_tuning_cost_counts_executed_cells(fairness):
     """A cell that raises is dropped by the sweep, so the count must be passed in."""
     nominal = fairness.tuning_cost("eggroll", 1000, rounds=2)
     realized = fairness.tuning_cost("eggroll", 1000, rounds=2, configs=14)
@@ -291,7 +286,7 @@ def test_tuning_cost_quotes_the_cells_that_ran(fairness):
     assert realized["tuning_evals"] == 14 * 1000
 
 
-def test_maxsat_config_has_every_key_its_builder_reads(require_experiments):
+def test_maxsat_config_states_probe_jitter():
     """get_polystep_config reads probe_radius_jitter, so POLYSTEP_CONFIG must define it."""
     from experiments.runners.run_maxsat import get_polystep_config
 

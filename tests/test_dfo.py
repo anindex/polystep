@@ -17,7 +17,7 @@ def _make_model_and_closure():
     data = torch.randn(8, 4)
     targets = torch.randn(8, 2)
 
-    def make_closure(opt):
+    def make_closure():
         evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
 
         def closure(params):
@@ -28,7 +28,7 @@ def _make_model_and_closure():
     return model, make_closure
 
 
-def test_fd_gradient_replaces_the_ot_descent_direction():
+def test_fd_gradient_replaces_ot_direction():
     """Under the quadratic model the stored direction is the FD gradient, not the OT step."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
@@ -41,7 +41,7 @@ def test_fd_gradient_replaces_the_ot_descent_direction():
         max_iterations=2,
         seed=42,
     )
-    opt.step(make_closure(opt))
+    opt.step(make_closure())
 
     dir_ = opt._prev_descent_direction
     assert dir_ is not None and dir_.shape[1] == 2
@@ -50,7 +50,7 @@ def test_fd_gradient_replaces_the_ot_descent_direction():
 
 
 def test_losses_3d_retained():
-    """Optimizer should retain the (P, V, K) loss tensor when use_quadratic_model=True, polytope_type="orthoplex"."""
+    """Keeps the (P, V, K) tensor under the orthoplex quadratic model."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
         model,
@@ -62,7 +62,7 @@ def test_losses_3d_retained():
         max_iterations=2,
         seed=42,
     )
-    closure = make_closure(opt)
+    closure = make_closure()
     opt.step(closure)
 
     assert opt._losses_3d is not None
@@ -73,7 +73,7 @@ def test_losses_3d_retained():
 
 
 def test_newton_momentum_uses_fd_direction():
-    """With use_quadratic_model=True, polytope_type="orthoplex", momentum steps should use Newton direction."""
+    """Orthoplex quadratic model: momentum steps take the Newton direction."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
         model,
@@ -88,7 +88,7 @@ def test_newton_momentum_uses_fd_direction():
         max_iterations=2,
         seed=42,
     )
-    closure = make_closure(opt)
+    closure = make_closure()
 
     # Step 1: full OT step computes the Newton direction from FD data
     opt.step(closure)
@@ -114,7 +114,7 @@ def test_newton_momentum_fallback_without_qm():
         max_iterations=2,
         seed=42,
     )
-    closure = make_closure(opt)
+    closure = make_closure()
     opt.step(closure)
     assert opt._transport_direction_ema is not None
     assert opt._newton_direction is None
@@ -139,7 +139,7 @@ def test_trust_region_expands_on_accurate_prediction():
         max_iterations=12,
         seed=42,
     )
-    closure = make_closure(opt)
+    closure = make_closure()
     for _ in range(12):
         opt.step(closure)
 
@@ -163,7 +163,7 @@ def test_newton_refinement_keeps_warmstart_duals():
         max_iterations=3,
         seed=42,
     )
-    opt.step(make_closure(opt))
+    opt.step(make_closure())
     assert opt._state.f is not None
     assert opt._state.g is not None
 
@@ -186,7 +186,7 @@ def test_newton_refinement_keeps_momentum():
             max_iterations=3,
             seed=42,
         )
-        closure = make_closure(opt)
+        closure = make_closure()
         for _ in range(3):
             opt.step(closure)
         final.append(opt._state.X.clone())
@@ -217,20 +217,20 @@ def _bowl_probe_counts(**kwargs):
     return opt, counts
 
 
-def test_newton_refinement_keeps_every_probe_by_default():
+def test_newton_refinement_default_keeps_probes():
     opt, counts = _bowl_probe_counts()
     assert opt.adaptive_num_probe is False
     assert counts == [3] * 10
 
 
-def test_adaptive_num_probe_under_newton_refinement_warns():
+def test_adaptive_probes_newton_refinement_warns():
     with pytest.warns(UserWarning, match="refinement pauses"):
         _, counts = _bowl_probe_counts(adaptive_num_probe=True)
     assert counts[-1] == 1
 
 
 @pytest.mark.parametrize("kwargs", [{"block_strategy": "per_layer"}, {"num_probe": 1}])
-def test_inactive_newton_refinement_skips_the_pause_warning(kwargs):
+def test_inactive_newton_refinement_skips_pause_warning(kwargs):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         PolyStepOptimizer(
@@ -280,7 +280,6 @@ def test_multifidelity_screening_keeps_descending():
 
 
 def test_multifidelity_off_by_default():
-    """Multi-fidelity should be disabled by default."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
         model,
@@ -292,7 +291,7 @@ def test_multifidelity_off_by_default():
     assert not opt.multifidelity_screen
 
 
-def test_screen_ranks_by_deviation_from_the_row_mean_on_a_simplex():
+def test_simplex_screen_ranks_by_row_mean_deviation():
     """sum_v v = 0, so a vertex at the row mean moves the barycentre by nothing.
 
     Deviation from the mean is what the antithetic contrast measures, written for a
@@ -324,7 +323,6 @@ def test_screen_ranks_by_deviation_from_the_row_mean_on_a_simplex():
 
 
 def test_all_dfo_features_compose():
-    """All DFO features should work together without errors."""
     model, make_closure = _make_model_and_closure()
     opt = PolyStepOptimizer(
         model,
@@ -339,7 +337,7 @@ def test_all_dfo_features_compose():
         max_iterations=3,
         seed=42,
     )
-    closure = make_closure(opt)
+    closure = make_closure()
 
     # 10 steps = 3+ full OT cycles with amortization
     losses = []
@@ -357,7 +355,7 @@ def test_all_dfo_features_compose():
     assert set(lengths.values()) == {10}, lengths
 
 
-def test_screen_masks_dropped_vertices_only_for_selection_solvers():
+def test_screen_masks_dropped_only_for_selection():
     """A weighted mean reads every entry; an argmin reads only the winner.
 
     Imputing a dropped vertex is fine for the first and wrong for the second, where an
@@ -403,7 +401,7 @@ def test_screen_masks_dropped_vertices_only_for_selection_solvers():
         assert seen["all_finite"] is expect_finite, solver
 
 
-def test_screen_runs_on_a_simplex_under_a_selection_solver():
+def test_selection_screen_runs_on_simplex():
     """Ranking vertices by their own cost needs no antithetic partner, so no orthoplex."""
     model, _ = _make_model_and_closure()
     x, y = torch.randn(64, 4), torch.randn(64, 2)
@@ -430,9 +428,19 @@ def test_screen_runs_on_a_simplex_under_a_selection_solver():
     assert opt._last_screen_savings > 0
 
 
-def test_screen_keeps_enough_vertices_for_top_k_mean():
+def test_screen_keeps_top_k_vertices(monkeypatch):
     """TopKMeanSolver averages min(k, V) vertices, so a screen keeping fewer feeds it
     entries that were never evaluated at full fidelity."""
+    from polystep import _step_monolithic
+
+    kept_per_row = []
+    fill = _step_monolithic._fill_screened_losses
+
+    def spy(screen_cost, kept, sel_idx, keep_mask, *args, **kwargs):
+        kept_per_row.append(keep_mask.sum(-1))
+        return fill(screen_cost, kept, sel_idx, keep_mask, *args, **kwargs)
+
+    monkeypatch.setattr(_step_monolithic, "_fill_screened_losses", spy)
     model, _ = _make_model_and_closure()
     inputs, targets = torch.randn(16, 4), torch.randn(16, 2)
     evaluator = NNCostEvaluator(model, nn.MSELoss())
@@ -460,13 +468,12 @@ def test_screen_keeps_enough_vertices_for_top_k_mean():
     assert torch.isfinite(opt.state.X).all()
     assert opt.solver.k == 3
 
-    # Every vertex holding transport mass must be one the screen kept.
     V = opt._polytope_vertices.shape[0]
-    keep_v = min(V, max(1, int(round(V * opt.screen_keep_ratio)), min(opt.solver.k, V)))
-    assert keep_v >= min(opt.solver.k, V), f"keep_v={keep_v} < k_eff={min(opt.solver.k, V)}"
+    assert kept_per_row, "the screen did not run"
+    assert all(bool((rows >= min(opt.solver.k, V)).all()) for rows in kept_per_row)
 
 
-def test_default_polytope_is_the_minimal_positive_spanning_set():
+def test_default_polytope_is_minimal_spanning_set():
     """k+1 vertices, not 2k. Changing this default is a real cost-per-step change."""
     model, _ = _make_model_and_closure()
     opt = PolyStepOptimizer(model, particle_dim=4, seed=0)
@@ -474,7 +481,7 @@ def test_default_polytope_is_the_minimal_positive_spanning_set():
     assert opt._polytope_vertices.shape[0] == 5
 
 
-def test_only_newton_refinement_still_needs_the_orthoplex():
+def test_only_newton_refinement_needs_orthoplex():
     """The gradient and curvature are closed forms on any centred tight frame."""
     model, _ = _make_model_and_closure()
     with pytest.warns(UserWarning, match="antithetic vertex ordering"):
@@ -488,7 +495,7 @@ def test_only_newton_refinement_still_needs_the_orthoplex():
         )
 
 
-def test_screen_places_full_fidelity_values_at_the_kept_positions():
+def test_screen_places_kept_values_in_place():
     """The screen must not disturb the values it did evaluate at full fidelity.
 
     Kept entries must arrive unchanged at the right index, or the OT solve ranks
@@ -549,7 +556,7 @@ def test_screen_calibrates_on_finite_screen_costs():
     assert out[3].isnan()
 
 
-def test_site_vmap_screens_on_the_screen_slice():
+def test_site_vmap_screens_on_screen_slice():
     """A Conv2d model scores full-space candidates on the site-vmap path, which must
     screen on the same slice as the screen closure, not on the whole batch."""
     torch.manual_seed(0)
@@ -586,11 +593,11 @@ def test_site_vmap_screens_on_the_screen_slice():
     assert opt._last_screen_savings > 0
 
 
-def test_a_2d_cube_is_not_treated_as_an_orthoplex():
+def test_2d_cube_not_treated_as_orthoplex():
     """cube at pdim=2 also has 4 vertices, but its halves are not antipodal.
 
-    Inferring the geometry from the vertex count read L(v0)-L(v2) as a central
-    difference: cosine to the true descent fell from 1.0 to 0.29, first sign flipped.
+    Inferring the geometry from the vertex count would read L(v0)-L(v2) as a central
+    difference and point the step away from descent.
     """
     torch.manual_seed(0)
     model = nn.Linear(2, 1, bias=False)
@@ -621,3 +628,232 @@ def test_a_2d_cube_is_not_treated_as_an_orthoplex():
 
     # Descent from zero weights is -grad = 2 * target, recovered exactly on a quadratic.
     torch.testing.assert_close(opt._prev_descent_direction[0], 2.0 * target[0], rtol=1e-4, atol=1e-4)
+
+
+def test_newton_refinement_warns_at_default_num_probe():
+    """The finite-difference model needs two probe scales; num_probe defaults to 1."""
+    with pytest.warns(UserWarning, match="newton_refinement needs num_probe"):
+        PolyStepOptimizer(nn.Linear(8, 4), epsilon=0.1, max_iterations=5, newton_refinement=True)
+
+
+@pytest.mark.parametrize("mode", ["mean", "max_cost"])
+def test_nan_screen_loss_excluded_from_divisor(monkeypatch, mode):
+    """A sanitized screen loss would pass the penalty off as a cost.
+
+    It would set the divisor, and through the calibration offset drag the dropped
+    vertices far below the scored ones.
+    """
+    import polystep.solvers._shared as shared
+
+    divisors = []
+    resolve = shared.resolve_cost_scale
+
+    def spy(*args):
+        divisors.append(resolve(*args))
+        return divisors[-1]
+
+    monkeypatch.setattr(shared, "resolve_cost_scale", spy)
+    torch.manual_seed(0)
+    model = nn.Linear(4, 1, bias=False)
+    opt = PolyStepOptimizer(
+        model,
+        solver="sinkhorn",
+        polytope_type="orthoplex",
+        scale_cost=mode,
+        use_momentum=False,
+        seed=0,
+        multifidelity_screen=True,
+        screen_keep_ratio=0.25,
+        screen_fidelity=0.25,
+    )
+
+    def closure(params):
+        return 2.30 + 0.01 * torch.sigmoid(params["weight"].reshape(-1, 4).sum(-1))
+
+    def screen(params):
+        loss = closure(params)
+        loss[params["weight"].reshape(-1, 4)[:, 0].argmax()] = float("nan")
+        return loss
+
+    opt.step(closure, screen_closure=screen)
+
+    assert divisors
+    assert max(d.item() for d in divisors) < 0.01
+
+
+def test_screen_dropped_vertices_keep_clean_trajectory():
+    """A selection solver's screen drops vertices as +inf, though every loss is finite.
+
+    The pinned weight is the trajectory with screen-dropped vertices penalized per probe.
+    """
+    torch.manual_seed(3)
+    model = nn.Linear(6, 1, bias=False)
+    target = torch.linspace(-1, 1, 6)
+    opt = PolyStepOptimizer(
+        model,
+        solver="min_cost_greedy",
+        polytope_type="orthoplex",
+        num_probe=3,
+        seed=3,
+        multifidelity_screen=True,
+        screen_keep_ratio=0.5,
+        screen_fidelity=0.25,
+    )
+
+    def closure(params):
+        w = params["weight"].reshape(-1, 6)
+        return ((w - target) ** 2).sum(-1) + 0.5 * torch.sin(9 * w).sum(-1)
+
+    def screen(params):
+        w = params["weight"].reshape(-1, 6)
+        return ((w - target) ** 2).sum(-1) + 0.2 * torch.cos(3 * w).sum(-1)
+
+    for _ in range(60):
+        opt.step(closure, screen_closure=screen)
+
+    assert model.weight[0, 2].item() == pytest.approx(-0.42066213, abs=1e-7)
+
+
+def test_multifidelity_screen_skips_forwards():
+    """The screen has to run before the full-fidelity sweep, or it saves nothing."""
+    torch.manual_seed(0)
+    inputs, targets = torch.randn(64, 12), torch.randn(64, 3)
+    seen = {}
+
+    def build(screen):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(12, 8), nn.ReLU(), nn.Linear(8, 3))
+        evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
+        seen[screen] = 0
+
+        def closure(batched, _in=inputs, _tgt=targets, _key=screen):
+            seen[_key] += next(iter(batched.values())).shape[0] * _in.shape[0]
+            return evaluator.evaluate(batched, _in, _tgt)
+
+        opt = PolyStepOptimizer(
+            model,
+            epsilon=0.1,
+            max_iterations=20,
+            seed=3,
+            multifidelity_screen=screen,
+            polytope_type="orthoplex",
+            screen_keep_ratio=0.5,
+            screen_fidelity=0.25,
+        )
+        return closure, opt
+
+    for screen in (False, True):
+        closure, opt = build(screen)
+        screen_closure = opt.screen_closure_from(closure, inputs, targets)
+        assert (screen_closure is not None) == screen
+        for _ in range(5):
+            opt.step(closure, screen_closure=screen_closure)
+
+    # Budget is screen_fidelity + screen_keep_ratio of the unscreened cost.
+    assert seen[True] < 0.85 * seen[False], (seen[True], seen[False])
+
+
+def test_multifidelity_screen_warns_without_screen_closure():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(12, 8), nn.ReLU(), nn.Linear(8, 3))
+    evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
+    inputs, targets = torch.randn(16, 12), torch.randn(16, 3)
+    opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=20, multifidelity_screen=True, polytope_type="orthoplex")
+    with pytest.warns(UserWarning, match="no forward evaluations are saved"):
+        opt.step(lambda bp: evaluator.evaluate(bp, inputs, targets))
+
+
+def _screen_step(num_probe, keep_ratio, screen_fidelity=0.25):
+    torch.manual_seed(0)
+    model = nn.Linear(8, 4)
+    opt = PolyStepOptimizer(
+        model,
+        seed=0,
+        particle_dim=4,
+        multifidelity_screen=True,
+        polytope_type="orthoplex",
+        screen_keep_ratio=keep_ratio,
+        screen_fidelity=screen_fidelity,
+        num_probe=num_probe,
+    )
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    inputs, targets = torch.randn(16, 8), torch.randn(16, 4)
+
+    def closure(batched, _in=inputs, _tgt=targets):
+        return evaluator.evaluate(batched, _in, _tgt)
+
+    return opt, closure, inputs, targets
+
+
+def test_multifidelity_screen_refuses_costly_config():
+    """screen_fidelity/num_probe + keep_ratio >= 1: the screen would buy work, not save it."""
+    opt, closure, inputs, targets = _screen_step(num_probe=1, keep_ratio=0.9, screen_fidelity=0.5)
+    with pytest.warns(UserWarning, match="costs more work than it saves"):
+        opt.step(closure, screen_closure=opt.screen_closure_from(closure, inputs, targets))
+    assert opt._last_screen_savings == 0.0
+
+
+@pytest.mark.parametrize("num_probe", [1, 5])
+def test_multifidelity_screen_saves_work_when_cheap(num_probe):
+    """A cheap stage one pays for itself even at a single probe scale."""
+    opt, closure, inputs, targets = _screen_step(num_probe=num_probe, keep_ratio=0.5)
+    opt.step(closure, screen_closure=opt.screen_closure_from(closure, inputs, targets))
+    assert opt._last_screen_savings > 0.0
+
+
+def test_screen_ranks_directions_per_particle():
+    """The kept set is per particle, not one index list shared by all of them.
+
+    Each particle carries its own rotation, so vertex index j points somewhere
+    different in every row. Averaging the contrast down the rows would make the topk
+    a draw between exchangeable values and spend the full-fidelity budget on
+    directions picked at random.
+    """
+    from polystep import _step_monolithic
+
+    torch.manual_seed(0)
+    inputs, targets = torch.randn(64, 12), torch.randn(64, 3)
+    model = nn.Sequential(nn.Linear(12, 8), nn.ReLU(), nn.Linear(8, 3))
+    evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
+
+    def closure(batched, _in=inputs, _tgt=targets):
+        return evaluator.evaluate(batched, _in, _tgt)
+
+    seen = {}
+    original = _step_monolithic._fill_screened_losses
+
+    def capture(screen_cost, kept, sel_idx, keep_mask, *args, **kwargs):
+        seen["mask"] = keep_mask.clone()
+        seen["screen"] = screen_cost.clone()
+        return original(screen_cost, kept, sel_idx, keep_mask, *args, **kwargs)
+
+    opt = PolyStepOptimizer(
+        model,
+        epsilon=0.1,
+        max_iterations=20,
+        seed=3,
+        multifidelity_screen=True,
+        polytope_type="orthoplex",
+        screen_keep_ratio=0.5,
+        screen_fidelity=0.25,
+    )
+    _step_monolithic._fill_screened_losses = capture
+    try:
+        opt.step(closure, screen_closure=opt.screen_closure_from(closure, inputs, targets))
+    finally:
+        _step_monolithic._fill_screened_losses = original
+
+    mask, screen = seen["mask"], seen["screen"]
+    assert mask.dim() == 2, "the kept set is per particle, not one shared index list"
+    assert not bool((mask == mask[0]).all()), "every particle kept the same directions"
+
+    # Each row must keep its own highest-contrast pairs.
+    pdim = mask.shape[1] // 2
+    contrast = (screen[:, :pdim] - screen[:, pdim:]).abs()
+    kept = mask[:, :pdim]
+    assert bool(
+        (
+            contrast.masked_fill(~kept, float("inf")).amin(dim=1)
+            >= contrast.masked_fill(kept, -float("inf")).amax(dim=1)
+        ).all()
+    )

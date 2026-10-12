@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple
 
 import torch
-
-from .solvers._shared import decomposition_dtype, thin_qr
-from .subspace import ProjectedAbsorbMixin, SvdRatioMixin, absorb_due
 import torch.nn as nn
 
-if TYPE_CHECKING:
-    from .transform import ParamLayout
+from .projection import SparseRandomProjection
+from .solvers._shared import decomposition_dtype, thin_qr
+from .subspace import ProjectedAbsorbMixin, SvdRatioMixin, history_unusable
+from .transform import ParamLayout
 
 
 def _draw_basis_gaussian(rows, cols, device, dtype, generator):
@@ -96,7 +94,7 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         # Positive diagonal in R removes the QR sign ambiguity.
         d = torch.sign(torch.diagonal(R))
         d = torch.where(d == 0, 1.0, d)
-        P = (P * d)[:, :cols]  # QR may return a full square Q; slice back to cols
+        P = P * d
         if dtype != compute_dtype:
             P = P.to(dtype=dtype)
         if P.device != target_device:
@@ -117,19 +115,7 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         device = projection.device
         dtype = projection.dtype
 
-        use_random = (
-            self.rotation_mode == "random" or displacement_history is None or displacement_history.shape[0] == 0
-        )
-
-        if not use_random:
-            disp_norm_sq = torch.where(
-                torch.isfinite(displacement_history).all(),
-                (displacement_history * displacement_history).sum(),
-                torch.nan,
-            ).item()
-            use_random = math.isnan(disp_norm_sq) or disp_norm_sq < 1e-20
-
-        if use_random:
+        if history_unusable(self.rotation_mode, displacement_history):
             return self._rotate_random(device, dtype, generator)
         else:
             svd_ratio = self.get_svd_ratio(step, total_steps)
@@ -176,7 +162,6 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             return self._rotate_random(device, dtype, generator)
 
         k_svd = max(1, int(svd_ratio * self.subspace_dim))
-        k_random = self.subspace_dim - k_svd
 
         # A full-space history keeps the basis each row was measured in; the caller states the frame.
         if history_is_full:
@@ -205,7 +190,6 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         d = torch.sign(torch.diagonal(R))
         d = torch.where(d == 0, 1.0, d)
         P_new = P_new * d
-        P_new = P_new[:, : self.subspace_dim]
         if P_new.dtype != dtype:
             P_new = P_new.to(dtype)
 
@@ -221,8 +205,6 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         flat_subspace: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """Reconstruct a state_dict from the base weights and one subspace vector."""
-        from .projection import SparseRandomProjection
-
         if isinstance(projection, SparseRandomProjection):
             delta_flat = projection.project(flat_subspace)  # (full_dim,)
         else:
@@ -245,8 +227,6 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
 
         A dense projection writes into a contiguous ``(N, full_dim)`` ``out`` when one is given.
         """
-        from .projection import SparseRandomProjection
-
         if isinstance(projection, SparseRandomProjection):
             # project() returns a transposed result; make it contiguous.
             delta_batch = projection.project(flat_subspace_batch).contiguous()  # (N, full_dim)
@@ -283,16 +263,6 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             for spec in self._entry_specs
         }
 
-    def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
-        """Whether to fold the perturbation into the base weights this step."""
-        return absorb_due(
-            self.absorb_mode,
-            self.absorb_patience,
-            self.absorb_interval,
-            stagnation_count,
-            iteration,
-        )
-
     @classmethod
     def auto_from_params(
         cls,
@@ -303,8 +273,6 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         **kwargs,
     ) -> AdaptiveSubspace:
         """Create an AdaptiveSubspace from an nn.Module with auto rank."""
-        from .transform import ParamLayout
-
         layout = ParamLayout.from_module(model)
         full_dim = layout.total_params
         subspace_dim = max(min_rank, min(max_rank, int(full_dim * compression_target)))

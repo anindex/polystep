@@ -625,7 +625,7 @@ def main():
     if args.repeats < 2 or min(args.batch, args.candidates, args.threads) < 1 or args.warmup < 0:
         ap.error("repeats must be >=2; batch, candidates and threads positive; warmup nonnegative")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
-        ap.error("CUDA is unavailable; run on CPU or restore GPU access")
+        ap.error("CUDA is unavailable; use --device cpu")
     torch.set_num_threads(args.threads)
     rows = (
         prefix_bench(args)

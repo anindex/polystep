@@ -309,7 +309,6 @@ def cma_es(
     best = torch.tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
 
     # IPOP restarts (Auger & Hansen 2005): pycma stops early on its own criteria, so double the population and resume from the incumbent on each stop.
-    restarts = 0
     while obj.remaining >= es.popsize:
         while obj.remaining >= es.popsize and not es.stop():
             solutions = es.ask()
@@ -324,7 +323,6 @@ def cma_es(
         best = torch.tensor(es.result.xfavorite, device=x.device, dtype=x.dtype)
         if obj.remaining < es.popsize:
             break
-        restarts += 1
         # Budget cap stops a spin; max_popsize cap stops the doubling from exhausting GPU memory.
         pop = min(int(es.popsize) * 2, max_popsize, max(2, int(obj.remaining)))
         if pop <= es.popsize:

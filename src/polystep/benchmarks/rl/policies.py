@@ -66,7 +66,6 @@ class NonDiffMLPPolicy(nn.Sequential):
     """Discrete-action MLP policy with a non-differentiable activation layer instead of Tanh."""
 
     def __init__(self, obs_dim: int, hidden: int, action_dim: int, *, mode: str = "binary"):
-        mode = str(mode).lower()
         super().__init__(
             OrderedDict(
                 [
@@ -81,7 +80,6 @@ class NonDiffMLPPolicy(nn.Sequential):
                 ]
             )
         )
-        self.mode = mode
 
 
 def stack_module_params(

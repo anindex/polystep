@@ -415,7 +415,6 @@ def screen_configs(env: Env):
             s,
             kwargs={"num_probe": 2, "biased_rotation": True, "use_quadratic_model": True},
         ),
-        Config("quadratic", "multifidelity", s, kwargs={"num_probe": 2, "multifidelity_screen": True}),
     ]
 
     # 9. Geometry.
@@ -787,21 +786,6 @@ def sweep_baseline(method: str, envs, seeds, device: str, results_dir: str) -> d
     return per_env
 
 
-def polystep_tuning_cost(envs, stage: str, seeds) -> dict:
-    """What the PolyStep sweep costs, in the same units, for the same table."""
-    out = {}
-    for env in envs:
-        n = len(configs_for(env, stage))
-        out[env.name] = {
-            "method": "polystep",
-            "configs": n,
-            "seeds_per_config": len(seeds),
-            "evals_per_config": env.budget,
-            "tuning_evals": n * len(seeds) * env.budget,
-        }
-    return out
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--envs", nargs="+", default=["fast"], help="env names, or 'fast' / 'all'")
@@ -834,7 +818,10 @@ def main():
         print(f"\nwrote tuning cost for {args.baseline} to {cost_path}")
         return
 
-    costs["polystep"] = polystep_tuning_cost(envs, args.stage, seeds)
+    costs["polystep"] = {
+        env.name: tuning_cost("polystep", env.budget, seeds=len(seeds), configs=len(configs_for(env, args.stage)))
+        for env in envs
+    }
     with open(cost_path, "w") as f:
         json.dump(costs, f, indent=2)
 

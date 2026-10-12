@@ -20,7 +20,7 @@ def test_controlled():
     gen = torch.Generator().manual_seed(13)
     u = draw_vertices(3, "orthoplex", gen, "cpu").double()
     assert torch.allclose(u[:, :8] @ u[:, :8].transpose(1, 2), torch.eye(8).double().expand(3, 8, 8), atol=1e-6)
-    assert torch.equal(u.sum(1), torch.zeros(3, 8).double()) or u.sum(1).abs().max() < 1e-6
+    assert u.sum(1).abs().max() < 1e-6
     cost = torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]]).expand(
         3, -1
     )
@@ -58,8 +58,3 @@ def test_controlled():
             exact_params = reconstruct(base, sub, projection, candidate)
             for key in base:
                 assert torch.allclose(batch[key][16 * i + j], exact_params[key], atol=1e-6)
-
-
-if __name__ == "__main__":
-    test_controlled()
-    print("controlled-study checks passed")

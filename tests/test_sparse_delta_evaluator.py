@@ -39,7 +39,7 @@ ARCHITECTURES = [
 
 
 @pytest.mark.parametrize("name,dims,loss_fn,kind", ARCHITECTURES, ids=[a[0] for a in ARCHITECTURES])
-def test_matches_the_dense_path_at_every_perturbation_site(name, dims, loss_fn, kind):
+def test_matches_dense_path_at_every_site(name, dims, loss_fn, kind):
     """Every accepted candidate must match the dense path, across all site kinds."""
     torch.manual_seed(0)
     model = _mlp(dims)
@@ -72,7 +72,7 @@ def test_matches_the_dense_path_at_every_perturbation_site(name, dims, loss_fn, 
 
 
 @pytest.mark.parametrize("pdim", [3, 8, 16])
-def test_wide_runs_keep_the_touched_output_units(pdim):
+def test_wide_runs_keep_touched_output_units(pdim):
     """A run wider than a weight row spans several output units, and one ending on the
     last row names units past it; every site must still match the dense path."""
     torch.manual_seed(0)
@@ -107,7 +107,7 @@ def test_wide_runs_keep_the_touched_output_units(pdim):
     assert last_row and (wide or pdim < 6), (wide, last_row)
 
 
-def test_a_batch_of_candidates_matches_one_at_a_time():
+def test_candidate_batch_matches_single_calls():
     """The chunk is evaluated in one call, so N candidates must agree with N calls."""
     torch.manual_seed(0)
     model = _mlp([6, 5, 4, 3])
@@ -164,7 +164,7 @@ def test_grouping_candidates_by_particle_changes_nothing():
     torch.testing.assert_close(grouped, flat, rtol=0, atol=0)
 
 
-def test_declines_a_run_that_straddles_two_parameters():
+def test_declines_run_straddling_two_parameters():
     """A run straddling two parameters perturbs two layers at once and must be declined."""
     torch.manual_seed(0)
     # Linear(3, 3) gives a 9-element weight, so the flat run [8, 10) crosses into bias.
@@ -178,7 +178,7 @@ def test_declines_a_run_that_straddles_two_parameters():
     assert evaluator.resolve_site(torch.tensor([straddling]), PDIM) is None
 
 
-def test_declines_a_chunk_spanning_two_parameters():
+def test_declines_chunk_spanning_two_parameters():
     """A chunk covering rows from two different entries has no single site."""
     torch.manual_seed(0)
     model = _mlp([4, 4, 2])
@@ -214,26 +214,21 @@ def test_declines_tied_weights():
     ],
     ids=["layernorm", "batchnorm", "softmax", "conv"],
 )
-def test_declines_layers_that_mix_features(model):
-    """Normalization, softmax and convolution spread a perturbation across every
-    output, breaking delta confinement.
-    """
+def test_declines_feature_mixing_layers(model):
+    """These layers spread a perturbation to every output, breaking delta confinement."""
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
     assert SparseDeltaEvaluator.try_build(model, nn.MSELoss(), layout) is None
 
 
-def test_declines_a_configured_loss():
+def test_declines_configured_loss():
     """A loss the batched reduction cannot reproduce must use the real loss_fn."""
     model = _mlp([4, 4, 2])
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
     assert SparseDeltaEvaluator.try_build(model, nn.CrossEntropyLoss(label_smoothing=0.1), layout) is None
 
 
-def test_optimizer_step_matches_with_and_without_the_fast_path():
+def test_fast_path_keeps_step_trajectory():
     """End to end: the fast path must not change the trajectory it accelerates."""
-    from polystep import PolyStepOptimizer
-    from polystep.cost_nn import NNCostEvaluator
-
     calls = []
 
     def run(use_fast):
@@ -348,7 +343,7 @@ def _sweep_every_site(model):
 
 
 @pytest.mark.parametrize("activation", [nn.ReLU, nn.Sigmoid, _SignAct], ids=["relu", "sigmoid", "sign"])
-def test_delta_algebra_is_exact_for_any_elementwise_activation(activation):
+def test_delta_exact_for_elementwise_activations(activation):
     """``module(a + d) - module(a)`` is an exact finite difference for any
     elementwise activation.
     """
@@ -358,7 +353,7 @@ def test_delta_algebra_is_exact_for_any_elementwise_activation(activation):
 
 
 @pytest.mark.parametrize("layer", [nn.Linear, _SignLinear], ids=["linear", "sign_weight"])
-def test_delta_algebra_is_exact_for_a_declared_weight_transform(layer):
+def test_delta_exact_for_declared_weight_transform(layer):
     """A weight-transforming layer moves its output by ``Q(w + d) - Q(w)``, which
     the evaluator must reproduce.
     """
@@ -368,7 +363,7 @@ def test_delta_algebra_is_exact_for_a_declared_weight_transform(layer):
 
 
 @pytest.mark.parametrize("activation", [_StatefulAct, _PerTensorAct], ids=["buffer", "per_tensor"])
-def test_a_module_that_cannot_keep_the_elementwise_contract_is_declined(activation):
+def test_non_elementwise_module_declined(activation):
     """A module with a buffer or a whole-tensor reduction cannot keep the
     elementwise contract and must be declined.
     """
@@ -377,7 +372,7 @@ def test_a_module_that_cannot_keep_the_elementwise_contract_is_declined(activati
     assert SparseDeltaEvaluator.try_build(model, nn.CrossEntropyLoss(), layout) is None
 
 
-def test_the_per_tensor_control_really_does_disagree():
+def test_per_tensor_control_disagrees():
     """Guards the test above: it must decline something that would be wrong if accepted."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 5), _PerTensorAct(), nn.Linear(5, 3))
@@ -405,14 +400,12 @@ def test_the_per_tensor_control_really_does_disagree():
 
 
 @pytest.mark.parametrize("block_strategy", ["per_layer", "grouped"])
-def test_blockwise_step_scores_through_the_delta_path(block_strategy):
+def test_blockwise_step_uses_delta_path(block_strategy):
     """A block-wise step must reach the delta path and agree with the dense one.
 
     Without it block-wise builds a full model configuration per candidate and calls
     the closure, leaving every delta evaluator unreachable.
     """
-    from polystep import PolyStepOptimizer
-    from polystep.cost_nn import NNCostEvaluator
 
     def build():
         torch.manual_seed(0)
@@ -445,12 +438,11 @@ def test_blockwise_step_scores_through_the_delta_path(block_strategy):
 
 
 @pytest.mark.parametrize("block_strategy", ["per_layer", "grouped"])
-def test_blockwise_scores_only_the_padded_tails_densely(block_strategy):
+def test_blockwise_scores_padded_tails_densely(block_strategy):
     """At particle_dim 8 both biases end mid-particle; only the first one's padded particle goes dense.
 
     The last bias runs into the layout's own padding, so it stays site-local with every
-    other particle. Grouped blocks and the leading particles of a padded block used to
-    go dense whole.
+    other particle.
     """
 
     def run(register):
@@ -486,11 +478,9 @@ def test_blockwise_scores_only_the_padded_tails_densely(block_strategy):
 
 
 @pytest.mark.parametrize("frozen", ["0.weight", "0.bias", "2.weight", "2.bias"])
-def test_delta_evaluator_declines_when_a_linear_param_is_frozen(frozen):
-    """``ParamLayout`` drops ``requires_grad=False`` parameters, but the delta path
-    read every Linear weight straight out of that partial ``base_sd``: a frozen
-    weight raised KeyError and a frozen bias silently evaluated a bias-free net.
-    Both must fall back to the materializing path instead.
+def test_delta_evaluator_declines_frozen_linear_param(frozen):
+    """``ParamLayout`` drops ``requires_grad=False`` parameters, so the delta path must
+    decline rather than read a partial ``base_sd``, and the step materializes instead.
     """
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 6), nn.ReLU(), nn.Linear(6, 2))
@@ -506,11 +496,8 @@ def test_delta_evaluator_declines_when_a_linear_param_is_frozen(frozen):
     optimizer.step(lambda params: evaluator.evaluate(params, inputs, targets))
 
 
-def test_registering_a_new_objective_rebuilds_the_fast_paths():
-    """The fast-path evaluators were built once and keyed on nothing, so
-    re-registering an evaluator with a different loss left them scoring the old
-    objective while the closure scored the new one.
-    """
+def test_reregistering_objective_rebuilds_fast_paths():
+    """A new loss must reach the rebuilt fast paths."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 6), nn.ReLU(), nn.Linear(6, 2))
     optimizer = PolyStepOptimizer(model, seed=0)
@@ -525,3 +512,34 @@ def test_registering_a_new_objective_rebuilds_the_fast_paths():
 
     assert second is not first
     assert isinstance(second.loss_fn, nn.L1Loss)
+
+
+@pytest.mark.parametrize(
+    "layers, out, expected",
+    [
+        (lambda: (nn.Linear(3, 101, bias=False),), 101, 0),
+        (lambda: (nn.Linear(3, 101), nn.Tanh(), nn.Linear(101, 5)), 5, 27),
+    ],
+    ids=["tail", "interior"],
+)
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_only_straddling_particles_fall_back(hybrid, layers, out, expected):
+    from polystep.hybrid_subspace import HybridSubspace
+
+    torch.manual_seed(0)
+    model = nn.Sequential(*layers())
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model, particle_dim=8), rank=4) if hybrid else None
+    opt = PolyStepOptimizer(
+        model, particle_dim=8, polytope_type="simplex", subspace=subspace, solver="softmax", compile=False, seed=0
+    )
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    x, y = torch.randn(16, 3), torch.randn(16, out)
+    opt.register_evaluator(ev, x, y)
+    rows = []
+
+    def closure(params):
+        rows.append(next(iter(params.values())).shape[0])
+        return ev.evaluate(params, x, y)
+
+    opt.step(closure)
+    assert sum(rows) == expected

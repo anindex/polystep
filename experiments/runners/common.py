@@ -22,11 +22,11 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 # its thread pool, hence import time.
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 
-import torch  # noqa: E402
-import torch.nn as nn
+import torch
 from torch.utils.data import DataLoader
 
 from polystep.benchmarks.utils import (
+    evaluate_accuracy,
     seeded_loader_kwargs,
     get_environment_info as _base_get_environment_info,
     get_mnist_loaders as _base_get_mnist_loaders,
@@ -40,11 +40,10 @@ SEEDS: List[int] = [42, 123, 456, 789, 1337]
 METHOD_ALIASES = {"cmaes": "cma_es"}
 
 
-_DEFAULT_RESULTS_DIR = os.path.join(
+RESULTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "results",
-    "softmax",
-    "main",
+    "revision",
 )
 
 
@@ -116,7 +115,7 @@ def save_result(
     metrics.setdefault("test_accuracy_at_selected", metrics["final_accuracy"])
 
     if results_dir is None:
-        results_dir = _DEFAULT_RESULTS_DIR
+        results_dir = RESULTS_DIR
     os.makedirs(results_dir, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -158,55 +157,6 @@ def save_result(
         json.dump(result, f, indent=2, default=str)
 
     return filepath
-
-
-@torch.no_grad()
-def evaluate_accuracy(
-    model: nn.Module,
-    test_loader: DataLoader,
-    device: Optional[torch.device] = None,
-) -> float:
-    """Classification accuracy on a test DataLoader.
-
-    SNN models (those with a 'num_steps' attribute) accumulate spikes across
-    timesteps; SST-2 style 3-element batches are also handled.
-    """
-    if device is None:
-        try:
-            device = next(model.parameters()).device
-        except StopIteration:
-            device = torch.device("cpu")
-
-    model.eval()
-    correct = 0
-    total = 0
-
-    for batch in test_loader:
-        if len(batch) == 2:
-            inputs, targets = batch
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            outputs = model(inputs)
-        elif len(batch) == 3:
-            # SST-2 format: (input_ids, attention_mask, labels)
-            input_ids, attention_mask, targets = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            targets = targets.to(device)
-            outputs = model(input_ids, attention_mask=attention_mask)
-        else:
-            raise ValueError(f"Unexpected batch format with {len(batch)} elements")
-
-        preds = outputs.argmax(dim=-1)
-        # Regression task: classification accuracy is meaningless, return 0.0.
-        if preds.shape != targets.shape:
-            model.train()
-            return 0.0
-        correct += (preds == targets).sum().item()
-        total += targets.size(0)
-
-    model.train()
-    return correct / total if total > 0 else 0.0
 
 
 def pin_threads() -> None:
@@ -359,6 +309,7 @@ def load_fashion_mnist(
 
 
 __all__ = [
+    "RESULTS_DIR",
     "SEEDS",
     "save_result",
     "get_environment_info",

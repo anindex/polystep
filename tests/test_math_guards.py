@@ -23,7 +23,7 @@ def test_exp_plan_saturates_instead_of_overflowing():
     assert (P > 0).all()
 
 
-def test_exp_plan_is_exact_where_the_plain_exp_was_finite():
+def test_exp_plan_exact_where_plain_exp_finite():
     torch.manual_seed(0)
     f, g = torch.randn(4), torch.randn(5)
     C = torch.rand(4, 5)
@@ -31,13 +31,13 @@ def test_exp_plan_is_exact_where_the_plain_exp_was_finite():
     torch.testing.assert_close(exp_plan(f, g, C, 0.1), ref)
 
 
-def test_diverged_sinkhorn_duals_do_not_yield_a_nan_plan():
+def test_diverged_sinkhorn_duals_keep_plan_finite():
     solver = SinkhornSolver(epsilon=1e-4, max_iterations=5, threshold=0.0)
     res = solver.solve(cost_matrix=torch.randn(4, 6) * 1e3)
     assert torch.isfinite(res.matrix).all()
 
 
-def test_greedy_leaves_an_all_infeasible_row_where_it_is():
+def test_greedy_all_infeasible_row_stays_put():
     C = torch.tensor([[float("inf"), float("nan")], [0.0, 1.0]])
     T = MinCostGreedySolver(epsilon=0.1).solve(cost_matrix=C).matrix
     # Row 0 got no information, so its mass is spread evenly.
@@ -46,7 +46,7 @@ def test_greedy_leaves_an_all_infeasible_row_where_it_is():
     torch.testing.assert_close(T[1], torch.tensor([0.5, 0.0]))
 
 
-def test_a_zero_transport_row_leaves_the_particle_where_it_is():
+def test_zero_transport_row_keeps_particle():
     """An underflowed row must not move the particle to the coordinate origin."""
     torch.manual_seed(0)
     X = torch.randn(2, 8)
@@ -66,7 +66,7 @@ def test_a_zero_transport_row_leaves_the_particle_where_it_is():
     torch.testing.assert_close(_barycentric_projection(T, X_vertices)[dead], X[dead])
 
 
-def test_an_infinite_transport_row_leaves_the_particle_where_it_is():
+def test_infinite_transport_row_keeps_particle():
     torch.manual_seed(0)
     X = torch.randn(2, 8)
     rot = torch.linalg.qr(torch.randn(2, 8, 8))[0]
@@ -76,7 +76,7 @@ def test_an_infinite_transport_row_leaves_the_particle_where_it_is():
     torch.testing.assert_close(_barycentric_projection(T, X_vertices)[0], X[0])
 
 
-def test_tiny_positive_row_projects_to_its_normalized_barycentre():
+def test_tiny_row_projects_to_normalized_barycentre():
     torch.manual_seed(0)
     T = torch.rand(2, 6, dtype=torch.float64)
     X_vertices = torch.randn(2, 6, 3, dtype=torch.float64)
@@ -93,7 +93,7 @@ def test_ess_ignores_row_scale():
     torch.testing.assert_close(tiny_ess, ess)
 
 
-def test_every_nonfinite_cost_ranks_below_every_finite_one():
+def test_nonfinite_costs_rank_below_finite():
     """-inf is a diverged evaluation, not a free optimum."""
     C = torch.tensor([[0.0, float("-inf"), 1.0]])
     sanitized = sanitize_cost(C)
@@ -106,7 +106,7 @@ def test_every_nonfinite_cost_ranks_below_every_finite_one():
     assert sanitize_cost(allbad).unique().numel() == 1
 
 
-def test_a_negative_probe_radius_is_rejected():
+def test_negative_radii_rejected():
     model = nn.Sequential(nn.Linear(2, 2))
     with pytest.raises(ValueError, match="probe_radius must be > 0"):
         PolyStepOptimizer(model, probe_radius=-0.1, compile=False)
@@ -114,7 +114,7 @@ def test_a_negative_probe_radius_is_rejected():
         PolyStepOptimizer(model, step_radius=-0.1, compile=False)
 
 
-def test_single_particle_polystep_swaps_in_the_softmax_solver():
+def test_single_particle_polystep_uses_softmax():
     """The substitution follows the state, so states of different sizes can coexist."""
     solver = PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2)
     with pytest.warns(UserWarning, match="Single particle"):
@@ -127,7 +127,7 @@ def test_single_particle_polystep_swaps_in_the_softmax_solver():
     assert isinstance(solver._solver_for(one), SoftmaxSolver)
 
 
-def test_single_particle_polystep_actually_descends():
+def test_single_particle_polystep_descends():
     torch.manual_seed(0)
     solver = PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, max_iterations=30)
     with pytest.warns(UserWarning):
@@ -147,7 +147,7 @@ def test_constant_speed_is_not_convergence():
     assert solver._converged(state)
 
 
-def test_polystep_keeps_running_through_an_infeasible_region():
+def test_polystep_runs_through_infeasible_region():
     target = torch.tensor([3.0, 0.0])
 
     def objective(x):
@@ -160,7 +160,7 @@ def test_polystep_keeps_running_through_an_infeasible_region():
     assert all(math.isfinite(c) for c in state.costs)
 
 
-def test_polystep_reports_inf_when_every_candidate_is_nonfinite():
+def test_polystep_all_nonfinite_candidates_report_inf():
     solver = PolyStep(objective_fn=lambda x: torch.full(x.shape[:-1], torch.inf), dim=2, threshold=1e-12)
     X = torch.randn(8, 2, generator=torch.Generator().manual_seed(0))
     state = solver.run(X)
@@ -169,7 +169,7 @@ def test_polystep_reports_inf_when_every_candidate_is_nonfinite():
     torch.testing.assert_close(state.X, X)
 
 
-def test_polystep_step_flags_an_all_nonfinite_solve_and_keeps_its_duals():
+def test_all_nonfinite_step_flagged_keeps_duals():
     from polystep.epsilon import ProgressiveEpsilon
 
     objective = {"fn": lambda x: x.pow(2).sum(-1)}
@@ -187,7 +187,7 @@ def test_polystep_step_flags_an_all_nonfinite_solve_and_keeps_its_duals():
     torch.testing.assert_close(state.g, g)
 
 
-def test_polystep_reports_a_nonfinite_particle_as_diverged():
+def test_polystep_nonfinite_particle_reports_diverged():
     solver = PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, threshold=1e-12)
     X = torch.randn(8, 2, generator=torch.Generator().manual_seed(0))
     X[3, 0] = torch.nan

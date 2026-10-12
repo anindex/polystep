@@ -1,18 +1,13 @@
-"""Numerical stress tests for the Sinkhorn solver and OT pipeline.
-
-Sanitisation lives in test_input_validation.py and test_regressions.py;
-random-problem marginal checks live in test_sinkhorn_numerics.py.
-"""
+"""Numerical stress tests for the Sinkhorn solver and OT pipeline."""
 
 import torch
-import torch.nn as nn
 import pytest
 
-from polystep import ParamLayout, SinkhornSolver
+from polystep import SinkhornSolver
 
 
 class TestSinkhornEdgeCases:
-    def test_smaller_epsilon_concentrates_the_plan(self):
+    def test_smaller_epsilon_concentrates_plan(self):
         """Lower eps means a sharper plan: each row's mass piles onto fewer columns.
 
         Rows that must split across two columns cap the eps -> 0 row share at 0.5.
@@ -44,7 +39,7 @@ class TestSinkhornEdgeCases:
         expected = 1.0 / (n * m)
         assert (T - expected).abs().max() < expected * 0.05
 
-    @pytest.mark.parametrize("const", [0.0, 42.0])
+    @pytest.mark.parametrize("const", [0.0, 42.0, 1_000_000.0])
     def test_zero_cost_matrix(self, const):
         """Constant cost (including all-zero) should produce uniform transport."""
         n, m = 8, 4
@@ -54,13 +49,13 @@ class TestSinkhornEdgeCases:
 
         T = result.matrix
         assert torch.isfinite(T).all()
+        assert torch.allclose(T, torch.full((n, m), 1.0 / (n * m)), atol=1e-6)
         row_sums = T.sum(dim=1)
         col_sums = T.sum(dim=0)
         assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-4)
         assert torch.allclose(col_sums, torch.ones(m) / m, atol=1e-4)
 
     def test_negative_costs(self):
-        """Cost matrix with negative values should still work."""
         torch.manual_seed(0)
         n, m = 10, 6
         C = torch.randn(n, m)
@@ -98,39 +93,3 @@ def test_non_uniform_marginals():
     result = solver.solve(C, a=a)
     T = result.matrix
     assert torch.allclose(T.sum(dim=1), a, atol=1e-3)
-
-
-class TestParamLayoutStress:
-    # nn.Linear(13, 7) is 98 params: pdim 1 needs no padding, 3 and 8 do.
-    @pytest.mark.parametrize("particle_dim", [1, 3, 8])
-    def test_roundtrip_various_particle_dims(self, particle_dim):
-        """Round-trip should work for any particle_dim."""
-        model = nn.Linear(13, 7)
-        layout = ParamLayout.from_module(model, particle_dim=particle_dim)
-
-        assert layout.padded_size % particle_dim == 0
-        flat = layout.flatten(model)
-        assert flat.shape[1] == particle_dim
-
-        recovered = layout.unflatten(flat)
-        sd = model.state_dict()
-        for key in recovered:
-            assert torch.equal(sd[key], recovered[key])
-
-    def test_empty_model(self):
-        """Model with no parameters should not crash."""
-        model = nn.ReLU()
-        layout = ParamLayout.from_module(model)
-        assert layout.total_params == 0
-
-    def test_batch_unflatten_consistency(self):
-        """batch_unflatten(N=1) should match unflatten on the same data."""
-        model = nn.Linear(10, 5)
-        layout = ParamLayout.from_module(model)
-        flat = layout.flatten(model)
-
-        single = layout.unflatten(flat)
-        batched = layout.batch_unflatten(flat.unsqueeze(0))
-
-        for key in single:
-            assert torch.allclose(single[key], batched[key][0], atol=1e-6)

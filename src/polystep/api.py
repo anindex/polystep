@@ -139,7 +139,7 @@ def train(
                         "displacement": (state.displacement_sqnorms[-1] if state.displacement_sqnorms else 0.0),
                         "velocity_mag": (torch.norm(state.velocity).item() if state.velocity is not None else 0.0),
                         "converged": (state.linear_convergence[-1] if state.linear_convergence else False),
-                        "absorb_count": getattr(state, "absorb_count", 0),
+                        "absorb_count": state.absorb_count,
                     }
                 else:
                     metrics = None
@@ -247,5 +247,5 @@ def get_diagnostics(optimizer: PolyStepOptimizer) -> dict:
         "iteration_count": state.iteration_count,
         "epsilon": state.epsilon,
         "radius_multiplier": state.radius_multiplier,
-        "absorb_count": getattr(state, "absorb_count", 0),
+        "absorb_count": state.absorb_count,
     }

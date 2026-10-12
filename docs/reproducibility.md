@@ -104,9 +104,10 @@ will not reproduce them:
   periodic absorbs, and 1.0 changes both, so their seeded trajectories differ.
 - The variant sweep lost its CMA arms (`cma_subspace`, `covariance`, and the
   `cma_x_adaptive` pair), the `tempered_softmax` solver arm, and the data-dependent
-  Sinkhorn initialization arm, because 1.0 removes those features. The sweep's
-  `block_x_repr`/`per_layer_hybrid` arm now runs the Sinkhorn solver instead of
-  softmax, so that row changes too.
+  Sinkhorn initialization arm, because 1.0 removes those features. Its
+  `quadratic/multifidelity` arm is gone as well: it never ran the screen and repeated
+  the baseline. The sweep's `block_x_repr`/`per_layer_hybrid` arm now runs the
+  Sinkhorn solver instead of softmax, so that row changes too.
 - The surviving `quadratic/trust_region`, `trust_x_quad/trust_quad_k3`,
   `quadratic/biased_rotation`, and `quadratic/newton` sweep arms change as well. The
   trust region now applies its new radius on the step that measured the ratio

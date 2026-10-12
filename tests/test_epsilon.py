@@ -8,11 +8,11 @@ import math
 
 import pytest
 
-from polystep.epsilon import CosineEpsilon, LinearEpsilon, ProgressiveEpsilon
+from polystep.epsilon import CosineEpsilon, LinearEpsilon, ProgressiveEpsilon, resolve_epsilon
 
 
 class TestLinearEpsilon:
-    def test_decays_linearly_from_init_and_holds_at_target(self):
+    def test_decays_linearly_then_holds_target(self):
         s = LinearEpsilon(init=1.0, decay=0.01, target=0.2)
         assert s.at(0) == pytest.approx(1.0)
         assert s.at(50) == pytest.approx(0.5)
@@ -31,7 +31,7 @@ class TestLinearEpsilon:
 
 
 class TestCosineEpsilon:
-    def test_spans_init_to_target_over_the_inferred_horizon(self):
+    def test_spans_init_to_target_over_horizon(self):
         # decay infers T = (init - target) / decay = 80, so a LinearEpsilon config transfers.
         s = CosineEpsilon(init=1.0, decay=0.01, target=0.2)
         assert s.at(0) == pytest.approx(1.0)
@@ -39,7 +39,7 @@ class TestCosineEpsilon:
         assert s.at(80) == pytest.approx(0.2)
         assert s.at(500) == pytest.approx(0.2), "past the horizon the value must clamp, not wrap"
 
-    def test_inferred_horizon_matches_linear_on_a_fractional_ratio(self):
+    def test_fractional_ratio_horizon_matches_linear(self):
         """``(init - target) / decay`` need not be integral; truncating it ends the
         cosine before the LinearEpsilon it transfers from reaches the floor."""
         cos = CosineEpsilon(init=1.0, decay=0.01, target=1e-3)
@@ -51,7 +51,7 @@ class TestCosineEpsilon:
     def test_unstarted_returns_init_not_target(self):
         assert CosineEpsilon(init=1.0, decay=0.01, target=0.2).at(None) == 1.0
 
-    def test_stays_above_linear_through_the_middle(self):
+    def test_stays_above_linear_mid_schedule(self):
         """The reason to pick cosine: it holds epsilon high while linear is already low."""
         cos = CosineEpsilon(init=1.0, decay=0.01, target=0.0)
         lin = LinearEpsilon(init=1.0, decay=0.01, target=0.0)
@@ -66,10 +66,17 @@ class TestCosineEpsilon:
         assert s.at(10) == pytest.approx(1.0, rel=0.05), "a restart must climb back toward init"
         assert all(math.isfinite(s.at(t)) and 0.2 <= s.at(t) <= 1.0 for t in range(200))
 
+    def test_restarts_stay_in_range_past_schedule(self):
+        """Warm-restart cosine epsilon must stay within [target, init] even far
+        beyond the schedule (a maxed-out restart loop cannot push cos past pi)."""
+        ce = CosineEpsilon(init=1.0, target=0.01, total_steps=50, restart_mult=1.0001)
+        for i in range(0, 100_000, 2500):
+            v = ce.at(i)
+            assert 0.01 - 1e-9 <= v <= 1.0 + 1e-9
+
 
 class TestProgressiveEpsilon:
     def test_at_returns_init_value(self):
-        """ProgressiveEpsilon.at(0) returns init value."""
         pe = ProgressiveEpsilon(init=1.0, target=0.01)
         assert pe.at(0) == 1.0
 
@@ -108,7 +115,6 @@ class TestProgressiveEpsilon:
         assert after > initial, f"Expected increase: {after} > {initial}"
 
     def test_epsilon_never_below_target(self):
-        """Epsilon never goes below target floor."""
         pe = ProgressiveEpsilon(
             init=0.05,
             target=0.01,
@@ -121,7 +127,6 @@ class TestProgressiveEpsilon:
         assert pe.at() >= 0.01
 
     def test_epsilon_never_above_max(self):
-        """Epsilon never goes above max_epsilon ceiling."""
         pe = ProgressiveEpsilon(
             init=1.0,
             target=0.01,
@@ -160,7 +165,7 @@ class TestProgressiveEpsilon:
         )
 
 
-class TestProgressiveEpsilonIsDrivenByEveryStepDriver:
+class TestProgressiveEpsilonDrivers:
     """``at()`` moves only when a driver feeds it solver stats, so every driver must."""
 
     @staticmethod
@@ -215,7 +220,7 @@ class TestProgressiveEpsilonIsDrivenByEveryStepDriver:
             seen.append(scheduler.at(None))
         assert len(set(seen)) > 1, f"epsilon pinned at {seen[0]}"
 
-    def test_solvers_without_a_threshold_do_not_feed_it(self):
+    def test_solvers_without_threshold_skip_feed(self):
         """A one-shot solve reports a ratio of 1.0, which would read as a slow Sinkhorn."""
         from polystep.epsilon import feed_solver_stats
         from polystep.solvers import SoftmaxSolver
@@ -242,13 +247,13 @@ class TestProgressiveEpsilonIsDrivenByEveryStepDriver:
 class TestDefaults:
     """The defaults are what an unconfigured run gets, so pin the behaviour they set."""
 
-    def test_linear_defaults_decay_from_one_to_the_target_floor(self):
+    def test_linear_defaults_decay_one_to_floor(self):
         s = LinearEpsilon()
         assert s.at(0) == pytest.approx(1.0)
         assert s.at(50) == pytest.approx(0.5)
         assert s.at(10_000) == pytest.approx(1e-3)
 
-    def test_progressive_defaults_raise_on_a_slow_solve_and_cap(self):
+    def test_progressive_slow_solve_raises_to_cap(self):
         pe = ProgressiveEpsilon()
         assert pe.at() == pytest.approx(1.0)
         # ratio 1.0 is past slow_threshold, so epsilon climbs by increase_factor
@@ -259,7 +264,7 @@ class TestDefaults:
             pe.update(n_iters=100, max_iterations=100, converged=True)
         assert pe.at() == pytest.approx(5.0)
 
-    def test_progressive_defaults_lower_on_a_fast_solve_and_floor(self):
+    def test_progressive_fast_solve_lowers_to_floor(self):
         pe = ProgressiveEpsilon()
         pe.update(n_iters=5, max_iterations=100, converged=True)
         assert pe.at() == pytest.approx(0.7 * 1.0 + 0.3 * 0.95)
@@ -282,7 +287,7 @@ class TestDefaults:
         assert pe.at() == pytest.approx(expected)
 
 
-def test_power_decay_is_square_summable_but_not_summable():
+def test_power_decay_square_summable_not_summable():
     """r_t = r_0 (t+1)^-(1/2+gamma): the schedule the convergence analysis assumes."""
     from polystep.epsilon import PowerDecay
 
@@ -304,14 +309,14 @@ class TestRadiusEpsilonSemantics:
     Both entry points must apply this rule the same way.
     """
 
-    def test_scalar_radius_is_a_multiplier_on_epsilon(self):
+    def test_scalar_radius_multiplies_epsilon(self):
         from polystep.epsilon import radius_epsilon_factor, resolve_radius
 
         assert resolve_radius(2.0, 0, 0.5) == 1.0
         assert resolve_radius(2.0, 999, 0.5) == 1.0  # no iteration dependence
         assert radius_epsilon_factor(2.0, 0.5) == 0.5
 
-    def test_scheduled_radius_is_the_physical_distance(self):
+    def test_scheduled_radius_is_physical_distance(self):
         from polystep.epsilon import radius_epsilon_factor, resolve_radius
 
         sched = CosineEpsilon(init=32.0, target=8.0, decay=(32.0 - 8.0) / 100)
@@ -332,7 +337,7 @@ class TestRadiusEpsilonSemantics:
         solver_side = resolve_radius(radius, iteration, eps)
         assert optimizer_side == solver_side
 
-    def test_solver_accepts_a_scheduled_radius_without_raising(self):
+    def test_solver_accepts_scheduled_radius(self):
         """A scheduled radius must not raise a TypeError in the solver."""
         import torch
 
@@ -349,3 +354,21 @@ class TestRadiusEpsilonSemantics:
         state = solver.run(torch.zeros(4, 2))
         assert len(state.costs) == 3
         assert all(c == c for c in state.costs)  # no NaN
+
+
+def test_fixed_epsilon_does_not_decay():
+    import torch.nn as nn
+
+    from polystep.optimizer import PolyStepOptimizer
+
+    model = nn.Sequential(nn.Linear(10, 5), nn.ReLU(), nn.Linear(5, 2))
+    optimizer = PolyStepOptimizer(
+        model,
+        epsilon=1.0,
+        step_radius=1.0,
+        num_probe=1,
+        sinkhorn_max_iters=20,
+    )
+    for i in range(100):
+        eps = resolve_epsilon(optimizer.epsilon, i, "epsilon")
+        assert eps == 1.0, f"Fixed epsilon changed at iteration {i}: {eps}"

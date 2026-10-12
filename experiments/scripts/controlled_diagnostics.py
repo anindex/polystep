@@ -8,6 +8,7 @@ import sys
 import time
 
 from experiments.runners.run_controlled import (
+    ARMS,
     ROOT,
     RESULTS,
     FINAL_SEEDS,
@@ -30,9 +31,8 @@ import numpy as np
 import torch
 
 
-def ready():
-    process = json.loads((RESULTS / "campaign_process.json").read_text())
-    for arm in process["arms"]:
+def arms_complete():
+    for arm in ARMS:
         path = RESULTS / "selected" / f"{arm}.json"
         if not path.exists():
             return False
@@ -179,7 +179,7 @@ def run(geometry, normalization, seed, smoke=False):
 
 
 def campaign():
-    while not ready():
+    while not arms_complete():
         time.sleep(30)
     subprocess.run([sys.executable, "-m", "experiments.scripts.aggregate_controlled"], cwd=ROOT, check=True)
     for geometry, normalization, seed in itertools.product(

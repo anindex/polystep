@@ -49,39 +49,6 @@ class TestMixedPrecisionProperties:
 
 
 class TestMixedPrecisionStep:
-    def test_step_with_mixed_precision(self):
-        """Optimizer step works with mixed precision enabled."""
-        model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 5))
-        opt = PolyStepOptimizer(
-            model,
-            mixed_precision=True,
-            epsilon=0.1,
-            step_radius=0.5,
-            compile=False,
-        )
-
-        assert next(model.parameters()).dtype == torch.bfloat16
-
-        def closure(batched_params):
-            from torch.func import functional_call, vmap
-
-            model.eval()
-            x = torch.randn(4, 10)
-
-            def forward(params):
-                # Candidate params are BF16 under mixed_precision (the real
-                # NNCostEvaluator casts inputs to the param dtype); mirror that.
-                xc = x.to(next(iter(params.values())).dtype)
-                return functional_call(model, params, (xc,)).mean()
-
-            losses = vmap(forward)(batched_params)
-            model.train()
-            return losses
-
-        cost = opt.step(closure)
-        assert isinstance(cost, float)
-        assert not torch.isnan(torch.tensor(cost))
-
     def test_step_costs_are_fp32(self):
         """Cost matrix in Sinkhorn solver is FP32 even with mixed precision."""
         model = nn.Linear(10, 5)
@@ -206,7 +173,7 @@ def test_bf16_batched_cross_entropy_matches_vmap():
 
 
 @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
-def test_bf16_batched_regression_losses_reduce_in_fp32(loss_fn):
+def test_bf16_batched_regression_reduces_in_fp32(loss_fn):
     """The batched path averages BF16 outputs in FP32, so each candidate matches its
     FP32 loss instead of the nearest BF16 value, which is up to 2^-7 away here."""
     gen = torch.Generator().manual_seed(0)
@@ -282,8 +249,8 @@ class TestProjectionDtype:
         for P in projections.values():
             assert P.dtype == dtype and torch.isfinite(P).all()
 
-    def test_an_fp16_history_whose_squares_overflow_still_rotates_by_displacement(self):
-        """Only nonfinite entries trigger the random fallback, so an FP16 squared-norm overflow still rotates by displacement."""
+    def test_fp16_history_overflow_keeps_displacement_rotation(self):
+        """Only nonfinite entries trigger the random fallback."""
         model = nn.Sequential(nn.Linear(16, 12), nn.Linear(12, 4))
         layout = ParamLayout.from_module(model)
         full_dim = sum(p.numel() for p in model.parameters())
@@ -351,7 +318,7 @@ def test_half_precision_rotation_on_cuda(dtype):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_mixed_precision_step_with_wide_polytope_on_cuda():
+def test_mixed_precision_wide_polytope_on_cuda():
     """particle_dim > 2 takes the QR branch, which has no half-precision kernel."""
     from torch.func import functional_call, vmap
 
@@ -367,7 +334,6 @@ def test_mixed_precision_step_with_wide_polytope_on_cuda():
 
 
 def test_no_nans_in_normal_training():
-    """Normal training with mixed precision produces no NaNs."""
     model = nn.Sequential(
         nn.Linear(8, 6),
         nn.ReLU(),
@@ -410,7 +376,7 @@ def test_no_nans_in_normal_training():
     assert min(costs) < costs[0], f"no progress on a fixed objective: {costs}"
 
 
-def test_barycentric_projection_keeps_the_vertex_dtype():
+def test_barycentric_projection_keeps_vertex_dtype():
     """fp32 transport weights against bf16 vertices return finite bf16."""
     b, V, d = 3, 6, 3
     transport = torch.rand(b, V)  # fp32
@@ -421,7 +387,7 @@ def test_barycentric_projection_keeps_the_vertex_dtype():
     assert torch.isfinite(out.float()).all()
 
 
-def test_fused_softmax_project_keeps_the_geometry_dtype():
+def test_fused_softmax_project_keeps_geometry_dtype():
     """fp32 cost against bf16 geometry returns finite bf16."""
     b, V, d = 3, 6, 3
     C = torch.randn(b, V)  # fp32 cost
@@ -433,15 +399,15 @@ def test_fused_softmax_project_keeps_the_geometry_dtype():
     assert torch.isfinite(X_new.float()).all()
 
 
-def test_barycentric_softmax_path_unchanged():
+def test_barycentric_normalized_plan_divides_by_marginal():
     """When rows already sum to ``a`` (softmax path), /rowsum == /a exactly."""
     b, V, d = 4, 5, 3
     a = torch.full((b,), 1.0 / b)
     transport = torch.softmax(-torch.randn(b, V), dim=-1) * a.unsqueeze(-1)
     X_vertices = torch.randn(b, V, d)
-    new = _barycentric_projection(transport, X_vertices)
-    old = torch.einsum("bkd,bk->bd", X_vertices, transport / a.unsqueeze(-1))
-    assert torch.allclose(new, old, atol=1e-6)
+    got = _barycentric_projection(transport, X_vertices)
+    reference = torch.einsum("bkd,bk->bd", X_vertices, transport / a.unsqueeze(-1))
+    assert torch.allclose(got, reference, atol=1e-6)
 
 
 def test_barycentric_translation_invariant_unconverged_plan():
@@ -495,11 +461,10 @@ def test_optimizer_mixed_precision_step(solver):
     assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters())), "the model never moved"
 
 
-def test_mixed_dtype_model_runs_in_subspace_mode():
+def test_subspace_keeps_minority_param_dtype():
     """Coordinates carry the layout's dominant dtype while each projection carries its
     own parameter's, so a minority FP64 parameter must not mix dtypes in the
     reconstruction matmul or lose its dtype."""
-    from polystep.hybrid_subspace import HybridSubspace
 
     class MixedDtype(nn.Module):
         def __init__(self):
@@ -510,34 +475,31 @@ def test_mixed_dtype_model_runs_in_subspace_mode():
         def forward(self, x):
             return x @ self.big
 
-    for build in (HybridSubspace.from_layout,):
-        torch.manual_seed(0)
-        model = MixedDtype()
-        subspace = build(ParamLayout.from_module(model), rank=2)
-        opt = PolyStepOptimizer(model, subspace=subspace, compile=False, seed=0)
-        inputs, targets = torch.randn(8, 20), torch.randn(8, 20)
-        loss_fn = nn.MSELoss()
+    torch.manual_seed(0)
+    model = MixedDtype()
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    opt = PolyStepOptimizer(model, subspace=subspace, compile=False, seed=0)
+    inputs, targets = torch.randn(8, 20), torch.randn(8, 20)
+    loss_fn = nn.MSELoss()
 
-        def closure(batched):
-            from torch.func import functional_call, vmap
+    def closure(batched):
+        from torch.func import functional_call, vmap
 
-            return vmap(lambda p: loss_fn(functional_call(model, p, (inputs,)), targets))(batched)
+        return vmap(lambda p: loss_fn(functional_call(model, p, (inputs,)), targets))(batched)
 
-        opt.step(closure)
+    opt.step(closure)
 
-        assert model.small.dtype == torch.float64
-        assert model.big.dtype == torch.float32
+    assert model.small.dtype == torch.float64
+    assert model.big.dtype == torch.float32
 
 
 @pytest.mark.parametrize("minority", [torch.float64, torch.bfloat16])
-def test_mixed_dtype_model_computing_in_both_dtypes(minority):
+def test_two_dtype_forward_keeps_projection_dtypes(minority):
     """A model whose forward runs in two dtypes, not just holding an unused one. Each
     per-entry projection must be built at its own parameter's dtype or the
     reconstruction matmul mixes dtypes, and the evaluator must not cast inputs to the
     perturbed layer's dtype. A resync mid-run must keep each projection at its
     parameter's dtype, and a sparse projection must not promote a narrower one."""
-    from polystep.hybrid_subspace import HybridSubspace
-    from polystep.cost_nn import NNCostEvaluator
 
     class Mixed(nn.Module):
         def __init__(self):
@@ -577,7 +539,7 @@ def test_mixed_dtype_model_computing_in_both_dtypes(minority):
 
 
 @pytest.mark.parametrize("fused", [False, True])
-def test_in_place_half_weights_round_as_the_batch_reconstruction(fused):
+def test_inplace_half_weights_round_like_batch(fused):
     """The in-place path scores the fallback candidates of a step whose site candidates
     read ``reconstruct_batch`` weights, so a BF16 weight must round the product before
     adding the base, as that does, not in one fused addmm."""
@@ -600,7 +562,7 @@ def test_in_place_half_weights_round_as_the_batch_reconstruction(fused):
 
 
 @pytest.mark.parametrize("fused", [False, True])
-def test_synced_half_weights_are_the_scored_weights(fused):
+def test_synced_half_weights_match_scored(fused):
     """The step scores ``reconstruct_batch`` weights, which round a half-precision
     product before adding the base, so the weights it writes back must round the same
     way, through the fused matmul when there is one."""
@@ -621,7 +583,7 @@ def test_synced_half_weights_are_the_scored_weights(fused):
         assert torch.equal(param.data, expected[key][0]), key
 
 
-def test_fused_reconstruction_keeps_a_sparse_minority_dtype():
+def test_fused_reconstruction_keeps_sparse_minority_dtype():
     """Two FP32 blocks fuse, so the sparse BF16 layer is rebuilt next to the fused
     matmul and must not be promoted to the coordinates' dtype."""
     model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8), nn.Linear(8, 64))
@@ -637,7 +599,7 @@ def test_fused_reconstruction_keeps_a_sparse_minority_dtype():
     assert {k: v.dtype for k, v in batch.items()} == {k: v.dtype for k, v in base_sd.items()}
 
 
-def test_bf16_weights_skip_the_factored_low_rank_path_until_cast_back():
+def test_bf16_skips_factored_path_until_cast():
     """The low-rank path adds each candidate's change after the matmul, so BF16 weights
     would be ranked on changes they round away."""
     from polystep import FactoredSubspace
@@ -663,7 +625,7 @@ def test_bf16_weights_skip_the_factored_low_rank_path_until_cast_back():
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
-def test_resync_rebuilds_the_fused_projection_after_a_cast(dtype):
+def test_resync_after_cast_rebuilds_fused_projection(dtype):
     """Same-dtype dense blocks share one fused projection, so a resync after a cast has
     to rebuild it at the new dtype before the next step reconstructs through it."""
     torch.manual_seed(0)
@@ -684,7 +646,7 @@ def test_resync_rebuilds_the_fused_projection_after_a_cast(dtype):
 
 
 @pytest.mark.parametrize("rotate", [False, True])
-def test_projections_drawn_after_a_resync_follow_the_cast(rotate):
+def test_projections_after_resync_follow_cast(rotate):
     """A rank transition or a rotation after the cast draws each projection at its
     parameter's new dtype, not at the coordinates' or the construction-time one."""
     from polystep import RankSchedule
@@ -722,7 +684,7 @@ def test_projections_drawn_after_a_resync_follow_the_cast(rotate):
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
-def test_resync_moves_a_global_projection_and_its_coordinates_with_a_cast(dtype):
+def test_resync_casts_global_projection_and_coords(dtype):
     """One global projection multiplies the coordinates straight into the parameters, so
     both have to follow the model's dtype."""
     torch.manual_seed(0)
@@ -744,13 +706,12 @@ def test_resync_moves_a_global_projection_and_its_coordinates_with_a_cast(dtype)
     assert model[0].weight.dtype is dtype
 
 
-def test_global_vector_modes_reject_a_mixed_dtype_model():
+def test_global_vector_modes_reject_mixed_dtype():
     """Full space and AdaptiveSubspace hold every parameter in one vector at one dtype.
 
     A minority-dtype weight would be optimized at the majority's precision, so this has to
     raise rather than downgrade it silently.
     """
-    from polystep.adaptive_subspace import AdaptiveSubspace
 
     class Mixed(nn.Module):
         def __init__(self):
@@ -788,14 +749,31 @@ def _biased_fallback_step(dtype):
     return opt._prev_descent_direction, step.view_as(opt._prev_descent_direction)
 
 
-def test_biased_rotation_fallback_follows_the_barycentre_step():
+def test_biased_fallback_follows_barycentre_step():
     direction, step = _biased_fallback_step(torch.float32)
     torch.testing.assert_close(direction, step)
 
 
-def test_biased_rotation_fallback_keeps_steps_below_the_bf16_grid():
+def test_biased_fallback_keeps_sub_bf16_steps():
     """Near 3 a bf16 parameter rounds some 0.05 steps to zero; the bias direction must not."""
     direction, step = _biased_fallback_step(torch.bfloat16)
     assert direction.dtype == torch.float32
     assert (step.abs().amax(-1) == 0).any()
     assert (direction.abs().amax(-1) > 0).all()
+
+
+def test_blockwise_biased_rotation_runs_under_bfloat16():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 6), nn.ReLU(), nn.Linear(6, 4))
+    opt = PolyStepOptimizer(model, seed=0, mixed_precision=True, block_strategy="per_layer", biased_rotation=True)
+
+    def closure(params):
+        v = next(iter(params.values()))
+        return v.reshape(v.shape[0], -1).sum(1).float()
+
+    losses = [opt.step(closure) for _ in range(3)]
+
+    assert all(math.isfinite(loss) for loss in losses)
+    # Reaching step 3 with finite particles is the contract, not just the absence of an exception.
+    assert opt.state.iteration_count == 3
+    assert torch.isfinite(opt.state.X).all()

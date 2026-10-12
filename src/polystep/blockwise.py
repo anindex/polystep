@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Tuple, TYPE_CHECKING
 
 import torch
@@ -28,30 +28,11 @@ def create_per_layer_blocks(
     layout: ParamLayout,
     particle_dim: int = 2,
 ) -> List[BlockConfig]:
-    """Create one block per parameter entry in the layout."""
-    blocks: List[BlockConfig] = []
-    offset = 0
-
-    for i, entry in enumerate(layout.entries):
-        num_params = entry.numel
-        padded = num_params + (-num_params % particle_dim)
-        num_particles = padded // particle_dim
-        if num_particles == 0:
-            # A zero-width block divides by zero in the uniform marginal.
-            continue
-        blocks.append(
-            BlockConfig(
-                name=entry.key,
-                leaf_indices=(i,),
-                flat_start=offset,
-                flat_end=offset + padded,
-                num_particles=num_particles,
-                particle_dim=particle_dim,
-            )
-        )
-        offset += padded
-
-    return blocks
+    """Create one block per parameter entry in the layout, named by its key."""
+    return [
+        replace(b, name=layout.entries[b.leaf_indices[0]].key)
+        for b in create_grouped_blocks(layout, group_size=1, particle_dim=particle_dim)
+    ]
 
 
 def create_grouped_blocks(

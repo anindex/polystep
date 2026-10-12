@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Dict
 
 import torch
 
-from .gym_evaluator import _batched_mlp_logits
-from .policies import count_stacked_candidates
+from .gym_evaluator import GymRolloutResult, _StackedRolloutEvaluator, _batched_mlp_logits
+from .policies import count_stacked_candidates, stack_module_params
 
 
 OBS_DIM = 4
@@ -70,14 +69,7 @@ def cartpole_step(states: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Te
     return next_states, reward, done
 
 
-@dataclass
-class CartPoleRolloutResult:
-    returns: torch.Tensor
-    lengths: torch.Tensor
-    successes: torch.Tensor  # episode survived full horizon
-
-
-class CartPoleEvaluator:
+class CartPoleEvaluator(_StackedRolloutEvaluator):
     """Vectorized evaluator for stacked MLP policies on CartPole-v1."""
 
     env_id = "CartPole-v1"
@@ -105,7 +97,7 @@ class CartPoleEvaluator:
         *,
         seed: int,
         step: int,
-    ) -> CartPoleRolloutResult:
+    ) -> GymRolloutResult:
         n_candidates = count_stacked_candidates(stacked_params)
         R = self.rollouts_per_candidate
         # CRN: same initial states for every candidate within a step; vary across steps.
@@ -145,31 +137,7 @@ class CartPoleEvaluator:
                 break
 
         successes = active  # survived all horizon steps
-        return CartPoleRolloutResult(returns=returns, lengths=lengths, successes=successes)
-
-    def loss_for_stacked_params(
-        self,
-        stacked_params: Dict[str, torch.Tensor],
-        seed: int,
-        step: int,
-    ) -> torch.Tensor:
-        result = self.rollout_stacked_params(stacked_params, seed=seed, step=step)
-        self.env_steps += int(result.lengths.sum().item())
-        return -result.returns.mean(dim=1).to(dtype=torch.float32)
-
-    def summarize_stacked_params(
-        self,
-        stacked_params: Dict[str, torch.Tensor],
-        *,
-        seed: int,
-        step: int = 0,
-    ) -> Dict[str, float]:
-        result = self.rollout_stacked_params(stacked_params, seed=seed, step=step)
-        return {
-            "mean_return": float(result.returns.mean().item()),
-            "success_rate": float(result.successes.float().mean().item()),
-            "episode_length": float(result.lengths.mean().item()),
-        }
+        return GymRolloutResult(returns=returns, lengths=lengths, successes=successes)
 
 
 def evaluate_policy_module(
@@ -181,8 +149,6 @@ def evaluate_policy_module(
     device: str = "cpu",
 ) -> Dict[str, float]:
     """Evaluate a single ``DiscreteMLPPolicy`` module deterministically."""
-
-    from .policies import stack_module_params
 
     evaluator = CartPoleEvaluator(
         rollouts_per_candidate=int(episodes),

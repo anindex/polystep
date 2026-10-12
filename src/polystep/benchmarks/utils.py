@@ -67,7 +67,7 @@ def download_file(url: str, filepath: str) -> None:
 def _download_mnist(data_dir: str) -> None:
     """Download MNIST dataset if not already present."""
     os.makedirs(data_dir, exist_ok=True)
-    for name, filename in MNIST_FILES.items():
+    for filename in MNIST_FILES.values():
         filepath = os.path.join(data_dir, filename)
         download_file(MNIST_URL + filename, filepath)
 
@@ -112,10 +112,8 @@ def get_mnist_loaders(
         test_images = (test_images - mean) / std
 
     if max_train > 0:
-        train_images = train_images[:max_train]
         train_labels = train_labels[:max_train]
     if max_test > 0:
-        test_images = test_images[:max_test]
         test_labels = test_labels[:max_test]
 
     train_ds = TensorDataset(torch.from_numpy(train_images), torch.from_numpy(train_labels))

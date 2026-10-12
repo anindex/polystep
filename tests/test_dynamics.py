@@ -59,7 +59,7 @@ class TestApplyMomentum:
         assert torch.allclose(v2, torch.tensor([[1.5, 0.0]]))
 
     @pytest.mark.parametrize("velocity_lr, expected_x", [(1.0, 2.0), (0.5, 1.0)])
-    def test_velocity_lr_scales_the_move(self, velocity_lr, expected_x):
+    def test_velocity_lr_scales_move(self, velocity_lr, expected_x):
         X_old = torch.tensor([[0.0, 0.0]])
         X_new, _ = apply_momentum(
             X_old, torch.tensor([[2.0, 0.0]]), torch.zeros_like(X_old), beta=0.0, velocity_lr=velocity_lr

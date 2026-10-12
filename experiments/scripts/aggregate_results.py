@@ -6,6 +6,7 @@ mean/std per (benchmark, method) group.
 CLI usage:
     python experiments/scripts/aggregate_results.py experiments/results/
     python experiments/scripts/aggregate_results.py experiments/results/ --benchmark mnist
+    python experiments/scripts/aggregate_results.py experiments/results/ --write summary
 """
 
 from __future__ import annotations
@@ -52,9 +53,8 @@ def load_single_result(path: str) -> Dict[str, Any]:
         "benchmark": data["benchmark"],
         "method": data["method"],
         "seed": data["seed"],
-        # Reported metric: test accuracy of the val-selected checkpoint. Older
-        # result files lack the key; final_accuracy is the fallback (best_accuracy
-        # was max-over-epochs test).
+        # Reported metric: test accuracy of the val-selected checkpoint, with
+        # final_accuracy for files written without the key.
         "test_accuracy_at_selected": metrics.get("test_accuracy_at_selected", metrics.get("final_accuracy", 0.0)),
         "final_accuracy": metrics.get("final_accuracy", 0.0),
         # Distinguishes "solved nothing" from "no metric recorded"; a missing
@@ -80,6 +80,18 @@ def load_single_result(path: str) -> Dict[str, Any]:
     }
 
     return result
+
+
+def _load_rows(results_dir: str, benchmark: Optional[str]) -> List[Dict[str, Any]]:
+    """Every result file directly in ``results_dir``, filtered by ``benchmark``; unparsable files are skipped."""
+    pattern = os.path.join(results_dir, f"{benchmark}_*.json" if benchmark else "*.json")
+    rows = []
+    for path in sorted(glob.glob(pattern)):
+        try:
+            rows.append(load_single_result(path))
+        except (json.JSONDecodeError, KeyError, FileNotFoundError, AttributeError, TypeError) as e:
+            print(f"Warning: skipping {path}: {e}", file=sys.stderr)
+    return rows
 
 
 def aggregate_results(
@@ -109,25 +121,7 @@ def aggregate_results(
         "n_runs",
     ]
 
-    if benchmark:
-        pattern = os.path.join(results_dir, f"{benchmark}_*.json")
-    else:
-        pattern = os.path.join(results_dir, "*.json")
-
-    json_files = sorted(glob.glob(pattern))
-
-    if not json_files:
-        return pd.DataFrame(columns=summary_columns)
-
-    rows = []
-    for path in json_files:
-        try:
-            row = load_single_result(path)
-            rows.append(row)
-        except (json.JSONDecodeError, KeyError, FileNotFoundError, AttributeError, TypeError) as e:
-            print(f"Warning: skipping {path}: {e}", file=sys.stderr)
-            continue
-
+    rows = _load_rows(results_dir, benchmark)
     if not rows:
         return pd.DataFrame(columns=summary_columns)
 
@@ -179,7 +173,10 @@ def aggregate_results(
 def main() -> None:
     """CLI entry point: aggregate results and print summary."""
     if len(sys.argv) < 2:
-        print("Usage: python experiments/scripts/aggregate_results.py <results_dir> [--benchmark <name>]")
+        print(
+            "Usage: python experiments/scripts/aggregate_results.py <results_dir> "
+            "[--benchmark <name>] [--write <prefix>]"
+        )
         sys.exit(1)
 
     results_dir = sys.argv[1]
@@ -221,21 +218,12 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(summary_path)) or ".", exist_ok=True)
     df.to_csv(summary_path, index=False)
 
-    # Same population as the summary above: directly in ``results_dir``, filtered
-    # by ``--benchmark``, skipping files that will not parse. Recursing would pull
-    # in theory-mode runs and tuning trials that share the reported
-    # ``{benchmark}_{method}_{seed}`` filename pattern.
-    rows: List[Dict[str, Any]] = []
-    pattern = os.path.join(results_dir, f"{benchmark}_*.json") if benchmark else os.path.join(results_dir, "*.json")
-    for path in sorted(glob.glob(pattern)):
-        try:
-            rec = load_single_result(path)
-        except (json.JSONDecodeError, KeyError, FileNotFoundError, AttributeError, TypeError) as e:
-            print(f"Warning: skipping {path}: {e}", file=sys.stderr)
-            continue
+    # Same population as the summary above. Recursing would pull in theory-mode runs
+    # and tuning trials that share the reported ``{benchmark}_{method}_{seed}``
+    # filename pattern.
+    rows = _load_rows(results_dir, benchmark)
+    for rec in rows:
         rec.pop("epoch_logs", None)
-        rec["source_file"] = os.path.relpath(path, results_dir)
-        rows.append(rec)
     per_seed = pd.DataFrame(rows)
     per_seed.to_csv(per_seed_path, index=False)
     if len(per_seed) != int(df["n_runs"].sum()):

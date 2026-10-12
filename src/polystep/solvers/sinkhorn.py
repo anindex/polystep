@@ -8,6 +8,7 @@ from typing import List, Optional, Union
 
 import torch
 
+from .._compiled import CompiledFunctions
 from ._shared import (
     align_dual,
     align_marginal,
@@ -62,7 +63,7 @@ class SinkhornResult:
 
 @dataclass
 class SinkhornSolver:
-    """Full-rank log-domain Sinkhorn solver for entropic optimal transport."""
+    """Log-domain Sinkhorn solver for entropic optimal transport."""
 
     epsilon: float = 0.1
     max_iterations: int = 2000
@@ -92,9 +93,7 @@ class SinkhornSolver:
                 f"Zero iterations leave the duals at their init and return an infeasible plan."
             )
 
-        from .._compiled import CompiledFunctions
-
-        self._compiled = CompiledFunctions(compile=self.compile and torch.cuda.is_available())
+        self._compiled = CompiledFunctions(compile=self.compile)
 
     def solve(
         self,
@@ -112,25 +111,6 @@ class SinkhornSolver:
             "epsilon",
             "A zero/negative epsilon divides by zero in log-domain Sinkhorn.",
         )
-        return self._solve_full_rank(
-            cost_matrix,
-            a,
-            b,
-            init_f,
-            init_g,
-            scale_cost,
-        )
-
-    def _solve_full_rank(
-        self,
-        cost_matrix: torch.Tensor,
-        a: Optional[torch.Tensor],
-        b: Optional[torch.Tensor],
-        init_f: Optional[torch.Tensor],
-        init_g: Optional[torch.Tensor],
-        scale_cost: Optional[Union[str, float]],
-    ) -> SinkhornResult:
-        """Full-rank log-domain Sinkhorn iterations."""
         # Balanced Sinkhorn needs sum(a) == sum(b). Check when either marginal is given; a=b=None is balanced by construction, so the hot path stays sync-free.
         marginals_given = a is not None or b is not None
         cost_matrix, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, "Sinkhorn")

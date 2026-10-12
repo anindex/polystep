@@ -58,13 +58,11 @@ _FAST_TEST_THREADS = int(os.environ.get("POLYSTEP_TEST_THREADS", "1"))
 
 
 def pytest_configure(config):
-    """Register custom markers and pin torch to one intra-op thread.
+    """Pin torch to one intra-op thread.
 
     The fast suite's tensors are small enough that the intra-op pool costs more than
     the arithmetic. ``POLYSTEP_TEST_THREADS`` overrides; numbers in CONTRIBUTING.md.
     """
-    config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
-    config.addinivalue_line("markers", "gpu: marks tests requiring CUDA GPU")
     torch.set_num_threads(_FAST_TEST_THREADS)
 
 

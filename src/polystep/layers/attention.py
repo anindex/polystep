@@ -123,7 +123,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
                 if attn_mask.shape[0] == batch_size * self.num_heads:
                     attn_mask = attn_mask.reshape(batch_size, self.num_heads, seq_q, seq_k)
                 else:
-                    # Also retain the wrapper's per-batch mask extension.
+                    # (batch, seq_q, seq_k): broadcast over heads.
                     attn_mask = attn_mask.unsqueeze(1)
             elif attn_mask.dim() != 4:
                 raise ValueError(
@@ -149,8 +149,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
                 scale=self.scale,
             )
         else:
-            # Keep the established CUDA/vmap path until fused dispatch is measured
-            # across the supported torch versions (including the 2.8 floor).
+            # Off CPU: explicit matmul and softmax, with fully masked rows given zero weight.
             scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
             if attn_mask is None:
                 weights = F.softmax(scores, dim=-1)

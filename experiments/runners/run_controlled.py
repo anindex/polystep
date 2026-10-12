@@ -27,6 +27,9 @@ from polystep.transform import ParamLayout
 ROOT = Path(__file__).resolve().parents[2]
 RESULTS = ROOT / "experiments/results/controlled"
 RULES = ("softmax", "linear", "rank", "greedy", "top4")
+ARMS = [
+    f"{g}_{r}_{n}" for g, n, r in itertools.product(("orthoplex", "antipodal"), ("natural", "normalized"), RULES)
+] + ["joint_softmax_natural", "schedule_constant", "schedule_decay"]
 TUNING_SEEDS = (2027, 2028, 2029)
 FINAL_SEEDS = tuple(range(1000, 1010))
 
@@ -225,7 +228,7 @@ def smooth_jitter(shape, generator, device):
 @torch.no_grad()
 def run(cfg, seed, stage, *, budget=None, chunk=128, compiled=False, device="cuda"):
     if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required; run with GPU access outside the sandbox")
+        raise RuntimeError("CUDA is required")
     torch.set_num_threads(4)
     torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.allow_tf32 = False

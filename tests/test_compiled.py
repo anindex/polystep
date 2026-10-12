@@ -17,7 +17,6 @@ from polystep._compiled import (
 
 
 def test_compile_false_stores_eager_functions():
-    """compile=False stores raw eager functions."""
     cf = CompiledFunctions(compile=False)
     assert cf.sinkhorn_iter is _sinkhorn_iteration
     assert cf.rotate_and_translate is _rotate_and_translate
@@ -167,8 +166,8 @@ def test_compiles_without_graph_breaks(fn, make_args):
     ],
     ids=["rotate_and_translate", "sinkhorn_iteration"],
 )
-def test_new_float_compiles_at_most_once_more(fn, make_args, floats):
-    """A float argument goes symbolic after one recompile, so a scheduled radius or epsilon stays compiled."""
+def test_new_float_recompiles_at_most_once(fn, make_args, floats):
+    """Floats go symbolic, so scheduled radii and epsilons stay compiled."""
     from torch._dynamo.testing import CompileCounter
 
     torch._dynamo.reset()
@@ -178,3 +177,24 @@ def test_new_float_compiles_at_most_once_more(fn, make_args, floats):
     for values in floats:
         compiled(*tensors, *values)
     assert counter.frame_count <= 2
+
+
+def test_fused_softmax_survives_large_negative_costs():
+    """The fused kernel must recenter before dividing, or -C/epsilon overflows to NaN."""
+    cost = torch.tensor([[-1e6, -1e6 + 1.0]])
+    verts = torch.tensor([[1.0], [-1.0]])
+    rot = torch.eye(1).unsqueeze(0)
+    X = torch.zeros(1, 1)
+    X_new, transport = CompiledFunctions(compile=False).fused_softmax_project(cost, 1e-3, verts, rot, 0.1, X)
+    assert torch.isfinite(X_new).all() and torch.isfinite(transport).all()
+    # The cheaper vertex still wins.
+    assert transport[0, 0] > transport[0, 1]
+
+
+def test_fused_softmax_row_above_minimum_stays_finite():
+    C = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
+    verts = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
+    rot = torch.eye(2).expand(2, 2, 2).contiguous()
+    X_new, transport = _fused_softmax_project(C, 1e-45, verts, rot, 0.1, torch.zeros(2, 2))
+    assert torch.isfinite(transport).all()
+    assert torch.isfinite(X_new).all()

@@ -4,7 +4,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from polystep import PolyStepOptimizer
 from polystep.blockwise import create_grouped_blocks, create_per_layer_blocks
+from polystep.cost_nn import NNCostEvaluator
 from polystep.transform import ParamLayout
 
 
@@ -50,13 +52,6 @@ class TestGroupedBlocks:
         blocks = create_grouped_blocks(layout, **kwargs)
         assert len(blocks) == 2
         assert [b.leaf_indices for b in blocks] == [(0, 1), (2, 3)]
-
-    def test_grouped_leaf_indices(self):
-        model = SimpleMLP()
-        layout = ParamLayout.from_module(model)
-        blocks = create_grouped_blocks(layout, group_size=2)
-        assert blocks[0].leaf_indices == (0, 1)
-        assert blocks[1].leaf_indices == (2, 3)
 
     def test_grouped_element_counts(self):
         model = SimpleMLP()
@@ -125,7 +120,7 @@ class TestBlockLayoutConversion:
         assert torch.all(b1_data[:5] == 2.0)
         assert torch.all(b1_data[5:] == 0.0)
 
-    def test_grouped_blocks_hold_their_entries_in_order(self):
+    def test_grouped_blocks_hold_entries_in_order(self):
         """A wrong but consistent column map still round-trips, so check the values."""
         from polystep.blockwise import layout_flat_to_block_flat
 
@@ -179,11 +174,10 @@ class TestBlockLayoutConversion:
         assert b1_flat[3].item() == 0.0
 
 
-def test_blockwise_keeps_a_vertex_with_a_nonfinite_probe_infeasible():
+def test_blockwise_nonfinite_probe_marks_vertex_infeasible():
     """One non-finite probe makes the whole vertex infeasible, as in the monolithic driver.
 
-    It used to come back as a blend of its finite probes and the penalty, so the solve
-    could still pick it.
+    A blend of its finite probes and the penalty would let the solve still pick it.
     """
     from types import SimpleNamespace
 
@@ -196,12 +190,11 @@ def test_blockwise_keeps_a_vertex_with_a_nonfinite_probe_infeasible():
     assert cost.tolist() == [[float("inf"), 2.0]]
 
 
-def test_blockwise_radius_follows_the_best_vertex_mean(monkeypatch):
-    """The radius controller reads the best-vertex mean while ``state.costs`` keeps the full mean."""
+def test_blockwise_radius_follows_best_vertex_mean(monkeypatch):
+    """``state.costs`` still records the full mean."""
     from torch.func import functional_call, vmap
 
     import polystep._step_blockwise as step_blockwise
-    from polystep import PolyStepOptimizer
 
     seen = []
     update = step_blockwise.update_stagnation_and_radius
@@ -220,3 +213,118 @@ def test_blockwise_radius_follows_the_best_vertex_mean(monkeypatch):
     opt.step(closure)
     assert len(seen) == 1
     assert seen[0] < opt._state.costs[-1]
+
+
+class TestBlockwiseStepState:
+    """Dual momentum, biased rotation and the amortized EMA must
+    work in the blockwise step, not just monolithic."""
+
+    def _make_simple_model(self):
+        return nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 2))
+
+    def test_blockwise_transport_direction_ema_populated(self):
+        """After a blockwise step with amortize_steps>1, _transport_direction_ema
+        must be populated (not None) so momentum steps can fire."""
+        model = self._make_simple_model()
+        optimizer = PolyStepOptimizer(
+            model,
+            epsilon=0.5,
+            step_radius=1.0,
+            num_probe=1,
+            sinkhorn_max_iters=20,
+            amortize_steps=2,
+            amortize_ema=0.7,
+            block_strategy="per_layer",
+        )
+        loss_fn = nn.CrossEntropyLoss()
+        evaluator = NNCostEvaluator(model, loss_fn)
+        inputs = torch.randn(4, 10)
+        targets = torch.randint(0, 2, (4,))
+
+        def closure(bp):
+            return evaluator.evaluate(bp, inputs, targets)
+
+        # First step triggers a full OT.
+        optimizer.step(closure)
+        ema = optimizer._transport_direction_ema
+        assert ema is not None, "the amortized momentum step has nothing to coast along"
+        # A populated-but-zero EMA makes every cheap step a no-op, which the
+        # None check cannot see.
+        assert ema.shape == optimizer.state.X.shape
+        assert ema.abs().max() > 0, "the EMA is all zeros, so a momentum step would not move anything"
+
+        before = [p.detach().clone() for p in model.parameters()]
+        optimizer.step(closure)
+        assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters())), (
+            "the amortized step did not move the model"
+        )
+
+    def test_blockwise_biased_rotation_descent_dirs_populated(self):
+        """After a blockwise step with biased_rotation=True,
+        _prev_block_descent_directions must be populated."""
+        model = self._make_simple_model()
+        optimizer = PolyStepOptimizer(
+            model,
+            epsilon=0.5,
+            step_radius=1.0,
+            num_probe=1,
+            sinkhorn_max_iters=20,
+            biased_rotation=True,
+            block_strategy="per_layer",
+        )
+        loss_fn = nn.CrossEntropyLoss()
+        evaluator = NNCostEvaluator(model, loss_fn)
+        inputs = torch.randn(4, 10)
+        targets = torch.randint(0, 2, (4,))
+
+        def closure(bp):
+            return evaluator.evaluate(bp, inputs, targets)
+
+        optimizer.step(closure)
+        dirs = getattr(optimizer, "_prev_block_descent_directions", None)
+        assert dirs is not None, "the next step has no heading to bias its rotation toward"
+        assert len(dirs) == len(optimizer._blocks), "one descent direction per block"
+        # A list of zero vectors carries no heading, and apply_biased_rotation routes
+        # those particles to the unbiased fallback.
+        assert any(d is not None and torch.linalg.vector_norm(d) > 0 for d in dirs), (
+            "every block descent direction is zero, so the bias is inert"
+        )
+
+    def test_blockwise_dual_momentum_prev_duals_populated(self):
+        """After 2 blockwise steps with dual_momentum_beta>0,
+        _prev_prev_block_duals must be populated for extrapolation."""
+        model = self._make_simple_model()
+        optimizer = PolyStepOptimizer(
+            model,
+            epsilon=0.5,
+            step_radius=1.0,
+            num_probe=1,
+            sinkhorn_max_iters=20,
+            dual_momentum_beta=0.3,
+            block_strategy="per_layer",
+        )
+        loss_fn = nn.CrossEntropyLoss()
+        evaluator = NNCostEvaluator(model, loss_fn)
+        inputs = torch.randn(4, 10)
+        targets = torch.randint(0, 2, (4,))
+
+        def closure(bp):
+            return evaluator.evaluate(bp, inputs, targets)
+
+        optimizer.step(closure)
+        optimizer.step(closure)
+        ppbd = getattr(optimizer._state, "_prev_prev_block_duals", None)
+        assert ppbd is not None, (
+            "After 2 blockwise steps with dual_momentum_beta>0, _prev_prev_block_duals should be populated"
+        )
+        assert len(ppbd) > 0
+        has_duals = any(f is not None for f, g in ppbd)
+        assert has_duals, "At least one block should have previous duals"
+
+
+def test_zero_numel_parameter_gets_no_block():
+    """A (0, V) cost matrix would divide by zero in the marginal or give a NaN mean."""
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 0))
+    blocks = create_per_layer_blocks(ParamLayout.from_module(model), particle_dim=2)
+    assert blocks, "the non-empty layer must still get a block"
+    assert all(b.num_particles > 0 for b in blocks)

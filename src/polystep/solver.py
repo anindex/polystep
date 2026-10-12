@@ -9,10 +9,10 @@ import torch
 
 from ._compiled import CompiledFunctions
 from .costs import compute_cost_matrix
-from .epsilon import feed_solver_stats, resolve_radius, LinearEpsilon, ProgressiveEpsilon
+from .epsilon import feed_solver_stats, resolve_epsilon, resolve_radius, LinearEpsilon, ProgressiveEpsilon
 from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
 from .solvers import SinkhornSolver, SoftmaxSolver
-from .solvers._shared import sanitize_cost, solver_health, validate_positive
+from .solvers._shared import sanitize_cost, solver_health
 
 
 @dataclass
@@ -47,9 +47,7 @@ class SolverState:
     # Dual potential momentum
     prev_prev_f: Optional[torch.Tensor] = None
     prev_prev_g: Optional[torch.Tensor] = None
-    # Epsilon under which ``f`` and ``g`` were computed by the previous
-    # solve. Lets the next ``SinkhornSolver.solve`` rescale the warm-
-    # started duals if the schedule moved epsilon between calls.
+    # Epsilon of the last solve; a >2x jump drops the dual-momentum history.
     last_solve_eps: Optional[float] = None
     # Trust region diagnostics
     trust_region_multipliers: List[float] = field(default_factory=list)
@@ -103,7 +101,7 @@ class PolyStep:
             max_iterations=self.sinkhorn_max_iters,
             compile=self.compile,
         )
-        self._compiled = CompiledFunctions(compile=self.compile and torch.cuda.is_available())
+        self._compiled = CompiledFunctions(compile=self.compile)
 
     @classmethod
     def create(
@@ -152,20 +150,6 @@ class PolyStep:
             cached = self._softmax_fallback = SoftmaxSolver(epsilon=solver.epsilon)
         return cached
 
-    def _get_epsilon(self, iteration: int) -> float:
-        """Resolve epsilon at ``iteration``; duck-types on ``.at()`` so schedules and plain floats both work."""
-        if hasattr(self.epsilon, "at"):
-            return validate_positive(self.epsilon.at(iteration), "epsilon")
-        return validate_positive(self.epsilon, "epsilon")
-
-    def _get_ent_epsilon(self, iteration: int) -> Optional[float]:
-        """Resolve ent_epsilon at current iteration (supports schedule objects)."""
-        if self.ent_epsilon is None:
-            return None
-        if hasattr(self.ent_epsilon, "at"):
-            return validate_positive(self.ent_epsilon.at(iteration), "ent_epsilon")
-        return validate_positive(self.ent_epsilon, "ent_epsilon")
-
     @torch.inference_mode()
     def step(
         self,
@@ -178,7 +162,7 @@ class PolyStep:
         device = X.device
 
         # Shared with PolyStepOptimizer so a scheduled radius means the same distance via either entry point.
-        current_eps = self._get_epsilon(iteration)
+        current_eps = resolve_epsilon(self.epsilon, iteration, "epsilon")
         step_radius = resolve_radius(self.step_radius, iteration, current_eps)
         probe_radius = resolve_radius(self.probe_radius, iteration, current_eps)
 
@@ -224,13 +208,12 @@ class PolyStep:
             chunk_size=self.chunk_size,
         )
 
-        ent_eps = self._get_ent_epsilon(iteration)
+        ent_eps = resolve_epsilon(self.ent_epsilon, iteration, "ent_epsilon")
         ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
-        # Forward the previous solve's epsilon so warm-started duals rescale when the schedule moved.
         ot_solver = self._solver_for(state)
         ot_solver.epsilon = ot_epsilon
-        solve_kwargs = dict(
+        ot_result = ot_solver.solve(
             cost_matrix=cost_matrix,
             # a=None lets the solver build the uniform marginal itself; passing a only buys host-sync validation.
             a=None,
@@ -238,8 +221,6 @@ class PolyStep:
             init_g=state.g,
             scale_cost=self.scale_cost,
         )
-        ot_result = ot_solver.solve(**solve_kwargs)
-        state.last_solve_eps = ot_epsilon
 
         transport_matrix = ot_result.matrix  # (batch, num_vertices)
         X_new = self._compiled.barycentric_projection(

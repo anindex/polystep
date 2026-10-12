@@ -1,57 +1,41 @@
+"""Finite-difference quadratic model: gradient, curvature, Newton step and trust region."""
+
 import math
 
 import pytest
 import torch
 
 
-def test_fd_gradient_quadratic_function():
-    """FD gradient should recover the true gradient of a known quadratic."""
+def _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P, c=10.0):
+    """Helper: generate losses_3d for a known quadratic f(x) = c + g*x + 0.5*H*x^2."""
+    K = len(scales)
+    V = 2 * pdim
+    losses_3d = torch.zeros(P, V, K)
+    for p in range(P):
+        for k in range(K):
+            t = scales[k] * probe_radius
+            for i in range(pdim):
+                losses_3d[p, i, k] = c + true_grad[p, i] * t + 0.5 * true_hess[p, i] * t**2
+                losses_3d[p, i + pdim, k] = c - true_grad[p, i] * t + 0.5 * true_hess[p, i] * t**2
+    return losses_3d
+
+
+def test_fd_gradient_and_hessian_recover_quadratic():
     pdim = 2
     P = 1
     K = 5
-    V = 2 * pdim
 
     true_grad = torch.tensor([[3.0, -2.0]])
     true_hess = torch.tensor([[2.0, 5.0]])
     scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 1.0
-    c = 10.0
+    losses_3d = _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P)
 
-    losses_3d = torch.zeros(P, V, K)
-    for k in range(K):
-        t = scales[k] * probe_radius
-        for i in range(pdim):
-            losses_3d[0, i, k] = c + true_grad[0, i] * t + 0.5 * true_hess[0, i] * t**2
-            losses_3d[0, i + pdim, k] = c - true_grad[0, i] * t + 0.5 * true_hess[0, i] * t**2
-
-    from polystep.quadratic_model import extract_fd_gradient
+    from polystep.quadratic_model import extract_fd_gradient, extract_fd_hessian_diag
 
     grad = extract_fd_gradient(losses_3d, scales, probe_radius, pdim)
     assert grad.shape == (P, pdim)
     torch.testing.assert_close(grad, true_grad, atol=1e-5, rtol=1e-5)
-
-
-def test_fd_hessian_diagonal_quadratic_function():
-    """FD Hessian should recover true diagonal Hessian of a known quadratic."""
-    pdim = 2
-    P = 1
-    K = 5
-    V = 2 * pdim
-
-    true_grad = torch.tensor([[3.0, -2.0]])
-    true_hess = torch.tensor([[2.0, 5.0]])
-    scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
-    probe_radius = 1.0
-    c = 10.0
-
-    losses_3d = torch.zeros(P, V, K)
-    for k in range(K):
-        t = scales[k] * probe_radius
-        for i in range(pdim):
-            losses_3d[0, i, k] = c + true_grad[0, i] * t + 0.5 * true_hess[0, i] * t**2
-            losses_3d[0, i + pdim, k] = c - true_grad[0, i] * t + 0.5 * true_hess[0, i] * t**2
-
-    from polystep.quadratic_model import extract_fd_hessian_diag
 
     hess = extract_fd_hessian_diag(losses_3d, scales, probe_radius, pdim)
     assert hess.shape == (P, pdim)
@@ -70,12 +54,7 @@ def test_fd_hessian_survives_small_probe_radius(probe_radius):
     true_hess = torch.tensor([[3.0, -1.0]])
     scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
 
-    losses_3d = torch.zeros(P, 2 * pdim, K)
-    for k in range(K):
-        t = scales[k] * probe_radius
-        for i in range(pdim):
-            losses_3d[0, i, k] = true_grad[0, i] * t + 0.5 * true_hess[0, i] * t**2
-            losses_3d[0, i + pdim, k] = -true_grad[0, i] * t + 0.5 * true_hess[0, i] * t**2
+    losses_3d = _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P, c=0.0)
 
     from polystep.quadratic_model import extract_fd_hessian_diag
 
@@ -84,7 +63,6 @@ def test_fd_hessian_survives_small_probe_radius(probe_radius):
 
 
 def test_newton_step_recovers_minimum():
-    """Newton step from quadratic model should point toward the minimum."""
     gradient = torch.tensor([[3.0, -2.0]])
     hessian_diag = torch.tensor([[2.0, 5.0]])
 
@@ -122,7 +100,7 @@ def test_newton_step_regularizes_small_hessian():
     assert torch.norm(step).item() == pytest.approx(10.0)
 
 
-def test_trust_region_shrinks_on_a_predicted_increase():
+def test_trust_region_shrinks_on_predicted_increase():
     """pred>0 means the model called the step harmful, so it shrinks at any ratio."""
     from polystep.quadratic_model import update_trust_region
 
@@ -142,11 +120,38 @@ def test_trust_region_shrinks_on_a_predicted_increase():
         (-0.4, 0.5),  # ratio 0.2, below it
     ],
 )
-def test_trust_region_straddles_the_default_thresholds(actual, expected):
+def test_trust_region_straddles_default_thresholds(actual, expected):
     from polystep.quadratic_model import update_trust_region
 
     r = update_trust_region(torch.tensor([-2.0]), torch.tensor([actual]), current_radius=1.0)
     assert r == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "pred, actual, radius, expected, why",
+    [
+        (-1.0, 1.0, 1.0, 0.25, "predicted a gain and the loss rose: aggressive shrink"),
+        (-1.0, 2.0, 0.3, 0.1, "the aggressive shrink clamps at min_radius"),
+        (1.0, -0.4, 1.0, 0.5, "predicted a loss and the loss fell: ordinary shrink, not double"),
+        (-1.0, -1.0, 2.5, 3.0, "expansion saturates at max_radius"),
+        (-1.0, -0.1, 0.15, 0.1, "shrink saturates at min_radius"),
+        (-1.0, -0.5, 1.0, 1.0, "between the thresholds the radius holds"),
+        (1.0, 1.0, 1.0, 0.5, "predicted a rise and the loss rose: shrink, never hold"),
+        (1e-12, 1.0, 1.7, 1.7, "a degenerate prediction leaves the radius alone"),
+    ],
+)
+def test_trust_region_branches_and_clamps(pred, actual, radius, expected, why):
+    """Every branch, including both saturation points."""
+    from polystep.quadratic_model import update_trust_region
+
+    got = update_trust_region(
+        predicted_improvement=torch.tensor([pred]),
+        actual_improvement=torch.tensor([actual]),
+        current_radius=radius,
+        min_radius=0.1,
+        max_radius=3.0,
+    )
+    assert got == pytest.approx(expected), why
 
 
 def test_predicted_improvement():
@@ -180,21 +185,12 @@ def test_fd_gradient_batch_particles():
     pdim = 3
     P = 4
     K = 3
-    V = 2 * pdim
 
     true_grad = torch.randn(P, pdim)
     true_hess = torch.rand(P, pdim) + 0.5
     scales = torch.linspace(0, 1, K + 2)[1 : K + 1]
     probe_radius = 0.5
-    c = 5.0
-
-    losses_3d = torch.zeros(P, V, K)
-    for p in range(P):
-        for k in range(K):
-            t = scales[k] * probe_radius
-            for i in range(pdim):
-                losses_3d[p, i, k] = c + true_grad[p, i] * t + 0.5 * true_hess[p, i] * t**2
-                losses_3d[p, i + pdim, k] = c - true_grad[p, i] * t + 0.5 * true_hess[p, i] * t**2
+    losses_3d = _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P, c=5.0)
 
     from polystep.quadratic_model import extract_fd_gradient, extract_fd_hessian_diag
 
@@ -202,29 +198,6 @@ def test_fd_gradient_batch_particles():
     hess = extract_fd_hessian_diag(losses_3d, scales, probe_radius, pdim)
     torch.testing.assert_close(grad, true_grad, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(hess, true_hess, atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.parametrize("actual, expand", [(-1.8, True), (-0.1, False)])
-def test_trust_region_follows_prediction_accuracy(actual, expand):
-    """An accurate prediction earns a wider radius; a badly overshot one loses it."""
-    from polystep.quadratic_model import update_trust_region
-
-    new_radius = update_trust_region(torch.tensor([-2.0]), torch.tensor([actual]), current_radius=1.0)
-    assert (new_radius > 1.0) is expand, new_radius
-
-
-def _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P, c=10.0):
-    """Helper: generate losses_3d for a known quadratic f(x) = c + g*x + 0.5*H*x^2."""
-    K = len(scales)
-    V = 2 * pdim
-    losses_3d = torch.zeros(P, V, K)
-    for p in range(P):
-        for k in range(K):
-            t = scales[k] * probe_radius
-            for i in range(pdim):
-                losses_3d[p, i, k] = c + true_grad[p, i] * t + 0.5 * true_hess[p, i] * t**2
-                losses_3d[p, i + pdim, k] = c - true_grad[p, i] * t + 0.5 * true_hess[p, i] * t**2
-    return losses_3d
 
 
 @pytest.mark.parametrize(
@@ -235,7 +208,7 @@ def _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, 
         (torch.zeros(1, 2), 0.3, torch.tensor([[-0.45, 0.12]]), 1e-3),
     ],
 )
-def test_newton_refinement_alpha_one_moves_toward_minimum(x_bary, alpha, expected, tol):
+def test_newton_alpha_one_moves_toward_minimum(x_bary, alpha, expected, tol):
     """apply_newton_refinement blends X_bary with the Newton-corrected minimum by alpha."""
     from polystep.quadratic_model import apply_newton_refinement
 
@@ -269,7 +242,7 @@ def test_newton_refinement_alpha_one_moves_toward_minimum(x_bary, alpha, expecte
     torch.testing.assert_close(X_refined, expected, atol=tol, rtol=tol)
 
 
-def test_newton_refinement_anchors_at_probe_center_not_x_bary():
+def test_newton_refinement_anchors_at_probe_center():
     """The Newton step is measured from the probe center X_current, so when
     X_bary differs the refinement does not double-count the OT move."""
     from polystep.quadratic_model import apply_newton_refinement
@@ -307,7 +280,7 @@ def test_newton_refinement_anchors_at_probe_center_not_x_bary():
     torch.testing.assert_close(X_refined, expected_minimum, atol=1e-3, rtol=1e-3)
 
 
-def test_newton_refinement_gate_falls_back_when_blend_worse():
+def test_newton_gate_keeps_bary_when_worse():
     """When a clipped Newton step lands at a worse modeled point than the OT
     step, the descent gate keeps X_bary instead of the ascent blend."""
     from polystep.quadratic_model import apply_newton_refinement
@@ -343,7 +316,7 @@ def test_newton_refinement_gate_falls_back_when_blend_worse():
 
 
 def test_newton_refinement_handles_near_zero_hessian():
-    """apply_newton_refinement with near-zero Hessian should not explode (regularization prevents it)."""
+    """Regularization keeps the step bounded."""
     from polystep.quadratic_model import apply_newton_refinement
 
     pdim = 2
@@ -378,7 +351,6 @@ def test_newton_refinement_handles_near_zero_hessian():
 
 
 def test_newton_refinement_respects_max_step_norm():
-    """apply_newton_refinement should clamp Newton correction to max_step_norm."""
     from polystep.quadratic_model import apply_newton_refinement
 
     pdim = 2
@@ -414,7 +386,7 @@ def test_newton_refinement_respects_max_step_norm():
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16])
-def test_the_orthoplex_path_is_the_central_difference_exactly(dtype):
+def test_orthoplex_path_is_exact_central_difference(dtype):
     """sum_v v v^T = (V/d) I collapses the least-squares fit to (d/(V s r)) sum_v L_v v.
 
     On antipodal pairs that is the central difference with the 2d-2 zero terms dropped,
@@ -433,7 +405,7 @@ def test_the_orthoplex_path_is_the_central_difference_exactly(dtype):
                 assert torch.equal(extract_fd_gradient(losses, scales, radius, pdim), reference)
 
 
-def test_the_simplex_recovers_a_planted_gradient_and_the_curvature_trace():
+def test_simplex_recovers_gradient_and_curvature_trace():
     """The simplex carries an O(r) third-moment bias the orthoplex cancels; the shared
     centre recovers tr(H)/d exactly at any radius."""
     from polystep.geometry import get_simplex_vertices
@@ -458,3 +430,49 @@ def test_the_simplex_recovers_a_planted_gradient_and_the_curvature_trace():
         curv = extract_iso_curvature(losses_3d, torch.tensor([L0], dtype=torch.float64), scales, radius)
         assert curv.shape == (1, 1)
         assert curv.item() == pytest.approx(torch.trace(H).item() / d, rel=1e-9)
+
+
+def test_fd_gradient_requires_orthoplex_vertices():
+    """FD gradient slices [:pdim]/[pdim:], so a non-orthoplex vertex count
+    (V != 2*pdim) must fail loudly, not silently return wrong gradients."""
+    from polystep.quadratic_model import extract_fd_gradient
+
+    losses = torch.randn(4, 5, 2)  # V=5, not 2*pdim
+    # Raises ValueError (not AssertionError) so the check survives `python -O`.
+    with pytest.raises(ValueError, match="orthoplex"):
+        extract_fd_gradient(losses, torch.ones(2), probe_radius=0.1, pdim=3)
+
+
+def test_newton_step_survives_flat_coordinate():
+    """Dividing by hessian_reg gives that coordinate a 1e4x step.
+
+    The norm clip is a single global rescale, so without a per-coordinate cap the flat
+    coordinate dominates the norm and shrinks every other component by the same factor.
+    """
+    from polystep.quadratic_model import compute_newton_step
+
+    gradient = torch.full((1, 10), 0.1)
+    hessian = torch.ones(1, 10)
+    hessian[0, 9] = 0.0  # flat direction
+
+    delta = compute_newton_step(gradient, hessian, max_step_norm=1.0, hessian_reg=1e-4)
+
+    good = delta[0, :9].abs()
+    assert (good > 0.01).all(), good
+    assert delta[0, 9].abs() <= 1.0 + 1e-6
+    assert (delta <= 0).all(), "Newton step must not ascend"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_constant_simplex_losses_give_zero_gradient(dtype):
+    from polystep.geometry import get_simplex_vertices
+    from polystep.quadratic_model import extract_fd_gradient
+
+    g = extract_fd_gradient(
+        torch.full((2, 9, 1), 1e6, dtype=dtype),
+        torch.ones(1, dtype=dtype),
+        0.01,
+        8,
+        get_simplex_vertices(8, dtype=dtype),
+    )
+    assert torch.count_nonzero(g) == 0

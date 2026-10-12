@@ -6,7 +6,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from polystep import PolyStepOptimizer
 from polystep.adaptive_subspace import AdaptiveSubspace
+from polystep.cost_nn import NNCostEvaluator
 from polystep.transform import ParamLayout
 
 
@@ -50,7 +52,6 @@ class TestInitProjection:
         )
 
     def test_init_projection_deterministic_with_generator(self, adaptive_sub):
-        """Two calls with same Generator seed produce identical P."""
         gen1 = torch.Generator().manual_seed(123)
         P1 = adaptive_sub.init_projection(generator=gen1)
 
@@ -138,10 +139,8 @@ class TestRotateDisplacement:
             (False, 0, 456, 1e-5),
         ],
     )
-    def test_rotate_displacement_zero_history_falls_back_to_random(
-        self, adaptive_sub, use_zero_history, step, seed, atol
-    ):
-        """Zero or None displacement history falls back to random (still orthogonal)."""
+    def test_rotate_zero_history_redraws_random(self, adaptive_sub, use_zero_history, step, seed, atol):
+        """Covers zero and None history."""
         P = adaptive_sub.init_projection(generator=torch.Generator().manual_seed(0))
 
         disp_history = torch.zeros(3, adaptive_sub.subspace_dim) if use_zero_history else None
@@ -173,7 +172,7 @@ class TestRotateDisplacement:
         torch.testing.assert_close(P_new, again, rtol=1e-5, atol=1e-6)
 
     def test_rotate_displacement_incorporates_svd(self):
-        """Displacement rotation incorporates SVD directions when history has clear dominant direction."""
+        """History has one dominant direction."""
         full_dim = 100
         subspace_dim = 20
         sub = AdaptiveSubspace(
@@ -214,8 +213,8 @@ class TestRotateDisplacement:
             "expected > 0.3 for displacement-biased rotation"
         )
 
-    def test_svd_ratio_zero_keeps_no_displacement_direction(self):
-        """``svd_ratio_init=0`` must keep the basis fully random, with no singular vector forced in."""
+    def test_svd_ratio_zero_keeps_random_basis(self):
+        """No singular vector enters the basis."""
         sub = AdaptiveSubspace(
             full_dim=100, subspace_dim=20, rotation_mode="displacement", svd_ratio_init=0.0, svd_ratio_final=0.0
         )
@@ -243,8 +242,8 @@ class TestRotateDisplacement:
         (200, 100, 0.5),
     ],
 )
-def test_svd_ratio_at_start(step, total, expected):
-    """SVD ratio interpolates from init to final and clamps beyond total_steps."""
+def test_svd_ratio_interpolates_and_clamps(step, total, expected):
+    """Clamps beyond total_steps."""
     sub = AdaptiveSubspace(full_dim=100, subspace_dim=10, svd_ratio_init=0.0, svd_ratio_final=0.5)
     assert sub.get_svd_ratio(step, total) == pytest.approx(expected)
 
@@ -266,14 +265,14 @@ class TestShouldAbsorb:
     """The absorb schedule, checked on every subspace class that exposes it."""
 
     @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored"])
-    def test_stagnation_fires_at_the_patience_boundary(self, kind):
+    def test_stagnation_fires_at_patience_boundary(self, kind):
         sub = _absorb_schedules(absorb_mode="stagnation", absorb_patience=20)[kind]
         assert not sub.should_absorb(stagnation_count=19, iteration=50)
         assert sub.should_absorb(stagnation_count=20, iteration=50)
         assert sub.should_absorb(stagnation_count=25, iteration=50)
 
     @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored"])
-    def test_periodic_fires_on_multiples_and_skips_iteration_zero(self, kind):
+    def test_periodic_fires_on_multiples_skips_zero(self, kind):
         sub = _absorb_schedules(absorb_mode="periodic", absorb_interval=10)[kind]
         assert not sub.should_absorb(stagnation_count=0, iteration=0)
         assert not sub.should_absorb(stagnation_count=0, iteration=5)
@@ -282,17 +281,16 @@ class TestShouldAbsorb:
         assert sub.should_absorb(stagnation_count=0, iteration=20)
 
     @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored"])
-    def test_periodic_with_zero_interval_never_fires(self, kind):
+    def test_periodic_zero_interval_never_fires(self, kind):
         sub = _absorb_schedules(absorb_mode="periodic", absorb_interval=0)[kind]
         assert not sub.should_absorb(stagnation_count=100, iteration=100)
 
 
 @pytest.mark.parametrize("kind", ["adaptive", "hybrid"])
-def test_absorb_keeps_the_progress_baseline(model, layout, kind):
-    """The stagnation baseline stays the best-vertex mean the step measured, not the full cost mean."""
+def test_absorb_keeps_progress_baseline(model, layout, kind):
+    """Baseline is the measured best-vertex mean, not the cost mean."""
     from torch.func import functional_call, vmap
 
-    from polystep import PolyStepOptimizer
     from polystep.hybrid_subspace import HybridSubspace
 
     cls = AdaptiveSubspace if kind == "adaptive" else HybridSubspace
@@ -437,8 +435,8 @@ def test_displacement_mode_productivity():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_cuda_generator_draws_on_its_own_device():
-    """A CUDA generator draws the Gaussian on the GPU; the basis comes back on the projection's device."""
+def test_cuda_generator_draws_on_cuda():
+    """The basis returns on the projection's device."""
     sub = AdaptiveSubspace(
         full_dim=100,
         subspace_dim=10,
@@ -454,8 +452,8 @@ def test_cuda_generator_draws_on_its_own_device():
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
-def test_nonfinite_history_redraws_a_random_basis(bad):
-    """The history's squared norm catches a nonfinite entry, so the rotation redraws from the generator."""
+def test_nonfinite_history_redraws_random_basis(bad):
+    """The squared-norm check catches the bad entry."""
     sub = AdaptiveSubspace(full_dim=50, subspace_dim=6, svd_ratio_init=0.5, svd_ratio_final=0.5)
     projection = sub.init_projection(generator=torch.Generator().manual_seed(0))
     history = torch.randn(3, 50, generator=torch.Generator().manual_seed(1))
@@ -466,7 +464,7 @@ def test_nonfinite_history_redraws_a_random_basis(bad):
     assert torch.equal(rotated, expected)
 
 
-def test_rotation_keeps_the_uncentered_displacement_direction():
+def test_rotation_keeps_uncentered_displacement_direction():
     """Rotation must not centre the history; the offset IS the direction to keep."""
     full_dim, sub_dim, history_len = 200, 8, 16
     sub = AdaptiveSubspace(
@@ -492,11 +490,9 @@ def test_rotation_keeps_the_uncentered_displacement_direction():
 
 
 @pytest.mark.parametrize("interval, expected_rotations", [(1, 4), (2, 2), (0, 0)])
-def test_rotation_interval_amortizes_the_basis_decomposition(interval, expected_rotations):
+def test_rotation_interval_amortizes_basis_decomposition(interval, expected_rotations):
     """Each rotation costs an absorb plus a QR/SVD, which dominate at large full_dim."""
     from torch.func import functional_call
-
-    from polystep.optimizer import PolyStepOptimizer
 
     model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
     sub = AdaptiveSubspace.auto_from_params(model, compression_target=0.15)
@@ -521,11 +517,9 @@ def test_rotation_interval_amortizes_the_basis_decomposition(interval, expected_
 
 
 @pytest.mark.parametrize("option", [{"amortize_steps": 2}, {"biased_rotation": True}, {"use_momentum": True}])
-def test_per_step_rotation_warns_about_the_state_it_clears(option):
-    """A basis change clears the velocity and both cached directions, so a rotation every step leaves them inert."""
+def test_per_step_rotation_warns_cleared_state(option):
+    """Basis changes clear velocity and cached directions."""
     import warnings
-
-    from polystep.optimizer import PolyStepOptimizer
 
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
     with pytest.warns(UserWarning, match="changes its basis every step"):
@@ -538,7 +532,7 @@ def test_per_step_rotation_warns_about_the_state_it_clears(option):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_offsets_match_reconstruct_batch(model, layout, dtype):
-    """A candidate that moves one particle is the incumbent plus that particle's columns of P."""
+    """Moving one particle adds that particle's columns of P."""
     sub = AdaptiveSubspace.from_layout(layout, rank=21)
     gen = torch.Generator().manual_seed(0)
     projection = sub.init_projection(generator=gen, dtype=dtype)
@@ -572,8 +566,6 @@ def test_step_with_offsets_matches_full_reconstruction(layout, polytope_type, ch
     from unittest.mock import patch
 
     from torch.func import functional_call, vmap
-
-    from polystep import PolyStepOptimizer
 
     x, y = torch.randn(16, 20), torch.randn(16, 5)
     runs, delegated, buffers, storages = [], [], [], []
@@ -634,13 +626,11 @@ def test_step_with_offsets_matches_full_reconstruction(layout, polytope_type, ch
     assert runs[0].state.costs == pytest.approx(runs[1].state.costs, rel=1e-6)
 
 
-def test_half_precision_steps_keep_the_full_reconstruction(layout):
-    """bf16 candidates round where they are built, so a cost matrix never mixes two rounding models."""
+def test_bf16_step_uses_full_reconstruction(layout):
+    """Keeps one rounding model per cost matrix."""
     from unittest.mock import patch
 
     from torch.func import functional_call, vmap
-
-    from polystep import PolyStepOptimizer
 
     model = SimpleMLP().to(torch.bfloat16)
     x, y = torch.randn(16, 20, dtype=torch.bfloat16), torch.randn(16, 5, dtype=torch.bfloat16)
@@ -654,11 +644,8 @@ def test_half_precision_steps_keep_the_full_reconstruction(layout):
     assert torch.isfinite(opt.state.X).all()
 
 
-def test_offsets_follow_the_subspace_layout_when_a_param_is_frozen(model, layout):
-    """The subspace keeps the layout it was built on after a parameter is frozen."""
+def test_offsets_keep_layout_after_param_freeze(model, layout):
     from torch.func import functional_call, vmap
-
-    from polystep import PolyStepOptimizer
 
     sub = AdaptiveSubspace.from_layout(layout, rank=21, rotation_interval=0)
     model.fc1.bias.requires_grad_(False)
@@ -673,11 +660,9 @@ def test_offsets_follow_the_subspace_layout_when_a_param_is_frozen(model, layout
     assert torch.isfinite(opt.state.X).all()
 
 
-def test_offsets_build_candidates_at_the_projection_dtype_after_a_partial_cast(model, layout):
+def test_partial_cast_offsets_use_projection_dtype(model, layout):
     """Casting one layer and resyncing leaves a mixed-dtype base under one projection."""
     from torch.func import functional_call, vmap
-
-    from polystep import PolyStepOptimizer
 
     sub = AdaptiveSubspace.from_layout(layout, rank=21)
     opt = PolyStepOptimizer(model, subspace=sub, subspace_particle_dim=4, solver="softmax", seed=0)
@@ -692,3 +677,75 @@ def test_offsets_build_candidates_at_the_projection_dtype_after_a_partial_cast(m
     for _ in range(2):
         opt.step(closure)
     assert torch.isfinite(opt.state.X).all()
+
+
+def _mlp_and_closure(seed, in_dim=20, out_dim=4, samples=64):
+    """Build an MLP plus a batched-params closure over fixed random data."""
+    gen = torch.Generator().manual_seed(1000 + seed)
+    inputs = torch.randn(samples, in_dim, generator=gen)
+    targets = torch.randn(samples, out_dim, generator=gen)
+    torch.manual_seed(seed)
+    model = nn.Sequential(nn.Linear(in_dim, 16), nn.ReLU(), nn.Linear(16, out_dim))
+    evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
+
+    def closure(batched_params):
+        return evaluator.evaluate(batched_params, inputs, targets)
+
+    def true_loss():
+        with torch.no_grad():
+            return nn.functional.mse_loss(model(inputs), targets).item()
+
+    return model, closure, true_loss
+
+
+class TestRotationPreservesPoint:
+    """The represented point is ``base + P @ coords``.
+
+    Replacing ``P`` while coords are non-zero moves the weights with no evaluation
+    behind it, so every rotation must fold coords into base first.
+    """
+
+    def test_coords_are_zero_after_rotation(self):
+        """Rotation re-anchors the origin, so coords must be exactly zero."""
+        model, closure, _ = _mlp_and_closure(0)
+        subspace = AdaptiveSubspace.auto_from_params(model)
+        opt = PolyStepOptimizer(model, subspace=subspace, epsilon=0.1, max_iterations=10)
+
+        prev_projection = None
+        for _ in range(5):
+            opt.step(closure)
+            coords = opt.state.X.reshape(-1)[: subspace.subspace_dim]
+            assert torch.count_nonzero(coords) == 0
+            if prev_projection is not None:
+                teleport = torch.linalg.vector_norm((opt.state.projection - prev_projection) @ coords)
+                assert teleport.item() == 0.0
+            prev_projection = opt.state.projection.clone()
+
+    def test_loss_reduction_floor(self):
+        """Median loss reduction across seeds must clear a floor."""
+        reductions = []
+        for seed in range(6):
+            model, closure, true_loss = _mlp_and_closure(seed)
+            opt = PolyStepOptimizer(
+                model,
+                subspace=AdaptiveSubspace.auto_from_params(model),
+                epsilon=0.1,
+                max_iterations=60,
+            )
+            before = true_loss()
+            for _ in range(60):
+                opt.step(closure)
+            reductions.append((before - true_loss()) / before * 100.0)
+
+        reductions.sort()
+        median = 0.5 * (reductions[2] + reductions[3])
+        assert median > 8.0, reductions
+
+
+def test_rank_above_full_dim_rejected():
+    """Reduced QR of a wide matrix returns ``full_dim`` columns, not the requested
+    ``subspace_dim``, so the optimizer would allocate coordinates the projection
+    cannot consume and the mismatch would surface only later, at reconstruction.
+    """
+    with pytest.raises(ValueError, match="subspace_dim"):
+        AdaptiveSubspace(full_dim=2, subspace_dim=3)

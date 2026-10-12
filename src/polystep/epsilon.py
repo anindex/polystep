@@ -4,6 +4,15 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .solvers._shared import validate_positive
+
+
+def resolve_epsilon(value, iteration: int, name: str) -> Optional[float]:
+    """``value`` at ``iteration``, a schedule's ``.at()`` or the float itself, checked positive; None stays None."""
+    if value is None:
+        return None
+    return validate_positive(value.at(iteration) if hasattr(value, "at") else value, name)
+
 
 def resolve_radius(radius, iteration: int, epsilon: float) -> float:
     """The physical radius at ``iteration``: a scalar is ``radius * epsilon``, a schedule is its own value."""
@@ -12,7 +21,7 @@ def resolve_radius(radius, iteration: int, epsilon: float) -> float:
 
 
 def radius_epsilon_factor(radius, epsilon: float) -> float:
-    """``1.0`` for a scheduled radius, ``epsilon`` for a scalar one. Keep the existing multiplication order."""
+    """``1.0`` for a scheduled radius, ``epsilon`` for a scalar one."""
     return 1.0 if hasattr(radius, "at") else float(epsilon)
 
 

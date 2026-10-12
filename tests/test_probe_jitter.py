@@ -6,6 +6,7 @@ q(t) ~ exp(-1/(1-t^2)) qualifies, a uniform density does not.
 
 import math
 
+import pytest
 import torch
 
 from polystep.optimizer import PolyStepOptimizer
@@ -23,24 +24,75 @@ def test_jitter_respects_support():
     assert etas.abs().max().item() > 0.05  # not degenerate
 
 
-def test_zero_jitter_is_a_noop():
-    opt = _optimizer(probe_radius_jitter=0.0, seed=2)
-    assert opt._apply_probe_radius_jitter(1.5) == 1.5
-
-
-def test_jitter_is_seed_reproducible():
-    a = [_optimizer(probe_radius_jitter=0.2, seed=7)._sample_jitter_pooled(0.2) for _ in range(1)]
-    b = [_optimizer(probe_radius_jitter=0.2, seed=7)._sample_jitter_pooled(0.2) for _ in range(1)]
+def test_jitter_reproducible_under_seed():
+    a = _optimizer(probe_radius_jitter=0.2, seed=7)._sample_jitter_pooled(0.2)
+    b = _optimizer(probe_radius_jitter=0.2, seed=7)._sample_jitter_pooled(0.2)
     assert a == b
 
 
 def test_invalid_distribution_rejected():
-    try:
+    with pytest.raises(ValueError, match="smooth"):
         _optimizer(probe_radius_jitter_dist="gaussian")
-    except ValueError as exc:
-        assert "smooth" in str(exc)
-    else:
-        raise AssertionError("expected ValueError")
+
+
+class TestProbeRadiusJitter:
+    """Probe-radius jitter gives the step density a spread along any wall normal.
+
+    The probe distribution must be absolutely continuous on a positive-measure
+    tube around the (d_p-1)-sphere; the 0.0 default keeps runs reproducible.
+    """
+
+    def test_default_jitter_noop(self):
+        """With jitter=0, _apply_probe_radius_jitter returns the input unchanged
+        and consumes NO random state from the optimizer's generator."""
+        opt = _optimizer(particle_dim=2, probe_radius=2.0, seed=42)
+        # Snapshot the generator state BEFORE calling the helper.
+        state_before = opt._generator.get_state().clone()
+        result = opt._apply_probe_radius_jitter(2.0)
+        state_after = opt._generator.get_state()
+        assert result == 2.0
+        # No random call should have occurred.
+        assert torch.equal(state_before, state_after)
+
+    def test_jitter_perturbs_probe_radius(self):
+        """With jitter > 0, _apply_probe_radius_jitter returns a value in
+        the bounded multiplicative interval [(1-eta_max)*r, (1+eta_max)*r]
+        and consumes random state from the optimizer's generator."""
+        eta_max = 0.05
+        opt = _optimizer(particle_dim=2, probe_radius=2.0, probe_radius_jitter=eta_max, seed=42)
+        base = 2.0
+        # Sample many jitter values and check (a) they are all in the interval,
+        # (b) the variance is non-zero (jitter is actually being applied).
+        samples = [opt._apply_probe_radius_jitter(base) for _ in range(200)]
+        lo = base * (1.0 - eta_max)
+        hi = base * (1.0 + eta_max)
+        assert all(lo <= s <= hi for s in samples), (
+            f"jitter samples must lie in [{lo}, {hi}], got min={min(samples)} max={max(samples)}"
+        )
+        assert max(samples) - min(samples) > 0.01, "jitter samples should span a non-trivial range"
+
+    @pytest.mark.parametrize("bad", [1.0, -0.1])
+    def test_jitter_validation_rejects_out_of_range(self, bad):
+        """probe_radius_jitter must lie in [0, 1) - values >= 1 risk negative
+        effective probe radius and are rejected at init time."""
+        with pytest.raises(ValueError, match="probe_radius_jitter"):
+            _optimizer(probe_radius_jitter=bad)
+
+    def test_jitter_step_runs_and_changes_iterates(self, regression_closure):
+        """End-to-end: optimization with jitter > 0 still produces a valid
+        step and updates the iterate, exercising the helper from inside the
+        full step path (resolve_radii / _step_monolithic)."""
+        torch.manual_seed(0)
+        opt = _optimizer(particle_dim=2, probe_radius=2.0, probe_radius_jitter=0.05, seed=42)
+        model = opt.model
+        closure = regression_closure(model)
+        params_before = torch.cat([p.detach().flatten() for p in model.parameters()])
+        opt.step(closure)
+        params_after = torch.cat([p.detach().flatten() for p in model.parameters()])
+        assert opt._state.iteration_count == 1
+        # The step must have produced a finite, non-trivial update.
+        assert torch.isfinite(params_after).all()
+        assert not torch.equal(params_before, params_after)
 
 
 # --- Jitter is exclusive with the amortization heuristics -------------------------
@@ -71,24 +123,20 @@ def test_no_jitter_leaves_amortization_alone():
 # on a Lebesgue-null sphere; Cor. 4.12 needs a volume there.
 
 
-def test_step_jitter_is_a_noop_at_zero():
+def test_step_jitter_noop_at_zero():
     opt = _optimizer(step_radius_jitter=0.0, seed=2)
     X = torch.zeros(3, 4)
     X_bary = torch.ones(3, 4)
     assert torch.equal(opt._apply_particle_step_jitter(X, X_bary), X_bary)
 
 
-def test_step_jitter_rejects_out_of_range():
-    for bad in (-0.1, 1.0, 2.5):
-        try:
-            _optimizer(step_radius_jitter=bad)
-        except ValueError as exc:
-            assert "step_radius_jitter" in str(exc)
-        else:
-            raise AssertionError(f"expected ValueError for {bad}")
+@pytest.mark.parametrize("bad", [-0.1, 1.0, 2.5])
+def test_step_jitter_rejects_out_of_range(bad):
+    with pytest.raises(ValueError, match="step_radius_jitter"):
+        _optimizer(step_radius_jitter=bad)
 
 
-def test_step_jitter_spreads_the_displacement_length():
+def test_step_jitter_spreads_displacement_length():
     """Without jitter every step has the same length; with it, a spread of lengths."""
     from polystep.cost_nn import NNCostEvaluator
 
@@ -133,7 +181,7 @@ def test_step_jitter_is_drawn_per_particle():
     assert len(set(scales.tolist())) > 1, scales
 
 
-def test_the_jitter_sampler_draws_the_law_lemma_4_3_assumes():
+def test_jitter_sampler_matches_lemma_4_3_law():
     """Mollifier tighter than uniform, tail empty at +-1, symmetric about zero."""
     n = 20_000
     smooth = _optimizer(probe_radius_jitter=0.9, probe_radius_jitter_dist="smooth", seed=3)

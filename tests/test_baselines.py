@@ -130,7 +130,7 @@ def test_objective_tracks_best_and_ignores_nan():
 
 
 @pytest.mark.parametrize("name", METHOD_NAMES)
-def test_nan_candidates_keep_the_iterate_finite(name):
+def test_nan_candidates_keep_iterate_finite(name):
     def fn(X):
         return quadratic()(X).masked_fill(X[:, 0] > 0.2, float("nan"))
 
@@ -140,8 +140,8 @@ def test_nan_candidates_keep_the_iterate_finite(name):
     assert math.isfinite(result.best_loss)
 
 
-def test_random_search_compares_on_the_same_call():
-    """A shift that changes from call to call, like a fresh minibatch, must not decide acceptance."""
+def test_random_search_compares_on_same_call():
+    """A per-call shift, like a fresh minibatch, must not decide acceptance."""
     gen = torch.Generator().manual_seed(0)
 
     def fn(X):
@@ -162,6 +162,11 @@ def test_objective_rejects_bad_shapes():
 def test_shaping_helpers():
     x = torch.tensor([3.0, 1.0, 2.0])
     assert centered_rank(x).tolist() == [0.5, -0.5, 0.0]
+    values = torch.tensor([2.0, 1.0, 1.0, 3.0])
+    assert torch.allclose(centered_rank(values), torch.tensor([1 / 6, -1 / 3, -1 / 3, 0.5]))
+    permutation = torch.tensor([3, 0, 2, 1])
+    assert torch.equal(centered_rank(values[permutation]), centered_rank(values)[permutation])
+    assert torch.equal(centered_rank(torch.ones(32)), torch.zeros(32))
     assert torch.allclose(zscore(torch.ones(4)), torch.zeros(4))
     assert zscore(x).mean().abs() < 1e-6
 
@@ -176,7 +181,7 @@ def test_shaping_puts_nonfinite_losses_last(shaping):
         assert u.argmin() == 1
 
 
-def test_zscore_rescales_losses_that_would_overflow():
+def test_zscore_rescales_overflowing_losses():
     from polystep.baselines.methods import _shaped
 
     u = _shaped(torch.tensor([1e38, 1e38, float("inf"), float("inf")]), "zscore")
@@ -219,7 +224,7 @@ def subspace_objective(budget: int) -> Objective:
 
 
 @pytest.mark.parametrize("name", METHOD_NAMES)
-def test_runs_in_subspace_with_same_counter_semantics(name):
+def test_subspace_run_keeps_counter_semantics(name):
     """Same method, same budget, same counter meaning, projected coordinates."""
     plain = Objective(quadratic(), dim=DIM, budget=BUDGET, shapes=[(3, 4)])
     projected = subspace_objective(BUDGET)
@@ -249,7 +254,7 @@ def test_subspace_objective_reports_layer_shapes():
     assert len(obj.shapes) == len(hybrid.specs)
 
 
-def test_from_layout_keeps_parameter_shapes_for_eggroll():
+def test_from_layout_keeps_shapes_for_eggroll():
     model = nn.Sequential(nn.Linear(8, 6), nn.Linear(6, 2))
     layout = ParamLayout.from_module(model)
     obj = Objective.from_layout(layout, quadratic(), budget=64)
@@ -260,7 +265,7 @@ def test_from_layout_keeps_parameter_shapes_for_eggroll():
 # EGGROLL specifics
 
 
-def test_eggroll_perturbations_are_low_rank_but_update_is_not():
+def test_eggroll_lowrank_noise_full_rank_update():
     from polystep.baselines.methods import _lowrank_noise
 
     gen = torch.Generator().manual_seed(0)
@@ -289,7 +294,7 @@ def test_eggroll_handles_1d_entries():
 # MeZO specifics
 
 
-def test_mezo_regenerates_the_same_perturbation():
+def test_mezo_regenerates_same_perturbation():
     """The same seed must give the same z, or the update points nowhere."""
     seen = []
 
@@ -305,8 +310,14 @@ def test_mezo_regenerates_the_same_perturbation():
     assert torch.allclose(result.x, torch.zeros(DIM)), "lr=0 must not move x"
 
 
-def test_mezo_skips_weight_decay_on_a_nonfinite_pair():
+def test_mezo_nonfinite_pair_skips_weight_decay():
     obj = Objective(lambda X: torch.tensor([float("inf"), 1.0]), dim=1, budget=2)
     result = METHODS["mezo"](obj, x0=torch.ones(1), lr=0.01, weight_decay=1.0)
     assert result.x.tolist() == [1.0]
     assert (result.evals, result.iters) == (2, 1)
+
+
+def test_baseline_objective_never_records_nonfinite_best():
+    obj = Objective(lambda x: torch.full((len(x),), float("inf")), dim=2, budget=4)
+    obj(torch.zeros(4, 2))
+    assert obj.best_loss == float("inf") and obj.best_x is None

@@ -5,14 +5,9 @@ free, so ``set_seed`` also pins deterministic kernels and every loader carries
 a seeded generator.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn as nn
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -47,7 +42,6 @@ def _restore_global_determinism_flags():
 
 def _train_once(train_loader, seed=42, epochs=2, device="cpu"):
     """Train a tiny MLP with PolyStep and return the per-step losses."""
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.runners.common import reseed_loaders, set_seed
     from polystep.cost_nn import NNCostEvaluator
     from polystep.optimizer import PolyStepOptimizer
@@ -76,7 +70,7 @@ def _train_once(train_loader, seed=42, epochs=2, device="cpu"):
     return losses
 
 
-def test_two_seeded_runs_have_identical_loss_trajectories(require_experiments, mnist_loaders):
+def test_seeded_runs_repeat_loss_trajectory(require_experiments, mnist_loaders):
     train_loader, _ = mnist_loaders(n_train=128, n_test=32, batch_size=32, downsample=4)
 
     first = _train_once(train_loader)
@@ -89,7 +83,6 @@ def test_two_seeded_runs_have_identical_loss_trajectories(require_experiments, m
 
 
 def test_set_deterministic_pins_tf32_and_cudnn(require_experiments):
-    sys.path.insert(0, str(REPO_ROOT))
     from experiments.runners.common import set_deterministic
 
     set_deterministic()
@@ -100,10 +93,9 @@ def test_set_deterministic_pins_tf32_and_cudnn(require_experiments):
     assert torch.backends.cudnn.allow_tf32 is False
 
 
-def test_cublas_workspace_is_configured_before_cuda(require_experiments):
+def test_runner_import_sets_cublas_workspace(require_experiments):
     """cuBLAS reads CUBLAS_WORKSPACE_CONFIG when the context is created,
     so importing the runner utilities has to be enough to set it."""
-    sys.path.insert(0, str(REPO_ROOT))
     import os
 
     import experiments.runners.common  # noqa: F401
@@ -111,7 +103,7 @@ def test_cublas_workspace_is_configured_before_cuda(require_experiments):
     assert os.environ.get("CUBLAS_WORKSPACE_CONFIG") == ":4096:8"
 
 
-def test_loaders_carry_a_seeded_generator():
+def test_loaders_carry_seeded_generator():
     from polystep.benchmarks.utils import seeded_loader_kwargs
 
     torch.manual_seed(7)
@@ -129,7 +121,7 @@ def test_loaders_carry_a_seeded_generator():
 
 
 @pytest.mark.gpu
-def test_two_seeded_cuda_runs_have_identical_loss_trajectories(require_experiments, mnist_loaders):
+def test_seeded_cuda_runs_repeat_loss_trajectory(require_experiments, mnist_loaders):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     train_loader, _ = mnist_loaders(n_train=128, n_test=32, batch_size=32, downsample=4)

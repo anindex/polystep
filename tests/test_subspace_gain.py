@@ -24,7 +24,7 @@ def _weight_norm_for_unit_coords(subspace, projections, model, seed=0):
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning")
-def test_hybrid_is_unit_gain_on_its_dense_blocks():
+def test_hybrid_unit_gain_on_dense_blocks():
     """step_radius is in coordinates, so a gain other than 1 silently retunes every run."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 10))
@@ -37,7 +37,7 @@ def test_hybrid_is_unit_gain_on_its_dense_blocks():
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning")
-def test_factored_preserves_the_coordinate_norm():
+def test_factored_preserves_coordinate_norm():
     """B has orthonormal rows, so ||A @ B||_F == ||A||_F."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 10))

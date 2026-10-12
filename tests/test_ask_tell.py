@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from polystep import PolyStepES, minimize
-from polystep.solvers import SinkhornSolver
+from polystep.solvers import SinkhornSolver, SoftmaxSolver
 
 
 def _sphere(X):
@@ -25,8 +25,8 @@ def test_tell_requires_ask_first():
         es.tell(torch.zeros(es.popsize))
 
 
-def test_tell_keeps_the_best_candidate_it_was_shown():
-    """``best_solution`` must be the best candidate ever shown, not just the latest round's."""
+def test_tell_keeps_best_shown_candidate():
+    """Across all rounds, not only the latest."""
     es = PolyStepES(3, num_particles=2, seed=0)
     candidates = es.ask()
     fitness = _sphere(candidates)
@@ -41,8 +41,7 @@ def test_tell_keeps_the_best_candidate_it_was_shown():
     assert es.best_fitness == pytest.approx(fitness[best].item())
 
 
-def test_tell_ignores_a_non_finite_update():
-    """A NaN fitness must leave the particles where they were, not poison them."""
+def test_tell_ignores_nonfinite_update():
     es = PolyStepES(3, num_particles=2, seed=0)
     es.ask()
     before = es.X.clone()
@@ -50,8 +49,8 @@ def test_tell_ignores_a_non_finite_update():
     torch.testing.assert_close(es.X, before)
 
 
-def test_unconverged_sinkhorn_row_keeps_its_particle():
-    """A row left with almost no mass still averages its own vertices instead of collapsing to the origin."""
+def test_unconverged_sinkhorn_row_keeps_particle():
+    """A near-empty row averages its own vertices, not the origin."""
     x0 = torch.tensor([[0.0], [10.0]])
     es = PolyStepES(
         1,
@@ -65,7 +64,7 @@ def test_unconverged_sinkhorn_row_keeps_its_particle():
     torch.testing.assert_close(es.X, x0)
 
 
-def test_unseeded_population_follows_the_global_rng():
+def test_unseeded_population_follows_global_rng():
     def first_population(seed):
         torch.manual_seed(seed)
         return PolyStepES(4, num_particles=2).ask()
@@ -122,3 +121,52 @@ def test_sinkhorn_solver_variant_runs():
         es.tell(_sphere(es.ask()))
     assert torch.isfinite(es.X).all()
     assert es.best_fitness < _sphere(torch.full((1, 6), 1.5)).item()
+
+
+def test_es_best_skips_nan_fitness():
+    """A single NaN makes ``torch.min`` return NaN, so ``fmin < best_fitness`` would be
+    False and no finite candidate recorded, even with valid evaluations in the same
+    population.
+    """
+    es = PolyStepES(dim=3, num_particles=2, seed=0)
+    asked = es.ask()
+    fitness = torch.arange(asked.shape[0], dtype=torch.float32)
+    fitness[3] = float("nan")
+
+    es.tell(fitness)
+
+    assert es.best_solution is not None, "no finite best recorded despite valid candidates"
+    assert es.best_fitness == 0.0
+
+
+def test_user_solver_keeps_own_temperature():
+    """tell() must not overwrite it with PolyStepES.epsilon."""
+    es = PolyStepES(dim=3, num_particles=2, solver=SoftmaxSolver(epsilon=0.01), seed=0)
+    es.ask()
+    es.tell(torch.rand(es.popsize))
+    assert es.solver.epsilon == 0.01
+
+
+def test_neginf_fitness_never_captures_best():
+    """-inf survives nan_to_num and wins torch.min, so nothing could ever beat it."""
+    es = PolyStepES(dim=3, num_particles=2, seed=0)
+    f = torch.full((es.popsize,), float("-inf"))
+    f[1], f[2] = 2.0, 3.0
+    candidates = es.ask()
+    es.tell(f)
+    assert es.best_fitness == 2.0
+    assert torch.equal(es.best_solution, candidates[1])
+
+
+def test_ask_tell_never_records_nonfinite_best():
+    es = PolyStepES(dim=2)
+    es.ask()
+    es.tell(torch.tensor([float("inf"), float("nan"), float("-inf"), float("inf")]))
+    assert es.best_fitness == float("inf") and es.best_solution is None
+    es.ask()
+    es.tell(torch.ones(es.popsize))
+    previous = es.best_solution.clone()
+    es.ask()
+    es.tell(torch.full((es.popsize,), float("inf")))
+    assert es.best_fitness == 1.0
+    torch.testing.assert_close(es.best_solution, previous)

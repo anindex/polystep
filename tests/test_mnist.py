@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from polystep import PolyStepOptimizer, TrainCallback, TrainConfig, train
 from polystep.adaptive_subspace import AdaptiveSubspace
+from polystep.benchmarks.utils import MNISTNet, evaluate_accuracy
 from polystep.epsilon import LinearEpsilon
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
@@ -47,7 +48,7 @@ def test_capped_mnist_matches_full_data(tmp_path):
             assert torch.equal(actual, expected[:count])
 
 
-def test_a_truncated_download_leaves_no_file(tmp_path, monkeypatch):
+def test_truncated_download_leaves_no_file(tmp_path, monkeypatch):
     from http.client import IncompleteRead
 
     from polystep.benchmarks import utils
@@ -68,7 +69,7 @@ def test_a_truncated_download_leaves_no_file(tmp_path, monkeypatch):
     assert target.read_bytes() == b"payload"
 
 
-def test_overlapping_downloads_do_not_share_a_temporary_file(tmp_path, monkeypatch):
+def test_overlapping_downloads_use_separate_temp_files(tmp_path, monkeypatch):
     from polystep.benchmarks import utils
 
     target = tmp_path / "train-labels-idx1-ubyte.gz"
@@ -111,37 +112,6 @@ class SmallMNISTNet(nn.Sequential):
                 ]
             )
         )
-
-
-class SmallMLP(nn.Sequential):
-    """Full 28x28 input, 64 hidden: 50890 params. Used for the subspace tests."""
-
-    def __init__(self, hidden: int = 64):
-        super().__init__(
-            OrderedDict(
-                [
-                    ("flatten", nn.Flatten()),
-                    ("fc1", nn.Linear(784, hidden)),
-                    ("relu", nn.ReLU()),
-                    ("fc2", nn.Linear(hidden, 10)),
-                ]
-            )
-        )
-
-
-@torch.no_grad()
-def _accuracy(model: nn.Module, loader, device=None) -> float:
-    was_training = model.training
-    model.eval()
-    correct = total = 0
-    for inputs, targets in loader:
-        if device is not None:
-            inputs, targets = inputs.to(device), targets.to(device)
-        correct += (model(inputs).argmax(dim=-1) == targets).sum().item()
-        total += targets.size(0)
-    if was_training:
-        model.train()
-    return correct / total if total > 0 else 0.0
 
 
 @torch.no_grad()
@@ -189,7 +159,7 @@ def test_mnist_accuracy(mnist_loaders):
     )
     model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=10))
 
-    accuracy = _accuracy(model, test_loader)
+    accuracy = evaluate_accuracy(model, test_loader)
     assert accuracy > 0.50, f"expected > 50% on the 1000-sample test subset, got {accuracy * 100:.1f}%"
 
 
@@ -209,7 +179,7 @@ def test_subspace_trains(mnist_loaders, kind):
     # hidden=32 rather than 64: half the parameters converge faster per step in a fixed
     # subspace rank, so this reaches a higher accuracy in a third of the wall clock.
     # Do not shrink it further: at hidden=24 the adaptive floor fails at 26.2%.
-    model = SmallMLP(hidden=32)
+    model = MNISTNet(hidden=32)
     layout = ParamLayout.from_module(model)
     if kind == "adaptive":
         subspace = AdaptiveSubspace.from_layout(
@@ -228,8 +198,7 @@ def test_subspace_trains(mnist_loaders, kind):
         # Per mode: a single global projection wants a larger radius than a per-layer one.
         step_radius={"adaptive": 10.0, "hybrid": 4.5}[kind],
         probe_radius=2.0,
-        # K=1 is the library default and evaluates 31,320 candidates here against 93,960
-        # at K=3, for higher accuracy on two of the three modes.
+        # K=1 is the library default and evaluates 31,320 candidates here against 93,960 at K=3.
         num_probe=1,
         sinkhorn_max_iters=50,
         subspace=subspace,
@@ -252,7 +221,7 @@ def test_subspace_trains(mnist_loaders, kind):
     finite_disps = [d for d in optimizer.state.displacement_sqnorms if d == d]
     assert sum(finite_disps) > 0, "every displacement was zero or NaN, so no step moved"
 
-    # Both remaining classes rotate, so they steer their next basis with this history.
+    # Both subspace kinds rotate, so they steer their next basis with this history.
     assert optimizer.state.displacement_history_count > 0, "displacement history was never populated"
     assert optimizer.state.absorb_count > 0, (
         f"absorb never fired in {optimizer.state.iteration_count} steps with absorb_interval=5"
@@ -275,7 +244,7 @@ def test_subspace_trains(mnist_loaders, kind):
     # basis, so it gets a lower floor. A floor at 2x chance would pass on a
     # near-dead run; these sit just under the measured values instead.
     floor = {"hybrid": 0.50, "adaptive": 0.25}[kind]
-    accuracy = _accuracy(model, test_loader)
+    accuracy = evaluate_accuracy(model, test_loader)
     assert accuracy >= floor, f"{kind} accuracy {accuracy * 100:.1f}% is below the {floor * 100:.0f}% floor"
 
 
@@ -304,7 +273,7 @@ def test_mnist_gpu_full_space(mnist_loaders):
     )
     model = train(model, train_loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=10))
 
-    accuracy = _accuracy(model, test_loader, device=device)
+    accuracy = evaluate_accuracy(model, test_loader)
     assert accuracy > 0.70, f"expected > 70% on 7x7 MNIST on GPU, got {accuracy * 100:.1f}%"
 
 

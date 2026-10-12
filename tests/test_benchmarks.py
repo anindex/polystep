@@ -81,7 +81,7 @@ class TestSyntheticBenchmarks:
         )
 
     def test_health_series_stay_aligned_with_costs(self):
-        """``record_solver_health`` promises ess/rho/evals aligned with ``costs`` in length and bounds."""
+        """ess/rho/evals match ``costs`` in length and bounds."""
         state, _ = _run_benchmark(Sphere(dim=2), dim=2, num_particles=8, max_iters=6)
 
         n = len(state.costs)
@@ -93,7 +93,7 @@ class TestSyntheticBenchmarks:
         assert all(r >= 0.0 for r in state.rho), state.rho
         assert all(v > 0 for v in state.evals), state.evals
 
-    def test_run_stops_early_once_the_displacement_settles(self):
+    def test_run_stops_once_displacement_settles(self):
         """A huge ``threshold`` must trip the convergence break right after ``min_iterations``."""
         torch.manual_seed(0)
         solver = PolyStep(

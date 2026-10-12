@@ -34,8 +34,8 @@ def test_ess_and_rho_are_recorded():
     assert all(0.0 <= r <= 1.0 + 1e-6 for r in diag["rho"])
 
 
-def test_greedy_solver_moves_all_the_way_to_a_vertex():
-    """A selection solver moves to a vertex, so rho = 1 by construction."""
+def test_greedy_solver_moves_to_vertex():
+    """Selection gives rho = 1 by construction."""
     torch.manual_seed(0)
     model = _model()
     x, y = torch.randn(32, 12), torch.randint(0, 4, (32,))
@@ -46,7 +46,7 @@ def test_greedy_solver_moves_all_the_way_to_a_vertex():
     assert all(r == pytest.approx(1.0, abs=1e-5) for r in get_diagnostics(opt)["rho"])
 
 
-def test_evals_records_what_the_step_actually_cost():
+def test_evals_records_step_cost():
     """P*V*K per step."""
     torch.manual_seed(0)
     model = _model()
@@ -79,7 +79,7 @@ def test_all_lists_stay_aligned_with_costs(solver):
 
 
 @pytest.mark.parametrize("strategy", ["per_layer", "grouped"])
-def test_blockwise_records_them_too(strategy):
+def test_blockwise_records_diagnostics(strategy):
     model = _model()
     evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
     inputs, targets = torch.randn(12, 12), torch.randint(0, 4, (12,))

@@ -1,17 +1,15 @@
 """Data generators for the non-differentiable experiment runners.
 
 - MAX-SAT: random 3-SAT instances via PySAT with clause tensors
-- Permutation learning: random sequences with target sort permutations
 - Multi-domain: combined MNIST + Fashion-MNIST (20 classes)
 
-Consumed by ``run_maxsat.py``, ``run_elevation.py``, ``run_mnist.py``,
-and ``run_moe.py`` under ``experiments/runners/``.
+Consumed by ``run_maxsat.py`` and ``run_moe.py`` under ``experiments/runners/``.
 """
 
 from __future__ import annotations
 
 import random
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
@@ -19,7 +17,6 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 __all__ = [
     "generate_maxsat_instance",
-    "generate_sorting_data",
     "generate_multidomain_data",
 ]
 
@@ -88,33 +85,6 @@ def generate_maxsat_instance(
         "num_clauses": num_clauses,
         "cnf": cnf,
     }
-
-
-def generate_sorting_data(
-    N: int = 50,
-    num_samples: int = 1000,
-    seed: int = 42,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate random sequences and their target sort permutations.
-
-    Creates random float sequences and computes the permutation that sorts
-    each sequence in ascending order. Used for permutation learning experiments.
-
-    Args:
-        N: Length of each sequence.
-        num_samples: Number of sequence/permutation pairs to generate.
-        seed: Random seed for reproducibility.
-
-    Returns:
-        Tuple of (sequences, permutations):
-            - sequences: Tensor of shape (num_samples, N), random floats in [0, 1).
-            - permutations: Tensor of shape (num_samples, N), each row is the
-              permutation of indices 0..N-1 that sorts the corresponding sequence.
-    """
-    gen = torch.Generator().manual_seed(seed)
-    sequences = torch.rand(num_samples, N, generator=gen)
-    permutations = sequences.argsort(dim=-1)
-    return sequences, permutations
 
 
 class _LabelOffsetDataset(Dataset):

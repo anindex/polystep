@@ -31,18 +31,6 @@ def simple_model():
 
 
 @pytest.fixture
-def medium_model():
-    """Medium MLP for memory tests (~100K params)."""
-    return nn.Sequential(
-        nn.Linear(256, 512),
-        nn.ReLU(),
-        nn.Linear(512, 256),
-        nn.ReLU(),
-        nn.Linear(256, 10),
-    )
-
-
-@pytest.fixture
 def simple_closure(simple_model):
     """Create a closure for simple_model."""
     criterion = nn.CrossEntropyLoss()
@@ -137,7 +125,7 @@ class TestCombinedModeStep:
         assert seen[:segments] == [None] * segments
         assert [g.shape for g in seen[segments:]] == [(V,)] * segments
 
-    def test_an_all_nonfinite_step_is_not_a_loss(self, simple_model):
+    def test_all_nonfinite_step_reports_no_loss(self, simple_model):
         """The segments solved a flat penalty matrix, so the step reports no loss, no
         convergence and no progress, and keeps the previous warm start."""
         sub = HybridSubspace.from_layout(ParamLayout.from_module(simple_model), rank=2, absorb_mode="none")
@@ -167,7 +155,6 @@ class TestCombinedModeStep:
 @pytest.mark.timeout(180)
 class TestSynchronizedAbsorb:
     def test_absorb_resets_all_coords(self, simple_model, simple_closure):
-        """Test that absorb resets all block coordinates to zero."""
         subspace = AdaptiveSubspace.auto_from_params(
             simple_model,
             compression_target=0.5,
@@ -197,7 +184,6 @@ class TestSynchronizedAbsorb:
         assert changed, "absorb did not fold the perturbation into base params"
 
     def test_absorb_rotates_projection(self, simple_model, simple_closure):
-        """Test that absorb rotates the global projection matrix."""
         subspace = AdaptiveSubspace.auto_from_params(
             simple_model,
             compression_target=0.5,
@@ -227,7 +213,7 @@ class TestSynchronizedAbsorb:
 
 @pytest.mark.parametrize("interval, expected_rotations", [(1, 6), (3, 2), (0, 0)])
 def test_global_subspace_honours_rotation_interval(simple_model, simple_closure, interval, expected_rotations):
-    """The global-subspace branch rotated every step regardless of the interval."""
+    """The global-subspace branch rotates only every rotation_interval steps."""
     sub = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5, min_rank=8, max_rank=16)
     sub.rotation_interval = interval
     sub.absorb_mode = "interval"
@@ -250,7 +236,6 @@ def test_global_subspace_honours_rotation_interval(simple_model, simple_closure,
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_combined_mode_runs_without_hang():
-    """Smaller combined subspace+blockwise test that completes without deadlock."""
     model = nn.Sequential(
         nn.Linear(64, 128),
         nn.ReLU(),
@@ -289,7 +274,6 @@ def test_combined_mode_runs_without_hang():
 
 class TestEdgeCases:
     def test_with_momentum(self, simple_model, simple_closure):
-        """Test combined mode with momentum enabled."""
         # A basis change zeroes the velocity, which is a displacement in the basis it
         # replaces. AdaptiveSubspace rotates every step by default, so hold the basis
         # still or there is never a second step for momentum to accumulate over.
@@ -316,7 +300,7 @@ class TestEdgeCases:
         assert torch.linalg.vector_norm(optimizer._state.velocity) > 0, "momentum never accumulated"
         assert any(not torch.allclose(a, b) for a, b in zip(params_before, simple_model.parameters()))
 
-    def test_grouped_block_strategy_warns_and_behaves_like_per_layer(self, simple_model, simple_closure):
+    def test_grouped_strategy_warns_matches_per_layer(self, simple_model, simple_closure):
         """In subspace mode the segments slice particles, so 'grouped' cannot group anything.
 
         It produces exactly the per_layer segments, so accepting it silently would hide
@@ -346,16 +330,13 @@ class TestEdgeCases:
         assert any(not torch.allclose(a, b) for a, b in zip(params_before, simple_model.parameters()))
 
 
-def test_blockwise_keeps_the_displacement_history_in_full_space():
+def test_blockwise_displacement_history_in_full_space():
     """The basis rotates every step, so subspace-coordinate history mixes frames.
 
     The step must store the full-space image under the basis in use at measurement
     time, or the rotation SVD reads old displacements along directions never measured.
     """
     from torch.func import functional_call
-
-    from polystep.adaptive_subspace import AdaptiveSubspace
-    from polystep.optimizer import PolyStepOptimizer
 
     model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
     full_dim = sum(p.numel() for p in model.parameters())
@@ -400,7 +381,7 @@ def test_rank_schedule_runs_under_row_segments(simple_model, simple_closure):
 
 
 @pytest.mark.parametrize("rank", [1, 4])
-def test_row_segments_follow_the_scheduled_particle_count(rank):
+def test_row_segments_follow_scheduled_particle_count(rank):
     """The segment count and the frozen-segment warning follow the particle count each
     scheduled rank produces, whatever rank the subspace was built at."""
     from torch.func import functional_call

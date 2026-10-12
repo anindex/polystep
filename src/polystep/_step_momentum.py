@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Callable
-
 import torch
 
 
-def step_momentum(opt, closure: Callable) -> float:
+def step_momentum(opt) -> float:
     """Cheap step: reapply the last direction with decay, no forward passes."""
     state = opt._state
     if opt._transport_direction_ema is None:

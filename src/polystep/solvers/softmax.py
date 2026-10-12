@@ -6,8 +6,18 @@ from typing import Optional, Union
 
 import torch
 
-from ._shared import solve_softmax
+from ._shared import prepare_cost, validate_positive, warn_tiny_temperature
 from .base import SolverResult
+
+
+def _softmax_plan(C, a, temperature: float, cost_shift, cost_scale):
+    """Return ``(transport, ent_cost)`` for the one-sided softmax plan. Shifts per row before dividing so softmax does not return NaN at tiny temperatures."""
+    with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
+        W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / temperature, dim=-1)
+        transport = W * a.to(W.dtype).unsqueeze(-1)
+        # Undo both frame changes so the reported cost is <C_raw, transport>.
+        ent_cost = (C * transport).sum() * cost_scale + cost_shift * a.to(W.dtype).sum()
+    return transport, ent_cost
 
 
 @dataclass
@@ -37,4 +47,8 @@ class SoftmaxSolver:
                     stacklevel=2,
                 )
 
-        return solve_softmax(self, cost_matrix, a, self.epsilon, scale_cost, "SoftmaxSolver", "epsilon")
+        validate_positive(self.epsilon, "epsilon", "epsilon is the temperature in softmax(-C/epsilon).")
+        C, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, "SoftmaxSolver")
+        warn_tiny_temperature(self, self.epsilon, C, "SoftmaxSolver", "epsilon")
+        transport, ent_cost = _softmax_plan(C, a, self.epsilon, cost_shift, cost_scale)
+        return SolverResult(matrix=transport, _ent_reg=ent_cost)

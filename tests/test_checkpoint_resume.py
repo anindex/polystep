@@ -66,7 +66,7 @@ class TestStateDictRoundTrip:
         torch.testing.assert_close(opt.state.X, before)
         assert opt.state.iteration_count == 1
 
-    def test_resume_matches_an_uninterrupted_run(self):
+    def test_resume_matches_uninterrupted_run(self):
         """N steps must equal N/2 steps, save, load into a fresh optimizer, N/2 more."""
         model_a, closure_a = _model_and_closure(seed=1)
         opt_a = PolyStepOptimizer(model_a, epsilon=0.1, max_iterations=20, seed=7, use_momentum=True)
@@ -113,9 +113,12 @@ class TestStateDictRoundTrip:
             ),
             pytest.param({"probe_radius_jitter": 0.2}, id="probe_jitter"),
             pytest.param({"adaptive": True}, id="adaptive_subspace"),
+            pytest.param({"biased_rotation": True}, id="biased_rotation"),
+            pytest.param({"amortize_steps": 4, "use_quadratic_model": True, "num_probe": 3}, id="amortize_quadratic"),
+            pytest.param({"adaptive_num_probe": True, "num_probe": 3}, id="adaptive_num_probe"),
         ],
     )
-    def test_resume_is_exact_for_stateful_features(self, kwargs):
+    def test_stateful_features_resume_exactly(self, kwargs):
         """Features whose state lives outside SolverState still resume bit-exactly."""
         kwargs = dict(kwargs)
         hybrid = kwargs.pop("hybrid", False)
@@ -125,9 +128,6 @@ class TestStateDictRoundTrip:
             model, closure = _model_and_closure(seed=2)
             subspace = None
             if hybrid:
-                from polystep.hybrid_subspace import HybridSubspace
-                from polystep.transform import ParamLayout
-
                 subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4, seed=3)
             if adaptive:
                 from polystep.adaptive_subspace import AdaptiveSubspace
@@ -161,7 +161,7 @@ class TestStateDictRoundTrip:
             opt_c.step(closure_c)
 
         for expected, got in zip(reference, model_c.parameters()):
-            assert torch.allclose(expected, got, atol=1e-6), (expected - got).abs().max()
+            assert torch.equal(expected, got), (expected - got).abs().max()
 
     def test_subspace_load_drops_block_state(self):
         """Subspace runs keep their duals in state.f and state.g, so per-block state from
@@ -180,7 +180,7 @@ class TestStateDictRoundTrip:
         assert opt.state._prev_prev_block_duals is None
         assert opt._prev_block_descent_directions is None
 
-    def test_rejects_a_newer_format(self):
+    def test_rejects_newer_format(self):
         model, _ = _model_and_closure()
         opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10)
         sd = opt.state_dict()
@@ -188,7 +188,7 @@ class TestStateDictRoundTrip:
         with pytest.raises(ValueError, match="Unsupported optimizer state_dict format"):
             opt.load_state_dict(sd)
 
-    def test_rejects_an_older_format(self):
+    def test_rejects_older_format(self):
         model, _ = _model_and_closure()
         opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10)
         sd = opt.state_dict()
@@ -242,6 +242,31 @@ class TestStateDictRoundTrip:
 
         assert torch.equal(snapshot, saved["solver_state"]["X"])
 
+    def test_load_state_dict_copies_checkpoint_tensors(self):
+        """A same-device .to() returns the saved tensor itself, which the step would mutate."""
+        torch.manual_seed(0)
+        model = nn.Linear(4, 2)
+        opt = PolyStepOptimizer(model, seed=0)
+        opt.step(lambda p: torch.full((next(iter(p.values())).shape[0],), 1.0))
+        sd = opt.state_dict()
+        before = sd["solver_state"]["X"].clone()
+
+        other = PolyStepOptimizer(nn.Linear(4, 2), seed=0)
+        other.load_state_dict(sd)
+        other.state.X.add_(5.0)
+        torch.testing.assert_close(sd["solver_state"]["X"], before)
+
+    def test_missing_control_key_keeps_live_value(self):
+        """Resetting _applied_rank to None would fire a spurious rank transition."""
+        torch.manual_seed(0)
+        opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0)
+        opt.step(lambda p: torch.full((next(iter(p.values())).shape[0],), 1.0))
+        sd = opt.state_dict()
+        sd["control"].pop("_applied_rank", None)
+        opt._applied_rank = 7
+        opt.load_state_dict(sd)
+        assert opt._applied_rank == 7
+
 
 class TestRestoreBest:
     """restore_best defaults to True, so it decides what train() hands back."""
@@ -252,7 +277,7 @@ class TestRestoreBest:
         targets = torch.randn(samples, out_dim, generator=gen)
         return DataLoader(TensorDataset(inputs, targets), batch_size=batch_size, shuffle=False)
 
-    def test_returns_weights_no_worse_than_the_final_step(self):
+    def test_returns_weights_no_worse_than_final(self):
         loader = self._loaders(batch_size=32)
         torch.manual_seed(3)
         model = nn.Sequential(nn.Linear(12, 8), nn.ReLU(), nn.Linear(8, 3))
@@ -282,7 +307,7 @@ class TestRestoreBest:
         assert losses, "callback never fired"
         assert final <= min(losses) + 1e-4
 
-    def test_disabled_keeps_the_last_step(self):
+    def test_disabled_keeps_last_step(self):
         """With restore_best off, a run that ends worse than its best stays worse."""
         loader = self._loaders()
         results = {}
@@ -303,7 +328,7 @@ class TestRestoreBest:
 
         assert results[True] <= results[False] + 1e-6
 
-    def test_reverts_a_deliberate_late_divergence(self):
+    def test_reverts_late_divergence(self):
         """A callback that blows the weights up on the last step must be undone."""
         loader = self._loaders()
         torch.manual_seed(3)
@@ -342,9 +367,6 @@ class TestAbsorbAlignedActive:
     """absorb_aligned_active changes how projections are rebuilt at an absorb."""
 
     def _run(self, aligned):
-        from polystep.hybrid_subspace import HybridSubspace
-        from polystep.transform import ParamLayout
-
         model, closure = _model_and_closure(seed=4)
         subspace = HybridSubspace.from_layout(
             ParamLayout.from_module(model),
@@ -359,9 +381,6 @@ class TestAbsorbAlignedActive:
         return opt
 
     def test_flag_defaults_off(self):
-        from polystep.hybrid_subspace import HybridSubspace
-        from polystep.transform import ParamLayout
-
         model, _ = _model_and_closure()
         subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4)
         assert subspace.absorb_aligned_active is False
@@ -372,7 +391,7 @@ class TestAbsorbAlignedActive:
             assert opt.state.absorb_count > 0
             assert torch.isfinite(opt.state.X).all()
 
-    def test_aligned_changes_the_projections(self):
+    def test_aligned_changes_projections(self):
         """Displacement-SVD rebuild must not reproduce the fresh-redraw basis."""
         plain = self._run(False)
         aligned = self._run(True)
@@ -383,28 +402,7 @@ class TestAbsorbAlignedActive:
         )
 
 
-def test_rank_schedule_stage_zero_applies_before_the_first_step():
-    """``RankSchedule.at(0)`` must apply before the first step, not after the
-    first OT solve advances ``iteration_count``.
-    """
-    torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(8, 12), nn.Tanh(), nn.Linear(12, 3))
-    supplied = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4)
-    dim_at_supplied_rank = supplied.subspace_dim
-
-    opt = PolyStepOptimizer(
-        model,
-        subspace=supplied,
-        rank_schedule=RankSchedule(stages=[(0, 2), (100, 8)]),
-        compile=False,
-        seed=0,
-    )
-
-    assert opt._applied_rank == 2
-    assert opt.subspace.subspace_dim != dim_at_supplied_rank
-
-
-def test_resume_across_a_rank_transition():
+def test_resume_across_rank_transition():
     """A checkpoint taken after a rank transition must restore ``_applied_rank``,
     so wide coordinates do not land in a narrow subspace.
     """

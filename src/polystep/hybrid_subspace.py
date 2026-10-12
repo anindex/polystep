@@ -12,7 +12,7 @@ import torch
 from .solvers._shared import decomposition_dtype, thin_qr
 
 from .projection.sparse import SparseRandomProjection
-from .subspace import ProjectedAbsorbMixin, ProjectionSpec, SvdRatioMixin, _stable_entry_seed, absorb_due
+from .subspace import ProjectedAbsorbMixin, ProjectionSpec, SvdRatioMixin, _stable_entry_seed, history_unusable
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -142,7 +142,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     # Budget control settings (preserved across rank transitions)
     _max_subspace_dim: Optional[int] = None
     # Per-entry dtype; on mixed models each entry's projection is built at its own dtype.
-    # Empty means uniform.
+    # None means uniform.
     _entry_dtypes: Optional[Dict[str, torch.dtype]] = None
 
     def __post_init__(self) -> None:
@@ -312,20 +312,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
                 device, dtype = p.device, p.dtype
                 break
 
-        use_random = (
-            self.rotation_mode == "random" or displacement_history is None or displacement_history.shape[0] == 0
-        )
-
-        if not use_random:
-            # Fall back to random when the history is non-finite or near zero.
-            disp_norm_sq = torch.where(
-                torch.isfinite(displacement_history).all(),
-                (displacement_history * displacement_history).sum(),
-                torch.nan,
-            ).item()
-            use_random = math.isnan(disp_norm_sq) or disp_norm_sq < 1e-20
-
-        if use_random:
+        if history_unusable(self.rotation_mode, displacement_history):
             return self._rotate_all_random(device, dtype, step)
         else:
             svd_ratio = self.get_svd_ratio(step, total_steps)
@@ -418,7 +405,6 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             return self._get_projection(spec, device, dtype, step=step)
 
         k_svd = max(1, int(svd_ratio * spec.num_coords))
-        k_random = spec.num_coords - k_svd
 
         # Displacement history in full parameter space: (num_params, history_len).
         D_full = P_old @ layer_displacement.T.to(P_old.dtype)
@@ -457,18 +443,6 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         orig_dtype = combined.dtype
         Q, _ = thin_qr(combined.to(decomposition_dtype(orig_dtype)))
         return Q.to(orig_dtype) if Q.dtype != orig_dtype else Q
-
-    # Absorb coordination
-
-    def should_absorb(self, stagnation_count: int, iteration: int) -> bool:
-        """Whether to fold the perturbation into the base weights this step."""
-        return absorb_due(
-            self.absorb_mode,
-            self.absorb_patience,
-            self.absorb_interval,
-            stagnation_count,
-            iteration,
-        )
 
     # Core reconstruction methods
 

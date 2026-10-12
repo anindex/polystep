@@ -60,16 +60,14 @@ experiments = [
     "python-sat",  # unusual pre-release versioning, left unpinned to stay installable
     "torchvision>=0.25",
     "cma>=3.3",  # run_elevation / run_moe / run_maxsat baselines
-    "snntorch>=0.7",  # LIF neurons in benchmarks.utils.SpikingNet
     "datasets>=2.14",  # HuggingFace loader in experiments/runners/run_gpt2_finetune.py
     "transformers>=4.40",  # GPT-2 tokenizer + pretrained weights, same runner
     "gymnasium>=0.29",
 ]
-# RL experiments (Box2D envs)
+# RL experiments (SB3 PPO/DQN baselines)
 rl = [
-    "gymnasium[box2d]>=0.29",
+    "gymnasium>=0.29",
     "stable-baselines3>=2.3",
-    "swig>=4.2",
 ]
 
 [tool.setuptools.dynamic]
@@ -91,10 +89,7 @@ src = ["src"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
-# Deferred imports after sys.path manipulation or a long module-level docstring.
-# Every entry below suppresses a live violation; the __init__.py F401 entry that used
-# to sit here suppressed none, since those modules re-export through __all__.
-"src/polystep/optimizer.py" = ["E402"]
+# Examples import after _env.setup().
 "examples/*.py" = ["E402"]
 
 [tool.pytest.ini_options]

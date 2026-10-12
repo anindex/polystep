@@ -13,20 +13,11 @@ def compute_cost_matrix(
 ) -> torch.Tensor:
     """Evaluate the objective at probe points and average over the probe dimension."""
     batch, num_verts, num_probe, dim = X_probe.shape
+    flat_X = X_probe.reshape(-1, dim)
 
     if chunk_size is not None and chunk_size > 0:
-        flat_X = X_probe.reshape(-1, dim)
-        N = flat_X.shape[0]
-
-        results = []
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            chunk = flat_X[start:end]
-            results.append(objective_fn(chunk))
-
-        raw_costs_flat = torch.cat(results, dim=0)
+        raw_costs_flat = torch.cat([objective_fn(chunk) for chunk in flat_X.split(chunk_size)])
     else:
-        flat_X = X_probe.reshape(-1, dim)
         raw_costs_flat = objective_fn(flat_X)
 
     raw_costs = raw_costs_flat.reshape(batch, num_verts, num_probe)

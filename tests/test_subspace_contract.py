@@ -21,7 +21,7 @@ def _model():
     return nn.Sequential(nn.Linear(12, 10), nn.ReLU(), nn.Linear(10, 6))
 
 
-# Each entry returns (subspace, projection); every remaining class takes one.
+# Each entry returns (subspace, projection).
 BUILDERS = {
     "adaptive": lambda lay: _with_single(AdaptiveSubspace.from_layout(lay, rank=3)),
     "hybrid": lambda lay: _with_dict(HybridSubspace.from_layout(lay, rank=3)),
@@ -49,21 +49,21 @@ def _coords(sub, scale=0.01):
     return torch.randn(sub.subspace_dim) * scale
 
 
-def test_a_zero_coordinate_leaves_the_base_unchanged(case):
+def test_zero_coordinate_keeps_base(case):
     sub, proj, base_sd = case
     result = sub.apply_perturbation(proj, base_sd, torch.zeros(sub.subspace_dim))
     for key, value in result.items():
         torch.testing.assert_close(value, base_sd[key], msg=lambda m, k=key: f"{k}: {m}")
 
 
-def test_a_nonzero_coordinate_moves_at_least_one_parameter(case):
+def test_nonzero_coordinate_moves_some_parameter(case):
     """Guards the zero test above: it would also pass if the class ignored coords."""
     sub, proj, base_sd = case
     result = sub.apply_perturbation(proj, base_sd, _coords(sub))
     assert any(not torch.allclose(v, base_sd[k]) for k, v in result.items())
 
 
-def test_the_batched_reconstruction_agrees_with_the_single_one(case):
+def test_batched_reconstruction_matches_single(case):
     sub, proj, base_sd = case
     torch.manual_seed(2)
     batch = torch.randn(4, sub.subspace_dim) * 0.01
@@ -77,7 +77,7 @@ def test_the_batched_reconstruction_agrees_with_the_single_one(case):
             )
 
 
-def test_absorb_zeros_the_coordinates_and_folds_them_into_the_base(case):
+def test_absorb_zeros_coords_folds_into_base(case):
     sub, proj, base_sd = case
     coords = _coords(sub)
     expected = sub.apply_perturbation(proj, base_sd, coords)

@@ -9,8 +9,6 @@ Supports:
 - SGD with momentum=0.9
 
 The training loop is straightforward: forward pass, loss, backward, step.
-For SNN models with snnTorch surrogate gradients, the same loop works
-because snnTorch provides surrogate gradient functions for autograd.
 
 Usage:
     from experiments.baselines.sgd_baseline import train_sgd
@@ -60,8 +58,7 @@ def train_sgd(
 
     This serves as the "ceiling" baseline: gradient methods have
     access to exact gradient information and should achieve the highest
-    accuracy. The paper honestly reports the gap between gradient-free
-    methods and this ceiling.
+    accuracy.
 
     Args:
         model: PyTorch model to train.
@@ -71,7 +68,7 @@ def train_sgd(
         val_loader: Held-out validation loader used for checkpoint
             selection. When given, ``best_accuracy`` is a validation
             number and the test set is not touched during training.
-            When None the legacy (test-selected) behavior is kept.
+            When None, selection uses the test loader.
         loss_fn: Loss function. Defaults to CrossEntropyLoss.
         optimizer_name: Optimizer to use, "adam" or "sgd".
         lr: Learning rate.
@@ -81,9 +78,9 @@ def train_sgd(
         seed: Random seed for reproducibility.
 
     Returns:
-        Dict with keys: benchmark, method, seed, hyperparameters,
-        metrics (final_accuracy, best_accuracy, wall_time_seconds,
-        peak_gpu_memory_mb, function_evals, total_steps), epoch_logs.
+        Dict with keys: hyperparameters, metrics (final_accuracy,
+        best_accuracy, wall_time_seconds, peak_gpu_memory_mb, function_evals,
+        total_steps), epoch_logs.
 
     Raises:
         ValueError: If optimizer_name is not "adam" or "sgd".
@@ -112,7 +109,6 @@ def train_sgd(
     epoch_logs: List[Dict[str, Any]] = []
     best_accuracy = 0.0
     best_state = None
-    total_samples_seen = 0
     total_batches_seen = 0
     start_time = time.time()
 
@@ -143,7 +139,6 @@ def train_sgd(
                 epoch_batches += 1
                 epoch_correct += (outputs.argmax(dim=1) == targets).sum().item()
                 epoch_total += targets.size(0)
-                total_samples_seen += inputs.size(0)
                 total_batches_seen += 1
 
             if scheduler is not None:
@@ -153,7 +148,7 @@ def train_sgd(
             train_acc = epoch_correct / max(epoch_total, 1)
 
             # Evaluation
-            selection_acc = evaluate_accuracy(model, selection_loader, device=device)
+            selection_acc = evaluate_accuracy(model, selection_loader)
             elapsed = time.time() - start_time
 
             if selection_acc > best_accuracy:
@@ -175,21 +170,14 @@ def train_sgd(
     wall_time = time.time() - start_time
     if best_state is not None:
         model.load_state_dict(best_state)
-    final_accuracy = evaluate_accuracy(model, test_loader, device=device)
+    final_accuracy = evaluate_accuracy(model, test_loader)
     if val_loader is None and final_accuracy > best_accuracy:
         best_accuracy = final_accuracy
 
-    # One "evaluation" is one forward pass over a minibatch -- the same unit the
-    # gradient-free methods count, where a candidate is scored on one minibatch.
-    # Counting training *samples* made the budget column read as batch_size times
-    # larger than the comparison it sits next to, so Adam appeared to be handed
-    # several times the budget when it in fact spends far fewer forward passes.
+    # One evaluation is one minibatch forward pass, the unit the gradient-free methods count.
     function_evals = total_batches_seen
 
     return {
-        "benchmark": "unknown",
-        "method": optimizer_name_lower,
-        "seed": seed,
         "hyperparameters": {
             "optimizer": optimizer_name_lower,
             "lr": lr,

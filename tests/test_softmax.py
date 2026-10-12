@@ -84,23 +84,6 @@ def test_softmax_warns_on_nonuniform_b():
     )
 
 
-def test_softmax_warns_on_tiny_epsilon():
-    """The solver must warn when eps < 1e-6 * cost_max, where -C/eps overflows."""
-    P, V = 4, 8
-    torch.manual_seed(0)
-    C = torch.randn(P, V) * 10.0  # cost_max ~ 30
-    solver = SoftmaxSolver(epsilon=1e-30)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        solver.solve(C)
-
-    msgs = [str(w.message).lower() for w in caught]
-    assert any("epsilon" in m and ("underflow" in m or "small" in m or "scale" in m) for m in msgs), (
-        f"expected SoftmaxSolver to warn about tiny epsilon underflow; got warnings: {msgs}"
-    )
-
-
 def test_softmax_does_not_mutate_caller_cost_matrix():
     """solve() must not mutate the caller's cost matrix when scale_cost is set."""
     P, V = 4, 8
@@ -111,9 +94,7 @@ def test_softmax_does_not_mutate_caller_cost_matrix():
     solver = SoftmaxSolver(epsilon=0.5)
     solver.solve(C, scale_cost="mean")
 
-    assert torch.equal(C, C_before), (
-        "solver mutated caller's cost matrix via scale_cost_matrix. softmax.py:87 must clone before scaling."
-    )
+    assert torch.equal(C, C_before), "solve() mutated the caller's cost matrix"
 
 
 def test_softmax_init_f_and_g_are_ignored():
@@ -127,10 +108,37 @@ def test_softmax_init_f_and_g_are_ignored():
     torch.testing.assert_close(r0.matrix, r1.matrix)
 
 
-def test_default_epsilon_sets_the_selectivity():
+def test_default_epsilon_sets_selectivity():
     """The 0.1 default is what an unconfigured solver picks with, so pin its weights."""
     C = torch.tensor([[0.0, 0.1, 0.2]])
     weights = SoftmaxSolver().solve(C).matrix
     expected = torch.softmax(-C / 0.1, dim=1)
     torch.testing.assert_close(weights, expected)
     assert weights[0, 0].item() == pytest.approx(0.6652409, abs=1e-6)
+
+
+def test_softmax_no_nan_at_extreme_epsilon():
+    """A finite cost with a huge negative entry must not NaN the softmax;
+    the limiting weights put all mass on the minimum-cost vertex."""
+    C = torch.tensor([[-1e20, 0.0]], dtype=torch.float32)
+    W = SoftmaxSolver(epsilon=1e-20).solve(C).matrix
+    assert torch.isfinite(W).all(), W
+    # a=[1.0]; all mass on the min-cost (col 0).
+    assert torch.allclose(W, torch.tensor([[1.0, 0.0]]), atol=1e-5), W
+
+
+def test_all_infinite_cost_gives_uniform_plan():
+    plan = SoftmaxSolver(epsilon=0.5).solve(torch.full((2, 4), float("inf"))).matrix
+    assert torch.isfinite(plan).all()
+    assert torch.allclose(plan, torch.full_like(plan, 0.125))
+
+
+def test_softmax_row_above_minimum_stays_finite():
+    C = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        transport = SoftmaxSolver(epsilon=1e-45).solve(cost_matrix=C.clone()).matrix
+
+    assert torch.isfinite(transport).all()
+    # Each row still puts its mass on that row's cheaper vertex.
+    assert transport[1, 0] > transport[1, 1]

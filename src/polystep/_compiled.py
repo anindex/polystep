@@ -128,7 +128,7 @@ def _fused_softmax_project(
     """Fused softmax solve + vertex-free barycentric projection."""
     # Shift per row before dividing: torch.softmax subtracts the row max only after
     # the division, so at tiny epsilon a row above the global minimum returns NaN.
-    # Pinned outside autocast like the eager softmax_plan.
+    # Pinned outside autocast like the eager _softmax_plan.
     with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
         W = torch.softmax(-(cost_matrix - cost_matrix.amin(dim=-1, keepdim=True)) / epsilon, dim=-1)  # (P, V)
 

@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 
 from .._compiled import normalize_rows
-from .base import SolverResult
+from ..costs import resolve_cost_scale
 
 
 def validate_positive(value: float, name: str, context: str = "") -> float:
@@ -182,8 +182,6 @@ def recenter_and_scale(cost_matrix, raw, scale_cost):
     at twice the largest scaled finite cost plus one, so a narrow finite spread cannot
     inflate the penalty.
     """
-    from ..costs import resolve_cost_scale
-
     finite = torch.isfinite(raw) if isinstance(scale_cost, str) else None
     C, cost_shift = recenter_cost(cost_matrix)
     cost_scale = resolve_cost_scale(C, scale_cost, finite)
@@ -200,22 +198,3 @@ def prepare_cost(cost_matrix, a, scale_cost, solver: str):
     a = align_marginal(a, rows, safe.device, safe.dtype)
     C, cost_shift, cost_scale = recenter_and_scale(safe, cost_matrix, scale_cost)
     return C, a, cost_shift, cost_scale
-
-
-def solve_softmax(solver_obj, cost_matrix, a, temperature: float, scale_cost, solver: str, name: str):
-    """One-sided softmax solve for ``SoftmaxSolver``."""
-    validate_positive(temperature, name, f"{name} is the temperature in softmax(-C/{name}).")
-    C, a, cost_shift, cost_scale = prepare_cost(cost_matrix, a, scale_cost, solver)
-    warn_tiny_temperature(solver_obj, temperature, C, solver, name)
-    transport, ent_cost = softmax_plan(C, a, temperature, cost_shift, cost_scale)
-    return SolverResult(matrix=transport, _ent_reg=ent_cost)
-
-
-def softmax_plan(C, a, temperature: float, cost_shift, cost_scale):
-    """Return ``(transport, ent_cost)`` for the one-sided softmax plan. Shifts per row before dividing so softmax does not return NaN at tiny temperatures."""
-    with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
-        W = torch.softmax(-(C - C.amin(dim=-1, keepdim=True)) / temperature, dim=-1)
-        transport = W * a.to(W.dtype).unsqueeze(-1)
-        # Undo both frame changes so the reported cost is <C_raw, transport>.
-        ent_cost = (C * transport).sum() * cost_scale + cost_shift * a.to(W.dtype).sum()
-    return transport, ent_cost

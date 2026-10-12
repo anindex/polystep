@@ -27,7 +27,7 @@ def _fused_disagrees_with_projections(sub, projections, base_sd, coords):
     return worst
 
 
-def test_fused_matrix_tracks_the_basis_across_an_aligned_absorb():
+def test_fused_matrix_tracks_aligned_absorb_basis():
     """absorb_aligned_active draws a different basis; the fused cache must follow."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
@@ -60,7 +60,7 @@ def test_fused_matrix_tracks_the_basis_across_an_aligned_absorb():
     assert opt.state.absorb_count > 0, "no absorb fired, the test proved nothing"
 
 
-def test_blockwise_mode_still_rotates_a_per_layer_subspace():
+def test_blockwise_mode_rotates_per_layer_subspace():
     """absorb_interval must not be silently ignored under a block strategy."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
@@ -126,7 +126,7 @@ def test_fused_projection_not_rebuilt_when_static():
     assert calls["n"] == 0, f"expected no rebuilds with static projections, got {calls['n']}"
 
 
-def test_absorb_reuses_the_seeded_basis_without_redrawing_it():
+def test_absorb_reuses_seeded_basis():
     """Without rotation, an absorb re-anchors the origin and keeps the current basis.
 
     The fused matrix is a pure function of that basis, so it is never rebuilt. A basis
@@ -161,7 +161,7 @@ def test_absorb_reuses_the_seeded_basis_without_redrawing_it():
     assert all(torch.equal(first[k], v) for k, v in fresh.items()), "absorb must not redraw the basis"
 
 
-def test_rank_transition_rebuilds_the_fused_projection():
+def test_rank_transition_rebuilds_fused_projection():
     """A transition swaps in a new-rank basis, so the fused matrix must follow it.
 
     The step only rebuilds on a basis-object change, so a transition that does not

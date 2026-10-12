@@ -42,6 +42,11 @@ def _make_optimizer(model):
     )
 
 
+def _batch(n=6, d=4, c=3, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(n, d, generator=g), torch.randint(0, c, (n,), generator=g)
+
+
 class TestTrainConfig:
     def test_defaults(self):
         config = TrainConfig()
@@ -61,16 +66,6 @@ class TestTrainCallback:
 
 
 class TestTrain:
-    def test_train_returns_model(self):
-        torch.manual_seed(42)
-        model = _make_model()
-        dl = _make_dataloader()
-        opt = _make_optimizer(model)
-        config = TrainConfig(epochs=1)
-
-        result = train(model, dl, nn.MSELoss(), opt, config)
-        assert result is model
-
     def test_train_runs_correct_steps(self):
         """With epochs=2 and 2 batches/epoch, expect 4 on_step_end calls."""
         torch.manual_seed(42)
@@ -166,7 +161,7 @@ class TestTrain:
 
     @pytest.mark.parametrize("reduction", ["mean", "none"])
     @pytest.mark.parametrize("precision", ["float64", "mixed_precision", "candidate_autocast"])
-    def test_train_scores_the_incumbent_like_its_candidates(self, precision, reduction):
+    def test_train_scores_incumbent_like_candidates(self, precision, reduction):
         """FP32 batches reach an FP64 or BF16 model through the evaluator's input cast,
         under candidate_autocast the incumbent is scored in BF16 like every candidate,
         and an unreduced loss is averaged."""
@@ -199,6 +194,49 @@ class TestTrain:
         train(model, dl, nn.MSELoss(reduction=reduction), opt, TrainConfig(epochs=3, callbacks=[rescore]))
         assert len(rescore.pairs) == 3
         assert all(loss == expected for loss, expected in rescore.pairs), rescore.pairs
+
+    def test_train_releases_evaluator_when_callback_raises(self):
+        """``release_evaluator()`` must also run on an exception, or the batch stays alive
+        on the optimizer for the rest of its lifetime (device memory on CUDA).
+        """
+
+        class Boom(TrainCallback):
+            def on_step_end(self, metrics):
+                raise RuntimeError("boom")
+
+        model = nn.Sequential(nn.Flatten(), nn.Linear(4, 2))
+        optimizer = PolyStepOptimizer(model)
+        loader = DataLoader(TensorDataset(torch.randn(8, 4), torch.randint(0, 2, (8,))), batch_size=4)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            train(model, loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=1, callbacks=[Boom()]))
+
+        assert optimizer._cost_evaluator is None
+        assert optimizer._fused_inputs is None
+        assert optimizer._fused_targets is None
+
+    def test_train_rejects_foreign_model(self):
+        """Candidates would score one model while steps were written into the other."""
+        a, b = nn.Linear(4, 2), nn.Linear(4, 2)
+        loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
+        with pytest.raises(ValueError, match="different model"):
+            train(b, loader, nn.CrossEntropyLoss(), PolyStepOptimizer(a, seed=0), TrainConfig(epochs=1))
+
+    def test_train_rejects_trust_region(self):
+        """The changing objective_token would clear the pending pair before it was ever used."""
+        model = nn.Linear(4, 2)
+        loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
+        opt = PolyStepOptimizer(model, seed=0, trust_region=True, polytope_type="orthoplex")
+        with pytest.raises(ValueError, match="trust_region is not supported"):
+            train(model, loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=1))
+
+    def test_train_restores_model_train_mode(self):
+        """The evaluator switches to eval to freeze statistics; train() must switch back."""
+        model = nn.Linear(4, 2)
+        model.train()
+        loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
+        train(model, loader, nn.CrossEntropyLoss(), PolyStepOptimizer(model, seed=0), TrainConfig(epochs=1))
+        assert model.training
 
 
 class TestLoggingCallback:

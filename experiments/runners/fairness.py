@@ -1,17 +1,15 @@
 #!/usr/bin/env python
 """Fairness controls for the baseline tables. Three knobs:
 
-1. **Matched representation.** PolyStep ran inside a ``HybridSubspace`` while every
-   baseline ran in full parameter space. :func:`make_subspace` hands every method the
-   same subspace class, rank and seed, and :func:`run_baseline` searches in its
+1. **Matched representation.** :func:`make_subspace` hands every method the same
+   subspace class, rank and seed, and :func:`run_baseline` searches in its
    coordinates. The one documented exception is EGGROLL: its rank-``r`` ``A B^T``
    perturbation needs matrix-structured coordinates, which ``HybridSubspace`` does not
    have, so it gets :class:`~polystep.factored_subspace.FactoredSubspace` -- the
    subspace that *is* that parameterization -- and the result JSON records which
    subspace each method actually used.
 
-2. **Matched budget.** Forward evaluations were counted three incompatible ways.
-   Everything here counts candidates through
+2. **Matched budget.** Everything here counts candidates through
    :class:`~polystep.baselines.core.Objective`, and :func:`polystep_eval_budget`
    derives the shared budget from what PolyStep itself consumes for its configured
    number of epochs, so a fairness table is a fixed-budget comparison by construction.
@@ -44,6 +42,7 @@ from polystep.hybrid_subspace import HybridSubspace
 __all__ = [
     "DEFAULT_SELECTION_PATH",
     "FAIR_METHODS",
+    "POLYSTEP_SELECTION_PATH",
     "RADIUS_KEYS",
     "TUNING_GRID",
     "TestSplitTripwire",
@@ -51,6 +50,7 @@ __all__ = [
     "apply_polystep_multipliers",
     "apply_theory_mode",
     "build_polystep",
+    "fair_eval_budget",
     "fair_hyperparams",
     "load_selection",
     "make_subspace",
@@ -68,6 +68,7 @@ __all__ = [
     "select_best",
     "subspace_tag",
     "tuning_cost",
+    "UNMATCHED_BUDGETS",
     "write_selection",
 ]
 
@@ -84,6 +85,18 @@ FAIR_METHODS = ("openai_es", "spsa", "mezo", "random_search", "eggroll", "cma_es
 #: ``POLYSTEP_FAIR_POPSIZE`` when matching on evaluations or wall-clock, where throughput
 #: is the whole point.
 FAIR_POPSIZE = int(os.environ.get("POLYSTEP_FAIR_POPSIZE", "32"))
+
+#: Free-running (non-fair) candidate budgets: ES 2000 gen x 50 pop, SPSA 10000
+#: iters x 2, CMA-ES 2000 gen x 16 pop. ``--fair`` overrides all of these with one
+#: budget derived from PolyStep.
+UNMATCHED_BUDGETS = {
+    "openai_es": 100_000,
+    "eggroll": 100_000,
+    "cma_es": 32_000,
+    "spsa": 20_000,
+    "mezo": 20_000,
+    "random_search": 20_000,
+}
 
 
 # --- matched budget ---------------------------------------------------------------
@@ -105,8 +118,8 @@ def polystep_eval_budget(opt, total_steps: int) -> int:
 
     Only the *OT* steps evaluate probes. Under ``amortize_steps = a > 1`` the optimizer
     coasts on the transport EMA for ``a - 1`` steps out of every ``a``
-    (:meth:`PolyStepOptimizer.step`), and ``_step_momentum`` calls the closure zero
-    times, so those steps cost nothing. Charging ``evals_per_step * total_steps`` would
+    (:meth:`PolyStepOptimizer.step`), and a coasting step runs no forward pass, so
+    those steps cost nothing. Charging ``evals_per_step * total_steps`` would
     hand the baselines ``a`` times what PolyStep spent, 3x on MNIST and on the time
     series.
     """
@@ -134,7 +147,7 @@ def make_subspace(layout, *, rank: int, seed: int, method: str = "polystep", **k
 def build_polystep(model, seed: int, total_steps: int, cfg: dict, solver: str = "softmax"):
     """``(layout, subspace, optimizer)`` for one gallery config.
 
-    Shared by each runner's training loop and by its ``fair_eval_budget``, which needs
+    Shared by each runner's training loop and by :func:`fair_eval_budget`, which needs
     the built optimizer to know what a step costs.
     """
     from polystep.optimizer import PolyStepOptimizer
@@ -182,6 +195,12 @@ def build_polystep(model, seed: int, total_steps: int, cfg: dict, solver: str = 
         solver=solver,
     )
     return layout, subspace, optimizer
+
+
+def fair_eval_budget(model, seed: int, total_steps: int, cfg: dict, solver: str = "softmax") -> int:
+    """The shared candidate budget: what PolyStep spends over ``total_steps`` steps."""
+    _, _, opt = build_polystep(model, seed, total_steps, cfg, solver)
+    return polystep_eval_budget(opt, total_steps)
 
 
 def subspace_tag(subspace, rank: Optional[int], *, shared_dim: Optional[int] = None) -> Dict[str, object]:
@@ -299,7 +318,7 @@ def budget_for_method(
     ``wallclock``: everyone gets the seconds PolyStep spent on the same cell. Needed on
     argmax, MoE and timeseries, where PolyStep's evaluation budget (42.0M and 100.6M
     candidates) is unaffordable for a population method, and capping those on steps
-    instead handed PolyStep 55x to 500x the evaluations. The deadline is enforced by
+    gives PolyStep 55x to 500x the evaluations. The deadline is enforced by
     ``Objective.remaining``, so no method changes.
     """
     if match == "wallclock":
@@ -358,22 +377,9 @@ def probe_scale_of(cfg: dict, default: float = 1.0, *, dim: Optional[int] = None
     is wrong for any method that samples isotropically and exists only for callers with
     no dimension to hand.
 
-    The radius is read through the optimizer's own rule
-    (:func:`polystep.epsilon.radius_epsilon_factor`): a bare ``probe_radius`` float is a
-    *multiplier on epsilon*, not a physical radius, so it must be scaled by the epsilon
-    the run realizes before it can be compared with a baseline's sigma. Reading the raw
-    key handed the baselines 2x PolyStep's displacement on every config with a scalar
-    probe radius and a non-unit epsilon (snn, moe).
-
-    That rule has to be read off the object the *optimizer* ends up holding, not off the
-    config key. ``probe_radius_target`` is a plain float, so ``radius_epsilon_factor``
-    called on it returns epsilon -- but ``build_polystep`` turns an
-    ``_init``/``_target`` pair into a ``CosineEpsilon``, and both step drivers read a
-    schedule as the physical radius with no epsilon factor at all. Applying the scalar
-    rule to a scheduled endpoint therefore handed the baselines ``radius * epsilon``
-    where PolyStep realizes ``radius``: 10x down on MNIST and timeseries, 3.33x on int8
-    and argmax. :func:`_physical_radius` already decides this correctly and is the one
-    place that should.
+    A bare ``probe_radius`` float is a multiplier on epsilon; an ``_init``/``_target``
+    pair becomes a schedule in :func:`build_polystep`, and a schedule is the physical
+    radius. :func:`_physical_radius` applies that rule.
     """
     radius = _physical_radius(cfg, "probe_radius", flat_epsilon(cfg), default=default, prefer="target")
     return radius / math.sqrt(dim) if dim else radius
@@ -423,8 +429,8 @@ _EGGROLL_AXES = {"lr": (0.003, 0.03), "sigma": (0.25, 4.0), "popsize": (16, 64)}
 _RADIUS_MULT = (0.25, 1.0, 4.0)
 
 #: One grid per method, all the same size, so tuning cost is comparable across the
-#: table. ponytail: deliberately coarse -- the point is a *recorded, equal* tuning
-#: budget, not a good one.
+#: table. Deliberately coarse: the point is a *recorded, equal* tuning budget, not a
+#: good one.
 TUNING_GRID: Dict[str, List[dict]] = {
     "openai_es": [dict(lr=lr, sigma=s) for lr in (0.003, 0.01, 0.03) for s in _RADIUS_MULT],
     "spsa": [dict(a=a, c=c) for a in (0.03, 0.1, 0.3) for c in _RADIUS_MULT],
@@ -592,6 +598,8 @@ class TestSplitTripwire:
 
 #: Where the scale sweeps write their picks, and where the runners read them back.
 DEFAULT_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "selected_configs.json")
+#: tune_polystep.py writes here, not the shared baseline selection file.
+POLYSTEP_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "polystep_selected.json")
 
 
 def select_best(trials: List[dict]) -> dict:
@@ -637,9 +645,7 @@ def write_selection(
                 # tie-break returned the grid's first entry, which is the untuned prior.
                 # Say so here rather than let the paper quote it as a tuned config.
                 "informative": distinct > 1,
-                # Next to the pick, not once per experiment: the experiment-wide key
-                # was overwritten by whichever sweep finished last, so a table could
-                # quote one sweep's seed and epochs for another sweep's config.
+                # Per pick, so each entry carries the sweep that produced it.
                 "provenance": dict(stamped),
             }
 
@@ -647,7 +653,7 @@ def write_selection(
     # only way to pack a grid across workers, and replacing ``blob[experiment]``
     # wholesale drops every method swept before this one -- serially as well as
     # concurrently. The lock covers the read-modify-write so parallel tuners do not
-    # interleave; without it four concurrent finishes left one method in the file.
+    # interleave.
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a+") as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -658,9 +664,7 @@ def write_selection(
             exp = blob.setdefault(experiment, {})
             for showcase, methods in selected.items():
                 exp.setdefault("selected", {}).setdefault(showcase, {}).update(methods)
-            # Two levels, like ``selected``. Keyed by method alone, a second showcase
-            # overwrote the first showcase's budget record, so a multi-showcase sweep
-            # quoted the last showcase's cost for all of them.
+            # Two levels, like ``selected``, so each showcase keeps its own budget record.
             tc = exp.setdefault("tuning_cost", {})
             for showcase, per_method in costs.items():
                 if isinstance(per_method, dict):
@@ -715,12 +719,8 @@ def load_selection(experiment: str, showcase: str, method: str, path: str = DEFA
     entry = ((exp.get("selected") or {}).get(showcase) or {}).get(method)
     if not entry:
         return None, None
-    # No fallback to the experiment-wide provenance. That key is whatever sweep wrote
-    # last, so falling back to it stamps one benchmark's sweep record onto another
-    # benchmark's config -- observed live: SNN runs carrying {"showcases": ["mnist"]}
-    # because the SNN baselines were swept before per-pick provenance existed and the
-    # MNIST sweep then overwrote the shared key. That is the very failure the per-pick
-    # nesting was introduced to prevent. A missing record is reported as missing.
+    # No fallback to the experiment-wide provenance: it belongs to whichever sweep
+    # wrote last. A missing record is reported as missing.
     return entry, entry.get("provenance")
 
 
@@ -795,11 +795,7 @@ def apply_theory_mode(cfg: dict) -> dict:
     # The radii transplant in PHYSICAL units, not in whichever key the source config
     # happened to use.  A bare ``step_radius``/``probe_radius`` float is a multiplier on
     # epsilon; a ``*_init``/``*_target`` pair becomes a schedule, which is the physical
-    # radius itself (polystep.epsilon.resolve_radius).  Copying the raw key across the
-    # two parameterizations rescaled the realized radius by epsilon or by 1/epsilon --
-    # 10x down on the MNIST probe radius, 2x up on the SNN step radius -- so the
-    # reported gap between the tuned and the analysed configuration measured an
-    # unintended radius change on top of the analysed restrictions.
+    # radius itself (polystep.epsilon.resolve_radius).
     r_s_phys = _physical_radius(cfg, "step_radius", eps, default=1.0, prefer="init")
     r_p_phys = _physical_radius(cfg, "probe_radius", eps, default=1.0, prefer="target")
 
@@ -882,7 +878,7 @@ def run_baseline(
     """Run one :mod:`polystep.baselines` method and report it like a runner does.
 
     Selection is on ``val_fn``; ``test_fn`` is called for the trajectory and once more
-    at the end on the selected iterate, which is the protocol every runner now follows.
+    at the end on the selected iterate, which is the protocol every runner follows.
 
     Args:
         method: A key of :data:`polystep.baselines.METHODS`.
@@ -953,10 +949,8 @@ def run_baseline(
 
         ``obj.best_x`` is the lowest-training-loss *candidate*; ``obj.iterate`` is the
         method's own estimate. For a population method these differ by ``sigma*eps``,
-        whose norm is about one probe radius, so scoring only ``best_x`` reported every
-        population baseline below the point it had actually found -- while PolyStep was
-        scored at its true barycentre. Both are scored and validation picks between
-        them, which is the same selection rule PolyStep gets.
+        about one probe radius, so both are scored and validation picks between them,
+        the same selection rule PolyStep gets.
         """
         nonlocal best_val, best_coords
         candidates = [("iterate", obj.iterate), ("best_x", obj.best_x)]
@@ -981,7 +975,7 @@ def run_baseline(
                 # restart, so evals/popsize is off by whatever the restart schedule did.
                 "step": generations[0],
                 f"val_{quality_key}": v,
-                # Best-so-far on validation, which is what the honest protocol selects.
+                # Best-so-far on validation, which is what selection picks.
                 # The value at exactly step N is the *final* iterate at N, and for a
                 # method whose validation curve turns over late -- PolyStep on MNIST ends
                 # at 0.8867 having peaked at 0.9652 -- reading that instead of the
@@ -1024,11 +1018,7 @@ def run_baseline(
             while log_at and log_at[0] <= objective.evals:
                 log_at.pop(0)
             next_log[0] = log_at[0] if log_at else budget + 1
-            # Print as well as record. The trajectory points go into the result file,
-            # but a population baseline that logs nothing to stdout is indistinguishable
-            # from a wedged one for the hour it runs -- the MNIST OpenAI-ES arm went 60
-            # minutes without a line while holding 866 MiB of GPU. PYTHONUNBUFFERED
-            # cannot help when nothing is written.
+            # Print as well as record, so a long population run shows progress.
             pct = 100.0 * objective.evals / max(budget, 1)
             head = f"      {pct:5.1f}%  evals={objective.evals:,}/{budget:,}"
             q = trajectory[-1].get(f"val_{quality_key}") if trajectory else None

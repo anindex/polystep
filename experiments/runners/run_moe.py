@@ -13,11 +13,9 @@ unaccelerated reference configuration. See ``experiments/runners/fairness.py``.
 Model: HardMoENet (~235K params) - top-1 argmax gating (non-differentiable)
 Data: Combined MNIST + Fashion-MNIST (20 classes)
 
-polystep config from r4_sr12t4 config (90.92% at 20ep, seed 42):
-  Flat eps=0.5 (eps scheduling -> collapse), scheduled sr 12->4,
-  flat pr=1.0, rank=4, biased_rotation.
+Config: flat eps=0.5, step radius 12->4, flat probe radius 1.0, rank 4, biased_rotation.
 
-Results saved as: experiments/results/softmax/main/moe_{method}_{seed}.json
+Results saved as: experiments/results/revision/moe_{method}_{seed}.json
 """
 
 from __future__ import annotations
@@ -37,6 +35,7 @@ import torch.nn as nn
 
 from experiments.runners.common import (
     METHOD_ALIASES,
+    RESULTS_DIR,
     SEEDS,
     evaluate_accuracy,
     make_train_val_split,
@@ -49,10 +48,13 @@ from experiments.runners.nondiff_data import generate_multidomain_data
 from experiments.runners.fairness import (
     build_polystep,
     FAIR_METHODS,
+    POLYSTEP_SELECTION_PATH,
+    UNMATCHED_BUDGETS,
     TestSplitTripwire,
     apply_point,
     apply_polystep_multipliers,
     apply_theory_mode,
+    fair_eval_budget,
     matched_budget,
     load_selection,
     make_subspace,
@@ -66,24 +68,9 @@ from experiments.runners.fairness import (
 
 BENCHMARK = "moe"
 
-# Store PolyStep tuning separately from baseline selections.
-POLYSTEP_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "polystep_selected.json")
 BATCH_SIZE = 512
 EPOCHS = 30
 
-# Free-running (non-fair) candidate budgets, preserving what the previous ad-hoc
-# implementations spent: ES 2000 gen x 50 pop, CMA-ES 2000 gen x 16 pop, SPSA 10000
-# iters x 2. `--fair` replaces all of these with one budget derived from PolyStep.
-LEGACY_BUDGETS = {
-    "openai_es": 100_000,
-    "eggroll": 100_000,
-    "cma_es": 32_000,
-    "spsa": 20_000,
-    "mezo": 20_000,
-    "random_search": 20_000,
-}
-
-# polystep config - r4_sr12t4 config (90.92% at 20ep, seed 42)
 # HYBRID: flat eps + flat pr, but SCHEDULED sr only
 # eps <= 0.5 mandatory - eps scheduling causes MoE collapse (2.66% at eps=1.5)
 # sr scheduling (12->4) with rank=4 beats flat rank=8 while being 2x faster
@@ -103,10 +90,10 @@ POLYSTEP_CONFIG = {
 
 
 def _load_split(seed, audit_no_leakage):
-    """Load the MoE data and carve the honest-protocol val split.
+    """Load the MoE data and carve the validation split.
 
     Returns ``(train_loader, val_loader, test_loader)`` with ``val_loader``
-    None only in legacy ``--allow-test-leakage`` mode. Every method goes
+    None only under ``--allow-test-leakage``. Every method goes
     through here, so no method can quietly select on the test set.
     """
     data = generate_multidomain_data(data_dir="data/", batch_size=BATCH_SIZE)
@@ -115,13 +102,6 @@ def _load_split(seed, audit_no_leakage):
     if audit_no_leakage:
         train_loader, val_loader = make_train_val_split(train_loader, val_frac=0.1, seed=seed)
     return train_loader, val_loader, test_loader
-
-
-def fair_eval_budget(seed, device, train_loader, epochs, cfg):
-    """The shared candidate budget: what PolyStep spends over ``epochs`` epochs."""
-    set_seed(seed)
-    _, _, opt = build_polystep(HardMoENet(num_experts=4).to(device), seed, epochs * len(train_loader), cfg)
-    return polystep_eval_budget(opt, epochs * len(train_loader))
 
 
 def run_polystep(
@@ -137,9 +117,8 @@ def run_polystep(
 ):
     """Train Hard MoE with polystep PolyStepOptimizer + HybridSubspace.
 
-    By default, best-checkpoint selection uses a held-out validation
-    split (honest protocol). Set ``audit_no_leakage=False`` to revert
-    to legacy test-set selection.
+    Best-checkpoint selection uses a held-out validation split;
+    ``audit_no_leakage=False`` selects on test and stamps the run leaked.
     """
     from polystep.cost_nn import NNCostEvaluator
 
@@ -220,9 +199,8 @@ def run_polystep(
                 epoch_loss += loss
                 step_count += 1
 
-                # Per-20-step fine-grained tracking. Scored on the selection split:
-                # nothing selects on this trajectory, so evaluating *test* here bought
-                # no information and cost the untouched-test claim.
+                # Per-20-step tracking, scored on the selection split; nothing selects
+                # on this trajectory.
                 if step_count % 20 == 0:
                     step_logs.append(
                         {
@@ -231,7 +209,7 @@ def run_polystep(
                             # Cumulative candidate evaluations: the x-axis of the
                             # accuracy-vs-evaluations figure, shared with the baselines.
                             "evals": fwd_pass_count,
-                            "val_accuracy": evaluate_accuracy(model, selection_loader, device=device),
+                            "val_accuracy": evaluate_accuracy(model, selection_loader),
                             "loss": loss,
                             "wall_time": time.time() - start_time,
                         }
@@ -240,7 +218,7 @@ def run_polystep(
             train_acc = epoch_correct / max(epoch_total, 1)
             # Selection split only; the test set is read once, after the checkpoint has
             # been chosen.
-            selection_acc = evaluate_accuracy(model, selection_loader, device=device)
+            selection_acc = evaluate_accuracy(model, selection_loader)
             if selection_acc > best_accuracy:
                 best_accuracy = selection_acc
                 best_state_dict = copy.deepcopy(model.state_dict())
@@ -266,7 +244,7 @@ def run_polystep(
     last_epoch_acc = selection_acc
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
-    final_acc = float("nan") if tuning else evaluate_accuracy(model, test_loader, device=device)
+    final_acc = float("nan") if tuning else evaluate_accuracy(model, test_loader)
 
     filepath = save_result(
         benchmark=BENCHMARK,
@@ -315,12 +293,7 @@ def run_gradient_free(
     epochs: int = EPOCHS,
     budget: int = None,
 ):
-    """Run one ``polystep.baselines`` method on Hard MoE.
-
-    Replaces the inline pycma copy and the two ``experiments/baselines`` wrappers,
-    which each counted evaluations differently and searched full parameter space
-    while PolyStep searched a subspace.
-    """
+    """Run one ``polystep.baselines`` method on Hard MoE through ``fairness.run_baseline``."""
     from polystep.cost_nn import NNCostEvaluator
     from polystep.transform import ParamLayout
 
@@ -343,7 +316,7 @@ def run_gradient_free(
         # see that the table is matched on rank and not on dimension.
         shared_dim = make_subspace(layout, rank=cfg["rank"], seed=seed, method="polystep").subspace_dim
         if budget is None:
-            budget = fair_eval_budget(seed, device, train_loader, epochs, cfg)
+            budget = fair_eval_budget(HardMoENet(num_experts=4).to(device), seed, epochs * len(train_loader), cfg)
             budget, match_axis, deadline_s = matched_budget(
                 method,
                 showcase=BENCHMARK,
@@ -353,7 +326,8 @@ def run_gradient_free(
                 results_dir=results_dir,
             )
     if budget is None:
-        budget = LEGACY_BUDGETS[method]
+        budget = UNMATCHED_BUDGETS[method]
+        match_axis = "unmatched"
 
     # Same evaluator settings as the PolyStep runner above, so both sides of the
     # table optimize the same objective rather than two float-equivalent ones.
@@ -383,8 +357,8 @@ def run_gradient_free(
         layout=layout,
         loss_batch=loss_batch,
         budget=budget,
-        val_fn=lambda m: evaluate_accuracy(m, selection_loader, device=device),
-        test_fn=lambda m: evaluate_accuracy(m, test_loader, device=device),
+        val_fn=lambda m: evaluate_accuracy(m, selection_loader),
+        test_fn=lambda m: evaluate_accuracy(m, test_loader),
         mode="max",
         seed=seed,
         subspace=subspace,
@@ -411,9 +385,6 @@ def run_gradient_free(
     print(f"    Saved: {filepath}")
 
 
-# polystep has its own loop; every gradient-free method goes through the one
-# shared runner.
-METHOD_RUNNERS = {"polystep": run_polystep}
 ALL_METHODS = ("polystep", *FAIR_METHODS)
 
 
@@ -435,7 +406,7 @@ def main():
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
     parser.add_argument(
         "--results-dir",
-        default=os.path.join("experiments", "results", "softmax", "main"),
+        default=RESULTS_DIR,
         help="Output directory for JSON results",
     )
     parser.add_argument(
@@ -453,10 +424,8 @@ def main():
         "--allow-test-leakage",
         action="store_true",
         help=(
-            "Legacy mode: select best_state_dict on the test set instead "
-            "of a held-out validation slice. Default is honest protocol "
-            "(val-selected). Use only for bit-for-bit reproduction "
-            "of earlier results."
+            "Select the checkpoint on the test split instead of a held-out validation "
+            "slice; the run is stamped leaked and the aggregators refuse it."
         ),
     )
     parser.add_argument(

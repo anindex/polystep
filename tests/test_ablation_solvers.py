@@ -45,6 +45,14 @@ class TestMinCostGreedySolver:
         expected = torch.ones(4) / 4
         assert torch.allclose(row_sums, expected, atol=1e-7)
 
+    def test_greedy_scaled_cost_in_caller_frame(self):
+        C = torch.tensor([[0.0, 4.0], [6.0, 2.0]])
+        plain = MinCostGreedySolver().solve(cost_matrix=C.clone())
+        scaled = MinCostGreedySolver().solve(cost_matrix=C.clone(), scale_cost="max_cost")
+
+        assert torch.equal(plain.matrix, scaled.matrix)  # argmin is scale-invariant
+        assert scaled.ent_reg_cost == pytest.approx(plain.ent_reg_cost)
+
 
 class TestTopKMeanSolver:
     def test_top_k_correctness(self, cost_matrix, source_marginal):
@@ -84,7 +92,6 @@ class TestTopKMeanSolver:
         torch.testing.assert_close(T.sum(dim=1), a)
 
     def test_k_equals_1_matches_greedy(self, cost_matrix, source_marginal):
-        """TopKMean with k=1 should match greedy exactly."""
         greedy = MinCostGreedySolver()
         topk1 = TopKMeanSolver(k=1)
         r_greedy = greedy.solve(cost_matrix, a=source_marginal)
@@ -123,7 +130,6 @@ class TestSolverSelection:
         ],
     )
     def test_optimizer_accepts_solver(self, solver_name, simple_model):
-        """PolyStepOptimizer should accept all solver strings without error."""
         from polystep.optimizer import PolyStepOptimizer
         from polystep.hybrid_subspace import HybridSubspace
         from polystep.transform import ParamLayout
@@ -136,14 +142,6 @@ class TestSolverSelection:
             solver=solver_name,
             epsilon=1.0,
         )
-        from polystep.solvers import (
-            SoftmaxSolver,
-            SinkhornSolver,
-            MinCostGreedySolver,
-            TopKMeanSolver,
-            KLSoftmaxSolver,
-        )
-
         expected = {
             "softmax": SoftmaxSolver,
             "sinkhorn": SinkhornSolver,
@@ -167,8 +165,8 @@ class TestSolverSelection:
     [MinCostGreedySolver(), TopKMeanSolver(k=2), SoftmaxSolver(epsilon=0.1), SinkhornSolver(epsilon=0.1)],
     ids=["min_cost", "top_k", "softmax", "sinkhorn"],
 )
-def test_half_precision_cost_gives_a_full_precision_plan(solver):
-    """sanitize_cost promotes to fp32; every solver must report the promoted dtype."""
+def test_half_cost_gives_fp32_plan(solver):
+    """sanitize_cost promotes the cost to fp32 first."""
     C = torch.randn(5, 8, generator=torch.Generator().manual_seed(0)).to(torch.bfloat16)
     result = solver.solve(C)
     assert result.matrix.dtype == torch.float32
@@ -180,17 +178,17 @@ def test_half_precision_cost_gives_a_full_precision_plan(solver):
     [MinCostGreedySolver(), TopKMeanSolver(k=1), SoftmaxSolver(), KLSoftmaxSolver(), SinkhornSolver()],
     ids=["min_cost", "top_k", "softmax", "kl_softmax", "sinkhorn"],
 )
-def test_integer_cost_gives_the_float_plan(solver):
+def test_integer_cost_matches_float_plan(solver):
     C = torch.tensor([[1, 2], [3, 0]])
     assert torch.equal(solver.solve(C).matrix, solver.solve(C.float()).matrix)
 
 
 @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
 @pytest.mark.parametrize("num_probe", [1, 3])
-def test_topk_in_the_optimizer_ignores_infeasible_vertices(block_strategy, num_probe):
+def test_optimizer_topk_ignores_infeasible_vertices(block_strategy, num_probe):
     """Only the candidate with the largest first weight scores; every other one is NaN.
 
-    The step handed TopK the sanitize penalty as a finite cost, so it averaged
+    TopK must not receive the sanitize penalty as a finite cost, or it averages
     infeasible vertices into the move. A vertex with any infeasible probe is
     infeasible, so with three probes none is left and the particle stays put.
     """
@@ -223,7 +221,7 @@ def test_topk_in_the_optimizer_ignores_infeasible_vertices(block_strategy, num_p
     torch.testing.assert_close(model.weight.detach().reshape(-1), expected)
 
 
-def test_topk_excludes_every_nonfinite_cost_and_freezes_uninformative_rows():
+def test_topk_excludes_nonfinite_freezes_uninformative_rows():
     costs = torch.tensor([[1.0, float("-inf"), float("nan"), float("inf")], [float("nan")] * 4, [2.0] * 4])
     plan = TopKMeanSolver(k=3).solve(costs).matrix
     expected = torch.tensor([[1 / 3, 0.0, 0.0, 0.0], [1 / 12] * 4, [1 / 12] * 4])
@@ -231,8 +229,8 @@ def test_topk_excludes_every_nonfinite_cost_and_freezes_uninformative_rows():
 
 
 @pytest.mark.parametrize("solver", [MinCostGreedySolver(), TopKMeanSolver(k=1)])
-def test_a_cost_at_the_dtype_limit_still_excludes_infeasible_vertices(solver):
-    """The penalty clamps to the dtype max, so ranking on it made the row look flat."""
+def test_dtype_max_cost_excludes_infeasible(solver):
+    """The penalty clamps to the dtype max; ranking on it would make the row look flat."""
     top = torch.finfo(torch.float32).max
     costs = torch.tensor([[top, float("inf")], [float("nan"), top]])
     plan = solver.solve(costs).matrix

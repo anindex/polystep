@@ -23,7 +23,7 @@ import torch.nn as nn
 
 sys.path.insert(0, ".")
 
-from experiments.runners.common import (  # noqa: E402
+from experiments.runners.common import (
     evaluate_accuracy,
     reseed_loaders,
     load_mnist,
@@ -31,10 +31,12 @@ from experiments.runners.common import (  # noqa: E402
     set_seed,
 )
 from experiments.runners.fairness import (
+    FAIR_METHODS,
     SEQUENTIAL_METHODS,
     step_matched_budget,
-    refine_grid,  # noqa: E402
+    refine_grid,
     TUNING_GRID,
+    fair_eval_budget,
     make_subspace,
     minibatch_loss,
     probe_scale_of,
@@ -44,10 +46,8 @@ from experiments.runners.fairness import (
     tuning_cost,
     write_selection,
 )
-from polystep.cost_nn import NNCostEvaluator  # noqa: E402
-from polystep.transform import ParamLayout  # noqa: E402
-
-GF_METHODS = ("openai_es", "spsa", "cma_es", "mezo", "random_search", "eggroll")
+from polystep.cost_nn import NNCostEvaluator
+from polystep.transform import ParamLayout
 
 
 def setup(showcase: str, seed: int, device, epochs: int = None):
@@ -65,14 +65,14 @@ def setup(showcase: str, seed: int, device, epochs: int = None):
             EPOCHS,
             POLYSTEP_CONFIG,
             MNISTNet,
-            fair_eval_budget,
         )
 
         train, _ = load_mnist(batch_size=BATCH_SIZE)
         train, val = make_train_val_split(train, val_frac=0.1, seed=seed)
         cfg = dict(POLYSTEP_CONFIG)
-        budget = fair_eval_budget(seed, device, train, epochs or EPOCHS, cfg, "softmax")
-        return (lambda: MNISTNet().to(device)), cfg, train, val, budget, (epochs or EPOCHS) * len(train)
+        total_steps = (epochs or EPOCHS) * len(train)
+        budget = fair_eval_budget(MNISTNet().to(device), seed, total_steps, cfg)
+        return (lambda: MNISTNet().to(device)), cfg, train, val, budget, total_steps
 
     if showcase == "moe":
         # run_moe.run_gradient_free reads load_selection("gallery", "moe", ...), so
@@ -82,34 +82,33 @@ def setup(showcase: str, seed: int, device, epochs: int = None):
             POLYSTEP_CONFIG,
             HardMoENet,
             _load_split,
-            fair_eval_budget,
         )
 
         train, val, _ = _load_split(seed, True)
         cfg = dict(POLYSTEP_CONFIG)
-        budget = fair_eval_budget(seed, device, train, epochs or EPOCHS, cfg)
-        return (lambda: HardMoENet(num_experts=4).to(device)), cfg, train, val, budget, (epochs or EPOCHS) * len(train)
+        total_steps = (epochs or EPOCHS) * len(train)
+        budget = fair_eval_budget(HardMoENet(num_experts=4).to(device), seed, total_steps, cfg)
+        return (lambda: HardMoENet(num_experts=4).to(device)), cfg, train, val, budget, total_steps
 
     from experiments.runners.run_elevation import (
         POLYSTEP_CONFIGS,
         SHOWCASE_CONFIGS,
         _epochs_for,
         _load_split,
-        fair_eval_budget,
     )
 
     train, val, _ = _load_split(showcase, seed, True)
     cfg = dict(POLYSTEP_CONFIGS[showcase])
-    epochs = epochs or _epochs_for(showcase, cfg, False)
-    budget = fair_eval_budget(showcase, seed, device, train, epochs, cfg)
+    total_steps = (epochs or _epochs_for(cfg, False)) * len(train)
     model_fn = SHOWCASE_CONFIGS[showcase]["model_fn"]
-    return (lambda: model_fn().to(device)), cfg, train, val, budget, epochs * len(train)
+    budget = fair_eval_budget(model_fn().to(device), seed, total_steps, cfg)
+    return (lambda: model_fn().to(device)), cfg, train, val, budget, total_steps
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--showcases", nargs="+", default=["snn"])
-    p.add_argument("--methods", nargs="+", default=list(GF_METHODS))
+    p.add_argument("--methods", nargs="+", default=list(FAIR_METHODS))
     p.add_argument("--seed", type=int, default=42, help="Tuning seed.")
     p.add_argument(
         "--epochs",
@@ -164,7 +163,6 @@ def main() -> int:
                 budget = max(1000, int(full_budget * args.budget_frac))
             dim = make_subspace(layout, rank=cfg["rank"], seed=args.seed, method=method).subspace_dim
             scale = probe_scale_of(cfg, dim=dim)
-            costs.setdefault(showcase, {})[method] = tuning_cost(method, budget, seeds=1, rounds=args.rounds)
 
             def sweep(points, rnd):
                 """Score one round's points and append them to ``trials``."""
@@ -194,7 +192,7 @@ def main() -> int:
                             layout=layout,
                             loss_batch=loss_batch,
                             budget=budget,
-                            val_fn=lambda m: evaluate_accuracy(m, val_loader, device=device),
+                            val_fn=lambda m: evaluate_accuracy(m, val_loader),
                             # A tuning sweep that can reach test is a leak waiting to happen.
                             test_fn=lambda m: float("nan"),
                             mode="max",

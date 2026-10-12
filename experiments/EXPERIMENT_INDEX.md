@@ -55,3 +55,11 @@ python experiments/scripts/generate_tables.py \
 
 Architecture results live in `results/revision/`, with `theory/`, `evalmatched/`, and
 `wallclock/` subdirectories for separate protocols. Outputs are not tracked in Git.
+
+`run_revision.sh` fills `theory/`. For the other two, rerun the runners with `--fair`
+and `--results-dir experiments/results/revision/evalmatched` under
+`POLYSTEP_MATCH_AXIS=evals` (raise `POLYSTEP_FAIR_POPSIZE` there, so the population
+methods keep their throughput), or with `.../wallclock` under
+`POLYSTEP_MATCH_AXIS=wallclock`. The wall-clock runs read PolyStep's time for the same
+cell from the parent directory. `run_elevation.py`, `run_moe.py`, and
+`run_timeseries.py` read the variable; `run_maxsat.py` takes `--es-eval-budget`.

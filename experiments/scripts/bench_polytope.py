@@ -15,7 +15,6 @@ from experiments.runners.search_suite import ARMS, WORKLOADS, run_search
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
-    ap.add_argument("--suite", action="store_true", help=argparse.SUPPRESS)  # existing commands remain valid
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--budget", type=int, default=4096)

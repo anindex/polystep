@@ -94,7 +94,7 @@ def test_compile_forward_falls_back_on_cpu():
         (False, True, True),
     ],
 )
-def test_compile_forward_defaults_to_the_inplace_path(use_inplace, compile_forward, expected):
+def test_compile_forward_defaults_on_inplace_path(use_inplace, compile_forward, expected):
     """CUDA graphs only help the in-place path, so the flag defaults on there.
 
     The in-place path is a Python loop of N sequential forwards, so it is
@@ -107,3 +107,16 @@ def test_compile_forward_defaults_to_the_inplace_path(use_inplace, compile_forwa
         compile_forward=compile_forward,
     )
     assert ev._compile_forward is expected
+
+
+def test_eager_inplace_skips_verification_forward():
+    model = nn.Linear(3, 2)
+    count = []
+    model.register_forward_hook(lambda *args: count.append(1))
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=True, compile_forward=False)
+    params = {k: v.detach()[None].expand(3, *v.shape) for k, v in model.named_parameters()}
+    original = {k: v.clone() for k, v in model.state_dict().items()}
+    ev.evaluate(params, torch.randn(4, 3), torch.randn(4, 2))
+    assert len(count) == 3
+    for k, v in model.state_dict().items():
+        torch.testing.assert_close(v, original[k])

@@ -50,7 +50,7 @@ def test_off_by_default_and_exact():
     assert torch.equal(plain.evaluate(params, x, y), explicit.evaluate(params, x, y))
 
 
-def test_optimizer_flag_reaches_the_evaluator():
+def test_optimizer_flag_reaches_evaluator():
     model = nn.Sequential(nn.Flatten(), nn.Linear(16, 8), nn.ReLU(), nn.Linear(8, 4))
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
     opt = PolyStepOptimizer(model, candidate_autocast=True, epsilon=0.1, compile=False, seed=0)
@@ -61,11 +61,9 @@ def test_optimizer_flag_reaches_the_evaluator():
     assert torch.isfinite(torch.tensor(loss))
 
 
-def test_delta_evaluators_stay_in_full_precision():
-    """Their correction is a small offset on a full-scale output; BF16 erases it.
-
-    The optimizer's own delta paths call the specialized evaluators directly, so they
-    must never pick up the evaluator's autocast frame.
+def test_autocast_frame_exits_after_evaluate():
+    """The frame must not outlive evaluate(): the delta paths run outside it in full
+    precision, since BF16 erases their small offset on a full-scale output.
     """
     model, params, x, y = _candidates(seed=2, n=8)
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), autocast_dtype=torch.bfloat16)
@@ -76,7 +74,7 @@ def test_delta_evaluators_stay_in_full_precision():
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, None])
-def test_subspace_inplace_path_accepts_the_flag(dtype):
+def test_subspace_inplace_accepts_autocast_flag(dtype):
     from polystep.hybrid_subspace import HybridSubspace
     from polystep.transform import ParamLayout
 

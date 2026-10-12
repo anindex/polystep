@@ -3,7 +3,7 @@
 
 Random 3-SAT instances at scaling variable counts. All methods share the
 sigmoid+CRA relaxation; ES budgets are step-matched (polystep_steps * popsize).
-Results are saved as experiments/results/softmax/main/maxsat_{method}_{seed}.json.
+Results are saved as experiments/results/revision/maxsat_{method}_{seed}.json.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from experiments.runners.common import (
+    RESULTS_DIR,
     SEEDS,
     save_result,
     set_seed,
@@ -47,7 +48,6 @@ POLYSTEP_CONFIG = {
     # Stated, not defaulted: this value decides whether condition (iv) of the
     # convergence theorem holds, so the config has to say it out loud.
     "probe_radius_jitter": 0.0,
-    # Required by the convergence analysis.
     "amortize_steps": 3,
     "amortize_ema": 0.7,
     "use_momentum": True,
@@ -119,25 +119,7 @@ SLS_MAX_FLIPS = 100000
 SLS_MAX_FLIPS_1M = 50000  # small enough that SLS at 1M vars finishes in reasonable time
 
 
-class CountingClosure:
-    """Wraps a closure and counts total evaluations (sum of batch dim N)."""
-
-    def __init__(self, closure):
-        self._closure = closure
-        self.count = 0
-
-    def __call__(self, stacked_params):
-        result = self._closure(stacked_params)
-        self.count += result.shape[0]
-        return result
-
-    def reset(self):
-        self.count = 0
-
-
-def make_sat_closure(
-    clause_vars, clause_signs, cra_lambda=0.0, cra_alpha=2, clause_sample_size=0, model=None, particle_dim=2
-):
+def make_sat_closure(clause_vars, clause_signs, cra_lambda=0.0, cra_alpha=2, clause_sample_size=0, model=None):
     """Create a polystep-compatible MAX-SAT closure: stacked_params dict -> (N,) costs.
 
     With clause_sample_size > 0 a random clause subset is evaluated per step; with
@@ -152,19 +134,10 @@ def make_sat_closure(
     # Build inverted index for delta evaluation: variable -> clause indices (CSR)
     if use_delta:
         cv_cpu = clause_vars.cpu()
-        var_counts = torch.zeros(num_vars, dtype=torch.long)
-        for j in range(cv_cpu.shape[1]):
-            var_counts.scatter_add_(0, cv_cpu[:, j], torch.ones(total_clauses, dtype=torch.long))
+        keys = cv_cpu.T.reshape(-1)
         var_offsets = torch.zeros(num_vars + 1, dtype=torch.long)
-        var_offsets[1:] = var_counts.cumsum(0)
-        total_mentions = var_offsets[-1].item()
-        var_clause_list = torch.empty(total_mentions, dtype=torch.long)
-        fill_pos = var_offsets[:-1].clone()
-        for j in range(cv_cpu.shape[1]):
-            for c_idx in range(total_clauses):
-                v = cv_cpu[c_idx, j].item()
-                var_clause_list[fill_pos[v]] = c_idx
-                fill_pos[v] += 1
+        var_offsets[1:] = torch.bincount(keys, minlength=num_vars).cumsum(0)
+        var_clause_list = torch.arange(total_clauses).repeat(cv_cpu.shape[1])[torch.sort(keys, stable=True).indices]
         var_offsets = var_offsets.to(clause_vars.device)
         var_clause_list = var_clause_list.to(clause_vars.device)
 
@@ -327,9 +300,6 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         device: Device string ('cuda' or 'cpu').
         steps: Number of optimizer steps.
         results_dir: Directory for JSON results.
-
-    Returns:
-        Total function evaluations (for budget matching with ES methods).
     """
     from polystep.optimizer import PolyStepOptimizer
     from polystep.epsilon import CosineEpsilon
@@ -351,9 +321,7 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # Build CosineEpsilon schedules for epsilon, step_radius, probe_radius.
-    # Keyword, not positional: CosineEpsilon declares `target` before `init`, so the
-    # positional form ran every one of these schedules backwards -- a logged
-    # `epsilon: 5 -> 0.5` executed as 0.5 at step 0 and 5.0 from step 1 on.
+    # Keyword arguments: CosineEpsilon declares `target` before `init`.
     eps = (
         CosineEpsilon(init=cfg["epsilon_init"], target=cfg["epsilon_target"])
         if "epsilon_init" in cfg
@@ -403,9 +371,7 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         cra_alpha=CRA_ALPHA,
         clause_sample_size=clause_sample,
         model=model if turbo else None,
-        particle_dim=pdim,
     )
-    counter = CountingClosure(base_closure)
 
     best_sat_ratio = 0.0
     step_logs = []
@@ -419,7 +385,7 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
         for step in range(steps):
             if has_resample:
                 base_closure.resample()
-            optimizer.step(counter)
+            optimizer.step(base_closure)
 
             # Per-20-step fine-grained tracking
             if (step + 1) % 20 == 0:
@@ -460,7 +426,7 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
                         f"sat={result['sat_ratio'] * 100:.1f}% "
                         f"({result['num_satisfied']}/{result['num_clauses']}, "
                         f"unsat={unsat}) | "
-                        f"evals={counter.count}"
+                        f"evals={optimizer.candidate_evals}"
                     )
 
     wall_time = time.time() - start_time
@@ -479,7 +445,7 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
             "num_clauses": final_result["num_clauses"],
             "wall_time_seconds": wall_time,
             "peak_gpu_memory_mb": mem["peak_gpu_memory_mb"],
-            "function_evals": counter.count,
+            "function_evals": optimizer.candidate_evals,
             "total_steps": steps,
         },
         hyperparameters={
@@ -492,23 +458,20 @@ def run_polystep(num_vars, instance, seed, device, steps, results_dir, solver=No
             "subspace_class": None,
             "subspace_rank": None,
             "eval_budget": polystep_eval_budget(optimizer, steps),
-            "evals_used": counter.count,
+            "evals_used": optimizer.candidate_evals,
         },
         epoch_logs=step_logs,
         step_logs=fine_step_logs,
         results_dir=results_dir,
     )
     print(f"      Saved: {filepath}")
-    return counter.count
 
 
 def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
     """Train MAX-SAT with CMA-ES, using the same sigmoid+CRA encoding as PolyStep.
 
-    The inline pycma driver this replaces was one of four near-identical copies;
-    :func:`polystep.baselines.cma_es` is the single implementation, and
-    :class:`polystep.baselines.Objective` is the counter -- one candidate scored is
-    one evaluation, and it refuses a generation that would exceed ``max_evals``.
+    :func:`polystep.baselines.cma_es` over an :class:`polystep.baselines.Objective`
+    that counts one evaluation per candidate and refuses to exceed ``max_evals``.
 
     Args:
         num_vars: Number of Boolean variables.
@@ -550,7 +513,7 @@ def run_cmaes(num_vars, instance, seed, device, max_evals, results_dir):
             x0=x0,
             sigma0=CMAES_CONFIG["sigma0"],
             popsize=popsize,
-            # Keep the old convention: separable CMA-ES above 1000 dimensions.
+            # Separable CMA-ES above 1000 dimensions.
             diagonal=num_vars >= 1000,
             seed=seed,
         )
@@ -1131,7 +1094,7 @@ def main():
         nargs="+",
         type=int,
         default=VARIABLE_SIZES,
-        help="Variable counts (default: 100 500 1000 5000)",
+        help=f"Variable counts (default: {VARIABLE_SIZES})",
     )
     parser.add_argument(
         "--methods",
@@ -1147,7 +1110,7 @@ def main():
         help="Seeds for optimizer methods (default: 42 123 456 789 1337)",
     )
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
-    parser.add_argument("--results-dir", default="experiments/results/softmax/main", help="Results directory")
+    parser.add_argument("--results-dir", default=RESULTS_DIR, help="Results directory")
     parser.add_argument(
         "--force",
         action="store_true",
@@ -1205,9 +1168,7 @@ def main():
 
         # Determine step/eval budgets
         steps = 10 if args.dry_run else STEP_BUDGETS.get(num_vars, 1000)
-        polystep_evals = None  # Will be set after polystep runs
 
-        # Run polystep first to determine eval budget
         if "polystep" in args.methods:
             for seed in args.seeds:
                 output_file = os.path.join(
@@ -1219,7 +1180,7 @@ def main():
                     continue
                 print(f"  Running polystep seed={seed} ({steps} steps)...")
                 try:
-                    evals = run_polystep(
+                    run_polystep(
                         num_vars,
                         instance,
                         seed,
@@ -1229,8 +1190,6 @@ def main():
                         solver=args.solver,
                         theory_mode=args.theory_mode,
                     )
-                    if polystep_evals is None:
-                        polystep_evals = evals
                 except Exception as e:
                     print(f"    ERROR: polystep seed={seed} failed: {e}")
                     import traceback
@@ -1253,23 +1212,6 @@ def main():
         if args.es_eval_budget is not None and not args.dry_run:
             es_budget = int(args.es_eval_budget)
             print(f"    ES eval budget overridden: {es_budget:,} (step-matched default was {steps * es_popsize:,})")
-        # Also track polystep eval count for reporting
-        if polystep_evals is None:
-            import json as _json
-
-            polystep_ref = os.path.join(
-                args.results_dir,
-                f"{BENCHMARK}_{num_vars}v_polystep_42.json",
-            )
-            if os.path.exists(polystep_ref):
-                try:
-                    with open(polystep_ref) as _f:
-                        _r = _json.load(_f)
-                    polystep_evals = _r["metrics"]["function_evals"]
-                except Exception:
-                    pass
-            if polystep_evals is None:
-                polystep_evals = steps * 12
         print(f"  ES eval budget: {es_budget:,} ({es_budget // es_popsize} gens x pop{es_popsize})")
 
         # Run CMA-ES with step-matched budget

@@ -9,16 +9,13 @@ Tests verify:
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
 from torch.func import functional_call, vmap
 
 # experiments/ is the paper reproduction harness and is not part of the distributed
 # package, so this module is unimportable when the tests run from an sdist.
-if not (Path(__file__).resolve().parent.parent / "experiments" / "runners").is_dir():
-    pytest.skip("experiments/runners not present (running outside the repo)", allow_module_level=True)
+pytest.importorskip("experiments.runners")
 
 from experiments.runners.nondiff_models import (  # noqa: E402
     LIFNeuron,
@@ -33,22 +30,13 @@ from experiments.runners.nondiff_models import (  # noqa: E402
     STETernary,
     BinaryLinearSTE,
     TernaryLinearSTE,
-    BinaryConv2d,
-    BinaryConv2dSTE,
     BinaryMNISTNetSTE,
     DiscreteAttentionNet,
     StaircaseActivation,
     StaircaseNet,
     HardMoELayer,
     HardMoENet,
-    SoftMoELayer,
-    SoftMoENet,
-    compute_expert_utilization,
     MaxSATModel,
-    cra_penalty,
-    HardPermutationNet,
-    SoftPermutationNet,
-    PermutationLoss,
 )
 
 
@@ -139,10 +127,7 @@ class TestSTETernary:
     [
         (lambda: BinaryLinearSTE(16, 8), (2, 16)),
         (lambda: TernaryLinearSTE(16, 8, threshold=0.3), (2, 16)),
-        (lambda: BinaryConv2dSTE(3, 16, 3, padding=1), (2, 3, 8, 8)),
-        (lambda: SoftMoELayer(input_dim=32, hidden_dim=64, num_experts=4), (2, 32)),
         (BinaryMNISTNetSTE, (2, 1, 28, 28)),
-        (SoftMoENet, (2, 1, 28, 28)),
     ],
 )
 def test_ste_passes_gradient_to_every_weight(build, input_shape):
@@ -158,21 +143,6 @@ def test_ste_passes_gradient_to_every_weight(build, input_shape):
         assert p.grad.abs().max() > 0, name
 
 
-def test_weights_are_binary():
-    """forward() must convolve with sign-binarized weights, not the raw ones."""
-    layer = BinaryConv2d(1, 1, 1, padding=0)  # 1x1 conv -> per-pixel scale by the (binarized) weight
-    x = torch.randn(1, 1, 4, 4)
-    with torch.no_grad():
-        layer.bias.zero_()
-        layer.weight.copy_(torch.tensor([[[[0.3]]]]))  # sign -> +1
-    assert torch.allclose(layer(x), x, atol=1e-6)  # +1 -> identity
-    with torch.no_grad():
-        layer.weight.copy_(torch.tensor([[[[-0.2]]]]))  # sign -> -1
-    out = layer(x)
-    assert torch.allclose(out, -x, atol=1e-6)  # -1 -> negate
-    assert not torch.allclose(out, -0.2 * x, atol=1e-3)  # not the raw (-0.2) conv
-
-
 def test_output_values_quantized():
     """Output values must be in {0/5, 1/5, 2/5, 3/5, 4/5}."""
     sa = StaircaseActivation(levels=5)
@@ -185,7 +155,6 @@ def test_output_values_quantized():
 
 
 def test_hard_routing_selects_argmax_expert():
-    """Return the output of the expert selected by argmax."""
     torch.manual_seed(0)
     moe = HardMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
     x = torch.randn(5, 8)
@@ -198,50 +167,6 @@ def test_hard_routing_selects_argmax_expert():
     assert not torch.allclose(out, avg, atol=1e-4)  # hard threshold, not averaging
 
 
-def test_soft_routing_is_softmax_weighted():
-    """forward() must return the softmax-weighted expert mix, not hard top-1."""
-    torch.manual_seed(0)
-    moe = SoftMoELayer(input_dim=8, hidden_dim=6, num_experts=4)
-    x = torch.randn(5, 8)
-    out = moe(x)
-    weights = torch.softmax(moe.gate(x), dim=-1)
-    all_out = torch.stack([e(x) for e in moe.experts], dim=1)
-    expected = (all_out * weights.unsqueeze(-1)).sum(dim=1)
-    assert torch.allclose(out, expected, atol=1e-5)  # soft-weighted mix
-    hard = all_out[torch.arange(5), moe.gate(x).argmax(dim=-1)]
-    assert not torch.allclose(out, hard, atol=1e-4)  # not hard argmax
-
-
-def test_param_count_matches_hard():
-    hard = HardMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
-    soft = SoftMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4)
-    hard_params = sum(p.numel() for p in hard.parameters())
-    soft_params = sum(p.numel() for p in soft.parameters())
-    assert hard_params == soft_params, f"Param count mismatch: hard={hard_params}, soft={soft_params}"
-
-
-class TestExpertUtilization:
-    def test_utilization_sums_to_one(self):
-        model = HardMoENet()
-        dataset = torch.utils.data.TensorDataset(torch.randn(100, 1, 28, 28), torch.randint(0, 20, (100,)))
-        loader = torch.utils.data.DataLoader(dataset, batch_size=50)
-        result = compute_expert_utilization(model, loader, device="cpu")
-        total = sum(result["expert_utilization"].values())
-        assert abs(total - 1.0) < 1e-5, f"Utilization should sum to 1.0, got {total}"
-
-    def test_collapse_detection(self):
-        model = HardMoENet()
-        # Bias gate weights so one expert dominates
-        with torch.no_grad():
-            model.moe.gate.bias.zero_()
-            model.moe.gate.bias[0] = 100.0  # Expert 0 always wins
-        dataset = torch.utils.data.TensorDataset(torch.randn(50, 1, 28, 28), torch.randint(0, 20, (50,)))
-        loader = torch.utils.data.DataLoader(dataset, batch_size=50)
-        result = compute_expert_utilization(model, loader, device="cpu")
-        assert result["collapsed"] is True, "Should detect collapse when one expert handles all inputs"
-        assert result["max_expert_share"] > 0.90
-
-
 class TestMaxSATModel:
     def test_no_hidden_layers(self):
         """MaxSATModel should have NO hidden layers, only self.assignments."""
@@ -250,16 +175,6 @@ class TestMaxSATModel:
         assert param_names == ["assignments"], (
             f"MaxSATModel should only have 'assignments' parameter, got {param_names}"
         )
-
-
-def test_known_values():
-    """cra_penalty should be 0 for {0, 1} values and positive for 0.5."""
-    soft = torch.tensor([0.0, 1.0, 0.5])
-    penalty = cra_penalty(soft)
-    # For x=0: (2*0-1)^2 = 1, so 1-1=0
-    # For x=1: (2*1-1)^2 = 1, so 1-1=0
-    # For x=0.5: (2*0.5-1)^2 = 0, so 1-0=1
-    assert penalty.item() == pytest.approx(1.0, abs=1e-5)
 
 
 class TestVmapCompatibility:
@@ -297,68 +212,10 @@ class TestVmapCompatibility:
                 (2, 1, 28, 28),
                 (2, 2, 20),
             ),
-            (
-                lambda: SoftMoENet(input_dim=784, hidden_dim=128, num_classes=20, num_experts=4),
-                (2, 1, 28, 28),
-                (2, 2, 20),
-            ),
-            (lambda: HardPermutationNet(N=10, hidden_dim=64), (4, 10), (2, 4, 10)),
-            (lambda: SoftPermutationNet(N=10, hidden_dim=64), (4, 10), (2, 4, 10, 10)),
         ],
     )
-    def test_spiking_mnist_vmap(self, model_fn, input_shape, expected_shape):
+    def test_vmap_returns_per_candidate_outputs(self, model_fn, input_shape, expected_shape):
         model = model_fn()
         x = torch.randn(*input_shape)
         outputs = self._vmap_test(model, x)
         assert outputs.shape == expected_shape
-
-
-def test_output_is_long_indices():
-    """Output dtype is long, values in [0, N)."""
-    model = HardPermutationNet(N=10, hidden_dim=64)
-    x = torch.randn(4, 10)
-    out = model(x)
-    assert out.dtype == torch.long
-    assert out.max() < 10
-
-
-class TestSoftPermutationNet:
-    def test_doubly_stochastic(self):
-        """Row sums and column sums are approximately 1.0."""
-        model = SoftPermutationNet(N=10, hidden_dim=64, n_sinkhorn_iters=20)
-        x = torch.randn(4, 10)
-        out = model(x)
-        row_sums = out.sum(dim=-1)  # (4, 10)
-        col_sums = out.sum(dim=-2)  # (4, 10)
-        assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-4), (
-            f"Row sums not close to 1: max deviation {(row_sums - 1).abs().max():.6f}"
-        )
-        assert torch.allclose(col_sums, torch.ones_like(col_sums), atol=1e-4), (
-            f"Col sums not close to 1: max deviation {(col_sums - 1).abs().max():.6f}"
-        )
-
-    def test_param_count_matches_hard(self):
-        """Same param count as HardPermutationNet for same N, hidden_dim."""
-        hard = HardPermutationNet(N=10, hidden_dim=64)
-        soft = SoftPermutationNet(N=10, hidden_dim=64)
-        hard_params = sum(p.numel() for p in hard.parameters())
-        soft_params = sum(p.numel() for p in soft.parameters())
-        assert hard_params == soft_params, f"Param count mismatch: hard={hard_params}, soft={soft_params}"
-
-
-@pytest.mark.parametrize(
-    "pred, target, expected",
-    [
-        (
-            torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
-            torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
-            0.0,
-        ),
-        (torch.tensor([[1, 0, 3, 2]]), torch.tensor([[0, 1, 2, 3]]), 1.0),
-        (torch.tensor([[0, 1, 3, 2]]), torch.tensor([[0, 1, 2, 3]]), 0.5),
-    ],
-)
-def test_perfect_match(pred, target, expected):
-    loss_fn = PermutationLoss()
-    loss = loss_fn(pred, target)
-    assert loss.item() == pytest.approx(expected)

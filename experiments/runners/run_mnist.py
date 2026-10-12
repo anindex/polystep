@@ -5,7 +5,7 @@ Methods: polystep, adam, and the six gradient-free baselines from
 ``polystep.baselines``, all on the MNISTNet MLP (784->128->10). ``--fair`` runs
 the matched-budget, matched-representation table; ``--theory-mode`` runs the
 unaccelerated reference configuration. Results are saved as JSON in
-experiments/results/softmax/main/.
+experiments/results/revision/.
 
 Usage:
     python experiments/runners/run_mnist.py
@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from experiments.runners.common import (
     METHOD_ALIASES,
+    RESULTS_DIR,
     SEEDS,
     MNISTNet,
     evaluate_accuracy,
@@ -41,11 +42,14 @@ from experiments.runners.common import (
 from experiments.runners.fairness import (
     build_polystep,
     FAIR_METHODS,
+    POLYSTEP_SELECTION_PATH,
+    UNMATCHED_BUDGETS,
     apply_point,
     apply_theory_mode,
     budget_for_method,
     TestSplitTripwire,
     apply_polystep_multipliers,
+    fair_eval_budget,
     load_selection,
     make_subspace,
     minibatch_loss,
@@ -59,8 +63,6 @@ from experiments.baselines.sgd_baseline import train_sgd
 
 BENCHMARK = "mnist"
 
-# Store PolyStep tuning separately from baseline selections.
-POLYSTEP_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "polystep_selected.json")
 BATCH_SIZE = 512
 EPOCHS = 30
 
@@ -88,26 +90,6 @@ ADAM_CONFIG = {
     "lr": 0.001,
     "epochs": EPOCHS,
 }
-
-# Free-running (non-fair) candidate budgets: ES 2000 gen x 50 pop, SPSA 10000
-# iters x 2, CMA-ES 2000 gen x 16 pop. `--fair` overrides all of these with one
-# budget derived from PolyStep.
-LEGACY_BUDGETS = {
-    "openai_es": 100_000,
-    "eggroll": 100_000,
-    "cma_es": 32_000,
-    "spsa": 20_000,
-    "mezo": 20_000,
-    "random_search": 20_000,
-}
-
-
-def fair_eval_budget(seed, device, train_loader, epochs, cfg, solver):
-    """The shared candidate budget: what PolyStep spends over ``epochs`` epochs."""
-    set_seed(seed)
-    probe_model = MNISTNet().to(device)
-    _, _, opt = build_polystep(probe_model, seed, epochs * len(train_loader), cfg, solver)
-    return polystep_eval_budget(opt, epochs * len(train_loader))
 
 
 def run_polystep(
@@ -207,7 +189,7 @@ def run_polystep(
                             "epoch": epoch + 1,
                             # Cumulative candidate evaluations, shared with the baselines.
                             "evals": fwd_pass_count,
-                            "val_accuracy": evaluate_accuracy(model, selection_loader, device=device),
+                            "val_accuracy": evaluate_accuracy(model, selection_loader),
                             "loss": loss,
                             "wall_time": time.time() - start_time,
                         }
@@ -217,7 +199,7 @@ def run_polystep(
             # Score the selection split only (validation when audit_no_leakage=True,
             # test otherwise -- and then the run is stamped leaked=True). The test set
             # is read once, after the checkpoint has been chosen.
-            selection_acc = evaluate_accuracy(model, selection_loader, device=device)
+            selection_acc = evaluate_accuracy(model, selection_loader)
             if selection_acc > best_accuracy:
                 best_accuracy = selection_acc
                 best_state_dict = copy.deepcopy(model.state_dict())
@@ -243,13 +225,11 @@ def run_polystep(
             )
 
     wall_time = time.time() - start_time
-    # The epoch loop already scored (and, if better, saved) the final
-    # weights on the selection split; re-scoring here only ever added a
-    # second chance for the test set to pick the checkpoint.
+    # The epoch loop selected the checkpoint on the selection split; test is read once below.
     last_epoch_acc = selection_acc
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
-    final_acc = float("nan") if tuning else evaluate_accuracy(model, test_loader, device=device)
+    final_acc = float("nan") if tuning else evaluate_accuracy(model, test_loader)
 
     result = save_result(
         benchmark=BENCHMARK,
@@ -321,10 +301,11 @@ def run_gradient_free(
         # see that the table is matched on rank and not on dimension.
         shared_dim = make_subspace(layout, rank=cfg["rank"], seed=seed, method="polystep").subspace_dim
         if budget is None:
-            budget = fair_eval_budget(seed, device, train_loader, epochs, cfg, "softmax")
+            budget = fair_eval_budget(MNISTNet().to(device), seed, epochs * len(train_loader), cfg)
             budget, match_axis = budget_for_method(method, budget, epochs * len(train_loader))
     if budget is None:
-        budget = LEGACY_BUDGETS[method]
+        budget = UNMATCHED_BUDGETS[method]
+        match_axis = "unmatched"
 
     loss_batch = minibatch_loss(NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss()), train_loader, device)
     selection_loader = val_loader if (audit_no_leakage and val_loader is not None) else test_loader
@@ -344,8 +325,8 @@ def run_gradient_free(
         layout=layout,
         loss_batch=loss_batch,
         budget=budget,
-        val_fn=lambda m: evaluate_accuracy(m, selection_loader, device=device),
-        test_fn=lambda m: evaluate_accuracy(m, test_loader, device=device),
+        val_fn=lambda m: evaluate_accuracy(m, selection_loader),
+        test_fn=lambda m: evaluate_accuracy(m, test_loader),
         mode="max",
         seed=seed,
         subspace=subspace,
@@ -388,7 +369,6 @@ def run_adam(seed, device, train_loader, test_loader, results_dir, val_loader=No
         seed=seed,
     )
 
-    result["benchmark"] = BENCHMARK
     filepath = save_result(
         benchmark=BENCHMARK,
         method="adam",
@@ -477,7 +457,7 @@ def main():
         help="Seeds to run (default: 42 123 456 789 1337)",
     )
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
-    parser.add_argument("--results-dir", default="experiments/results/softmax/main", help="Results directory")
+    parser.add_argument("--results-dir", default=RESULTS_DIR, help="Results directory")
     parser.add_argument("--data-dir", default="data", help="Data directory")
     parser.add_argument(
         "--solver",
@@ -489,10 +469,8 @@ def main():
         "--allow-test-leakage",
         action="store_true",
         help=(
-            "Legacy mode: select best_state_dict on the test set instead "
-            "of a held-out validation slice. Default is honest protocol "
-            "(val-selected). Use this flag only for bit-for-bit reproduction "
-            "of earlier results."
+            "Select the checkpoint on the test split instead of a held-out validation "
+            "slice; the run is stamped leaked and the aggregators refuse it."
         ),
     )
     parser.add_argument(

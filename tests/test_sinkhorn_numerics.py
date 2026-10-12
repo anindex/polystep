@@ -45,7 +45,7 @@ def test_sinkhorn_lse_safety(dtype, scale):
     assert (result.matrix > 0).any(dim=-1).all(), "some row got no mass at all"
 
 
-def test_a_warm_start_survives_a_sharp_epsilon_change():
+def test_warm_start_survives_sharp_epsilon_change():
     """Duals are cost-unit, so a converged warm start carries across an epsilon step."""
     torch.manual_seed(0)
     C = torch.rand(32, 64)
@@ -124,7 +124,7 @@ def test_sinkhorn_omega_default_is_safe():
     assert not any("diverg" in m for m in msgs), f"divergence detector fired on benign input: {msgs}"
 
 
-def test_sinkhorn_divergence_detector_backs_off_omega_on_growth():
+def test_divergence_detector_backs_off_omega():
     """Near the unstable boundary on an ill-conditioned cost, three growth steps
     must back omega off to 1.0 with a UserWarning.
     """
@@ -167,7 +167,7 @@ def test_sinkhorn_omega_sweep(omega):
     assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all(), f"omega={omega} produced non-finite duals"
 
 
-def test_sinkhorn_anderson_does_not_diverge_on_ill_conditioned():
+def test_anderson_matches_plain_on_ill_conditioned():
     """Anderson acceleration on an ill-conditioned cost must match plain Sinkhorn's
     accuracy (Chizat 2020: fall back to the plain iterate when Anderson regresses).
     """
@@ -357,3 +357,16 @@ def test_empty_cost_matrix_raises_valueerror(make_solver):
     """
     with pytest.raises(ValueError, match="empty cost matrix"):
         make_solver().solve(torch.zeros(2, 0))
+
+
+@pytest.mark.parametrize("mode", ["mean", "max_cost"])
+@pytest.mark.parametrize("spread", [0.0, 1e-3])
+def test_narrow_finite_spread_keeps_sinkhorn_marginals(mode, spread):
+    """A spread-scaled penalty breaks FP32 at a 1e-10 divisor yet reports convergence."""
+    nan = float("nan")
+    cost = torch.tensor([[100.0, 100.0 + spread], [100.0 + spread, 100.0], [nan, nan]])
+    result = SinkhornSolver(epsilon=0.1).solve(cost, scale_cost=mode)
+
+    assert result.converged
+    torch.testing.assert_close(result.matrix.sum(dim=1), torch.full((3,), 1 / 3))
+    torch.testing.assert_close(result.matrix.sum(dim=0), torch.full((2,), 0.5))

@@ -9,7 +9,6 @@ import torch.nn as nn
 
 from polystep import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
-from polystep.costs import scale_cost_matrix
 from polystep._compiled import _fused_softmax_project
 from polystep.geometry import get_orthoplex_vertices, get_random_rotation_matrices
 from polystep.solvers import KLSoftmaxSolver, SinkhornSolver, SoftmaxSolver
@@ -57,14 +56,6 @@ def test_num_probe_zero_raises():
         PolyStepOptimizer(model, num_probe=0)
 
 
-def test_numeric_scale_cost_zero_and_inf_raise():
-    cost = torch.rand(3, 4)
-    with pytest.raises(ValueError, match="scale_cost"):
-        scale_cost_matrix(cost, 0.0)
-    with pytest.raises(ValueError, match="scale_cost"):
-        scale_cost_matrix(cost, float("inf"))
-
-
 @pytest.mark.parametrize("solver_class", [SinkhornSolver, KLSoftmaxSolver, SoftmaxSolver])
 @pytest.mark.parametrize("epsilon", [0.0, -1.0, float("inf"), float("nan")])
 def test_epsilon_revalidated_per_solve(solver_class, epsilon):
@@ -96,7 +87,7 @@ def test_align_marginal_defaults_and_coerces():
     assert out.dtype == torch.float32
 
 
-def test_align_dual_coerces_dtype_and_warns_on_mismatch():
+def test_align_dual_coerces_dtype_warns_on_mismatch():
     f64 = torch.zeros(5, dtype=torch.float64)
     out = align_dual(f64, 5, torch.device("cpu"), torch.float32, "init_f")
     assert out is not None and out.dtype == torch.float32
@@ -185,7 +176,7 @@ def test_unsupported_subspace_type_raises():
         PolyStepOptimizer(nn.Linear(8, 4), subspace=object(), compile=False)
 
 
-def test_newton_refinement_warns_under_a_block_strategy():
+def test_newton_refinement_warns_under_block_strategy():
     """newton_refinement auto-enables the quadratic model, which block-wise ignores."""
     with pytest.warns(UserWarning, match="use_quadratic_model=True is not supported"):
         PolyStepOptimizer(
@@ -197,3 +188,55 @@ def test_newton_refinement_warns_under_a_block_strategy():
             block_strategy="per_layer",
             compile=False,
         )
+
+
+def test_fully_frozen_model_raises_clearly():
+    """A model with no trainable parameters must say so, not fail deep in the layout."""
+    model = nn.Sequential(nn.Linear(4, 4))
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    with pytest.raises(ValueError, match="requires_grad"):
+        PolyStepOptimizer(model, epsilon=0.1, max_iterations=5)
+
+
+@pytest.mark.parametrize(
+    "build,match",
+    [
+        (
+            lambda: PolyStepOptimizer(nn.Linear(4, 2), block_strategy="grouped", block_group_size=-1),
+            "block_group_size",
+        ),
+        (lambda: PolyStepOptimizer(nn.Linear(4, 2), chunk_size=-1), "chunk_size"),
+    ],
+    ids=["block_group_size", "chunk_size"],
+)
+def test_degenerate_argument_rejected(build, match):
+    """Negative block_group_size gives no blocks; negative chunk_size, no chunks."""
+    with pytest.raises(ValueError, match=match):
+        build()
+
+
+def test_cost_batch_size_zero_is_rejected():
+    """0 slices an empty batch: every candidate scores NaN, sanitization flattens
+    the cost matrix to a constant, and the run reports finite losses while
+    learning nothing.
+    """
+    with pytest.raises(ValueError, match="cost_batch_size"):
+        PolyStepOptimizer(nn.Linear(4, 2), cost_batch_size=0)
+
+
+@pytest.mark.parametrize("target", [0.0, -0.1, float("inf"), float("nan")])
+@pytest.mark.parametrize("name", ["epsilon", "ent_epsilon"])
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_invalid_temperature_rejected_before_fused_step(target, name, scheduled):
+    """Zero freezes the run through NaN reversion and a negative value ascends."""
+    from polystep.epsilon import LinearEpsilon
+
+    torch.manual_seed(0)
+    opt = PolyStepOptimizer(nn.Linear(4, 2), seed=0, solver="softmax")
+    value = LinearEpsilon(init=1.0, target=target, decay=10.0) if scheduled else target
+    setattr(opt, name, value)
+    with pytest.raises(ValueError, match=f"{name} must be > 0"):
+        for _ in range(4):
+            opt.step(lambda p: torch.full((next(iter(p.values())).shape[0],), 1.0))

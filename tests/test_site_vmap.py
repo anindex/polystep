@@ -83,7 +83,7 @@ def _batch(seed=0):
     return torch.randn(6, 1, 8, 8, generator=gen), torch.randint(0, 4, (6,), generator=gen)
 
 
-def test_matches_the_plain_vmap_path_at_every_site():
+def test_matches_plain_vmap_at_every_site():
     """Every entry the evaluator accepts must score exactly like batching everything."""
     torch.manual_seed(0)
     model = ConvNet()
@@ -120,7 +120,7 @@ def test_matches_the_plain_vmap_path_at_every_site():
     assert checked > 0, "no site resolved, the test proved nothing"
 
 
-def test_a_step_on_a_conv_model_skips_the_closure_and_keeps_the_same_losses():
+def test_conv_step_skips_closure_keeps_losses():
     """The path has to reach a model no other fast path accepts, and not change it."""
 
     def build():
@@ -163,7 +163,7 @@ def test_try_build_declines_tied_weights():
 
 
 @pytest.mark.parametrize("forced", [True, False])
-def test_the_in_place_site_path_accepts_tied_weights(forced):
+def test_inplace_site_accepts_tied_weights(forced):
     """Writing the shared storage moves every alias, so in place a tied weight scores
     exactly like the full swap, whether in-place was forced or picked for memory;
     a per-sample evaluator is declined.
@@ -209,7 +209,7 @@ class BufferAliasNet(nn.Module):
 
 @pytest.mark.parametrize("hybrid", [False, True])
 @pytest.mark.parametrize("use_inplace", [None, True])
-def test_a_persistent_buffer_aliasing_a_parameter_trains_it(hybrid, use_inplace):
+def test_persistent_buffer_alias_trains_parameter(hybrid, use_inplace):
     """The state_dict lists the root's buffers before its children's parameters, yet
     the parameter must stay canonical: a persistent alias trains like a
     non-persistent one, on every path.
@@ -237,8 +237,7 @@ def test_a_persistent_buffer_aliasing_a_parameter_trains_it(hybrid, use_inplace)
     torch.testing.assert_close(weight, want_weight)
 
 
-def test_sparse_delta_still_wins_where_it_applies():
-    """Both paths accept a plain MLP, so they must agree on it."""
+def test_sparse_delta_matches_site_on_mlp():
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 3))
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -261,11 +260,11 @@ def test_sparse_delta_still_wins_where_it_applies():
     torch.testing.assert_close(from_sparse.reshape(-1), from_site.reshape(-1), rtol=1e-5, atol=1e-6)
 
 
-def test_subspace_step_on_a_conv_model_matches_the_materializing_path():
+def test_conv_subspace_step_matches_materializing_path():
     """Per-layer blocks map to one parameter, so the site argument holds in
     coordinate space; the offset is relative to the barycentre the weights carry.
     """
-    from polystep import HybridSubspace, ParamLayout
+    from polystep import HybridSubspace
 
     def build(register):
         torch.manual_seed(0)
@@ -292,7 +291,7 @@ def test_subspace_step_on_a_conv_model_matches_the_materializing_path():
     torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=1e-5, atol=1e-5)
 
 
-def test_the_stateless_paths_score_a_repacked_model_blind():
+def test_stateless_paths_score_repacked_model_blind():
     """On a repacked model the stateless paths score every candidate blind: one
     loss for all candidates, and no error. The in-place site path writes the packed
     storage, so it tells them apart.
@@ -333,7 +332,7 @@ def test_the_stateless_paths_score_a_repacked_model_blind():
 @pytest.mark.parametrize(
     "subspace, block_strategy", [(False, "monolithic"), (True, "monolithic"), (False, "per_layer")]
 )
-def test_forced_inplace_keeps_only_the_in_place_site_path(subspace, block_strategy):
+def test_forced_inplace_keeps_only_inplace_site(subspace, block_strategy):
     """``use_inplace=True`` is a correctness contract: the stateless paths score
     through ``functional_call`` and must step aside, in full space and subspace,
     leaving only the site path that writes the real weights. It is built once, and
@@ -370,7 +369,7 @@ def test_forced_inplace_keeps_only_the_in_place_site_path(subspace, block_strate
 
 
 @pytest.mark.parametrize("kind, width", [(nn.Embedding, 12), (nn.EmbeddingBag, 4)])
-def test_forced_inplace_on_a_max_norm_embedding_matches_the_default_path(kind, width):
+def test_inplace_max_norm_embedding_matches_default(kind, width):
     """A ``max_norm`` lookup renormalizes rows inside the forward; that write must not
     carry from one candidate into the next.
     """
@@ -392,7 +391,7 @@ def test_forced_inplace_on_a_max_norm_embedding_matches_the_default_path(kind, w
     torch.testing.assert_close(weights[0], weights[1], atol=1e-5, rtol=0)
 
 
-def test_forced_inplace_restores_a_max_norm_embedding_after_a_raising_loss():
+def test_inplace_raise_restores_max_norm_rows():
     """A step that raises mid-sweep must leave every renormalized row as it was."""
     model = nn.Embedding(2, 4, max_norm=1.0)
     with torch.no_grad():
@@ -415,8 +414,7 @@ def test_forced_inplace_restores_a_max_norm_embedding_after_a_raising_loss():
     assert torch.equal(model.weight, before)
 
 
-def test_swapping_back_to_an_unforced_evaluator_rearms():
-    """Swapping back to an unforced evaluator must rebuild the fast paths."""
+def test_unforced_evaluator_swap_rearms_fast_paths():
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 3))
     loss_fn = nn.CrossEntropyLoss()  # one instance, so the cache key would not move
@@ -429,8 +427,8 @@ def test_swapping_back_to_an_unforced_evaluator_rearms():
     assert opt._sparse_delta_evaluator is not None or opt._site_vmap_evaluator is not None
 
 
-def test_forced_inplace_disarms_the_factored_low_rank_path():
-    """The factored low-rank path is stateless too; forced in-place must disarm it."""
+def test_forced_inplace_disarms_factored_low_rank():
+    """The factored low-rank path is stateless too."""
     from polystep import FactoredSubspace
 
     torch.manual_seed(0)
@@ -449,7 +447,7 @@ def test_forced_inplace_disarms_the_factored_low_rank_path():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_the_in_place_site_matches_the_full_swap(dtype):
+def test_inplace_site_matches_full_swap(dtype):
     """Writing only a candidate's entries scores exactly what swapping in all of its
     weights scores, and the model ends holding the incumbent.
     """
@@ -482,7 +480,7 @@ def test_the_in_place_site_matches_the_full_swap(dtype):
     torch.testing.assert_close(layout.flatten(model).reshape(-1), flat, rtol=0, atol=0)
 
 
-def test_the_in_place_site_keeps_float64_resolution():
+def test_inplace_site_keeps_float64_resolution():
     """FP32 loss buffers collapse candidates that differ below FP32 resolution."""
     model = nn.Sequential(nn.Linear(2, 1)).double()
     with torch.no_grad():
@@ -505,7 +503,7 @@ def test_the_in_place_site_keeps_float64_resolution():
 
 
 @pytest.mark.parametrize("projection", ["dense", "sparse", "unprojected"])
-def test_the_in_place_subspace_site_matches_the_full_swap(projection):
+def test_inplace_subspace_site_matches_full_swap(projection):
     """Rewriting one spec's parameter from the incumbent, at a column past the spec's
     first, matches reconstructing every weight from the base. Dropout stays off while
     scoring, and the model ends holding the incumbent in train mode.
@@ -551,7 +549,7 @@ def test_the_in_place_subspace_site_matches_the_full_swap(projection):
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_the_in_place_site_declines_what_it_cannot_write():
+def test_inplace_site_declines_unwritable_sites():
     """A non-contiguous parameter has no flat view to write into, and an FP16/BF16
     subspace weight must be rebuilt from the base, so those sites take the dense path
     while the others stay in place.
@@ -580,7 +578,7 @@ def test_the_in_place_site_declines_what_it_cannot_write():
 
 
 @pytest.mark.parametrize("back", [torch.bfloat16, torch.float32])
-def test_a_half_in_place_hybrid_step_builds_no_incumbent(monkeypatch, back):
+def test_half_inplace_step_builds_no_incumbent(monkeypatch, back):
     """The in-place site declines every FP16/BF16 spec, so a step whose specs are all
     BF16 must not build an incumbent weight set that nothing reads, whatever dtype the
     buffers carry. An FP32 spec is still written in place and reads the incumbent."""
@@ -611,7 +609,7 @@ def test_a_half_in_place_hybrid_step_builds_no_incumbent(monkeypatch, back):
     assert bool(calls) == (back is torch.float32)
 
 
-def test_a_forward_vmap_cannot_batch_falls_back_instead_of_crashing():
+def test_unbatchable_forward_falls_back_to_loop():
     """An ``.item()`` on a batched activation makes vmap fail; the site path must
     fall back to a sequential loop, not crash.
     """
@@ -642,7 +640,7 @@ def test_a_forward_vmap_cannot_batch_falls_back_instead_of_crashing():
 
 
 @pytest.mark.parametrize("compile_vmap", [False, True])
-def test_a_noisy_forward_stays_batched(compile_vmap):
+def test_noisy_forward_stays_batched(compile_vmap):
     """vmap refuses a per-forward noise draw under randomness='error'; both paths
     retry with a draw per candidate and stay batched, compiled or not, so identical
     candidates score differently.
@@ -685,7 +683,7 @@ class CountingNoisyMLP(NoisyMLP):
         return super().forward(x) * self.calls
 
 
-def test_a_noisy_retry_rewinds_buffers_the_refused_forward_wrote():
+def test_noisy_retry_rewinds_refused_forward_buffers():
     torch.manual_seed(0)
     model = CountingNoisyMLP()
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -718,7 +716,7 @@ def test_a_noisy_retry_rewinds_buffers_the_refused_forward_wrote():
     assert model.calls.item() == 2
 
 
-def _dense_reference(site, projections, bary_sd, spec, col_start, dcoords):
+def _dense_reference(projections, bary_sd, spec, col_start, dcoords):
     """The full-width formulation the block-diagonal bmm replaces."""
     n_groups, n_cand, pdim = dcoords.shape
     n = n_groups * n_cand
@@ -739,7 +737,7 @@ def _dense_reference(site, projections, bary_sd, spec, col_start, dcoords):
 
 @pytest.mark.parametrize(("dtype", "sparse_dtype"), [(torch.float32, torch.float64), (torch.bfloat16, torch.float32)])
 @pytest.mark.parametrize("projection_type", ["dense", "sparse", "unprojected"])
-def test_the_block_diagonal_correction_matches_the_dense_one(projection_type, dtype, sparse_dtype):
+def test_block_diagonal_correction_matches_dense(projection_type, dtype, sparse_dtype):
     """Only pdim columns per group are nonzero, so building the site from those
     columns alone, past the spec's first column and around a nonzero incumbent, must
     match the full-width ``dcoords @ P.t()``: a bmm for a dense projection, a
@@ -788,7 +786,7 @@ def test_the_block_diagonal_correction_matches_the_dense_one(projection_type, dt
     expected = site._vmap_over_site(
         spec.entry_key,
         bary_sd,
-        _dense_reference(site, projections, bary_sd, spec, col, dcoords),
+        _dense_reference(projections, bary_sd, spec, col, dcoords),
         inputs,
         targets,
     )
@@ -800,7 +798,7 @@ def test_the_block_diagonal_correction_matches_the_dense_one(projection_type, dt
     torch.testing.assert_close(got, expected, rtol=tol, atol=tol)
 
 
-def test_a_half_precision_site_holds_the_weights_reconstruct_batch_builds(monkeypatch):
+def test_half_site_holds_reconstruct_batch_weights(monkeypatch):
     """A BF16 bias of 1 at coordinate 0.003 stores 1, so the 0.002 step to a candidate
     at 0.005 vanishes when added to the stored incumbent, while the base plus 0.005
     rounds up to 1.0078125. The site must hold what ``reconstruct_batch`` builds from
@@ -836,7 +834,7 @@ def test_a_half_precision_site_holds_the_weights_reconstruct_batch_builds(monkey
     assert scored["0.bias"].unique().tolist() == [1.0, 1.0078125]
 
 
-def test_a_half_precision_subspace_step_matches_the_materializing_path():
+def test_half_subspace_step_matches_materializing_path():
     """The shared BF16 weights must round as the candidates do: a fused ``addmm``
     rounds once where the candidates round twice, so the two paths would score the
     same candidate differently and could swap a ranking.
@@ -862,7 +860,7 @@ def test_a_half_precision_subspace_step_matches_the_materializing_path():
     assert fast == dense
 
 
-def test_release_evaluator_drops_the_cast_batch_the_site_path_reaches():
+def test_release_evaluator_drops_site_cast_batch():
     """The site path casts through its owner evaluator and keeps it across a release,
     so the release has to drop the owner's cast copy of the batch as well."""
     from polystep import HybridSubspace
@@ -879,3 +877,231 @@ def test_release_evaluator_drops_the_cast_batch_the_site_path_reaches():
     assert evaluator._cast_cache is not None
     opt.release_evaluator()
     assert evaluator._cast_cache is None
+
+
+def test_compiled_site_tracks_base_and_batch(monkeypatch):
+    # Dynamo's eager backend checks graph guards without requiring a C++ toolchain.
+    compile_fn = torch.compile
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: compile_fn(fn, backend="eager", fullgraph=True))
+    model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2))
+    owner = NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_vmap=True)
+    site_ev = SiteVmapEvaluator.try_build(owner, ParamLayout.from_module(model))
+    base = {k: v.detach().clone() for k, v in model.named_parameters()}
+    key = "2.weight"
+    for batch in (5, 3):
+        x, y = torch.randn(batch, 3), torch.randint(0, 2, (batch,))
+        base["0.weight"].add_(0.2)
+        candidates = base[key].unsqueeze(0) + torch.randn(3, *base[key].shape) * 0.1
+        got = site_ev._vmap_over_site(key, base, candidates, x, y)
+        expected = torch.stack(
+            [
+                nn.functional.cross_entropy(torch.func.functional_call(model, {**base, key: p}, (x,)), y)
+                for p in candidates
+            ]
+        )
+        torch.testing.assert_close(got, expected)
+    assert set(site_ev._compiled_sites) == {key}
+    assert not site_ev._compile_failed_sites
+
+
+def test_mixed_dtype_site_skips_unrelated_scalar_cast():
+    class Mixed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones((), dtype=torch.float64))
+            self.weight = nn.Parameter(torch.randn(2, 3))
+
+        def forward(self, x):
+            return (x @ self.weight.t()).double() * self.scale
+
+    model = Mixed()
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    site_ev = SiteVmapEvaluator.try_build(ev, ParamLayout.from_module(model))
+    base = dict(model.named_parameters())
+    site = base["weight"][None].expand(2, -1, -1)
+    x, y = torch.randn(4, 3), torch.randn(4, 2, dtype=torch.float64)
+    got = site_ev._vmap_over_site("weight", base, site, x, y)
+    torch.testing.assert_close(got, nn.functional.mse_loss(model(x), y).expand(2))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_grouped_site_casts_past_float32_buffer(dtype):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(2, 2).to(dtype)
+            self.register_buffer("extra", torch.zeros(()))
+
+        def forward(self, x):
+            return self.fc(x) + self.extra
+
+    torch.manual_seed(0)
+    model, loss_fn = Model(), nn.MSELoss()
+    x, y = torch.randn(8, 2), torch.randn(8, 2)
+    opt = PolyStepOptimizer(model, block_strategy="grouped", seed=0)
+    opt.register_evaluator(NNCostEvaluator(model, loss_fn), x, y)
+    with torch.no_grad():
+        loss = opt.step(lambda *_: loss_fn(model(x.to(dtype)).float(), y))
+    assert torch.isfinite(torch.as_tensor(loss)).all()
+    assert model.fc.weight.dtype is dtype
+
+
+def test_reregister_rebuilds_site_evaluator_and_owner():
+    model = nn.Sequential(nn.Linear(3, 2))
+    opt = PolyStepOptimizer(model)
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    x, y = torch.randn(4, 3), torch.randn(4, 2)
+    opt.register_evaluator(ev, x, y)
+    old = opt._site_vmap_evaluator
+    ev.reset_vmap()
+    opt.register_evaluator(ev, x, y)
+    assert opt._site_vmap_evaluator is not old
+    replacement = NNCostEvaluator(model, ev.loss_fn, compile_vmap=True)
+    opt.register_evaluator(replacement, x, y)
+    assert opt._site_vmap_evaluator._owner is replacement
+
+
+@pytest.mark.parametrize("block_strategy, screen", [("monolithic", False), ("monolithic", True), ("per_layer", False)])
+def test_materialized_fallback_honours_chunk_size(block_strategy, screen):
+    """The site path rounds its stride to whole groups; the dense fallback keeps the user's cap."""
+    model = nn.Sequential(nn.Linear(2, 2))
+    opt = PolyStepOptimizer(
+        model,
+        particle_dim=3,
+        chunk_size=1,
+        multifidelity_screen=screen,
+        block_strategy=block_strategy,
+        solver="softmax",
+        compile=False,
+        seed=0,
+    )
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    x, y = torch.randn(4, 2), torch.randn(4, 2)
+    opt.register_evaluator(ev, x, y)
+    rows = []
+
+    def closure(params):
+        rows.append(next(iter(params.values())).shape[0])
+        return ev.evaluate(params, x, y)
+
+    opt.step(closure, screen_closure=closure if screen else None)
+    assert rows and max(rows) == 1
+    assert torch.isfinite(opt.state.X).all()
+
+
+@pytest.mark.parametrize("route", ["monolithic", "per_layer", "hybrid"])
+def test_site_chunk_budgets_downstream_activations(route):
+    from polystep.hybrid_subspace import HybridSubspace
+
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        nn.Conv2d(1, 4, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(4), nn.Flatten(), nn.Linear(64, 8)
+    )
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=3) if route == "hybrid" else None
+    block_strategy = "per_layer" if route == "per_layer" else "monolithic"
+    opt = PolyStepOptimizer(
+        model, subspace=subspace, block_strategy=block_strategy, solver="softmax", compile=False, seed=0
+    )
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+    x, y = torch.randn(64, 1, 64, 64), torch.randint(0, 8, (64,))
+    opt.register_evaluator(ev, x, y)
+    head = 64 * 8 / x.numel()
+    assert opt._act_ratios == {None: 4.0, "0.weight": 4.0, "0.bias": 4.0, "4.weight": head, "4.bias": head}
+    assert not any(m._forward_hooks or m._forward_pre_hooks for m in model.modules())
+
+    site = opt._site_vmap_evaluator
+    rows = {}
+    inner = site._vmap_over_site
+
+    def spy(key, base_sd, candidates, inputs, targets):
+        rows.setdefault(key, []).append(candidates.shape[0])
+        return inner(key, base_sd, candidates, inputs, targets)
+
+    site._vmap_over_site = spy
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    conv_chunk = max(rows["0.weight"])
+    assert 2 * 4 * x.numel() * conv_chunk <= 1 << 26
+    assert max(rows["4.weight"]) > conv_chunk
+
+
+def test_site_budget_unexecuted_module_uses_global_max():
+    from polystep._step_core import activation_elements
+
+    class Functional(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(1, 4, 3, padding=1)
+            self.head = nn.Linear(4, 2)
+
+        def forward(self, x):
+            return nn.functional.linear(self.conv(x).mean((2, 3)), self.head.weight, self.head.bias)
+
+    model = Functional()
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    x = torch.randn(8, 1, 16, 16)
+    opt.register_evaluator(NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False), x, torch.zeros(8).long())
+    assert "head.weight" not in opt._act_ratios
+    assert activation_elements(opt, x, "head.weight") == activation_elements(opt, x) == 4 * x.numel()
+
+
+class InputNoise(nn.Module):
+    def forward(self, x):
+        return x + 0.01 * torch.randn_like(x)
+
+
+def test_site_budget_random_forward_uses_global_max():
+    model = nn.Sequential(InputNoise(), nn.Linear(4, 8), nn.Linear(8, 2))
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    x = torch.randn(8, 4)
+    opt.register_evaluator(NNCostEvaluator(model, nn.MSELoss(), use_inplace=False), x, torch.zeros(8, 2))
+    assert opt._act_ratios == {None: 2.0}
+
+
+@pytest.mark.parametrize(
+    "layer, ratios",
+    [("relu", {None: 2.0, "0.weight": 2.0, "0.bias": 2.0, "2.weight": 0.5, "2.bias": 0.5}), ("linear", None)],
+    ids=["relu", "linear"],
+)
+def test_site_budget_scripted_submodule_skips_hooks(layer, ratios):
+    layers = [nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)]
+    i = {"linear": 0, "relu": 1}[layer]
+    layers[i] = torch.jit.script(layers[i])
+    model = nn.Sequential(*layers)
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    x, y = torch.randn(16, 4), torch.zeros(16, 2)
+    opt.register_evaluator(ev, x, y)
+    assert opt._act_ratios == ratios
+    assert not any(
+        m._forward_hooks or m._forward_pre_hooks for m in layers if not isinstance(m, torch.jit.ScriptModule)
+    )
+    opt.step(lambda p: ev.evaluate(p, x, y))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("noise", [nn.Identity, InputNoise])
+def test_site_chunk_peak_within_budget(noise):
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        noise(), nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(4), nn.Flatten(), nn.Linear(128, 8)
+    ).cuda()
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+    x, y = torch.randn(64, 1, 64, 64, device="cuda"), torch.randint(0, 8, (64,), device="cuda")
+    opt.register_evaluator(ev, x, y)
+    site = opt._site_vmap_evaluator
+    inner = site._vmap_over_site
+    peaks = {}
+
+    def spy(key, base_sd, candidates, inputs, targets):
+        torch.cuda.reset_peak_memory_stats()
+        start = torch.cuda.memory_allocated()
+        out = inner(key, base_sd, candidates, inputs, targets)
+        peaks[key] = max(peaks.get(key, 0), torch.cuda.max_memory_allocated() - start)
+        return out
+
+    site._vmap_over_site = spy
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    assert set(peaks) == {"1.weight", "1.bias", "5.weight", "5.bias"}
+    assert max(peaks.values()) <= 1.05 * 4 * (1 << 26)

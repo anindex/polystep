@@ -3,7 +3,9 @@
 import torch
 import pytest
 
+from polystep.costs import resolve_cost_scale
 from polystep.solvers import SinkhornSolver
+from polystep.solvers._shared import recenter_cost
 
 
 class TestSinkhornSolver:
@@ -31,7 +33,6 @@ class TestSinkhornSolver:
         """Identity cost matrix should produce near-diagonal transport plan."""
         torch.manual_seed(42)
         n = 5
-        C = torch.eye(n) * 0.0
         C = 1.0 - torch.eye(n)  # 0 on diagonal, 1 off-diagonal
 
         solver = SinkhornSolver(
@@ -43,7 +44,7 @@ class TestSinkhornSolver:
         result = solver.solve(C)
 
         P = result.matrix
-        # Diagonal should dominate: P_ii > 0.5 / n for each i
+        # Diagonal dominates every off-diagonal entry.
         diag = torch.diag(P)
         off_diag_max = (P - torch.diag(diag)).max()
         assert diag.min() > off_diag_max, (
@@ -68,7 +69,6 @@ class TestSinkhornSolver:
         assert torch.allclose(P.sum(dim=1), a, atol=1e-3), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
 
     def test_entropic_cost_finite(self):
-        """Entropic regularized cost should be finite."""
         torch.manual_seed(42)
         C = torch.rand(10, 8)
 
@@ -78,7 +78,6 @@ class TestSinkhornSolver:
 
 
 def test_warmstart_shape_mismatch_warns():
-    """Sinkhorn should warn when warm-start duals have wrong shape."""
     solver = SinkhornSolver(threshold=1e-3, max_iterations=10)
     cost = torch.rand(5, 8)
     wrong_f = torch.zeros(99)  # wrong shape, should be (5,)
@@ -110,7 +109,7 @@ def test_invalid_marginal_raises(a):
 class TestSharedIteration:
     """Both modes run ``_sinkhorn_iteration``, and the check reports the plan's marginal error."""
 
-    def test_convergence_loop_runs_the_shared_iteration(self):
+    def test_convergence_loop_runs_shared_iteration(self):
         torch.manual_seed(0)
         solver = SinkhornSolver(epsilon=0.1, threshold=1e-6, check_every=5)
         calls = []
@@ -133,7 +132,7 @@ class TestSharedIteration:
             {"anderson_depth": 3, "check_every": 1, "max_iterations": 6},
         ],
     )
-    def test_reported_error_matches_the_plan_marginals(self, kwargs):
+    def test_reported_error_matches_plan_marginals(self, kwargs):
         torch.manual_seed(0)
         n, m = 12, 7
         C = torch.rand(n, m, dtype=torch.float64)
@@ -153,7 +152,7 @@ class TestSharedIteration:
         assert not result.converged
         assert torch.isfinite(result.f).all() and torch.isfinite(result.g).all()
 
-    def test_duals_near_the_float32_limit_are_kept(self):
+    def test_duals_near_float32_limit_kept(self):
         C = torch.tensor([[1.8255e36, 1.5541e38, 6.1981e37, 2.3055e37], [1.8135e38, 8.4998e37, 2.8427e38, 3.5292e37]])
         result = SinkhornSolver(epsilon=1.7183182677327684e38, threshold=1e-6).solve(C)
         assert result.converged
@@ -288,7 +287,7 @@ class TestAndersonAcceleration:
             ({"adaptive_omega": True}, (10, 8), 2000),
         ],
     )
-    def test_acceleration_knobs_reach_the_same_fixed_point(self, override, shape, max_iterations):
+    def test_acceleration_knobs_reach_same_fixed_point(self, override, shape, max_iterations):
         """Acceleration may change the path to the optimum, never the optimum."""
         torch.manual_seed(42)
         n, m = shape
@@ -336,6 +335,17 @@ class TestAndersonAcceleration:
         P = result.matrix
         assert torch.isfinite(P).all(), f"noise={noise}: Transport matrix contains NaN or Inf"
 
+    def test_anderson_acceleration_reduces_iterations(self):
+        """The update subtracts dX+dR; subtracting dX alone is worse than no acceleration."""
+        torch.manual_seed(0)
+        cost = torch.rand(20, 30) * 5.0
+        kwargs = dict(epsilon=0.05, max_iterations=400, threshold=1e-7, check_every=1)
+        plain = SinkhornSolver(anderson_depth=0, **kwargs).solve(cost)
+        accelerated = SinkhornSolver(anderson_depth=3, **kwargs).solve(cost)
+
+        assert plain.converged and accelerated.converged
+        assert accelerated.n_iters < plain.n_iters
+
 
 def test_ill_conditioned_stays_finite():
     """On a stiff cost the divergence back-off latches, so adaptive omega
@@ -369,7 +379,7 @@ class TestFixedModeLogic:
     adaptive omega.
     """
 
-    def test_check_every_exceeds_max_iterations_uses_eager_path(self):
+    def test_large_check_every_uses_eager_path(self):
         """When check_every > max_iterations but threshold > 0, solver uses eager path.
 
         The eager (convergence-checking) path produces valid transport plans and
@@ -478,3 +488,40 @@ class TestFixedModeLogic:
 
         anderson_warnings = [x for x in w if "anderson_depth" in str(x.message) and "fixed-iteration" in str(x.message)]
         assert len(anderson_warnings) == 1, f"Expected 1 Anderson fixed-mode warning, got {len(anderson_warnings)}"
+
+
+@pytest.mark.parametrize("scale_cost", [None, "mean", "max_cost", 2.0])
+def test_sinkhorn_ent_reg_cost_in_caller_frame(scale_cost):
+    C = torch.tensor([[0.0, 3.0, 1.0, 2.0], [2.0, 0.0, 4.0, 1.0], [1.0, 2.0, 0.0, 3.0]])
+    solver = SinkhornSolver(epsilon=0.5, max_iterations=5000, threshold=1e-13)
+    result = solver.solve(cost_matrix=C.clone(), scale_cost=scale_cost)
+
+    # Solving the scaled problem at eps is the raw problem at eps * divisor.
+    divisor = float(resolve_cost_scale(recenter_cost(C.clone())[0], scale_cost))
+    P = result.matrix
+    entropy = -(P * (P.clamp(min=1e-30).log() - 1)).sum()
+    expected = (C * P).sum() - 0.5 * divisor * entropy
+
+    assert result.ent_reg_cost == pytest.approx(expected.item(), rel=1e-5)
+
+
+class TestSinkhornMarginalBalance:
+    @pytest.mark.parametrize("b", [torch.tensor([1.0]), None], ids=["both", "a_only"])
+    def test_warns_on_unequal_total_mass(self, b):
+        """Balanced OT with sum(a) != sum(b) is infeasible; warn instead of
+        silently reporting converged."""
+        C = torch.zeros(2, 1)
+        with pytest.warns(UserWarning, match="unequal total mass"):
+            SinkhornSolver(epsilon=0.5, max_iterations=50).solve(C, a=torch.tensor([1.0, 1.0]), b=b)
+
+    def test_no_warning_on_uniform_marginals(self):
+        """The hot path (a=b=None uniform) must never trip the balance warning."""
+        import warnings
+
+        C = torch.rand(4, 6)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = SinkhornSolver(epsilon=0.5, max_iterations=50).solve(C)
+
+        assert caught == [], [str(w.message) for w in caught]
+        torch.testing.assert_close(result.matrix.sum(dim=1), torch.full((4,), 0.25))

@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import torch
 
-from experiments.runners.common import SEEDS, save_result, set_seed, track_gpu_memory
+from experiments.runners.common import RESULTS_DIR, SEEDS, save_result, set_seed, track_gpu_memory
+from experiments.runners.hardened_env import HARDENED_GYM_IDS, register_hardened_envs
 from polystep import PolyStepOptimizer
 from polystep.baselines import centered_rank
 from polystep.benchmarks.rl.gym_evaluator import _is_goal_reaching
@@ -38,27 +39,6 @@ from polystep.epsilon import CosineEpsilon, PowerDecay
 from experiments.runners.fairness import THEORY_GAMMA, THEORY_JITTER
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
-
-
-DEFAULT_RESULTS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "results",
-    "softmax",
-    "rl",
-)
-
-
-class CountingClosure:
-    """Wrap a PolyStep closure and count candidate policy evaluations."""
-
-    def __init__(self, closure):
-        self.closure = closure
-        self.count = 0
-
-    def __call__(self, stacked_params):
-        losses = self.closure(stacked_params)
-        self.count += int(losses.shape[0])
-        return losses
 
 
 # Eval-seed offsets for multi_seed_summary()'s final-return confidence intervals.
@@ -166,24 +146,6 @@ def _sb3_periodic_eval_callback(
     return _PeriodicEval(), curve
 
 
-CARTPOLE_POLYSTEP_FINAL_CONFIG: dict[str, Any] = {
-    "steps": 200,
-    "rollouts_per_candidate": 32,
-    "horizon": CARTPOLE_HORIZON,
-    "hidden": 16,
-    "subspace_rank": 4,
-    "epsilon_init": 2.0,
-    "epsilon_target": 0.3,
-    "step_radius": 0.1,
-    "probe_radius": 1.5,
-    # Required by the convergence analysis; forces amortize_steps=1 in
-    # PolyStepOptimizer.__init__.
-    "amortize_steps": 1,
-    "max_subspace_dim": 24,
-    "selected_from": "hyperparameter sweep",
-}
-
-
 def run_random_cartpole(
     *,
     seed: int,
@@ -214,28 +176,21 @@ def run_random_cartpole(
         seed,
         metrics,
         {"eval_episodes": eval_episodes, "horizon": horizon, "action_selection": "uniform_random"},
-        results_dir=results_dir or DEFAULT_RESULTS_DIR,
+        results_dir=results_dir or RESULTS_DIR,
     )
 
 
 def _run_cartpole_polystep_full(*, seed: int, device: str, results_dir: str, args) -> None:
-    config = CARTPOLE_POLYSTEP_FINAL_CONFIG.copy()
     run_polystep_gym(
         env_short="cartpole",
         seed=seed,
         device=device,
-        steps=args.steps or config["steps"],
-        rollouts_per_candidate=args.rollouts_per_candidate or config["rollouts_per_candidate"],
-        horizon=args.horizon or config["horizon"],
-        hidden=args.hidden or config["hidden"],
-        subspace_rank=config["subspace_rank"],
-        epsilon_init=config["epsilon_init"],
-        epsilon_target=config["epsilon_target"],
-        step_radius=config["step_radius"],
-        probe_radius=args.probe_radius if args.probe_radius is not None else config["probe_radius"],
-        probe_radius_jitter=config.get("probe_radius_jitter", 0.05),
-        amortize_steps=config["amortize_steps"],
-        max_subspace_dim=args.max_subspace_dim or config.get("max_subspace_dim"),
+        steps=args.steps,
+        rollouts_per_candidate=args.rollouts_per_candidate or 32,
+        horizon=args.horizon,
+        hidden=args.hidden,
+        probe_radius=args.probe_radius,
+        max_subspace_dim=args.max_subspace_dim,
         results_dir=results_dir,
         theory_mode=getattr(args, "theory_mode", False),
     )
@@ -292,26 +247,18 @@ GYM_ENV_REGISTRY: dict[str, dict[str, Any]] = {
 
 
 # Hardened-env variants: quantized obs + bucketed reward via hardened_env.py.
-def _register_hardened_envs_if_needed() -> None:
-    try:
-        from experiments.runners.hardened_env import register_hardened_envs
-    except Exception:  # pragma: no cover - keep import guard cheap
-        return
-    register_hardened_envs()
-
-
-_register_hardened_envs_if_needed()
+register_hardened_envs()
 
 # Hardened entries inherit the vanilla parent config but use lower scoring
 # anchors (bucketed sparse reward).
 _HARDENED_OVERRIDES = {
-    "cartpole_hard": dict(env_id="CartPoleHard-v1", random_return=18.0, reference_return=475.0),
-    "acrobot_hard": dict(env_id="AcrobotHard-v1", random_return=-500.0, reference_return=-90.0),
+    "cartpole_hard": dict(random_return=18.0, reference_return=475.0),
+    "acrobot_hard": dict(random_return=-500.0, reference_return=-90.0),
 }
 for _short, _ovr in _HARDENED_OVERRIDES.items():
     _parent = _short.replace("_hard", "")
     _entry = dict(GYM_ENV_REGISTRY[_parent])
-    _entry.update(_ovr)
+    _entry.update(_ovr, env_id=HARDENED_GYM_IDS[_short])
     _entry["short"] = _short
     GYM_ENV_REGISTRY[_short] = _entry
 
@@ -476,8 +423,6 @@ def run_polystep_gym(
         step = optimizer.state.iteration_count if optimizer.state is not None else len(step_logs)
         return evaluator.loss_for_stacked_params(stacked_params, seed=seed, step=step)
 
-    counted = CountingClosure(closure)
-
     # Step-0 anchor.
     init_summary = evaluator.summarize_stacked_params(
         stack_module_params(model, 1),
@@ -503,7 +448,7 @@ def run_polystep_gym(
     with track_gpu_memory() as mem:
         for step in range(1, total_steps + 1):
             step_start = time.time()
-            optimizer.step(counted)
+            optimizer.step(closure)
             step_wall = time.time() - step_start
 
             if step == 1 or step == total_steps or step % eval_interval == 0:
@@ -527,7 +472,7 @@ def run_polystep_gym(
                         "loss": -mean_return,
                         "time": time.time() - start,
                         "step_wall_time": step_wall,
-                        "candidates_evaluated": counted.count,
+                        "candidates_evaluated": optimizer.candidate_evals,
                         "env_steps_cumulative": evaluator.env_steps,
                     }
                 )
@@ -552,7 +497,7 @@ def run_polystep_gym(
         normalized_score=_gym_normalized_score(env_short, final_summary["mean_return"]),
         wall_time_seconds=time.time() - start,
         peak_gpu_memory_mb=mem["peak_gpu_memory_mb"],
-        function_evals=counted.count,
+        function_evals=optimizer.candidate_evals,
         total_steps=total_steps,
         rl_env_steps=evaluator.env_steps,
         success_rate=final_summary["success_rate"],
@@ -591,11 +536,11 @@ def run_polystep_gym(
         },
         epoch_logs=epoch_logs,
         step_logs=step_logs,
-        results_dir=results_dir or DEFAULT_RESULTS_DIR,
+        results_dir=results_dir or RESULTS_DIR,
     )
     if hasattr(evaluator, "close"):
         evaluator.close()
-    return counted.count
+    return optimizer.candidate_evals
 
 
 def run_random_gym(
@@ -645,7 +590,7 @@ def run_random_gym(
             "horizon": horizon,
             "action_selection": "uniform_random",
         },
-        results_dir=results_dir or DEFAULT_RESULTS_DIR,
+        results_dir=results_dir or RESULTS_DIR,
     )
 
 
@@ -777,7 +722,7 @@ def run_sb3_gym(
         },
         epoch_logs=[{"epoch": c["epoch"], "accuracy": 0.0, "loss": c["loss"], "time": c["time"]} for c in curve],
         step_logs=curve,
-        results_dir=results_dir or DEFAULT_RESULTS_DIR,
+        results_dir=results_dir or RESULTS_DIR,
     )
 
 
@@ -1058,28 +1003,13 @@ def run_es_gym(
             {"epoch": r["step"], "accuracy": r["accuracy"], "loss": r["loss"], "time": r["time"]} for r in step_logs
         ],
         step_logs=step_logs,
-        results_dir=results_dir or DEFAULT_RESULTS_DIR,
+        results_dir=results_dir or RESULTS_DIR,
     )
     if hasattr(evaluator, "close"):
         evaluator.close()
 
 
-# Method dispatch tables for new envs (DQN excluded for LunarLander per plan).
-_ACROBOT_METHODS = {"polystep", "random_policy", "dqn", "ppo", "es"}
-_LUNARLANDER_METHODS = {"polystep", "random_policy", "ppo", "es"}
-# Hardened-env method sets mirror their vanilla parents.
-_HARDENED_METHODS = {
-    "cartpole_hard": {"polystep", "random_policy", "dqn", "ppo", "es"},
-    "acrobot_hard": _ACROBOT_METHODS,
-}
-
-_CARTPOLE_METHODS = {
-    "polystep",
-    "random_policy",
-    "dqn",
-    "ppo",
-    "es",
-}
+RL_METHODS = {"polystep", "random_policy", "dqn", "ppo", "es"}
 
 
 def main() -> None:
@@ -1098,7 +1028,7 @@ def main() -> None:
     parser.add_argument("--methods", nargs="+", default=["polystep"])
     parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    parser.add_argument("--results-dir", default=RESULTS_DIR)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--hidden", type=int, default=None)
     parser.add_argument("--rollouts-per-candidate", type=int, default=None)
@@ -1132,13 +1062,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    def _done(method: str, seed: int) -> bool:
-        """True when this cell's result file already exists.
+    def _result_exists(method: str, seed: int) -> bool:
+        """True when this cell's result file exists.
 
-        Every other runner skips a finished cell and takes ``--force`` to override; this
-        one re-ran unconditionally, which is why the launcher had to list its jobs last
-        and could not resume them. The suffix mirrors how the writers name their files:
-        ``{env}_{method}[_nondiff_{mode}]_{seed}.json``.
+        The suffix mirrors the writers: ``{env}_{method}[_nondiff_{mode}]_{seed}.json``.
         """
         suffix = "" if args.nondiff_mode in (None, "float32") else f"_nondiff_{args.nondiff_mode}"
         path = os.path.join(args.results_dir, f"{args.env}_{method}{suffix}_{seed}.json")
@@ -1146,7 +1073,7 @@ def main() -> None:
 
     for seed in args.seeds:
         for method in args.methods:
-            if not args.force and _done(method, seed):
+            if not args.force and _result_exists(method, seed):
                 print(
                     f"[skip] {args.env}/{method}{'' if args.nondiff_mode in (None, 'float32') else '/' + args.nondiff_mode} seed={seed} (exists)"
                 )
@@ -1156,8 +1083,8 @@ def main() -> None:
             print(f"{'=' * 60}")
 
             if args.env == "cartpole":
-                if method not in _CARTPOLE_METHODS:
-                    raise ValueError(f"Unknown CartPole method: {method!r}. Valid: {sorted(_CARTPOLE_METHODS)}")
+                if method not in RL_METHODS:
+                    raise ValueError(f"Unknown CartPole method: {method!r}. Valid: {sorted(RL_METHODS)}")
                 if args.nondiff_mode != "float32":
                     if method == "polystep":
                         run_polystep_gym(
@@ -1211,15 +1138,14 @@ def main() -> None:
                         env_short="cartpole",
                         method=method,
                         seed=seed,
-                        total_timesteps=10_000 if args.mode == "sweep" else 1_000_000,
+                        total_timesteps=GYM_ENV_REGISTRY["cartpole"]["sb3_total_timesteps"][args.mode],
                         results_dir=args.results_dir,
                     )
 
             elif args.env in {"acrobot", "cartpole_hard", "acrobot_hard"}:
                 env_short = args.env
-                allowed = _HARDENED_METHODS.get(env_short, _ACROBOT_METHODS)
-                if method not in allowed:
-                    raise ValueError(f"Unknown {env_short} method: {method!r}. Valid: {sorted(allowed)}")
+                if method not in RL_METHODS:
+                    raise ValueError(f"Unknown {env_short} method: {method!r}. Valid: {sorted(RL_METHODS)}")
                 cfg = GYM_ENV_REGISTRY[env_short]
                 if method == "polystep":
                     run_polystep_gym(

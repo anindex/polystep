@@ -14,7 +14,6 @@ def get_orthoplex_vertices(
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
     radius: float = 1.0,
-    **kwargs,
 ) -> torch.Tensor:
     """``(2*dim, dim)``: the positive then negative unit vector along each axis."""
     eye = torch.eye(dim, dtype=dtype, device=device)
@@ -28,7 +27,6 @@ def get_simplex_vertices(
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
     radius: float = 1.0,
-    **kwargs,
 ) -> torch.Tensor:
     """``(dim+1, dim)``: a regular simplex centered at the origin."""
     points = math.sqrt(1 + 1 / dim) * torch.eye(dim, dtype=dtype, device=device)
@@ -47,7 +45,6 @@ def get_cube_vertices(
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
     radius: float = 1.0,
-    **kwargs,
 ) -> torch.Tensor:
     """``(2**dim, dim)``: every sign combination, normalized by ``sqrt(dim)``."""
     n_vertices = 2**dim

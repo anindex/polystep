@@ -26,6 +26,34 @@ class GymRolloutResult:
     successes: torch.Tensor  # (N, R) bool - "success" flag, env-specific
 
 
+class _StackedRolloutEvaluator:
+    """Loss and summary over ``rollout_stacked_params``, shared by the RL evaluators."""
+
+    def loss_for_stacked_params(
+        self,
+        stacked_params: Dict[str, torch.Tensor],
+        seed: int,
+        step: int,
+    ) -> torch.Tensor:
+        result = self.rollout_stacked_params(stacked_params, seed=seed, step=step)
+        self.env_steps += int(result.lengths.sum().item())
+        return -result.returns.mean(dim=1).to(dtype=torch.float32)
+
+    def summarize_stacked_params(
+        self,
+        stacked_params: Dict[str, torch.Tensor],
+        *,
+        seed: int,
+        step: int = 0,
+    ) -> Dict[str, float]:
+        result = self.rollout_stacked_params(stacked_params, seed=seed, step=step)
+        return {
+            "mean_return": float(result.returns.mean().item()),
+            "success_rate": float(result.successes.float().mean().item()),
+            "episode_length": float(result.lengths.mean().item()),
+        }
+
+
 def _make_vector_env(env_id: str, total_envs: int):
     """Create a SyncVectorEnv with ``total_envs`` instances of ``env_id``."""
 
@@ -68,7 +96,7 @@ def _batched_mlp_logits(
     return x
 
 
-class GymVectorEvaluator:
+class GymVectorEvaluator(_StackedRolloutEvaluator):
     """Vectorized evaluator for stacked discrete-action MLP policies on any Gymnasium env."""
 
     def __init__(
@@ -187,30 +215,6 @@ class GymVectorEvaluator:
             lengths=lengths.to(self.device),
             successes=successes.to(self.device),
         )
-
-    def loss_for_stacked_params(
-        self,
-        stacked_params: Dict[str, torch.Tensor],
-        seed: int,
-        step: int,
-    ) -> torch.Tensor:
-        result = self.rollout_stacked_params(stacked_params, seed=seed, step=step)
-        self.env_steps += int(result.lengths.sum().item())
-        return -result.returns.mean(dim=1).to(dtype=torch.float32)
-
-    def summarize_stacked_params(
-        self,
-        stacked_params: Dict[str, torch.Tensor],
-        *,
-        seed: int,
-        step: int = 0,
-    ) -> Dict[str, float]:
-        result = self.rollout_stacked_params(stacked_params, seed=seed, step=step)
-        return {
-            "mean_return": float(result.returns.mean().item()),
-            "success_rate": float(result.successes.float().mean().item()),
-            "episode_length": float(result.lengths.mean().item()),
-        }
 
 
 def random_policy_baseline(

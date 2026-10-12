@@ -12,11 +12,12 @@ import torch
 from ._compiled import normalize_rows
 from .cost_nn import SiteInplaceEvaluator, _reuse_prefixes
 from .solvers._shared import loss_buffer_dtype, recenter_and_scale, sanitize_cost, solver_health
-from .epsilon import feed_solver_stats, radius_epsilon_factor
+from .epsilon import feed_solver_stats, radius_epsilon_factor, resolve_epsilon
 from ._step_core import (
     activation_elements,
     check_losses,
     chunk_spans,
+    epsilon_jumped,
     invalidate_for_basis_change,
     record_saturation,
     site_bounds,
@@ -30,6 +31,17 @@ from .dynamics import (
     compute_momentum_coefficient,
 )
 from .geometry import apply_biased_rotation, get_random_rotation_matrices
+from .projection import SparseRandomProjection
+from .quadratic_model import (
+    apply_newton_refinement,
+    compute_newton_step,
+    compute_predicted_improvement,
+    extract_fd_gradient,
+    extract_fd_hessian_diag,
+    extract_fd_hessian_diag_centered,
+    extract_iso_curvature,
+    update_trust_region,
+)
 from .solvers.greedy import MinCostGreedySolver, TopKMeanSolver
 from .solvers.base import SolverResult
 
@@ -194,7 +206,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     iteration = state.iteration_count
     device = X.device
 
-    current_eps = opt._get_epsilon(iteration)
+    current_eps = resolve_epsilon(opt.epsilon, iteration, "epsilon")
     if opt.use_adaptive_radius:
         radius_mult = state.radius_multiplier
     else:
@@ -734,8 +746,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     ):
         # Negative means loss decreased.
         actual_improvement = torch.tensor([_center_value - opt._prev_pre_step_loss])
-        from .quadratic_model import update_trust_region
-
         opt._trust_region_multiplier = update_trust_region(
             opt._prev_predicted_improvement.sum(),
             actual_improvement,
@@ -749,14 +759,12 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         opt._prev_predicted_improvement = None
         opt._prev_pre_step_loss = None
 
-    ent_eps = opt._get_ent_epsilon(iteration)
+    ent_eps = resolve_epsilon(opt.ent_epsilon, iteration, "ent_epsilon")
     ot_epsilon = ent_eps if ent_eps is not None else current_eps
 
     # A >2x epsilon jump invalidates the dual-momentum history: the prev values were
     # measured at the old epsilon and extrapolate to a bad warm start.
-    if state.last_solve_eps is not None and (
-        ot_epsilon / state.last_solve_eps > 2.0 or state.last_solve_eps / ot_epsilon > 2.0
-    ):
+    if epsilon_jumped(state, ot_epsilon):
         state.prev_prev_f = None
         state.prev_prev_g = None
 
@@ -791,7 +799,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # state.costs tracks cost_matrix.mean, so the OT cost is unused here.
         ot_result = SolverResult(matrix=transport_matrix)
     else:
-        # prev_epsilon lets the solver rescale warm-started duals across an epsilon change.
         solve_kwargs = dict(
             cost_matrix=solve_cost,
             init_f=init_f_for_solve,
@@ -834,14 +841,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # Stale otherwise: adaptive_num_probe can drop K_eff to 1 mid-run.
         opt._newton_direction = None
     if (opt.biased_rotation or opt.trust_region) and _quad_ready:
-        from .quadratic_model import (
-            compute_newton_step,
-            extract_fd_gradient,
-            extract_fd_hessian_diag,
-            extract_fd_hessian_diag_centered,
-            extract_iso_curvature,
-        )
-
         _fd_grad = extract_fd_gradient(opt._losses_3d, probes, probe_r, pdim, None if _antithetic else polytope_verts)
         if _center_loss is None:
             _fd_hess = extract_fd_hessian_diag(opt._losses_3d, probes, probe_r, pdim)  # (P, pdim)
@@ -895,8 +894,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # Post-OT correction, ahead of momentum so the velocity carries it.
     X_target = X_bary
     if opt._newton_refinement and opt._losses_3d is not None and K_eff >= 2 and opt.polytope_type == "orthoplex":
-        from .quadratic_model import apply_newton_refinement
-
         X_refined = apply_newton_refinement(
             X_bary=X_bary,
             losses_3d=opt._losses_3d,
@@ -933,8 +930,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # state.X is final here, so the model scores the realized move, not a Newton step
     # that was never applied.
     if opt.trust_region and _fd_grad is not None and _center_loss is not None:
-        from .quadratic_model import compute_predicted_improvement
-
         realized_rot = torch.einsum("bij,bj->bi", rot_mats.transpose(-1, -2), state.X - X)
         # Rows are disjoint parameter blocks of one objective, not independent losses.
         opt._prev_predicted_improvement = compute_predicted_improvement(_fd_grad, _fd_hess, realized_rot).sum().detach()
@@ -955,9 +950,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         ]
     ).tolist()
     _fabricated = bool(_all_nonfinite)
-    if _all_nonfinite:
-        warn_all_nonfinite(opt)
     if _fabricated:
+        warn_all_nonfinite(opt)
         _cost_mean = _progress = float("inf")
     _converged = ot_result.converged and not _fabricated
     feed_solver_stats(opt._progressive_epsilon, opt.solver, ot_result.n_iters, _converged)
@@ -1026,8 +1020,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             # Zero rather than re-project: after a random redraw the bases are largely
             # uncorrelated, and the next OT solve finds a fresh descent direction.
             state.X = torch.zeros_like(state.X)
-            from .projection import SparseRandomProjection
-
             if isinstance(state.projection, SparseRandomProjection):
                 new_seed = state.projection.seed + state.absorb_count + 1000
                 state.projection = SparseRandomProjection(
@@ -1051,8 +1043,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 state.X.reshape(-1)[: adaptive_sub.subspace_dim],
             )
             state.X = torch.zeros_like(state.X)
-
-            from .projection import SparseRandomProjection
 
             if isinstance(state.projection, SparseRandomProjection):
                 new_seed = state.projection.seed + state.iteration_count

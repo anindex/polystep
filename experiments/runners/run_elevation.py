@@ -6,7 +6,7 @@ variant, and the six gradient-free baselines from ``polystep.baselines``.
 ``--fair`` gives every gradient-free method the same subspace, budget, and probe
 radius; ``--theory-mode`` runs the unaccelerated reference configuration.
 
-Results saved as: experiments/results/softmax/main/{showcase}_{method}_{seed}.json
+Results saved as: experiments/results/revision/{showcase}_{method}_{seed}.json
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import torch.nn as nn
 
 from experiments.runners.common import (
     METHOD_ALIASES,
+    RESULTS_DIR,
     SEEDS,
     reseed_loaders,
     evaluate_accuracy,
@@ -51,10 +52,12 @@ from experiments.baselines.sgd_baseline import train_sgd
 from experiments.runners.fairness import (
     build_polystep,
     FAIR_METHODS,
+    POLYSTEP_SELECTION_PATH,
     TestSplitTripwire,
     apply_point,
     apply_polystep_multipliers,
     apply_theory_mode,
+    fair_eval_budget,
     load_selection,
     make_subspace,
     minibatch_loss,
@@ -64,10 +67,6 @@ from experiments.runners.fairness import (
     run_baseline,
     subspace_tag,
 )
-
-#: tune_polystep.py writes here, not the shared baseline selection file.
-POLYSTEP_SELECTION_PATH = os.path.join("experiments", "results", "tuning", "polystep_selected.json")
-
 
 SHOWCASE_CONFIGS = {
     "snn": {
@@ -97,15 +96,14 @@ SHOWCASE_CONFIGS = {
 }
 
 
-EPOCHS_POLYSTEP = 30  # SNN needs more epochs; softmax solver is fast enough
-EPOCHS_POLYSTEP_NONSNN = 30
+EPOCHS_POLYSTEP = 30
 EPOCHS_ADAM = 30
 ADAM_LR = 0.001
 
 # Free-running (non-fair) candidate budgets: ES 10000 gen x 50 pop, CMA-ES 10000
 # gen x 16 pop, SPSA 50000 iters x 2. `--fair` replaces all of these with one
 # budget derived from PolyStep.
-LEGACY_BUDGETS = {
+UNMATCHED_BUDGETS = {
     "openai_es": 500_000,
     "eggroll": 500_000,
     "cma_es": 160_000,
@@ -183,10 +181,10 @@ POLYSTEP_CONFIGS = {
 
 
 def _load_split(showcase_name, seed, audit_no_leakage):
-    """Load the showcase data and carve the honest-protocol val split.
+    """Load the showcase data and carve the validation split.
 
     Returns ``(train_loader, val_loader, test_loader)`` with ``val_loader``
-    None only in legacy ``--allow-test-leakage`` mode. Every method goes
+    None only under ``--allow-test-leakage``. Every method goes
     through here, so no method can quietly select on the test set.
     """
     train_loader, test_loader = SHOWCASE_CONFIGS[showcase_name]["load_data"]()
@@ -199,20 +197,10 @@ def _load_split(showcase_name, seed, audit_no_leakage):
     return train_loader, val_loader, test_loader
 
 
-def _epochs_for(showcase_name, cfg, dry_run):
+def _epochs_for(cfg, dry_run):
     if dry_run:
         return 1
-    if "epochs" in cfg:
-        return cfg["epochs"]
-    return EPOCHS_POLYSTEP if showcase_name == "snn" else EPOCHS_POLYSTEP_NONSNN
-
-
-def fair_eval_budget(showcase_name, seed, device, train_loader, epochs, cfg):
-    """The shared candidate budget: what PolyStep spends over ``epochs`` epochs."""
-    set_seed(seed)
-    model = SHOWCASE_CONFIGS[showcase_name]["model_fn"]().to(device)
-    _, _, opt = build_polystep(model, seed, epochs * len(train_loader), cfg)
-    return polystep_eval_budget(opt, epochs * len(train_loader))
+    return cfg.get("epochs", EPOCHS_POLYSTEP)
 
 
 def run_polystep(
@@ -256,7 +244,7 @@ def run_polystep(
     _cfg_override = os.environ.get("POLYSTEP_CFG_OVERRIDE")
     if _cfg_override:
         polystep_cfg = {**polystep_cfg, **json.loads(_cfg_override)}
-    epochs = _epochs_for(showcase_name, polystep_cfg, dry_run)
+    epochs = _epochs_for(polystep_cfg, dry_run)
 
     set_seed(seed)
     model = config["model_fn"]().to(device)
@@ -330,14 +318,14 @@ def run_polystep(
                             "epoch": epoch + 1,
                             # Cumulative candidate evaluations, shared with the baselines.
                             "evals": fwd_pass_count,
-                            "val_accuracy": evaluate_accuracy(model, selection_loader, device=device),
+                            "val_accuracy": evaluate_accuracy(model, selection_loader),
                             "loss": loss,
                             "wall_time": time.time() - start_time,
                         }
                     )
 
             train_acc = epoch_correct / max(epoch_total, 1)
-            selection_acc = evaluate_accuracy(model, selection_loader, device=device)
+            selection_acc = evaluate_accuracy(model, selection_loader)
             if selection_acc > best_accuracy:
                 best_accuracy = selection_acc
                 best_state_dict = copy.deepcopy(model.state_dict())
@@ -364,7 +352,7 @@ def run_polystep(
     last_epoch_acc = selection_acc
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
-    final_acc = float("nan") if tuning else evaluate_accuracy(model, test_loader, device=device)
+    final_acc = float("nan") if tuning else evaluate_accuracy(model, test_loader)
 
     filepath = save_result(
         benchmark=showcase_name,
@@ -458,7 +446,7 @@ def run_gradient_free(
     cfg = POLYSTEP_CONFIGS[showcase_name]
     if theory_mode:
         cfg = apply_theory_mode(cfg)
-    epochs = _epochs_for(showcase_name, cfg, dry_run)
+    epochs = _epochs_for(cfg, dry_run)
     match_axis = "evals"
     deadline_s = None
     if dry_run and budget is None:
@@ -478,7 +466,7 @@ def run_gradient_free(
         # matched on rank, not dimension.
         shared_dim = make_subspace(layout, rank=cfg["rank"], seed=seed, method="polystep").subspace_dim
         if budget is None:
-            budget = fair_eval_budget(showcase_name, seed, device, train_loader, epochs, cfg)
+            budget = fair_eval_budget(config["model_fn"]().to(device), seed, epochs * len(train_loader), cfg)
             budget, match_axis, deadline_s = matched_budget(
                 method,
                 showcase=showcase_name,
@@ -488,8 +476,8 @@ def run_gradient_free(
                 results_dir=results_dir,
             )
     if budget is None:
-        budget = LEGACY_BUDGETS[method]
-        match_axis = "legacy"
+        budget = UNMATCHED_BUDGETS[method]
+        match_axis = "unmatched"
 
     loss_batch = minibatch_loss(NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss()), train_loader, device)
     selection_loader = val_loader if val_loader is not None else test_loader
@@ -507,8 +495,8 @@ def run_gradient_free(
         layout=layout,
         loss_batch=loss_batch,
         budget=budget,
-        val_fn=lambda m: evaluate_accuracy(m, selection_loader, device=device),
-        test_fn=lambda m: evaluate_accuracy(m, test_loader, device=device),
+        val_fn=lambda m: evaluate_accuracy(m, selection_loader),
+        test_fn=lambda m: evaluate_accuracy(m, test_loader),
         mode="max",
         seed=seed,
         subspace=subspace,
@@ -572,7 +560,7 @@ def main():
     )
     parser.add_argument(
         "--results-dir",
-        default="experiments/results/softmax/main",
+        default=RESULTS_DIR,
         help="Results directory",
     )
     parser.add_argument(
@@ -589,10 +577,8 @@ def main():
         "--allow-test-leakage",
         action="store_true",
         help=(
-            "Legacy mode: select best_state_dict on the test set instead "
-            "of a held-out validation slice. Default is honest protocol "
-            "(val-selected). Use only for bit-for-bit reproduction "
-            "of earlier results."
+            "Select the checkpoint on the test split instead of a held-out validation "
+            "slice; the run is stamped leaked and the aggregators refuse it."
         ),
     )
     parser.add_argument(
@@ -688,9 +674,8 @@ def main():
         print(f"  Step radius override: {args.step_radius}")
         _override_radius("step_radius", args.step_radius)
     if args.epochs_polystep is not None:
-        global EPOCHS_POLYSTEP, EPOCHS_POLYSTEP_NONSNN
+        global EPOCHS_POLYSTEP
         EPOCHS_POLYSTEP = args.epochs_polystep
-        EPOCHS_POLYSTEP_NONSNN = args.epochs_polystep
         print(f"  polystep epochs override: {args.epochs_polystep}")
     if args.probe_radius is not None:
         print(f"  probe_radius override: {args.probe_radius}")

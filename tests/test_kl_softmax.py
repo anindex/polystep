@@ -122,7 +122,7 @@ def test_alpha_avoids_overflow(epsilon, lam, expected):
     assert KLSoftmaxSolver(epsilon=epsilon, lam=lam).alpha == pytest.approx(expected, abs=0.0)
 
 
-def test_default_uniform_marginals_when_a_b_none() -> None:
+def test_marginals_default_to_uniform() -> None:
     C = torch.rand(6, 4)
     res = KLSoftmaxSolver(epsilon=0.1, lam=1.0).solve(C)
     torch.testing.assert_close(
@@ -152,7 +152,7 @@ def test_inf_lam_treated_as_full_sinkhorn() -> None:
 
 @pytest.mark.parametrize("lam", [0.0, 1.0, 10.0, float("inf")])
 @pytest.mark.parametrize("iters", [1, 2, 50])
-def test_row_marginal_is_exact_at_any_iteration_count(lam, iters) -> None:
+def test_row_marginal_exact_at_any_iteration(lam, iters) -> None:
     """P1 == a is the one hard constraint this solver enforces, so it must hold at
     every iteration count rather than waiting for convergence."""
     torch.manual_seed(0)
@@ -171,7 +171,7 @@ def test_optimizer_wires_lam_through() -> None:
     assert opt.solver.lam == 2.0
 
 
-def test_the_limits_inherit_the_guards_of_the_solver_they_become() -> None:
+def test_lam_limits_inherit_solver_guards() -> None:
     """lam=inf is balanced Sinkhorn and lam=0 is the one-shot softmax, so each limit
     must inherit that solver's optimizer-side guards."""
     from polystep.epsilon import ProgressiveEpsilon
@@ -193,7 +193,7 @@ def test_the_limits_inherit_the_guards_of_the_solver_they_become() -> None:
 
 
 @pytest.mark.parametrize("bad", ["f", "g", "both"])
-def test_a_partly_non_finite_warm_start_is_dropped_whole(bad):
+def test_partly_nonfinite_warm_start_dropped_whole(bad):
     """One poisoned dual has to discard both, or the LSE carries the NaN through."""
     C = torch.tensor([[1.0, 2.0, 3.0], [3.0, 1.0, 2.0]])
     solver = KLSoftmaxSolver(epsilon=0.5, lam=1.0)
@@ -213,7 +213,7 @@ def test_a_partly_non_finite_warm_start_is_dropped_whole(bad):
     torch.testing.assert_close(poisoned.matrix, clean.matrix)
 
 
-def test_convergence_is_measured_on_the_dual_step_not_its_magnitude():
+def test_convergence_measures_dual_step_not_magnitude():
     """A skewed ``b`` drives the column duals away from zero, so a residual built from
     anything but the step between iterates stops reporting convergence."""
     C = torch.tensor([[0.0, 1.0, 2.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]])
@@ -225,7 +225,7 @@ def test_convergence_is_measured_on_the_dual_step_not_its_magnitude():
 
 
 @pytest.mark.parametrize("check_every", [7, 13])
-def test_convergence_is_checked_every_check_every_iterations(check_every):
+def test_convergence_check_honors_check_every(check_every):
     C = torch.tensor([[0.0, 1.0, 2.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]])
     b = torch.tensor([0.6, 0.3, 0.1])
     solver = KLSoftmaxSolver(epsilon=0.5, lam=1.0, max_iterations=2000, check_every=check_every)
@@ -234,7 +234,7 @@ def test_convergence_is_checked_every_check_every_iterations(check_every):
     assert result.n_iters % check_every == 0
 
 
-def test_denormal_lam_takes_the_softmax_closed_form():
+def test_denormal_lam_takes_softmax_closed_form():
     """Below fp32's smallest normal the damped g-update underflows to zero, making the
     residual's ``/alpha`` normalization 0/0 = nan, so the solver must take the softmax
     closed form instead."""
@@ -244,7 +244,7 @@ def test_denormal_lam_takes_the_softmax_closed_form():
     torch.testing.assert_close(result.g, torch.zeros_like(result.g))
 
 
-def test_fp64_resolves_an_alpha_an_fp32_bound_would_flatten():
+def test_fp64_resolves_alpha_denormal_in_fp32():
     """The softmax-limit cutoff follows the working dtype: alpha = lam/(lam+eps) ~ 1e-39
     is denormal in fp32 but ordinary in fp64, so an fp64 solve must run the damped
     iteration and return a non-zero ``g``."""
@@ -256,3 +256,35 @@ def test_fp64_resolves_an_alpha_an_fp32_bound_would_flatten():
     fp32 = KLSoftmaxSolver(epsilon=0.1, lam=1e-40, max_iterations=2000).solve(C.float())
     assert fp32.converged and fp32.n_iters < 10
     torch.testing.assert_close(fp32.g, torch.zeros_like(fp32.g))
+
+
+def test_lam0_matches_softmax_under_large_offset():
+    """KLSoftmax(lam=0) is exactly SoftmaxSolver, even at |C|~1e6."""
+    C = torch.full((1, 3), 1_000_000.0)
+    kl_result = KLSoftmaxSolver(epsilon=1.0, lam=0.0).solve(C)
+    kl = kl_result.matrix
+    sm = SoftmaxSolver(epsilon=1.0).solve(C).matrix
+    assert torch.isfinite(kl).all()
+    assert torch.allclose(kl, sm, atol=1e-6), (kl, sm)
+    assert torch.allclose(kl, torch.full((1, 3), 1.0 / 3.0), atol=1e-5)
+    assert torch.allclose(kl.sum(dim=1), torch.ones(1), atol=1e-5)
+    # Recentering shifts C before the solve, so the reported cost has to come
+    # back in the raw frame: <C_raw, P> = 1e6 at unit mass.
+    assert kl_result.ent_reg_cost == pytest.approx(1_000_000.0, rel=1e-6)
+
+
+def test_kl_softmax_rejects_misshapen_warm_start():
+    """A (1, m) init_g is dropped with a warning; it must not broadcast into a 3-D plan."""
+    cost = torch.rand(2, 2)
+    solver = KLSoftmaxSolver(epsilon=0.1, lam=1.0, max_iterations=20)
+    with pytest.warns(UserWarning):
+        result = solver.solve(cost, init_g=torch.zeros(1, 2))
+    assert result.matrix.shape == cost.shape
+
+
+def test_negative_kl_penalty_rejected_at_solve():
+    """A finite negative lam would give alpha<0 and take the softmax-limit branch."""
+    solver = KLSoftmaxSolver(epsilon=0.1, lam=1.0)
+    solver.lam = -0.05
+    with pytest.raises(ValueError, match="lam must be >= 0"):
+        solver.solve(torch.rand(3, 4))

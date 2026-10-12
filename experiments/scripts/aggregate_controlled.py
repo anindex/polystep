@@ -3,7 +3,7 @@
 import itertools
 import json
 
-from experiments.runners.run_controlled import RESULTS, FINAL_SEEDS, RULES, atomic_json, config_id
+from experiments.runners.run_controlled import ARMS, RESULTS, FINAL_SEEDS, RULES, atomic_json, config_id
 import numpy as np
 
 
@@ -38,11 +38,7 @@ def main():
     summaries = {}
     records = {}
     missing = []
-    arms = [
-        f"{g}_{r}_{n}" for g, n, r in itertools.product(("orthoplex", "antipodal"), ("natural", "normalized"), RULES)
-    ]
-    arms += ["joint_softmax_natural", "schedule_constant", "schedule_decay"]
-    for arm in arms:
+    for arm in ARMS:
         selected = RESULTS / "selected" / f"{arm}.json"
         if not selected.exists():
             missing.append(arm)
@@ -87,10 +83,10 @@ def main():
             weighting_contrasts=contrasts,
         ),
     )
-    if all(arm in summaries for arm in arms[:20]):
+    if all(arm in summaries for arm in ARMS[:20]):
         plot(records, summaries)
         endpoint_plot(summaries, contrasts)
-    print(f"Completed variants: {len(summaries)}/{len(arms)}")
+    print(f"Completed variants: {len(summaries)}/{len(ARMS)}")
 
 
 def plot(records, summaries):

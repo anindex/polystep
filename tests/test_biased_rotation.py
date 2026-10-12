@@ -36,7 +36,7 @@ def test_stays_proper_rotation():
     assert torch.allclose(torch.det(out), torch.ones(6), atol=1e-5)
 
 
-def test_bfloat16_cpu_still_returns_a_proper_rotation():
+def test_bf16_cpu_returns_proper_rotation():
     R = torch.eye(3, dtype=torch.bfloat16)[None]
     b = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.bfloat16)
     out = apply_biased_rotation(R, b)
@@ -48,8 +48,8 @@ def test_bfloat16_cpu_still_returns_a_proper_rotation():
     assert torch.det(m) > 0
 
 
-def test_bfloat16_actually_applies_the_bias():
-    """bf16 must keep the bias, not silently fall back to the unbiased rotation."""
+def test_bf16_applies_bias():
+    """No silent fallback to the unbiased rotation."""
     for dim in (2, 4, 8, 16):
         torch.manual_seed(dim)
         R = get_random_rotation_matrices(64, dim, dtype=torch.float32)
@@ -81,7 +81,7 @@ def test_axis_aligned_bias_is_applied():
 
 
 @pytest.mark.parametrize("dim", [2, 8, 32])
-def test_near_aligned_bias_keeps_column_zero_in_fp32(dim):
+def test_near_aligned_bias_keeps_column_zero_fp32(dim):
     gen = torch.Generator().manual_seed(dim)
     R = get_random_rotation_matrices(512, dim, generator=gen)
     sign = torch.where(torch.rand(512, 1, generator=gen) < 0.5, -1.0, 1.0)
@@ -101,7 +101,7 @@ def test_complement_axes_stay_haar():
     assert (x.T @ x / len(x) - torch.eye(2, dtype=torch.float64) / 2).abs().max() < 0.02
 
 
-def test_nonfinite_bias_row_keeps_only_its_own_frame():
+def test_nonfinite_bias_row_keeps_own_frame():
     torch.manual_seed(2)
     R = get_random_rotation_matrices(4, 3)
     b = torch.randn(4, 3)
@@ -111,3 +111,35 @@ def test_nonfinite_bias_row_keeps_only_its_own_frame():
     out = apply_biased_rotation(R, b)
     assert torch.equal(out[1:3], R[1:3])
     assert torch.allclose(out[[0, 3], :, 0], b[[0, 3]], atol=1e-5)
+
+
+@pytest.mark.parametrize("pdim", [2, 3, 8])
+def test_vanishing_bias_keeps_frame_orthonormal(pdim):
+    """A vanishing descent direction must leave the frame orthonormal.
+
+    Normalizing by ``norm.clamp(min=1e-10)`` would aim the first axis at rounding
+    noise, so such a particle keeps its unbiased rotation instead.
+    """
+    P = 32
+    gen = torch.Generator().manual_seed(7)
+    rot_mats = get_random_rotation_matrices(P, pdim, device="cpu", dtype=torch.float32, generator=gen)
+
+    # Half the particles have collapsed, half still carry a usable heading.
+    bias_dir = torch.randn(P, pdim, generator=gen)
+    bias_dir[::2] *= 1e-12
+
+    biased = apply_biased_rotation(rot_mats, bias_dir)
+
+    gram = biased.transpose(-1, -2) @ biased
+    assert torch.allclose(gram, torch.eye(pdim).expand(P, -1, -1), atol=1e-4)
+    assert torch.allclose(torch.det(biased), torch.ones(P), atol=1e-3)
+    # Collapsed particles fall back to exactly the rotation they came in with.
+    assert torch.equal(biased[::2], rot_mats[::2])
+
+
+def test_biased_rotation_1d_returns_identity():
+    """SO(1) = {[[1]]}; a 1D biased rotation cannot represent a sign flip (that
+    is a reflection), so it must return identity, not flip the aligned axis back."""
+    out = apply_biased_rotation(torch.ones(1, 1, 1), torch.tensor([[-1.0]]))
+    assert torch.allclose(out, torch.ones(1, 1, 1)), out
+    assert torch.det(out[0]).item() > 0

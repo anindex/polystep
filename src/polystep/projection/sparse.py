@@ -40,34 +40,32 @@ class SparseRandomProjection:
         self.density = density if density is not None else 1.0 / math.sqrt(full_dim)
         self.seed = seed
 
-        if full_dim > 0:
-            ratio = subspace_dim / full_dim
-            if ratio < _EXTREME_COMPRESSION_RATIO:
-                warnings.warn(
-                    f"SparseRandomProjection: subspace_dim={subspace_dim} / "
-                    f"full_dim={full_dim} = {ratio:.2e} is below the empirical "
-                    f"floor ({_EXTREME_COMPRESSION_RATIO:.0e}) where the "
-                    f"projection preserves distances meaningfully. The paper "
-                    f"reports GPT-2 124M with 128-dim projection collapsed to "
-                    f"random predictions in this regime. Consider increasing "
-                    f"subspace_dim.",
-                    stacklevel=2,
-                )
+        ratio = subspace_dim / full_dim
+        if ratio < _EXTREME_COMPRESSION_RATIO:
+            warnings.warn(
+                f"SparseRandomProjection: subspace_dim={subspace_dim} / "
+                f"full_dim={full_dim} = {ratio:.2e} is below the empirical "
+                f"floor ({_EXTREME_COMPRESSION_RATIO:.0e}) where the "
+                f"projection preserves distances meaningfully. The paper "
+                f"reports GPT-2 124M with 128-dim projection collapsed to "
+                f"random predictions in this regime. Consider increasing "
+                f"subspace_dim.",
+                stacklevel=2,
+            )
 
         self._nnz_per_col = max(1, int(self.density * full_dim))
 
         # A row missed by every column stays frozen while the basis stands.
-        if full_dim > 0 and subspace_dim > 0:
-            covered = 1.0 - (1.0 - self._nnz_per_col / full_dim) ** subspace_dim
-            if covered < 0.5:
-                warnings.warn(
-                    f"SparseRandomProjection: this basis reaches only {covered:.1%} of the "
-                    f"{full_dim} parameters, so the rest cannot move while it stands. "
-                    f"Raise density (currently {self.density:.2e}) or subspace_dim "
-                    f"(currently {subspace_dim}); coverage is "
-                    f"1 - (1 - density)**subspace_dim.",
-                    stacklevel=2,
-                )
+        covered = 1.0 - (1.0 - self._nnz_per_col / full_dim) ** subspace_dim
+        if covered < 0.5:
+            warnings.warn(
+                f"SparseRandomProjection: this basis reaches only {covered:.1%} of the "
+                f"{full_dim} parameters, so the rest cannot move while it stands. "
+                f"Raise density (currently {self.density:.2e}) or subspace_dim "
+                f"(currently {subspace_dim}); coverage is "
+                f"1 - (1 - density)**subspace_dim.",
+                stacklevel=2,
+            )
 
         self._rows: Optional[torch.Tensor] = None
         self._values: Optional[torch.Tensor] = None

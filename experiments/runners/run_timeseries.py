@@ -4,7 +4,7 @@
 Trains a TimeSeriesLSTM (VmapSafeLSTM hidden=64, Linear head) with polystep,
 Adam, gradient-free baselines, and a persistence floor, on ETTh1 univariate OT
 (oil temperature) with the Informer-standard split. Results are saved as JSON
-under experiments/results/softmax/main/.
+under experiments/results/revision/.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, Dataset
 from polystep.benchmarks.utils import seeded_loader_kwargs
 from experiments.runners.common import (
     METHOD_ALIASES,
+    RESULTS_DIR,
     SEEDS,
     reseed_loaders,
     save_result,
@@ -37,6 +38,9 @@ from experiments.runners.common import (
 )
 from experiments.runners.fairness import (
     FAIR_METHODS,
+    UNMATCHED_BUDGETS,
+    build_polystep,
+    fair_eval_budget,
     matched_budget,
     apply_theory_mode,
     make_subspace,
@@ -295,24 +299,11 @@ POLYSTEP_CONFIG = {
     "rotation_interval": 0,
     "absorb_interval": 0,
     "chunk_size": 1024,
-    # Probe-radius jitter makes anything measured at the previous step's radius
-    # stale, so amortized OT stays off while jitter is on.
     "amortize_steps": 3,
     "amortize_ema": 0.7,
     "use_momentum": True,
     "momentum_init": 0.5,
     "momentum_final": 0.95,
-}
-
-# Free-running (non-fair) candidate budgets per method. --fair replaces them
-# with one budget derived from PolyStep.
-LEGACY_BUDGETS = {
-    "openai_es": 100_000,
-    "eggroll": 100_000,
-    "cma_es": 32_000,
-    "spsa": 20_000,
-    "mezo": 20_000,
-    "random_search": 20_000,
 }
 
 # Adam hyperparameters
@@ -339,9 +330,6 @@ def run_polystep(
 
     Best-checkpoint selection uses validation MSE, not test MSE.
     """
-    from polystep.optimizer import PolyStepOptimizer
-    from polystep.epsilon import CosineEpsilon
-    from polystep.transform import ParamLayout
     from polystep.cost_nn import NNCostEvaluator
 
     set_seed(seed)
@@ -355,47 +343,7 @@ def run_polystep(
 
     total_steps = epochs * len(train_loader)
     cfg = apply_theory_mode(POLYSTEP_CONFIG) if theory_mode else dict(POLYSTEP_CONFIG)
-
-    def sched(key, flat_default):
-        # Scheduled when the config carries both endpoints; flat otherwise.
-        if f"{key}_init" not in cfg:
-            return cfg.get(key, flat_default)
-        init, target = cfg[f"{key}_init"], cfg[f"{key}_target"]
-        return CosineEpsilon(init=init, target=target, decay=(init - target) / max(1, total_steps))
-
-    layout = ParamLayout.from_module(model)
-    subspace = make_subspace(
-        layout,
-        rank=cfg["rank"],
-        seed=seed,
-        rotation_mode="random",
-        rotation_interval=cfg["rotation_interval"],
-        absorb_mode="periodic",
-        absorb_interval=cfg["absorb_interval"],
-    )
-
-    optimizer = PolyStepOptimizer(
-        model,
-        compile=False,
-        seed=seed,
-        epsilon=sched("epsilon", 0.5),
-        step_radius=sched("step_radius", 1.0),
-        probe_radius=sched("probe_radius", 1.0),
-        num_probe=cfg["num_probe"],
-        subspace=subspace,
-        chunk_size=cfg.get("chunk_size", 1024),
-        probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
-        probe_radius_jitter_dist=cfg.get("probe_radius_jitter_dist", "smooth"),
-        step_radius_jitter=cfg.get("step_radius_jitter", 0.0),
-        polytope_type=cfg.get("polytope_type", "simplex"),
-        amortize_steps=cfg.get("amortize_steps", 1),
-        amortize_ema=cfg.get("amortize_ema", 0.0),
-        use_momentum=cfg.get("use_momentum", False),
-        momentum_init=cfg.get("momentum_init", 0.5),
-        momentum_final=cfg.get("momentum_final", 0.95),
-        biased_rotation=cfg.get("biased_rotation", False),
-        solver=solver,
-    )
+    layout, subspace, optimizer = build_polystep(model, seed, total_steps, cfg, solver)
     eval_budget = polystep_eval_budget(optimizer, total_steps)
 
     evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
@@ -570,38 +518,6 @@ def run_adam(
     print(f"    Saved: {filepath}")
 
 
-def _fair_eval_budget(seed, device, train_loader, epochs, cfg, solver="softmax"):
-    """The shared candidate budget: what PolyStep spends over ``epochs`` epochs."""
-    from polystep.optimizer import PolyStepOptimizer
-    from polystep.transform import ParamLayout
-
-    set_seed(seed)
-    model = TimeSeriesLSTM().to(device)
-    layout = ParamLayout.from_module(model)
-    total_steps = epochs * len(train_loader)
-    subspace = make_subspace(
-        layout,
-        rank=cfg["rank"],
-        seed=seed,
-        rotation_mode="random",
-        rotation_interval=cfg["rotation_interval"],
-        absorb_mode="periodic",
-        absorb_interval=cfg["absorb_interval"],
-    )
-    opt = PolyStepOptimizer(
-        model,
-        compile=False,
-        seed=seed,
-        num_probe=cfg["num_probe"],
-        subspace=subspace,
-        probe_radius_jitter=cfg.get("probe_radius_jitter", 0.0),
-        step_radius_jitter=cfg.get("step_radius_jitter", 0.0),
-        polytope_type=cfg.get("polytope_type", "simplex"),
-        solver=solver,
-    )
-    return polystep_eval_budget(opt, total_steps)
-
-
 def run_gradient_free(
     method,
     seed,
@@ -649,7 +565,7 @@ def run_gradient_free(
         # and the dimension gap.
         shared_dim = make_subspace(layout, rank=cfg["rank"], seed=seed, method="polystep").subspace_dim
         if budget is None:
-            budget = _fair_eval_budget(seed, device, train_loader, epochs, cfg)
+            budget = fair_eval_budget(TimeSeriesLSTM().to(device), seed, epochs * len(train_loader), cfg)
             budget, match_axis, deadline_s = matched_budget(
                 method,
                 showcase=BENCHMARK,
@@ -659,10 +575,11 @@ def run_gradient_free(
                 results_dir=results_dir,
             )
     if budget is None:
-        budget = LEGACY_BUDGETS[method]
+        budget = UNMATCHED_BUDGETS[method]
+        match_axis = "unmatched"
 
     loss_batch = minibatch_loss(NNCostEvaluator(model, loss_fn=nn.MSELoss()), train_loader, device)
-    # Honest protocol selects on val; test drives nothing.
+    # Selection is on val; test drives nothing.
     selection_data = test_data if not audit_no_leakage else val_data
 
     out = run_baseline(
@@ -805,7 +722,7 @@ def main():
         help="Seeds to run (default: 42 123 456 789 1337)",
     )
     parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
-    parser.add_argument("--results-dir", default="experiments/results/softmax/main", help="Results directory")
+    parser.add_argument("--results-dir", default=RESULTS_DIR, help="Results directory")
     parser.add_argument(
         "--epochs-override",
         type=int,
@@ -822,9 +739,8 @@ def main():
         "--allow-test-leakage",
         action="store_true",
         help=(
-            "Legacy mode: select best_state_dict on test MSE instead of "
-            "validation MSE. Default is honest protocol (val-selected). "
-            "Use only for bit-for-bit reproduction of earlier results."
+            "Select the checkpoint on test MSE instead of validation MSE; the run is "
+            "stamped leaked and the aggregators refuse it."
         ),
     )
     parser.add_argument(

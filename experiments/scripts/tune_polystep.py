@@ -27,7 +27,8 @@ import torch
 
 sys.path.insert(0, ".")
 
-from experiments.runners.fairness import (  # noqa: E402
+from experiments.runners.fairness import (
+    POLYSTEP_SELECTION_PATH,
     TUNING_GRID,
     refine_grid,
     apply_polystep_multipliers,
@@ -54,7 +55,6 @@ def _elevation_adapter(showcase):
 
     def set_epochs(epochs):
         R.EPOCHS_POLYSTEP = epochs
-        R.EPOCHS_POLYSTEP_NONSNN = epochs
 
     def run(seed, device, cell):
         R.run_polystep(showcase, seed, device, cell, fair=True, tuning=True)
@@ -161,11 +161,9 @@ def main() -> int:
     )
     p.add_argument(
         "--selection-path",
-        default="experiments/results/tuning/polystep_selected.json",
-        help="Deliberately not the shared selected_configs.json. Runners read that file "
-        "with load_selection, which swallows a parse error and silently falls back to "
-        "the untuned config, so writing it while a table is running can untune a seed "
-        "without saying so. Merge into the shared file once the table is done.",
+        default=POLYSTEP_SELECTION_PATH,
+        help="Where the picks go; the runners read PolyStep's picks from here, apart from "
+        "the baselines' selected_configs.json.",
     )
     args = p.parse_args()
 

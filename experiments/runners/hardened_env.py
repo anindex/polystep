@@ -23,8 +23,8 @@ Conventions:
   not change reset seeds.
 * Observation bounds clip values outside ``[lo, hi]`` *before* binning so a
   rare out-of-bounds observation does not destabilise the bin grid.
-* The ``register_hardened_envs()`` function registers ``CartPole-Hard-v1``,
-  ``Acrobot-Hard-v1`` env IDs that bake in the
+* The ``register_hardened_envs()`` function registers ``CartPoleHard-v1``,
+  ``AcrobotHard-v1`` env IDs that bake in the
   per-env defaults; the underlying class definitions remain reusable.
 """
 
@@ -161,6 +161,11 @@ def make_hardened_env(env_short: str):
 
 _REGISTERED = False
 
+HARDENED_GYM_IDS = {
+    "cartpole_hard": "CartPoleHard-v1",
+    "acrobot_hard": "AcrobotHard-v1",
+}
+
 
 def register_hardened_envs() -> None:
     """Register ``cartpole_hard`` / ``acrobot_hard`` Gym IDs.
@@ -173,33 +178,10 @@ def register_hardened_envs() -> None:
         return
     import gymnasium as gym
 
-    id_map = {
-        "cartpole_hard": "CartPoleHard-v1",
-        "acrobot_hard": "AcrobotHard-v1",
-    }
-    for short, gym_id in id_map.items():
-        spec = HARDENED_DEFAULTS[short]
+    for short, gym_id in HARDENED_GYM_IDS.items():
         try:
-            gym.register(
-                id=gym_id,
-                entry_point=lambda spec=spec: SparseRewardWrapper(
-                    QuantizedObsWrapper(
-                        gym.make(spec["base"]),
-                        bins=spec["bins"],
-                        low=spec["low"],
-                        high=spec["high"],
-                    ),
-                    bucket=spec["bucket"],
-                    deadband=spec["deadband"],
-                ),
-            )
+            gym.register(id=gym_id, entry_point=lambda short=short: make_hardened_env(short))
         except gym.error.Error:
             # Already registered (e.g. previous import).
             pass
     _REGISTERED = True
-
-
-HARDENED_GYM_IDS = {
-    "cartpole_hard": "CartPoleHard-v1",
-    "acrobot_hard": "AcrobotHard-v1",
-}

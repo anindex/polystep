@@ -37,7 +37,6 @@ def apply_momentum(
     return X_new, velocity_new
 
 
-@torch.inference_mode()
 def update_stagnation(
     current_loss: float,
     prev_loss: float,
@@ -53,7 +52,6 @@ def update_stagnation(
     return ((stagnation_count + 1) if rel_change < stagnation_threshold else 0, current_loss)
 
 
-@torch.inference_mode()
 def update_radius_multiplier(
     current_loss: float,
     prev_loss: float,
