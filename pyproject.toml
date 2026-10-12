@@ -14,7 +14,7 @@ requires-python = ">=3.11"
 dependencies = ["torch>=2.8"]
 keywords = ["pytorch", "optimal-transport", "gradient-free", "sinkhorn", "polystep", "optimization", "neural-network"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
