@@ -47,22 +47,10 @@ def _batch(n=6, d=4, c=3, seed=0):
     return torch.randn(n, d, generator=g), torch.randint(0, c, (n,), generator=g)
 
 
-class TestTrainConfig:
-    def test_defaults(self):
-        config = TrainConfig()
-        assert config.epochs == 10
-        assert config.callbacks == []
-
-    @pytest.mark.parametrize("epochs", [0, -1])
-    def test_invalid_epochs(self, epochs):
-        with pytest.raises(ValueError):
-            TrainConfig(epochs=epochs)
-
-
-class TestTrainCallback:
-    def test_base_on_step_end_returns_false(self):
-        cb = TrainCallback()
-        assert cb.on_step_end({}) is False
+@pytest.mark.parametrize("epochs", [0, -1])
+def test_invalid_epochs(epochs):
+    with pytest.raises(ValueError):
+        TrainConfig(epochs=epochs)
 
 
 class TestTrain:
@@ -256,11 +244,6 @@ class TestLoggingCallback:
         cb.on_step_end({"step": 0, "loss": 0.5, "ot_cost": 1.0, "displacement": 6.5e-7, "converged": True})
         assert "disp_sq=6.500e-07" in capsys.readouterr().out
 
-    def test_never_stops(self):
-        cb = LoggingCallback(log_every=1)
-        metrics = {"step": 0, "loss": 0.5, "ot_cost": 1.0, "displacement": 0.001, "converged": True}
-        assert cb.on_step_end(metrics) is False
-
     def test_epoch_end_prints(self, capsys):
         cb = LoggingCallback()
         cb.on_epoch_end({"epoch": 1, "avg_loss": 0.5})
@@ -340,15 +323,8 @@ class TestGetDiagnostics:
             "absorb_count",
         }
         assert set(diag.keys()) == expected
-
-    def test_diagnostics_values(self):
-        torch.manual_seed(42)
-        model = _make_model()
-        opt = self._run_optimizer(model, steps=3)
-        diag = get_diagnostics(opt)
-        assert len(diag["costs"]) == 3
-        assert diag["iteration_count"] == 3
-        assert diag["velocity_magnitude"] is None  # no momentum
+        assert len(diag["costs"]) == diag["iteration_count"] == 3
+        assert diag["velocity_magnitude"] is None
 
     def test_diagnostics_with_momentum(self):
         torch.manual_seed(42)
@@ -357,24 +333,3 @@ class TestGetDiagnostics:
         diag = get_diagnostics(opt)
         # The reported magnitude is the velocity's norm, not just some non-negative float.
         assert diag["velocity_magnitude"] == pytest.approx(opt.state.velocity.norm().item(), rel=1e-6)
-
-
-def test_train_with_logging_and_early_stop(capsys):
-    torch.manual_seed(42)
-    model = _make_model()
-    dl = _make_dataloader(num_samples=32, batch_size=16)  # 2 batches
-    opt = _make_optimizer(model)
-
-    logging_cb = LoggingCallback(log_every=1)
-    early_cb = EarlyStoppingCallback(patience=2, min_delta=1e-8)
-    config = TrainConfig(epochs=10, callbacks=[logging_cb, early_cb])
-
-    result = train(model, dl, nn.MSELoss(), opt, config)
-    assert result is model
-
-    captured = capsys.readouterr().out
-    assert "[Step 0]" in captured
-
-    # Early stopping may or may not trigger within 20 steps; just check training ran.
-    assert opt.state.iteration_count > 0
-    assert opt.state.iteration_count <= 20

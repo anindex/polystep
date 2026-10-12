@@ -71,44 +71,16 @@ class TestGenerateMaxsatInstance:
         assert len(result["cnf"].clauses) == 86
 
 
+@pytest.mark.slow
 class TestGenerateMultidomainData:
-    def test_returns_dict_with_required_keys(self):
-        pytest.importorskip("torchvision", reason="torchvision not installed")
-        from experiments.runners.nondiff_data import generate_multidomain_data
-
-        result = generate_multidomain_data()
-        assert isinstance(result, dict)
-        assert "train_loader" in result
-        assert "test_loader" in result
-        assert "num_classes" in result
-
-    def test_labels_range_0_to_19(self):
-        """Labels should span MNIST 0-9 and Fashion-MNIST 10-19."""
-        pytest.importorskip("torchvision", reason="torchvision not installed")
-        from experiments.runners.nondiff_data import generate_multidomain_data
-
-        result = generate_multidomain_data()
-        all_labels = []
-        for images, labels in result["train_loader"]:
-            all_labels.extend(labels.tolist())
-            if len(all_labels) > 5000:
-                break
-        min_label = min(all_labels)
-        max_label = max(all_labels)
-        assert min_label >= 0
-        assert max_label <= 19
-        # Should have labels from both domains
-        assert max_label >= 10, "Expected Fashion-MNIST labels (10-19)"
-        assert min_label <= 9, "Expected MNIST labels (0-9)"
-
-    def test_image_shape(self):
-        """Each batch should have shape (batch, 1, 28, 28)."""
+    def test_combined_domains(self):
         pytest.importorskip("torchvision", reason="torchvision not installed")
         from experiments.runners.nondiff_data import generate_multidomain_data
 
         result = generate_multidomain_data(batch_size=32)
+        assert result["num_classes"] == 20
+        assert "test_loader" in result
         images, labels = next(iter(result["train_loader"]))
-        assert images.dim() == 4
-        assert images.shape[1] == 1
-        assert images.shape[2] == 28
-        assert images.shape[3] == 28
+        assert images.shape == (32, 1, 28, 28)
+        assert labels.min() >= 0 and labels.max() <= 19
+        assert (labels < 10).any() and (labels >= 10).any()

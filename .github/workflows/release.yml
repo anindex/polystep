@@ -22,7 +22,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -41,12 +41,10 @@ jobs:
           assert citation == version, 'CITATION.cff version must match the package version'
           assert any(re.fullmatch(rf'## {re.escape(version)} - \d{{4}}-\d{{2}}-\d{{2}}', line) for line in Path('CHANGELOG.md').read_text().splitlines()), 'missing dated changelog entry'
           PY
-      - name: Lint and test the release commit
+      - name: Lint the release commit
         run: |
-          uv pip install --system -e ".[dev]"
-          ruff check .
-          ruff format --check .
-          pytest -q -rs -n auto
+          uvx ruff@0.15.13 check .
+          uvx ruff@0.15.13 format --check .
       - name: Build and check distributions
         run: |
           uv build

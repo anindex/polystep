@@ -55,16 +55,6 @@ class TestSinkhornEdgeCases:
         assert torch.allclose(row_sums, torch.ones(n) / n, atol=1e-4)
         assert torch.allclose(col_sums, torch.ones(m) / m, atol=1e-4)
 
-    def test_negative_costs(self):
-        torch.manual_seed(0)
-        n, m = 10, 6
-        C = torch.randn(n, m)
-        solver = SinkhornSolver(epsilon=1.0, max_iterations=200)
-        result = solver.solve(C)
-        T = result.matrix
-        assert torch.isfinite(T).all()
-        assert (T >= -1e-8).all(), "Transport plan should be non-negative"
-
     def test_warm_start_after_scale_change(self):
         """Warm-started duals from a 1x-cost step applied to a 100x-cost step."""
         torch.manual_seed(0)

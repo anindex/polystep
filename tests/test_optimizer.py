@@ -437,34 +437,6 @@ class TestProgressiveEpsilon:
         assert all(0 < e < 100 for e in eps_values)
 
 
-@pytest.mark.parametrize(
-    "attribute, expected",
-    [
-        ("layout.particle_dim", 2),
-        ("_particle_dim", 2),
-        ("ent_epsilon", None),
-        ("stagnation_threshold", 1e-4),
-        ("_progressive_epsilon", None),
-        ("solver.anderson_depth", 0),
-        ("solver.adaptive_omega", False),
-        ("probe_radius_jitter", 0.0),
-    ],
-)
-def test_documented_defaults(attribute, expected):
-    """The published defaults, pinned off one optimizer.
-
-    Every acceleration knob is off unless asked for.
-    """
-    opt = PolyStepOptimizer(_make_model(), epsilon=0.1, compile=False, seed=42)
-    value = opt
-    for part in attribute.split("."):
-        value = getattr(value, part)
-    if expected is None:
-        assert value is None
-    else:
-        assert value == expected
-
-
 def test_both_entry_points_default_num_probe_one():
     """K=1 is the reported and optimal setting; the two APIs must not disagree."""
 

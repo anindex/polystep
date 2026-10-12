@@ -1,16 +1,20 @@
 # Contributing
 
-Install the development dependencies and run the same checks as CI:
+Install the development dependencies. Then run the CI checks:
 
 ```bash
 pip install -e ".[dev]"
 ruff check .
 ruff format --check .
-pytest tests/ -q
+pytest tests/ -q -n auto
 ```
 
-Create a branch, make the change, add regression coverage where needed, and open a
-pull request. Keep comments specific and public APIs typed.
+Work on a branch. Add a regression test when the change needs one.
+Open a pull request after the checks pass. Test observable behavior.
+Keep one small regression test per bug.
+Extend an existing case when it already covers the same path; avoid separate tests
+for trivial defaults, getters, or repeated shapes. Keep comments specific and public
+APIs typed.
 
 ## Tests
 
@@ -23,9 +27,10 @@ pytest tests/ -m ""
 ```
 
 The fast suite uses one CPU thread; `POLYSTEP_TEST_THREADS` overrides it. Slow tests
-use `ncpu - 8` threads, clamped to 2-16, and may download MNIST. Tests importing
-`experiments/` must skip when that directory is absent, since it is excluded from
-distributions.
+use `ncpu - 8` threads, clamped to 2-16, and may download datasets. Keep downloads
+and training-quality checks in the slow suite; use synthetic inputs for unit tests.
+Tests importing `experiments/` must skip when that directory is absent, since it is
+excluded from distributions.
 
 Pushes and pull requests test Python 3.11 with PyTorch 2.8 and Python 3.14 with
 current PyTorch. Scheduled and manual runs add Python 3.12/3.13, coverage, real-data
@@ -34,21 +39,25 @@ builds both distributions and checks the wheel's imports and type marker.
 
 ## Releases
 
-Update `polystep.__version__`, the version and date in `CITATION.cff`, and
-`CHANGELOG.md`, whose heading must read `## X.Y.Z - YYYY-MM-DD`. `pyproject.toml`
-reads the package version automatically, but its `Development Status` classifier
-needs a manual update when the release changes the project's maturity. Then build and
-check the distributions:
+Update `polystep.__version__`. Set the same version and the release date in
+`CITATION.cff`. Add a `CHANGELOG.md` entry with the heading `## X.Y.Z - YYYY-MM-DD`.
+`pyproject.toml` reads the package version automatically.
+If the project's maturity changes, update its `Development Status` classifier.
+
+Build the distributions. Then check their metadata:
 
 ```bash
 uv build
 uvx twine check --strict dist/*
 ```
 
-Publishing a GitHub Release tagged `vX.Y.Z` triggers the PyPI workflow. It checks
-version consistency, lint, tests, and package metadata before publishing. The
-release also runs the shipped tests against the wheel. Only the separate publish
-job has OIDC permission; it uses the `pypi` environment and PyPI Trusted Publishing.
+Run the full manual CI workflow on the release commit.
+This covers the Python matrix and repository-only experiment tests.
+After CI passes, publish a GitHub Release with the tag `vX.Y.Z`.
+This triggers the PyPI workflow. The workflow checks version consistency, lint, and
+package metadata. It tests the installed wheel before it publishes the package.
+Only the separate publish job has OIDC permission; it uses the `pypi` environment
+and PyPI Trusted Publishing.
 
 ## Issues
 

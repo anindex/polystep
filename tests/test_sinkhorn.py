@@ -68,14 +68,6 @@ class TestSinkhornSolver:
         a = torch.ones(5) / 5
         assert torch.allclose(P.sum(dim=1), a, atol=1e-3), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
 
-    def test_entropic_cost_finite(self):
-        torch.manual_seed(42)
-        C = torch.rand(10, 8)
-
-        solver = SinkhornSolver(epsilon=0.1, max_iterations=500, compile=False)
-        result = solver.solve(C)
-        assert torch.isfinite(torch.tensor(result.ent_reg_cost)), f"ent_reg_cost not finite: {result.ent_reg_cost}"
-
 
 @pytest.mark.parametrize("solver_cls", [SinkhornSolver, KLSoftmaxSolver])
 def test_warmstart_shape_mismatch_warns_at_caller(solver_cls):

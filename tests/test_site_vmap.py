@@ -881,6 +881,7 @@ def test_release_evaluator_drops_site_cast_batch():
 
 def test_compiled_site_tracks_base_and_batch(monkeypatch):
     # Dynamo's eager backend checks graph guards without requiring a C++ toolchain.
+    torch.compiler.reset()
     compile_fn = torch.compile
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: compile_fn(fn, backend="eager", fullgraph=True))
     model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2))
@@ -902,6 +903,7 @@ def test_compiled_site_tracks_base_and_batch(monkeypatch):
         torch.testing.assert_close(got, expected)
     assert set(site_ev._compiled_sites) == {key}
     assert not site_ev._compile_failed_sites
+    torch.compiler.reset()
 
 
 def test_mixed_dtype_site_skips_unrelated_scalar_cast():

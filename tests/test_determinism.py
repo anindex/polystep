@@ -40,6 +40,16 @@ def _restore_global_determinism_flags():
         torch.use_deterministic_algorithms(deterministic)
 
 
+@pytest.fixture
+def train_loader():
+    from torch.utils.data import DataLoader, TensorDataset
+    from polystep.benchmarks.utils import seeded_loader_kwargs
+
+    gen = torch.Generator().manual_seed(0)
+    data = TensorDataset(torch.randn(128, 1, 7, 7, generator=gen), torch.randint(10, (128,), generator=gen))
+    return DataLoader(data, batch_size=32, shuffle=True, **seeded_loader_kwargs(42))
+
+
 def _train_once(train_loader, seed=42, epochs=2, device="cpu"):
     """Train a tiny MLP with PolyStep and return the per-step losses."""
     from experiments.runners.common import reseed_loaders, set_seed
@@ -47,6 +57,7 @@ def _train_once(train_loader, seed=42, epochs=2, device="cpu"):
     from polystep.optimizer import PolyStepOptimizer
 
     set_seed(seed)
+    torch.set_num_threads(1)
     # A loader's own generator advances per epoch and ignores the global RNG, so
     # the second run must rewind it to see the same stream.
     reseed_loaders(seed, train_loader)
@@ -70,8 +81,7 @@ def _train_once(train_loader, seed=42, epochs=2, device="cpu"):
     return losses
 
 
-def test_seeded_runs_repeat_loss_trajectory(require_experiments, mnist_loaders):
-    train_loader, _ = mnist_loaders(n_train=128, n_test=32, batch_size=32, downsample=4)
+def test_seeded_runs_repeat_loss_trajectory(require_experiments, train_loader):
 
     first = _train_once(train_loader)
     second = _train_once(train_loader)
@@ -121,8 +131,7 @@ def test_loaders_carry_seeded_generator():
 
 
 @pytest.mark.gpu
-def test_seeded_cuda_runs_repeat_loss_trajectory(require_experiments, mnist_loaders):
+def test_seeded_cuda_runs_repeat_loss_trajectory(require_experiments, train_loader):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    train_loader, _ = mnist_loaders(n_train=128, n_test=32, batch_size=32, downsample=4)
     assert _train_once(train_loader, device="cuda") == _train_once(train_loader, device="cuda")

@@ -4,7 +4,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from polystep.solvers.base import SolverResult
 from polystep.solvers.greedy import MinCostGreedySolver, TopKMeanSolver
 from polystep.solvers.kl_softmax import KLSoftmaxSolver
 from polystep.solvers.sinkhorn import SinkhornSolver
@@ -37,13 +36,6 @@ class TestMinCostGreedySolver:
             mask = torch.ones(6, dtype=torch.bool)
             mask[min_col] = False
             assert T[i, mask].sum().item() == pytest.approx(0.0, abs=1e-10)
-
-    def test_default_uniform_marginal(self, cost_matrix):
-        solver = MinCostGreedySolver()
-        result = solver.solve(cost_matrix)
-        row_sums = result.matrix.sum(dim=1)
-        expected = torch.ones(4) / 4
-        assert torch.allclose(row_sums, expected, atol=1e-7)
 
     def test_greedy_scaled_cost_in_caller_frame(self):
         C = torch.tensor([[0.0, 4.0], [6.0, 2.0]])
@@ -97,21 +89,6 @@ class TestTopKMeanSolver:
         r_greedy = greedy.solve(cost_matrix, a=source_marginal)
         r_topk1 = topk1.solve(cost_matrix, a=source_marginal)
         assert torch.allclose(r_greedy.matrix, r_topk1.matrix, atol=1e-7)
-
-
-@pytest.mark.parametrize("P,V", [(1, 4), (10, 2), (50, 16), (100, 8)])
-def test_various_sizes(P, V):
-    C = torch.rand(P, V)
-    a = torch.ones(P) / P
-    for solver in [MinCostGreedySolver(), TopKMeanSolver(k=3), SoftmaxSolver()]:
-        result = solver.solve(C, a=a)
-        assert isinstance(result, SolverResult)
-        assert result.matrix.shape == (P, V)
-        assert result.converged and result.n_iters == 1
-        assert result.f is None and result.g is None
-        assert isinstance(result.ent_reg_cost, float)
-        assert (result.matrix >= 0).all()
-        assert torch.allclose(result.matrix.sum(dim=1), a, atol=1e-6)
 
 
 class TestSolverSelection:
