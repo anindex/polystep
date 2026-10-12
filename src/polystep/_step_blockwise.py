@@ -24,6 +24,7 @@ from ._step_core import (
     chunk_spans,
     record_saturation,
     site_bounds,
+    site_chunks,
     update_amortized_direction,
     update_stagnation_and_radius,
     warn_all_nonfinite,
@@ -306,12 +307,17 @@ def step_blockwise(opt, closure: Callable) -> float:
         block_columns = layout_columns[block.flat_start : block.flat_end].view(P, D)
         # Layout entries are contiguous, so a block maps to the layout by a constant shift.
         base = opt.layout.entries[block.leaf_indices[0]].offset
-        bounds = None
+        bounds = chunks = None
         if site_owner is not None:
-            ends = accumulate(opt.layout.entries[i].numel for i in block.leaf_indices)
+            ends = list(accumulate(opt.layout.entries[i].numel for i in block.leaf_indices))
+            if site_owner is site_vmap and not opt.chunk_size:
+                keys = [opt.layout.entries[i].key for i in block.leaf_indices]
+                chunks = site_chunks(opt, fused_inputs, zip([0, *ends], keys), D, group, most)
+            if block.leaf_indices[-1] == len(opt.layout.entries) - 1:
+                ends.pop()
             bounds = site_bounds(ends, D, group, total_evals)
 
-        for chunk_start, chunk_end in chunk_spans(total_evals, site_chunk, bounds):
+        for chunk_start, chunk_end in chunk_spans(total_evals, site_chunk, bounds, chunks):
             if site_owner is not None:
                 g0, g1 = chunk_start // group, chunk_end // group
                 offsets = base + D * torch.arange(g0, g1, device=device)

@@ -389,29 +389,50 @@ class NNCostEvaluator:
         return cast_inputs_memo(self, inputs, dtype)
 
     @torch.inference_mode()
-    def _activation_ratio(self, inputs: torch.Tensor) -> Optional[float]:
-        """Widest output of a module that owns parameters, per input element.
+    def _activation_ratios(self, inputs: torch.Tensor) -> Optional[dict]:
+        """Widest output per input element, keyed by parameter name.
 
-        Runs one real forward under a forked RNG and puts back the buffers and any
-        weight a ``max_norm`` embedding renormalizes; None when that forward raises.
+        The ``None`` key holds the widest output of a module that owns parameters. A
+        parameter's key holds the widest output of any module from its own module's
+        first call on, the activations a site path batches. A parameter whose module
+        never runs has no key, and no parameter has one when the forward draws random
+        numbers, since vmap then batches everything from the draw on. Runs one real
+        forward under a forked RNG and puts back the buffers and any weight a
+        ``max_norm`` embedding renormalizes; None when that forward raises. A scripted
+        module takes no hooks, so a parameter-free one goes unmeasured and one that owns
+        parameters gives None.
         """
-        widths = []
+        widths, owned, starts = [], [], {}
         state = [*self._buffers.values(), *_max_norm_weights(self.model)]
         saved = [t.clone() for t in state]
+        owners = {m for m in self.model.modules() if next(m.parameters(recurse=False), None) is not None}
+        hooked = [m for m in self.model.modules() if not isinstance(m, torch.jit.ScriptModule)]
+        if not owners.issubset(hooked):
+            return None
+
+        def start(module, args):
+            starts.setdefault(module, len(widths))
 
         def record(module, args, out):
-            widths.extend(t.numel() for t in (out if isinstance(out, tuple) else (out,)) if isinstance(t, torch.Tensor))
+            sizes = [t.numel() for t in (out if isinstance(out, tuple) else (out,)) if isinstance(t, torch.Tensor)]
+            widths.extend(sizes)
+            if module in owners:
+                owned.extend(sizes)
 
-        handles = [
-            m.register_forward_hook(record)
-            for m in self.model.modules()
-            if next(m.parameters(recurse=False), None) is not None
-        ]
+        handles = [m.register_forward_hook(record) for m in hooked]
+        handles += [m.register_forward_pre_hook(start) for m in owners]
+        devices = [inputs.device] if inputs.device.type == "cuda" else []
+
+        def rng_state():
+            return [torch.get_rng_state(), *map(torch.cuda.get_rng_state, devices)]
+
         was_training = self.model.training
         self.model.eval()
         try:
-            with torch.random.fork_rng(devices=[inputs.device] if inputs.device.type == "cuda" else []):
+            with torch.random.fork_rng(devices=devices):
+                before = rng_state()
                 self.model(self.cast_inputs(inputs, self._input_dtype(self._param_dict_cache)))
+                drew = not all(map(torch.equal, before, rng_state()))
         except Exception:
             return None
         finally:
@@ -421,7 +442,15 @@ class NNCostEvaluator:
                 t.copy_(s)
             if was_training:
                 self.model.train()
-        return max(widths, default=0) / max(1, inputs.numel())
+        scale = max(1, inputs.numel())
+        ratios = {None: max(owned, default=0) / scale}
+        if drew:
+            return ratios
+        for name, _ in self.model.named_parameters(remove_duplicate=False):
+            owner = self.model.get_submodule(name.rpartition(".")[0])
+            if owner in starts:
+                ratios[name] = max(widths[starts[owner] :], default=0) / scale
+        return ratios
 
     def _input_dtype(self, stacked_params) -> Optional[torch.dtype]:
         """Float dtype the first input-consuming layer expects, cached; None to skip."""
@@ -869,12 +898,31 @@ def _base_prefix(evaluator, params, inputs, end):
     return cache[end]
 
 
+def _sweep_matmul(cache, key, x, m):
+    """``x @ m.T``, computed once per candidate sweep when ``cache`` is a dict."""
+    if cache is None:
+        return x @ m.t()
+    if key not in cache:
+        cache[key] = x @ m.t()
+    return cache[key]
+
+
 def _gather_cols(t, cols):
     """``(G, 1, B, w)`` holding ``t[:, cols]`` for ``(G, w)`` columns, broadcastable over C.
 
     Gathers the transposed view, whose copy runs over contiguous rows.
     """
     return t.t().index_select(0, cols.reshape(-1)).reshape(*cols.shape, -1).permute(0, 2, 1).unsqueeze(1)
+
+
+def _column_run(t, start, n):
+    """``t.narrow(-1, start, n)``, reading positions past the end of ``t`` as zeros.
+
+    Those positions are the padding of the last particle, which moves no parameter.
+    """
+    real = min(n, t.shape[-1] - start)
+    run = t.narrow(-1, start, real)
+    return run if real == n else nn.functional.pad(run, (0, n - real))
 
 
 def _confined_site(x, j, delta, stride, d_out):
@@ -1239,7 +1287,7 @@ def _resolve_layout_entry(self, offsets: torch.Tensor, pdim: int, span=None):
     """The one layout entry every candidate in this chunk perturbs, or None.
 
     ``span`` is ``(lo, hi)`` when the caller knows the chunk bounds, avoiding a device
-    reduce and sync.
+    reduce and sync. A span may run past the last entry, where only padding follows.
     """
     if span is None:
         lo, hi = torch.stack([offsets.min(), offsets.max()]).tolist()
@@ -1251,7 +1299,7 @@ def _resolve_layout_entry(self, offsets: torch.Tensor, pdim: int, span=None):
     if idx < 0 or idx >= len(self._keys):
         return None
     entry = self._entry_by_key[self._keys[idx]]
-    if lo < entry.offset or hi > entry.offset + entry.numel:
+    if lo < entry.offset or (hi > entry.offset + entry.numel and idx + 1 < len(self._keys)):
         return None
     return entry
 
@@ -1319,8 +1367,9 @@ class SiteVmapEvaluator:
 
         Coordinates past ``sub_dim`` are particle padding with nothing behind them.
         """
-        if hi > sub_dim or self._retired():
+        if self._retired():
             return None
+        hi = min(hi, sub_dim)
         for spec in subspace.specs:
             if spec.flat_start <= lo and hi <= spec.flat_end:
                 return spec
@@ -1338,6 +1387,7 @@ class SiteVmapEvaluator:
         the entries those columns touch. A half-precision weight is rebuilt from
         ``base_sd`` and the candidate's full coordinates instead, as ``reconstruct_batch``
         builds it, since an offset added to the rounded incumbent can round differently.
+        Columns past the spec are the last particle's padding and change nothing.
         """
         base = bary_sd[spec.entry_key]
         n_groups, n_cand, pdim = values.shape
@@ -1345,12 +1395,14 @@ class SiteVmapEvaluator:
         n_cols = n_groups * pdim
         P = projections[spec.entry_key] if spec.is_projected else None
         incumbent = coords[spec.flat_start : spec.flat_end]
+        pad = max(0, col_start + n_cols - spec.num_coords)
 
         if base.dtype in (torch.float16, torch.bfloat16):
             base = base_sd[spec.entry_key]
             cols = torch.arange(col_start, col_start + n_cols, device=values.device)
             cols = cols.reshape(n_groups, 1, pdim).expand(n_groups, n_cand, pdim).reshape(n, pdim)
-            wide = incumbent.expand(n, -1).clone().scatter_(1, cols, values.reshape(n, pdim))
+            wide = _column_run(incumbent, 0, spec.num_coords + pad).expand(n, -1).clone()
+            wide = wide.scatter_(1, cols, values.reshape(n, pdim))[:, : spec.num_coords]
             if P is None:
                 delta = wide.to(base.dtype)
             elif isinstance(P, torch.Tensor):
@@ -1360,13 +1412,22 @@ class SiteVmapEvaluator:
             site = (base.reshape(1, -1) + delta).to(base.dtype).reshape(-1, *base.shape)
             return self._vmap_over_site(spec.entry_key, bary_sd, site, inputs, targets)
 
-        dcoords = values - incumbent.narrow(0, col_start, n_cols).view(n_groups, 1, pdim)
+        dcoords = values - _column_run(incumbent, col_start, n_cols).view(n_groups, 1, pdim)
+        if pad:
+            dcoords[-1, :, -pad:] = 0
         if isinstance(P, torch.Tensor):
             # P is (num_params, num_coords); .t() first so groups lead.
-            blk = P.narrow(1, col_start, n_cols).t().reshape(n_groups, pdim, -1)
-            site = torch.baddbmm(base.reshape(1, 1, -1), dcoords.to(blk.dtype), blk)
+            full = n_groups - (pad > 0)
+            blk = P.narrow(1, col_start, full * pdim).t().reshape(full, pdim, P.shape[0])
+            site = base.new_empty(n_groups, n_cand, P.shape[0])
+            torch.baddbmm(base.reshape(1, 1, -1), dcoords[:full].to(blk.dtype), blk, out=site[:full])
+            if pad:
+                tail = P.narrow(1, col_start + full * pdim, pdim - pad).t()
+                torch.addmm(base.reshape(1, -1), dcoords[-1, :, : pdim - pad].to(tail.dtype), tail, out=site[-1])
         else:
             cols = torch.arange(col_start, col_start + n_cols, device=dcoords.device).view(n_groups, 1, pdim)
+            if pad:
+                cols = cols.clamp(max=spec.num_coords - 1)
             if P is None:
                 idx, src = cols, dcoords
             else:
@@ -1377,12 +1438,23 @@ class SiteVmapEvaluator:
             site.scatter_add_(2, idx.expand(-1, n_cand, -1), src.to(base.dtype))
         return self._vmap_over_site(spec.entry_key, bary_sd, site.reshape(-1, *base.shape), inputs, targets)
 
+    def _clamp_padding(self, entry, local_idx, values):
+        """Point indices past the last entry, which hold layout padding, at its last element.
+
+        A clamped position repeats the value its row writes there, so the write keeps it.
+        """
+        if entry.key != self._keys[-1]:
+            return local_idx, values
+        idx = local_idx.clamp(max=entry.numel - 1)
+        return idx, values.gather(2, (idx - local_idx[:, :1]).unsqueeze(1).expand_as(values))
+
     @torch.inference_mode()
     def evaluate(self, base_sd, entry, local_idx, values, inputs, targets=None):
         """Losses of shape ``(G*C,)`` for ``G`` particle groups of ``C`` candidates."""
         groups, cand, pdim = values.shape
         n = groups * cand
         base = base_sd[entry.key]
+        local_idx, values = self._clamp_padding(entry, local_idx, values)
 
         # Only this entry gets a candidate axis; every other parameter stays shared.
         site = base.reshape(-1).unsqueeze(0).expand(n, -1).clone()
@@ -1525,6 +1597,7 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
         """Losses of shape ``(G*C,)``; a candidate writes only its ``pdim`` entries."""
         groups, cand, _ = values.shape
         flat = self._param(entry.key).view(-1)
+        local_idx, values = self._clamp_padding(entry, local_idx, values)
         values = values.to(flat.dtype)
         with self._frame(base_sd, inputs, targets, groups * cand) as (losses, score):
             incumbent = flat[local_idx]
@@ -1544,18 +1617,25 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
         Only the spec's parameter is rewritten: ``bary + P[:, cols] @ delta`` for a dense
         projection; a sparse projection or an unprojected spec writes the incumbent plus
         its update into the entries its columns touch, summing repeated rows first, and
-        puts them back.
+        puts them back. Columns past the spec are the last particle's padding and change
+        nothing.
         """
         n_groups, n_cand, pdim = values.shape
         flat = self._param(spec.entry_key).view(-1)
         bary = bary_sd[spec.entry_key].reshape(-1)
         P = projections[spec.entry_key] if spec.is_projected else None
+        pad = max(0, col_start + n_groups * pdim - spec.num_coords)
         cols = torch.arange(col_start, col_start + n_groups * pdim, device=values.device)
-        dcoords = values - coords.narrow(0, spec.flat_start + col_start, n_groups * pdim).view(n_groups, 1, pdim)
+        dcoords = values - _column_run(coords, spec.flat_start + col_start, n_groups * pdim).view(n_groups, 1, pdim)
+        if pad:
+            cols = cols.clamp(max=spec.num_coords - 1)
+            dcoords[-1, :, -pad:] = 0
         if isinstance(P, torch.Tensor):
             dcoords = dcoords.to(P.dtype)
         elif P is None:
             rows, src = cols.view(n_groups, pdim), dcoords.to(flat.dtype)
+            if pad:
+                src[-1, :, -pad:] = src[-1, :, -pad - 1 : -pad]
         else:
             rows, vals = P.columns(cols, flat.device, dcoords.dtype)
             rows = rows.view(n_groups, -1)
@@ -1574,7 +1654,7 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
             try:
                 if isinstance(P, torch.Tensor):
                     for g, group in enumerate(dcoords):
-                        block = P.narrow(1, col_start + g * pdim, pdim)
+                        block = _column_run(P, col_start + g * pdim, pdim)
                         for c, delta in enumerate(group):
                             torch.addmv(bary, block, delta, out=flat)
                             losses[g * n_cand + c] = score()
@@ -1645,7 +1725,8 @@ class SparseDeltaEvaluator:
         """Losses of shape ``(G*C,)`` for ``G`` particle groups of ``C`` candidates.
 
         The perturbed positions are a function of the particle, not the vertex, so a
-        group's ``C`` candidates share one ``local_idx`` row.
+        group's ``C`` candidates share one ``local_idx`` row. Positions past the last
+        entry are layout padding and carry a zero delta.
         """
         groups, cand, _ = values.shape
         site_idx, is_weight = self._site[entry_key]
@@ -1655,6 +1736,9 @@ class SparseDeltaEvaluator:
         # transformed site moves by the difference of the transformed values.
         site_q = _weight_transforms(self._layer_keys[site_idx][2])[0 if is_weight else 1]
         base_param = base_sd[entry_key].reshape(-1)
+        if entry_key == self._keys[-1]:
+            values = torch.where(local_idx.unsqueeze(1) < base_param.numel(), values, base_param[-1])
+            local_idx = local_idx.clamp(max=base_param.numel() - 1)
         base_at_site = base_param[local_idx].unsqueeze(1)
         if site_q is not None:
             delta = (site_q(values) - site_q(base_at_site)).to(param_dtype)  # (G, C, pdim)
@@ -1714,32 +1798,41 @@ class SubspaceDeltaEvaluator:
         return cls(model, loss_fn, plan._layer_keys, loss_kind)
 
     def resolve_site(self, subspace, lo: int, hi: int, sub_dim: int):
-        """The spec owning coordinates ``[lo, hi)``, or ``None`` if they straddle."""
-        if hi > sub_dim:
-            return None
+        """The spec owning coordinates ``[lo, hi)``, or ``None`` if they straddle.
+
+        Coordinates past ``sub_dim`` are particle padding with nothing behind them.
+        """
+        hi = min(hi, sub_dim)
         for spec in subspace.specs:
             if spec.flat_start <= lo and hi <= spec.flat_end:
                 return spec if spec.entry_key in self._site else None
         return None
 
     def _basis_products(self, spec, P, col_start, n_cols, x):
-        """``(n_cols, d_out, B)`` holding ``x @ M_j.T`` for the column run at ``col_start``."""
+        """``(n_cols, d_out, B)`` holding ``x @ M_j.T`` for the column run at ``col_start``.
+
+        Columns past the spec are the last particle's padding and hold zeros.
+        """
         d_out, d_in = spec.original_shape
+        real = min(n_cols, spec.num_coords - col_start)
         if isinstance(P, SparseRandomProjection):
             # A column of P is sparse, so gather the entries and scatter-add instead of
             # forming M_j.
-            cols = torch.arange(col_start, col_start + n_cols, device=x.device)
-            rows, vals = P.columns(cols, x.device, x.dtype)  # (n_cols, nnz)
-            out_idx = torch.div(rows, d_in, rounding_mode="floor")  # (n_cols, nnz)
+            cols = torch.arange(col_start, col_start + real, device=x.device)
+            rows, vals = P.columns(cols, x.device, x.dtype)  # (real, nnz)
+            out_idx = torch.div(rows, d_in, rounding_mode="floor")  # (real, nnz)
             in_idx = rows.remainder(d_in)
-            contrib = x.index_select(1, in_idx.reshape(-1)).reshape(x.shape[0], n_cols, -1)
-            contrib = contrib.permute(1, 2, 0) * vals.unsqueeze(-1)  # (n_cols, nnz, B)
+            contrib = x.index_select(1, in_idx.reshape(-1)).reshape(x.shape[0], real, -1)
+            contrib = contrib.permute(1, 2, 0) * vals.unsqueeze(-1)  # (real, nnz, B)
             g = torch.zeros(n_cols, d_out, x.shape[0], device=x.device, dtype=x.dtype)
             return g.scatter_add_(1, out_idx.unsqueeze(-1).expand_as(contrib), contrib)
         # P.view(d_out, d_in, -1)[o, i, j] is M_j[o, i] with no copy; batching over
         # columns rather than d_out is faster at the same FLOPs.
-        blk = P.view(d_out, d_in, -1).narrow(2, col_start, n_cols).permute(2, 1, 0).to(x.dtype)
-        return torch.matmul(x, blk).permute(0, 2, 1)  # (n_cols, B, d_out) -> (n_cols, d_out, B)
+        blk = P.view(d_out, d_in, -1).narrow(2, col_start, real).permute(2, 1, 0).to(x.dtype)
+        g = x.new_empty(n_cols, x.shape[0], d_out)
+        g[real:] = 0
+        torch.matmul(x, blk, out=g[:real])
+        return g.permute(0, 2, 1)  # (n_cols, B, d_out) -> (n_cols, d_out, B)
 
     @torch.inference_mode()
     def evaluate(
@@ -1753,13 +1846,20 @@ class SubspaceDeltaEvaluator:
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Losses of shape ``(G*C,)`` for ``G`` particle groups of ``C`` candidates."""
+        """Losses of shape ``(G*C,)`` for ``G`` particle groups of ``C`` candidates.
+
+        Columns past the spec are the last particle's padding and carry a zero delta.
+        """
         n_groups, n_cand, pdim = dcoords.shape
         site_idx, is_weight = self._site[spec.entry_key]
         param_dtype = next(iter(bary_sd.values())).dtype
         inputs = cast_inputs_memo(self, inputs, param_dtype)
         d = dcoords.to(param_dtype)
         j = torch.arange(col_start, col_start + n_groups * pdim, device=dcoords.device).view(n_groups, pdim)
+        pad = max(0, col_start + n_groups * pdim - spec.num_coords)
+        if pad:
+            d = torch.where(j.unsqueeze(1) < spec.num_coords, d, 0)
+            j = j.clamp(max=spec.num_coords - 1)
         factored = getattr(subspace, "coords_are_factored", False)
 
         def site(x, out, weight):
@@ -1830,12 +1930,14 @@ class FactoredEvaluator:
         x = inputs if inputs.dim() == 2 else inputs.reshape(inputs.shape[0], -1)
         # Shared across candidates until the first perturbed layer.
         shared = True
+        cache = getattr(self, "_prefix_cache", None)
 
         for name, tag, module in self._layer_keys:
             if tag == "linear":
                 w_key, b_key = f"{name}.weight", f"{name}.bias"
                 W = base_sd[w_key]
-                base = x @ W.t()  # (B, d_out) while shared, else (N, B, d_out)
+                # (B, d_out) while shared, else (N, B, d_out)
+                base = _sweep_matmul(cache, w_key, x, W) if shared else x @ W.t()
 
                 spec = specs.get(w_key)
                 if spec is not None and spec.is_projected:
@@ -1845,7 +1947,7 @@ class FactoredEvaluator:
                     B = projections[w_key].to(param_dtype)
                     if shared:
                         # x is (B, d_in), so one (B, r) product feeds every candidate.
-                        corr = torch.einsum("nor,br->nbo", A, x @ B.t())
+                        corr = torch.einsum("nor,br->nbo", A, _sweep_matmul(cache, (w_key, "B"), x, B))
                         base = base.unsqueeze(0) + corr
                         shared = False
                     else:

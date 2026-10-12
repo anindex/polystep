@@ -127,8 +127,8 @@ These changes need code or workflow updates. Details follow under Changes.
 - Full-space `per_layer` and `grouped` steps raise `ValueError` when the closure does
   not return one loss per candidate.
 - With a registered evaluator, those steps also score grouped and padded blocks on
-  the site paths. Particles that straddle two parameters or hold padding still go
-  to the closure.
+  the site paths. Particles that straddle two parameters, or hold the padding of a
+  block other than the last, still go to the closure.
 - Closure batches in those steps no longer round up to a whole candidate group, so
   they stay within `chunk_size`.
 - Those steps drive the adaptive radius with the best-vertex mean, like the
@@ -299,19 +299,26 @@ These changes need code or workflow updates. Details follow under Changes.
   belong to. Runs that span two parameters, screened candidates and the incumbent
   keep the low-rank evaluator. Factored runs can change in the last bit. A
   784-128-10 rank-8 step runs 13 to 25 times faster on one CPU thread. On CUDA the
-  delta path scores each parameter in its own pass, so it runs only when the
-  low-rank evaluator would need more than one chunk or `chunk_size` is below the
-  candidate count. At the default chunk size such steps, 784-256-10 rank 8 at batch
-  256 among them, run 1.2 to 2.3 times faster and allocate a thirtieth to a fiftieth of the peak memory above
-  what the model and data already hold. Smaller CUDA steps, 784-128-10 rank 8 at
-  batch 128 among them, keep the low-rank evaluator and its speed. With
-  `chunk_size=72` the delta path allocates a quarter to a seventh of the peak memory.
-  It runs 1.3 to 1.4 times slower, since such small chunks are bound by kernel
-  launches, until the batch reaches 1024 on 784-128-10 or 512 on 784-256-10, where
-  both paths take the same time.
+  delta path launches more kernels per chunk, so it runs only when one chunk of the
+  default budget cannot hold every candidate and `chunk_size`, or the candidate
+  count when it is unset, times a candidate's largest layer output reaches 2^24,
+  about 16.8 million, elements. At the default chunk size such steps, 784-128-10
+  rank 8 at batch 384 to 1024 and 784-1024-256-10 at batch 2 to 512 among them, run
+  up to 5 times faster and allocate 4 to 54 times less peak memory above what the
+  model and data hold. Other CUDA steps keep the low-rank evaluator: a batch of one
+  on a 784-512-512-10 MLP, where the delta path ran 1.35 times slower, and
+  `chunk_size=72` on 784-128-10 at batch 512, where it ran 1.4 times slower, and up
+  to 17% slower with `chunk_size` from 184 to 216. From `chunk_size=256` that step
+  takes the delta path, which ran 4% faster there and 11% faster at 288 with a
+  fourteenth of the peak memory.
 - Those factored steps keep whole particles in each chunk, as hybrid steps already
   do, so `chunk_size` drops to a multiple of the vertex count times `num_probe` and
   never goes below one such group.
+- The factored low-rank evaluator multiplies the batch by the first perturbed
+  layer's weight and `B` once per candidate sweep instead of once per chunk.
+  Screening and incumbent scoring are separate sweeps. CUDA steps that
+  split it into several chunks, such as 784-128-10 rank 8 at batch 512 with
+  `chunk_size=72`, run 2 to 6% faster.
 - CPU `AdaptiveSubspace` steps with a dense projection build each candidate from the
   incumbent plus the projection columns of the one particle it moves, instead of
   multiplying every candidate's full coordinates. The padded last particle, screened
@@ -353,23 +360,25 @@ These changes need code or workflow updates. Details follow under Changes.
   algorithms.
 - Candidates that a delta, site or offsets chunk sends back to materialization are
   scored in batches of at most `chunk_size` instead of a whole particle group.
-- Delta and site paths give the padded last particle a chunk of its own, so the
-  particles before it stay on those paths instead of falling back with it. These
-  runs can change in the last bit.
+- Delta and site paths score the padded last particle with the particles before it,
+  instead of sending them all back to materialization. Its padding moves no
+  parameter, so those entries carry a zero change. These runs can change in the
+  last bit.
 - The automatic chunk size counts the widest layer output, measured by one forward
   when an evaluator is registered, instead of the widest layer's channel count, and
   delta and site chunks no longer charge a full candidate. That forward puts back
   the buffers and any weight a `max_norm` embedding renormalizes. On CUDA, a
   one-conv model on 256x256 inputs at batch 64 peaked at 6.8 GiB and now peaks at
   384 MiB.
-- Those two changes slow small models down. The benchmark's 8x8 CNN full-space step
-  now runs five site forwards instead of three: the activation budget splits its
-  largest weight across two chunks, and the bias particle that used to fall back with
-  the padded one gets a site forward of its own. Each of those forwards is bound by
-  kernel launches, so on CUDA the step takes 17 to 19% longer than in 0.13 with
-  Sinkhorn (3.5 to about 4.15 ms) and 30% longer with softmax (2.15 to 2.8 ms). CPU
-  steps take 2 to 5% longer. A `chunk_size` at or above the candidate count wins back
-  about half of it.
+- The automatic budget slows small models down. In 0.13 the benchmark's 8x8 CNN
+  full-space step ran three site forwards and sent its last bias, with the padded
+  particle, to the closure. It now runs five site forwards and no closure call: the
+  activation budget splits its largest weight across two chunks, and the last bias
+  gets a site forward. Each of those forwards is bound by kernel launches, so on CUDA
+  the step takes 8% longer with Sinkhorn (3.37 to 3.64 ms) and 16% longer with
+  softmax (2.05 to 2.38 ms). CPU steps take 1 to 2% longer. With a `chunk_size` at or
+  above the candidate count, the step runs four site forwards and beats 0.13 on CUDA
+  by 1 to 4%.
 - FP16/BF16 hybrid steps on the in-place path no longer build an incumbent weight
   set that the path never reads. On CUDA, a step of a BF16 2048-2048-4 MLP at rank 4
   with `use_inplace=True` allocates at most 34 MiB above the model instead of 42 MiB.

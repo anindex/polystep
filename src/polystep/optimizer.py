@@ -1121,7 +1121,7 @@ class PolyStepOptimizer(SerializationMixin):
         rebuild = getattr(self, "_fastpath_key", None) != fastpath_key
         if rebuild:
             self._fastpath_key = fastpath_key
-            self._act_ratio = None
+            self._act_ratios = None
             for attr in (
                 "_factored_evaluator",
                 "_sparse_delta_evaluator",
@@ -1181,7 +1181,7 @@ class PolyStepOptimizer(SerializationMixin):
                 )
             return
         if rebuild:
-            self._act_ratio = evaluator._activation_ratio(inputs)
+            self._act_ratios = evaluator._activation_ratios(inputs)
         # FactoredSubspace can score through the low-rank identity, never building a
         # candidate weight.
         if self._factored and not hasattr(self, "_factored_evaluator"):

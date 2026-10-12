@@ -20,6 +20,7 @@ from ._step_core import (
     invalidate_for_basis_change,
     record_saturation,
     site_bounds,
+    site_chunks,
     update_amortized_direction,
     update_stagnation_and_radius,
     warn_all_nonfinite,
@@ -305,7 +306,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     if (
         _factored_eval is not None
         and device.type != "cpu"
-        and total_evals <= (opt.chunk_size or (1 << 26) // (X.numel() + _act))
+        and (total_evals <= (1 << 26) // (X.numel() + _act) or (opt.chunk_size or total_evals) * _act < 1 << 24)
     ):
         _subspace_delta = None
     # The same site argument in coordinate space: a per-layer block maps to one
@@ -394,14 +395,17 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         chunk_mat = min(chunk_mat, chunk)
     # Break chunks where sites do, or a chunk spans entries and resolves to no site.
     if _sparse_delta is not None or _site_vmap is not None:
-        _starts = [e.offset for e in opt.layout.entries] + [opt.layout.total_params]
+        _sites = [(e.offset, e.key) for e in opt.layout.entries]
     elif _subspace_delta is not None or _subspace_site is not None:
-        _starts = [s.flat_start for s in state.subspace.specs] + [_sub_dim]
+        _sites = [(s.flat_start, s.entry_key) for s in state.subspace.specs]
     elif _bary_flat is not None:
-        _starts = [_sub_dim]
+        _sites = [(_sub_dim, None)]
     else:
-        _starts = []
-    _site_bounds = site_bounds(_starts, pdim, _group, total_evals)
+        _sites = []
+    _site_bounds = site_bounds([s for s, _ in _sites], pdim, _group, total_evals)
+    _site_chunks = None
+    if _local and not opt.chunk_size and _sparse_delta is None and _subspace_delta is None:
+        _site_chunks = site_chunks(opt, _fused_inputs, _sites, pdim, _group, total_evals)
 
     # Shape-determined and fully overwritten each step, so cached on the optimizer.
     _loss_dtype = loss_buffer_dtype(X.dtype)
@@ -428,7 +432,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     _, losses, _, _local_range_full, _i_all, _v_all, _k_all, _ = _bufs
     _configs_wanted = chunk_mat <= total_evals
 
-    @_reuse_prefixes(_sparse_delta, _subspace_delta, _site_vmap, _subspace_site)
+    @_reuse_prefixes(_sparse_delta, _subspace_delta, _site_vmap, _subspace_site, _factored_eval)
     def _evaluate_candidates(
         i_all,
         v_all,
@@ -450,7 +454,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # Restore only the rows the previous chunk dirtied (O(chunk*pdim) vs a full
         # copy); None means copy it all first.
         dirty_rows = None
-        for chunk_start, chunk_end in chunk_spans(n_cand, chunk, _site_bounds if dense else None):
+        for chunk_start, chunk_end in chunk_spans(
+            n_cand, chunk, _site_bounds if dense else None, _site_chunks if dense else None
+        ):
             chunk_size_actual = chunk_end - chunk_start
 
             i_idx = i_all[chunk_start:chunk_end]
@@ -538,7 +544,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
 
             for lo in range(chunk_start, chunk_end, chunk_mat):
                 hi = min(lo + chunk_mat, chunk_end)
-                i_idx = i_all[lo:hi]
+                if hi - lo < chunk_size_actual:
+                    i_idx, v_idx, k_idx = i_all[lo:hi], v_all[lo:hi], k_all[lo:hi]
                 if _configs_wanted and hi - lo == chunk_mat:
                     local_range = _local_range_full
                     if _bufs[2] is None:
@@ -555,7 +562,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 else:
                     batch_configs = X.unsqueeze(0).expand(hi - lo, -1, -1).clone()
                     local_range = torch.arange(hi - lo, device=device)
-                batch_configs[local_range, i_idx] = probe_src[i_idx, v_all[lo:hi], k_all[lo:hi]]
+                batch_configs[local_range, i_idx] = probe_src[i_idx, v_idx, k_idx]
 
                 flat_configs = batch_configs.reshape(hi - lo, -1)
 

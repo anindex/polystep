@@ -405,12 +405,12 @@ def test_eager_inplace_does_not_spend_an_extra_verification_forward():
 
 @pytest.mark.parametrize("screen", [False, True])
 def test_materialized_fallback_honours_chunk_size(screen):
-    model = nn.Sequential(nn.Linear(3, 2))
+    model = nn.Sequential(nn.Linear(2, 2))
     opt = PolyStepOptimizer(
         model, particle_dim=3, chunk_size=1, multifidelity_screen=screen, solver="softmax", compile=False, seed=0
     )
     ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
-    x, y = torch.randn(4, 3), torch.randn(4, 2)
+    x, y = torch.randn(4, 2), torch.randn(4, 2)
     opt.register_evaluator(ev, x, y)
     rows = []
 
@@ -425,13 +425,13 @@ def test_materialized_fallback_honours_chunk_size(screen):
 @pytest.mark.parametrize(
     "layers, out, expected",
     [
-        (lambda: (nn.Linear(3, 101, bias=False),), 101, 9),
-        (lambda: (nn.Linear(3, 101), nn.Tanh(), nn.Linear(101, 5)), 5, 36),
+        (lambda: (nn.Linear(3, 101, bias=False),), 101, 0),
+        (lambda: (nn.Linear(3, 101), nn.Tanh(), nn.Linear(101, 5)), 5, 27),
     ],
     ids=["tail", "interior"],
 )
 @pytest.mark.parametrize("hybrid", [False, True])
-def test_only_the_padded_tail_particle_falls_back(hybrid, layers, out, expected):
+def test_only_straddling_particles_fall_back(hybrid, layers, out, expected):
     from polystep.hybrid_subspace import HybridSubspace
     from polystep.transform import ParamLayout
 
@@ -454,30 +454,247 @@ def test_only_the_padded_tail_particle_falls_back(hybrid, layers, out, expected)
     assert sum(rows) == expected
 
 
-@pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
-def test_activation_width_counts_conv_outputs(block_strategy):
+@pytest.mark.parametrize("route", ["delta", "site", "inplace"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "full",
+        "full_bias",
+        "per_layer",
+        "grouped",
+        "dense",
+        "sparse",
+        "unprojected",
+        "unprojected_bias",
+        "factored",
+        "bf16",
+    ],
+)
+def test_the_padded_tail_scores_like_the_materialized_step(monkeypatch, kind, route):
+    from polystep import _step_blockwise, _step_monolithic
+    from polystep.factored_subspace import FactoredSubspace
+    from polystep.hybrid_subspace import HybridSubspace
+    from polystep.solvers._shared import sanitize_cost
+    from polystep.transform import ParamLayout
+
+    if (kind == "factored" and route != "delta") or (kind == "bf16" and route != "site"):
+        pytest.skip("no site path for this pair")
+    dtype = torch.bfloat16 if kind == "bf16" else torch.float64
+    out = 6 if kind.endswith("bias") else 5
+
+    def run(register):
+        torch.manual_seed(0)
+        last = nn.Linear(4, out, bias=kind.endswith("bias"))
+        model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Tanh(), last).to(dtype)
+        layout = ParamLayout.from_module(model)
+        subspace = {
+            "full": lambda: None,
+            "per_layer": lambda: None,
+            "grouped": lambda: None,
+            "dense": lambda: HybridSubspace.from_layout(layout, rank=1),
+            "sparse": lambda: HybridSubspace.from_layout(layout, rank=1, sparse_threshold_bytes=0),
+            "unprojected": lambda: HybridSubspace.from_layout(layout, rank=4),
+            "factored": lambda: FactoredSubspace.from_layout(layout, rank=2),
+            "bf16": lambda: HybridSubspace.from_layout(layout, rank=1),
+        }[kind.removesuffix("_bias")]()
+        opt = PolyStepOptimizer(
+            model,
+            subspace=subspace,
+            polytope_type="simplex",
+            solver="softmax",
+            block_strategy=kind if kind in ("per_layer", "grouped") else "monolithic",
+            compile=False,
+            seed=0,
+            **({"particle_dim": 8} if subspace is None else {}),
+        )
+        assert opt._state.X.numel() > (layout.total_params if subspace is None else subspace.subspace_dim)
+        ev = NNCostEvaluator(
+            model, nn.MSELoss(reduction="sum" if route == "site" else "mean"), use_inplace=route == "inplace"
+        )
+        x, y = torch.randn(16, 4).to(dtype), torch.randn(16, out).to(dtype)
+        if register:
+            opt.register_evaluator(ev, x, y)
+        materialized, owners, costs = [], [], []
+        for step_module in (_step_monolithic, _step_blockwise):
+            monkeypatch.setattr(step_module, "sanitize_cost", lambda c: costs.append(c.clone()) or sanitize_cost(c))
+        for name in (
+            "_sparse_delta_evaluator",
+            "_site_vmap_evaluator",
+            "_subspace_delta_evaluator",
+            "_factored_evaluator",
+        ):
+            owner = getattr(opt, name, None)
+            for method in ("evaluate", "evaluate_subspace"):
+                if hasattr(owner, method):
+                    f = getattr(owner, method)
+                    monkeypatch.setattr(owner, method, lambda *a, f=f, o=owner: owners.append(type(o)) or f(*a))
+        swap = ev.evaluate_subspace_inplace
+        monkeypatch.setattr(ev, "evaluate_subspace_inplace", lambda *a: materialized.append(a[3].shape[0]) or swap(*a))
+
+        def closure(params):
+            materialized.append(next(iter(params.values())).shape[0])
+            return ev.evaluate(params, x, y)
+
+        opt.step(closure)
+        return materialized, owners, costs
+
+    dense_rows, _, dense = run(register=False)
+    fast_rows, owners, fast = run(register=True)
+    assert sum(dense_rows) == sum(c.numel() for c in dense)
+    assert not fast_rows
+    assert len(owners) == (3 if kind.endswith("bias") else 2) and len(set(owners)) == 1
+    tol = dict(rtol=2e-2, atol=1e-2) if kind == "bf16" else dict(rtol=1e-10, atol=1e-12)
+    torch.testing.assert_close(fast, dense, **tol)
+
+
+@pytest.mark.parametrize("route", ["delta", "site", "inplace"])
+def test_a_chunk_of_only_the_padded_tail_scores_like_the_materialized_step(monkeypatch, route):
+    from polystep import _step_monolithic
+    from polystep.hybrid_subspace import HybridSubspace
+    from polystep.solvers._shared import sanitize_cost
+    from polystep.transform import ParamLayout
+
+    def run(register):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Tanh(), nn.Linear(4, 5, bias=False)).double()
+        subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+        opt = PolyStepOptimizer(
+            model, subspace=subspace, polytope_type="simplex", solver="softmax", chunk_size=1, compile=False, seed=0
+        )
+        ev = NNCostEvaluator(
+            model, nn.MSELoss(reduction="sum" if route == "site" else "mean"), use_inplace=route == "inplace"
+        )
+        x, y = torch.randn(16, 4).double(), torch.randn(16, 5).double()
+        if register:
+            opt.register_evaluator(ev, x, y)
+        costs, calls = [], []
+        monkeypatch.setattr(_step_monolithic, "sanitize_cost", lambda c: costs.append(c.clone()) or sanitize_cost(c))
+        opt.step(lambda params: calls.append(1) or ev.evaluate(params, x, y))
+        return costs, calls
+
+    dense, _ = run(register=False)
+    fast, calls = run(register=True)
+    assert not calls
+    torch.testing.assert_close(fast, dense, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("route", ["monolithic", "per_layer", "hybrid"])
+def test_site_chunk_budgets_downstream_activations(route):
+    from polystep.hybrid_subspace import HybridSubspace
+    from polystep.transform import ParamLayout
+
     torch.manual_seed(0)
     model = nn.Sequential(
-        nn.Conv2d(1, 4, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(4, 2)
+        nn.Conv2d(1, 4, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(4), nn.Flatten(), nn.Linear(64, 8)
     )
-    opt = PolyStepOptimizer(model, block_strategy=block_strategy, solver="softmax", compile=False, seed=0)
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=3) if route == "hybrid" else None
+    block_strategy = "per_layer" if route == "per_layer" else "monolithic"
+    opt = PolyStepOptimizer(
+        model, subspace=subspace, block_strategy=block_strategy, solver="softmax", compile=False, seed=0
+    )
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
-    x, y = torch.randn(64, 1, 64, 64), torch.randint(0, 2, (64,))
+    x, y = torch.randn(64, 1, 64, 64), torch.randint(0, 8, (64,))
     opt.register_evaluator(ev, x, y)
-    assert opt._act_ratio == 4.0
-    assert not any(m._forward_hooks for m in model.modules())
+    head = 64 * 8 / x.numel()
+    assert opt._act_ratios == {None: 4.0, "0.weight": 4.0, "0.bias": 4.0, "4.weight": head, "4.bias": head}
+    assert not any(m._forward_hooks or m._forward_pre_hooks for m in model.modules())
 
     site = opt._site_vmap_evaluator
-    rows = []
+    rows = {}
     inner = site._vmap_over_site
 
     def spy(key, base_sd, candidates, inputs, targets):
-        rows.append(candidates.shape[0])
+        rows.setdefault(key, []).append(candidates.shape[0])
         return inner(key, base_sd, candidates, inputs, targets)
 
     site._vmap_over_site = spy
     opt.step(lambda p: ev.evaluate(p, x, y))
-    assert rows and max(rows) < 54
+    conv_chunk = max(rows["0.weight"])
+    assert 2 * 4 * x.numel() * conv_chunk <= 1 << 26
+    assert max(rows["4.weight"]) > conv_chunk
+
+
+def test_site_budget_unexecuted_module_uses_global_max():
+    from polystep._step_core import activation_elements
+
+    class Functional(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(1, 4, 3, padding=1)
+            self.head = nn.Linear(4, 2)
+
+        def forward(self, x):
+            return nn.functional.linear(self.conv(x).mean((2, 3)), self.head.weight, self.head.bias)
+
+    model = Functional()
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    x = torch.randn(8, 1, 16, 16)
+    opt.register_evaluator(NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False), x, torch.zeros(8).long())
+    assert "head.weight" not in opt._act_ratios
+    assert activation_elements(opt, x, "head.weight") == activation_elements(opt, x) == 4 * x.numel()
+
+
+class InputNoise(nn.Module):
+    def forward(self, x):
+        return x + 0.01 * torch.randn_like(x)
+
+
+def test_site_budget_random_forward_uses_global_max():
+    model = nn.Sequential(InputNoise(), nn.Linear(4, 8), nn.Linear(8, 2))
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    x = torch.randn(8, 4)
+    opt.register_evaluator(NNCostEvaluator(model, nn.MSELoss(), use_inplace=False), x, torch.zeros(8, 2))
+    assert opt._act_ratios == {None: 2.0}
+
+
+@pytest.mark.parametrize(
+    "layer, ratios",
+    [("relu", {None: 2.0, "0.weight": 2.0, "0.bias": 2.0, "2.weight": 0.5, "2.bias": 0.5}), ("linear", None)],
+    ids=["relu", "linear"],
+)
+def test_site_budget_scripted_submodule_skips_hooks(layer, ratios):
+    layers = [nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)]
+    i = {"linear": 0, "relu": 1}[layer]
+    layers[i] = torch.jit.script(layers[i])
+    model = nn.Sequential(*layers)
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    x, y = torch.randn(16, 4), torch.zeros(16, 2)
+    opt.register_evaluator(ev, x, y)
+    assert opt._act_ratios == ratios
+    assert not any(
+        m._forward_hooks or m._forward_pre_hooks for m in layers if not isinstance(m, torch.jit.ScriptModule)
+    )
+    opt.step(lambda p: ev.evaluate(p, x, y))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("noise", [nn.Identity, InputNoise])
+def test_site_chunk_peak_within_budget(noise):
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        noise(), nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(4), nn.Flatten(), nn.Linear(128, 8)
+    ).cuda()
+    opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+    x, y = torch.randn(64, 1, 64, 64, device="cuda"), torch.randint(0, 8, (64,), device="cuda")
+    opt.register_evaluator(ev, x, y)
+    site = opt._site_vmap_evaluator
+    inner = site._vmap_over_site
+    peaks = {}
+
+    def spy(key, base_sd, candidates, inputs, targets):
+        torch.cuda.reset_peak_memory_stats()
+        start = torch.cuda.memory_allocated()
+        out = inner(key, base_sd, candidates, inputs, targets)
+        peaks[key] = max(peaks.get(key, 0), torch.cuda.max_memory_allocated() - start)
+        return out
+
+    site._vmap_over_site = spy
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    assert set(peaks) == {"1.weight", "1.bias", "5.weight", "5.bias"}
+    assert max(peaks.values()) <= 1.05 * 4 * (1 << 26)
 
 
 @pytest.mark.parametrize("kind", [nn.Embedding, nn.EmbeddingBag])
@@ -489,7 +706,7 @@ def test_registering_leaves_a_max_norm_embedding_untouched(kind):
     opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
     ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
     opt.register_evaluator(ev, torch.tensor([[0], [1]]), torch.zeros(2, 4))
-    assert opt._act_ratio is not None
+    assert opt._act_ratios is not None
     assert torch.equal(model.weight, before)
 
 
@@ -513,7 +730,7 @@ def test_registering_leaves_train_mode_stats_and_rng_untouched():
     before = {k: v.clone() for k, v in model.state_dict().items()}
     rng = torch.get_rng_state()
     opt.register_evaluator(ev, x, y)
-    assert opt._act_ratio is not None
+    assert opt._act_ratios is not None
     assert model.training
     assert torch.equal(torch.get_rng_state(), rng)
     for k, v in model.state_dict().items():

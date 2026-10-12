@@ -14,7 +14,7 @@ evaluation when `biased_rotation` or `trust_region` uses it.
 |---|---|---|
 | Sequential MLP, full space | Sparse delta | Automatic after registration |
 | Sequential MLP, hybrid subspace | Subspace delta | Automatic after registration |
-| Sequential MLP, factored subspace | Subspace delta, low-rank correction as fallback | Automatic after registration; on CUDA the low-rank correction when one chunk holds every candidate |
+| Sequential MLP, factored subspace | Subspace delta, low-rank correction as fallback | Automatic after registration; on CUDA the low-rank correction when one chunk holds every candidate or chunks are small |
 | Any model, `AdaptiveSubspace` on CPU | Incumbent plus the moved particle's projection columns | Automatic with a dense FP32 or FP64 projection |
 | Convolution, attention, custom forward | Site-local vmap | Automatic when supported |
 | Sequential MLP, dense candidates | Batched matrix multiplication | Automatic |
@@ -81,14 +81,27 @@ compute `x @ W.T + (x @ B.T) @ A.T` without constructing candidate weights. A
 candidate changes a few consecutive coordinates of one `A`, so the subspace-delta
 path scores it from `x @ B.T` and moves only the output units those coordinates
 belong to. Runs that span two parameters, screened candidates and the incumbent use
-the full low-rank correction. The delta path scores each parameter in its own pass,
-which a GPU pays for in kernel launches, so on CUDA it runs only when the low-rank
-correction would need more than one chunk or `chunk_size` is below the candidate
-count. Smaller CUDA steps score every candidate in one low-rank pass, at the cost of
-more peak memory within the default budget. On small MLPs at batch 128 or less that
-pass runs up to twice as fast as the delta path; at larger batches it can run up to
-1.3 times slower. The search is limited to the input directions spanned
-by `B`; basis rotation changes that search space.
+the full low-rank correction, which computes `x @ W.T` and `x @ B.T` for the first
+perturbed layer once per candidate sweep and reuses them across its chunks.
+Screening and incumbent scoring are separate sweeps. The delta path scores
+each parameter in its own pass and launches more kernels per chunk than the low-rank
+correction, which a GPU pays for while its chunks are too small to keep it busy. On
+CUDA it therefore runs only when one chunk of the default budget cannot hold every
+candidate and `chunk_size`, or the candidate count when it is unset, times a
+candidate's largest layer output reaches 2^24, about 16.8 million, elements. Other
+CUDA steps use the low-rank correction, which needs more peak memory per chunk. On
+an RTX 5090 the delta steps this rule picks at the default chunk size ran up to 5
+times faster, though only a few percent faster close to the threshold, with 4 to 54
+times less peak memory. A batch of one on a 784-512-512-10 or 3072-1024-10 MLP stays
+below it, and there the delta path ran up to 1.35 times slower. The threshold sits
+where shallow MLPs stop losing on the delta path: on 784-128-10 at batch 512 it ran
+up to 17% slower with `chunk_size` from 184 to 216, about even at 234 to 243, 4%
+faster at 256, where the rule switches to it, and 11% faster at 288, with a
+fourteenth of the peak memory. Below the threshold the low-rank correction ran up
+to 1.4 times faster on small or shallow MLPs, but wider, deeper and larger-batch
+ones favor the delta path from smaller chunks on, so with a `chunk_size` set they
+may step faster with a larger one. The search is limited to the input directions
+spanned by `B`; basis rotation changes that search space.
 
 `AdaptiveSubspace` still builds every candidate's full weights, since its single
 projection `P` spreads each coordinate over every parameter. On the CPU, with a dense
@@ -108,18 +121,26 @@ products the offsets need.
 candidate's parameters and its largest layer output, which one forward measures when
 the evaluator is first registered and which then scales with the batch. Delta and
 site paths build no full candidate, so they are budgeted on activations and the
-perturbed parameter alone. Reduce `chunk_size` after an out-of-memory error. Steps
-that score on a delta or site path, or on CPU `AdaptiveSubspace` offsets, keep
-whole particles in each chunk, every vertex and probe of one particle, so
-`chunk_size` drops to a multiple of the vertex count times `num_probe` and never
-goes below one such group. A particle that straddles two parameters, or holds the
-padding at the end, gets a chunk of its own and falls back to materialization, in
-batches of at most `chunk_size`. Each chunk costs one forward, so a small CUDA model,
-whose forwards are bound by kernel launches, can step faster with a `chunk_size` at
-or above the candidate count than with the automatic one.
-Per-layer blocks reduce the size of each OT solve, but not the forward count.
-With a subspace, a block strategy only splits Sinkhorn and KL solves into at most
-eight row segments; candidates are scored exactly as in the monolithic step.
+perturbed parameter alone. A site path batches only the layers from the perturbed one
+on, so each site is budgeted on the module outputs from its own layer on. A forward
+that draws random numbers is batched from the draw on, so its sites keep the
+whole-model budget. In example 10's LeNet-5 at batch 256, a chunk holds 27 candidates
+on the first convolution, whose output fills the budget, 72 on the second and up to 729
+on the fully connected layers, so a step scores its 4,833 candidates in 36 forwards.
+Reduce `chunk_size` after an out-of-memory error. Steps that score on a delta or site
+path, or on CPU `AdaptiveSubspace` offsets, keep whole particles in each chunk, every
+vertex and probe of one particle, so `chunk_size` drops to a multiple of the vertex
+count times `num_probe` and never goes below one such group. A particle that straddles
+two parameters gets a chunk of its own and falls back to materialization, in batches of
+at most `chunk_size`. So does the padded particle at the end of the CPU offsets, or of
+a per-layer or grouped block other than the last. On the delta and site paths the
+padded last particle stays with the particles before it, since its padding moves no
+parameter. Each chunk costs one forward, so a small CUDA model, whose forwards are
+bound by kernel launches, can step faster with a `chunk_size` at or above the candidate
+count than with the automatic one. Per-layer blocks reduce the size of each OT solve,
+but not the forward count. With a subspace, a block strategy only splits Sinkhorn and
+KL solves into at most eight row segments; candidates are scored exactly as in the
+monolithic step.
 
 ## Compilation and precision
 

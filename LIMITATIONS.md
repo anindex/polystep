@@ -49,9 +49,11 @@ momentum.
   unsupported options warn at construction. With a subspace, `per_layer` and
   `grouped` run the monolithic step and only split Sinkhorn and KL solves into row
   segments.
-- The automatic chunk size sees only the outputs of layers that own parameters.
-  Attention scores and other intermediates inside a layer are not counted, so set
-  `chunk_size` by hand if such a model runs out of memory.
+- The automatic chunk size sees only module outputs: those of layers that own
+  parameters, and on a site path whose forward draws no random numbers, those of
+  every module from the perturbed layer on. Attention scores and other intermediates
+  inside a module's forward are not counted, so set `chunk_size` by hand if such a
+  model runs out of memory.
 - The library does not distribute optimizer state across multiple GPUs.
 
 ## Attention and recurrent layers

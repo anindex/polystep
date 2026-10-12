@@ -23,32 +23,51 @@ def warn_all_nonfinite(opt) -> None:
     )
 
 
-def chunk_spans(n_cand: int, chunk: int, bounds=None):
+def chunk_spans(n_cand: int, chunk: int, bounds=None, chunks=None):
     """Yield (start, end) chunks of at most ``chunk``, also breaking at ``bounds``.
 
-    Cutting at entry boundaries lets the site-aware paths resolve a site.
+    Cutting at entry boundaries lets the site-aware paths resolve a site. ``chunks``
+    maps the start of a span between bounds to its own chunk size.
     """
     stops = sorted(set(bounds or ()) | {n_cand})
     start = 0
     for stop in stops:
         if stop <= start:
             continue
-        for chunk_start in range(start, stop, chunk):
-            yield chunk_start, min(chunk_start + chunk, stop)
+        size = chunks.get(start, chunk) if chunks else chunk
+        for chunk_start in range(start, stop, size):
+            yield chunk_start, min(chunk_start + size, stop)
         start = stop
 
 
-def activation_elements(opt, inputs) -> int:
+def activation_elements(opt, inputs, key=None) -> int:
     """Activation elements one candidate's forward holds on ``inputs``.
 
-    Scales the ratio the rebuild probe measured, or the widest layer when there is none.
+    With ``key``, only the outputs from that parameter's module on count. Scales the
+    ratios the rebuild probe measured, falling back to the whole model for a key it
+    could not place, or the widest layer when there are none.
     """
     if inputs is None:
         return 0
-    ratio = getattr(opt, "_act_ratio", None)
-    if ratio is not None:
-        return int(ratio * inputs.numel())
+    ratios = getattr(opt, "_act_ratios", None)
+    if ratios is not None:
+        return round(ratios.get(key, ratios[None]) * inputs.numel())
     return inputs.shape[0] * max((e.shape[0] for e in opt.layout.entries if e.shape), default=0)
+
+
+def site_chunks(opt, inputs, sites, pdim: int, group: int, cap: int) -> dict[int, int]:
+    """Automatic chunk for each site's span, keyed by the first candidate wholly inside it.
+
+    ``sites`` pairs each site's first coordinate with its parameter name. A site path
+    batches only the activations from the perturbed parameter's module on, so each site
+    is budgeted on those and on the largest parameter.
+    """
+    numel = max(e.numel for e in opt.layout.entries)
+    chunks = {}
+    for start, key in sites:
+        chunk = min(cap, (1 << 26) // (2 * activation_elements(opt, inputs, key) + numel))
+        chunks[-(-start // pdim) * group] = max(group, chunk // group * group)
+    return chunks
 
 
 def site_bounds(starts, pdim: int, group: int, total: int) -> list[int]:

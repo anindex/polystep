@@ -99,13 +99,15 @@ def test_resolve_site_rejects_a_run_straddling_two_blocks():
     assert ev.resolve_site(sub, boundary - 2, boundary + 2, sub.subspace_dim) is None
 
 
-def test_resolve_site_rejects_particle_padding():
-    """Coordinates past subspace_dim have no parameter behind them."""
+def test_resolve_site_gives_particle_padding_to_the_last_spec():
+    """Coordinates past subspace_dim have no parameter behind them, so the last spec owns a run into them."""
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(64, 16), nn.ReLU(), nn.Linear(16, 10))
     _, sub, _, _ = _setup(model)
     ev = SubspaceDeltaEvaluator.try_build(model, nn.CrossEntropyLoss(), sub)
-    assert ev.resolve_site(sub, sub.subspace_dim - 2, sub.subspace_dim + 2, sub.subspace_dim) is None
+    assert ev.resolve_site(sub, sub.subspace_dim - 2, sub.subspace_dim + 2, sub.subspace_dim) is sub.specs[-1]
+    boundary = sub.specs[-1].flat_start
+    assert ev.resolve_site(sub, boundary - 2, sub.subspace_dim + 2, sub.subspace_dim) is None
 
 
 def test_try_build_declines_a_non_mlp():

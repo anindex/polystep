@@ -446,9 +446,11 @@ def test_blockwise_step_scores_through_the_delta_path(block_strategy):
 
 @pytest.mark.parametrize("block_strategy", ["per_layer", "grouped"])
 def test_blockwise_scores_only_the_padded_tails_densely(block_strategy):
-    """At particle_dim 8 both biases end mid-particle; every other particle stays site-local.
+    """At particle_dim 8 both biases end mid-particle; only the first one's padded particle goes dense.
 
-    Grouped blocks and the leading particles of a padded block used to go dense whole.
+    The last bias runs into the layout's own padding, so it stays site-local with every
+    other particle. Grouped blocks and the leading particles of a padded block used to
+    go dense whole.
     """
 
     def run(register):
@@ -479,7 +481,7 @@ def test_blockwise_scores_only_the_padded_tails_densely(block_strategy):
     fast_rows, fast, _, _ = run(register=True)
 
     assert sum(dense_rows) == evals
-    assert fast_rows == [2 * group] * 3
+    assert fast_rows == [group] * 3
     torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=1e-5, atol=1e-6)
 
 

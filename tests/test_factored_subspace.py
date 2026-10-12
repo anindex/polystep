@@ -99,13 +99,26 @@ def test_registered_step_matches_the_closure_only_step(polytope):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("chunk_size, uses_delta", [(None, False), (72, True)])
-def test_cuda_keeps_the_low_rank_evaluator_when_one_chunk_holds_every_candidate(chunk_size, uses_delta):
-    """A one-chunk low-rank pass beats one delta pass per parameter on a launch-bound GPU."""
+@pytest.mark.parametrize(
+    "width, batch, chunk_size, uses_delta",
+    [
+        (128, 128, None, False),
+        (128, 128, 1152, False),
+        (128, 512, None, True),
+        (128, 512, 72, False),
+        (128, 512, 255, False),
+        (128, 512, 256, True),
+        (1024, 1, None, False),
+        (2048, 1, None, True),
+    ],
+)
+def test_cuda_takes_the_delta_path_only_for_large_chunks(width, batch, chunk_size, uses_delta):
+    """The delta path launches more kernels per chunk, so on CUDA it waits until one
+    default chunk cannot hold every candidate and each chunk carries enough activations."""
     torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 4)).cuda()
-    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=4)
-    x, y = torch.randn(32, 32, device="cuda"), torch.randint(0, 4, (32,), device="cuda")
+    model = nn.Sequential(nn.Linear(784, width), nn.ReLU(), nn.Linear(width, 10)).cuda()
+    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=8)
+    x, y = torch.randn(batch, 784, device="cuda"), torch.randint(0, 10, (batch,), device="cuda")
     evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
     opt = PolyStepOptimizer(model, subspace=subspace, chunk_size=chunk_size, seed=0)
     with patch.object(
