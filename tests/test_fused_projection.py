@@ -5,6 +5,7 @@ the optimizer evaluates in one basis and steps in another, with no error raised.
 rebuild is a full dense reconstruction, so it must not run when the basis held still.
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -57,7 +58,38 @@ def test_fused_matrix_tracks_aligned_absorb_basis():
         assert _fused_disagrees_with_projections(sub, state.hybrid_projections, state.base_params, coords) < 1e-4, (
             f"step {i}: fused matrix describes a different basis than state.hybrid_projections"
         )
+        assert sub._fused_src is state.hybrid_projections
     assert opt.state.absorb_count > 0, "no absorb fired, the test proved nothing"
+
+
+@pytest.mark.parametrize("dtype, tol", [(torch.float32, 1e-5), (torch.bfloat16, 5e-2)])
+def test_fused_paths_use_passed_projections(dtype, tol):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 6), nn.Tanh(), nn.Linear(6, 3)).to(dtype)
+    sub = HybridSubspace.from_layout(
+        ParamLayout.from_module(model), rank=1, rotation_interval=1, rotation_mode="random"
+    )
+    base_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    old = sub.init_projections(torch.device("cpu"), dtype)
+    sub.build_fused_projection(old)
+    assert sub._fused_P is not None
+    new = sub.rotate_all(old, step=1, total_steps=4)
+    coords = torch.randn(sub.subspace_dim, generator=torch.Generator().manual_seed(3)).to(dtype)
+    want = {
+        s.entry_key: base_sd[s.entry_key].float().reshape(-1)
+        + new[s.entry_key].float() @ coords[s.flat_start : s.flat_end].float()
+        for s in sub.specs
+        if s.is_projected
+    }
+    sub.apply_perturbation_inplace(new, model, base_sd, coords)
+    got = {
+        "batch": {k: v[0] for k, v in sub.reconstruct_batch(new, base_sd, coords.unsqueeze(0)).items()},
+        "single": sub.apply_perturbation(new, base_sd, coords),
+        "inplace": dict(model.named_parameters()),
+    }
+    for path, sd in got.items():
+        for k, w in want.items():
+            assert (sd[k].detach().float().reshape(-1) - w).abs().max() < tol, (path, k)
 
 
 def test_blockwise_mode_rotates_per_layer_subspace():

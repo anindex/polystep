@@ -508,6 +508,21 @@ def test_subspace_keeps_minority_param_dtype():
     assert model.big.dtype == torch.float32
 
 
+def test_mixed_precision_refreshes_entry_dtypes():
+    """A HybridSubspace built on a mixed-dtype model before the BF16 cast builds every projection at BF16."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3).double())
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    opt = PolyStepOptimizer(model, subspace=subspace, mixed_precision=True, seed=0)
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    inputs, targets = torch.randn(16, 4), torch.randint(0, 3, (16,))
+
+    loss = opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+
+    assert {p.dtype for p in opt.state.hybrid_projections.values()} == {torch.bfloat16}
+    assert math.isfinite(float(loss))
+
+
 @pytest.mark.parametrize("minority", [torch.float64, torch.bfloat16])
 def test_two_dtype_forward_keeps_projection_dtypes(minority):
     """A model whose forward runs in two dtypes, not just holding an unused one. Each

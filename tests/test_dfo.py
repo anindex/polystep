@@ -428,6 +428,43 @@ def test_selection_screen_runs_on_simplex():
     assert opt._last_screen_savings > 0
 
 
+@pytest.mark.parametrize("solver", ["min_cost_greedy", "top_k_mean", None])
+def test_screened_cost_averages_scored_losses(monkeypatch, solver):
+    """The reported cost averages the losses the solve saw, never a dropped vertex's +inf mask."""
+    from polystep import _step_monolithic
+
+    scored = []
+    fill = _step_monolithic._fill_screened_losses
+
+    def spy(*args, **kwargs):
+        losses = fill(*args, **kwargs)
+        scored.append(losses[torch.isfinite(losses)].mean().item())
+        return losses
+
+    monkeypatch.setattr(_step_monolithic, "_fill_screened_losses", spy)
+    model, _ = _make_model_and_closure()
+    x, y = torch.randn(64, 4), torch.randn(64, 2)
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    opt = PolyStepOptimizer(
+        model,
+        particle_dim=5,
+        epsilon=1.0,
+        seed=0,
+        solver=solver,
+        polytope_type="simplex",
+        num_probe=1,
+        multifidelity_screen=True,
+        screen_keep_ratio=0.5,
+        screen_fidelity=0.25,
+    )
+
+    def closure(bp, _x=x, _y=y):
+        return ev.evaluate(bp, _x, _y)
+
+    cost = opt.step(closure, screen_closure=opt.screen_closure_from(closure, x, y))
+    assert scored == [pytest.approx(cost, rel=1e-6)]
+
+
 def test_screen_keeps_top_k_vertices(monkeypatch):
     """TopKMeanSolver averages min(k, V) vertices, so a screen keeping fewer feeds it
     entries that were never evaluated at full fidelity."""
@@ -711,7 +748,7 @@ def test_screen_dropped_vertices_keep_clean_trajectory():
     for _ in range(60):
         opt.step(closure, screen_closure=screen)
 
-    assert model.weight[0, 2].item() == pytest.approx(-0.42066213, abs=1e-7)
+    assert model.weight[0, 2].item() == pytest.approx(-0.42342189, abs=1e-7)
 
 
 def test_multifidelity_screen_skips_forwards():
@@ -788,6 +825,29 @@ def _screen_step(num_probe, keep_ratio, screen_fidelity=0.25):
 def test_multifidelity_screen_refuses_costly_config():
     """screen_fidelity/num_probe + keep_ratio >= 1: the screen would buy work, not save it."""
     opt, closure, inputs, targets = _screen_step(num_probe=1, keep_ratio=0.9, screen_fidelity=0.5)
+    with pytest.warns(UserWarning, match="costs more work than it saves"):
+        opt.step(closure, screen_closure=opt.screen_closure_from(closure, inputs, targets))
+    assert opt._last_screen_savings == 0.0
+
+
+@pytest.mark.parametrize("solver, keep_ratio, screen_fidelity", [(None, 0.55, 0.4), ("top_k_mean", 0.5, 0.25)])
+def test_screen_realized_cost_over_sweep_refused(solver, keep_ratio, screen_fidelity):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
+    inputs, targets = torch.randn(16, 4), torch.randn(16, 2)
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    opt = PolyStepOptimizer(
+        model,
+        seed=0,
+        solver=solver,
+        multifidelity_screen=True,
+        screen_keep_ratio=keep_ratio,
+        screen_fidelity=screen_fidelity,
+    )
+
+    def closure(batched, _in=inputs, _tgt=targets):
+        return evaluator.evaluate(batched, _in, _tgt)
+
     with pytest.warns(UserWarning, match="costs more work than it saves"):
         opt.step(closure, screen_closure=opt.screen_closure_from(closure, inputs, targets))
     assert opt._last_screen_savings == 0.0

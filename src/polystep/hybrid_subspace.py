@@ -225,13 +225,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Dict[str, Union[torch.Tensor, SparseRandomProjection]]:
-        """Per-layer projection matrices, memoized by ``(device, dtype)``.
-
-        Callers must not write into the result.
-        """
-        cached = getattr(self, "_init_projections_cache", None)
-        if cached is not None and cached[0] == (device, dtype):
-            return cached[1]
+        """Per-layer projection matrices."""
         projections: Dict[str, Union[torch.Tensor, SparseRandomProjection]] = {}
         for spec in self.specs:
             if not spec.is_projected:
@@ -246,8 +240,6 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             else:
                 P = self._get_projection(spec, device, dtype, step=0)
                 projections[spec.entry_key] = P
-        # Not an __init__ field, so dataclasses.replace drops it, matching _fused_P.
-        self._init_projections_cache = ((device, dtype), projections)
         return projections
 
     def entry_dtype(self, spec: ProjectionSpec, default: torch.dtype) -> torch.dtype:
@@ -454,7 +446,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     ) -> Dict[str, torch.Tensor]:
         """Reconstruct a state_dict from the base weights and one subspace vector."""
         result = {}
-        fused_P = getattr(self, "_fused_P", None)
+        fused_P = self._fused_for(projections)
         if fused_P is not None and fused_P.dtype in (torch.float16, torch.bfloat16):
             fused = self._gather_fused_coords(flat_subspace).unsqueeze(0) @ fused_P.t()
             for spec, offset in self._fused_dense_specs:
@@ -522,6 +514,9 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             return cached
         return torch.cat([base_sd[spec.entry_key].reshape(-1) for spec, _ in self._fused_dense_specs]).unsqueeze(0)
 
+    def _fused_for(self, projections: Dict[str, Union[torch.Tensor, SparseRandomProjection]]) -> Optional[torch.Tensor]:
+        return getattr(self, "_fused_P", None) if projections is getattr(self, "_fused_src", None) else None
+
     def build_fused_projection(
         self,
         projections: Dict[str, Union[torch.Tensor, "SparseRandomProjection"]],
@@ -567,6 +562,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             self._fused_P = torch.block_diag(*dense_blocks)
         else:
             self._fused_P = None
+        self._fused_src = projections if self._fused_P is not None else None
         self.release_inplace()
 
     def apply_perturbation_inplace(
@@ -582,7 +578,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             param_dict = dict(model.named_parameters())
 
         # Fused path: one addmm plus one grouped copy per candidate, whatever the layer count.
-        fused_P = getattr(self, "_fused_P", None)
+        fused_P = self._fused_for(projections)
         if fused_P is not None and self._fused_dense_specs:
             coords = self._gather_fused_coords(flat_subspace)
             buf = self._inplace_delta_buffer
@@ -654,9 +650,10 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         N = flat_subspace_batch.shape[0]
         result = {}
 
-        if getattr(self, "_fused_P", None) is not None and self._fused_dense_specs:
+        fused_P = self._fused_for(projections)
+        if fused_P is not None and self._fused_dense_specs:
             fused_coords = self._gather_fused_coords(flat_subspace_batch)
-            fused_delta = fused_coords @ self._fused_P.t()
+            fused_delta = fused_coords @ fused_P.t()
 
             for spec, param_offset in self._fused_dense_specs:
                 block = fused_delta[:, param_offset : param_offset + spec.num_params]

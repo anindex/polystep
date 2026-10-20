@@ -198,9 +198,10 @@ constant token means a stationary objective.
 | `candidate_autocast` | `False` | Candidate forward precision; disables incompatible fast paths |
 
 `amortize_steps` skips evaluations between sampled updates. `multifidelity_screen`
-scores candidates on a smaller batch and evaluates only the `screen_keep_ratio` share
-it keeps on the full batch. Measure the quality of either at equal evaluation and time
-budgets.
+scores candidates on a smaller batch and re-scores on the full batch only the
+`round(V * screen_keep_ratio)` vertices it keeps per particle, at least the solver's
+`k` for `top_k_mean` and whole antithetic pairs on the orthoplex. Measure the quality
+of either at equal evaluation and time budgets.
 
 Screening needs a cheaper closure. `screen_closure_from` passes the first
 `screen_fidelity` fraction of the batch as extra arguments to the closure. Give those
@@ -218,9 +219,11 @@ optimizer.step(closure, screen_closure=screen)
 ```
 
 A registered evaluator screens on the same leading slice of its batch. Screening runs
-only when `screen_fidelity / num_probe + screen_keep_ratio < 1`, where it costs less
-than the full sweep, and not with `use_quadratic_model`, `newton_refinement` or
-`trust_region`.
+only when `screen_fidelity / num_probe` plus the share of vertices kept per particle is
+below 1, where it costs less than the full sweep, and not with `use_quadratic_model`,
+`newton_refinement` or `trust_region`. With few vertices the kept share is coarse: at
+the default `particle_dim=2` the simplex has 3 vertices, so `screen_keep_ratio=0.5`
+keeps 2 of them.
 
 ## Custom layers
 

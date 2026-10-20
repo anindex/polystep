@@ -1,5 +1,7 @@
 """Tests for HybridSubspace: per-layer projections with synchronized rotation."""
 
+import gc
+import weakref
 from dataclasses import replace
 
 import pytest
@@ -798,6 +800,24 @@ def test_rotation_clears_displacement_history():
         previous_basis = state.hybrid_projections
 
     assert rotations > 0, "no rotation fired, the test proves nothing"
+
+
+def test_rotation_frees_step_zero_projections():
+    from polystep import PolyStepOptimizer
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 8), nn.Tanh(), nn.Linear(8, 2))
+    subspace = HybridSubspace.from_layout(
+        ParamLayout.from_module(model), rank=2, rotation_interval=1, rotation_mode="random"
+    )
+    opt = PolyStepOptimizer(model, subspace=subspace, compile=False, seed=0, solver="softmax")
+    step_zero = weakref.ref(next(iter(opt.state.hybrid_projections.values())))
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    inputs, targets = torch.randn(16, 8), torch.randn(16, 2)
+    for _ in range(3):
+        opt.step(lambda batched: evaluator.evaluate(batched, inputs, targets))
+    gc.collect()
+    assert step_zero() is None
 
 
 @pytest.mark.parametrize("rotation_mode", ["random", "displacement"])

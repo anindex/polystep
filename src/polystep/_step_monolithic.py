@@ -345,23 +345,28 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # A selection solver ranks vertices by their own screened cost, so it needs no
     # antithetic pairing; the contrast-ranked branch below still does.
     _selection_solver = isinstance(opt.solver, (MinCostGreedySolver, TopKMeanSolver))
+    if _selection_solver:
+        # A floor at k, not a cap: TopKMeanSolver skips the dropped vertices, so a
+        # cap would leave it fewer than k scored ones to average.
+        keep_v = min(V, max(1, int(round(V * opt.screen_keep_ratio)), min(getattr(opt.solver, "k", 1), V)))
+    elif opt.polytope_type == "orthoplex":
+        keep_v = 2 * max(1, min(V // 2, int(round(V // 2 * opt.screen_keep_ratio))))
+    else:
+        keep_v = max(1, min(V, int(round(V * opt.screen_keep_ratio))))
     _screen_ready = (
         opt.multifidelity_screen
         and screen_closure is not None
-        # Every remaining branch ranks on the screened costs alone.
-        and opt.screen_keep_ratio < 1.0
         and not (opt.use_quadratic_model or opt._newton_refinement or opt.trust_region)
-        # Only pays when screen_fidelity/K_eff + keep_ratio < 1.
-        and opt.screen_fidelity / K_eff + opt.screen_keep_ratio < 1.0
+        and opt.screen_fidelity / K_eff + keep_v / V < 1.0
     )
     if opt.multifidelity_screen and not _screen_ready and not getattr(opt, "_screen_warned", False):
         opt._screen_warned = True
         warnings.warn(
             "multifidelity_screen=True but the screen did not run, so no forward "
             "evaluations are saved this step. It needs a cheap screen_closure passed "
-            "to step() (api.train builds one), screen_fidelity/num_probe + "
-            "screen_keep_ratio < 1 (above that the screen costs more work than it "
-            "saves), and none of use_quadratic_model / newton_refinement / "
+            "to step() (api.train builds one), screen_fidelity/num_probe plus the "
+            "share of vertices kept per particle < 1 (above that the screen costs more "
+            "work than it saves), and none of use_quadratic_model / newton_refinement / "
             "trust_region enabled.",
             stacklevel=3,
         )
@@ -649,9 +654,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # Stage 2: full fidelity only where it can still matter, ranked per particle.
         keep_mask = torch.zeros(P, V, dtype=torch.bool, device=device)
         if _selection_solver:
-            # A floor at k, not a cap: TopKMeanSolver skips the dropped vertices, so a
-            # cap would leave it fewer than k scored ones to average.
-            keep_v = min(V, max(1, int(round(V * opt.screen_keep_ratio)), min(getattr(opt.solver, "k", 1), V)))
             keep_idx = torch.topk(screen_cost, keep_v, dim=1, largest=False).indices
             keep_mask.scatter_(1, keep_idx, True)
         elif opt.polytope_type == "orthoplex":
@@ -659,7 +661,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             # so rank by that and keep both signs.
             pdim_local = V // 2
             contrast = (screen_cost[:, :pdim_local] - screen_cost[:, pdim_local:]).abs()
-            keep_k = max(1, min(pdim_local, int(round(pdim_local * opt.screen_keep_ratio))))
+            keep_k = keep_v // 2
             keep_dirs = torch.topk(contrast, keep_k, dim=1).indices  # (P, keep_k)
             keep_mask.scatter_(1, keep_dirs, True)
             keep_mask.scatter_(1, keep_dirs + pdim_local, True)
@@ -668,7 +670,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             # barycentre by nothing. Deviation from the mean is the contrast above,
             # written for a frame with no partner to subtract.
             deviation = (screen_cost - screen_cost.mean(dim=1, keepdim=True)).abs()
-            keep_v = max(1, min(V, int(round(V * opt.screen_keep_ratio))))
             keep_mask.scatter_(1, torch.topk(deviation, keep_v, dim=1).indices, True)
 
         sel_idx = torch.nonzero(keep_mask[_i_all, _v_all], as_tuple=True)[0]
@@ -938,7 +939,11 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # One transfer for all of these, not a device sync each.
     _cost_mean, _ess, _rho, _all_nonfinite, _progress, _x_finite, _disp = torch.stack(
         [
-            cost_matrix.mean(),
+            (
+                torch.where(keep_mask, cost_matrix, 0).sum() / keep_mask.sum()
+                if _screen_ready and _selection_solver
+                else cost_matrix.mean()
+            ),
             _ess_tensor,
             _rho_tensor,
             _nonfinite.to(cost_matrix.dtype),

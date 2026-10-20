@@ -41,7 +41,7 @@ from .solvers import (
 from .solver import SolverState
 from .adaptive_subspace import AdaptiveSubspace
 from .factored_subspace import FactoredSubspace
-from .hybrid_subspace import HybridSubspace
+from .hybrid_subspace import HybridSubspace, _mixed_entry_dtypes
 from ._serialization import SerializationMixin
 from .transform import ParamLayout, create_generator
 
@@ -872,6 +872,8 @@ class PolyStepOptimizer(SerializationMixin):
             )
 
         if self._per_layer_projections:
+            if self._hybrid:
+                subspace._entry_dtypes = _mixed_entry_dtypes(self.layout)
             self._state.hybrid_projections = subspace.init_projections(
                 model_device,
                 self._model_dtype,
