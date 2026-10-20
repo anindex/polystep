@@ -6,11 +6,14 @@ particle shape and padding, metadata, device handling, and deterministic generat
 
 import dataclasses
 import logging
+import sys
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
+from polystep import transform
 from polystep.transform import ParamLayout, create_generator
 
 
@@ -352,7 +355,7 @@ def test_differently_shaped_buffer_views_rejected():
         def forward(self, x):
             return x @ self.weight.T
 
-    with pytest.raises(ValueError, match="share storage but are different views"):
+    with pytest.raises(ValueError, match="share storage but are different tensors"):
         ParamLayout.from_module(ReshapedAlias())
 
 
@@ -378,7 +381,7 @@ def test_transposed_alias_rejected():
     assert model.weight.shape == model.weight_t.shape
     assert model.weight.stride() != model.weight_t.stride()
 
-    with pytest.raises(ValueError, match="share storage but are different views"):
+    with pytest.raises(ValueError, match="share storage but are different tensors"):
         ParamLayout.from_module(model)
 
 
@@ -388,5 +391,219 @@ def test_layout_distinct_parameter_alias_raises(frozen):
     model[2].weight.data = model[0].weight.data
     model[2].weight.requires_grad_(not frozen)
 
-    with pytest.raises(ValueError, match="distinct Parameters sharing storage"):
+    with pytest.raises(ValueError, match="share storage but are different tensors"):
         ParamLayout.from_module(model)
+
+
+@pytest.mark.filterwarnings("ignore:The PyTorch API of nested tensors:UserWarning")
+def test_layout_frozen_offset_alias_raises():
+    model = nn.Module()
+    flat = torch.arange(6.0)
+    model.a = nn.Parameter(flat[2:4])
+    model.before = nn.Parameter(flat[:2], requires_grad=False)
+    model.after = nn.Parameter(flat[4:], requires_grad=False)
+    cols = torch.arange(8.0).view(2, 4)
+    model.cols_train = nn.Parameter(cols[:, :2])
+    model.cols_frozen = nn.Parameter(cols[:, 2:], requires_grad=False)
+    model.register_buffer("sparse", torch.eye(2).to_sparse())
+    assert [e.key for e in ParamLayout.from_module(model).entries] == ["a", "cols_train"]
+
+    model.register_buffer("nested", torch.nested.as_nested_tensor(cols))
+    with pytest.raises(ValueError, match="'nested' and trainable parameter 'cols_train' share storage"):
+        ParamLayout.from_module(model)
+
+    del model.nested
+    model.overlap = nn.Parameter(flat[1:3], requires_grad=False)
+    with pytest.raises(ValueError, match="'overlap' and trainable parameter 'a' share storage"):
+        ParamLayout.from_module(model)
+
+    del model.overlap
+    model.cols_shifted = nn.Parameter(cols[:, 1:3], requires_grad=False)
+    with pytest.raises(ValueError, match="'cols_shifted' and trainable parameter 'cols_train' share storage"):
+        ParamLayout.from_module(model)
+
+    del model.cols_shifted
+    grid = torch.arange(8.0).view(2, 4)
+    model.grid_frozen = nn.Parameter(grid[:, :2], requires_grad=False)
+    model.grid_train = nn.Parameter(grid[:, 1:3])
+    with pytest.raises(ValueError, match="'grid_frozen' and trainable parameter 'grid_train' share storage"):
+        ParamLayout.from_module(model)
+
+    model.grid_train = nn.Parameter(grid[:, :3])
+    model.grid_frozen = nn.Parameter(grid[:, 2:3], requires_grad=False)
+    with pytest.raises(ValueError, match="'grid_frozen' and trainable parameter 'grid_train' share storage"):
+        ParamLayout.from_module(model)
+
+    del model.grid_frozen, model.grid_train
+    wide = torch.zeros(8, dtype=torch.float64)
+    model.wide_frozen = nn.Parameter(wide.view(2, 4)[:, :1], requires_grad=False)
+    model.narrow_train = nn.Parameter(wide.view(torch.float32)[4:12].view(2, 4)[:, :1])
+    with pytest.raises(ValueError, match="'wide_frozen' and trainable parameter 'narrow_train' share storage"):
+        ParamLayout.from_module(model)
+
+    del model.wide_frozen, model.narrow_train
+    model.rows_frozen = nn.Parameter(grid[:, :1], requires_grad=False)
+    model.pairs_train = nn.Parameter(grid.view(-1)[2:6].view(2, 2)[:, :1])
+    with pytest.raises(ValueError, match="'rows_frozen' and trainable parameter 'pairs_train' share storage"):
+        ParamLayout.from_module(model)
+
+
+def test_alias_cache_misses_changed_model():
+    model, matrix = nn.Module(), torch.arange(6.0).view(2, 3)
+    model.a = nn.Parameter(matrix[:, 0])
+    model.b = nn.Parameter(matrix[:, 1], requires_grad=False)
+    model.register_buffer("c", matrix[:, 1])
+    ParamLayout.from_module(model)
+
+    model.b.requires_grad_(True)
+    with pytest.raises(ValueError, match="'c' and trainable parameter 'b' share storage"):
+        ParamLayout.from_module(model)
+
+    model.b.requires_grad_(False)
+    ParamLayout.from_module(model)
+    model.c = matrix.view(-1)[1:5]
+    with pytest.raises(ValueError, match="'c' and trainable parameter 'a' share storage"):
+        ParamLayout.from_module(model)
+
+
+def test_numpy_wrapper_alias_raises():
+    backing = np.arange(6, dtype=np.float32)
+    model = nn.Module()
+    model.a = nn.Parameter(torch.from_numpy(backing[2:4]))
+    model.frozen = nn.Parameter(torch.from_numpy(backing[1:3]), requires_grad=False)
+    assert model.a.untyped_storage().data_ptr() != model.frozen.untyped_storage().data_ptr()
+
+    with pytest.raises(ValueError, match="share storage but are different tensors"):
+        ParamLayout.from_module(model)
+
+
+def test_disjoint_slices_layout_builds_fast(monkeypatch):
+    calls = []
+    monkeypatch.setattr(transform, "_shares_bytes", lambda a, b: calls.append((a, b)) or True)
+    model, flat = nn.Module(), torch.ones(400)
+    for i in range(100):
+        model.register_parameter(f"p{i}", nn.Parameter(flat[4 * i : 4 * i + 4], requires_grad=i % 2 == 0))
+
+    assert ParamLayout.from_module(model).total_params == 200
+    assert calls == []
+
+
+def test_strided_parameter_gap_buffer_builds():
+    model, flat = nn.Module(), torch.arange(12.0)
+    model.w = nn.Parameter(flat[0::4])
+    model.a = nn.Parameter(flat[1:3])
+    model.register_buffer("odd", flat[3:4])
+
+    assert ParamLayout.from_module(model).total_params == 5
+
+
+def test_strided_parameter_late_buffer_raises():
+    model, flat = nn.Module(), torch.arange(12.0)
+    model.w = nn.Parameter(flat[0::4])
+    model.a = nn.Parameter(flat[1:3])
+    model.register_buffer("late", flat[8:9])
+
+    with pytest.raises(ValueError, match="'late' and trainable parameter 'w' share storage"):
+        ParamLayout.from_module(model)
+
+
+@pytest.mark.parametrize("persistent", [True, False])
+@pytest.mark.parametrize(
+    "view",
+    [lambda w: w, lambda w: w.detach(), lambda w: w.detach().reshape(1, 2), lambda w: w.detach().view(torch.int32)],
+    ids=["parameter", "same", "reshaped", "int32"],
+)
+def test_buffer_alias_parameter_raises(persistent, view):
+    model = nn.Module()
+    model.w = nn.Parameter(torch.tensor([1.0, 2.0]))
+    model.register_buffer("alias", view(model.w), persistent=persistent)
+
+    with pytest.raises(ValueError, match="'alias' and trainable parameter 'w' share storage"):
+        ParamLayout.from_module(model)
+
+
+def test_many_ties_layout_builds_linear(monkeypatch):
+    spans, byte_span = [], transform._byte_span
+    monkeypatch.setattr(transform, "_byte_span", lambda t: spans.append(t) or byte_span(t))
+    model, weight, table = nn.Module(), nn.Parameter(torch.ones(4)), torch.zeros(4)
+    for i in range(200):
+        child = nn.Module()
+        child.weight = weight
+        child.register_buffer("table", table)
+        model.add_module(f"m{i}", child)
+
+    layout = ParamLayout.from_module(model)
+    assert layout.total_params == 4 and len(layout.shared_groups[0]) == 200
+    assert len(spans) == 2
+
+
+@pytest.mark.filterwarnings("ignore:Sparse CSR tensor support is in beta:UserWarning")
+@pytest.mark.parametrize("part", ["coo_values", "csr_values", "coo_indices", "csr_indices"])
+def test_sparse_buffer_alias_raises(part):
+    model = nn.Module()
+    model.w = nn.Parameter(torch.zeros(2, 2, dtype=torch.float64))
+    rows, cols, values = torch.tensor([0, 0, 1, 1]), torch.tensor([0, 1, 0, 1]), model.w.detach().flatten()
+    if part == "coo_values":
+        alias = torch.sparse_coo_tensor(torch.stack([rows, cols]), values, (2, 2), check_invariants=True)
+    elif part == "csr_values":
+        alias = torch.sparse_csr_tensor(torch.tensor([0, 2, 4]), cols, values, (2, 2), check_invariants=True)
+    elif part == "coo_indices":
+        indices = model.w.detach().view(torch.int64)
+        alias = torch.sparse_coo_tensor(indices, torch.ones(2), (2, 2), check_invariants=True)
+    else:
+        crow = model.w.detach().flatten().view(torch.int64)
+        alias = torch.sparse_csr_tensor(crow, cols[:0], torch.zeros(0), (3, 2), check_invariants=True)
+    model.register_buffer("alias", alias)
+
+    with pytest.raises(ValueError, match="'alias' and trainable parameter 'w' share storage"):
+        ParamLayout.from_module(model)
+
+
+@pytest.mark.parametrize("field", ["offsets", "lengths"])
+def test_jagged_offsets_alias_raises(field):
+    offsets, lengths = torch.tensor([0, 2, 4]), torch.tensor([2, 2])
+    model = nn.Module()
+    model.w = nn.Parameter((offsets if field == "offsets" else lengths).view(torch.float64))
+    model.register_buffer("nested", torch.nested.nested_tensor_from_jagged(torch.ones(4, 2), offsets, lengths=lengths))
+
+    with pytest.raises(ValueError, match="'nested' and trainable parameter 'w' share storage"):
+        ParamLayout.from_module(model)
+
+
+def test_reordered_state_dict_keeps_tie_name():
+    class Tied(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.z, self.a = nn.Linear(2, 2), nn.Linear(2, 2)
+            self.a.weight = self.z.weight
+            self.register_state_dict_post_hook(self.sort_keys)
+
+        @staticmethod
+        def sort_keys(module, state, prefix, local_metadata):
+            for key in sorted(state):
+                state.move_to_end(key)
+
+    layout = ParamLayout.from_module(Tied())
+    assert [e.key for e in layout.entries] == ["a.bias", "z.bias", "z.weight"]
+    assert layout.shared_groups == (("z.weight", "a.weight"),)
+
+
+def test_strided_span_sweep_stays_linear():
+    events, previous = [], sys.gettrace()
+
+    def count(frame, event, arg):
+        events.append(event)
+        return count
+
+    n, model = 4000, nn.Module()
+    flat = torch.ones(n + 2)
+    model.long = nn.Parameter(flat[:: n + 1])
+    for i in range(n):
+        model.register_parameter(f"p{i}", nn.Parameter(flat[i + 1 : i + 2]))
+
+    sys.settrace(lambda frame, event, arg: count if frame.f_code.co_filename == transform.__file__ else None)
+    try:
+        assert ParamLayout.from_module(model).total_params == n + 2
+    finally:
+        sys.settrace(previous)
+    assert len(events) < 200 * n

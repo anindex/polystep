@@ -260,50 +260,6 @@ def test_inplace_site_accepts_tied_weights(forced):
     assert torch.equal(got, evaluator.evaluate(layout.batch_unflatten(candidates), inputs, targets))
 
 
-class BufferAliasNet(nn.Module):
-    def __init__(self, persistent):
-        super().__init__()
-        self.a, self.b = nn.Linear(4, 8), nn.Linear(8, 3)
-        alias = self.a.weight.detach()
-        self.register_buffer("alias", alias, persistent=persistent)
-        self.b.register_buffer("alias", alias, persistent=persistent)
-
-    def forward(self, x):
-        return self.b(torch.tanh(self.a(x)))
-
-
-@pytest.mark.parametrize("hybrid", [False, True])
-@pytest.mark.parametrize("use_inplace", [None, True])
-def test_persistent_buffer_alias_trains_parameter(hybrid, use_inplace):
-    """The state_dict lists the root's buffers before its children's parameters, yet
-    the parameter must stay canonical: a persistent alias trains like a
-    non-persistent one, on every path.
-    """
-    from polystep import HybridSubspace
-
-    def run(persistent):
-        torch.manual_seed(0)
-        model = BufferAliasNet(persistent)
-        inputs, targets = torch.randn(16, 4), torch.randint(0, 3, (16,))
-        layout = ParamLayout.from_module(model, particle_dim=PDIM)
-        subspace = HybridSubspace.from_layout(layout, rank=2) if hybrid else None
-        opt = PolyStepOptimizer(model, solver="softmax", seed=0, subspace=subspace)
-        evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=use_inplace, compile_forward=False)
-        initial_weight = model.a.weight.detach().clone()
-        losses = []
-        for _ in range(3):
-            opt.register_evaluator(evaluator, inputs, targets)
-            losses.append(float(opt.step(lambda p: evaluator.evaluate(p, inputs, targets))))
-        assert model.alias.data_ptr() == model.a.weight.data_ptr()
-        assert not torch.equal(model.a.weight, initial_weight)
-        return losses, model.a.weight.detach()
-
-    losses, weight = run(True)
-    want_losses, want_weight = run(False)
-    torch.testing.assert_close(torch.tensor(losses), torch.tensor(want_losses))
-    torch.testing.assert_close(weight, want_weight)
-
-
 def test_sparse_delta_matches_site_on_mlp():
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(6, 5), nn.ReLU(), nn.Linear(5, 3))

@@ -27,6 +27,8 @@ Heavy-ball momentum can amplify the barycentric displacement.
   any you keep after the closure returns.
 - Manual loops must register the evaluator and current batch to enable fast paths.
   The evaluator and closure must compute the same objective.
+- Tied weights must be the same Parameter object, and buffers may not share memory
+  with trainable parameters. Register a clone or compute the tensor in forward instead.
 - `NNCostEvaluator` and `train()` score candidates in eval mode: dropout is off and
   batch-norm running statistics never update. A custom closure that runs the model in
   train mode compares candidates under different dropout masks.

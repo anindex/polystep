@@ -43,7 +43,7 @@ from .adaptive_subspace import AdaptiveSubspace
 from .factored_subspace import FactoredSubspace
 from .hybrid_subspace import HybridSubspace, _mixed_entry_dtypes
 from ._serialization import SerializationMixin
-from .transform import ParamLayout, create_generator
+from .transform import ParamLayout, _trainable_owners, create_generator
 
 from ._step_monolithic import step_monolithic as _step_monolithic_fn
 from ._step_blockwise import step_blockwise as _step_blockwise_fn
@@ -1236,17 +1236,20 @@ class PolyStepOptimizer(SerializationMixin):
         self._fused_inputs = None
         self._fused_targets = None
 
-    def _screen_data(self):
-        """Low-fidelity ``(inputs, targets)`` the registered evaluator screens on."""
-        inputs = getattr(self, "_fused_inputs", None)
-        targets = getattr(self, "_fused_targets", None)
-        if inputs is None or not self.multifidelity_screen:
-            return inputs, targets
-        n = inputs.shape[0]
+    def _screen_slice(self, inputs: torch.Tensor, targets=None):
+        """Leading ``screen_fidelity`` rows of a batch and the batch share they realize."""
+        n = inputs.shape[0] if inputs.dim() else 1
         m = max(1, int(round(n * self.screen_fidelity)))
         if m >= n:
-            return inputs, targets
-        return inputs[:m], (targets[:m] if targets is not None else None)
+            return inputs, targets, 1.0
+        return inputs[:m], (targets[:m] if targets is not None else None), m / n
+
+    def _screen_data(self, screen_closure: Callable):
+        """Low-fidelity ``(inputs, targets, share)`` the screen scores on."""
+        inputs = getattr(self, "_fused_inputs", None)
+        if inputs is None:
+            return None, None, getattr(screen_closure, "fidelity", self.screen_fidelity)
+        return self._screen_slice(inputs, getattr(self, "_fused_targets", None))
 
     def screen_closure_from(self, closure: Callable, inputs: torch.Tensor, targets=None) -> Callable:
         """Wrap a full-fidelity batch into a cheap screening closure, or return None.
@@ -1258,16 +1261,14 @@ class PolyStepOptimizer(SerializationMixin):
         """
         if not self.multifidelity_screen:
             return None
-        n = inputs.shape[0]
-        m = max(1, int(round(n * self.screen_fidelity)))
-        if m >= n:
+        sub_in, sub_tgt, share = self._screen_slice(inputs, targets)
+        if sub_in is inputs:
             return None
-        sub_in = inputs[:m]
-        sub_tgt = targets[:m] if targets is not None else None
 
         def screen(batched_params, _in=sub_in, _tgt=sub_tgt):
             return closure(batched_params, _in, _tgt)
 
+        screen.fidelity = share
         return screen
 
     @torch.inference_mode()
@@ -1302,6 +1303,7 @@ class PolyStepOptimizer(SerializationMixin):
             self._prev_predicted_improvement = None
             self._prev_pre_step_loss = None
             self._prev_objective_token = objective_token
+        self._last_screen_savings = 0.0
         # Amortized OT: cheap momentum steps between full OT solves.
         if (
             self.amortize_steps > 1
@@ -1424,6 +1426,7 @@ class PolyStepOptimizer(SerializationMixin):
                 f"The model moved from {self._state.X.device} to {device}, and resync_from_model() "
                 "does not move the optimizer state. Build a new optimizer on the moved model."
             )
+        _trainable_owners(self.model)
         if self.subspace is not None:
             # Re-anchor the base and zero the coordinates.
             self._state.base_params = {

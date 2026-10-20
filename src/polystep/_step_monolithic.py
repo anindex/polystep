@@ -341,7 +341,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
 
     # One incumbent loss serves every parameter block, at every probe count.
     _center_wanted = opt.use_quadratic_model and (opt.biased_rotation or opt.trust_region)
-    screen_inputs, screen_targets = opt._screen_data()
     # A selection solver ranks vertices by their own screened cost, so it needs no
     # antithetic pairing; the contrast-ranked branch below still does.
     _selection_solver = isinstance(opt.solver, (MinCostGreedySolver, TopKMeanSolver))
@@ -353,19 +352,16 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         keep_v = 2 * max(1, min(V // 2, int(round(V // 2 * opt.screen_keep_ratio))))
     else:
         keep_v = max(1, min(V, int(round(V * opt.screen_keep_ratio))))
-    # Screen forwards see part of the data, so weight them by the realized slice
-    # (or the configured fraction when there is none).
-    _fidelity = (
-        screen_inputs.shape[0] / max(1, _fused_inputs.shape[0])
-        if screen_inputs is not None and _fused_inputs is not None
-        else opt.screen_fidelity
-    )
     _screen_ready = (
         opt.multifidelity_screen
         and screen_closure is not None
         and not (opt.use_quadratic_model or opt._newton_refinement or opt.trust_region)
-        and _fidelity / K_eff + keep_v / V < 1.0
     )
+    if _screen_ready:
+        # Screen forwards see part of the data, so weight them by the realized slice
+        # (or the configured fraction when there is none).
+        screen_inputs, screen_targets, _fidelity = opt._screen_data(screen_closure)
+        _screen_ready = _fidelity / K_eff + keep_v / V < 1.0
     if opt.multifidelity_screen and not _screen_ready and not getattr(opt, "_screen_warned", False):
         opt._screen_warned = True
         warnings.warn(

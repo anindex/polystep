@@ -831,10 +831,15 @@ def test_multifidelity_screen_refuses_costly_config():
 
 
 @pytest.mark.parametrize(
-    "solver, keep_ratio, screen_fidelity, batch",
-    [(None, 0.55, 0.4, 16), ("top_k_mean", 0.5, 0.25, 16), (None, 0.5, 0.1, 2)],
+    "solver, keep_ratio, screen_fidelity, batch, register",
+    [
+        (None, 0.55, 0.4, 16, True),
+        ("top_k_mean", 0.5, 0.25, 16, True),
+        (None, 0.5, 0.1, 2, True),
+        (None, 0.5, 0.1, 2, False),
+    ],
 )
-def test_screen_realized_cost_over_sweep_refused(solver, keep_ratio, screen_fidelity, batch):
+def test_screen_realized_cost_over_sweep_refused(solver, keep_ratio, screen_fidelity, batch, register):
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
     inputs, targets = torch.randn(batch, 4), torch.randn(batch, 2)
@@ -847,7 +852,8 @@ def test_screen_realized_cost_over_sweep_refused(solver, keep_ratio, screen_fide
         screen_keep_ratio=keep_ratio,
         screen_fidelity=screen_fidelity,
     )
-    opt.register_evaluator(evaluator, inputs, targets)
+    if register:
+        opt.register_evaluator(evaluator, inputs, targets)
 
     def closure(batched, _in=inputs, _tgt=targets):
         return evaluator.evaluate(batched, _in, _tgt)
@@ -857,13 +863,42 @@ def test_screen_realized_cost_over_sweep_refused(solver, keep_ratio, screen_fide
     assert opt._last_screen_savings == 0.0
 
 
-def test_empty_registered_batch_steps_without_error():
-    model = nn.Linear(4, 2)
-    inputs, targets = torch.randn(0, 4), torch.randn(0, 2)
+def test_refused_screen_reports_zero_savings():
+    model = nn.Linear(2, 1)
     evaluator = NNCostEvaluator(model, nn.MSELoss())
-    opt = PolyStepOptimizer(model, seed=0)
-    opt.register_evaluator(evaluator, inputs, targets)
-    opt.step(lambda batched: evaluator.evaluate(batched, inputs, targets))
+    opt = PolyStepOptimizer(model, seed=0, solver="softmax", multifidelity_screen=True, screen_fidelity=0.1)
+    savings = []
+    for batch in (16, 2):
+        inputs, targets = torch.ones(batch, 2), torch.zeros(batch, 1)
+        opt.register_evaluator(evaluator, inputs, targets)
+
+        def closure(batched, _in=inputs, _tgt=targets):
+            return evaluator.evaluate(batched, _in, _tgt)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            opt.step(closure, screen_closure=opt.screen_closure_from(closure, inputs, targets))
+        savings.append(opt._last_screen_savings)
+    assert savings[0] > 0.0
+    assert savings[1] == 0.0
+
+
+@pytest.mark.parametrize("screen", [False, True])
+@pytest.mark.parametrize(
+    "model, inputs, targets",
+    [(nn.Linear(4, 2), torch.randn(0, 4), torch.randn(0, 2)), (nn.PReLU(), torch.tensor(-2.0), torch.tensor(1.0))],
+)
+def test_empty_or_scalar_registered_batch_steps(model, inputs, targets, screen):
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+
+    def closure(batched):
+        return evaluator.evaluate(batched, inputs, targets)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt = PolyStepOptimizer(model, seed=0, multifidelity_screen=screen)
+        opt.register_evaluator(evaluator, inputs, targets)
+        opt.step(closure, screen_closure=closure)
 
 
 @pytest.mark.parametrize("num_probe", [1, 5])

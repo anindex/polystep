@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import logging
+import operator
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Tuple
@@ -23,12 +26,108 @@ def create_generator(seed: int, device: torch.device) -> torch.Generator:
     return gen
 
 
-def _element_span(tensor: torch.Tensor) -> Tuple[int, int]:
-    """Half-open byte range this tensor can touch in its storage, from strides."""
+def _byte_span(tensor: torch.Tensor) -> Tuple[int, int]:
+    """Half-open absolute byte range this tensor can touch, from its address and strides."""
     esize = tensor.element_size()
-    start = tensor.storage_offset() * esize
-    reach = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())) * esize
+    start, stride = tensor.data_ptr(), tensor.stride()
+    reach = (sum(map(operator.mul, tensor.shape, stride)) - sum(stride)) * esize
     return start, start + reach + esize
+
+
+def _shares_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two tensors with overlapping spans touch a common byte, not only a common span."""
+    (a_start, a_stop), (b_start, b_stop) = _byte_span(a), _byte_span(b)
+    if a_start == b_start or (a if a_start < b_start else b).is_contiguous():
+        return True
+    stride, esize = a.stride(), a.element_size()
+    if stride == b.stride() and esize == b.element_size() and max(stride, default=0) > 0:
+        dim = stride.index(max(stride))
+        period = stride[dim] * esize
+        gap = (b_start - a_start) % period
+        a_width = a_stop - a_start - (a.shape[dim] - 1) * period
+        b_width = b_stop - b_start - (b.shape[dim] - 1) * period
+        if a_width <= gap <= period - b_width:
+            return False
+    base = min(a_start, b_start)
+    mask = torch.zeros(max(a_stop, b_stop) - base, dtype=torch.bool)
+
+    def byte_view(t: torch.Tensor) -> torch.Tensor:
+        esize = t.element_size()
+        return mask.as_strided((*t.shape, esize), (*(s * esize for s in t.stride()), 1), t.data_ptr() - base)
+
+    byte_view(a).fill_(True)
+    return bool(byte_view(b).any())
+
+
+def _dense_parts(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    """Strided tensors holding the bytes of ``tensor``: itself, none if unmaterialized, or sparse or nested parts."""
+    layout = tensor.layout
+    if layout == torch.strided and not tensor.is_nested:
+        return () if tensor.is_meta or nn.parameter.is_lazy(tensor) else (tensor,)
+    if layout == torch.sparse_coo:
+        return tensor._indices(), tensor._values()
+    if layout in (torch.sparse_csr, torch.sparse_bsr):
+        return tensor.crow_indices(), tensor.col_indices(), tensor.values()
+    if layout in (torch.sparse_csc, torch.sparse_bsc):
+        return tensor.ccol_indices(), tensor.row_indices(), tensor.values()
+    if layout == torch.jagged:
+        return tuple(part for part in (tensor.values(), tensor.offsets(), tensor.lengths()) if part is not None)
+    return (tensor.values(),) if tensor.is_nested else ()
+
+
+_validated_signature: list | None = None
+
+
+def _trainable_owners(model: nn.Module) -> dict[str, int]:
+    """Each name of a trainable parameter mapped to its id; raises if another registered tensor shares its bytes."""
+    global _validated_signature
+    params = list(model.named_parameters(remove_duplicate=False))
+    owners = {name: id(param) for name, param in params if param.requires_grad}
+    trainable = set(owners.values())
+    tensors: dict[tuple[int, int], tuple[str, torch.Tensor]] = {}
+    for is_buffer, named in enumerate((params, model.named_buffers(remove_duplicate=False))):
+        for name, tensor in named:
+            tensors.setdefault((id(tensor), is_buffer), (name, tensor))
+
+    rows: dict[torch.device, list] = {}
+    for (ident, is_buffer), (name, tensor) in tensors.items():
+        for part in _dense_parts(tensor):
+            if part.numel() > 0:
+                trained = not is_buffer and ident in trainable
+                rows.setdefault(part.device, []).append((*_byte_span(part), trained, name, part))
+
+    def overlapping_pairs():
+        for row in rows.values():
+            row.sort(key=lambda span: span[0])
+            others_open: list = []
+            trained_open: list = []
+            for i, (start, stop, trained, name, tensor) in enumerate(row):
+                for heap in (others_open, trained_open):
+                    while heap and heap[0][0] <= start:
+                        heapq.heappop(heap)
+                for _, _, other_name, other in trained_open:
+                    yield name, other_name, tensor, other
+                for _, _, other_name, other in others_open if trained else ():
+                    yield other_name, name, other, tensor
+                heapq.heappush(trained_open if trained else others_open, (stop, i, name, tensor))
+
+    pairs = overlapping_pairs()
+    first = next(pairs, None)
+    if first is None:
+        return owners
+    signature = [(device, *span[:3], span[4].shape, span[4].stride()) for device, row in rows.items() for span in row]
+    if signature == _validated_signature:
+        return owners
+    for name, trained_name, a, b in itertools.chain((first,), pairs):
+        if _shares_bytes(a, b):
+            raise ValueError(
+                f"{name!r} and trainable parameter {trained_name!r} share storage but are different "
+                f"tensors, so candidates would not reach {name!r}. Tie weights by assigning the "
+                f"Parameter itself (module.b = module.a); otherwise register a clone of {name!r} "
+                "or compute it in forward."
+            )
+    _validated_signature = signature
+    return owners
 
 
 @dataclass(frozen=True)
@@ -78,60 +177,28 @@ class ParamLayout:
                 _all_keys=(),
             )
 
-        # Storage identity catches aliases whose data pointers have different offsets.
-        seen_storage: dict[int, list[tuple[str, int, int, tuple]]] = {}
         canonical_entries: list[ParamEntry] = []
         shared_map: dict[str, list[str]] = {}  # canonical_key -> [alias keys]
         offset = 0
 
-        # Collect trainable data_ptrs so tied weights are detected under a different name too.
-        param_grad = {}
-        trainable_ptrs: set[int] = set()
-        for name, param in model.named_parameters():
-            param_grad[name] = param.requires_grad
-            if param.requires_grad:
-                trainable_ptrs.add(param.data_ptr())
+        owners = _trainable_owners(model)
+        canonical_keys: dict[int, str] = {}
+        for name, ident in owners.items():
+            canonical_keys.setdefault(ident, name)
 
         all_keys: list[str] = []
 
-        for key, tensor in sorted(sd.items(), key=lambda item: item[0] not in param_grad):
+        for key, tensor in sd.items():
             # Only trainable params belong here: buffers are frozen, and a running stat would drift with no signal.
-            # Tied params may be absent from named_parameters(), so fall back to data_ptr.
-            requires_grad = param_grad.get(key, False)
-            is_trainable_alias = tensor.data_ptr() in trainable_ptrs
-            if not requires_grad and not is_trainable_alias:
+            if key not in owners:
                 continue
 
             all_keys.append(key)
 
-            if tensor.numel() > 0:
-                storage_id = tensor.untyped_storage().data_ptr()
-                start, stop = _element_span(tensor)
-                view = (tuple(tensor.shape), tensor.stride(), tensor.storage_offset())
-                group = seen_storage.setdefault(storage_id, [])
-                alias_of = None
-                for canonical_key, c_start, c_stop, canonical_view in group:
-                    if stop <= c_start or c_stop <= start:
-                        continue  # disjoint slices of one buffer stay independent
-                    # Only an identical view is a tie: a weight and its transpose match on pointer and shape, and merging would transpose one.
-                    if view != canonical_view:
-                        raise ValueError(
-                            f"{key!r} and {canonical_key!r} share storage but are different views "
-                            f"(shape/stride/offset {view} vs {canonical_view}). Overlapping views of "
-                            "one buffer cannot be laid out as independent parameters."
-                        )
-                    alias_of = canonical_key
-                    break
-                if alias_of is not None:
-                    if key in param_grad:
-                        raise ValueError(
-                            f"{key!r} and {alias_of!r} are distinct Parameters sharing storage, so "
-                            f"candidates would replace only {alias_of!r}. Tie them as one Parameter "
-                            "instead (module.b = module.a)."
-                        )
-                    shared_map.setdefault(alias_of, [alias_of]).append(key)
-                    continue
-                group.append((key, start, stop, view))
+            alias_of = canonical_keys[owners[key]]
+            if alias_of != key:
+                shared_map.setdefault(alias_of, [alias_of]).append(key)
+                continue
 
             numel = tensor.numel()
             module_path = key.rsplit(".", 1)[0] if "." in key else ""
@@ -143,7 +210,7 @@ class ParamLayout:
                     dtype=tensor.dtype,
                     offset=offset,
                     numel=numel,
-                    requires_grad=requires_grad,
+                    requires_grad=True,
                     module_path=module_path,
                 )
             )

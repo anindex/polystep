@@ -22,6 +22,7 @@ from torch.utils._pytree import tree_leaves
 
 from .projection import SparseRandomProjection
 from .solvers._shared import loss_buffer_dtype
+from .transform import _trainable_owners
 
 if TYPE_CHECKING:
     from .hybrid_subspace import HybridSubspace
@@ -316,6 +317,7 @@ class NNCostEvaluator:
         # remove_duplicate=False so tied weights resolve under every module path: a
         # deduplicated dict would report their aliases as unknown parameters.
         self._param_dict_cache = dict(self.model.named_parameters(remove_duplicate=False))
+        self._check_aliases()
 
     def _autocast(self, device: torch.device):
         """Run the candidate forward in ``autocast_dtype``, or a no-op when unset."""
@@ -339,6 +341,7 @@ class NNCostEvaluator:
         self._compile_forward_verified = False
         self._buffers = dict(self.model.named_buffers())
         self._param_dict_cache = dict(self.model.named_parameters(remove_duplicate=False))
+        self._check_aliases()
         self._inplace_backup = None
         self._subspace_backup = None
         self._cast_cache = None
@@ -346,6 +349,13 @@ class NNCostEvaluator:
         self._uncast_ok = {}
         self._chunk_size_cached = _UNSET
         self.loss_fn = self.loss_fn
+
+    def _check_aliases(self) -> None:
+        """Reject buffers sharing trainable parameter bytes, rechecked while any tensor is unmaterialized."""
+        self._aliases_pending = True
+        _trainable_owners(self.model)
+        tensors = itertools.chain(self.model.parameters(), self.model.buffers())
+        self._aliases_pending = any(nn.parameter.is_lazy(t) or t.is_meta for t in tensors)
 
     def _refresh_recast_buffers(self) -> None:
         """Call reset_vmap when a dtype cast or device move rebound the buffers."""
@@ -395,6 +405,8 @@ class NNCostEvaluator:
         Returns losses of shape ``(N,)``, or ``(N, B)`` under ``per_sample``.
         """
         self._refresh_recast_buffers()
+        if self._aliases_pending:
+            self._check_aliases()
         # Already eval (set in __init__), so this is a bool check, not an O(L) walk.
         was_training = self.model.training
         if was_training:
@@ -443,20 +455,22 @@ class NNCostEvaluator:
 
     @contextmanager
     def _restoring_buffers(self, extra=()):
-        """Put back every buffer and ``extra`` tensor the frame writes."""
+        """Put back every buffer and ``extra`` tensor the frame writes, at exit and on each yielded restore."""
         state = [*self._buffers.values(), *extra]
         versions = [None if torch.is_inference(t) else t._version for t in state]
         copies = [t.clone() for t in state]
+
+        def restore():
+            for i, (t, v, c) in enumerate(zip(state, versions, copies)):
+                if not torch.equal(t, c) if v is None else t._version != v:
+                    t.copy_(c)
+                    if v is not None:
+                        versions[i] = t._version
+
         try:
-            yield
+            yield restore
         finally:
-            changed = [
-                (t, c)
-                for t, v, c in zip(state, versions, copies)
-                if (not torch.equal(t, c) if v is None else t._version != v)
-            ]
-            for t, c in changed:
-                t.copy_(c)
+            restore()
 
     @torch.inference_mode()
     def _activation_ratios(self, inputs: torch.Tensor) -> Optional[dict]:
@@ -680,12 +694,13 @@ class NNCostEvaluator:
         if N == 0:
             return torch.zeros(0, device=inputs.device)
         losses = []
-        for i in range(N):
-            full_dict = {**{k: v[i] for k, v in stacked_params.items()}, **self._buffers}
-            with self._restoring_buffers():
+        with self._restoring_buffers() as restore:
+            for i in range(N):
+                full_dict = {**{k: v[i] for k, v in stacked_params.items()}, **self._buffers}
                 output = functional_call(self.model, full_dict, (inputs,))
                 loss = _candidate_loss(self.loss_fn, self._loss_kind, output, targets)
-            losses.append(_fold_candidate_loss(loss, self.per_sample))
+                restore()
+                losses.append(_fold_candidate_loss(loss, self.per_sample))
         return torch.stack(losses)
 
     def _forward_loss(self, inputs, targets):
@@ -1573,9 +1588,13 @@ class SiteVmapEvaluator:
             output = functional_call(model, {**shared, key: site_param}, (inputs,))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
-        def score_alone(i):
-            with self._owner._restoring_buffers():
-                return single_eval(site[i], shared, inputs, targets)
+        def score_alone(n):
+            losses = []
+            with self._owner._restoring_buffers() as restore:
+                for i in range(n):
+                    losses.append(single_eval(site[i], shared, inputs, targets))
+                    restore()
+            return torch.stack(losses)
 
         # No autocast frame: under vmap it casts activations but not a Conv2d bias, so
         # a conv model raises a dtype mismatch.
@@ -1611,7 +1630,7 @@ class SiteVmapEvaluator:
                 self._randomness = "different"
                 self._compiled_sites.clear()
                 return self._vmap_over_site(key, base_sd, site, inputs, targets)
-            if not _is_vmap_error(e, lambda: score_alone(0)):
+            if not _is_vmap_error(e, lambda: score_alone(1)):
                 raise
             self._failed_sites.add(key)
             if not self._warned:
@@ -1622,7 +1641,7 @@ class SiteVmapEvaluator:
                     stacklevel=2,
                 )
                 self._warned = True
-            return torch.stack([score_alone(i) for i in range(site.shape[0])])
+            return score_alone(site.shape[0])
         finally:
             if was_training:
                 model.train()

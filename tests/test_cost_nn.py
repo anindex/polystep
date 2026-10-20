@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.func import functional_call
 
-from polystep import PolyStepOptimizer
+from polystep import HybridSubspace, PolyStepOptimizer, transform
 from polystep.transform import ParamLayout
 from polystep.cost_nn import (
     BatchedLinearEvaluator,
@@ -743,6 +743,25 @@ def test_candidate_sweep_leaves_buffers_unchanged(looped):
         assert model.calls.item() == 0
 
 
+def test_sequential_sweep_clones_buffers_once(monkeypatch):
+    model = CountingLinear()
+    x, y = torch.randn(8, 4), torch.randn(8, 1)
+    params = {k: v.detach().expand(6, *v.shape) for k, v in model.named_parameters()}
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    ev._vmap_failed = True
+    ev.evaluate(params, x, y)
+    clone, table_clones = torch.Tensor.clone, []
+
+    def counting_clone(t, *args, **kwargs):
+        table_clones.append(t is model.table)
+        return clone(t, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", counting_clone)
+    ev.evaluate(params, x, y)
+    assert sum(table_clones) == 1
+    assert model.calls.item() == 0
+
+
 @pytest.mark.parametrize("looped", [False, True])
 def test_late_buffer_write_restored(looped):
     class LateCounter(nn.Module):
@@ -786,3 +805,65 @@ def test_inference_expanded_buffer_scores(looped):
     with torch.no_grad():
         expected = nn.MSELoss()(model(x), y)
     torch.testing.assert_close(ev.evaluate(params, x, y), expected.expand(3))
+
+
+def test_evaluator_buffer_alias_raises():
+    model = nn.Sequential(nn.Linear(2, 2))
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+    opt = PolyStepOptimizer(model, subspace=subspace, solver="softmax", seed=0)
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    model.register_buffer("alias", model[0].weight.detach())
+
+    for rebind in (lambda: NNCostEvaluator(model, nn.MSELoss()), ev.reset_vmap, opt.resync_from_model):
+        with pytest.raises(ValueError, match="'alias' and trainable parameter '0.weight' share storage"):
+            rebind()
+
+
+def test_lazy_evaluator_defers_alias_check():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.LazyLinear(8), nn.ReLU(), nn.LazyLinear(3))
+    model.register_buffer("alias", torch.zeros(()))
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    x, y = torch.randn(16, 5), torch.randn(16, 3)
+    model(x)
+    model.alias = model[0].weight.detach()
+    params = {k: v.detach().expand(3, *v.shape) for k, v in model.named_parameters()}
+    for _ in range(2):
+        with pytest.raises(ValueError, match="'alias' and trainable parameter '0.weight' share storage"):
+            ev.evaluate(params, x, y)
+    model.alias = torch.zeros(())
+    opt = PolyStepOptimizer(model, solver="softmax", seed=0)
+    assert torch.isfinite(torch.as_tensor(opt.step(lambda s: ev.evaluate(s, x, y))))
+
+
+def test_failed_alias_check_stays_pending():
+    model = nn.Sequential(nn.Linear(1, 1, bias=False))
+    model.register_buffer("alias", torch.zeros(()))
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    model.alias = model[0].weight.detach()
+
+    with pytest.raises(ValueError, match="'alias' and trainable parameter '0.weight' share storage"):
+        ev.reset_vmap()
+    with pytest.raises(ValueError, match="'alias' and trainable parameter '0.weight' share storage"):
+        ev.evaluate({"0.weight": torch.tensor([[[2.0]], [[3.0]]])}, torch.ones(1, 1), torch.zeros(1, 1))
+
+
+def test_meta_layer_keeps_alias_check():
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2, device="meta"))
+    NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    model.register_buffer("alias", model[0].weight.detach())
+
+    with pytest.raises(ValueError, match="'alias' and trainable parameter '0.weight' share storage"):
+        NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+
+
+def test_evaluator_reset_reuses_alias_check(monkeypatch):
+    calls, shares_bytes = [], transform._shares_bytes
+    monkeypatch.setattr(transform, "_shares_bytes", lambda a, b: calls.append(a) or shares_bytes(a, b))
+    monkeypatch.setattr(transform, "_validated_signature", None)
+    model, matrix = nn.Module(), torch.ones(2, 2)
+    model.a, model.b = nn.Parameter(matrix[:, 0]), nn.Parameter(matrix[:, 1])
+
+    ParamLayout.from_module(model)
+    NNCostEvaluator(model, nn.MSELoss(), use_inplace=False).reset_vmap()
+    assert len(calls) == 1
