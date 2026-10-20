@@ -15,9 +15,10 @@ __all__ = ["METHODS", "cma_es", "eggroll", "mezo", "openai_es", "random_search",
 
 def _init(obj: Objective, x0: Optional[torch.Tensor]) -> torch.Tensor:
     """Starting point, defaulting to the origin of the search space."""
+    dtype = obj.dtype or torch.float32
     if x0 is None:
-        return torch.zeros(obj.dim)
-    x = torch.as_tensor(x0).detach().clone().reshape(-1).float()
+        return torch.zeros(obj.dim, device=obj.device, dtype=dtype)
+    x = torch.as_tensor(x0).detach().clone().reshape(-1).to(device=obj.device, dtype=dtype)
     if x.numel() != obj.dim:
         raise ValueError(f"x0 has {x.numel()} entries, objective dim is {obj.dim}.")
     return x
@@ -99,7 +100,7 @@ def openai_es(
             eps = torch.cat([eps, -eps])
         losses = obj(x + sigma * eps)
         # g = (1 / (pop * sigma)) * eps^T @ utilities; ascent on utility = descent on loss.
-        x = x + (lr / (popsize * sigma)) * (eps.t() @ _shaped(losses, shaping))
+        x = x + (lr / (popsize * sigma)) * (eps.t() @ _shaped(losses, shaping).to(eps.dtype))
         obj.iterate = x
         it += 1
         history.record(obj, it)
@@ -260,7 +261,7 @@ def eggroll(
             # Shape both halves; the -E half contributes with a flipped sign.
             u = _shaped(losses, shaping)
             w = u[:pairs] - u[pairs:]
-        x = x + (lr / pairs) * (E.t() @ w)
+        x = x + (lr / pairs) * (E.t() @ w.to(E.dtype))
         obj.iterate = x
         it += 1
         history.record(obj, it)

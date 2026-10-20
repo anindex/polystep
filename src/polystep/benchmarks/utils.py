@@ -143,31 +143,33 @@ class MNISTNet(nn.Sequential):
 @torch.no_grad()
 def evaluate_accuracy(model: nn.Module, dataloader: DataLoader) -> float:
     """Compute classification accuracy on a DataLoader."""
-    model.eval()
     device = next(model.parameters()).device
+    was_training = model.training
+    model.eval()
     correct = 0
     total = 0
 
-    for batch in dataloader:
-        if len(batch) == 2:
-            inputs, targets = batch
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-        elif len(batch) == 3:
-            # SST-2 format: (input_ids, attention_mask, labels)
-            input_ids, attention_mask, targets = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            targets = targets.to(device)
-            outputs = model(input_ids, attention_mask=attention_mask)
-        else:
-            raise ValueError(f"Unexpected batch format with {len(batch)} elements")
+    try:
+        for batch in dataloader:
+            if len(batch) == 2:
+                inputs, targets = batch
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+            elif len(batch) == 3:
+                # SST-2 format: (input_ids, attention_mask, labels)
+                input_ids, attention_mask, targets = batch
+                input_ids = input_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                targets = targets.to(device)
+                outputs = model(input_ids, attention_mask=attention_mask)
+            else:
+                raise ValueError(f"Unexpected batch format with {len(batch)} elements")
 
-        preds = outputs.argmax(dim=-1)
-        correct += (preds == targets).sum().item()
-        total += targets.size(0)
-
-    model.train()
+            preds = outputs.argmax(dim=-1)
+            correct += (preds == targets).sum().item()
+            total += targets.size(0)
+    finally:
+        model.train(was_training)
     return correct / total if total > 0 else 0.0
 
 
@@ -219,7 +221,7 @@ class LIFNeuron(nn.Module):
 
 
 class SpikingNet(nn.Module):
-    """SNN with LIF neurons; uses snnTorch.Leaky when available, else pure PyTorch LIF."""
+    """SNN with built-in LIF neurons; use_snntorch=True swaps in snnTorch.Leaky."""
 
     def __init__(
         self,
@@ -228,15 +230,17 @@ class SpikingNet(nn.Module):
         output: int = 10,
         beta: float = 0.95,
         num_steps: int = 25,
-        use_snntorch: bool = True,
+        use_snntorch: bool = False,
     ):
         super().__init__()
+        if use_snntorch and not _HAS_SNNTORCH:
+            raise ImportError("use_snntorch=True needs snntorch")
         self.input_dim = input_dim
         self.hidden = hidden
         self.output_dim = output
         self.num_steps = num_steps
         self.beta = beta
-        self.use_snntorch = use_snntorch and _HAS_SNNTORCH
+        self.use_snntorch = use_snntorch
 
         self.fc1 = nn.Linear(input_dim, hidden)
         self.fc2 = nn.Linear(hidden, output)

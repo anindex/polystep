@@ -276,6 +276,9 @@ Its `step_radius` is a distance in solution space; unlike the optimizer's scalar
 radii, it is not multiplied by epsilon. It accepts neither `probe_radius` nor
 `num_probe`. With `seed` it draws rotations from its own generator; without one it
 uses PyTorch's global RNG, so `torch.manual_seed` reproduces the run.
+`tell()` averages the points `ask()` generated. The returned candidates do not
+always share memory with those points, so do not rely on an in-place `clamp_` to
+move them.
 
 ## Low-level solver
 

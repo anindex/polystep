@@ -4,8 +4,10 @@ import math
 
 import pytest
 import torch
+import torch.nn as nn
 
 from polystep import LinearEpsilon
+from polystep.benchmarks.utils import evaluate_accuracy
 from polystep.solver import PolyStep
 from polystep.objectives import Ackley, Rosenbrock, Rastrigin, Sphere
 
@@ -143,3 +145,16 @@ class TestSyntheticBenchmarks:
         assert final_dist < init_dist, (
             f"Sphere+LinearEpsilon did not converge: init_dist={init_dist:.4f}, final_dist={final_dist:.4f}"
         )
+
+
+def test_evaluate_accuracy_preserves_eval_mode():
+    model = nn.Sequential(nn.Linear(4, 2), nn.Dropout(0.5)).eval()
+    evaluate_accuracy(model, [(torch.randn(8, 4), torch.randint(0, 2, (8,)))])
+    assert not model.training
+
+
+def test_evaluate_accuracy_raise_restores_train_mode():
+    model = nn.Sequential(nn.Linear(4, 2), nn.Dropout(0.5))
+    with pytest.raises(ValueError):
+        evaluate_accuracy(model, [(torch.randn(8, 4),)])
+    assert model.training

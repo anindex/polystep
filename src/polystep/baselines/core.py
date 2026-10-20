@@ -59,6 +59,8 @@ class Objective:
         self.dim = int(dim)
         self.budget = int(budget)
         self.subspace = subspace
+        self.device: Optional[torch.device] = None
+        self.dtype: Optional[torch.dtype] = None
         self.deadline_s = None if deadline_s is None else float(deadline_s)
         self._t0: Optional[float] = None
         self.shapes: Tuple[Tuple[int, ...], ...] = (
@@ -97,7 +99,9 @@ class Objective:
         # EGGROLL samples flat hybrid coordinates or matrix-shaped factored coordinates.
         factored = bool(getattr(subspace, "coords_are_factored", False))
         shapes = tuple(_coord_shape(spec, factored) for spec in subspace.specs)
-        return cls(fn, subspace.subspace_dim, budget, shapes=shapes, subspace=subspace, deadline_s=deadline_s)
+        obj = cls(fn, subspace.subspace_dim, budget, shapes=shapes, subspace=subspace, deadline_s=deadline_s)
+        obj.device, obj.dtype = device, dtype
+        return obj
 
     @classmethod
     def from_layout(

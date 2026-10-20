@@ -193,9 +193,12 @@ def test_zscore_rescales_overflowing_losses():
     assert (u[:2] > u[2:]).all()
 
 
-def test_integer_losses_rank_shape():
-    obj = Objective(lambda X: (X > 0).sum(1), dim=3, budget=4)
-    result = METHODS["openai_es"](obj, popsize=4)
+@pytest.mark.parametrize("dtype", [torch.float64, torch.int64, torch.float16])
+@pytest.mark.parametrize(("name", "shaping"), [("openai_es", "rank"), ("eggroll", "sign"), ("eggroll", "rank")])
+def test_loss_dtypes_run_es_methods(name, shaping, dtype):
+    obj = Objective(lambda X: X.square().sum(1).to(dtype), dim=4, budget=8)
+    result = METHODS[name](obj, popsize=4, shaping=shaping)
+    assert result.x.dtype == torch.float32
     assert torch.isfinite(result.x).all()
 
 
@@ -264,6 +267,29 @@ def test_from_layout_keeps_shapes_for_eggroll():
     obj = Objective.from_layout(layout, quadratic(), budget=64)
     assert obj.dim == layout.total_params
     assert (6, 8) in obj.shapes and (2, 6) in obj.shapes
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")],
+        ),
+    ],
+)
+@pytest.mark.parametrize("name", METHOD_NAMES)
+def test_x0_follows_objective_dtype_device(name, device):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 6), nn.Tanh(), nn.Linear(6, 2)).to(device, torch.float64)
+    hybrid = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2, seed=0)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    for x0 in (None, torch.zeros(hybrid.subspace_dim)):
+        obj = Objective.from_subspace(hybrid, base_sd, lambda p: p["2.bias"].sum(-1), 64, dtype=torch.float64)
+        result = METHODS[name](obj, x0=x0, **HYPERPARAMS[name])
+        assert result.x.dtype == result.best_x.dtype == torch.float64
+        assert result.x.device.type == result.best_x.device.type == device
 
 
 # EGGROLL specifics

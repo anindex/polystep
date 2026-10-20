@@ -110,7 +110,7 @@ class PolyStepES:
         """Mean particle position (the current solution estimate)."""
         return self.X.mean(dim=0)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def ask(self) -> torch.Tensor:
         """Return candidate points of shape ``(popsize, dim)`` to evaluate."""
         if self._pending is not None:
@@ -122,14 +122,14 @@ class PolyStepES:
         self._pending = X_vertices
         return X_vertices.reshape(self.popsize, self.dim)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def tell(self, fitness: torch.Tensor) -> None:
         """Update particles from the fitness of the last ``ask`` (lower is better)."""
         if self._pending is None:
             raise RuntimeError("tell() called before ask()")
-        cost = torch.as_tensor(fitness, device=self.device, dtype=self.dtype).reshape(
-            self.num_particles, self.num_vertices
-        )
+        cost = torch.as_tensor(fitness, device=self.device, dtype=None if hasattr(fitness, "dtype") else torch.float64)
+        cost_dtype = torch.promote_types(cost.dtype, torch.promote_types(self.dtype, torch.float32))
+        cost = cost.to(cost_dtype).reshape(self.num_particles, self.num_vertices)
         if self._own_solver:
             self.solver.epsilon = self.epsilon
         # None skips the solver's host-syncing marginal validation on this per-step path.

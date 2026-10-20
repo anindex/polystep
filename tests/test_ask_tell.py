@@ -181,3 +181,34 @@ def test_ask_tell_never_records_nonfinite_best():
     es.tell(torch.full((es.popsize,), float("inf")))
     assert es.best_fitness == 1.0
     torch.testing.assert_close(es.best_solution, previous)
+
+
+def test_ask_candidates_allow_inplace_autograd():
+    es = PolyStepES(4, num_particles=2, seed=0)
+    candidates = es.ask()
+    candidates.clamp_(-0.1, 0.1)
+    es.tell(torch.nn.Linear(4, 1)(candidates).squeeze(-1))
+    assert not es.X.requires_grad
+    net = torch.nn.Linear(3, 1)
+    torch.nn.utils.vector_to_parameters(es.best_solution, net.parameters())
+    net(torch.ones(2, 3)).sum().backward()
+    assert net.weight.grad is not None
+
+
+@pytest.mark.parametrize("as_input", [torch.Tensor.double, torch.Tensor.tolist])
+def test_tell_offset_fitness_matches_unshifted(as_input):
+    shifted, plain = PolyStepES(4, seed=0, x0=torch.ones(4)), PolyStepES(4, seed=0, x0=torch.ones(4))
+    fitness = (shifted.ask().double() ** 2).sum(-1)
+    plain.ask()
+    shifted.tell(as_input(1e8 + fitness))
+    plain.tell(fitness)
+    assert shifted.best_fitness == 1e8 + fitness.min().item()
+    torch.testing.assert_close(shifted.X, plain.X)
+
+
+def test_float64_es_float32_fitness_keeps_precision():
+    x0 = torch.full((6,), 1e5, dtype=torch.float64)
+    es = PolyStepES(6, seed=0, x0=x0, dtype=torch.float64)
+    es.ask()
+    es.tell(torch.zeros(es.popsize))
+    torch.testing.assert_close(es.X, x0.expand_as(es.X), rtol=0, atol=1e-8)

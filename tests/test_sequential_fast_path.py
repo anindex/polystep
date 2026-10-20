@@ -347,3 +347,25 @@ def test_spiking_net_hoists_fc1_on_static_input():
     shapes = _record_fc1_shapes(net)
     net(torch.rand(batch, features))
     assert shapes == [(batch, features)]
+
+
+def test_spiking_net_defaults_to_builtin_lif(monkeypatch):
+    from types import SimpleNamespace
+
+    from polystep.benchmarks import utils
+
+    monkeypatch.setattr(utils, "_HAS_SNNTORCH", True)
+    monkeypatch.setattr(utils, "snn", SimpleNamespace(Leaky=lambda beta: nn.Identity()), raising=False)
+    net = utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2)
+    assert isinstance(net.lif1, utils.LIFNeuron)
+    assert isinstance(net.lif2, utils.LIFNeuron)
+    stub_net = utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2, use_snntorch=True)
+    assert isinstance(stub_net.lif1, nn.Identity)
+
+
+def test_spiking_net_snntorch_missing_raises(monkeypatch):
+    from polystep.benchmarks import utils
+
+    monkeypatch.setattr(utils, "_HAS_SNNTORCH", False)
+    with pytest.raises(ImportError, match="needs snntorch"):
+        utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2, use_snntorch=True)
