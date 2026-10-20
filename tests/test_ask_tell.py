@@ -108,6 +108,24 @@ def test_scale_cost_typo_raises_at_init():
         PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, scale_cost="maen")
 
 
+def test_scale_cost_beyond_float32_accepted_at_init():
+    PolyStepES(dim=3, dtype=torch.float64, scale_cost=1e100)
+    PolyStepOptimizer(torch.nn.Linear(3, 1).double(), scale_cost=1e100)
+    PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, scale_cost=1e100)
+
+
+def test_scale_cost_check_ignores_default_device(monkeypatch):
+    devices = []
+    for module in ("ask_tell", "optimizer", "solver"):
+        monkeypatch.setattr(f"polystep.{module}.resolve_cost_scale", lambda cost, scale: devices.append(cost.device))
+    model = torch.nn.Linear(3, 1)
+    with torch.device("meta"):
+        PolyStepES(dim=3, scale_cost=1e100)
+        PolyStepOptimizer(model, scale_cost=1e100)
+        PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, scale_cost=1e100)
+    assert devices == [torch.device("cpu")] * 3
+
+
 def test_sinkhorn_single_particle_warns():
     with pytest.warns(UserWarning):
         PolyStepES(4, num_particles=1, solver=SinkhornSolver(epsilon=0.1))

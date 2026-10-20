@@ -40,8 +40,8 @@ raises `ValueError` if that set changes. To freeze, unfreeze, add or remove a pa
 set `requires_grad` first and then build a new optimizer.
 
 After a dtype cast, resync moves the subspace projections to the new parameter dtypes.
-An `AdaptiveSubspace` also moves its coordinates to the new dtype.
-`HybridSubspace`, `FactoredSubspace` and full space keep their original coordinate dtype.
+Full space and an `AdaptiveSubspace` also move their coordinates to the new dtype.
+`HybridSubspace` and `FactoredSubspace` keep their original coordinate dtype.
 If the coordinates must use the new dtype, build a new optimizer.
 If the model moves to another device, build a new optimizer. Resync cannot change devices.
 
@@ -219,11 +219,12 @@ optimizer.step(closure, screen_closure=screen)
 ```
 
 A registered evaluator screens on the same leading slice of its batch. Screening runs
-only when `screen_fidelity / num_probe` plus the share of vertices kept per particle is
-below 1, where it costs less than the full sweep, and not with `use_quadratic_model`,
-`newton_refinement` or `trust_region`. With few vertices the kept share is coarse: at
-the default `particle_dim=2` the simplex has 3 vertices, so `screen_keep_ratio=0.5`
-keeps 2 of them.
+only when the screened share of the batch divided by `num_probe`, plus the share of
+vertices kept per particle, is below 1, where it costs less than the full sweep, and not
+with `use_quadratic_model`, `newton_refinement` or `trust_region`. With few vertices the
+kept share is coarse: at the default `particle_dim=2` the simplex has 3 vertices, so
+`screen_keep_ratio=0.5` keeps 2 of them. The batch share rounds the same way: a
+registered batch of 2 samples screens on 1 of them even at `screen_fidelity=0.1`.
 
 ## Custom layers
 

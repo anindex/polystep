@@ -379,8 +379,9 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         )
         assert torch.allclose(fast, expected, atol=1e-6)
 
+    @pytest.mark.parametrize("target_shape", [(6,), (5, 6, 1)])
     @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
-    def test_mse_target_broadcast_matches_loop(self, loss_fn):
+    def test_mse_target_broadcast_matches_loop(self, loss_fn, target_shape):
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(4, 1)).double()
         layout = ParamLayout.from_module(model)
@@ -388,7 +389,7 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         batch += torch.randn_like(batch) * 0.05
         stacked = layout.batch_unflatten(batch)
         inputs = torch.randn(6, 4, dtype=torch.float64)
-        targets = torch.randn(6, dtype=torch.float64)
+        targets = torch.randn(target_shape, dtype=torch.float64)
 
         evaluator = NNCostEvaluator(model, loss_fn)
         assert evaluator._batched_linear is not None
@@ -692,11 +693,12 @@ def test_cast_cache_observes_input_mutation(inference_tensor):
         torch.testing.assert_close(cast_inputs_memo(holder, inputs, torch.float32), torch.full((2,), 7.0))
 
 
-def test_forward_accepting_fp32_skips_cast():
+@pytest.mark.parametrize("shape", [(), (64, 1)])
+def test_forward_accepting_fp32_skips_cast(shape):
     class Centred(nn.Module):
         def __init__(self):
             super().__init__()
-            self.register_buffer("t0", torch.tensor(5000.0))
+            self.register_buffer("t0", torch.tensor(5000.0).expand(shape))
             self.net = nn.Sequential(nn.Linear(1, 8), nn.Tanh(), nn.Linear(8, 1)).bfloat16()
 
         def forward(self, t):
@@ -739,16 +741,28 @@ def test_candidate_sweep_leaves_buffers_unchanged(looped):
         part = ev.evaluate({k: v[start : start + 2] for k, v in params.items()}, x, y)
         assert torch.equal(part, whole[start : start + 2])
         assert model.calls.item() == 0
-    assert ev._snapshot_buffers()[1].keys() == {"calls"}
 
 
-def test_readonly_buffer_skips_snapshot():
-    model = MLPWithBatchNorm()
-    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
-    params = {k: v.detach().expand(3, *v.shape) for k, v in model.named_parameters()}
-    ev.evaluate(params, torch.randn(5, 4), torch.randint(0, 2, (5,)))
-    assert ev._batched_linear is None
-    assert ev._snapshot_buffers()[1] == {}
+@pytest.mark.parametrize("looped", [False, True])
+def test_late_buffer_write_restored(looped):
+    class LateCounter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            self.register_buffer("counter", torch.zeros(()))
+
+        def forward(self, x):
+            if x.shape[0] == 2:
+                self.counter.add_(1)
+            return x * self.weight + self.counter
+
+    model = LateCounter()
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    ev._vmap_failed = looped
+    params = {"weight": torch.ones(3, 1)}
+    ev.evaluate(params, torch.ones(1, 1), torch.zeros(1, 1))
+    assert ev.evaluate(params, torch.ones(2, 1), torch.zeros(2, 1)).tolist() == [4.0, 4.0, 4.0]
+    assert model.counter.item() == 0
 
 
 @pytest.mark.parametrize("looped", [False, True])

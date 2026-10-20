@@ -186,10 +186,13 @@ def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
     # promote so FP64 targets keep precision and half precision reduces in FP32.
     dtype = loss_buffer_dtype(torch.promote_types(outputs.dtype, targets.dtype))
     tgt = targets.to(dtype)
+    out = outputs.to(dtype)
     if tgt.shape == outputs.shape[1:]:
         tgt = tgt.expand_as(outputs)
+    elif tgt.dim() >= outputs.dim():
+        out = out.reshape(n, *(1,) * (tgt.dim() - outputs.dim() + 1), *outputs.shape[1:])
     fn = torch.nn.functional.mse_loss if loss_kind == "mse" else torch.nn.functional.l1_loss
-    return fn(outputs.to(dtype), tgt, reduction="none").flatten(1).mean(dim=1)  # (N,)
+    return fn(out, tgt, reduction="none").flatten(1).mean(dim=1)  # (N,)
 
 
 def _candidate_loss(loss_fn, loss_kind, output, targets):
@@ -285,7 +288,6 @@ class NNCostEvaluator:
         self._cast_cache = None  # (inputs, dtype, converted) for the per-chunk cast
         self._input_dtype_cache = _UNSET
         self._uncast_ok = {}
-        self._written_buffers = None
 
         # Eval mode: frozen BN stats, no dropout.
         model.eval()
@@ -342,7 +344,6 @@ class NNCostEvaluator:
         self._cast_cache = None
         self._input_dtype_cache = _UNSET
         self._uncast_ok = {}
-        self._written_buffers = None
         self._chunk_size_cached = _UNSET
         self.loss_fn = self.loss_fn
 
@@ -417,55 +418,45 @@ class NNCostEvaluator:
             return inputs
         key = (inputs.dtype, self.autocast_dtype)
         if key not in self._uncast_ok:
-            try:
-                with torch.inference_mode(), self._probe_frame(inputs.device), self._autocast(inputs.device):
+            with torch.inference_mode(), self._probe_frame(inputs.device), self._autocast(inputs.device):
+                try:
                     self.model(inputs)
-                self._uncast_ok[key] = True
-            except Exception:
-                self._uncast_ok[key] = False
+                    self._uncast_ok[key] = True
+                except Exception:
+                    self._uncast_ok[key] = False
         return inputs if self._uncast_ok[key] else cast_inputs_memo(self, inputs, dtype)
 
     @contextmanager
     def _probe_frame(self, device: torch.device):
         """Eval mode under a forked RNG; puts back the buffers and ``max_norm`` weights."""
-        state = [*self._buffers.values(), *_max_norm_weights(self.model)]
-        saved = [t.clone() for t in state]
         was_training = self.model.training
         self.model.eval()
         try:
-            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+            with (
+                self._restoring_buffers(_max_norm_weights(self.model)),
+                torch.random.fork_rng(devices=[device] if device.type == "cuda" else []),
+            ):
                 yield
         finally:
-            for t, s in zip(state, saved):
-                t.copy_(s)
             if was_training:
                 self.model.train()
 
-    def _snapshot_buffers(self):
-        """Every buffer's version, and copies of those a forward has written or may write."""
-        versions = {k: None if torch.is_inference(b) else b._version for k, b in self._buffers.items()}
-        written = self._written_buffers
-        copies = {
-            k: b.clone() for k, b in self._buffers.items() if written is None or k in written or versions[k] is None
-        }
-        return versions, copies
-
     @contextmanager
-    def _restoring_buffers(self):
-        """Put back every buffer the frame writes, and remember it as written."""
-        versions, copies = self._snapshot_buffers()
+    def _restoring_buffers(self, extra=()):
+        """Put back every buffer and ``extra`` tensor the frame writes."""
+        state = [*self._buffers.values(), *extra]
+        versions = [None if torch.is_inference(t) else t._version for t in state]
+        copies = [t.clone() for t in state]
         try:
             yield
         finally:
             changed = [
-                k
-                for k, b in self._buffers.items()
-                if (not torch.equal(b, copies[k]) if versions[k] is None else b._version != versions[k])
+                (t, c)
+                for t, v, c in zip(state, versions, copies)
+                if (not torch.equal(t, c) if v is None else t._version != v)
             ]
-            self._written_buffers = (self._written_buffers or set()) | {k for k in changed if versions[k] is not None}
-            for k in changed:
-                if k in copies:
-                    self._buffers[k].copy_(copies[k])
+            for t, c in changed:
+                t.copy_(c)
 
     @torch.inference_mode()
     def _activation_ratios(self, inputs: torch.Tensor) -> Optional[dict]:
@@ -1438,12 +1429,15 @@ class SiteVmapEvaluator:
     def try_build(cls, evaluator: "NNCostEvaluator", layout) -> "SiteVmapEvaluator | None":
         """Decline where the caller's vmap path is unusable, or on tied weights.
 
-        An in-place evaluator that is forced, or that faces tied weights, gets the
-        in-place site path instead, unless it scores per sample or its forward
-        renormalizes an embedding with ``max_norm``.
+        Also decline when the forward renormalizes an embedding with ``max_norm``:
+        shared weights alias the optimizer's coordinates. An in-place evaluator that
+        is forced, or that faces tied weights, gets the in-place site path instead,
+        unless it scores per sample.
         """
+        if _max_norm_weights(evaluator.model):
+            return None
         if evaluator._use_inplace and (evaluator._inplace_forced or layout.shared_groups):
-            if evaluator.per_sample or _max_norm_weights(evaluator.model):
+            if evaluator.per_sample:
                 return None
             return SiteInplaceEvaluator(evaluator.model, evaluator.loss_fn, layout, evaluator._buffers, owner=evaluator)
         if evaluator._vmap_failed or evaluator._inplace_forced or layout.shared_groups:

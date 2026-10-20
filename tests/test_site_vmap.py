@@ -447,7 +447,7 @@ def test_inplace_max_norm_embedding_matches_default(kind, width):
         torch.manual_seed(0)
         embedding = kind(6, 4, max_norm=1.0)
         with torch.no_grad():
-            embedding.weight.mul_(0.98 / embedding.weight.norm(dim=1, keepdim=True))
+            embedding.weight.mul_(3.0 / embedding.weight.norm(dim=1, keepdim=True))
         model = nn.Sequential(embedding, nn.Flatten(), nn.Linear(width, 3))
         opt = PolyStepOptimizer(model, solver="softmax", seed=0, epsilon=0.3)
         evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=inplace, compile_forward=False)
@@ -479,6 +479,22 @@ def test_inplace_raise_restores_max_norm_rows():
     with pytest.raises(RuntimeError, match="failed loss"):
         opt.step(lambda p: evaluator.evaluate(p, inputs))
     assert torch.equal(model.weight, before)
+
+
+def test_site_max_norm_keeps_incumbent():
+    torch.manual_seed(0)
+    embedding = nn.Embedding(6, 4, max_norm=1.0)
+    with torch.no_grad():
+        embedding.weight.mul_(3.0 / embedding.weight.norm(dim=1, keepdim=True))
+    model = nn.Sequential(embedding, nn.Flatten(), nn.Linear(12, 3))
+    gen = torch.Generator().manual_seed(1)
+    inputs, targets = torch.randint(0, 6, (16, 3), generator=gen), torch.randint(0, 3, (16,), generator=gen)
+    opt = PolyStepOptimizer(model, solver="softmax", seed=0, step_radius=0.0)
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_forward=False)
+    before = opt.state.X.clone()
+    opt.register_evaluator(evaluator, inputs, targets)
+    opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    assert torch.equal(opt.state.X, before)
 
 
 def test_unforced_evaluator_swap_rearms_fast_paths():

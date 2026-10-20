@@ -353,18 +353,25 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         keep_v = 2 * max(1, min(V // 2, int(round(V // 2 * opt.screen_keep_ratio))))
     else:
         keep_v = max(1, min(V, int(round(V * opt.screen_keep_ratio))))
+    # Screen forwards see part of the data, so weight them by the realized slice
+    # (or the configured fraction when there is none).
+    _fidelity = (
+        screen_inputs.shape[0] / max(1, _fused_inputs.shape[0])
+        if screen_inputs is not None and _fused_inputs is not None
+        else opt.screen_fidelity
+    )
     _screen_ready = (
         opt.multifidelity_screen
         and screen_closure is not None
         and not (opt.use_quadratic_model or opt._newton_refinement or opt.trust_region)
-        and opt.screen_fidelity / K_eff + keep_v / V < 1.0
+        and _fidelity / K_eff + keep_v / V < 1.0
     )
     if opt.multifidelity_screen and not _screen_ready and not getattr(opt, "_screen_warned", False):
         opt._screen_warned = True
         warnings.warn(
             "multifidelity_screen=True but the screen did not run, so no forward "
             "evaluations are saved this step. It needs a cheap screen_closure passed "
-            "to step() (api.train builds one), screen_fidelity/num_probe plus the "
+            "to step() (api.train builds one), the screened batch share/num_probe plus the "
             "share of vertices kept per particle < 1 (above that the screen costs more "
             "work than it saves), and none of use_quadratic_model / newton_refinement / "
             "trust_region enabled.",
@@ -687,13 +694,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # or the solve ranks by fidelity rather than by cost.
         losses = _fill_screened_losses(
             screen_raw, kept, sel_idx, keep_mask, P, V, K_eff, mask_dropped=_selection_solver
-        )
-        # Screen forwards see part of the data, so weight them by the realized slice
-        # (or the configured fraction when there is none).
-        _fidelity = (
-            screen_inputs.shape[0] / _fused_inputs.shape[0]
-            if screen_inputs is not None and _fused_inputs is not None
-            else opt.screen_fidelity
         )
         _evals_this_step = sel_idx.numel() + _fidelity * P * V
         opt._last_screen_savings = 1.0 - _evals_this_step / max(1, total_evals)

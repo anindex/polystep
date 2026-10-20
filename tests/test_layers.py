@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from polystep.cost_nn import NNCostEvaluator
 from polystep.layers import (
     VmapSafeMultiHeadAttention,
     VmapSafeLSTMCell,
@@ -397,3 +398,66 @@ def test_half_attention_accepts_float_masks():
             key_padding_mask=torch.zeros(2, 3, device="cuda"),
         )
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_meta_attention_forward_keeps_shape(dtype):
+    model = VmapSafeMultiHeadAttention(8, 2).to(device="meta", dtype=dtype)
+    x = torch.randn(2, 3, 8, device="meta", dtype=dtype)
+    assert model(x, x, x).shape == (2, 3, 8)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("autocast", [False, True])
+@pytest.mark.parametrize("attn_mask", [None, torch.tensor([[False, True], [False, False]])])
+def test_fp16_cuda_attention_stays_finite(attn_mask, autocast):
+    model = VmapSafeMultiHeadAttention(2, 1, bias=False).eval()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.copy_(torch.eye(2))
+    x = torch.tensor([[[400.0, 0.0], [0.0, 400.0]]])
+    expected = model(x, x, x, attn_mask=attn_mask)
+    dtype = torch.float32 if autocast else torch.float16
+    model = model.to(device="cuda", dtype=dtype)
+    x = x.to(device="cuda", dtype=dtype)
+    with torch.autocast("cuda", dtype=torch.float16, enabled=autocast):
+        actual = model(x, x, x, attn_mask=None if attn_mask is None else attn_mask.cuda())
+    torch.testing.assert_close(actual.float().cpu(), expected, rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("bias", [False, True])
+def test_fp16_autocast_attention_cost_stays_finite(bias):
+    class SelfAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = VmapSafeMultiHeadAttention(2, 1, bias=bias)
+
+        def forward(self, x):
+            return self.attn(x, x, x)
+
+    model = SelfAttention().cuda()
+    params = {
+        name: torch.eye(2, device="cuda").repeat(3, 1, 1) if p.dim() == 2 else torch.zeros(3, 2, device="cuda")
+        for name, p in model.named_parameters()
+    }
+    x = torch.tensor([[[400.0, 0.0], [0.0, 400.0]]], device="cuda")
+    evaluator = NNCostEvaluator(model, nn.MSELoss(), autocast_dtype=torch.float16)
+    torch.testing.assert_close(evaluator.evaluate(params, x, x), torch.zeros(3, device="cuda"))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fp16_autocast_keeps_fp64_attention_exact():
+    torch.manual_seed(0)
+    model = VmapSafeMultiHeadAttention(16, 4).to(device="cuda", dtype=torch.float64).eval()
+    x = torch.randn(2, 5, 16, device="cuda", dtype=torch.float64)
+    attn_mask = torch.triu(torch.ones(5, 5, dtype=torch.bool, device="cuda"), diagonal=1)
+    key_padding_mask = torch.zeros(2, 5, dtype=torch.bool, device="cuda")
+    key_padding_mask[1, 3:] = True
+    expected = model(x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+    with torch.autocast("cuda", dtype=torch.float16):
+        actual = model(x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

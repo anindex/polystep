@@ -123,6 +123,12 @@ class ParamLayout:
                     alias_of = canonical_key
                     break
                 if alias_of is not None:
+                    if key in param_grad:
+                        raise ValueError(
+                            f"{key!r} and {alias_of!r} are distinct Parameters sharing storage, so "
+                            f"candidates would replace only {alias_of!r}. Tie them as one Parameter "
+                            "instead (module.b = module.a)."
+                        )
                     shared_map.setdefault(alias_of, [alias_of]).append(key)
                     continue
                 group.append((key, start, stop, view))

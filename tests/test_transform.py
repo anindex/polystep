@@ -380,3 +380,13 @@ def test_transposed_alias_rejected():
 
     with pytest.raises(ValueError, match="share storage but are different views"):
         ParamLayout.from_module(model)
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_layout_distinct_parameter_alias_raises(frozen):
+    model = nn.Sequential(nn.Linear(3, 3), nn.Tanh(), nn.Linear(3, 3))
+    model[2].weight.data = model[0].weight.data
+    model[2].weight.requires_grad_(not frozen)
+
+    with pytest.raises(ValueError, match="distinct Parameters sharing storage"):
+        ParamLayout.from_module(model)

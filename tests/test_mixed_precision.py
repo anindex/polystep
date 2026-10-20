@@ -736,6 +736,29 @@ def test_resync_casts_global_projection_and_coords(dtype):
     assert model[0].weight.dtype is dtype
 
 
+@pytest.mark.parametrize("register", [True, False])
+def test_resync_after_dtype_cast_steps(register):
+    """Full space follows a cast to float64 and back to float32."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+    opt = PolyStepOptimizer(model, use_momentum=True, seed=0)
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    inputs, targets = torch.randn(16, 8), torch.randint(0, 4, (16,))
+    losses = []
+    for i, dtype in enumerate([None, None, torch.float64, None, torch.float32, None]):
+        if dtype is not None:
+            model.to(dtype)
+            evaluator.reset_vmap()
+            opt.resync_from_model()
+            assert opt.state.X.dtype is dtype
+        if register:
+            opt.register_evaluator(evaluator, inputs, targets)
+        losses.append(float(opt.step(lambda p: evaluator.evaluate(p, inputs, targets), objective_token=i)))
+    assert all(math.isfinite(loss) for loss in losses)
+    assert losses[-1] < losses[0]
+    assert opt.state.velocity.dtype is torch.float32
+
+
 def test_global_vector_modes_reject_mixed_dtype():
     """Full space and AdaptiveSubspace hold every parameter in one vector at one dtype.
 

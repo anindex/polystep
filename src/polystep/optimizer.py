@@ -6,7 +6,7 @@ import collections
 import logging
 import os
 import warnings
-from dataclasses import dataclass, fields as dataclass_fields
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -361,7 +361,7 @@ class PolyStepOptimizer(SerializationMixin):
         self._progressive_epsilon = epsilon if isinstance(epsilon, ProgressiveEpsilon) else None
         if self._progressive_epsilon is not None and ent_epsilon is not None:
             raise ValueError("ProgressiveEpsilon adapts the solve epsilon; it cannot be combined with ent_epsilon.")
-        resolve_cost_scale(torch.ones(()), scale_cost)
+        resolve_cost_scale(torch.ones((), dtype=torch.float64, device="cpu"), scale_cost)
         self.scale_cost = scale_cost
         # A negative radius flips the finite-difference denominator, which the
         # clamp then turns positive and scales the gradient by 1e10. 0 is the
@@ -1415,7 +1415,7 @@ class PolyStepOptimizer(SerializationMixin):
         """Re-read particle state from the model's current weights, after external writes.
 
         Subspace projections follow a dtype cast, once ``evaluator.reset_vmap()`` has dropped the evaluator's
-        cached input dtype. Only a global projection moves its coordinates too; per-layer subspaces and full space
+        cached input dtype. Full space and a global projection move their coordinates too; per-layer subspaces
         keep their coordinate dtype. Raises ``ValueError`` if the model moved to another device.
         """
         device = next(self.model.parameters()).device
@@ -1432,7 +1432,13 @@ class PolyStepOptimizer(SerializationMixin):
             self._state.X = torch.zeros_like(self._state.X)
             self._realign_subspace_to_model()
         else:
-            self._state.X = self.layout.flatten(self.model).to(self._state.X.dtype)
+            sd = self.model.state_dict()
+            self.layout = replace(
+                self.layout,
+                entries=tuple(replace(e, dtype=sd[e.key].dtype) for e in self.layout.entries),
+                dominant_dtype=ParamLayout.from_module(self.model).dominant_dtype,
+            )
+            self._state.X = self.layout.flatten(self.model)
         self._state.f = None
         self._state.g = None
         self._state.prev_prev_f = None
@@ -1452,7 +1458,7 @@ class PolyStepOptimizer(SerializationMixin):
         self._prev_predicted_improvement = None
         self._prev_pre_step_loss = None
         if self._state.velocity is not None:
-            self._state.velocity = torch.zeros_like(self._state.velocity)
+            self._state.velocity = torch.zeros_like(self._state.X)
         self._state._prev_prev_block_duals = None
         # Reset counters measured at the old weights, or the next step could fire a
         # spurious stagnation absorb.

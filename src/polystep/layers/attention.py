@@ -1,5 +1,6 @@
 """Vmap-compatible multi-head attention with native CPU SDPA."""
 
+import contextlib
 import math
 import warnings
 from typing import Optional
@@ -150,7 +151,16 @@ class VmapSafeMultiHeadAttention(nn.Module):
             )
         else:
             # Off CPU: explicit matmul and softmax, with fully masked rows given zero weight.
-            scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+            device_type = Q.device.type
+            autocast_on = torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type)
+            if Q.dtype == torch.float16 or (
+                Q.dtype != torch.float64 and autocast_on and torch.get_autocast_dtype(device_type) == torch.float16
+            ):
+                with torch.amp.autocast(device_type, enabled=False) if autocast_on else contextlib.nullcontext():
+                    scores = torch.matmul(Q.float(), K.float().transpose(-2, -1))
+            else:
+                scores = torch.matmul(Q, K.transpose(-2, -1))
+            scores = scores * self.scale
             if attn_mask is None:
                 weights = F.softmax(scores, dim=-1)
             else:

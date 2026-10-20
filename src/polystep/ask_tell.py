@@ -60,7 +60,7 @@ class PolyStepES:
         validate_positive(epsilon, "epsilon")
         if not (math.isfinite(step_radius) and step_radius >= 0):
             raise ValueError(f"step_radius must be finite and >= 0, got {step_radius}.")
-        resolve_cost_scale(torch.ones(()), scale_cost)
+        resolve_cost_scale(torch.ones((), dtype=torch.float64, device="cpu"), scale_cost)
         self.dim = dim
         self.num_particles = num_particles
         self.epsilon = epsilon
