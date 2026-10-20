@@ -264,6 +264,49 @@ def test_evaluator_fallback_warning():
     assert losses.isfinite().all()
 
 
+def test_gru_forward_falls_back_to_loop():
+    torch.manual_seed(0)
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rnn = nn.GRU(3, 4, batch_first=True)
+            self.out = nn.Linear(4, 2)
+
+        def forward(self, x):
+            return self.out(self.rnn(x)[0][:, -1])
+
+    model, loss_fn = Net(), nn.MSELoss()
+    x, y = torch.randn(4, 5, 3), torch.randn(4, 2)
+    stacked = {k: v.detach() + 0.1 * torch.randn(3, *v.shape) for k, v in model.named_parameters()}
+    evaluator = NNCostEvaluator(model, loss_fn, use_inplace=False)
+    with pytest.warns(UserWarning, match="Falling back"):
+        losses = evaluator.evaluate(stacked, x, y)
+    expected = [loss_fn(functional_call(model, {k: v[i] for k, v in stacked.items()}, (x,)), y) for i in range(3)]
+    torch.testing.assert_close(losses, torch.stack(expected))
+    assert evaluator._vmap_failed
+
+
+def test_vmap_oom_raises_without_fallback():
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(4, 2)
+
+        def forward(self, x):
+            h = self.fc(x)
+            if torch._C._functorch.is_batchedtensor(h):
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            return h
+
+    model = Net()
+    stacked = {k: v.detach().expand(3, *v.shape) for k, v in model.named_parameters()}
+    evaluator = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        evaluator.evaluate(stacked, torch.randn(5, 4), torch.randn(5, 2))
+    assert not evaluator._vmap_failed
+
+
 def test_evaluator_no_grad():
     """Evaluation does not attach gradients to model params."""
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
@@ -335,6 +378,30 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
             ]
         )
         assert torch.allclose(fast, expected, atol=1e-6)
+
+    @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
+    def test_mse_target_broadcast_matches_loop(self, loss_fn):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(4, 1)).double()
+        layout = ParamLayout.from_module(model)
+        batch = layout.flatten(model).unsqueeze(0).expand(5, -1, -1).clone()
+        batch += torch.randn_like(batch) * 0.05
+        stacked = layout.batch_unflatten(batch)
+        inputs = torch.randn(6, 4, dtype=torch.float64)
+        targets = torch.randn(6, dtype=torch.float64)
+
+        evaluator = NNCostEvaluator(model, loss_fn)
+        assert evaluator._batched_linear is not None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            fast = evaluator.evaluate(stacked, inputs, targets)
+            expected = torch.stack(
+                [
+                    loss_fn(functional_call(model, {k: v[i] for k, v in stacked.items()}, (inputs,)), targets)
+                    for i in range(5)
+                ]
+            )
+        torch.testing.assert_close(fast, expected, rtol=1e-12, atol=1e-12)
 
     def test_non_mean_reduction_falls_back(self):
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
@@ -547,6 +614,7 @@ class TestEvalModeEnforced:
             evaluator.evaluate(stacked, torch.randn(1, 10), torch.zeros(1, dtype=torch.long))
 
         assert model.training, "Model mode should be restored even after error"
+        assert not evaluator._vmap_failed
 
 
 def test_inplace_evaluator_rejects_unknown_parameter_keys():
@@ -585,6 +653,21 @@ def test_reset_recomputes_automatic_chunk_size():
         assert ev.chunk_size == 2
 
 
+@pytest.mark.parametrize("compile_vmap", [False, True])
+def test_loss_fn_swap_scores_new_loss(compile_vmap):
+    torch.manual_seed(0)
+    layers = [nn.Linear(3, 4), nn.LayerNorm(4)] if compile_vmap else [nn.Linear(3, 4)]
+    model = nn.Sequential(*layers).double()
+    x, y = torch.randn(6, 3, dtype=torch.float64), torch.randn(6, 4, dtype=torch.float64)
+    params = {k: v.detach().unsqueeze(0) for k, v in model.named_parameters()}
+    evaluator = NNCostEvaluator(model, nn.MSELoss(), compile_vmap=compile_vmap)
+    evaluator.evaluate(params, x, y)
+    evaluator.loss_fn = nn.L1Loss()
+    with torch.no_grad():
+        expected = nn.L1Loss()(model(x), y).reshape(1)
+    torch.testing.assert_close(evaluator.evaluate(params, x, y), expected)
+
+
 @pytest.mark.parametrize("site", ["0.weight", "0.bias", "2.weight", "2.bias"])
 def test_dense_shared_weights_match_materialized_candidates(site):
     model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2)).double()
@@ -607,3 +690,85 @@ def test_cast_cache_observes_input_mutation(inference_tensor):
             assert cast_inputs_memo(holder, inputs, torch.float32) is first
         inputs.fill_(7)
         torch.testing.assert_close(cast_inputs_memo(holder, inputs, torch.float32), torch.full((2,), 7.0))
+
+
+def test_forward_accepting_fp32_skips_cast():
+    class Centred(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("t0", torch.tensor(5000.0))
+            self.net = nn.Sequential(nn.Linear(1, 8), nn.Tanh(), nn.Linear(8, 1)).bfloat16()
+
+        def forward(self, t):
+            return self.net((t - self.t0).to(torch.bfloat16)).float()
+
+    torch.manual_seed(0)
+    model = Centred()
+    t = 5000 + torch.linspace(0, 3, 64)[:, None]
+    y = torch.sin(t - 5000)
+    params = {k: v.detach().unsqueeze(0) for k, v in model.named_parameters()}
+    with torch.no_grad():
+        expected = nn.MSELoss()(model(t), y).item()
+    got = NNCostEvaluator(model, nn.MSELoss()).evaluate(params, t, y).item()
+    assert got == pytest.approx(expected, rel=1e-2)
+
+
+class CountingLinear(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(4, 1)
+        self.register_buffer("calls", torch.zeros(()))
+        self.register_buffer("table", torch.ones(8))
+
+    def forward(self, x):
+        self.calls += 1
+        return self.fc(x) * self.calls
+
+
+@pytest.mark.parametrize("looped", [False, True])
+def test_candidate_sweep_leaves_buffers_unchanged(looped):
+    torch.manual_seed(0)
+    model = CountingLinear()
+    x, y = torch.randn(8, 4), torch.randn(8, 1)
+    params = {k: v.detach().expand(6, *v.shape) for k, v in model.named_parameters()}
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    ev._vmap_failed = looped
+    whole = ev.evaluate(params, x, y)
+    assert model.calls.item() == 0
+    for start in range(0, 6, 2):
+        part = ev.evaluate({k: v[start : start + 2] for k, v in params.items()}, x, y)
+        assert torch.equal(part, whole[start : start + 2])
+        assert model.calls.item() == 0
+    assert ev._snapshot_buffers()[1].keys() == {"calls"}
+
+
+def test_readonly_buffer_skips_snapshot():
+    model = MLPWithBatchNorm()
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    params = {k: v.detach().expand(3, *v.shape) for k, v in model.named_parameters()}
+    ev.evaluate(params, torch.randn(5, 4), torch.randint(0, 2, (5,)))
+    assert ev._batched_linear is None
+    assert ev._snapshot_buffers()[1] == {}
+
+
+@pytest.mark.parametrize("looped", [False, True])
+def test_inference_expanded_buffer_scores(looped):
+    class Tabled(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(4, 1)
+            with torch.inference_mode():
+                self.register_buffer("table", torch.arange(4.0).expand(4, 4))
+
+        def forward(self, x):
+            return self.fc(x @ self.table)
+
+    torch.manual_seed(0)
+    model = Tabled()
+    x, y = torch.randn(8, 4), torch.randn(8, 1)
+    params = {k: v.detach().expand(3, *v.shape) for k, v in model.named_parameters()}
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    ev._vmap_failed = looped
+    with torch.no_grad():
+        expected = nn.MSELoss()(model(x), y)
+    torch.testing.assert_close(ev.evaluate(params, x, y), expected.expand(3))

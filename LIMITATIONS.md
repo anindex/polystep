@@ -30,6 +30,15 @@ Heavy-ball momentum can amplify the barycentric displacement.
 - `NNCostEvaluator` and `train()` score candidates in eval mode: dropout is off and
   batch-norm running statistics never update. A custom closure that runs the model in
   train mode compares candidates under different dropout masks.
+- The evaluator puts back any buffer the forward writes, such as a call counter, after
+  each batched scoring call and after each candidate in the sequential loop. Chunks of
+  `NNCostEvaluator(chunk_size=...)` run inside one vmap call and still see each other's
+  writes. `use_inplace=True` runs your real forward, so its writes persist. Update such
+  state in your own forward calls outside the closure.
+- Float inputs are cast to the dtype of the model's first floating weight only when
+  the forward raises on them as given. The evaluator checks this with one extra
+  forward per input dtype and puts back the buffers it changed. The delta and
+  factored paths, which accept plain Linear stacks only, always cast.
 - Mixed-dtype models require `HybridSubspace` or `FactoredSubspace`. Full-space and
   global-subspace coordinates use one dtype and reject mixed parameter dtypes.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
@@ -53,6 +62,8 @@ Heavy-ball momentum can amplify the barycentric displacement.
   forward neither draws random numbers nor reads the perturbed parameter before
   calling its layer. Attention scores and other temporary tensors inside a module's
   forward are not counted. Set `chunk_size` by hand if such a model runs out of memory.
+  `PolyStepOptimizer(chunk_size=...)` caps the candidates scored per step chunk, and
+  `NNCostEvaluator(chunk_size=...)` caps how many of them each vmap call batches.
 - The library does not distribute optimizer state across multiple GPUs.
 
 ## Attention and recurrent layers
@@ -67,6 +78,12 @@ masks accept `(query, key)`, `(batch * heads, query, key)`, and broadcastable 4D
 The wrapper also accepts `(batch, query, key)` masks.
 
 CPU vmap may emit a batching-fallback warning.
+
+Stock `nn.LSTM`, `nn.GRU` and `nn.RNN` have no vmap batching rule, so the evaluator
+scores them one candidate at a time in a sequential loop, with a warning. On a small
+CPU model, `NNCostEvaluator(..., use_inplace=True)` ran 1.1 to 1.3 times faster than
+the loop, and `VmapSafeLSTM` 3 to 5 times faster. `train()` builds its own evaluator,
+so it takes the loop for these layers.
 
 [`VmapSafeLSTM`](src/polystep/layers/rnn.py) requires batch-first dense inputs. It does
 not support bidirectional recurrence, projection, or `PackedSequence`. Its explicit

@@ -31,14 +31,19 @@ if TYPE_CHECKING:
 _MIN_BATCHED_CANDIDATES = 8
 
 
-def _is_vmap_error(e: BaseException) -> bool:
+def _is_vmap_error(e: BaseException, probe: Callable[[], object]) -> bool:
     """Whether an exception came from the vmap transform rather than the model.
 
-    Matches functorch's own markers, so a user-forward error is not demoted to the
-    slow loop.
+    An OOM is the model's. An error without functorch's markers runs ``probe``, one
+    candidate scored unbatched, so a user-forward error raises unbatched instead of
+    being demoted to the slow loop.
     """
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return False
     msg = str(e).lower()
-    return any(k in msg for k in ("vmap", "functorch", "torch.func", "batched tensor", "randomness"))
+    if not any(k in msg for k in ("vmap", "functorch", "torch.func", "batched tensor", "randomness")):
+        probe()
+    return True
 
 
 def _batchable_draw(e: BaseException, randomness: str) -> bool:
@@ -180,7 +185,9 @@ def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
     # Cast before expand, or the cast materializes the whole (N, *target) tensor;
     # promote so FP64 targets keep precision and half precision reduces in FP32.
     dtype = loss_buffer_dtype(torch.promote_types(outputs.dtype, targets.dtype))
-    tgt = targets.to(dtype).unsqueeze(0).expand(n, *targets.shape)
+    tgt = targets.to(dtype)
+    if tgt.shape == outputs.shape[1:]:
+        tgt = tgt.expand_as(outputs)
     fn = torch.nn.functional.mse_loss if loss_kind == "mse" else torch.nn.functional.l1_loss
     return fn(outputs.to(dtype), tgt, reduction="none").flatten(1).mean(dim=1)  # (N,)
 
@@ -276,15 +283,11 @@ class NNCostEvaluator:
         self._subspace_backup = None
         self._cast_cache = None  # (inputs, dtype, converted) for the per-chunk cast
         self._input_dtype_cache = _UNSET
+        self._uncast_ok = {}
+        self._written_buffers = None
 
         # Eval mode: frozen BN stats, no dropout.
         model.eval()
-
-        # Fast batched-linear evaluator (MLP-only), when the loss has a bmm-friendly form.
-        self._loss_kind = _builtin_loss_kind(loss_fn)
-        self._batched_linear = (
-            BatchedLinearEvaluator.try_build(model, loss_fn, self._loss_kind) if _batched_loss_kind(loss_fn) else None
-        )
 
         # Pick in-place only when the batched footprint would not fit (not on a
         # parameter count); pass use_inplace=True/False to override.
@@ -318,8 +321,8 @@ class NNCostEvaluator:
     def reset_vmap(self) -> None:
         """Rebuild every cache that pins the model's shape at construction.
 
-        Call after swapping a layer, rebinding a buffer, replacing a Parameter, or
-        moving the model.
+        Call after swapping a layer, rebinding a buffer, replacing a Parameter,
+        moving the model, or after changing loss_fn's settings in place.
         """
         self._reset_count += 1
         self._vmap_failed = False
@@ -337,13 +340,34 @@ class NNCostEvaluator:
         self._subspace_backup = None
         self._cast_cache = None
         self._input_dtype_cache = _UNSET
+        self._uncast_ok = {}
+        self._written_buffers = None
         self._chunk_size_cached = _UNSET
-        self._loss_kind = _builtin_loss_kind(self.loss_fn)
+        self.loss_fn = self.loss_fn
+
+    def _refresh_recast_buffers(self) -> None:
+        """Call reset_vmap when a dtype cast or device move rebound the buffers."""
+        live = dict(self.model.named_buffers())
+        if live.keys() != self._buffers.keys() or any(
+            live[k].dtype != b.dtype or live[k].device != b.device for k, b in self._buffers.items()
+        ):
+            self.reset_vmap()
+
+    @property
+    def loss_fn(self) -> Callable:
+        """The loss; assigning it rebuilds the bmm plan and drops compiled forwards."""
+        return self._loss_fn
+
+    @loss_fn.setter
+    def loss_fn(self, fn: Callable) -> None:
+        self._loss_fn = fn
+        self._loss_kind = _builtin_loss_kind(fn)
         self._batched_linear = (
-            BatchedLinearEvaluator.try_build(self.model, self.loss_fn, self._loss_kind)
-            if _batched_loss_kind(self.loss_fn)
-            else None
+            BatchedLinearEvaluator.try_build(self.model, fn, self._loss_kind) if _batched_loss_kind(fn) else None
         )
+        self._compiled_vmap_fn = None
+        self._compiled_fwd_loss = None
+        self._compile_forward_verified = False
 
     @property
     def chunk_size(self) -> Optional[int]:
@@ -368,6 +392,7 @@ class NNCostEvaluator:
 
         Returns losses of shape ``(N,)``, or ``(N, B)`` under ``per_sample``.
         """
+        self._refresh_recast_buffers()
         # Already eval (set in __init__), so this is a bool check, not an O(L) walk.
         was_training = self.model.training
         if was_training:
@@ -386,8 +411,60 @@ class NNCostEvaluator:
                 self.model.train()
 
     def cast_inputs(self, inputs: torch.Tensor, dtype: Optional[torch.dtype]) -> torch.Tensor:
-        """Cast float inputs to ``dtype``, reusing the last result across chunks."""
-        return cast_inputs_memo(self, inputs, dtype)
+        """Cast float inputs to ``dtype`` only when the forward rejects them, memoized across chunks."""
+        if dtype is None or not inputs.is_floating_point() or inputs.dtype == dtype:
+            return inputs
+        key = (inputs.dtype, self.autocast_dtype)
+        if key not in self._uncast_ok:
+            try:
+                with torch.inference_mode(), self._probe_frame(inputs.device), self._autocast(inputs.device):
+                    self.model(inputs)
+                self._uncast_ok[key] = True
+            except Exception:
+                self._uncast_ok[key] = False
+        return inputs if self._uncast_ok[key] else cast_inputs_memo(self, inputs, dtype)
+
+    @contextmanager
+    def _probe_frame(self, device: torch.device):
+        """Eval mode under a forked RNG; puts back the buffers and ``max_norm`` weights."""
+        state = [*self._buffers.values(), *_max_norm_weights(self.model)]
+        saved = [t.clone() for t in state]
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+                yield
+        finally:
+            for t, s in zip(state, saved):
+                t.copy_(s)
+            if was_training:
+                self.model.train()
+
+    def _snapshot_buffers(self):
+        """Every buffer's version, and copies of those a forward has written or may write."""
+        versions = {k: None if torch.is_inference(b) else b._version for k, b in self._buffers.items()}
+        written = self._written_buffers
+        copies = {
+            k: b.clone() for k, b in self._buffers.items() if written is None or k in written or versions[k] is None
+        }
+        return versions, copies
+
+    @contextmanager
+    def _restoring_buffers(self):
+        """Put back every buffer the frame writes, and remember it as written."""
+        versions, copies = self._snapshot_buffers()
+        try:
+            yield
+        finally:
+            changed = [
+                k
+                for k, b in self._buffers.items()
+                if (not torch.equal(b, copies[k]) if versions[k] is None else b._version != versions[k])
+            ]
+            self._written_buffers = (self._written_buffers or set()) | {k for k in changed if versions[k] is not None}
+            for k in changed:
+                if k in copies:
+                    self._buffers[k].copy_(copies[k])
 
     @torch.inference_mode()
     def _activation_ratios(self, inputs: torch.Tensor) -> Optional[dict]:
@@ -404,8 +481,6 @@ class NNCostEvaluator:
         parameter-free one goes unmeasured and one that owns parameters gives None.
         """
         widths, owned, starts = [], [], {}
-        state = [*self._buffers.values(), *_max_norm_weights(self.model)]
-        saved = [t.clone() for t in state]
         owners = {m for m in self.model.modules() if next(m.parameters(recurse=False), None) is not None}
         hooked = [m for m in self.model.modules() if not isinstance(m, torch.jit.ScriptModule)]
         if not owners.issubset(hooked):
@@ -422,6 +497,7 @@ class NNCostEvaluator:
             if module in owners:
                 owned.extend(sizes)
 
+        inputs = self.cast_inputs(inputs, self._input_dtype(self._param_dict_cache))
         handles = [m.register_forward_hook(record) for m in hooked]
         handles += [m.register_forward_pre_hook(start) for m in owners]
         devices = [inputs.device] if inputs.device.type == "cuda" else []
@@ -429,12 +505,9 @@ class NNCostEvaluator:
         def rng_state():
             return [torch.get_rng_state(), *map(torch.cuda.get_rng_state, devices)]
 
-        was_training = self.model.training
-        self.model.eval()
         try:
-            with torch.random.fork_rng(devices=devices):
+            with self._probe_frame(inputs.device):
                 before = rng_state()
-                inputs = self.cast_inputs(inputs, self._input_dtype(self._param_dict_cache))
                 with uses:
                     self.model(inputs)
                 drew = not all(map(torch.equal, before, rng_state()))
@@ -443,10 +516,6 @@ class NNCostEvaluator:
         finally:
             for h in handles:
                 h.remove()
-            for t, s in zip(state, saved):
-                t.copy_(s)
-            if was_training:
-                self.model.train()
         scale = max(1, inputs.numel())
         ratios = {None: max(owned, default=0) / scale}
         if drew:
@@ -510,24 +579,23 @@ class NNCostEvaluator:
         if self._vmap_failed:
             result = self._evaluate_loop(stacked_params, inputs, targets)
         else:
-            saved = [b.clone() for b in self._buffers.values()]
             try:
-                result = self._evaluate_vmap(stacked_params, inputs, targets)
+                with self._restoring_buffers():
+                    result = self._evaluate_vmap(stacked_params, inputs, targets)
             except Exception as e:
-                # Only catch vmap/functorch errors; re-raise real bugs.
-                if not _is_vmap_error(e):
-                    raise
-                for b, s in zip(self._buffers.values(), saved):
-                    b.copy_(s)
                 if _batchable_draw(e, self._randomness):
                     self._randomness = "different"
                     self._compiled_vmap_fn = None
                     return self._dispatch(stacked_params, inputs, targets)
+                if not _is_vmap_error(
+                    e, lambda: self._evaluate_loop({k: v[:1] for k, v in stacked_params.items()}, inputs, targets)
+                ):
+                    raise
                 if not self._warned:
                     warnings.warn(
                         f"vmap failed for {type(self.model).__name__}: {e}. Falling back to sequential "
-                        f"evaluation (~N x slower). If this masks a real bug in the model's forward, "
-                        f"the error text is above.",
+                        f"evaluation (~N x slower). use_inplace=True runs the model's own forward faster, "
+                        f"and polystep.VmapSafeLSTM replaces nn.LSTM with a vmap-safe layer.",
                         stacklevel=2,
                     )
                     self._warned = True
@@ -622,8 +690,9 @@ class NNCostEvaluator:
         losses = []
         for i in range(N):
             full_dict = {**{k: v[i] for k, v in stacked_params.items()}, **self._buffers}
-            output = functional_call(self.model, full_dict, (inputs,))
-            loss = _candidate_loss(self.loss_fn, self._loss_kind, output, targets)
+            with self._restoring_buffers():
+                output = functional_call(self.model, full_dict, (inputs,))
+                loss = _candidate_loss(self.loss_fn, self._loss_kind, output, targets)
             losses.append(_fold_candidate_loss(loss, self.per_sample))
         return torch.stack(losses)
 
@@ -1360,6 +1429,8 @@ class SiteVmapEvaluator:
         self._keys = [e.key for e in layout.entries]
         self._compiled_sites = {}
         self._compile_failed_sites = set()
+        self._failed_sites = set()
+        self._warned = False
         self._randomness = "error"
 
     @classmethod
@@ -1388,13 +1459,15 @@ class SiteVmapEvaluator:
         """The one layout entry this chunk perturbs, or None to use the dense path."""
         if self._retired():
             return None
-        return _resolve_layout_entry(self, offsets, pdim, span)
+        entry = _resolve_layout_entry(self, offsets, pdim, span)
+        return None if entry is None or entry.key in self._failed_sites else entry
 
     def resolve_spec(self, subspace, lo: int, hi: int, sub_dim: int):
         """The per-layer spec owning coordinates ``[lo, hi)``, or None if they straddle or this path is retired."""
         if self._retired():
             return None
-        return _owning_spec(subspace, lo, hi, sub_dim)
+        spec = _owning_spec(subspace, lo, hi, sub_dim)
+        return None if spec is None or spec.entry_key in self._failed_sites else spec
 
     @torch.inference_mode()
     def evaluate_subspace(self, projections, base_sd, coords, bary_sd, spec, col_start, values, inputs, targets=None):
@@ -1505,47 +1578,56 @@ class SiteVmapEvaluator:
             output = functional_call(model, {**shared, key: site_param}, (inputs,))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
+        def score_alone(i):
+            with self._owner._restoring_buffers():
+                return single_eval(site[i], shared, inputs, targets)
+
         # No autocast frame: under vmap it casts activations but not a Conv2d bias, so
         # a conv model raises a dtype mismatch.
-        saved = [b.clone() for b in self._buffers.values()]
         try:
-            batched = vmap(single_eval, in_dims=(0, None, None, None), randomness=self._randomness)
-            if self._owner._compile_vmap and key not in self._compile_failed_sites:
-                try:
-                    if key not in self._compiled_sites:
-                        # Shared weights, buffers and data are explicit arguments: no
-                        # batch or incumbent from the first call is baked into a graph.
-                        self._compiled_sites[key] = torch.compile(batched, mode="default", fullgraph=False)
-                    return self._compiled_sites[key](site, shared, inputs, targets)
-                except torch.cuda.OutOfMemoryError:
-                    raise
-                except Exception as e:
-                    if _batchable_draw(e, self._randomness):
+            with self._owner._restoring_buffers():
+                batched = vmap(
+                    single_eval,
+                    in_dims=(0, None, None, None),
+                    chunk_size=self._owner.chunk_size,
+                    randomness=self._randomness,
+                )
+                if self._owner._compile_vmap and key not in self._compile_failed_sites:
+                    try:
+                        if key not in self._compiled_sites:
+                            # Shared weights, buffers and data are explicit arguments: no
+                            # batch or incumbent from the first call is baked into a graph.
+                            self._compiled_sites[key] = torch.compile(batched, mode="default", fullgraph=False)
+                        return self._compiled_sites[key](site, shared, inputs, targets)
+                    except torch.cuda.OutOfMemoryError:
                         raise
-                    self._compiled_sites.pop(key, None)
-                    self._compile_failed_sites.add(key)
-                    warnings.warn(f"compile_vmap failed at site {key!r} ({e}); using eager vmap.", stacklevel=2)
-            return batched(site, shared, inputs, targets)
+                    except Exception as e:
+                        if _batchable_draw(e, self._randomness):
+                            raise
+                        self._compiled_sites.pop(key, None)
+                        self._compile_failed_sites.add(key)
+                        warnings.warn(f"compile_vmap failed at site {key!r} ({e}); using eager vmap.", stacklevel=2)
+                return batched(site, shared, inputs, targets)
         except Exception as e:
             # The step calls this directly, so the failure never reaches evaluate()'s
             # fallback. A random draw is retried once, drawing per candidate. Anything
-            # else scores this chunk in a loop; later chunks use the dense path.
-            if not _is_vmap_error(e):
-                raise
-            for b, s in zip(self._buffers.values(), saved):
-                b.copy_(s)
+            # else scores this chunk in a loop; later chunks of this key use the dense path.
             if _batchable_draw(e, self._randomness):
                 self._randomness = "different"
                 self._compiled_sites.clear()
                 return self._vmap_over_site(key, base_sd, site, inputs, targets)
-            self._owner._vmap_failed = True
-            warnings.warn(
-                f"vmap failed on the site-aware path for {type(model).__name__}: {e}. "
-                "Falling back to a sequential loop; later chunks use the dense path.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return torch.stack([single_eval(site[i], shared, inputs, targets) for i in range(site.shape[0])])
+            if not _is_vmap_error(e, lambda: score_alone(0)):
+                raise
+            self._failed_sites.add(key)
+            if not self._warned:
+                warnings.warn(
+                    f"vmap failed on the site-aware path for {type(model).__name__} at {key!r}: {e}. "
+                    "Falling back to a sequential loop; later chunks of a failed parameter use the dense path.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._warned = True
+            return torch.stack([score_alone(i) for i in range(site.shape[0])])
         finally:
             if was_training:
                 model.train()

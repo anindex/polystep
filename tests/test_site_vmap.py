@@ -47,16 +47,59 @@ class NoisyMLP(nn.Module):
 
 
 class ItemScaledMLP(nn.Module):
-    """Reads an activation back as a Python number, which vmap cannot batch."""
+    """Reads an activation back as a Python number, which vmap cannot batch, and counts calls."""
 
     def __init__(self):
         super().__init__()
         self.fc1 = nn.Linear(6, 5)
         self.fc2 = nn.Linear(5, 3)
+        self.register_buffer("calls", torch.zeros(()))
 
     def forward(self, x):
+        self.calls += 1
         h = torch.relu(self.fc1(x))
-        return self.fc2(h) / (1.0 + h.mean().item())
+        return self.fc2(h) * self.calls / (1.0 + h.mean().item())
+
+
+class ResidualMLP(nn.Module):
+    """Adds a shortcut in place, as a ResNet block does, so a shortcut site writes into an unbatched activation, and counts calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.body = nn.Linear(6, 5)
+        self.short = nn.Linear(6, 5)
+        self.head = nn.Linear(5, 3)
+        self.register_buffer("calls", torch.zeros(()))
+
+    def forward(self, x):
+        self.calls += 1
+        h = self.body(x)
+        h += self.short(x)
+        return self.head(torch.tanh(h)) * self.calls
+
+
+class LayerScale(nn.Module):
+    """Scales its input in place by a learned vector, as timm's LayerScale does."""
+
+    def __init__(self, width):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.full((width,), 0.5))
+
+    def forward(self, x):
+        return x.mul_(self.gamma)
+
+
+class LayerScaleMLP(nn.Module):
+    """vmap refuses its in-place scale only when ``ls.gamma`` alone carries the candidate axis."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(6, 5)
+        self.ls = LayerScale(5)
+        self.fc2 = nn.Linear(5, 3)
+
+    def forward(self, x):
+        return self.fc2(torch.tanh(self.ls(self.fc1(x))))
 
 
 def _small_batch(seed=1, d_in=6, classes=3):
@@ -152,6 +195,28 @@ def test_conv_step_skips_closure_keeps_losses():
     torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=1e-5, atol=1e-6)
 
 
+def test_site_vmap_honors_evaluator_chunk_size(monkeypatch):
+    from polystep import cost_nn
+
+    chunks = []
+    real_vmap = cost_nn.vmap
+
+    def spy(fn, *args, **kwargs):
+        if "_vmap_over_site" in fn.__qualname__:
+            chunks.append(kwargs.get("chunk_size"))
+        return real_vmap(fn, *args, **kwargs)
+
+    monkeypatch.setattr(cost_nn, "vmap", spy)
+    torch.manual_seed(0)
+    model = ConvNet()
+    inputs, targets = _batch()
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), chunk_size=4, use_inplace=False)
+    opt = PolyStepOptimizer(model, seed=0, particle_dim=PDIM)
+    opt.register_evaluator(evaluator, inputs, targets)
+    opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    assert chunks and set(chunks) == {4}
+
+
 def test_try_build_declines_tied_weights():
     """One flat position under two module paths would get half its perturbation."""
     shared = nn.Linear(6, 6)
@@ -224,11 +289,13 @@ def test_persistent_buffer_alias_trains_parameter(hybrid, use_inplace):
         subspace = HybridSubspace.from_layout(layout, rank=2) if hybrid else None
         opt = PolyStepOptimizer(model, solver="softmax", seed=0, subspace=subspace)
         evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=use_inplace, compile_forward=False)
+        initial_weight = model.a.weight.detach().clone()
         losses = []
         for _ in range(3):
             opt.register_evaluator(evaluator, inputs, targets)
             losses.append(float(opt.step(lambda p: evaluator.evaluate(p, inputs, targets))))
         assert model.alias.data_ptr() == model.a.weight.data_ptr()
+        assert not torch.equal(model.a.weight, initial_weight)
         return losses, model.a.weight.detach()
 
     losses, weight = run(True)
@@ -613,6 +680,8 @@ def test_unbatchable_forward_falls_back_to_loop():
     """An ``.item()`` on a batched activation makes vmap fail; the site path must
     fall back to a sequential loop, not crash.
     """
+    from polystep import HybridSubspace
+
     torch.manual_seed(0)
     model = ItemScaledMLP()
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -624,19 +693,74 @@ def test_unbatchable_forward_falls_back_to_loop():
         {k: v.detach() for k, v in model.state_dict().items()},
         site.resolve_site(torch.tensor([0]), PDIM, span=(0, PDIM)),
         torch.arange(PDIM).reshape(1, PDIM),
-        layout.flatten(model).reshape(-1)[0:PDIM].reshape(1, 1, PDIM),
+        layout.flatten(model).reshape(-1)[0:PDIM].expand(1, 2, PDIM),
         inputs,
         targets,
     )
 
     with pytest.warns(RuntimeWarning, match="site-aware"):
         losses = site.evaluate(*args)
-    assert losses.shape == (1,) and torch.isfinite(losses).all()
+    assert losses.shape == (2,) and torch.isfinite(losses).all()
+    assert losses[0] == losses[1] and model.calls.item() == 0
 
     # Retired, so the step stops offering it chunks rather than warning on every one.
-    assert dense._vmap_failed
+    assert not dense._vmap_failed
     assert site.resolve_site(torch.tensor([0]), PDIM, span=(0, PDIM)) is None
-    assert site.resolve_spec(None, 0, PDIM, PDIM) is None
+    later = layout.entries[2].offset
+    assert site.resolve_site(torch.tensor([later]), PDIM, span=(later, later + PDIM)) is not None
+    subspace = HybridSubspace.from_layout(layout, rank=1)
+    kept = subspace.specs[2]
+    assert site.resolve_spec(subspace, 0, 1, subspace.subspace_dim) is None
+    assert site.resolve_spec(subspace, kept.flat_start, kept.flat_start + 1, subspace.subspace_dim) is kept
+
+
+def test_site_forward_bug_raises_without_retiring():
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(6, 2)
+
+        def forward(self, x):
+            return self.fc(x) + torch.ones(7)
+
+    torch.manual_seed(0)
+    model = Net()
+    inputs, targets = _small_batch()
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    opt = PolyStepOptimizer(model, seed=3, particle_dim=PDIM)
+    opt.register_evaluator(evaluator, inputs, targets)
+    with pytest.raises(RuntimeError, match="must match"):
+        opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    site = opt._site_vmap_evaluator
+    assert not site._failed_sites and not site._owner._vmap_failed
+
+
+def _float64_step_losses(model_cls, register):
+    """Two float64 steps' losses, with the evaluator registered or closure-only, and the optimizer."""
+    torch.manual_seed(0)
+    model = model_cls().double()
+    inputs, targets = _small_batch()
+    inputs = inputs.double()
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    opt = PolyStepOptimizer(model, seed=3, particle_dim=PDIM)
+    if register:
+        opt.register_evaluator(evaluator, inputs, targets)
+    return [opt.step(lambda p: evaluator.evaluate(p, inputs, targets)) for _ in range(2)], opt
+
+
+def test_inplace_residual_site_matches_dense():
+    with pytest.warns(RuntimeWarning, match="site-aware"):
+        fast, opt = _float64_step_losses(ResidualMLP, register=True)
+    assert not opt._site_vmap_evaluator._owner._vmap_failed
+    torch.testing.assert_close(fast, _float64_step_losses(ResidualMLP, register=False)[0], rtol=0, atol=1e-12)
+
+
+def test_site_failure_keeps_dense_vmap():
+    with pytest.warns(RuntimeWarning, match="'ls.gamma'"):
+        fast, opt = _float64_step_losses(LayerScaleMLP, register=True)
+    site = opt._site_vmap_evaluator
+    assert site._failed_sites == {"ls.gamma"} and not site._owner._vmap_failed
+    torch.testing.assert_close(fast, _float64_step_losses(LayerScaleMLP, register=False)[0], rtol=0, atol=1e-12)
 
 
 @pytest.mark.parametrize("compile_vmap", [False, True])
@@ -703,7 +827,7 @@ def test_noisy_retry_rewinds_refused_forward_buffers():
     site = SiteVmapEvaluator.try_build(dense, layout)
     torch.manual_seed(1)
     torch.testing.assert_close(dense.evaluate(params, inputs, targets), expected)
-    assert model.calls.item() == 1
+    assert model.calls.item() == 0
 
     site.evaluate(
         {k: v.detach() for k, v in model.state_dict().items() if k != "calls"},
@@ -713,7 +837,7 @@ def test_noisy_retry_rewinds_refused_forward_buffers():
         inputs,
         targets,
     )
-    assert model.calls.item() == 2
+    assert model.calls.item() == 0
 
 
 def _dense_reference(projections, bary_sd, spec, col_start, dcoords):

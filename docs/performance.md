@@ -53,8 +53,14 @@ vmap refuses the draw at first, so the evaluator retries once with
 `randomness="different"`. Each candidate then gets its own draw: identical
 candidates can score differently, and a seeded run's stream differs from scoring
 them one at a time. A forward vmap cannot trace, such as one that calls `.item()` on
-an activation, falls back to a sequential loop with a warning. Buffers the refused
-forward wrote are restored before either the retry or the loop runs.
+an activation or runs a stock `nn.GRU`, falls back to a sequential loop with a
+warning. When the error names no functorch cause, the evaluator first scores one
+candidate unbatched, so a forward that fails on its own raises its own error. On the
+site-local path the fallback is per parameter: a parameter whose site vmap refuses,
+such as a shortcut added in place with `+=`, moves to the dense path, and every other
+parameter stays site-local. Buffers the forward writes are restored after every
+batched call and after every looped candidate, so the retry, the probe, the loop and
+later calls all start from the same buffer values.
 
 Register the evaluator before each batch; `train()` does this automatically:
 

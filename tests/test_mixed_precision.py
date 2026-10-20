@@ -98,6 +98,21 @@ class TestMixedPrecisionStep:
             assert captured["duals"] == torch.float32, f"duals came back {captured['duals']}"
 
 
+@pytest.mark.parametrize("register", [True, False])
+def test_evaluator_before_mixed_precision_steps(register):
+    """An evaluator built before the BF16 cast scores with the cast buffers."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(1, 4, 3), nn.BatchNorm2d(4), nn.ReLU(), nn.Flatten(), nn.Linear(144, 3))
+    evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    opt = PolyStepOptimizer(model, mixed_precision=True, seed=0, compile=False)
+    x = torch.randn(16, 1, 8, 8, dtype=torch.bfloat16)
+    y = torch.randint(0, 3, (16,))
+    if register:
+        opt.register_evaluator(evaluator, x, y)
+    loss = opt.step(lambda p: evaluator.evaluate(p, x, y))
+    assert torch.isfinite(torch.as_tensor(loss))
+
+
 @pytest.mark.parametrize(
     "path",
     [

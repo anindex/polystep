@@ -1077,6 +1077,7 @@ class PolyStepOptimizer(SerializationMixin):
             inputs: Current mini-batch inputs.
             targets: Current mini-batch targets (optional).
         """
+        evaluator._refresh_recast_buffers()
         self._cost_evaluator = evaluator
         self._fused_inputs = inputs
         self._fused_targets = targets
