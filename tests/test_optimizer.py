@@ -13,6 +13,7 @@ from torch.func import functional_call
 from polystep.solver import PolyStep
 from polystep import CosineEpsilon, PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
+from polystep.transform import ParamLayout
 
 
 def _make_model():
@@ -673,6 +674,18 @@ class TestNaNRevertRestoresState:
         assert torch.count_nonzero(opt.state.X) == 0
         assert torch.count_nonzero(opt.state.velocity) == 0
 
+    @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+    def test_partial_nan_x_keeps_finite_coords(self, block_strategy):
+        opt, closure = self._build(block_strategy=block_strategy)
+        opt.step(closure)
+        poisoned = opt.state.X.clone()
+        poisoned[0, 0] = float("nan")
+        poisoned[0, 1] = float("inf")
+        poisoned[1, 0] = float("-inf")
+        opt.state.X = poisoned
+        opt.step(closure)
+        torch.testing.assert_close(opt.state.X, poisoned.nan_to_num(0.0, 0.0, 0.0), rtol=0, atol=0)
+
     def test_amortized_transport_direction_is_dropped(self):
         opt, closure = self._build(amortize_steps=3)
         opt.step(closure)
@@ -822,3 +835,23 @@ def test_registering_keeps_train_mode_stats_rng():
     assert torch.equal(torch.get_rng_state(), rng)
     for k, v in model.state_dict().items():
         assert torch.equal(v, before[k]), k
+
+
+def test_compiled_module_keeps_sparse_delta_path():
+    torch.manual_seed(0)
+    plain = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+    inner = copy.deepcopy(plain)
+    x, y = torch.randn(16, 4), torch.randint(0, 3, (16,))
+    for model in (plain, torch.compile(inner)):
+        opt = PolyStepOptimizer(model, compile=False, seed=0)
+        ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+        for _ in range(2):
+            opt.register_evaluator(ev, x, y)
+            opt.step(lambda p: ev.evaluate(p, x, y))
+    assert opt.model is inner and ev.model is inner
+    layout = ParamLayout.from_module(model)
+    assert not any(e.key.startswith("_orig_mod.") for e in layout.entries)
+    assert torch.equal(layout.flatten(model), layout.flatten(inner))
+    assert opt._sparse_delta_evaluator is not None
+    for a, b in zip(plain.parameters(), inner.parameters()):
+        assert torch.equal(a, b)

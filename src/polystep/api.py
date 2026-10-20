@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -53,7 +54,8 @@ def train(
     config: TrainConfig,
 ) -> nn.Module:
     """Train a model with the PolyStep optimizer; builds the OT closure internally."""
-    if getattr(optimizer, "model", model) is not model:
+    module = getattr(model, "_orig_mod", model)
+    if getattr(optimizer, "model", module) is not module:
         raise ValueError("train() got a different model than the optimizer was built on.")
     if getattr(optimizer, "trust_region", False):
         # The optimizer clears the pending pair on every objective_token change, so the multiplier would sit at 1.0.
@@ -62,14 +64,14 @@ def train(
             "against the loss on the next batch, which is a different objective. "
             "Drop trust_region, or drive optimizer.step() on a fixed batch."
         )
-    was_training = model.training
-    evaluator = NNCostEvaluator(model, loss_fn)
+    was_training = module.training
+    evaluator = NNCostEvaluator(module, loss_fn)
     callbacks = list(config.callbacks)
     global_step = 0
     stop = False
 
     try:
-        device = next(model.parameters()).device
+        device = next(module.parameters()).device
     except StopIteration:
         raise ValueError("Model has no trainable parameters")
 
@@ -151,7 +153,10 @@ def train(
                 if config.restore_best and train_loss < best_loss:
                     best_loss = train_loss
                     # Keep the snapshot on CPU.
-                    best_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+                    best_state = {
+                        k: v.detach().to("cpu", copy=True) if isinstance(v, torch.Tensor) else copy.deepcopy(v)
+                        for k, v in module.state_dict().items()
+                    }
 
                 if metrics is not None:
                     for cb in callbacks:
@@ -178,12 +183,12 @@ def train(
     finally:
         # Re-anchor so the next step starts from the restored weights.
         if config.restore_best and best_state is not None:
-            model.load_state_dict(best_state)
+            module.load_state_dict(best_state)
             optimizer.resync_from_model()
         # An exception would otherwise leave the last batch alive on the optimizer.
         optimizer.release_evaluator()
         # NNCostEvaluator switched to eval so candidates score against frozen statistics.
-        model.train(was_training)
+        module.train(was_training)
 
     return model
 
@@ -215,6 +220,8 @@ class EarlyStoppingCallback(TrainCallback):
     """Stops training when loss stagnates for ``patience`` steps."""
 
     def __init__(self, patience: int = 10, min_delta: float = 1e-4):
+        if patience < 1:
+            raise ValueError(f"patience must be >= 1, got {patience}.")
         self.patience = patience
         self.min_delta = min_delta
         self.best_loss: float = float("inf")

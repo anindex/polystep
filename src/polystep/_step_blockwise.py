@@ -179,8 +179,8 @@ def _finish_step(opt, state, X, X_new_full, outcomes, iteration, current_eps, ot
 
     nan_reverted = not x_finite
     if nan_reverted:
-        # Back to the pre-step point, or to the origin when that was non-finite too.
-        state.X = X.clone() if torch.isfinite(X).all() else torch.zeros_like(X)
+        # Back to the pre-step point, with its non-finite coordinates reset to the origin.
+        state.X = X.nan_to_num(0.0, 0.0, 0.0)
         state.block_duals = [(None, None) for _ in outcomes]
         if opt.use_momentum and state.velocity is not None:
             state.velocity = torch.zeros_like(state.velocity)

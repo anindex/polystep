@@ -114,6 +114,26 @@ def test_negative_radii_rejected():
         PolyStepOptimizer(model, step_radius=-0.1, compile=False)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(momentum_final=1.2),
+        dict(momentum_final=1.0),
+        dict(momentum_init=1.0),
+        dict(amortize_ema=1.5),
+        dict(velocity_lr=-1.0),
+        dict(velocity_lr=0.0),
+        dict(radius_min=2.0, radius_max=0.5),
+        dict(radius_min=0.0),
+        dict(radius_increase=0.5),
+        dict(radius_decrease=0.0),
+    ],
+)
+def test_unstable_dynamics_values_raise(kwargs):
+    with pytest.raises(ValueError, match="must"):
+        PolyStepOptimizer(nn.Sequential(nn.Linear(2, 2)), compile=False, **kwargs)
+
+
 def test_single_particle_polystep_uses_softmax():
     """The substitution follows the state, so states of different sizes can coexist."""
     solver = PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2)

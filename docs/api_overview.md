@@ -26,11 +26,18 @@ The evaluator and closure must compute the same objective, including regularizat
 candidate in eval mode, so dropout stays off and batch-norm running statistics do not
 update.
 
+The optimizer, `NNCostEvaluator`, `ParamLayout` and `train()` unwrap a `torch.compile`
+module and work on the module inside it, so parameter names carry no `_orig_mod.` prefix.
+To compile candidate scoring, pass `compile_evaluator` or `compile_forward` instead.
+
 After external parameter updates, call `optimizer.resync_from_model()`.
 After you replace layers, parameters, or buffers, call `evaluator.reset_vmap()`.
 Do the same after a dtype cast. Then register the evaluator again.
-For a new layer or parameter, also call `optimizer.resync_from_model()`.
+For a layer swapped in under the same parameter names, also call `optimizer.resync_from_model()`.
 Otherwise, the next step overwrites it with the old weights plus the update.
+The optimizer keeps the set of `requires_grad` parameters it was built with, and `step()`
+raises `ValueError` if that set changes. To freeze, unfreeze, add or remove a parameter,
+set `requires_grad` first and then build a new optimizer.
 
 After a dtype cast, resync moves the subspace projections to the new parameter dtypes.
 An `AdaptiveSubspace` also moves its coordinates to the new dtype.

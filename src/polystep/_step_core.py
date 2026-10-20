@@ -23,8 +23,8 @@ def warn_all_nonfinite(opt) -> None:
     opt._nonfinite_warned = True
     warnings.warn(
         "every vertex cost was NaN or inf this step, so the cost matrix "
-        "carries no ranking information: the plan is uniform, the step is exactly "
-        "zero, and the step records an infinite cost.",
+        "carries no ranking information: the plan is uniform and the step records "
+        "an infinite cost.",
         RuntimeWarning,
         stacklevel=3,
     )

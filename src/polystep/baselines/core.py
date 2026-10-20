@@ -199,6 +199,8 @@ def centered_rank(x: torch.Tensor) -> torch.Tensor:
 
 def zscore(x: torch.Tensor) -> torch.Tensor:
     """Zero-mean unit-variance shaping; zeros when the population is flat."""
+    if x.numel() <= 1:
+        return torch.zeros_like(x)
     m = x.abs().amax()
     x = x / torch.where(m > math.sqrt(torch.finfo(x.dtype).max / x.numel()) / 2, m, 1.0)
     s = x.std()

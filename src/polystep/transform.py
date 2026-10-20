@@ -64,7 +64,8 @@ class ParamLayout:
         particle_dim: int = 2,
     ) -> ParamLayout:
         """Create a ``ParamLayout`` from any ``nn.Module``; shared tensors are deduplicated."""
-        sd = model.state_dict()
+        model = getattr(model, "_orig_mod", model)
+        sd = {k: v for k, v in model.state_dict().items() if isinstance(v, torch.Tensor)}
 
         if len(sd) == 0:
             return cls(
@@ -199,6 +200,7 @@ class ParamLayout:
 
     def flatten(self, model: nn.Module) -> torch.Tensor:
         """Flatten a model state_dict to a 2D particle tensor."""
+        model = getattr(model, "_orig_mod", model)
         if self.total_params == 0:
             return torch.zeros(0, self.particle_dim, dtype=self.dominant_dtype)
 

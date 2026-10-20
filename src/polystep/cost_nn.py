@@ -253,6 +253,7 @@ class NNCostEvaluator:
     ):
         if chunk_size not in (None, "auto") and (type(chunk_size) is not int or chunk_size < 1):
             raise ValueError("chunk_size must be None, 'auto', or a positive integer")
+        model = getattr(model, "_orig_mod", model)
         self.model = model
         self.loss_fn = loss_fn
         self.autocast_dtype = autocast_dtype

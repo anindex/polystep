@@ -200,6 +200,15 @@ def test_fully_frozen_model_raises_clearly():
         PolyStepOptimizer(model, epsilon=0.1, max_iterations=5)
 
 
+def test_freeze_after_construction_raises():
+    """The layout is fixed at construction, so a later freeze must not be ignored."""
+    model = nn.Sequential(nn.Linear(4, 6), nn.ReLU(), nn.Linear(6, 2))
+    optimizer = PolyStepOptimizer(model, seed=0)
+    model[0].requires_grad_(False)
+    with pytest.raises(ValueError, match="requires_grad"):
+        optimizer.step(lambda params: torch.zeros(next(iter(params.values())).shape[0]))
+
+
 @pytest.mark.parametrize(
     "build,match",
     [

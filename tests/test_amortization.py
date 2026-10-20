@@ -4,6 +4,7 @@ direction in between."""
 import torch
 import torch.nn as nn
 
+from polystep import AdaptiveSubspace, ParamLayout
 from polystep.optimizer import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
 
@@ -255,6 +256,23 @@ def test_resync_forces_next_step_evaluation():
     calls[0] = 0
     opt.step(counting)
     assert calls[0] > 0
+
+
+def test_resync_clears_displacement_history():
+    """resync_from_model drops moves recorded along the abandoned trajectory."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 32), nn.Tanh(), nn.Linear(32, 1))
+    inputs, targets = torch.randn(64, 8), torch.randn(64, 1)
+    sub = AdaptiveSubspace.from_layout(ParamLayout.from_module(model), rank=20, rotation_interval=4)
+    opt = PolyStepOptimizer(model, subspace=sub, compile=False, seed=0)
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    for _ in range(3):
+        opt.step(lambda bp: evaluator.evaluate(bp, inputs, targets))
+    opt.resync_from_model()
+    assert opt._state.displacement_history_count == 0
+    assert opt._state.displacement_history_idx == 0
+    assert opt._state.displacement_history_full is None
+    assert not opt._state.displacement_history.any()
 
 
 def test_probe_count_drops_on_negative_descent():

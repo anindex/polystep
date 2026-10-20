@@ -1,12 +1,16 @@
 """Tests for the high-level training API: train(), TrainConfig, TrainCallback,
 LoggingCallback, EarlyStoppingCallback, get_diagnostics."""
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from polystep import (
+    HybridSubspace,
+    ParamLayout,
     PolyStepOptimizer,
     train,
     TrainConfig,
@@ -51,6 +55,11 @@ def _batch(n=6, d=4, c=3, seed=0):
 def test_invalid_epochs(epochs):
     with pytest.raises(ValueError):
         TrainConfig(epochs=epochs)
+
+
+def test_parameters_generator_raises_type_error():
+    with pytest.raises(TypeError, match="nn.Module"):
+        PolyStepOptimizer(nn.Linear(4, 2).parameters())
 
 
 class TestTrain:
@@ -226,6 +235,34 @@ class TestTrain:
         train(model, loader, nn.CrossEntropyLoss(), PolyStepOptimizer(model, seed=0), TrainConfig(epochs=1))
         assert model.training
 
+    def test_train_compiled_module_matches_plain(self):
+        plain = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+        inner = copy.deepcopy(plain)
+        loader = DataLoader(TensorDataset(*_batch(n=12)), batch_size=6)
+        for model in (plain, torch.compile(inner)):
+            opt = PolyStepOptimizer(model, compile=False, seed=0)
+            train(model, loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=1, restore_best=True))
+        for a, b in zip(plain.parameters(), inner.parameters()):
+            assert torch.equal(a, b)
+
+    def test_train_restores_non_tensor_extra_state(self):
+        class Calibrated(nn.Linear):
+            def get_extra_state(self):
+                return {"calibrated": self.calibrated}
+
+            def set_extra_state(self, state):
+                self.calibrated = state["calibrated"]
+
+        torch.manual_seed(0)
+        model = nn.Sequential(Calibrated(5, 4), nn.Tanh(), nn.Linear(4, 2))
+        model[0].calibrated = True
+        layout = ParamLayout.from_module(model)
+        opt = PolyStepOptimizer(model, subspace=HybridSubspace.from_layout(layout, rank=2), seed=0, max_iterations=2)
+        loader = DataLoader(TensorDataset(*_batch(n=64, d=5, c=2)), batch_size=32)
+        train(model, loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=1, restore_best=True))
+        assert layout.total_params == 34
+        assert model[0].calibrated is True
+
 
 class TestLoggingCallback:
     def test_logs_at_interval(self, capsys):
@@ -276,6 +313,10 @@ class TestEarlyStoppingCallback:
         # 0.95 is NOT 0.1 better than 1.0 -> stagnation
         assert cb.on_step_end({"loss": 0.95, "step": 1}) is False  # counter=1
         assert cb.on_step_end({"loss": 0.92, "step": 2}) is True  # counter=2 >= patience
+
+    def test_patience_below_one_raises(self):
+        with pytest.raises(ValueError, match="patience"):
+            EarlyStoppingCallback(patience=0)
 
 
 class TestGetDiagnostics:

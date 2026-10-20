@@ -27,6 +27,7 @@ from .cost_nn import (
     SubspaceDeltaEvaluator,
     _reuse_prefixes,
 )
+from .costs import resolve_cost_scale
 from .epsilon import LinearEpsilon, ProgressiveEpsilon
 from .geometry import POLYTOPE_MAP
 from .projection import SparseRandomProjection
@@ -273,6 +274,12 @@ class PolyStepOptimizer(SerializationMixin):
         # explicit use_inplace=True.
         compile_forward: Optional[bool] = None,
     ) -> None:
+        if not isinstance(model, nn.Module):
+            raise TypeError(
+                f"PolyStepOptimizer takes the nn.Module itself, not {type(model).__name__}; "
+                f"freeze parameters with requires_grad_(False) before construction."
+            )
+        model = getattr(model, "_orig_mod", model)
         if projection_type not in ("dense", "sparse", "auto"):
             raise ValueError(f"Invalid projection_type: {projection_type!r}. Use 'dense', 'sparse', or 'auto'.")
         # Downstream code tests `!= "monolithic"`, so an unknown value would silently
@@ -354,6 +361,7 @@ class PolyStepOptimizer(SerializationMixin):
         self._progressive_epsilon = epsilon if isinstance(epsilon, ProgressiveEpsilon) else None
         if self._progressive_epsilon is not None and ent_epsilon is not None:
             raise ValueError("ProgressiveEpsilon adapts the solve epsilon; it cannot be combined with ent_epsilon.")
+        resolve_cost_scale(torch.ones(()), scale_cost)
         self.scale_cost = scale_cost
         # A negative radius flips the finite-difference denominator, which the
         # clamp then turns positive and scales the gradient by 1e10. 0 is the
@@ -423,6 +431,8 @@ class PolyStepOptimizer(SerializationMixin):
             raise ValueError(f"cost_batch_size must be > 0 or None, got {cost_batch_size}.")
         self.cost_batch_size = cost_batch_size
         self.amortize_steps = max(1, amortize_steps)
+        if not 0.0 <= amortize_ema <= 1.0:
+            raise ValueError(f"amortize_ema must be in [0, 1], got {amortize_ema}.")
         self.amortize_ema = amortize_ema
 
         # Jitter makes the per-step cost noisy, which amortization reads as progress, so
@@ -537,6 +547,17 @@ class PolyStepOptimizer(SerializationMixin):
                 stacklevel=2,
             )
 
+        for _name, _value in (("momentum_init", momentum_init), ("momentum_final", momentum_final)):
+            if not 0.0 <= _value < 1.0:
+                raise ValueError(f"{_name} must be in [0, 1), got {_value}.")
+        if not velocity_lr > 0:
+            raise ValueError(f"velocity_lr must be > 0, got {velocity_lr}.")
+        if not 0.0 < radius_min <= radius_max:
+            raise ValueError(f"radius_min and radius_max must satisfy 0 < min <= max, got {radius_min}, {radius_max}.")
+        if not radius_increase >= 1.0:
+            raise ValueError(f"radius_increase must be >= 1, got {radius_increase}.")
+        if not 0.0 < radius_decrease <= 1.0:
+            raise ValueError(f"radius_decrease must be in (0, 1], got {radius_decrease}.")
         self.use_momentum = use_momentum
         self.momentum_init = momentum_init
         self.momentum_final = momentum_final
@@ -655,6 +676,7 @@ class PolyStepOptimizer(SerializationMixin):
                 "Model has no parameters with requires_grad=True. PolyStepOptimizer "
                 "optimizes the requires_grad parameters, so at least one must be trainable."
             )
+        self._trainable_names = frozenset(n for n, p in model.named_parameters() if p.requires_grad)
 
         self._adaptive = isinstance(subspace, AdaptiveSubspace)
 
@@ -806,7 +828,9 @@ class PolyStepOptimizer(SerializationMixin):
         self._state = SolverState(X=X_init.clone())
 
         if subspace is not None:
-            self._state.base_params = {k: v.clone() for k, v in model.state_dict().items()}
+            self._state.base_params = {
+                k: v.clone() for k, v in model.state_dict().items() if isinstance(v, torch.Tensor)
+            }
             self._state.subspace = subspace
 
         self._init_subspace(subspace, seed, model_device)
@@ -1266,6 +1290,11 @@ class PolyStepOptimizer(SerializationMixin):
         Returns:
             Mean raw model cost for this step.
         """
+        if frozenset(n for n, p in self.model.named_parameters() if p.requires_grad) != self._trainable_names:
+            raise ValueError(
+                "The set of requires_grad parameters changed after the optimizer was built, and "
+                "PolyStepOptimizer keeps the layout it was built with. Build a new optimizer on the model."
+            )
         if objective_token != self._prev_objective_token:
             # A prediction on the previous minibatch cannot be scored against this one.
             self._prev_predicted_improvement = None
@@ -1395,7 +1424,9 @@ class PolyStepOptimizer(SerializationMixin):
             )
         if self.subspace is not None:
             # Re-anchor the base and zero the coordinates.
-            self._state.base_params = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+            self._state.base_params = {
+                k: v.detach().clone() for k, v in self.model.state_dict().items() if isinstance(v, torch.Tensor)
+            }
             self._state.X = torch.zeros_like(self._state.X)
             self._realign_subspace_to_model()
         else:
@@ -1404,6 +1435,11 @@ class PolyStepOptimizer(SerializationMixin):
         self._state.g = None
         self._state.prev_prev_f = None
         self._state.prev_prev_g = None
+        if self._state.displacement_history is not None:
+            self._state.displacement_history = torch.zeros_like(self._state.displacement_history)
+        self._state.displacement_history_full = None
+        self._state.displacement_history_idx = 0
+        self._state.displacement_history_count = 0
         # These were measured at the old anchor; keep them and the next step coasts
         # on a stale direction.
         self._amortize_counter = 0

@@ -171,6 +171,10 @@ def test_shaping_helpers():
     assert zscore(x).mean().abs() < 1e-6
 
 
+def test_zscore_single_returns_zero():
+    assert torch.equal(zscore(torch.tensor([3.0])), torch.zeros(1))
+
+
 @pytest.mark.parametrize("shaping", ["rank", "zscore"])
 def test_shaping_puts_nonfinite_losses_last(shaping):
     from polystep.baselines.methods import _shaped

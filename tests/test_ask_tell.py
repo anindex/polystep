@@ -3,7 +3,8 @@
 import pytest
 import torch
 
-from polystep import PolyStepES, minimize
+from polystep import PolyStepES, PolyStepOptimizer, minimize
+from polystep.solver import PolyStep
 from polystep.solvers import SinkhornSolver, SoftmaxSolver
 
 
@@ -89,12 +90,22 @@ def test_ask_twice_before_tell_raises():
         {"dim": 4, "epsilon": -1.0},
         {"dim": 4, "step_radius": float("inf")},
         {"dim": 4, "step_radius": -0.1},
+        {"dim": 4, "scale_cost": -1.0},
         {"dim": 4, "num_particles": 2, "x0": torch.zeros(3, 4)},
     ],
 )
 def test_invalid_construction_raises(kwargs):
     with pytest.raises(ValueError):
         PolyStepES(**kwargs)
+
+
+def test_scale_cost_typo_raises_at_init():
+    with pytest.raises(ValueError, match="Unknown scale_cost"):
+        PolyStepES(dim=3, scale_cost="maen")
+    with pytest.raises(ValueError, match="Unknown scale_cost"):
+        PolyStepOptimizer(torch.nn.Linear(3, 1), scale_cost="maen")
+    with pytest.raises(ValueError, match="Unknown scale_cost"):
+        PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, scale_cost="maen")
 
 
 def test_sinkhorn_single_particle_warns():
