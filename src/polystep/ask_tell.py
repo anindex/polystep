@@ -8,7 +8,7 @@ from typing import Callable, Optional, Union
 
 import torch
 
-from ._compiled import _barycentric_projection, _rotate_and_translate
+from ._compiled import _barycentric_projection
 from .costs import resolve_cost_scale
 from .geometry import get_orthoplex_vertices, get_random_rotation_matrices
 from .solvers import SinkhornSolver, SoftmaxSolver
@@ -117,10 +117,9 @@ class PolyStepES:
             raise RuntimeError("ask() called twice before tell(); tell() the previous population first.")
         rot = get_random_rotation_matrices(
             self.num_particles, self.dim, device=self.device, dtype=self.dtype, generator=self.generator
-        )
-        X_vertices, _ = _rotate_and_translate(rot, self.vertices, self.X, self.step_radius)  # (P, V, d)
-        self._pending = X_vertices
-        return X_vertices.reshape(self.popsize, self.dim)
+        ).transpose(1, 2)
+        self._pending = torch.cat([rot, -rot], 1) * self.step_radius + self.X.unsqueeze(1)
+        return self._pending.reshape(self.popsize, self.dim)
 
     @torch.no_grad()
     def tell(self, fitness: torch.Tensor) -> None:

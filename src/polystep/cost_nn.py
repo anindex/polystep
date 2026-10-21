@@ -32,7 +32,9 @@ if TYPE_CHECKING:
 # Smallest candidate batch worth the batched paths; below it the in-place path wins.
 _MIN_BATCHED_CANDIDATES = 8
 
-_MIN_INJECTED_SITE_NUMEL = 512
+_MACS_PER_INTERCEPTED_CALL = 150_000
+
+_INTERCEPT_SETUP_CALLS = 30
 
 _MAX_SITE_GRAPHS = 64
 
@@ -147,7 +149,7 @@ _TENSOR_METADATA = {
 
 
 class _SiteNotInjectable(Exception):
-    """A torch call ran inside a transform the forward opened, or attention met the candidate."""
+    """A transform the forward opened, attention, autocast, or no Linear or convolution took the change."""
 
 
 class _SiteDelta(TorchFunctionMode):
@@ -159,10 +161,12 @@ class _SiteDelta(TorchFunctionMode):
         self.width = base.numel() // base.shape[0]
         self.outs, self.ins = rows // self.width, rows % self.width
         self.level = maybe_current_level()
+        self.calls, self.added = 0, False
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         if maybe_current_level() != self.level:
             raise _SiteNotInjectable
+        self.calls += 1
         kwargs = kwargs or {}
         base, rows, dv = self.base, self.rows, self.dv
         reads = sum(t is base for t in tree_leaves((args, kwargs)))
@@ -171,16 +175,21 @@ class _SiteDelta(TorchFunctionMode):
         if not reads or func in _TENSOR_METADATA:
             return func(*args, **kwargs)
         if self.site is None and reads == 1 and len(args) > 1 and args[1] is base:
-            if func is nn.functional.linear and base.dim() == 2 and not is_batchedtensor(args[0]):
-                out = func(*args, **kwargs)
-                return out.scatter_add(-1, self.outs.expand(*out.shape[:-1], -1), args[0][..., self.ins] * dv)
             dims = _CONV_DIMS.get(func)
-            if dims and (args[6] if len(args) > 6 else kwargs.get("groups", 1)) == 1 and not is_batchedtensor(args[0]):
+            linear = func is nn.functional.linear and base.dim() == 2
+            conv = dims and (args[6] if len(args) > 6 else kwargs.get("groups", 1)) == 1
+            if (linear or conv) and not is_batchedtensor(args[0]):
+                out = func(*args, **kwargs)
+                if out.dtype != base.dtype:
+                    raise _SiteNotInjectable
+                self.added = True
+                if linear:
+                    return out.scatter_add(-1, self.outs.expand(*out.shape[:-1], -1), args[0][..., self.ins] * dv)
                 kernel = base.new_zeros(rows.shape[0], self.width).scatter(1, self.ins.unsqueeze(1), dv.unsqueeze(1))
                 bias_free = {k: v for k, v in kwargs.items() if k != "bias"}
                 delta = func(args[0], kernel.view(-1, *base.shape[1:]), None, *args[3:], **bias_free)
                 outs = self.outs.view(-1, *[1] * dims).expand_as(delta)
-                return func(*args, **kwargs).scatter_add(-dims - 1, outs, delta)
+                return out.scatter_add(-dims - 1, outs, delta)
         if self.site is None:
             self.site = base.reshape(-1).scatter_add(0, rows, dv).view_as(base)
         args, kwargs = tree_map(lambda t: self.site if t is base else t, (args, kwargs))
@@ -239,6 +248,8 @@ def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
 
     n = outputs.shape[0]
     if loss_kind == "cross_entropy":
+        if not targets.is_floating_point():
+            targets = targets.long()
         tgt = targets.unsqueeze(0).expand(n, *targets.shape).flatten(0, 1)
         logits = outputs.flatten(0, 1)
         logits = logits.to(loss_buffer_dtype(logits.dtype))
@@ -273,9 +284,9 @@ def _class_major_cross_entropy(z, targets, ignore):
     """Mean cross-entropy per ``(G, c)`` of ``(G, C, c, B)`` logits; overwrites ``z``."""
     valid = targets != ignore
     index = targets.masked_fill(~valid, 0).view(1, 1, 1, -1).expand(z.shape[0], 1, *z.shape[2:])
+    z.sub_(z.amax(1, keepdim=True))
     picked = z.gather(1, index).squeeze(1)
-    top = z.amax(1, keepdim=True)
-    lse = z.sub_(top).exp_().sum(1).log_().add_(top.squeeze(1))
+    lse = z.exp_().sum(1).log_()
     return torch.where(valid, lse - picked, 0).sum(-1) / valid.sum()
 
 
@@ -1317,8 +1328,13 @@ _TRACED_LAYERS = {
 }
 
 
+def _autocast_state():
+    """Autocast ``(enabled, dtype)`` on CPU and CUDA."""
+    return tuple((torch.is_autocast_enabled(d), torch.get_autocast_dtype(d)) for d in ("cpu", "cuda"))
+
+
 class _PlanTracer(torch.fx.Tracer):
-    """Keep every layer ``_entry`` judges as one ``call_module`` node."""
+    """Keep every layer ``_entry`` judges as one ``call_module`` node, tagged with its autocast state."""
 
     def is_leaf_module(self, m: nn.Module, module_qualified_name: str) -> bool:
         return (
@@ -1327,6 +1343,11 @@ class _PlanTracer(torch.fx.Tracer):
             or _linear_like(m)
             or bool(getattr(m, "polystep_elementwise", False))
         )
+
+    def create_node(self, *args, **kwargs):
+        node = super().create_node(*args, **kwargs)
+        node.meta["autocast"] = _autocast_state()
+        return node
 
 
 def _traced_children(model: nn.Module):
@@ -1343,14 +1364,14 @@ def _traced_children(model: nn.Module):
     was_training = model.training
     model.eval()
     try:
-        with torch.random.fork_rng(devices=devices):
+        with torch.random.fork_rng(devices=devices), torch.inference_mode():
             prev, *body, out = _PlanTracer().trace(model).nodes
     except Exception:
         return None
     finally:
         if was_training:
             model.train()
-    if prev.op != "placeholder":
+    if prev.op != "placeholder" or any(n.meta["autocast"] != prev.meta["autocast"] for n in body):
         return None
     children = []
     for node in body:
@@ -1622,6 +1643,13 @@ class SiteVmapEvaluator:
         self._compile_failed_sites = set()
         self._failed_sites = set()
         self._uninjectable_sites = set()
+        self._matched_injections = set()
+        self._has_script_module = any(
+            isinstance(v, (torch.jit.ScriptModule, torch.jit.ScriptFunction))
+            for m in model.modules()
+            for v in (m, *vars(m).values(), *(a for c in type(m).__mro__ for a in vars(c).values()))
+        )
+        self._forward_calls = 0
         self._graph_failed_sites = set()
         self._warned = False
         self._randomness = "error"
@@ -1744,6 +1772,30 @@ class SiteVmapEvaluator:
         idx = local_idx.clamp(max=entry.numel - 1)
         return idx, values.gather(2, (idx - local_idx[:, :1]).unsqueeze(1).expand_as(values))
 
+    def _injection_matches(self, base_sd, entry, local_idx, values, offsets, inputs, targets):
+        """Whether two candidates and the incumbent score alike injected and built, from one random state."""
+        k = min(2, values.shape[1])
+        rows, dv = offsets
+        idx, kept = self._clamp_padding(entry, local_idx[:1], values[:1, :k])
+        flat = base_sd[entry.key].reshape(1, -1)
+        weights = torch.cat([flat.expand(k, -1).clone().scatter_(1, idx.expand(k, -1), kept[0]), flat])
+        sites = (
+            (torch.cat([rows[:k], rows[:1]]), torch.cat([dv[:k], torch.zeros_like(dv[:1])])),
+            weights.view(k + 1, *entry.shape),
+        )
+        losses = []
+        for site in sites:
+            with torch.random.fork_rng(devices=[]):
+                losses.append(self._vmap_over_site(entry.key, base_sd, site, inputs, targets))
+        injected, built = losses
+        if not built.is_floating_point():
+            return torch.equal(injected, built)
+        if not torch.stack(losses).isfinite().all():
+            return False
+        eps = torch.finfo(built.dtype).eps
+        tol = torch.maximum(64 * eps * built.abs().clamp(min=1), 1e-2 * (built - built[k]).abs())
+        return bool(((injected - built).abs() <= tol).all())
+
     @torch.inference_mode()
     def evaluate(self, base_sd, entry, local_idx, values, inputs, targets=None):
         """Losses of shape ``(G*C,)`` for ``G`` particle groups of ``C`` candidates."""
@@ -1753,19 +1805,27 @@ class SiteVmapEvaluator:
         if (
             base.device.type == "cpu"
             and base.dim() > 1
-            and base.numel() >= _MIN_INJECTED_SITE_NUMEL
+            and min(n, self._owner.chunk_size or n) * (inputs.shape[0] if inputs.dim() else 1) * base.numel()
+            >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls + _INTERCEPT_SETUP_CALLS)
             and base.dtype not in (torch.float16, torch.bfloat16)
             and not self._owner._compile_vmap
+            and not self._has_script_module
             and entry.key not in self._uninjectable_sites
         ):
             rows = local_idx.clamp(max=entry.numel - 1)
             dv = values - base.reshape(-1)[rows].unsqueeze(1)
             dv = dv.masked_fill(local_idx.unsqueeze(1) >= entry.numel, 0)
-            rows = rows.unsqueeze(1).expand(groups, cand, pdim).reshape(n, pdim)
+            offsets = (rows.unsqueeze(1).expand(groups, cand, pdim).reshape(n, pdim), dv.reshape(n, pdim))
+            sig = (entry.key, inputs.shape, inputs.dtype)
             try:
-                return self._vmap_over_site(entry.key, base_sd, (rows, dv.reshape(n, pdim)), inputs, targets)
+                if sig in self._matched_injections or self._injection_matches(
+                    base_sd, entry, local_idx, values, offsets, inputs, targets
+                ):
+                    self._matched_injections.add(sig)
+                    return self._vmap_over_site(entry.key, base_sd, offsets, inputs, targets)
             except _SiteNotInjectable:
-                self._uninjectable_sites.add(entry.key)
+                pass
+            self._uninjectable_sites.add(entry.key)
         local_idx, values = self._clamp_padding(entry, local_idx, values)
 
         # Only this entry gets a candidate axis; every other parameter stays shared.
@@ -1799,8 +1859,11 @@ class SiteVmapEvaluator:
 
         def single_eval(site_param, shared, inputs, targets):
             if inject:
-                with _SiteDelta(base_sd[key], *site_param):
+                with _SiteDelta(base_sd[key], *site_param) as delta:
                     output = functional_call(model, {**shared, **dict.fromkeys(names, base_sd[key])}, (inputs,))
+                if not delta.added:
+                    raise _SiteNotInjectable
+                self._forward_calls = delta.calls
             else:
                 output = functional_call(model, {**shared, **dict.fromkeys(names, site_param)}, (inputs,))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)

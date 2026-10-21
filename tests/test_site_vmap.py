@@ -246,6 +246,136 @@ class RecurrentNet(nn.Module):
         return self.head(h)
 
 
+class ScriptedLinearNet(nn.Module):
+    """Reads its first weight inside a TorchScript module, which no torch function mode sees."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.jit.script(nn.Linear(6, 5))
+        self.head = nn.Linear(5, 3)
+
+    def forward(self, x):
+        return self.head(torch.tanh(self.fc(x)))
+
+
+class WeightProduct(nn.Module):
+    """Multiplies its input by the transpose of a weight it gets as an argument."""
+
+    def forward(self, h, w):
+        return h @ w.t()
+
+
+class ScriptedHelperNet(nn.Module):
+    """Reads its Linear weight through the Linear and again inside a TorchScript module."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(6, 6)
+        self.helper = torch.jit.script(WeightProduct())
+        self.head = nn.Linear(6, 3)
+
+    def forward(self, x):
+        h = torch.tanh(self.fc(x))
+        return self.head(h + self.helper(h, self.fc.weight))
+
+
+def weight_product(h, w):
+    return h @ w.t()
+
+
+class ScriptedFunctionNet(nn.Module):
+    """Reads its Linear weight through the Linear and again inside a scripted function attribute."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(6, 6)
+        self.fn = torch.jit.script(weight_product)
+        self.head = nn.Linear(6, 3)
+
+    def forward(self, x):
+        h = torch.tanh(self.fc(x))
+        return self.head(h + self.fn(h, self.fc.weight))
+
+
+scripted_weight_product = torch.jit.script(weight_product)
+
+
+def numpy_weight_product(h, w):
+    with torch._C.DisableTorchFunction():
+        w = torch.from_numpy(w.numpy())
+    return h @ w.t()
+
+
+class ClassScriptedNet(nn.Module):
+    """Reads its Linear weight again inside a scripted function held as a class attribute."""
+
+    fn = scripted_weight_product
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(6, 6)
+        self.head = nn.Linear(6, 3)
+
+    def forward(self, x):
+        h = torch.tanh(self.fc(x))
+        return self.head(h + self.fn(h, self.fc.weight))
+
+
+class HiddenReadNet(nn.Module):
+    """Reads its Linear weight again through a function kept in a list, out of reach of any scan."""
+
+    def __init__(self, read):
+        super().__init__()
+        self.fc = nn.Linear(6, 6)
+        self.head = nn.Linear(6, 3)
+        self.reads = [read]
+
+    def forward(self, x):
+        h = torch.tanh(self.fc(x))
+        return self.head(h + self.reads[0](h, self.fc.weight))
+
+
+class InfeasibleWeightNet(nn.Module):
+    """Scores infinite once its zero Linear weight moves, read out of reach of interception."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(6, 3)
+        nn.init.zeros_(self.fc.weight)
+
+    def forward(self, x):
+        with torch._C.DisableTorchFunction():
+            penalty = torch.where(self.fc.weight.any(), torch.inf, 0.0)
+        return self.fc(x) + penalty
+
+
+class AutocastNet(nn.Module):
+    """Runs its Linear layers under its own BF16 autocast."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(6, 5)
+        self.head = nn.Linear(5, 3)
+
+    def forward(self, x):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            return self.head(torch.tanh(self.fc(x))).float()
+
+
+class SineTailNet(nn.Module):
+    """Makes a hundred elementwise torch calls after its only Linear."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(32, 16)
+
+    def forward(self, x):
+        h = self.fc(x)
+        for _ in range(100):
+            h = h.sin()
+        return h
+
+
 class EncoderNet(nn.Module):
     """Runs ``nn.TransformerEncoderLayer`` between two Linear layers."""
 
@@ -259,14 +389,16 @@ class EncoderNet(nn.Module):
         return self.head(self.block(self.inp(x.unflatten(1, (2, 3)))).mean(1))
 
 
-def _injected_and_materialized(monkeypatch, model, inputs, targets):
-    """Float64 losses per candidate at every entry, scored as offsets and from built weights, and the evaluator."""
+def _injected_and_materialized(
+    monkeypatch, model, inputs, targets, dtype=torch.float64, injects=True, loss_fn=nn.CrossEntropyLoss()
+):
+    """Losses per candidate at every entry, scored as offsets and from built weights, and the evaluator."""
     from polystep import cost_nn
 
-    monkeypatch.setattr(cost_nn, "_MIN_INJECTED_SITE_NUMEL", 0)
-    model, inputs = model.double(), inputs.double()
+    monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
+    model, inputs = model.to(dtype), inputs.to(dtype)
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
-    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, loss_fn), layout)
     base_sd = {k: v.detach() for k, v in model.state_dict().items()}
     materialize, injected = site._vmap_over_site, []
     monkeypatch.setattr(
@@ -280,37 +412,132 @@ def _injected_and_materialized(monkeypatch, model, inputs, targets):
         flat = base_sd[entry.key].reshape(-1)
         starts = torch.tensor([0, entry.numel - (1 if entry is layout.entries[-1] else PDIM)])
         local_idx = starts.unsqueeze(1) + torch.arange(PDIM)
-        noise = torch.randn(2, 3, PDIM, generator=gen, dtype=torch.float64)
+        noise = torch.randn(2, 3, PDIM, generator=gen, dtype=dtype)
         values = flat[local_idx.clamp(max=entry.numel - 1)].unsqueeze(1) + noise
         got.append(site.evaluate(base_sd, entry, local_idx, values, inputs, targets))
         idx, kept = site._clamp_padding(entry, local_idx, values)
         weights = flat.expand(2, 3, -1).clone().scatter_(2, idx.unsqueeze(1).expand(-1, 3, -1), kept)
         want.append(materialize(entry.key, base_sd, weights.view(6, *entry.shape), inputs, targets))
-    assert any(injected)
+    assert any(injected) == injects
     return torch.cat(got), torch.cat(want), site
 
 
 @pytest.mark.parametrize(
-    "model_cls, batch",
+    "model_cls, batch, uninjectable",
     [
-        (SkipMLP, _small_batch),
-        (ConvNet, _batch),
-        (GroupedConvNet, _batch),
-        (RecurrentNet, _small_batch),
-        (StackedVmapNet, _small_batch),
-        (ClampedWeightNet, _small_batch),
+        (SkipMLP, _small_batch, set()),
+        (ConvNet, _batch, set()),
+        (GroupedConvNet, _batch, {"depthwise.weight"}),
+        (RecurrentNet, _small_batch, set()),
+        (StackedVmapNet, _small_batch, {"head.weight", "stack"}),
+        (ClampedWeightNet, _small_batch, {"fc.weight"}),
+        (ItemScaledMLP, _small_batch, set()),
+        (ResidualMLP, _small_batch, set()),
     ],
 )
-def test_site_injection_matches_materialized_linear(monkeypatch, model_cls, batch):
+def test_site_injection_matches_materialized_linear(monkeypatch, model_cls, batch, uninjectable):
     torch.manual_seed(0)
-    got, want, _ = _injected_and_materialized(monkeypatch, model_cls(), *batch())
+    got, want, site = _injected_and_materialized(monkeypatch, model_cls(), *batch())
     torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+    assert site._uninjectable_sites == uninjectable
+
+
+@pytest.mark.parametrize("model_cls", [ScriptedLinearNet, ScriptedHelperNet, ScriptedFunctionNet, ClassScriptedNet])
+def test_script_module_model_skips_injection(monkeypatch, model_cls):
+    torch.manual_seed(0)
+    got, want, _ = _injected_and_materialized(monkeypatch, model_cls(), *_small_batch(), injects=False)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.filterwarnings("ignore:vmap failed:RuntimeWarning")
+@pytest.mark.parametrize(
+    "model_fn, loss_fn",
+    [
+        (lambda: HiddenReadNet(scripted_weight_product), nn.CrossEntropyLoss()),
+        (lambda: HiddenReadNet(numpy_weight_product), nn.CrossEntropyLoss()),
+        (InfeasibleWeightNet, lambda out, y: out.mean()),
+    ],
+)
+def test_hidden_weight_read_disables_injection(monkeypatch, model_fn, loss_fn):
+    torch.manual_seed(0)
+    got, want, site = _injected_and_materialized(monkeypatch, model_fn(), *_small_batch(), loss_fn=loss_fn)
+    torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+    assert site._uninjectable_sites == {"fc.weight"}
+
+
+def test_integer_loss_keeps_injection(monkeypatch):
+    torch.manual_seed(0)
+    got, want, site = _injected_and_materialized(
+        monkeypatch, SkipMLP(), *_small_batch(), loss_fn=lambda out, y: (out.argmax(1) == y).sum()
+    )
+    assert got.dtype == torch.int64 and torch.equal(got, want)
+    assert site._uninjectable_sites == set()
 
 
 def test_nonlinear_weight_read_falls_back(monkeypatch):
     torch.manual_seed(0)
-    got, want, _ = _injected_and_materialized(monkeypatch, TransposedReadNet(), *_small_batch())
+    got, want, site = _injected_and_materialized(monkeypatch, TransposedReadNet(), *_small_batch())
     torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+    assert site._uninjectable_sites == {"fc.weight"}
+
+
+def test_internal_autocast_site_skips_injection(monkeypatch):
+    torch.manual_seed(0)
+    got, want, site = _injected_and_materialized(monkeypatch, AutocastNet(), *_small_batch(), dtype=torch.float32)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert site._uninjectable_sites == {"fc.weight", "head.weight"}
+
+
+def test_long_forward_stops_injecting_small_site():
+    from polystep import cost_nn
+
+    torch.manual_seed(0)
+    model = SineTailNet()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.MSELoss()), layout)
+    rows = cost_nn._MACS_PER_INTERCEPTED_CALL * (cost_nn._INTERCEPT_SETUP_CALLS + 10) // (6 * 512) + 1
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[0], torch.tensor([[0, 1], [2, 3]])
+    values = base_sd[entry.key].reshape(-1)[local_idx].unsqueeze(1) + torch.randn(2, 3, PDIM)
+    materialize, injected = site._vmap_over_site, []
+    site._vmap_over_site = lambda key, sd, c, *a: injected.append(isinstance(c, tuple)) or materialize(key, sd, c, *a)
+    for r in (rows // 2, rows, rows):
+        site.evaluate(base_sd, entry, local_idx, values, torch.randn(r, 32), torch.randn(r, 16))
+    assert injected == [False, True, False, True, False]
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1])
+def test_injection_estimate_respects_chunk_size(chunk_size):
+    from polystep import cost_nn
+
+    torch.manual_seed(0)
+    model = SkipMLP().double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss(), chunk_size=chunk_size), layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[0], torch.tensor([[0, 1], [2, 3]])
+    rows = cost_nn._MACS_PER_INTERCEPTED_CALL * cost_nn._INTERCEPT_SETUP_CALLS // (6 * entry.numel) + 1
+    values = base_sd[entry.key].reshape(-1)[local_idx].unsqueeze(1) + torch.randn(2, 3, PDIM, dtype=torch.float64)
+    inputs, targets = torch.randn(rows, 6, dtype=torch.float64), torch.randint(0, 3, (rows,))
+    site.evaluate(base_sd, entry, local_idx, values, inputs, targets)
+    assert bool(site._matched_injections) == (chunk_size is None)
+
+
+def test_scalar_input_site_gate_skips_crash():
+    torch.manual_seed(0)
+    model = nn.Embedding(4, 3)
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    site = SiteVmapEvaluator.try_build(evaluator, layout)
+    flat = layout.flatten(model).reshape(-1)
+    values = flat[3:5] + torch.tensor([[0.3, -0.2], [-0.4, 0.1]])
+    inputs, targets = torch.tensor(1), torch.zeros(3)
+    got = site.evaluate(
+        layout.unflatten(flat), layout.entries[0], torch.tensor([[3, 4]]), values[None], inputs, targets
+    )
+    candidates = flat.expand(2, -1).clone()
+    candidates[:, 3:5] = values
+    torch.testing.assert_close(got, evaluator.evaluate(layout.batch_unflatten(candidates), inputs, targets))
 
 
 def test_sites_feeding_attention_skip_injection(monkeypatch):
@@ -393,9 +620,9 @@ class TiedHead(nn.Module):
 
 @pytest.mark.parametrize("path", ["injected", "stacked", "hybrid"])
 @pytest.mark.parametrize("tie", ["attribute", "module"])
-def test_tied_site_vmap_matches_dense_costs(tie, path):
+def test_tied_site_vmap_matches_dense_costs(monkeypatch, tie, path):
     """Every alias of a tied site reads the candidate, with or without the alias keys in the base."""
-    from polystep import HybridSubspace
+    from polystep import HybridSubspace, cost_nn
 
     torch.manual_seed(0)
     gen = torch.Generator().manual_seed(1)
@@ -429,8 +656,13 @@ def test_tied_site_vmap_matches_dense_costs(tie, path):
     else:
         if path == "stacked":
             site._uninjectable_sites.add(layout.entries[0].key)
+        else:
+            monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
         entry = site.resolve_site(torch.tensor([0]), PDIM, span=(0, PDIM))
         got = site.evaluate(base_sd, entry, torch.arange(PDIM).reshape(1, PDIM), values, inputs, targets)
+        if path == "injected":
+            assert site._uninjectable_sites == ({entry.key} if tie == "attribute" else set())
+            assert bool(site._matched_injections) == (tie == "module")
 
     expected = []
     for candidate in candidates:
@@ -1189,6 +1421,19 @@ def test_release_evaluator_drops_site_cast_batch():
     assert evaluator._cast_cache is None
 
 
+def test_monolithic_site_step_after_release_runs():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(1, 2, 3), nn.ReLU(), nn.Flatten(), nn.Linear(72, 3))
+    opt = PolyStepOptimizer(model, compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    x, y = torch.randn(4, 1, 8, 8), torch.randint(0, 3, (4,))
+    opt.register_evaluator(ev, x, y)
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    opt.release_evaluator()
+    assert opt._site_vmap_evaluator is not None
+    assert torch.isfinite(torch.as_tensor(opt.step(lambda p: ev.evaluate(p, x, y))))
+
+
 def test_compiled_site_tracks_base_and_batch(monkeypatch):
     # Dynamo's eager backend checks graph guards without requiring a C++ toolchain.
     torch.compiler.reset()
@@ -1329,9 +1574,9 @@ def test_site_chunk_budgets_downstream_activations(route):
         model, subspace=subspace, block_strategy=block_strategy, solver="softmax", compile=False, seed=0
     )
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
-    x, y = torch.randn(64, 1, 64, 64), torch.randint(0, 8, (64,))
+    x, y = torch.randn(32, 1, 64, 64), torch.randint(0, 8, (32,))
     opt.register_evaluator(ev, x, y)
-    head = 64 * 8 / x.numel()
+    head = 32 * 8 / x.numel()
     assert opt._act_ratios == {None: 4.0, "0.weight": 4.0, "0.bias": 4.0, "4.weight": head, "4.bias": head}
     assert not any(m._forward_hooks or m._forward_pre_hooks for m in model.modules())
 
@@ -1339,7 +1584,47 @@ def test_site_chunk_budgets_downstream_activations(route):
     opt.step(lambda p: ev.evaluate(p, x, y))
     conv_chunk = max(rows["0.weight"])
     assert 2 * 4 * x.numel() * conv_chunk <= 1 << 26
+    assert (4 * x.numel() * conv_chunk * x.element_size() <= 32 << 20) == (route == "hybrid")
     assert max(rows["4.weight"]) > conv_chunk
+
+
+@pytest.mark.parametrize("dtype, cpu_chunk", [(torch.float32, 5), (torch.float64, 2)])
+def test_local_chunk_shrinks_only_on_cpu(dtype, cpu_chunk):
+    from polystep._step_core import local_chunk
+
+    opt = PolyStepOptimizer(nn.Linear(4, 2).to(dtype), compile=False, seed=0)
+    act = 1 << 18
+    assert local_chunk(opt, act, 3 * act, 1 << 20, cpu=False) == 85
+    assert local_chunk(opt, act, 3 * act, 1 << 20, cpu=True) == cpu_chunk
+    assert local_chunk(opt, act, 3 * act, 16, cpu=True) == 16
+    assert local_chunk(opt, act, 3 * act, (32 << 20) // (act * dtype.itemsize) + 1, cpu=True) == cpu_chunk
+
+
+def test_site_chunk_capped_by_own_span():
+    from polystep._step_core import site_chunks
+
+    opt = PolyStepOptimizer(nn.Linear(4, 2), compile=False, seed=0)
+    x = torch.zeros(1 << 16, 4)
+    sites = [(0, "weight"), (8, "bias")]
+    assert site_chunks(opt, x, sites, 1, 6, 600, shrink=True) == {0: 48, 48: 12}
+    assert site_chunks(opt, x.to("meta"), sites, 1, 6, 600, shrink=True)[48] == 252
+    assert site_chunks(opt, x, sites, 1, 6, 600)[48] == 252
+
+
+def test_cpu_site_chunk_keeps_injection():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(4, 8, 5), nn.ReLU(), nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(8, 4))
+    opt = PolyStepOptimizer(model, compile=False, seed=0)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+    x, y = torch.randn(32, 4, 14, 14), torch.randint(0, 4, (32,))
+    opt.register_evaluator(ev, x, y)
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    site = opt._site_vmap_evaluator
+    calls = []
+    inner = site._vmap_over_site
+    site._vmap_over_site = lambda key, sd, c, *a: calls.append((key, isinstance(c, tuple))) or inner(key, sd, c, *a)
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    assert ("0.weight", True) in calls
 
 
 @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
@@ -1369,6 +1654,7 @@ def test_unaligned_site_keeps_downstream_chunk():
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
     x, y = torch.randn(64, 1, 64, 64), torch.randint(0, 16, (64,))
     opt.register_evaluator(ev, x, y)
+    opt.step(lambda p: ev.evaluate(p, x, y))
     rows = _record_site_batches(opt)
     opt.step(lambda p: ev.evaluate(p, x, y))
     assert len(rows["3.weight"]) == 1

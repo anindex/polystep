@@ -161,6 +161,40 @@ def test_optimizer_step_matches_materializing_path(mixed, dtype, tol, path):
     torch.testing.assert_close(torch.tensor(fast), torch.tensor(dense), rtol=tol, atol=tol)
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")],
+        ),
+    ],
+)
+def test_subspace_delta_chunk_shrinks_only_on_cpu(device, monkeypatch):
+    from polystep import PolyStepOptimizer
+    from polystep._step_core import activation_elements
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(16, 128), nn.ReLU(), nn.Linear(128, 4)).to(device)
+    x, y = torch.randn(128, 16, device=device), torch.randint(0, 4, (128,), device=device)
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4)
+    opt = PolyStepOptimizer(model, subspace=subspace, solver="softmax", compile=False, seed=0)
+    ev = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+    opt.register_evaluator(ev, x, y)
+    sizes = []
+    delta = SubspaceDeltaEvaluator.evaluate
+
+    def counted(self, subspace, projections, bary_sd, spec, col_start, dcoords, *rest):
+        sizes.append(dcoords.shape[0] * dcoords.shape[1])
+        return delta(self, subspace, projections, bary_sd, spec, col_start, dcoords, *rest)
+
+    monkeypatch.setattr(SubspaceDeltaEvaluator, "evaluate", counted)
+    opt.step(lambda p: ev.evaluate(p, x, y))
+    assert opt._subspace_delta_evaluator is not None
+    assert (max(sizes) * activation_elements(opt, x) * x.element_size() <= 32 << 20) == (device == "cpu")
+
+
 @pytest.mark.parametrize("pdim", [1, 3, 4, 8])
 @pytest.mark.parametrize("kind", ["hybrid", "factored"])
 def test_confined_sites_match_reconstruct_batch(kind, pdim):

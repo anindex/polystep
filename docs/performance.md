@@ -37,25 +37,43 @@ site-local or vmap path. Tied weights, such as an output layer that reuses the
 embedding table, keep the site-local path too: a candidate for the tied weight reaches
 every module that reads it.
 
-On the site-local path on CPU, a candidate that moves an FP32 or FP64 weight with two or
-more dimensions and at least 512 elements does not get its own copy of that weight. Each
-`F.linear` or ungrouped convolution that reads the weight with an input shared by all
-candidates adds the candidate's output change to the shared output. Any other read,
-including one whose input already depends on the candidate, as in the later steps of a
-recurrent loop, uses the candidate's weight, built once per forward, and so does every
-read after it. A forward that opens its own `torch.vmap` or other `torch.func` transform
-gets a full copy per candidate. So does a weight that `nn.MultiheadAttention` reads, or
-whose change reaches its input, as in `nn.TransformerEncoderLayer`: intercepting calls
-turns off PyTorch's fused attention, and `torch.vmap` runs the unfused CPU attention one
-candidate at a time. The added change rounds differently from a built weight,
-so FP32 losses can differ in the last bits. On one CPU thread this made a step 3.5 times
-faster for a residual 784-256-256-10 MLP at batch 64 and 3.7 times faster for a LeNet-5
-at batch 32. CUDA keeps a full copy per candidate. There, intercepting each call of the
-forward costs a few microseconds that a launch-bound step pays in full: on an RTX 5090
-the residual MLP gained only 3%, while a LeNet-5 and a 20-step RNN with hidden size 64
-took about 1.3 times as long per step. Biases, weights below that size, FP16/BF16
-weights and `compile_vmap=True` keep a full copy too; for a small weight the copy costs
-less than intercepting every call of the forward.
+In full space, on the site-local path on CPU, a candidate that moves an FP32 or FP64
+weight with two or more dimensions can skip its own copy of that weight. Each `F.linear`
+or ungrouped convolution that reads the weight with an input shared by all candidates
+adds the candidate's output change to the shared output. Any other read, including one
+whose input already depends on the candidate, as in the later steps of a recurrent loop,
+uses the candidate's weight, built once per forward, and so does every read after it. A
+forward that opens its own `torch.vmap` or other `torch.func` transform gets a full copy
+per candidate. So does a weight that `nn.MultiheadAttention` reads, or whose change
+reaches its input, as in `nn.TransformerEncoderLayer`: intercepting calls turns off
+PyTorch's fused attention, and `torch.vmap` runs the unfused CPU attention one candidate
+at a time. A weight that no such `F.linear` or convolution reads, such as an embedding
+table or a weight read through `.t()`, falls back to a full copy, and so does one whose
+`F.linear` or convolution runs under autocast in a lower precision. A model that holds a
+TorchScript or traced module or function, as a submodule or as an instance or class
+attribute, keeps a full copy for every weight, since no call inside it can be
+intercepted. A read that escapes interception in some other way, such as a module-level
+scripted function, a scripted module kept in a list, a C++ extension or a read under
+`torch._C.DisableTorchFunction`, is caught by a parity check. The first time a weight
+would take this path for an input shape and dtype, two of its candidates and the
+incumbent are scored both with the added change and with built weights, from the same
+random state. The weight keeps the path only if every pair of losses agrees within 64
+machine epsilons times the larger of the loss and 1, or within 1% of how far the
+candidate moves the loss from the incumbent. Otherwise it gets a full copy for the rest
+of the run. A read whose effect on those first candidates stays below that tolerance
+goes unnoticed. The added change rounds differently from a built weight, so FP32 losses
+can differ in the last bits. Intercepting a call costs about 3 microseconds on one CPU
+thread, about what a batched matmul spends on 150,000 multiply-adds. The path therefore
+runs only when the candidates in one vmap chunk (all of them without a `chunk_size`)
+times batch size (1 for a scalar input) times weight elements reaches 150,000 for each
+torch call of the forward, plus 30 calls of setup. The call count comes from the last
+forward on this path and is zero before the first. On one CPU thread this made a step
+3.5 times faster for a residual 784-256-256-10 MLP at batch 64 and 3.7 times faster for
+a LeNet-5 at batch 32. CUDA keeps a full copy per candidate. There, intercepting each
+call of the forward costs a few microseconds that a launch-bound step pays in full: on
+an RTX 5090 the residual MLP gained only 3%, while a LeNet-5 and a 20-step RNN with
+hidden size 64 took about 1.3 times as long per step. Biases, FP16/BF16 weights and
+`compile_vmap=True` keep a full copy too.
 
 The Linear MLP paths need a builtin loss: `nn.CrossEntropyLoss`, `nn.MSELoss` or
 `nn.L1Loss` with mean reduction, or `F.cross_entropy`, `F.mse_loss` or `F.l1_loss`.
@@ -167,8 +185,19 @@ many thin batched products the offsets need.
 candidate's parameters and its largest layer output, which one forward measures when
 the evaluator is first registered and which then scales with the batch. Delta and
 site-local paths build no full candidate, so they are budgeted on activations and the
-perturbed parameter alone. The full-space delta path on CUDA counts activations only,
-since it never builds the parameter, so its chunks are larger and its peak memory
+perturbed parameter alone: 2^26 elements, counting two activations and the parameter. On
+the CPU, subspace site and subspace delta chunks drop to a 16 MiB budget once one
+activation of a chunk would pass 32 MiB, glibc's largest mmap threshold, above which
+each allocation maps fresh pages that fault in zeroed. Example 11's transformer keeps
+its chunks, whose activations stay under 32 MiB. Full-space delta and site chunks keep
+the element budget on every device. The delta estimate counts more than it allocates,
+and smaller chunks measured slower there. On the site path, smaller chunks can fall
+below the per-call size at which a convolution takes the output-delta injection. They
+also free only small mapped blocks, and glibc raises its mmap threshold to the largest
+block freed, so the fully connected sites after them fault on every chunk: a full-space
+LeNet-5 step took 17% to 49% longer at batch 32 and 128. On CUDA the full-space delta
+path counts activations only, since it never builds the parameter, so its chunks are
+larger and its peak memory
 higher: 397 MiB instead of 163 MiB for 784-256-256-10 at batch 256 on an RTX 5090. A
 candidate's loss can depend on the chunk shape, so on that model the larger chunks
 change a few losses in the last float32 bit. The CPU keeps the parameter in the budget,
@@ -176,9 +205,11 @@ because smaller chunks run faster there. A site-local path batches only the laye
 the perturbed one on, so each site is budgeted on the module outputs from its own layer
 on. A forward that draws random numbers is batched from the draw on, so its sites keep
 the whole-model budget, as does a parameter the forward reads before calling its layer.
-In example 10's LeNet-5 at batch 256, a chunk holds 27 candidates on the first
+In example 10's LeNet-5 at batch 256 on CUDA, a chunk holds 27 candidates on the first
 convolution, whose output fills the budget, 72 on the second and up to 729 on the fully
-connected layers, so a step scores its 4,833 candidates in 36 forwards. Reduce
+connected layers, so a step scores its 4,833 candidates in 36 forwards. On the CPU a
+chunk holds 9 candidates on both convolutions, 36 and 45 on the first two fully
+connected layers and up to 414 on the last, so a step takes 197 forwards. Reduce
 `chunk_size` after an out-of-memory error.
 
 Steps that score on a delta or site-local path, or on CPU `AdaptiveSubspace` offsets,

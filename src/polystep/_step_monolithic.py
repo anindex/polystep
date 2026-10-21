@@ -19,6 +19,7 @@ from ._step_core import (
     chunk_spans,
     epsilon_jumped,
     invalidate_for_basis_change,
+    local_chunk,
     record_saturation,
     site_bounds,
     site_chunks,
@@ -409,7 +410,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 _site_vmap is not None and (_sparse_delta is None or device.type == "cpu")
             ):
                 per_site += max(e.numel for e in opt.layout.entries)
-            chunk = min(total_evals, max(1, (1 << 26) // max(1, per_site)))
+            chunk = local_chunk(opt, _act, per_site, total_evals, device.type == "cpu" and _is_subspace)
 
     _group = V * K_eff
     if _local or _bary_flat is not None:
@@ -428,7 +429,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         _sites = []
     _site_chunks = None
     if _local and not opt.chunk_size and _sparse_delta is None and _subspace_delta is None:
-        _site_chunks = site_chunks(opt, _fused_inputs, _sites, pdim, _group, total_evals)
+        _site_chunks = site_chunks(opt, _fused_inputs, _sites, pdim, _group, total_evals, _is_subspace)
 
     # Shape-determined and fully overwritten each step, so cached on the optimizer.
     _loss_dtype = loss_buffer_dtype(X.dtype)

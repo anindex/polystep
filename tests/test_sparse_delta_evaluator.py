@@ -248,6 +248,15 @@ def test_class_major_ce_matches_reference_fp64(monkeypatch, tail, loss_fn, dtype
     assert len(calls) == expected_calls
 
 
+@pytest.mark.parametrize("dtype,offset", [(torch.float32, 1e8), (torch.float64, 1e16)])
+def test_class_major_ce_large_logits_exact(dtype, offset):
+    """A large common logit offset must not round away the normalization term."""
+    z = torch.randint(0, 3, (2, 3, 4, 5), generator=torch.Generator().manual_seed(0)).to(dtype).mul_(8).add_(offset)
+    targets = torch.tensor([0, 1, 2, -100, 1])
+    expected = [nn.functional.cross_entropy(z[g, :, c].t(), targets) for g in range(2) for c in range(4)]
+    torch.testing.assert_close(_class_major_cross_entropy(z, targets, -100).flatten(), torch.stack(expected))
+
+
 def test_declines_run_straddling_two_parameters():
     """A run straddling two parameters perturbs two layers at once and must be declined."""
     torch.manual_seed(0)
@@ -653,13 +662,19 @@ def test_only_straddling_particles_fall_back(hybrid, layers, out, expected):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
 def test_delta_chunk_ignores_site_parameter_size(block_strategy, monkeypatch):
-    torch.manual_seed(7)
-    model = _mlp([784, 64, 10]).cuda()
-    inputs, targets = torch.randn(128, 784, device="cuda"), torch.randint(0, 10, (128,), device="cuda")
-    evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
-    opt = PolyStepOptimizer(model, compile=False, seed=7, block_strategy=block_strategy)
-    opt.register_evaluator(evaluator, inputs, targets)
-    assert opt._site_vmap_evaluator is not None
+    def run(register):
+        torch.manual_seed(7)
+        model = _mlp([784, 64, 10]).cuda()
+        inputs, targets = torch.randn(128, 784, device="cuda"), torch.randint(0, 10, (128,), device="cuda")
+        evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+        opt = PolyStepOptimizer(model, compile=False, seed=7, block_strategy=block_strategy)
+        if register:
+            opt.register_evaluator(evaluator, inputs, targets)
+            assert opt._site_vmap_evaluator is not None
+        opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+        return opt, inputs, model.state_dict()
+
+    dense_sd = run(register=False)[2]
     sizes, vmap_calls = [], []
     delta = SparseDeltaEvaluator.evaluate
 
@@ -669,21 +684,29 @@ def test_delta_chunk_ignores_site_parameter_size(block_strategy, monkeypatch):
 
     monkeypatch.setattr(SparseDeltaEvaluator, "evaluate", counted)
     monkeypatch.setattr(SiteVmapEvaluator, "evaluate", lambda *a: vmap_calls.append(1))
-    opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    opt, inputs, fast_sd = run(register=True)
     act = activation_elements(opt, inputs)
     numel = max(e.numel for e in opt.layout.entries)
     assert not vmap_calls
     assert (1 << 26) // (2 * act + numel) < max(sizes) <= (1 << 26) // (2 * act)
+    for key in fast_sd:
+        torch.testing.assert_close(fast_sd[key], dense_sd[key], rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
 def test_cpu_delta_chunk_keeps_parameter_charge(block_strategy, monkeypatch):
-    torch.manual_seed(7)
-    model = _mlp([256, 64, 4])
-    inputs, targets = torch.randn(4, 256), torch.randint(0, 4, (4,))
-    evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
-    opt = PolyStepOptimizer(model, compile=False, seed=7, block_strategy=block_strategy)
-    opt.register_evaluator(evaluator, inputs, targets)
+    def run(register):
+        torch.manual_seed(7)
+        model = _mlp([64, 64, 4])
+        inputs, targets = torch.randn(64, 64), torch.randint(0, 4, (64,))
+        evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+        opt = PolyStepOptimizer(model, compile=False, seed=7, block_strategy=block_strategy)
+        if register:
+            opt.register_evaluator(evaluator, inputs, targets)
+        opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+        return opt, inputs, model.state_dict()
+
+    dense_sd = run(register=False)[2]
     sizes = []
     delta = SparseDeltaEvaluator.evaluate
 
@@ -692,7 +715,10 @@ def test_cpu_delta_chunk_keeps_parameter_charge(block_strategy, monkeypatch):
         return delta(self, base_sd, key, local_idx, values, *rest, **kw)
 
     monkeypatch.setattr(SparseDeltaEvaluator, "evaluate", counted)
-    opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    opt, inputs, fast_sd = run(register=True)
     act = activation_elements(opt, inputs)
     numel = max(e.numel for e in opt.layout.entries)
     assert max(sizes) <= (1 << 26) // (2 * act + numel)
+    assert max(sizes) * act * inputs.element_size() > 32 << 20
+    for key in fast_sd:
+        torch.testing.assert_close(fast_sd[key], dense_sd[key], rtol=1e-5, atol=1e-6)

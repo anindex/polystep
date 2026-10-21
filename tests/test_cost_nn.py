@@ -353,6 +353,21 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         evaluator._batched_linear.evaluate = lambda *a, **k: pytest.fail("bmm path preempted use_inplace")
         torch.testing.assert_close(evaluator.evaluate(params, x, y), reference)
 
+    @pytest.mark.parametrize("smoothing", [0.0, 0.1], ids=["hard", "smooth"])
+    @pytest.mark.parametrize("weight", [None, torch.rand(200) + 0.5], ids=["plain", "weight"])
+    def test_byte_label_156_stays_valid(self, weight, smoothing):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 200))
+        layout = ParamLayout.from_module(model)
+        params = layout.batch_unflatten(layout.flatten(model).unsqueeze(0).expand(2, -1, -1).clone())
+        x, y = torch.randn(3, 4), torch.tensor([156, 3, 156], dtype=torch.uint8)
+        loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=smoothing)
+        evaluator = NNCostEvaluator(model, loss_fn)
+        assert evaluator._batched_linear is not None
+        with torch.no_grad():
+            expected = loss_fn(model(x), y.long()).expand(2)
+        torch.testing.assert_close(evaluator.evaluate(params, x, y), expected)
+
     @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
     def test_regression_losses_fast_path_matches_vmap(self, loss_fn):
         """The bmm forward is loss-independent; only the reduction differs."""
@@ -411,16 +426,17 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
     class_weight = torch.tensor([0.5, 2.0, 1.0], dtype=torch.float64)
 
     @pytest.mark.parametrize(
-        "config, probability",
+        "config, target_dtype",
         [
-            ({"label_smoothing": 0.1}, False),
-            ({"weight": class_weight}, False),
-            ({"weight": class_weight, "label_smoothing": 0.2, "ignore_index": 1}, False),
-            ({"weight": class_weight, "label_smoothing": 0.2}, True),
+            ({"label_smoothing": 0.1}, torch.long),
+            ({"weight": class_weight}, torch.long),
+            ({"weight": class_weight}, torch.uint8),
+            ({"weight": class_weight, "label_smoothing": 0.2, "ignore_index": 1}, torch.long),
+            ({"weight": class_weight, "label_smoothing": 0.2}, torch.float64),
         ],
-        ids=["smoothing", "weight", "weight_smoothing_ignore", "probability_targets"],
+        ids=["smoothing", "weight", "weight_uint8", "weight_smoothing_ignore", "probability_targets"],
     )
-    def test_label_smoothing_matches_closure_loss(self, config, probability):
+    def test_label_smoothing_matches_closure_loss(self, config, target_dtype):
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3)).double()
         layout = ParamLayout.from_module(model)
@@ -432,8 +448,8 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         stacked = layout.batch_unflatten(batch)
 
         inputs = torch.randn(16, 4, dtype=torch.float64)
-        targets = torch.randint(0, 3, (16,))
-        if probability:
+        targets = torch.randint(0, 3, (16,)).to(target_dtype)
+        if target_dtype.is_floating_point:
             targets = torch.softmax(torch.randn(16, 3, dtype=torch.float64), dim=1)
         loss_fn = nn.CrossEntropyLoss(**config)
 

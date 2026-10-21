@@ -4,8 +4,11 @@ import pytest
 import torch
 
 from polystep import PolyStepES, PolyStepOptimizer, minimize
+from polystep._compiled import _rotate_and_translate
+from polystep.geometry import get_orthoplex_vertices, get_random_rotation_matrices
 from polystep.solver import PolyStep
 from polystep.solvers import SinkhornSolver, SoftmaxSolver
+from polystep.transform import create_generator
 
 
 def _sphere(X):
@@ -211,6 +214,23 @@ def test_ask_candidates_allow_inplace_autograd():
     torch.nn.utils.vector_to_parameters(es.best_solution, net.parameters())
     net(torch.ones(2, 3)).sum().backward()
     assert net.weight.grad is not None
+
+
+def test_ask_matches_orthoplex_einsum():
+    es = PolyStepES(4, num_particles=2, seed=0)
+    rot = get_random_rotation_matrices(2, 4, generator=create_generator(0, torch.device("cpu")))
+    expected = _rotate_and_translate(rot, get_orthoplex_vertices(4), es.X, es.step_radius)[0].reshape(-1, 4)
+    assert torch.equal(es.ask(), expected)
+
+
+def test_ask_inplace_clamp_reaches_tell():
+    es = PolyStepES(4, num_particles=2, seed=0)
+    candidates = es.ask()
+    candidates.clamp_(-0.1, 0.1)
+    fitness = _sphere(candidates - 1.0)
+    es.tell(fitness)
+    assert es.X.abs().max() <= 0.1 + 1e-6
+    torch.testing.assert_close(es.best_solution, candidates[fitness.argmin()])
 
 
 @pytest.mark.parametrize("as_input", [torch.Tensor.double, torch.Tensor.tolist])

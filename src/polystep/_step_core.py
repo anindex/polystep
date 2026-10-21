@@ -62,18 +62,33 @@ def activation_elements(opt, inputs, key=None) -> int:
     return inputs.shape[0] * max((e.shape[0] for e in opt.layout.entries if e.shape), default=0)
 
 
-def site_chunks(opt, inputs, sites, pdim: int, group: int, cap: int) -> dict[int, int]:
+def local_chunk(opt, act: int, per_site: int, cap: int, cpu: bool) -> int:
+    """Candidates per local chunk, kept under glibc's 32 MiB mmap threshold when ``cpu``."""
+    chunk = min(cap, (1 << 26) // max(1, per_site))
+    size = opt.layout.dominant_dtype.itemsize
+    if cpu and chunk * act * size > 32 << 20:
+        chunk = (16 << 20) // (size * per_site)
+    return max(1, chunk)
+
+
+def site_chunks(opt, inputs, sites, pdim: int, group: int, cap: int, shrink: bool = False) -> dict[int, int]:
     """Automatic chunk for each site's span, keyed by the first candidate wholly inside it.
 
     ``sites`` pairs each site's first coordinate with its parameter name. A site path
     batches only the activations from the perturbed parameter's module on, so each site
-    is budgeted on those and on the largest parameter.
+    is budgeted on those and on the largest parameter. ``shrink``, set on the subspace
+    path, lets a CPU chunk drop under the mmap threshold.
     """
     numel = max(e.numel for e in opt.layout.entries)
+    sites = list(sites)
+    stops = [start // pdim * group for start, _ in sites[1:]] + [cap]
+    cpu = shrink and inputs is not None and inputs.device.type == "cpu"
     chunks = {}
-    for start, key in sites:
-        chunk = min(cap, (1 << 26) // (2 * activation_elements(opt, inputs, key) + numel))
-        chunks[-(-start // pdim) * group] = max(group, chunk // group * group)
+    for (start, key), stop in zip(sites, stops):
+        first = -(-start // pdim) * group
+        act = activation_elements(opt, inputs, key)
+        chunk = local_chunk(opt, act, 2 * act + numel, max(group, stop - first), cpu)
+        chunks[first] = max(group, chunk // group * group)
     return chunks
 
 

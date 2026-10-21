@@ -186,6 +186,20 @@ def test_untraceable_forward_keeps_vmap_path(forward, hooked):
     assert _plan_names(model) is None
 
 
+def test_traced_plan_uses_inference_branch():
+    """Candidates are scored under inference_mode, so the plan must follow that branch."""
+    model = _single_linear(lambda m, x: torch.relu(m.fc(x)) if torch.is_grad_enabled() else torch.sigmoid(m.fc(x)))
+    assert _plan_names(model) == ["fc", "sigmoid"]
+
+
+def test_traced_autocast_chain_declines():
+    def forward(m, x):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            return torch.tanh(m.fc(x))
+
+    assert _plan_names(_single_linear(forward)) is None
+
+
 def test_declined_trace_keeps_global_rng():
     model = _single_linear(lambda m, x: m.fc(x + torch.randn(4)))
     torch.manual_seed(0)
