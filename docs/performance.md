@@ -33,7 +33,9 @@ A Linear MLP is an `nn.Sequential`, or a module whose forward chains Linear laye
 the common activations and `x.flatten(1)`, one call feeding the next. Activations count
 as modules or as `torch.relu`, `F.gelu` and similar calls with default arguments. Hooks,
 buffers, residual connections and other operations keep a custom forward on the
-site-local or vmap path.
+site-local or vmap path. Tied weights, such as an output layer that reuses the
+embedding table, keep the site-local path too: a candidate for the tied weight reaches
+every module that reads it.
 
 On the site-local path on CPU, a candidate that moves an FP32 or FP64 weight with two or
 more dimensions and at least 512 elements does not get its own copy of that weight. Each
@@ -42,7 +44,10 @@ candidates adds the candidate's output change to the shared output. Any other re
 including one whose input already depends on the candidate, as in the later steps of a
 recurrent loop, uses the candidate's weight, built once per forward, and so does every
 read after it. A forward that opens its own `torch.vmap` or other `torch.func` transform
-gets a full copy per candidate. The added change rounds differently from a built weight,
+gets a full copy per candidate. So does a weight that `nn.MultiheadAttention` reads, or
+whose change reaches its input, as in `nn.TransformerEncoderLayer`: intercepting calls
+turns off PyTorch's fused attention, and `torch.vmap` runs the unfused CPU attention one
+candidate at a time. The added change rounds differently from a built weight,
 so FP32 losses can differ in the last bits. On one CPU thread this made a step 3.5 times
 faster for a residual 784-256-256-10 MLP at batch 64 and 3.7 times faster for a LeNet-5
 at batch 32. CUDA keeps a full copy per candidate. There, intercepting each call of the
@@ -202,7 +207,25 @@ site compiles independently and falls back to eager execution on compilation fai
 Profiler output confirms whether a compiled region actually ran. PyTorch's
 recompilation limit can cause later calls to run eagerly.
 
-CPU attention uses native scaled-dot-product attention; CUDA uses explicit matmuls.
+On CUDA the site-local path replays its forward from CUDA graphs unless the evaluator
+or the optimizer gets `compile_forward=False`. Each parameter, chunk shape and batch shape runs eagerly
+once, is captured on its second call and replays after that, up to 64 graphs. This
+helps launch-bound models: example 11 steps about 1.15x to 1.35x faster, while LeNet-5 in
+example 10 is unchanged. The graphs share one memory pool sized to the largest chunk's
+activations and one copy of the weights and buffers. Each graph also holds its own copy
+of its candidate stack and batch, so memory grows with the number of graphs and can far
+exceed the weights. The graphs added 32 MiB allocated and 78 MiB reserved on example 11
+and about 120 MiB and 410 MiB on example 10. Widened to `d_model=256, d_ff=1024`,
+example 11 held 266 MiB of candidate stacks across 21 graphs for 3 MiB of weights. Capture
+freezes the Python-side state the forward reads, such as a Python counter, a flag or a
+reassigned tensor attribute. A forward that draws random numbers stays eager, and one
+that syncs with the host fails capture, warns once and keeps that parameter eager.
+`release_evaluator()` frees the graphs, so call it once after training rather than
+every epoch.
+
+CPU attention uses native scaled-dot-product attention. CUDA uses it too without a mask,
+or with `is_causal=True` and no padding mask, outside FP16; other CUDA attention uses
+explicit matmuls.
 BF16/FP16 solver costs accumulate in FP32. The builtin cross-entropy, MSE and L1
 losses, as modules or `torch.nn.functional` calls, also reduce half-precision candidate
 outputs in FP32, whether they come from an FP16/BF16 model or from

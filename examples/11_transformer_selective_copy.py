@@ -103,7 +103,6 @@ def run_epoch(optimizer, evaluator, x, y, batch_size):
         optimizer.register_evaluator(evaluator, xb, yb)
         total += optimizer.step(lambda params, _x=xb, _y=yb: evaluator.evaluate(params, _x, _y))
         batches += 1
-    optimizer.release_evaluator()
     return total / max(batches, 1)
 
 
@@ -187,6 +186,7 @@ def main():
             best, best_state = val_acc, {k: v.detach().clone() for k, v in model.state_dict().items()}
         if epoch % 5 == 0 or epoch == 1:
             print(f"  epoch {epoch:3d}  loss {loss:.4f}  val {val_acc:5.1f}%")
+    optimizer.release_evaluator()
 
     model.load_state_dict(best_state)
     print(f"\n  test accuracy: {accuracy(model, test_x, test_y):.1f}%  ({time.perf_counter() - started:.1f} s)")

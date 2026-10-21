@@ -194,7 +194,7 @@ constant token means a stationary objective.
 |---|---|---|
 | `compile` | `False` | CUDA geometry and solver kernels |
 | `compile_evaluator` | `False` | Dense and site-local candidate vmap |
-| `compile_forward` | `None` | Automatic compilation on the in-place forward path |
+| `compile_forward` | `None` | CUDA graphs for the in-place forward and the CUDA site-local vmap |
 | `candidate_autocast` | `False` | Candidate forward precision; disables incompatible fast paths |
 
 `amortize_steps` skips evaluations between sampled updates. `multifidelity_screen`

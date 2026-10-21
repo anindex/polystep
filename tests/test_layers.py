@@ -88,6 +88,36 @@ class TestVmapSafeMultiHeadAttention:
         torch.testing.assert_close(out_perturbed[:, :-3], out[:, :-3])
         assert not torch.allclose(out_perturbed[:, -1], out[:, -1]), "the tail should have moved"
 
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")],
+            ),
+        ],
+    )
+    def test_causal_flag_matches_triangular_mask(self, device):
+        reference = nn.MultiheadAttention(8, 2, batch_first=True).double().to(device)
+        ours = VmapSafeMultiHeadAttention(8, 2).double().to(device)
+        with torch.no_grad():
+            for index, layer in enumerate((ours.W_q, ours.W_k, ours.W_v)):
+                layer.weight.copy_(reference.in_proj_weight.chunk(3)[index])
+                layer.bias.copy_(reference.in_proj_bias.chunk(3)[index])
+            ours.W_o.load_state_dict(reference.out_proj.state_dict())
+        x = torch.randn(2, 5, 8, dtype=torch.float64, device=device)
+        mask = torch.ones(5, 5, dtype=torch.bool, device=device).triu(1)
+        actual = ours(x, x, x, attn_mask=mask, is_causal=True)
+        torch.testing.assert_close(actual, ours(x, x, x, attn_mask=mask))
+        torch.testing.assert_close(actual, reference(x, x, x, attn_mask=mask, is_causal=True, need_weights=False)[0])
+        with pytest.raises(RuntimeError, match="Need attn_mask"):
+            ours(x, x, x, is_causal=True)
+        half, x_half = ours.half(), x.half()
+        torch.testing.assert_close(
+            half(x_half, x_half, x_half, attn_mask=mask, is_causal=True), half(x_half, x_half, x_half, attn_mask=mask)
+        )
+
     def test_key_padding_mask_excludes_masked_keys(self, attn):
         """Masked keys must not reach the output, so changing them must change nothing."""
         torch.manual_seed(0)
@@ -185,19 +215,12 @@ class TestVmapSafeMultiHeadAttention:
         with pytest.raises(NotImplementedError, match="VmapSafeMultiHeadAttention"):
             VmapSafeMultiHeadAttention(embed_dim=32, num_heads=4, **kwargs)
 
-    @pytest.mark.parametrize(
-        "forward_kwargs",
-        [
-            dict(need_weights=True),
-            dict(is_causal=True),
-        ],
-    )
-    def test_attention_rejects_forward_kwargs(self, forward_kwargs):
-        """Forward must reject need_weights / is_causal explicitly."""
+    def test_attention_rejects_need_weights(self):
+        """Forward must reject need_weights explicitly."""
         attn = VmapSafeMultiHeadAttention(embed_dim=32, num_heads=4)
         x = torch.randn(2, 5, 32)
         with pytest.raises(NotImplementedError, match="VmapSafeMultiHeadAttention"):
-            attn(x, x, x, **forward_kwargs)
+            attn(x, x, x, need_weights=True)
 
 
 class TestVmapSafeLSTMCell:
@@ -389,7 +412,7 @@ def test_half_attention_accepts_float_masks():
     for dtype in (torch.float16, torch.bfloat16):
         model = VmapSafeMultiHeadAttention(8, 2).to(device="cuda", dtype=dtype).eval()
         x = torch.randn(2, 3, 8, device="cuda", dtype=dtype)
-        expected = model(x, x, x)
+        expected = model(x, x, x, attn_mask=torch.zeros(3, 3, dtype=torch.bool, device="cuda"))
         actual = model(
             x,
             x,
@@ -398,6 +421,39 @@ def test_half_attention_accepts_float_masks():
             key_padding_mask=torch.zeros(2, 3, device="cuda"),
         )
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("mask_kind", ["none", "causal", "padding"])
+def test_vmap_sdpa_cuda_matches_explicit(monkeypatch, mask_kind):
+    torch.manual_seed(0)
+    attn = VmapSafeMultiHeadAttention(32, 4).cuda().eval()
+    params = {k: torch.stack([v + 0.05 * i for i in range(3)]) for k, v in attn.named_parameters()}
+    x = torch.randn(2, 7, 32, device="cuda")
+    mask = torch.ones(7, 7, dtype=torch.bool, device="cuda").triu(1) & (mask_kind == "causal")
+    padding = torch.zeros(2, 7, dtype=torch.bool, device="cuda")
+    padding[1, 5:] = mask_kind == "padding"
+    calls = []
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    monkeypatch.setattr(
+        torch.nn.functional, "scaled_dot_product_attention", lambda *a, **k: calls.append(1) or sdpa(*a, **k)
+    )
+
+    def forward(p, kwargs):
+        return torch.func.functional_call(attn, p, (x, x, x), kwargs)
+
+    fused_kwargs = {
+        "none": {},
+        "causal": dict(attn_mask=mask, is_causal=True),
+        "padding": dict(key_padding_mask=padding),
+    }[mask_kind]
+    fused = torch.vmap(forward, in_dims=(0, None))(params, fused_kwargs)
+    assert bool(calls) == (mask_kind != "padding")
+    calls.clear()
+    explicit = torch.vmap(forward, in_dims=(0, None))(params, dict(attn_mask=mask | padding[:, None, :]))
+    assert not calls
+    torch.testing.assert_close(fused, explicit, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])

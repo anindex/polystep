@@ -7,6 +7,7 @@ replaces.
 """
 
 import warnings
+from functools import partial
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from torch.utils._pytree import tree_leaves
 
 from polystep import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator, SiteInplaceEvaluator, SiteVmapEvaluator, SparseDeltaEvaluator
+from polystep.layers import VmapSafeMultiHeadAttention
 from polystep.transform import ParamLayout
 
 PDIM = 2
@@ -244,8 +246,21 @@ class RecurrentNet(nn.Module):
         return self.head(h)
 
 
+class EncoderNet(nn.Module):
+    """Runs ``nn.TransformerEncoderLayer`` between two Linear layers."""
+
+    def __init__(self):
+        super().__init__()
+        self.inp = nn.Linear(3, 4)
+        self.block = nn.TransformerEncoderLayer(4, 2, dim_feedforward=4, dropout=0.0, batch_first=True)
+        self.head = nn.Linear(4, 3)
+
+    def forward(self, x):
+        return self.head(self.block(self.inp(x.unflatten(1, (2, 3)))).mean(1))
+
+
 def _injected_and_materialized(monkeypatch, model, inputs, targets):
-    """Float64 losses per candidate at every entry: scored as offsets, then from built weights."""
+    """Float64 losses per candidate at every entry, scored as offsets and from built weights, and the evaluator."""
     from polystep import cost_nn
 
     monkeypatch.setattr(cost_nn, "_MIN_INJECTED_SITE_NUMEL", 0)
@@ -272,7 +287,7 @@ def _injected_and_materialized(monkeypatch, model, inputs, targets):
         weights = flat.expand(2, 3, -1).clone().scatter_(2, idx.unsqueeze(1).expand(-1, 3, -1), kept)
         want.append(materialize(entry.key, base_sd, weights.view(6, *entry.shape), inputs, targets))
     assert any(injected)
-    return torch.cat(got), torch.cat(want)
+    return torch.cat(got), torch.cat(want), site
 
 
 @pytest.mark.parametrize(
@@ -288,14 +303,25 @@ def _injected_and_materialized(monkeypatch, model, inputs, targets):
 )
 def test_site_injection_matches_materialized_linear(monkeypatch, model_cls, batch):
     torch.manual_seed(0)
-    got, want = _injected_and_materialized(monkeypatch, model_cls(), *batch())
+    got, want, _ = _injected_and_materialized(monkeypatch, model_cls(), *batch())
     torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
 
 
 def test_nonlinear_weight_read_falls_back(monkeypatch):
     torch.manual_seed(0)
-    got, want = _injected_and_materialized(monkeypatch, TransposedReadNet(), *_small_batch())
+    got, want, _ = _injected_and_materialized(monkeypatch, TransposedReadNet(), *_small_batch())
     torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+
+
+def test_sites_feeding_attention_skip_injection(monkeypatch):
+    torch.manual_seed(0)
+    got, want, site = _injected_and_materialized(monkeypatch, EncoderNet(), *_small_batch())
+    torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+    assert site._uninjectable_sites == {
+        "inp.weight",
+        "block.self_attn.in_proj_weight",
+        "block.self_attn.out_proj.weight",
+    }
 
 
 def test_conv_step_skips_closure_keeps_losses():
@@ -352,14 +378,67 @@ def test_site_vmap_honors_evaluator_chunk_size(monkeypatch):
     assert chunks and set(chunks) == {4}
 
 
-def test_try_build_declines_tied_weights():
-    """One flat position under two module paths would get half its perturbation."""
-    shared = nn.Linear(6, 6)
-    model = nn.Sequential(shared, nn.ReLU(), shared)
+class TiedHead(nn.Module):
+    """Reads its embedding table again as the output projection."""
+
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(24, 24)
+        self.out = nn.Linear(24, 24)
+        self.out.weight = self.emb.weight
+
+    def forward(self, x):
+        return self.out(torch.tanh(self.emb(x)))
+
+
+@pytest.mark.parametrize("path", ["injected", "stacked", "hybrid"])
+@pytest.mark.parametrize("tie", ["attribute", "module"])
+def test_tied_site_vmap_matches_dense_costs(tie, path):
+    """Every alias of a tied site reads the candidate, with or without the alias keys in the base."""
+    from polystep import HybridSubspace
+
+    torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(1)
+    if tie == "attribute":
+        model, inputs = TiedHead().double(), torch.randint(0, 24, (7,), generator=gen)
+    else:
+        shared = nn.Linear(24, 24)
+        model = nn.Sequential(shared, nn.Tanh(), shared).double()
+        inputs = torch.randn(7, 24, generator=gen, dtype=torch.float64)
+    targets = torch.randint(0, 24, (7,), generator=gen)
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
-    dense = NNCostEvaluator(model, nn.MSELoss())
-    assert layout.shared_groups, "this model must actually tie its weights"
-    assert SiteVmapEvaluator.try_build(dense, layout) is None
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False), layout)
+    assert layout.shared_groups and site is not None
+    aliases = {a: e.key for e in layout.entries for a in e.shared_with}
+    flat = layout.flatten(model).reshape(-1)
+    base_sd = layout.unflatten(flat)
+    if path == "hybrid":
+        subspace = HybridSubspace.from_layout(layout, rank=3)
+        projections = subspace.init_projections(torch.device("cpu"), torch.float64)
+        vec = 0.1 * torch.randn(subspace.subspace_dim, generator=gen, dtype=torch.float64)
+        to_sd = partial(subspace.apply_perturbation, projections, base_sd)
+    else:
+        vec, to_sd = flat, layout.unflatten
+    candidates = vec.expand(2, -1).clone()
+    candidates[:, :PDIM] += 0.3 * torch.randn(2, PDIM, generator=gen, dtype=torch.float64)
+    values = candidates[:, :PDIM].reshape(1, 2, PDIM)
+    if path == "hybrid":
+        got = site.evaluate_subspace(
+            projections, base_sd, vec, to_sd(vec), subspace.specs[0], 0, values, inputs, targets
+        )
+    else:
+        if path == "stacked":
+            site._uninjectable_sites.add(layout.entries[0].key)
+        entry = site.resolve_site(torch.tensor([0]), PDIM, span=(0, PDIM))
+        got = site.evaluate(base_sd, entry, torch.arange(PDIM).reshape(1, PDIM), values, inputs, targets)
+
+    expected = []
+    for candidate in candidates:
+        sd = to_sd(candidate)
+        sd = {**sd, **{a: sd[k] for a, k in aliases.items()}}
+        output = torch.func.functional_call(model, sd, (inputs,), tie_weights=False)
+        expected.append(nn.functional.cross_entropy(output, targets))
+    torch.testing.assert_close(got, torch.stack(expected), rtol=0, atol=1e-12)
 
 
 @pytest.mark.parametrize("forced", [True, False])
@@ -1421,3 +1500,106 @@ def test_site_chunk_peak_within_budget(noise):
     opt.step(lambda p: ev.evaluate(p, x, y))
     assert set(peaks) == {"1.weight", "1.bias", "5.weight", "5.bias"}
     assert max(peaks.values()) <= 1.05 * 4 * (1 << 26)
+
+
+class TinyAttention(nn.Module):
+    """Embeds tokens and attends once, so every site runs through attention."""
+
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Linear(4, 8)
+        self.attn = VmapSafeMultiHeadAttention(8, 2, batch_first=True)
+        self.head = nn.Linear(8, 3)
+        self.register_buffer("pos", torch.randn(5, 8))
+
+    def forward(self, x):
+        h = self.embed(x) + self.pos
+        return self.head((h + self.attn(h, h, h)).mean(1))
+
+
+class HostScaledMLP(nn.Module):
+    """Divides by an input statistic read back to the host, which graph capture refuses."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(6, 5)
+        self.fc2 = nn.Linear(5, 3)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x))) / (1.0 + x.abs().mean().item())
+
+
+class HostCopiedMLP(HostScaledMLP):
+    """Copies a CPU tensor in before any kernel, so the refused capture is empty."""
+
+    def forward(self, x):
+        return super().forward(x * torch.tensor([1.0, 2.0, 1.0, 1.0, 1.0, 1.0]).to(x.device))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_site_graph_matches_eager_losses():
+    from polystep import HybridSubspace
+
+    x, y = torch.randn(32, 5, 4, device="cuda"), torch.randint(0, 3, (32,), device="cuda")
+    runs = []
+    for compile_forward in (False, None):
+        torch.manual_seed(0)
+        model = TinyAttention().cuda()
+        subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+        opt = PolyStepOptimizer(model, seed=0, subspace=subspace)
+        ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_forward=compile_forward)
+        losses = []
+        for _ in range(10):
+            opt.register_evaluator(ev, x, y)
+            losses.append(opt.step(lambda p: ev.evaluate(p, x, y)))
+        runs.append((losses, list(model.parameters()), opt._site_vmap_evaluator))
+    (eager, eager_params, _), (graphed, graphed_params, site) = runs
+    assert any(entry is not None for entry in site._graphs.values())
+    assert eager == graphed
+    assert all(map(torch.equal, eager_params, graphed_params))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("model_cls", [HostScaledMLP, HostCopiedMLP])
+def test_site_graph_sync_forward_falls_back(model_cls):
+    torch.manual_seed(0)
+    model = model_cls().cuda()
+    layout = ParamLayout.from_module(model)
+    eager, graphed = (
+        SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_forward=flag), layout)
+        for flag in (False, None)
+    )
+    base_sd = {k: v.detach() for k, v in model.named_parameters()}
+    x, y = (t.cuda() for t in _small_batch())
+    keys = ["fc1.weight", "fc2.weight"]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for key in keys:
+            candidates = base_sd[key] + 0.1 * torch.randn(4, *base_sd[key].shape, device="cuda")
+            for _ in range(3):
+                got = graphed._vmap_over_site(key, base_sd, candidates, x, y)
+                assert torch.equal(got, eager._vmap_over_site(key, base_sd, candidates, x, y))
+    assert len([w for w in caught if "cuda graph" in str(w.message).lower()]) == 1
+    assert graphed._graph_failed_sites == set(keys)
+    assert not any(graphed._graphs.values())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_tied_site_graph_matches_eager():
+    torch.manual_seed(0)
+    model = TiedHead().cuda()
+    layout = ParamLayout.from_module(model)
+    eager, graphed = (
+        SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_forward=flag), layout)
+        for flag in (False, None)
+    )
+    base_sd = layout.unflatten(layout.flatten(model))
+    x, y = torch.randint(0, 24, (7,), device="cuda"), torch.randint(0, 24, (7,), device="cuda")
+    candidates = base_sd["out.bias"] + 0.1 * torch.randn(4, 24, device="cuda")
+    for _ in range(3):
+        got = graphed._vmap_over_site("out.bias", base_sd, candidates, x, y)
+        assert torch.equal(got, eager._vmap_over_site("out.bias", base_sd, candidates, x, y))
+    assert not graphed._graph_failed_sites and any(graphed._graphs.values())

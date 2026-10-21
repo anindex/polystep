@@ -102,7 +102,6 @@ def run_epoch(optimizer, evaluator, x, y, batch_size):
         optimizer.register_evaluator(evaluator, xb, yb)
         total += optimizer.step(lambda params, _x=xb, _y=yb: evaluator.evaluate(params, _x, _y))
         batches += 1
-    optimizer.release_evaluator()
     return total / max(batches, 1)
 
 
@@ -196,6 +195,7 @@ def main():
             f"best {best:5.2f}%  ({time.perf_counter() - started:.0f} s)",
             flush=True,
         )
+    optimizer.release_evaluator()
 
     if best_state is not None:
         model.load_state_dict(best_state)

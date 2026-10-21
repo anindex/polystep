@@ -1,4 +1,4 @@
-"""Vmap-compatible multi-head attention with native CPU SDPA."""
+"""Vmap-compatible multi-head attention with native SDPA."""
 
 import contextlib
 import math
@@ -93,16 +93,17 @@ class VmapSafeMultiHeadAttention(nn.Module):
         """Compute multi-head attention.
 
         attn_mask is float (additive) or bool (True = masked), in 2D, 3D, or 4D,
-        matching ``nn.MultiheadAttention``. Returns ``(batch, seq_q, embed_dim)``.
+        matching ``nn.MultiheadAttention``. As there, ``is_causal`` is a hint that
+        needs ``attn_mask``. Returns ``(batch, seq_q, embed_dim)``.
         """
         if need_weights:
             raise NotImplementedError(
                 "VmapSafeMultiHeadAttention does not support need_weights=True. See LIMITATIONS.md."
             )
-        if is_causal:
-            raise NotImplementedError(
-                "VmapSafeMultiHeadAttention does not support is_causal=True. "
-                "Pass an explicit triangular attn_mask instead. See LIMITATIONS.md."
+        if is_causal and attn_mask is None:
+            raise RuntimeError(
+                "Need attn_mask if specifying the is_causal hint. You may use the Transformer module "
+                "method `generate_square_subsequent_mask` to create this mask."
             )
 
         batch_size, seq_q, _ = query.shape
@@ -115,6 +116,18 @@ class VmapSafeMultiHeadAttention(nn.Module):
         Q = Q.view(batch_size, seq_q, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(batch_size, seq_k, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_k, self.num_heads, self.head_dim).transpose(1, 2)
+
+        device_type = Q.device.type
+        autocast_on = torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type)
+        half_scores = Q.dtype == torch.float16 or (
+            Q.dtype != torch.float64 and autocast_on and torch.get_autocast_dtype(device_type) == torch.float16
+        )
+        fused = device_type == "cpu" or (
+            device_type == "cuda" and not half_scores and key_padding_mask is None and (attn_mask is None or is_causal)
+        )
+        is_causal = fused and is_causal and key_padding_mask is None
+        if is_causal:
+            attn_mask = None
 
         # Convert MHA's True=masked convention to an additive SDPA-compatible mask.
         if attn_mask is not None:
@@ -140,22 +153,19 @@ class VmapSafeMultiHeadAttention(nn.Module):
                 padding_mask = torch.zeros_like(padding_mask, dtype=Q.dtype).masked_fill(padding_mask, float("-inf"))
             attn_mask = padding_mask if attn_mask is None else attn_mask + padding_mask
 
-        if Q.device.type == "cpu":
+        if fused:
             context = F.scaled_dot_product_attention(
                 Q,
                 K,
                 V,
                 attn_mask=attn_mask,
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=is_causal,
                 scale=self.scale,
             )
         else:
             # Off CPU: explicit matmul and softmax, with fully masked rows given zero weight.
-            device_type = Q.device.type
-            autocast_on = torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type)
-            if Q.dtype == torch.float16 or (
-                Q.dtype != torch.float64 and autocast_on and torch.get_autocast_dtype(device_type) == torch.float16
-            ):
+            if half_scores:
                 with torch.amp.autocast(device_type, enabled=False) if autocast_on else contextlib.nullcontext():
                     scores = torch.matmul(Q.float(), K.float().transpose(-2, -1))
             else:

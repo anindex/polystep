@@ -66,16 +66,22 @@ Heavy-ball momentum can amplify the barycentric displacement.
   forward neither draws random numbers nor reads the perturbed parameter before
   calling its layer. Attention scores and other temporary tensors inside a module's
   forward are not counted. Set `chunk_size` by hand if such a model runs out of memory.
+  CUDA attention without a mask, or with `is_causal=True` and no padding mask, usually
+  does not materialize the scores in FP32 or BF16. In FP32, PyTorch's fused kernel
+  needs a head size divisible by 4; other head sizes fall back to explicit scores.
   `PolyStepOptimizer(chunk_size=...)` caps the candidates scored per step chunk, and
   `NNCostEvaluator(chunk_size=...)` caps how many of them each vmap call batches.
+- On CUDA the site-local path replays CUDA graphs, which freeze Python-side state the
+  forward reads, such as a Python counter or a flag. Pass `compile_forward=False` for such a forward.
 - The library does not distribute optimizer state across multiple GPUs.
 
 ## Attention and recurrent layers
 
 [`VmapSafeMultiHeadAttention`](src/polystep/layers/attention.py) requires batch-first
 inputs and `kdim == vdim == embed_dim`. It does not support `add_bias_kv`,
-`add_zero_attn`, returned attention weights, or `is_causal=True`; supply an explicit
-causal mask. It returns an output tensor, not an `(output, weights)` tuple.
+`add_zero_attn`, or returned attention weights. `is_causal` is a hint that needs
+`attn_mask`, as in `nn.MultiheadAttention`. It returns an output tensor, not an
+`(output, weights)` tuple.
 
 Boolean masks use `True` for masked positions; float masks are additive. Attention
 masks accept `(query, key)`, `(batch * heads, query, key)`, and broadcastable 4D shapes.

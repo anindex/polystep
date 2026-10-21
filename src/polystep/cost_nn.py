@@ -34,6 +34,8 @@ _MIN_BATCHED_CANDIDATES = 8
 
 _MIN_INJECTED_SITE_NUMEL = 512
 
+_MAX_SITE_GRAPHS = 64
+
 
 def _is_vmap_error(e: BaseException, probe: Callable[[], object]) -> bool:
     """Whether an exception came from the vmap transform rather than the model.
@@ -145,7 +147,7 @@ _TENSOR_METADATA = {
 
 
 class _SiteNotInjectable(Exception):
-    """A torch call ran inside a transform the forward opened, where ``base`` is wrapped."""
+    """A torch call ran inside a transform the forward opened, or attention met the candidate."""
 
 
 class _SiteDelta(TorchFunctionMode):
@@ -164,6 +166,8 @@ class _SiteDelta(TorchFunctionMode):
         kwargs = kwargs or {}
         base, rows, dv = self.base, self.rows, self.dv
         reads = sum(t is base for t in tree_leaves((args, kwargs)))
+        if func is nn.functional.multi_head_attention_forward and (reads or any(map(is_batchedtensor, args[:3]))):
+            raise _SiteNotInjectable
         if not reads or func in _TENSOR_METADATA:
             return func(*args, **kwargs)
         if self.site is None and reads == 1 and len(args) > 1 and args[1] is base:
@@ -320,7 +324,8 @@ class NNCostEvaluator:
             when eight weight copies would take more than half the free memory;
             ``True`` forces it and turns off the vmap, delta and factored paths.
         compile_forward: Compile the in-place path's forward with
-            ``mode="reduce-overhead"`` (CUDA graphs); ``None`` enables it there.
+            ``mode="reduce-overhead"`` (CUDA graphs) and replay the site-local vmap on
+            CUDA from captured graphs; ``None`` enables both, ``False`` turns both off.
         per_sample: Return unreduced ``(N, B)`` losses instead of ``(N,)``. Needs
             ``loss_fn.reduction == "none"``.
         autocast_dtype: Run the candidate forward under autocast in this dtype
@@ -388,13 +393,7 @@ class NNCostEvaluator:
         # state functional_call cannot substitute scores every candidate the same on
         # the stateless paths, and auto-detection only judges memory.
         self._inplace_forced = use_inplace is True
-
-        # Only the in-place loop (N sequential forwards) is launch-bound, so the flag
-        # only affects it; an explicit value wins, failure falls back to eager.
-        if compile_forward is None:
-            self._compile_forward = self._use_inplace
-        else:
-            self._compile_forward = compile_forward
+        self._compile_forward = compile_forward
 
         # Frozen buffers shared across all particles.
         self._buffers = dict(model.named_buffers())
@@ -811,7 +810,8 @@ class NNCostEvaluator:
         The swap loop mutates params via ``copy_``, which preserves storage addresses,
         so graph replay reads the fresh weights. Falls back to eager on failure.
         """
-        if not (self._compile_forward and not self._compile_forward_failed):
+        compile_forward = self._use_inplace if self._compile_forward is None else self._compile_forward
+        if not compile_forward or self._compile_forward_failed:
             return self._forward_loss
         first = next(self.model.parameters(), None)
         if first is None or not first.is_cuda:
@@ -1048,7 +1048,7 @@ def _reuse_prefixes(*evaluators):
         for ev, cache in zip(eligible, previous):
             ev._prefix_cache = cache
         for ev in evaluators:
-            if isinstance(ev, SiteInplaceEvaluator):
+            if isinstance(ev, SiteVmapEvaluator):
                 ev._primed = None
 
 
@@ -1615,18 +1615,26 @@ class SiteVmapEvaluator:
         self._buffers = buffers
         self._owner = owner
         self._entry_by_key = {e.key: e for e in layout.entries}
+        self._names = {e.key: (e.key, *e.shared_with) for e in layout.entries}
         self._starts = [e.offset for e in layout.entries]
         self._keys = [e.key for e in layout.entries]
         self._compiled_sites = {}
         self._compile_failed_sites = set()
         self._failed_sites = set()
         self._uninjectable_sites = set()
+        self._graph_failed_sites = set()
         self._warned = False
         self._randomness = "error"
+        self._drop_graphs()
+
+    def _drop_graphs(self) -> None:
+        """Free the captured site graphs, their static tensors and their memory pool."""
+        self._graphs = {}
+        self._graph_pool = self._graph_shared = self._primed = None
 
     @classmethod
     def try_build(cls, evaluator: "NNCostEvaluator", layout) -> "SiteVmapEvaluator | None":
-        """Decline where the caller's vmap path is unusable, or on tied weights.
+        """Decline where the caller's vmap path is unusable.
 
         Also decline when the forward renormalizes an embedding with ``max_norm``:
         shared weights alias the optimizer's coordinates. An in-place evaluator that
@@ -1639,7 +1647,7 @@ class SiteVmapEvaluator:
             if evaluator.per_sample:
                 return None
             return SiteInplaceEvaluator(evaluator.model, evaluator.loss_fn, layout, evaluator._buffers, owner=evaluator)
-        if evaluator._vmap_failed or evaluator._inplace_forced or layout.shared_groups:
+        if evaluator._vmap_failed or evaluator._inplace_forced:
             return None
         return cls(
             evaluator.model, evaluator.loss_fn, layout, evaluator._buffers, evaluator.per_sample, owner=evaluator
@@ -1775,7 +1783,8 @@ class SiteVmapEvaluator:
         once per forward.
         """
         inject = isinstance(site, tuple)
-        shared = {k: v for k, v in base_sd.items() if k != key}
+        names = self._names[key]
+        shared = {k: v for k, v in base_sd.items() if k not in names}
         shared.update(self._buffers)
         model, loss_fn, loss_kind, per_sample = self.model, self.loss_fn, self._loss_kind, self.per_sample
 
@@ -1791,9 +1800,9 @@ class SiteVmapEvaluator:
         def single_eval(site_param, shared, inputs, targets):
             if inject:
                 with _SiteDelta(base_sd[key], *site_param):
-                    output = functional_call(model, {**shared, key: base_sd[key]}, (inputs,))
+                    output = functional_call(model, {**shared, **dict.fromkeys(names, base_sd[key])}, (inputs,))
             else:
-                output = functional_call(model, {**shared, key: site_param}, (inputs,))
+                output = functional_call(model, {**shared, **dict.fromkeys(names, site_param)}, (inputs,))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
         def score_alone(n):
@@ -1829,6 +1838,15 @@ class SiteVmapEvaluator:
                         self._compiled_sites.pop(key, None)
                         self._compile_failed_sites.add(key)
                         warnings.warn(f"compile_vmap failed at site {key!r} ({e}); using eager vmap.", stacklevel=2)
+                if (
+                    not inject
+                    and site.is_cuda
+                    and self._owner._compile_forward is not False
+                    and not (self._owner._compile_vmap or self._owner._use_inplace)
+                    and self._randomness == "error"
+                    and key not in self._graph_failed_sites
+                ):
+                    return self._replay_site(key, batched, base_sd, site, shared, inputs, targets)
                 return batched(site, shared, inputs, targets)
         except _SiteNotInjectable:
             raise
@@ -1839,6 +1857,7 @@ class SiteVmapEvaluator:
             if _batchable_draw(e, self._randomness):
                 self._randomness = "different"
                 self._compiled_sites.clear()
+                self._drop_graphs()
                 return self._vmap_over_site(key, base_sd, site, inputs, targets)
             if not _is_vmap_error(e, lambda: score_alone(1)):
                 raise
@@ -1856,6 +1875,45 @@ class SiteVmapEvaluator:
             if was_training:
                 model.train()
 
+    def _replay_site(self, key, batched, base_sd, site, shared, inputs, targets):
+        """Replay ``batched`` from a CUDA graph captured on a signature's second call, eager before that."""
+        sig = (key, site.shape, site.dtype, inputs.shape, inputs.dtype, None if targets is None else targets.shape)
+        if sig not in self._graphs:
+            if len(self._graphs) < _MAX_SITE_GRAPHS:
+                self._graphs[sig] = None
+            return batched(site, shared, inputs, targets)
+        if self._graph_pool is None:
+            self._graph_pool = torch.cuda.graph_pool_handle(), torch.cuda.Stream(site.device)
+            merged = {**base_sd, **self._buffers}
+            fresh = {id(v): torch.empty_like(v) for v in merged.values()}
+            self._graph_shared = {k: fresh[id(v)] for k, v in merged.items()}
+        if self._primed is not base_sd:
+            torch._foreach_copy_([self._graph_shared[k] for k in base_sd], list(base_sd.values()))
+            self._primed = base_sd
+        live = (site, inputs, targets)
+        if self._graphs[sig] is None:
+            pool, stream = self._graph_pool
+            graph = torch.cuda.CUDAGraph()
+            statics = tuple(None if t is None else t.clone() for t in live)
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", "The CUDA Graph is empty")
+                    with torch.cuda.graph(graph, pool=pool, stream=stream, capture_error_mode="thread_local"):
+                        out = batched(statics[0], {k: self._graph_shared[k] for k in shared}, *statics[1:])
+            except Exception as e:
+                del self._graphs[sig]
+                if not self._graph_failed_sites:
+                    warnings.warn(f"CUDA graph capture failed at site {key!r} ({e}); using eager vmap.", stacklevel=3)
+                self._graph_failed_sites.add(key)
+                return batched(site, shared, inputs, targets)
+            self._graphs[sig] = graph, statics, out
+        graph, statics, out = self._graphs[sig]
+        dst = [s for s in statics if s is not None] + [self._graph_shared[k] for k in self._buffers]
+        src = [t for t in live if t is not None] + list(self._buffers.values())
+        torch._foreach_copy_(dst, src)
+        graph.replay()
+        return out.clone()
+
 
 class SiteInplaceEvaluator(SiteVmapEvaluator):
     """Score a site by writing each candidate into the model's own parameter.
@@ -1864,8 +1922,6 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
     only its site and puts it back. The model's real forward runs, so a tied weight
     moves with every alias and ``use_inplace=True`` keeps its contract.
     """
-
-    _primed = None
 
     def _retired(self) -> bool:
         """Never: this path runs no vmap."""

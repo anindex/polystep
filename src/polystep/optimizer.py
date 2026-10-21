@@ -269,9 +269,9 @@ class PolyStepOptimizer(SerializationMixin):
         projection_type: str = "dense",
         # Fusion-compile the vmapped forward (no CUDA graphs).
         compile_evaluator: bool = False,
-        # CUDA-graph the in-place forward. Reached whenever the evaluator selects the
-        # in-place path, which it auto-enables for large GPU models, not only under an
-        # explicit use_inplace=True.
+        # CUDA-graph the in-place forward and the site-local vmap on CUDA. The in-place
+        # path is reached whenever the evaluator selects it, which it auto-enables for
+        # large GPU models, not only under an explicit use_inplace=True.
         compile_forward: Optional[bool] = None,
     ) -> None:
         if not isinstance(model, nn.Module):
@@ -1084,7 +1084,7 @@ class PolyStepOptimizer(SerializationMixin):
 
     @property
     def compile_forward(self) -> Optional[bool]:
-        """Whether evaluators should CUDA-graph the in-place forward."""
+        """Whether evaluators should CUDA-graph the in-place and site-local forwards."""
         return self._compile_forward
 
     def register_evaluator(
@@ -1111,8 +1111,7 @@ class PolyStepOptimizer(SerializationMixin):
             evaluator.autocast_dtype = self._candidate_autocast_dtype
         if self._compile_evaluator:
             evaluator._compile_vmap = True
-        # None leaves the evaluator's own default, which pairs CUDA graphs with the
-        # in-place path they exist for. Only an explicit True/False overrides it.
+        # None leaves the evaluator's own setting; only an explicit True/False overrides it.
         if self._compile_forward is not None:
             evaluator._compile_forward = self._compile_forward
         half = any(p.dtype in (torch.float16, torch.bfloat16) for p in evaluator.model.parameters())
@@ -1232,6 +1231,9 @@ class PolyStepOptimizer(SerializationMixin):
             ev = getattr(self, attr, None)
             if ev is not None:
                 ev._cast_cache = None
+        site = getattr(self, "_site_vmap_evaluator", None)
+        if site is not None:
+            site._drop_graphs()
         self._cost_evaluator = None
         self._fused_inputs = None
         self._fused_targets = None

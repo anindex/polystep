@@ -95,7 +95,7 @@ def test_compile_forward_falls_back_on_cpu():
     ],
 )
 def test_compile_forward_defaults_on_inplace_path(use_inplace, compile_forward, expected):
-    """CUDA graphs only help the in-place path, so the flag defaults on there.
+    """The flag stays raw; the in-place gate resolves ``None`` to ``use_inplace``.
 
     The in-place path is a Python loop of N sequential forwards, so it is
     launch-bound. An explicit value still wins.
@@ -106,7 +106,8 @@ def test_compile_forward_defaults_on_inplace_path(use_inplace, compile_forward, 
         use_inplace=use_inplace,
         compile_forward=compile_forward,
     )
-    assert ev._compile_forward is expected
+    assert ev._compile_forward is compile_forward
+    assert (ev._use_inplace if ev._compile_forward is None else ev._compile_forward) is expected
 
 
 def test_eager_inplace_skips_verification_forward():
