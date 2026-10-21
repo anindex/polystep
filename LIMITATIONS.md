@@ -23,8 +23,9 @@ Heavy-ball momentum can amplify the barycentric displacement.
 ## Evaluation
 
 - `step()` expects `closure(batched_params) -> losses` with shape `(N,)`.
-  The candidate tensors may share storage that the next chunk overwrites, so clone
-  any you keep after the closure returns.
+  The candidate tensors may be expanded views or share storage that the next chunk
+  overwrites, so treat them as read-only and clone any you keep after the closure
+  returns.
 - Manual loops must register the evaluator and current batch to enable fast paths.
   The evaluator and closure must compute the same objective.
 - Tied weights must be the same Parameter object, and buffers may not share memory
@@ -45,9 +46,10 @@ Heavy-ball momentum can amplify the barycentric displacement.
   global-subspace coordinates use one dtype and reject mixed parameter dtypes.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
   Models needing autocast internally must provide it. Half-precision candidate outputs
-  reduce in FP32 only under the builtin cross-entropy, MSE and L1 losses at their
-  defaults apart from `reduction`. Other losses may round nearby candidate scores
-  to the same value. With FP16 or BF16 parameters, `FactoredSubspace` materializes
+  reduce in FP32 only under the builtin cross-entropy, MSE and L1 losses, as modules
+  or `torch.nn.functional` calls; a class-weighted cross-entropy does so only on the
+  Linear MLP paths. Other losses may round nearby candidate scores to the same
+  value. With FP16 or BF16 parameters, `FactoredSubspace` materializes
   every candidate and runs slower. See
   [precision](docs/performance.md#compilation-and-precision).
 - `train()` rejects `trust_region`. See

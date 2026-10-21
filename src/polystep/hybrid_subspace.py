@@ -697,3 +697,33 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
                 result[spec.entry_key] = base.unsqueeze(0) + delta
 
         return result
+
+    def offset_batch(
+        self,
+        projections: Dict[str, Union[torch.Tensor, SparseRandomProjection]],
+        bary_sd: Dict[str, torch.Tensor],
+        lo: int,
+        delta: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """``bary_sd`` moved by ``(N, w)`` offsets on coordinates ``[lo, lo + w)``; the rest are expanded views."""
+        n, w = delta.shape
+        result = {k: v.expand(n, *v.shape) for k, v in bary_sd.items()}
+        for spec in self.specs:
+            a, b = max(lo, spec.flat_start), min(lo + w, spec.flat_end)
+            if a >= b:
+                continue
+            d, c0, c1 = delta[:, a - lo : b - lo], a - spec.flat_start, b - spec.flat_start
+            bary = bary_sd[spec.entry_key].reshape(1, -1)
+            P = projections[spec.entry_key] if spec.is_projected else None
+            if isinstance(P, torch.Tensor):
+                site = torch.addmm(bary, d.to(P.dtype), P[:, c0:c1].t())
+            else:
+                site = bary.expand(n, -1).clone()
+                if P is None:
+                    site[:, c0:c1] += d.to(site.dtype)
+                else:
+                    rows, vals = P.columns(torch.arange(c0, c1, device=d.device), d.device, P.dtype or d.dtype)
+                    src = (d.unsqueeze(-1) * vals).flatten(1)
+                    site.scatter_add_(1, rows.reshape(1, -1).expand(n, -1), src.to(site.dtype))
+            result[spec.entry_key] = site.view(n, *spec.original_shape)
+        return result

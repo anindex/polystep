@@ -270,7 +270,9 @@ def step_blockwise(opt, closure: Callable) -> float:
     chunk = min(opt.chunk_size or max(1, (1 << 26) // (opt.layout.padded_size + act)), most)
     site_chunk = chunk
     if site_owner is not None:
-        per_site = 2 * act + (max(e.numel for e in opt.layout.entries) if site_vmap is not None else 0)
+        per_site = 2 * act
+        if site_vmap is not None and (sparse_delta is None or device.type == "cpu"):
+            per_site += max(e.numel for e in opt.layout.entries)
         site_chunk = min(opt.chunk_size or max(1, (1 << 26) // max(1, per_site)), most)
         # The delta path scores a whole particle's group at once, so a chunk holds whole groups.
         site_chunk = max(group, site_chunk // group * group)
@@ -329,6 +331,7 @@ def step_blockwise(opt, closure: Callable) -> float:
                         candidates[chunk_start:chunk_end].reshape(g1 - g0, group, D),
                         fused_inputs,
                         fused_targets,
+                        **({} if owner is site_vmap else {"base": base}),
                     ).to(losses.dtype)
                     continue
 

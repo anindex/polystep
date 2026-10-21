@@ -376,7 +376,9 @@ def test_padded_tail_scores_like_materialized_step(monkeypatch, kind, route):
             for method in ("evaluate", "evaluate_subspace"):
                 if hasattr(owner, method):
                     f = getattr(owner, method)
-                    monkeypatch.setattr(owner, method, lambda *a, f=f, o=owner: owners.append(type(o)) or f(*a))
+                    monkeypatch.setattr(
+                        owner, method, lambda *a, f=f, o=owner, **k: owners.append(type(o)) or f(*a, **k)
+                    )
         swap = ev.evaluate_subspace_inplace
         monkeypatch.setattr(ev, "evaluate_subspace_inplace", lambda *a: materialized.append(a[3].shape[0]) or swap(*a))
 

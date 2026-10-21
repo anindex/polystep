@@ -45,11 +45,12 @@ def test_per_sample_rejects_inplace_path():
         ev.evaluate(_stacked(model, 2), torch.randn(8, 12), torch.randint(0, 4, (8,)))
 
 
-def test_per_sample_rejects_reducing_loss():
+@pytest.mark.parametrize("loss_fn", [nn.CrossEntropyLoss(), nn.functional.cross_entropy])
+def test_per_sample_rejects_reducing_loss(loss_fn):
     """A mean-reduced loss silently returns (N,), which is the shape per_sample exists
     to avoid."""
     with pytest.raises(ValueError, match="reduction"):
-        NNCostEvaluator(_model(), nn.CrossEntropyLoss(), per_sample=True)
+        NNCostEvaluator(_model(), loss_fn, per_sample=True)
 
 
 def test_per_sample_rejects_reducing_callable():

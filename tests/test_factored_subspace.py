@@ -159,7 +159,7 @@ def test_unsupported_model_warns_and_falls_back():
     evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
     opt = PolyStepOptimizer(model, subspace=subspace, num_probe=1, seed=0)
 
-    with pytest.warns(UserWarning, match="not a plain nn.Sequential"):
+    with pytest.warns(UserWarning, match="not a chain of Linear and activation layers"):
         opt.register_evaluator(evaluator, inputs, targets)
 
     # Still correct, just via the materializing path.

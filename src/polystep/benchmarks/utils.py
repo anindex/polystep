@@ -125,7 +125,7 @@ def get_mnist_loaders(
 
 
 class MNISTNet(nn.Sequential):
-    """Two-layer MLP for MNIST: 784 -> hidden -> 10. An nn.Sequential subclass, as the batched evaluators require."""
+    """Two-layer MLP for MNIST: 784 -> hidden -> 10. An nn.Sequential subclass, so the batched paths need no tracing."""
 
     def __init__(self, hidden: int = 128):
         super().__init__(

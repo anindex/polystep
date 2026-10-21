@@ -1,7 +1,7 @@
 """Models that are MLPs must not opt themselves out of the batched evaluators.
 
-Every batched path requires ``type(model).forward is nn.Sequential.forward``;
-these tests pin the warning and the shipped models that would trigger it.
+A custom forward takes the batched paths only when it traces to a plain chain;
+these tests pin that plan, the warning for forwards that do not, and the shipped models.
 """
 
 import warnings
@@ -13,7 +13,8 @@ import torch.nn as nn
 
 from polystep.benchmarks.rl.policies import DiscreteMLPPolicy
 from polystep.benchmarks.utils import MNISTNet
-from polystep.cost_nn import BatchedLinearEvaluator, SubspaceDeltaEvaluator, _SEQ_EQUIVALENT_WARNED
+from polystep import PolyStepOptimizer
+from polystep.cost_nn import BatchedLinearEvaluator, NNCostEvaluator, SubspaceDeltaEvaluator, _SEQ_EQUIVALENT_WARNED
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
@@ -55,19 +56,26 @@ def _warns(model):
     return any("built from Linear/activation layers only" in str(w.message) for w in caught)
 
 
-def test_warns_on_handwritten_forward_over_children():
+def _plan_names(model):
+    plan = BatchedLinearEvaluator.try_build(model, nn.CrossEntropyLoss(), "cross_entropy")
+    return None if plan is None else [name for name, _, _ in plan._layer_keys]
+
+
+def test_untraceable_forward_over_children_warns():
     class Handwritten(nn.Module):
         def __init__(self):
             super().__init__()
             self.fc1, self.relu, self.fc2 = nn.Linear(8, 6), nn.ReLU(), nn.Linear(6, 3)
 
         def forward(self, x):
+            if x.dim() > 2:
+                x = x.flatten(1)
             return self.fc2(self.relu(self.fc1(x)))
 
     assert _warns(Handwritten())
 
 
-def test_warns_on_thin_sequential_wrapper():
+def test_sequential_wrapper_keeps_dotted_keys():
     class Wrapper(nn.Module):
         def __init__(self):
             super().__init__()
@@ -76,25 +84,138 @@ def test_warns_on_thin_sequential_wrapper():
         def forward(self, x):
             return self.net(x)
 
-    assert _warns(Wrapper())
+    assert not _warns(Wrapper())
+    assert _plan_names(Wrapper()) == ["net.0", "net.1", "net.2"]
 
 
-def test_silent_when_activations_are_applied_inline():
-    """No activation child means the children are not the whole forward.
+class _InlineMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1, self.fc2 = nn.Linear(12, 8), nn.Linear(8, 3)
 
-    Telling this model to subclass nn.Sequential would change what it computes, not
-    just how fast it runs.
-    """
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
 
-    class InlineMLP(nn.Module):
+
+def _hybrid_run(model):
+    """Losses and final parameters of three registered hybrid steps."""
+    g = torch.Generator().manual_seed(0)
+    x, y = torch.randn(16, 12, generator=g), torch.randint(0, 3, (16,), generator=g)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    sub = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.3, step_radius=0.1, seed=3)
+    opt.register_evaluator(ev, x, y)
+    losses = [opt.step(lambda bp: ev.evaluate(bp, x, y)) for _ in range(3)]
+    return opt, losses, [p.detach().clone() for p in model.parameters()]
+
+
+def test_inline_relu_mlp_takes_delta_path():
+    """The traced plan scores exactly what the nn.Sequential twin scores."""
+    torch.manual_seed(0)
+    inline = _InlineMLP()
+    twin = nn.Sequential(OrderedDict([("fc1", nn.Linear(12, 8)), ("relu", nn.ReLU()), ("fc2", nn.Linear(8, 3))]))
+    twin.load_state_dict(inline.state_dict())
+    assert _plan_names(inline) == ["fc1", "relu", "fc2"]
+
+    opt, losses, params = _hybrid_run(inline)
+    _, twin_losses, twin_params = _hybrid_run(twin)
+    assert opt._subspace_delta_evaluator is not None
+    assert losses == twin_losses
+    assert all(torch.equal(a, b) for a, b in zip(params, twin_params))
+
+
+def test_training_branch_traces_eval_forward():
+    """Candidates are scored in eval mode, so the plan must follow the eval branch."""
+
+    class Branchy(nn.Module):
         def __init__(self):
             super().__init__()
             self.fc1, self.fc2 = nn.Linear(6, 8), nn.Linear(8, 3)
 
         def forward(self, x):
-            return self.fc2(torch.relu(self.fc1(x)))
+            h = self.fc1(x)
+            return self.fc2(torch.relu(h) if self.training else torch.tanh(h))
 
-    assert not _warns(InlineMLP())
+    torch.manual_seed(0)
+    model = Branchy().train()
+    plan = BatchedLinearEvaluator.try_build(model, nn.CrossEntropyLoss(), "cross_entropy")
+    assert model.training
+    inputs, targets = torch.randn(5, 6), torch.randint(0, 3, (5,))
+    stacked = {k: v.detach()[None] for k, v in model.named_parameters()}
+    expected = nn.functional.cross_entropy(model.eval()(inputs), targets)
+    torch.testing.assert_close(plan.evaluate(stacked, inputs, targets), expected[None])
+
+
+def _single_linear(forward):
+    model = type("SingleLinear", (nn.Module,), {"forward": forward})()
+    model.fc = nn.Linear(4, 4)
+    return model
+
+
+@pytest.mark.parametrize(
+    "forward,hooked",
+    [
+        (lambda m, x: torch.relu(m.fc(x)), True),
+        (lambda m, x: m.fc(torch.relu(m.fc(x))), False),
+        (lambda m, x: nn.functional.relu(m.fc(x), True), False),
+        (lambda m, x: m.fc(x) + x, False),
+        (lambda m, x: (m.fc(x), torch.relu(x))[1], False),
+        (lambda m, x: m.fc(x.flatten(0)), False),
+        (lambda m, x: (m.fc(x), x), False),
+        (lambda m, x: nn.functional.gelu(m.fc(x), approximate="tanh"), False),
+        (lambda m, x: nn.functional.leaky_relu(m.fc(x), negative_slope=0.2), False),
+    ],
+    ids=[
+        "root_hook",
+        "repeated_linear",
+        "inplace_relu",
+        "residual_add",
+        "skipped_input",
+        "flatten_batch_dim",
+        "tuple_output",
+        "gelu_tanh",
+        "leaky_slope",
+    ],
+)
+def test_untraceable_forward_keeps_vmap_path(forward, hooked):
+    """A wrong accept scores a different function, so each of these must decline."""
+    model = _single_linear(forward)
+    if hooked:
+        assert _plan_names(model) == ["fc", "relu"]
+        model.register_forward_hook(lambda m, i, o: o + 1.0)
+    assert _plan_names(model) is None
+
+
+def test_declined_trace_keeps_global_rng():
+    model = _single_linear(lambda m, x: m.fc(x + torch.randn(4)))
+    torch.manual_seed(0)
+    expected = torch.rand(3)
+    torch.manual_seed(0)
+    assert _plan_names(model) is None
+    assert torch.equal(torch.rand(3), expected)
+
+
+def test_child_hook_keeps_vmap_path():
+    model = _single_linear(lambda m, x: m.fc(x))
+    model.fc = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
+    assert _plan_names(model) == ["fc.0", "fc.1"]
+    model.fc.register_forward_hook(lambda m, i, o: None)
+    assert _plan_names(model) is None
+
+
+def test_module_extra_arg_keeps_vmap_path():
+    class Scale(nn.Module):
+        polystep_elementwise = True
+
+        def forward(self, x, factor=1.0):
+            return x * factor
+
+    plans = []
+    for forward in (lambda m, x: m.act(m.fc(x)), lambda m, x: m.act(m.fc(x), 2.0)):
+        model = _single_linear(forward)
+        model.act = Scale()
+        plans.append(_plan_names(model))
+    assert plans == [["fc", "act"], None]
 
 
 def test_silent_on_unsupported_layer_or_extra_params():

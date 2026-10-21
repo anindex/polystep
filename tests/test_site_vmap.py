@@ -11,6 +11,7 @@ import warnings
 import pytest
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_leaves
 
 from polystep import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator, SiteInplaceEvaluator, SiteVmapEvaluator, SparseDeltaEvaluator
@@ -121,6 +122,20 @@ class ConvNet(nn.Module):
         return self.fc(nn.functional.avg_pool2d(x, 2).flatten(1))
 
 
+class GroupedConvNet(nn.Module):
+    """Feeds a depthwise convolution, whose weight has fewer input channels than its input."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(1, 4, 3, padding=1)
+        self.depthwise = nn.Conv2d(4, 8, 3, groups=4, padding=1)
+        self.fc = nn.Linear(8 * 4 * 4, 4)
+
+    def forward(self, x):
+        x = self.depthwise(torch.relu(self.conv(x)))
+        return self.fc(nn.functional.avg_pool2d(torch.relu(x), 2).flatten(1))
+
+
 def _batch(seed=0):
     gen = torch.Generator().manual_seed(seed)
     return torch.randn(6, 1, 8, 8, generator=gen), torch.randint(0, 4, (6,), generator=gen)
@@ -161,6 +176,126 @@ def test_matches_plain_vmap_at_every_site():
         checked += 1
 
     assert checked > 0, "no site resolved, the test proved nothing"
+
+
+class SkipMLP(nn.Module):
+    """Adds a shortcut out of place, so no chain plan takes it, and ends on a 2-D weight."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(6, 5)
+        self.fc2 = nn.Linear(5, 5)
+        self.head = nn.Linear(5, 3, bias=False)
+
+    def forward(self, x):
+        h = torch.tanh(self.fc1(x))
+        return self.head(h + torch.tanh(self.fc2(h)))
+
+
+class TransposedReadNet(nn.Module):
+    """Reads its weight through ``.t()``, not ``F.linear``."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(6, 3)
+
+    def forward(self, x):
+        return x @ self.fc.weight.t() + self.fc.bias
+
+
+class StackedVmapNet(nn.Module):
+    """Maps ``torch.vmap`` over a stack of weights inside its own forward."""
+
+    def __init__(self):
+        super().__init__()
+        self.stack = nn.Parameter(torch.randn(3, 5, 6) * 0.3)
+        self.head = nn.Linear(5, 3)
+
+    def forward(self, x):
+        return self.head(torch.vmap(lambda w: torch.tanh(x @ w.t()))(self.stack).mean(0))
+
+
+class ClampedWeightNet(nn.Module):
+    """Clamps its weight in place before ``F.linear`` reads it."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(6, 5)
+        self.head = nn.Linear(5, 3)
+
+    def forward(self, x):
+        self.fc.weight.clamp_(-0.2, 0.2)
+        return self.head(torch.tanh(self.fc(x)))
+
+
+class RecurrentNet(nn.Module):
+    """Reads one weight at every step, with a candidate-dependent input after the first."""
+
+    def __init__(self):
+        super().__init__()
+        self.inp = nn.Linear(6, 5)
+        self.rec = nn.Linear(5, 5, bias=False)
+        self.head = nn.Linear(5, 3)
+
+    def forward(self, x):
+        h = torch.tanh(self.inp(x))
+        for _ in range(3):
+            h = torch.tanh(self.inp(x) + self.rec(h))
+        return self.head(h)
+
+
+def _injected_and_materialized(monkeypatch, model, inputs, targets):
+    """Float64 losses per candidate at every entry: scored as offsets, then from built weights."""
+    from polystep import cost_nn
+
+    monkeypatch.setattr(cost_nn, "_MIN_INJECTED_SITE_NUMEL", 0)
+    model, inputs = model.double(), inputs.double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    materialize, injected = site._vmap_over_site, []
+    monkeypatch.setattr(
+        site,
+        "_vmap_over_site",
+        lambda key, sd, c, *a: injected.append(isinstance(c, tuple)) or materialize(key, sd, c, *a),
+    )
+    gen = torch.Generator().manual_seed(1)
+    got, want = [], []
+    for entry in layout.entries:
+        flat = base_sd[entry.key].reshape(-1)
+        starts = torch.tensor([0, entry.numel - (1 if entry is layout.entries[-1] else PDIM)])
+        local_idx = starts.unsqueeze(1) + torch.arange(PDIM)
+        noise = torch.randn(2, 3, PDIM, generator=gen, dtype=torch.float64)
+        values = flat[local_idx.clamp(max=entry.numel - 1)].unsqueeze(1) + noise
+        got.append(site.evaluate(base_sd, entry, local_idx, values, inputs, targets))
+        idx, kept = site._clamp_padding(entry, local_idx, values)
+        weights = flat.expand(2, 3, -1).clone().scatter_(2, idx.unsqueeze(1).expand(-1, 3, -1), kept)
+        want.append(materialize(entry.key, base_sd, weights.view(6, *entry.shape), inputs, targets))
+    assert any(injected)
+    return torch.cat(got), torch.cat(want)
+
+
+@pytest.mark.parametrize(
+    "model_cls, batch",
+    [
+        (SkipMLP, _small_batch),
+        (ConvNet, _batch),
+        (GroupedConvNet, _batch),
+        (RecurrentNet, _small_batch),
+        (StackedVmapNet, _small_batch),
+        (ClampedWeightNet, _small_batch),
+    ],
+)
+def test_site_injection_matches_materialized_linear(monkeypatch, model_cls, batch):
+    torch.manual_seed(0)
+    got, want = _injected_and_materialized(monkeypatch, model_cls(), *batch())
+    torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+
+
+def test_nonlinear_weight_read_falls_back(monkeypatch):
+    torch.manual_seed(0)
+    got, want = _injected_and_materialized(monkeypatch, TransposedReadNet(), *_small_batch())
+    torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
 
 
 def test_conv_step_skips_closure_keeps_losses():
@@ -1094,7 +1229,7 @@ def _record_site_batches(opt):
     inner = site._vmap_over_site
 
     def spy(key, base_sd, candidates, inputs, targets):
-        rows.setdefault(key, []).append(candidates.shape[0])
+        rows.setdefault(key, []).append(tree_leaves(candidates)[0].shape[0])
         return inner(key, base_sd, candidates, inputs, targets)
 
     site._vmap_over_site = spy

@@ -1197,7 +1197,7 @@ class PolyStepOptimizer(SerializationMixin):
             if self._factored_evaluator is None:
                 warnings.warn(
                     f"FactoredSubspace is in use but {type(evaluator.model).__name__} is not a "
-                    "plain nn.Sequential of Linear/activation layers, so candidates must be "
+                    "chain of Linear and activation layers, so candidates must be "
                     "materialized through reconstruct_batch and the low-rank speedup does not apply.",
                     stacklevel=2,
                 )
@@ -1283,8 +1283,9 @@ class PolyStepOptimizer(SerializationMixin):
         Args:
             closure: ``closure(batched_params) -> losses``, where ``batched_params``
                 is ``{key: (N, *shape)}`` and ``losses`` has shape ``(N,)``. The
-                tensors may share storage that the next chunk overwrites, so clone any
-                you keep after the closure returns.
+                tensors may be expanded views or share storage that the next chunk
+                overwrites, so treat them as read-only and clone any you keep after
+                the closure returns.
             screen_closure: Cheap-fidelity closure for ``multifidelity_screen``.
             objective_token: Identity of the objective ``closure`` measures; a change
                 drops the pending trust-region comparison. ``None`` or a constant means

@@ -31,7 +31,7 @@ def test_compile_vmap_tracks_changing_batch():
             self.fc = nn.Linear(4, 3)
 
         def forward(self, x):
-            return self.fc(x)
+            return self.fc(x) * 1.0
 
     model = TinyNet()
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_vmap=True)
@@ -327,8 +327,8 @@ def test_evaluator_no_grad():
 
 
 class TestBatchedLinearRespectsCrossEntropyConfig:
-    """Configured CrossEntropyLoss must not take the bmm fast path (it hardcodes
-    mean reduction and no class weights)."""
+    """The bmm fast path must reproduce a configured mean CrossEntropyLoss and decline
+    other reductions."""
 
     def test_vanilla_ce_uses_fast_path(self):
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
@@ -408,9 +408,21 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
         assert NNCostEvaluator(model, nn.MSELoss(reduction="sum"))._batched_linear is None
 
-    def test_label_smoothing_falls_back_and_matches(self):
+    class_weight = torch.tensor([0.5, 2.0, 1.0], dtype=torch.float64)
+
+    @pytest.mark.parametrize(
+        "config, probability",
+        [
+            ({"label_smoothing": 0.1}, False),
+            ({"weight": class_weight}, False),
+            ({"weight": class_weight, "label_smoothing": 0.2, "ignore_index": 1}, False),
+            ({"weight": class_weight, "label_smoothing": 0.2}, True),
+        ],
+        ids=["smoothing", "weight", "weight_smoothing_ignore", "probability_targets"],
+    )
+    def test_label_smoothing_matches_closure_loss(self, config, probability):
         torch.manual_seed(0)
-        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3)).double()
         layout = ParamLayout.from_module(model)
         particle = layout.flatten(model)
 
@@ -419,26 +431,27 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         batch += torch.randn_like(batch) * 0.05
         stacked = layout.batch_unflatten(batch)
 
-        inputs = torch.randn(16, 4)
+        inputs = torch.randn(16, 4, dtype=torch.float64)
         targets = torch.randint(0, 3, (16,))
-        loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
+        if probability:
+            targets = torch.softmax(torch.randn(16, 3, dtype=torch.float64), dim=1)
+        loss_fn = nn.CrossEntropyLoss(**config)
 
         evaluator = NNCostEvaluator(model, loss_fn)
-        # Configured loss must fall back so the real (smoothed) loss is used.
-        assert evaluator._batched_linear is None
+        assert evaluator._batched_linear is not None
 
         losses = evaluator.evaluate(stacked, inputs, targets)
 
         model.eval()
         buffers = dict(model.named_buffers())
-        expected = torch.zeros(N)
+        expected = torch.zeros(N, dtype=torch.float64)
         for i in range(N):
             sd = {k: v[i] for k, v in stacked.items()}
             with torch.no_grad():
                 out = functional_call(model, {**sd, **buffers}, (inputs,))
                 expected[i] = loss_fn(out, targets)
 
-        torch.testing.assert_close(losses, expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(losses, expected, atol=1e-12, rtol=0)
 
 
 def test_chunk_size_produces_same_result():
@@ -867,3 +880,58 @@ def test_evaluator_reset_reuses_alias_check(monkeypatch):
     ParamLayout.from_module(model)
     NNCostEvaluator(model, nn.MSELoss(), use_inplace=False).reset_vmap()
     assert len(calls) == 1
+
+
+def test_vmap_shares_expanded_parameters():
+    torch.manual_seed(0)
+
+    class ConvNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(1, 2, 3)
+            self.fc = nn.Linear(8, 3)
+
+        def forward(self, x):
+            return self.fc(torch.relu(self.conv(x)).flatten(1))
+
+    model = ConvNet().double()
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
+    params = {k: v.detach().expand(4, *v.shape) for k, v in model.named_parameters()}
+    params["fc.bias"] = params["fc.bias"] + torch.randn(4, 3, dtype=torch.float64)
+    batched = []
+    model.conv.register_forward_hook(lambda m, a, out: batched.append(torch._C._functorch.is_batchedtensor(out)))
+    x, y = torch.randn(5, 1, 4, 4, dtype=torch.float64), torch.randint(0, 3, (5,))
+
+    shared = ev.evaluate(params, x, y)
+    cloned = ev.evaluate({k: v.clone() for k, v in params.items()}, x, y)
+    torch.testing.assert_close(shared, cloned, rtol=0, atol=1e-12)
+    assert batched == [False, True]
+
+
+def test_residual_straddler_keeps_dense_vmap():
+    torch.manual_seed(0)
+
+    class ResidualMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.body = nn.Linear(4, 4)
+            self.short = nn.Linear(4, 4)
+            self.head = nn.Linear(4, 2)
+
+        def forward(self, x):
+            h = self.body(x)
+            h += self.short(x)
+            return self.head(torch.tanh(h))
+
+    model = ResidualMLP().double()
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    params = {k: v.detach().expand(3, *v.shape) for k, v in model.named_parameters()}
+    for k in ("short.weight", "short.bias"):
+        params[k] = params[k] + 0.1 * torch.randn_like(params[k])
+    x, y = torch.randn(5, 4, dtype=torch.float64), torch.randn(5, 2, dtype=torch.float64)
+    expected = [
+        nn.functional.mse_loss(functional_call(model, {k: v[i] for k, v in params.items()}, (x,)), y) for i in range(3)
+    ]
+
+    torch.testing.assert_close(ev.evaluate(params, x, y), torch.stack(expected))
+    assert not ev._vmap_failed

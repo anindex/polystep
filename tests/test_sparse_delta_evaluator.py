@@ -6,8 +6,16 @@ import pytest
 import torch
 import torch.nn as nn
 
-from polystep import PolyStepOptimizer
-from polystep.cost_nn import BatchedLinearEvaluator, NNCostEvaluator, SparseDeltaEvaluator
+from polystep import HybridSubspace, PolyStepOptimizer
+from polystep._step_core import activation_elements
+from polystep.cost_nn import (
+    BatchedLinearEvaluator,
+    NNCostEvaluator,
+    SiteVmapEvaluator,
+    SparseDeltaEvaluator,
+    _class_major_cross_entropy,
+    _confined_site,
+)
 from polystep.transform import ParamLayout
 
 PDIM = 2
@@ -107,6 +115,38 @@ def test_wide_runs_keep_touched_output_units(pdim):
     assert last_row and (wide or pdim < 6), (wide, last_row)
 
 
+@pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+@pytest.mark.parametrize("pdim,polytope", [(2, "cube"), (4, "orthoplex"), (8, "simplex")])
+def test_aligned_sparse_run_matches_two_lane(monkeypatch, pdim, polytope, block_strategy):
+    """A run the layout proves row-aligned scores one unit, as the two-lane contraction does."""
+    one_lane_units = set()
+
+    def run(one_lane):
+        def confined(x, j, delta, stride, d_out, aligned=False):
+            if aligned and stride is not None and stride % j.shape[1] == 0:
+                assert torch.equal(j[:, -1] // stride, j[:, 0] // stride), "an aligned run crosses a row"
+                one_lane_units.add(d_out)
+            return _confined_site(x, j, delta, stride, d_out, aligned and one_lane)
+
+        monkeypatch.setattr("polystep.cost_nn._confined_site", confined)
+        torch.manual_seed(0)
+        model = _mlp([8, 5, 8, 3], act=nn.Tanh)
+        inputs, targets = torch.randn(16, 8), torch.randint(0, 3, (16,))
+        evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+        opt = PolyStepOptimizer(
+            model, particle_dim=pdim, polytope_type=polytope, solver="softmax", seed=0, block_strategy=block_strategy
+        )
+        opt.register_evaluator(evaluator, inputs, targets)
+        losses = [opt.step(lambda p: evaluator.evaluate(p, inputs, targets)) for _ in range(2)]
+        return torch.tensor(losses), torch.cat([p.detach().flatten() for p in model.parameters()])
+
+    one, two = run(True), run(False)
+    assert one_lane_units == ({5} if block_strategy == "monolithic" else {5, 3})
+    tol = 0 if pdim == 2 else 1e-5
+    for got, expected in zip(one, two):
+        torch.testing.assert_close(got, expected, rtol=tol, atol=tol)
+
+
 def test_candidate_batch_matches_single_calls():
     """The chunk is evaluated in one call, so N candidates must agree with N calls."""
     torch.manual_seed(0)
@@ -162,6 +202,50 @@ def test_grouping_candidates_by_particle_changes_nothing():
         targets,
     )
     torch.testing.assert_close(grouped, flat, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "tail,loss_fn,dtype,expected_calls",
+    [
+        ((), nn.CrossEntropyLoss(), torch.long, 2),
+        ((), nn.CrossEntropyLoss(ignore_index=10), torch.long, 2),
+        ((), nn.CrossEntropyLoss(ignore_index=3), torch.uint8, 0),
+        ((), nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)), torch.long, 0),
+        ((), nn.CrossEntropyLoss(label_smoothing=0.1), torch.long, 0),
+        ((nn.Tanh(),), nn.CrossEntropyLoss(), torch.long, 0),
+    ],
+    ids=["long", "long_ignore10", "uint8", "weight", "smoothing", "trailing_tanh"],
+)
+def test_class_major_ce_matches_reference_fp64(monkeypatch, tail, loss_fn, dtype, expected_calls):
+    """Class-major cross-entropy matches functional_call; unsupported configs keep the old path."""
+    calls = []
+    monkeypatch.setattr(
+        "polystep.cost_nn._class_major_cross_entropy", lambda *a: calls.append(1) or _class_major_cross_entropy(*a)
+    )
+    torch.manual_seed(0)
+    model = nn.Sequential(*_mlp([6, 5, 4]), *tail).double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    evaluator = SparseDeltaEvaluator.try_build(model, loss_fn, layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    inputs, targets = torch.randn(9, 6, dtype=torch.float64), torch.randint(0, 3, (9,))
+    inputs[0, 0] = float("inf")
+    targets[::3] = loss_fn.ignore_index
+    targets = targets.to(dtype)
+
+    groups, cand = 4, 3
+    for starts in (torch.arange(0, groups * PDIM, PDIM), torch.tensor([30, 32, 30, 32])):
+        entry = evaluator.resolve_site(starts, PDIM)
+        local = starts.unsqueeze(1) + torch.arange(PDIM) - entry.offset
+        values = torch.randn(groups, cand, PDIM, dtype=torch.float64, generator=torch.Generator().manual_seed(2))
+        got = evaluator.evaluate(base_sd, entry.key, local, values, inputs, targets)
+        expected = []
+        for g in range(groups):
+            for c in range(cand):
+                param = base_sd[entry.key].flatten().index_put((local[g],), values[g, c])
+                params = {**base_sd, entry.key: param.view_as(base_sd[entry.key])}
+                expected.append(loss_fn(torch.func.functional_call(model, params, (inputs,)), targets))
+        torch.testing.assert_close(got, torch.stack(expected), rtol=0, atol=1e-12)
+    assert len(calls) == expected_calls
 
 
 def test_declines_run_straddling_two_parameters():
@@ -224,7 +308,27 @@ def test_declines_configured_loss():
     """A loss the batched reduction cannot reproduce must use the real loss_fn."""
     model = _mlp([4, 4, 2])
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
-    assert SparseDeltaEvaluator.try_build(model, nn.CrossEntropyLoss(label_smoothing=0.1), layout) is None
+    assert SparseDeltaEvaluator.try_build(model, nn.CrossEntropyLoss(reduction="sum"), layout) is None
+
+
+@pytest.mark.parametrize("hybrid", [False, True], ids=["full", "hybrid"])
+def test_functional_cross_entropy_takes_delta_path(hybrid):
+    def run(loss_fn):
+        torch.manual_seed(0)
+        model = _mlp([8, 6, 3])
+        evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
+        inputs, targets = torch.randn(12, 8), torch.randint(0, 3, (12,))
+        subspace = HybridSubspace.auto_from_layout(ParamLayout.from_module(model)) if hybrid else None
+        opt = PolyStepOptimizer(model, compile=False, seed=7, chunk_size=4, subspace=subspace)
+        opt.register_evaluator(evaluator, inputs, targets)
+        assert (opt._subspace_delta_evaluator if hybrid else opt._sparse_delta_evaluator) is not None
+        for _ in range(3):
+            opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+        return model.state_dict()
+
+    functional, module = run(nn.functional.cross_entropy), run(nn.CrossEntropyLoss())
+    for key in module:
+        assert torch.equal(functional[key], module[key])
 
 
 def test_fast_path_keeps_step_trajectory():
@@ -543,3 +647,52 @@ def test_only_straddling_particles_fall_back(hybrid, layers, out, expected):
 
     opt.step(closure)
     assert sum(rows) == expected
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+def test_delta_chunk_ignores_site_parameter_size(block_strategy, monkeypatch):
+    torch.manual_seed(7)
+    model = _mlp([784, 64, 10]).cuda()
+    inputs, targets = torch.randn(128, 784, device="cuda"), torch.randint(0, 10, (128,), device="cuda")
+    evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+    opt = PolyStepOptimizer(model, compile=False, seed=7, block_strategy=block_strategy)
+    opt.register_evaluator(evaluator, inputs, targets)
+    assert opt._site_vmap_evaluator is not None
+    sizes, vmap_calls = [], []
+    delta = SparseDeltaEvaluator.evaluate
+
+    def counted(self, base_sd, key, local_idx, values, *rest, **kw):
+        sizes.append(values.shape[0] * values.shape[1])
+        return delta(self, base_sd, key, local_idx, values, *rest, **kw)
+
+    monkeypatch.setattr(SparseDeltaEvaluator, "evaluate", counted)
+    monkeypatch.setattr(SiteVmapEvaluator, "evaluate", lambda *a: vmap_calls.append(1))
+    opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    act = activation_elements(opt, inputs)
+    numel = max(e.numel for e in opt.layout.entries)
+    assert not vmap_calls
+    assert (1 << 26) // (2 * act + numel) < max(sizes) <= (1 << 26) // (2 * act)
+
+
+@pytest.mark.parametrize("block_strategy", ["monolithic", "per_layer"])
+def test_cpu_delta_chunk_keeps_parameter_charge(block_strategy, monkeypatch):
+    torch.manual_seed(7)
+    model = _mlp([256, 64, 4])
+    inputs, targets = torch.randn(4, 256), torch.randint(0, 4, (4,))
+    evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+    opt = PolyStepOptimizer(model, compile=False, seed=7, block_strategy=block_strategy)
+    opt.register_evaluator(evaluator, inputs, targets)
+    sizes = []
+    delta = SparseDeltaEvaluator.evaluate
+
+    def counted(self, base_sd, key, local_idx, values, *rest, **kw):
+        sizes.append(values.shape[0] * values.shape[1])
+        return delta(self, base_sd, key, local_idx, values, *rest, **kw)
+
+    monkeypatch.setattr(SparseDeltaEvaluator, "evaluate", counted)
+    opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
+    act = activation_elements(opt, inputs)
+    numel = max(e.numel for e in opt.layout.entries)
+    assert max(sizes) <= (1 << 26) // (2 * act + numel)

@@ -10,7 +10,7 @@ import torch.nn as nn
 
 
 class DiscreteMLPPolicy(nn.Sequential):
-    """MLP policy for discrete-action direct policy search. An nn.Sequential subclass, as the batched evaluators require."""
+    """MLP policy for discrete-action direct policy search. An nn.Sequential subclass, so the batched paths need no tracing."""
 
     def __init__(self, obs_dim: int, hidden: int, action_dim: int):
         super().__init__(

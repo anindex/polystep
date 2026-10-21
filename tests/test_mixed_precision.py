@@ -187,6 +187,20 @@ def test_bf16_batched_cross_entropy_matches_vmap():
     assert batched[1] < batched[0]
 
 
+def test_bf16_weighted_cross_entropy_scores_candidates():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 3)).bfloat16()
+    loss_fn = nn.CrossEntropyLoss(weight=torch.tensor([0.5, 2.0, 1.0], dtype=torch.bfloat16))
+    inputs, targets = torch.randn(8, 4, dtype=torch.bfloat16), torch.randint(0, 3, (8,))
+    weight = model[0].weight.detach()
+    bias = torch.randn(2, 3, dtype=torch.bfloat16)
+    evaluator = NNCostEvaluator(model, loss_fn)
+    evaluator._batched_linear = None
+    losses = evaluator.evaluate({"0.weight": weight.expand(2, *weight.shape).clone(), "0.bias": bias}, inputs, targets)
+    expected = torch.stack([loss_fn(nn.functional.linear(inputs, weight, b), targets) for b in bias])
+    torch.testing.assert_close(losses, expected)
+
+
 @pytest.mark.parametrize("loss_fn", [nn.MSELoss(), nn.L1Loss()])
 def test_bf16_batched_regression_reduces_in_fp32(loss_fn):
     """The batched path averages BF16 outputs in FP32, so each candidate matches its

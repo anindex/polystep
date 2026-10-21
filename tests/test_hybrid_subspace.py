@@ -949,3 +949,31 @@ def test_absorb_keeps_caller_buffers():
     base = {"0.weight": torch.zeros(5, 6), "0.bias": torch.zeros(5), "running_thing": torch.ones(3)}
     new_base, _ = sub.absorb(proj, base, torch.zeros(sub.subspace_dim))
     assert "running_thing" in new_base
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize(
+    "layers",
+    [
+        lambda: [nn.Linear(16, 4), nn.Tanh(), nn.Linear(4, 2)],
+        lambda: [nn.Linear(16, 5), nn.LayerNorm(5), nn.Linear(5, 3)],
+    ],
+)
+def test_offset_batch_matches_reconstruct_batch(layers, sparse):
+    torch.manual_seed(0)
+    model = nn.Sequential(*layers()).double()
+    sub = HybridSubspace.from_layout(
+        ParamLayout.from_module(model), rank=2, sparse_threshold_bytes=0 if sparse else 10**9
+    )
+    proj = sub.init_projections(torch.device("cpu"), torch.float64)
+    base = {k: v.detach() for k, v in model.named_parameters()}
+    coords = torch.randn(-(-sub.subspace_dim // 8) * 8, dtype=torch.float64)
+    bary = sub.apply_perturbation(proj, base, coords[: sub.subspace_dim])
+    for lo in range(0, coords.numel(), 8):
+        delta = torch.randn(5, 8, dtype=torch.float64)
+        cand = coords.repeat(5, 1)
+        cand[:, lo : lo + 8] += delta
+        want = sub.reconstruct_batch(proj, base, cand[:, : sub.subspace_dim])
+        got = sub.offset_batch(proj, bary, lo, delta)
+        for k in want:
+            torch.testing.assert_close(got[k], want[k], rtol=0, atol=1e-12)

@@ -20,19 +20,47 @@ evaluation when `biased_rotation` or `trust_region` uses it.
 
 | Model | Path | Selection |
 |---|---|---|
-| Sequential MLP, full space | Sparse delta | Automatic after registration |
-| Sequential MLP, hybrid subspace | Subspace delta | Automatic after registration |
-| Sequential MLP, factored subspace | Subspace delta, low-rank correction as fallback | Automatic after registration; on CUDA the low-rank correction when one chunk holds every candidate or chunks are small |
+| Linear MLP, full space | Sparse delta | Automatic after registration |
+| Linear MLP, hybrid subspace | Subspace delta | Automatic after registration |
+| Linear MLP, factored subspace | Subspace delta, low-rank correction as fallback | Automatic after registration; on CUDA the low-rank correction when one chunk holds every candidate or chunks are small |
 | Any model, `AdaptiveSubspace` on CPU | Incumbent plus the moved particle's projection columns | Automatic with a dense FP32 or FP64 projection |
-| Convolution, attention, custom forward | Site-local vmap | Automatic when supported |
-| Sequential MLP, dense candidates | Batched matrix multiplication | Automatic |
+| Convolution, attention, other custom forwards | Site-local vmap | Automatic when supported |
+| Linear MLP, dense candidates | Batched matrix multiplication | Automatic |
 | Other models | vmap or sequential fallback | Automatic |
 | Models too large for batched weight copies | In-place parameter swaps | Automatic on CUDA when eight weight copies would take more than half the free memory; `NNCostEvaluator(..., use_inplace=True)` forces it |
 
+A Linear MLP is an `nn.Sequential`, or a module whose forward chains Linear layers,
+the common activations and `x.flatten(1)`, one call feeding the next. Activations count
+as modules or as `torch.relu`, `F.gelu` and similar calls with default arguments. Hooks,
+buffers, residual connections and other operations keep a custom forward on the
+site-local or vmap path.
+
+On the site-local path on CPU, a candidate that moves an FP32 or FP64 weight with two or
+more dimensions and at least 512 elements does not get its own copy of that weight. Each
+`F.linear` or ungrouped convolution that reads the weight with an input shared by all
+candidates adds the candidate's output change to the shared output. Any other read,
+including one whose input already depends on the candidate, as in the later steps of a
+recurrent loop, uses the candidate's weight, built once per forward, and so does every
+read after it. A forward that opens its own `torch.vmap` or other `torch.func` transform
+gets a full copy per candidate. The added change rounds differently from a built weight,
+so FP32 losses can differ in the last bits. On one CPU thread this made a step 3.5 times
+faster for a residual 784-256-256-10 MLP at batch 64 and 3.7 times faster for a LeNet-5
+at batch 32. CUDA keeps a full copy per candidate. There, intercepting each call of the
+forward costs a few microseconds that a launch-bound step pays in full: on an RTX 5090
+the residual MLP gained only 3%, while a LeNet-5 and a 20-step RNN with hidden size 64
+took about 1.3 times as long per step. Biases, weights below that size, FP16/BF16
+weights and `compile_vmap=True` keep a full copy too; for a small weight the copy costs
+less than intercepting every call of the forward.
+
+The Linear MLP paths need a builtin loss: `nn.CrossEntropyLoss`, `nn.MSELoss` or
+`nn.L1Loss` with mean reduction, or `F.cross_entropy`, `F.mse_loss` or `F.l1_loss`.
+Cross-entropy may carry class weights, `ignore_index` and label smoothing. Any other
+loss, including a lambda that calls one of these, takes the site-local or vmap path.
+
 The delta and factored paths treat each sample as one feature vector, so they need
-two-dimensional inputs or a leading `nn.Flatten`. A Sequential MLP applied per token
-to `(batch, tokens, features)` inputs takes the site-local path instead in full-space
-and hybrid runs; factored runs materialize its candidates.
+two-dimensional inputs or a leading `nn.Flatten` or `x.flatten(1)`. A Linear MLP
+applied per token to `(batch, tokens, features)` inputs takes the site-local path
+instead in full-space and hybrid runs; factored runs materialize its candidates.
 
 `NNCostEvaluator(model, loss_fn, use_inplace=True)` runs the model's own forward,
 one candidate at a time, and turns off the vmap, delta and factored paths. Each
@@ -41,7 +69,8 @@ candidate that changes one parameter then rewrites only that parameter, and in f
 space only its own entries. Tied weights share storage, so they move together. The
 registered evaluator's loss scores these candidates. Candidates that span two
 parameters, FP16/BF16 hybrid weights and non-contiguous parameters swap in every
-weight instead, as do screened hybrid candidates, the hybrid incumbent and models
+weight instead, as do screened hybrid candidates of
+[small steps](api_overview.md#evaluation-controls), the hybrid incumbent and models
 with a `max_norm` embedding, whose forward rewrites the rows it looks up. When the
 evaluator picks the in-place path on its own to save memory, it still uses the
 site-local, delta and factored paths where they apply and swaps the remaining
@@ -93,11 +122,11 @@ but restrict the search. Retune the radii when changing the representation.
 compute `x @ W.T + (x @ B.T) @ A.T` without constructing candidate weights. A
 candidate changes a few consecutive coordinates of one `A`, so the subspace-delta
 path scores it from `x @ B.T` and moves only the output units those coordinates
-belong to. Runs that span two parameters, screened candidates and the incumbent use
-the full low-rank correction, which computes `x @ W.T` and `x @ B.T` for the first
-perturbed layer once per candidate sweep and reuses them across its chunks.
-Screening and incumbent scoring are separate sweeps. The search is limited to the
-input directions spanned by `B`; basis rotation changes that search space.
+belong to. Runs that span two parameters, screened candidates of small steps and the
+incumbent use the full low-rank correction, which computes `x @ W.T` and `x @ B.T`
+for the first perturbed layer once per candidate sweep and reuses them across its
+chunks. Screening and incumbent scoring are separate sweeps. The search is limited to
+the input directions spanned by `B`; basis rotation changes that search space.
 
 The delta path scores each parameter in its own pass and launches more kernels per
 chunk than the low-rank correction, which a GPU pays for while its chunks are too
@@ -133,20 +162,29 @@ many thin batched products the offsets need.
 candidate's parameters and its largest layer output, which one forward measures when
 the evaluator is first registered and which then scales with the batch. Delta and
 site-local paths build no full candidate, so they are budgeted on activations and the
-perturbed parameter alone. A site-local path batches only the layers from the
-perturbed one on, so each site is budgeted on the module outputs from its own layer
-on. A forward that draws random numbers is batched from the draw on, so its sites
-keep the whole-model budget, as does a parameter the forward reads before calling its
-layer. In example 10's LeNet-5 at batch 256, a chunk holds 27 candidates on the first
-convolution, whose output fills the budget, 72 on the second and up to 729 on the
-fully connected layers, so a step scores its 4,833 candidates in 36 forwards. Reduce
+perturbed parameter alone. The full-space delta path on CUDA counts activations only,
+since it never builds the parameter, so its chunks are larger and its peak memory
+higher: 397 MiB instead of 163 MiB for 784-256-256-10 at batch 256 on an RTX 5090. A
+candidate's loss can depend on the chunk shape, so on that model the larger chunks
+change a few losses in the last float32 bit. The CPU keeps the parameter in the budget,
+because smaller chunks run faster there. A site-local path batches only the layers from
+the perturbed one on, so each site is budgeted on the module outputs from its own layer
+on. A forward that draws random numbers is batched from the draw on, so its sites keep
+the whole-model budget, as does a parameter the forward reads before calling its layer.
+In example 10's LeNet-5 at batch 256, a chunk holds 27 candidates on the first
+convolution, whose output fills the budget, 72 on the second and up to 729 on the fully
+connected layers, so a step scores its 4,833 candidates in 36 forwards. Reduce
 `chunk_size` after an out-of-memory error.
 
 Steps that score on a delta or site-local path, or on CPU `AdaptiveSubspace` offsets,
 keep whole particles in each chunk, every vertex and probe of one particle, so
 `chunk_size` drops to a multiple of the vertex count times `num_probe` and never goes
 below one such group. A particle that straddles two parameters gets a chunk of its
-own and falls back to materialization, in batches of at most `chunk_size`. So does the
+own. With `HybridSubspace`, FP32 or FP64 weights and no in-place evaluator, that chunk
+builds only the parameters the particle moves, as the incumbent plus the touched
+projection columns, and passes the rest as expanded views of the incumbent, so the vmap
+forward runs the layers ahead of the first moved parameter once. Otherwise the chunk
+falls back to materialization, in batches of at most `chunk_size`. So does the
 padded particle at the end of the CPU offsets, or of a per-layer or grouped block
 other than the last. On the delta and site-local paths the padded last particle stays
 with the particles before it, since its padding moves no parameter. Each chunk costs
@@ -165,10 +203,11 @@ Profiler output confirms whether a compiled region actually ran. PyTorch's
 recompilation limit can cause later calls to run eagerly.
 
 CPU attention uses native scaled-dot-product attention; CUDA uses explicit matmuls.
-BF16/FP16 solver costs accumulate in FP32. An `nn.CrossEntropyLoss`, `nn.MSELoss`, or
-`nn.L1Loss` left at its defaults apart from `reduction` also reduces half-precision
-candidate outputs in FP32, whether they come from an FP16/BF16 model or from
-`candidate_autocast`. Other losses keep their own dtype. Mixed-dtype models require
+BF16/FP16 solver costs accumulate in FP32. The builtin cross-entropy, MSE and L1
+losses, as modules or `torch.nn.functional` calls, also reduce half-precision candidate
+outputs in FP32, whether they come from an FP16/BF16 model or from
+`candidate_autocast`. A cross-entropy with class weights does so only on the Linear
+MLP paths. Other losses keep their own dtype. Mixed-dtype models require
 per-entry subspaces; see [limitations](../LIMITATIONS.md).
 
 With FP16 or BF16 parameters the subspace-delta and factored paths are off. They add

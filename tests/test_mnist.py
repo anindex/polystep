@@ -94,11 +94,10 @@ def test_overlapping_downloads_use_separate_temp_files(tmp_path, monkeypatch):
 class SmallMNISTNet(nn.Sequential):
     """7x7 input, 16 hidden: 49*16+16 + 16*10+10 = 970 params.
 
-    An ``nn.Sequential`` subclass, not a plain ``nn.Module``: every batched
-    evaluator checks ``type(model).forward is nn.Sequential.forward`` before it will
-    build a plan, so an identical hand-written ``forward`` silently opts the model out
-    of the bmm and subspace-delta paths. The ``OrderedDict`` keeps the ``fc1``/``fc2``
-    state_dict keys.
+    An ``nn.Sequential`` subclass, not a plain ``nn.Module``: the batched evaluators
+    read its children directly, while a hand-written ``forward`` must trace to a strict
+    Linear/activation chain, and one that does not opts the model out of the bmm and
+    subspace-delta paths. The ``OrderedDict`` keeps the ``fc1``/``fc2`` state_dict keys.
     """
 
     def __init__(self, input_dim: int = 49, hidden: int = 16):

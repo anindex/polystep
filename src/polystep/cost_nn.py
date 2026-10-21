@@ -16,9 +16,10 @@ from typing import Callable, Optional, TYPE_CHECKING, Union
 
 import torch
 import torch.nn as nn
+from torch._C._functorch import is_batchedtensor, maybe_current_level
 from torch.func import functional_call, vmap
 from torch.overrides import TorchFunctionMode
-from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_leaves, tree_map
 
 from .projection import SparseRandomProjection
 from .solvers._shared import loss_buffer_dtype
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
 
 # Smallest candidate batch worth the batched paths; below it the in-place path wins.
 _MIN_BATCHED_CANDIDATES = 8
+
+_MIN_INJECTED_SITE_NUMEL = 512
 
 
 def _is_vmap_error(e: BaseException, probe: Callable[[], object]) -> bool:
@@ -128,12 +131,73 @@ class _FirstParameterUse(TorchFunctionMode):
         return func(*args, **(kwargs or {}))
 
 
-def _builtin_loss_kind(loss_fn) -> Optional[str]:
-    """Name an unmodified cross-entropy, MSE, or L1 loss at any reduction, else None.
+_CONV_DIMS = {nn.functional.conv1d: 1, nn.functional.conv2d: 2, nn.functional.conv3d: 3}
 
-    A configured loss has no reproduction and falls back to vmap; a subclass that
-    overrides ``forward`` would score candidates on a different objective.
+_TENSOR_METADATA = {
+    torch.Tensor.shape.__get__,
+    torch.Tensor.dtype.__get__,
+    torch.Tensor.device.__get__,
+    torch.Tensor.ndim.__get__,
+    torch.Tensor.size,
+    torch.Tensor.dim,
+    torch.Tensor.numel,
+}
+
+
+class _SiteNotInjectable(Exception):
+    """A torch call ran inside a transform the forward opened, where ``base`` is wrapped."""
+
+
+class _SiteDelta(TorchFunctionMode):
+    """Adds ``dv`` at flat ``rows`` of ``base`` to each torch call that reads ``base``."""
+
+    def __init__(self, base, rows, dv):
+        super().__init__()
+        self.base, self.rows, self.dv, self.site = base, rows, dv, None
+        self.width = base.numel() // base.shape[0]
+        self.outs, self.ins = rows // self.width, rows % self.width
+        self.level = maybe_current_level()
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if maybe_current_level() != self.level:
+            raise _SiteNotInjectable
+        kwargs = kwargs or {}
+        base, rows, dv = self.base, self.rows, self.dv
+        reads = sum(t is base for t in tree_leaves((args, kwargs)))
+        if not reads or func in _TENSOR_METADATA:
+            return func(*args, **kwargs)
+        if self.site is None and reads == 1 and len(args) > 1 and args[1] is base:
+            if func is nn.functional.linear and base.dim() == 2 and not is_batchedtensor(args[0]):
+                out = func(*args, **kwargs)
+                return out.scatter_add(-1, self.outs.expand(*out.shape[:-1], -1), args[0][..., self.ins] * dv)
+            dims = _CONV_DIMS.get(func)
+            if dims and (args[6] if len(args) > 6 else kwargs.get("groups", 1)) == 1 and not is_batchedtensor(args[0]):
+                kernel = base.new_zeros(rows.shape[0], self.width).scatter(1, self.ins.unsqueeze(1), dv.unsqueeze(1))
+                bias_free = {k: v for k, v in kwargs.items() if k != "bias"}
+                delta = func(args[0], kernel.view(-1, *base.shape[1:]), None, *args[3:], **bias_free)
+                outs = self.outs.view(-1, *[1] * dims).expand_as(delta)
+                return func(*args, **kwargs).scatter_add(-dims - 1, outs, delta)
+        if self.site is None:
+            self.site = base.reshape(-1).scatter_add(0, rows, dv).view_as(base)
+        args, kwargs = tree_map(lambda t: self.site if t is base else t, (args, kwargs))
+        return func(*args, **kwargs)
+
+
+_FUNCTIONAL_LOSSES = (
+    (nn.functional.cross_entropy, "cross_entropy"),
+    (nn.functional.mse_loss, "mse"),
+    (nn.functional.l1_loss, "l1"),
+)
+
+
+def _builtin_loss_kind(loss_fn) -> Optional[str]:
+    """Name a cross-entropy, MSE, or L1 function or unmodified module loss, else None.
+
+    A subclass that overrides ``forward`` would score candidates on a different objective.
     """
+    for fn, kind in _FUNCTIONAL_LOSSES:
+        if loss_fn is fn:
+            return kind
     if _has_hooks(loss_fn):
         return None
     for base, kind in ((nn.CrossEntropyLoss, "cross_entropy"), (nn.MSELoss, "mse"), (nn.L1Loss, "l1")):
@@ -141,17 +205,13 @@ def _builtin_loss_kind(loss_fn) -> Optional[str]:
             continue
         if type(loss_fn).forward is not base.forward:
             return None
-        if kind == "cross_entropy" and not (
-            loss_fn.weight is None and loss_fn.ignore_index == -100 and float(loss_fn.label_smoothing) == 0.0
-        ):
-            return None
         return kind
     return None
 
 
 def _batched_loss_kind(loss_fn) -> Optional[str]:
     """Name the per-sample reduction the batched-linear path can reproduce, else None."""
-    return _builtin_loss_kind(loss_fn) if getattr(loss_fn, "reduction", None) == "mean" else None
+    return _builtin_loss_kind(loss_fn) if getattr(loss_fn, "reduction", "mean") == "mean" else None
 
 
 def _fold_candidate_loss(loss, per_sample):
@@ -178,10 +238,19 @@ def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
         tgt = targets.unsqueeze(0).expand(n, *targets.shape).flatten(0, 1)
         logits = outputs.flatten(0, 1)
         logits = logits.to(loss_buffer_dtype(logits.dtype))
-        losses = torch.nn.functional.cross_entropy(logits, tgt, reduction="none").reshape(n, -1)
+        weight = getattr(loss_fn, "weight", None)
+        weight = None if weight is None else weight.to(logits.dtype)
+        ignore = getattr(loss_fn, "ignore_index", -100)
+        smoothing = getattr(loss_fn, "label_smoothing", 0.0)
+        losses = torch.nn.functional.cross_entropy(
+            logits, tgt, weight=weight, ignore_index=ignore, label_smoothing=smoothing, reduction="none"
+        ).reshape(n, -1)
         if targets.shape == outputs.shape[1:]:  # Probability targets have no ignored labels.
             return losses.mean(dim=1)
-        return losses.sum(dim=1) / (targets != -100).sum()  # All ignored: 0/0 matches mean CE.
+        valid = targets != ignore
+        if weight is None:
+            return losses.sum(dim=1) / valid.sum()  # All ignored: 0/0 matches mean CE.
+        return losses.sum(dim=1) / (weight[targets.masked_fill(~valid, 0)] * valid).sum()
 
     # Cast before expand, or the cast materializes the whole (N, *target) tensor;
     # promote so FP64 targets keep precision and half precision reduces in FP32.
@@ -196,9 +265,23 @@ def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
     return fn(out, tgt, reduction="none").flatten(1).mean(dim=1)  # (N,)
 
 
+def _class_major_cross_entropy(z, targets, ignore):
+    """Mean cross-entropy per ``(G, c)`` of ``(G, C, c, B)`` logits; overwrites ``z``."""
+    valid = targets != ignore
+    index = targets.masked_fill(~valid, 0).view(1, 1, 1, -1).expand(z.shape[0], 1, *z.shape[2:])
+    picked = z.gather(1, index).squeeze(1)
+    top = z.amax(1, keepdim=True)
+    lse = z.sub_(top).exp_().sum(1).log_().add_(top.squeeze(1))
+    return torch.where(valid, lse - picked, 0).sum(-1) / valid.sum()
+
+
 def _candidate_loss(loss_fn, loss_kind, output, targets):
-    """``loss_fn`` on one forward's output; a builtin loss reduces half precision in FP32."""
-    if loss_kind is not None and output.dtype in (torch.float16, torch.bfloat16):
+    """``loss_fn`` on one forward's output; an unweighted builtin loss reduces half precision in FP32."""
+    if (
+        loss_kind is not None
+        and getattr(loss_fn, "weight", None) is None
+        and output.dtype in (torch.float16, torch.bfloat16)
+    ):
         output = output.float()
     return loss_fn(output, targets) if targets is not None else loss_fn(output)
 
@@ -262,10 +345,11 @@ class NNCostEvaluator:
         self.loss_fn = loss_fn
         self.autocast_dtype = autocast_dtype
         # A reducing loss_fn returns (N,), the shape per_sample exists to avoid.
-        if per_sample and getattr(loss_fn, "reduction", "none") != "none":
+        reduction = getattr(loss_fn, "reduction", "mean" if self._loss_kind else "none")
+        if per_sample and reduction != "none":
             raise ValueError(
                 f"per_sample=True needs loss_fn.reduction='none', got "
-                f"{loss_fn.reduction!r}. A reducing loss collapses the batch before "
+                f"{reduction!r}. A reducing loss collapses the batch before "
                 f"evaluate() can return the (N, B) tensor."
             )
         self.per_sample = per_sample
@@ -273,6 +357,7 @@ class NNCostEvaluator:
         self._chunk_size_cached = _UNSET  # lazily computed for "auto"
         self._reset_count = 0
         self._vmap_failed = False
+        self._share_failed = False
         self._randomness = "error"
         self._warned = False
         self._compile_vmap = compile_vmap
@@ -327,10 +412,12 @@ class NNCostEvaluator:
         """Rebuild every cache that pins the model's shape at construction.
 
         Call after swapping a layer, rebinding a buffer, replacing a Parameter,
-        moving the model, or after changing loss_fn's settings in place.
+        moving the model, flipping a Python attribute the forward branches on, or
+        after changing loss_fn's settings in place.
         """
         self._reset_count += 1
         self._vmap_failed = False
+        self._share_failed = False
         self._randomness = "error"
         self._warned = False
         # A prior compile failure should not stay latched after the model changed.
@@ -593,6 +680,9 @@ class NNCostEvaluator:
                     self._randomness = "different"
                     self._compiled_vmap_fn = None
                     return self._dispatch(stacked_params, inputs, targets)
+                if not self._share_failed and any(v.stride(0) == 0 for v in stacked_params.values()):
+                    self._share_failed = True
+                    return self._dispatch(stacked_params, inputs, targets)
                 if not _is_vmap_error(
                     e, lambda: self._evaluate_loop({k: v[:1] for k, v in stacked_params.items()}, inputs, targets)
                 ):
@@ -624,13 +714,15 @@ class NNCostEvaluator:
 
         # inputs/targets are explicit args, so a cached graph does not bake in the
         # first call's batch.
-        def single_eval(params, inputs, targets):
+        def single_eval(params, shared, inputs, targets):
             # Buffers win on a key collision: frozen model state, not part of the solve.
-            full_dict = {**params, **buffers}
+            full_dict = {**shared, **params, **buffers}
             output = functional_call(model, full_dict, (inputs,))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
-        batched = vmap(single_eval, in_dims=(0, None, None), chunk_size=resolved_chunk, randomness=self._randomness)
+        batched = vmap(
+            single_eval, in_dims=(0, None, None, None), chunk_size=resolved_chunk, randomness=self._randomness
+        )
 
         # torch.compile on the vmapped forward for kernel fusion only; lazy on first call.
         if self._compile_vmap and not self._compile_failed:
@@ -653,7 +745,8 @@ class NNCostEvaluator:
 
             if self._compiled_vmap_fn is not None:
                 try:
-                    return self._compiled_vmap_fn(stacked_params, inputs, targets)
+                    dense = {k: v.contiguous() if v.stride(0) == 0 else v for k, v in stacked_params.items()}
+                    return self._compiled_vmap_fn(dense, {}, inputs, targets)
                 except Exception as e:  # noqa: BLE001
                     if _batchable_draw(e, self._randomness):
                         raise
@@ -667,7 +760,9 @@ class NNCostEvaluator:
                         stacklevel=2,
                     )
 
-        return batched(stacked_params, inputs, targets)
+        moving = {k: v for k, v in stacked_params.items() if self._share_failed or v.stride(0) != 0}
+        moving = moving or dict(itertools.islice(stacked_params.items(), 1))
+        return batched(moving, {k: v[0] for k, v in stacked_params.items() if k not in moving}, inputs, targets)
 
     @staticmethod
     def _batched_footprint_exceeds_free_memory(model: nn.Module) -> bool:
@@ -886,8 +981,7 @@ _SEQ_EQUIVALENT_WARNED = set()
 def _warn_if_sequential_equivalent(model: nn.Module, supported: tuple) -> None:
     """Warn once when a hand-written forward is all that blocks the fast paths.
 
-    The plan is rebuilt from ``named_children()``, so a custom forward can apply ops
-    those children do not name.
+    Called once the forward has failed to trace to a strict chain of its children.
     """
     key = id(type(model))
     if key in _SEQ_EQUIVALENT_WARNED:
@@ -912,10 +1006,10 @@ def _warn_if_sequential_equivalent(model: nn.Module, supported: tuple) -> None:
         return
     _SEQ_EQUIVALENT_WARNED.add(key)
     warnings.warn(
-        f"{type(model).__name__} is built from Linear/activation layers only, but defines its own "
-        f"forward, so the batched and delta evaluators decline it and every candidate goes through "
-        f"vmap. Subclass nn.Sequential instead (pass an OrderedDict to keep the same state_dict "
-        f"keys) to take the fast path.",
+        f"{type(model).__name__} is built from Linear/activation layers only, but its forward "
+        f"does not trace to a plain chain of them, so the batched and delta evaluators decline it "
+        f"and every candidate goes through vmap. Subclass nn.Sequential instead (pass an "
+        f"OrderedDict to keep the same state_dict keys) to take the fast path.",
         stacklevel=3,
     )
 
@@ -1006,7 +1100,7 @@ def _column_run(t, start, n):
     return run if real == n else nn.functional.pad(run, (0, n - real))
 
 
-def _confined_site(x, j, delta, stride, d_out):
+def _confined_site(x, j, delta, stride, d_out, aligned=False):
     """``(dcols, dvals)`` for a Linear site moved by ``delta`` at flat positions ``j``.
 
     ``j`` is one contiguous ``(G, p)`` run per group and ``stride`` the weight's row
@@ -1014,11 +1108,16 @@ def _confined_site(x, j, delta, stride, d_out):
     ``r``, so a run touches at most ``u = min(p, (p - 1) // stride + 2)`` consecutive
     units. A one-hot contraction sums the entries of each unit, since the activation
     must see their sum; a unit clamped onto the last row carries exact zeros.
+
+    ``aligned`` promises every run starts at a multiple of ``p``; with ``stride % p == 0``
+    each run then sits in one row and needs one unit.
     """
     if stride is None:
         return j, delta.unsqueeze(2).expand(*delta.shape[:2], x.shape[0], delta.shape[2])
     p = j.shape[1]
     vals = _gather_cols(x, j % stride) * delta.unsqueeze(2)
+    if aligned and stride % p == 0:
+        return j[:, :1] // stride, vals.sum(-1, keepdim=True)
     span = torch.arange(min(p, (p - 1) // stride + 2), device=j.device)
     first = j[:, :1] // stride
     onehot = (j // stride - first).unsqueeze(-1) == span
@@ -1083,6 +1182,21 @@ def _delta_walk(ev, params, inputs, targets, site_idx, site_fn, n):
         if dvals is not None:
             # Mix the confined delta into every output unit: it goes dense here.
             w_cols = weight.index_select(1, dcols.reshape(-1)).reshape(-1, *dcols.shape)
+            if (
+                x.device.type == "cpu"
+                and ev.loss_kind == "cross_entropy"
+                and targets is not None
+                and targets.dtype == torch.long
+                and targets.dim() == 1
+                and getattr(ev.loss_fn, "weight", None) is None
+                and getattr(ev.loss_fn, "label_smoothing", 0.0) == 0
+                and all(t in ("flatten", "dropout") for _, t, _ in ev._layer_keys[idx + 1 :])
+            ):
+                g, c, b, p = dvals.shape
+                z = torch.bmm(w_cols.transpose(0, 1), dvals.permute(0, 3, 1, 2).reshape(g, p, c * b))
+                z = z.view(g, -1, c, b).add_(out.t().unsqueeze(1))
+                ignore = getattr(ev.loss_fn, "ignore_index", -100)
+                return _class_major_cross_entropy(z.to(loss_buffer_dtype(z.dtype)), targets, ignore).reshape(n)
             corr = torch.einsum("ogp,gcbp->gcbo", w_cols, dvals)
             xn = out + corr.reshape(n, batch, -1)
             dcols = dvals = None
@@ -1187,6 +1301,76 @@ def _plan_children(model: nn.Module):
             yield name, mod
 
 
+_TRACED_LAYERS = {
+    nn.functional.relu: (nn.ReLU, {"inplace": False}, ()),
+    torch.relu: (nn.ReLU, {}, ()),
+    "relu": (nn.ReLU, {}, ()),
+    torch.tanh: (nn.Tanh, {}, ()),
+    "tanh": (nn.Tanh, {}, ()),
+    torch.sigmoid: (nn.Sigmoid, {}, ()),
+    "sigmoid": (nn.Sigmoid, {}, ()),
+    nn.functional.gelu: (nn.GELU, {"approximate": "none"}, ()),
+    nn.functional.silu: (nn.SiLU, {"inplace": False}, ()),
+    nn.functional.leaky_relu: (nn.LeakyReLU, {"negative_slope": 0.01, "inplace": False}, ()),
+    torch.flatten: (nn.Flatten, {}, (1,)),
+    "flatten": (nn.Flatten, {}, (1,)),
+}
+
+
+class _PlanTracer(torch.fx.Tracer):
+    """Keep every layer ``_entry`` judges as one ``call_module`` node."""
+
+    def is_leaf_module(self, m: nn.Module, module_qualified_name: str) -> bool:
+        return (
+            super().is_leaf_module(m, module_qualified_name)
+            or isinstance(m, _SUPPORTED_LAYERS)
+            or _linear_like(m)
+            or bool(getattr(m, "polystep_elementwise", False))
+        )
+
+
+def _traced_children(model: nn.Module):
+    """``(name, submodule)`` along a forward that traces to a strict chain, else None."""
+    modules = list(model.modules())
+    if any(_has_hooks(m) for m in modules) or any(True for _ in model.buffers()):
+        return None
+    if any(
+        any(True for _ in m.parameters(recurse=False)) and not (isinstance(m, nn.Linear) or _linear_like(m))
+        for m in modules
+    ):
+        return None
+    devices = list({p.device for p in model.parameters() if p.device.type == "cuda"})
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.random.fork_rng(devices=devices):
+            prev, *body, out = _PlanTracer().trace(model).nodes
+    except Exception:
+        return None
+    finally:
+        if was_training:
+            model.train()
+    if prev.op != "placeholder":
+        return None
+    children = []
+    for node in body:
+        if not node.args or node.args[0] is not prev:
+            return None
+        if node.op == "call_module":
+            if len(node.args) > 1 or node.kwargs:
+                return None
+            children.append((node.target, model.get_submodule(node.target)))
+        else:
+            layer, defaults, extra = _TRACED_LAYERS.get(node.target, (None, {}, ()))
+            if layer is None or node.args[1:] != extra:
+                return None
+            if any(defaults.get(k, _UNSET) != v for k, v in node.kwargs.items()):
+                return None
+            children.append((node.name, layer()))
+        prev = node
+    return children if out.args == (prev,) else None
+
+
 def _plan_params_distinct(layer_keys) -> bool:
     """True when no two plan entries share a parameter tensor.
 
@@ -1245,12 +1429,11 @@ class BatchedLinearEvaluator:
         cls, model: nn.Module, loss_fn: Callable, loss_kind: str = "cross_entropy"
     ) -> "BatchedLinearEvaluator | None":
         """Build if model is compatible, else return None."""
-        # The plan is rebuilt from named_children(), which misses inline activations in
-        # a custom forward; only trust real nn.Sequential forwards.
-        if type(model).forward is not nn.Sequential.forward:
-            _warn_if_sequential_equivalent(model, _SUPPORTED_LAYERS)
-            return None
         if _has_hooks(model):
+            return None
+        children = _plan_children(model) if type(model).forward is nn.Sequential.forward else _traced_children(model)
+        if children is None:
+            _warn_if_sequential_equivalent(model, _SUPPORTED_LAYERS)
             return None
 
         # Build an ordered (name, tag, module) plan; the module is kept so evaluate()
@@ -1280,7 +1463,7 @@ class BatchedLinearEvaluator:
 
         layer_keys = []
         seen_linear = False
-        for full, submod in _plan_children(model):
+        for full, submod in children:
             entry = _entry(full, submod)
             if entry is None:
                 return None  # unsupported layer (Conv2d, non-default Flatten, ...)
@@ -1437,6 +1620,7 @@ class SiteVmapEvaluator:
         self._compiled_sites = {}
         self._compile_failed_sites = set()
         self._failed_sites = set()
+        self._uninjectable_sites = set()
         self._warned = False
         self._randomness = "error"
 
@@ -1558,6 +1742,22 @@ class SiteVmapEvaluator:
         groups, cand, pdim = values.shape
         n = groups * cand
         base = base_sd[entry.key]
+        if (
+            base.device.type == "cpu"
+            and base.dim() > 1
+            and base.numel() >= _MIN_INJECTED_SITE_NUMEL
+            and base.dtype not in (torch.float16, torch.bfloat16)
+            and not self._owner._compile_vmap
+            and entry.key not in self._uninjectable_sites
+        ):
+            rows = local_idx.clamp(max=entry.numel - 1)
+            dv = values - base.reshape(-1)[rows].unsqueeze(1)
+            dv = dv.masked_fill(local_idx.unsqueeze(1) >= entry.numel, 0)
+            rows = rows.unsqueeze(1).expand(groups, cand, pdim).reshape(n, pdim)
+            try:
+                return self._vmap_over_site(entry.key, base_sd, (rows, dv.reshape(n, pdim)), inputs, targets)
+            except _SiteNotInjectable:
+                self._uninjectable_sites.add(entry.key)
         local_idx, values = self._clamp_padding(entry, local_idx, values)
 
         # Only this entry gets a candidate axis; every other parameter stays shared.
@@ -1569,8 +1769,12 @@ class SiteVmapEvaluator:
     def _vmap_over_site(self, key, base_sd, site, inputs, targets):
         """Map the model over ``site``, an ``(n, *shape)`` stack for parameter ``key``.
 
-        ``in_dims`` batches that argument alone, so the work ahead of it runs once.
+        ``in_dims`` batches that argument alone, so the work ahead of it runs once. A
+        ``(rows, dv)`` pair instead adds each candidate's change at the calls that read
+        ``key``: after a Linear or convolution of a shared input, or into a weight built
+        once per forward.
         """
+        inject = isinstance(site, tuple)
         shared = {k: v for k, v in base_sd.items() if k != key}
         shared.update(self._buffers)
         model, loss_fn, loss_kind, per_sample = self.model, self.loss_fn, self._loss_kind, self.per_sample
@@ -1585,14 +1789,18 @@ class SiteVmapEvaluator:
             model.eval()
 
         def single_eval(site_param, shared, inputs, targets):
-            output = functional_call(model, {**shared, key: site_param}, (inputs,))
+            if inject:
+                with _SiteDelta(base_sd[key], *site_param):
+                    output = functional_call(model, {**shared, key: base_sd[key]}, (inputs,))
+            else:
+                output = functional_call(model, {**shared, key: site_param}, (inputs,))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
         def score_alone(n):
             losses = []
             with self._owner._restoring_buffers() as restore:
                 for i in range(n):
-                    losses.append(single_eval(site[i], shared, inputs, targets))
+                    losses.append(single_eval(tree_map(lambda t: t[i], site), shared, inputs, targets))
                     restore()
             return torch.stack(losses)
 
@@ -1622,6 +1830,8 @@ class SiteVmapEvaluator:
                         self._compile_failed_sites.add(key)
                         warnings.warn(f"compile_vmap failed at site {key!r} ({e}); using eager vmap.", stacklevel=2)
                 return batched(site, shared, inputs, targets)
+        except _SiteNotInjectable:
+            raise
         except Exception as e:
             # The step calls this directly, so the failure never reaches evaluate()'s
             # fallback. A random draw is retried once, drawing per candidate. Anything
@@ -1641,7 +1851,7 @@ class SiteVmapEvaluator:
                     stacklevel=2,
                 )
                 self._warned = True
-            return score_alone(site.shape[0])
+            return score_alone(tree_leaves(site)[0].shape[0])
         finally:
             if was_training:
                 model.train()
@@ -1830,14 +2040,16 @@ class SparseDeltaEvaluator:
         return entry if entry is not None and entry.key in self._site else None
 
     @torch.inference_mode()
-    def evaluate(self, base_sd, entry_key, local_idx, values, inputs, targets=None):
+    def evaluate(self, base_sd, entry_key, local_idx, values, inputs, targets=None, base=0):
         """Losses of shape ``(G*C,)`` for ``G`` particle groups of ``C`` candidates.
 
         The perturbed positions are a function of the particle, not the vertex, so a
         group's ``C`` candidates share one ``local_idx`` row. Positions past the last
-        entry are layout padding and carry a zero delta.
+        entry are layout padding and carry a zero delta. Every row starts at flat
+        position ``base`` plus a multiple of ``pdim``.
         """
-        groups, cand, _ = values.shape
+        groups, cand, pdim = values.shape
+        aligned = (self._entry_by_key[entry_key].offset - base) % pdim == 0
         site_idx, is_weight = self._site[entry_key]
         param_dtype = next(iter(base_sd.values())).dtype
         inputs = cast_inputs_memo(self, inputs, param_dtype)
@@ -1855,7 +2067,7 @@ class SparseDeltaEvaluator:
             delta = (values - base_at_site).to(param_dtype)
 
         def site(x, out, weight):
-            return _confined_site(x, local_idx, delta, weight.shape[1] if is_weight else None, weight.shape[0])
+            return _confined_site(x, local_idx, delta, weight.shape[1] if is_weight else None, weight.shape[0], aligned)
 
         return _delta_walk(self, base_sd, inputs, targets, site_idx, site, groups * cand)
 
@@ -1962,16 +2174,17 @@ class SubspaceDeltaEvaluator:
             d = torch.where(j.unsqueeze(1) < spec.num_coords, d, 0)
             j = j.clamp(max=spec.num_coords - 1)
         factored = getattr(subspace, "coords_are_factored", False)
+        aligned = col_start % pdim == 0
 
         def site(x, out, weight):
             d_out = weight.shape[0]
             if not is_weight:
                 return _confined_site(x, j, d, None, d_out)
             if not spec.is_projected:
-                return _confined_site(x, j, d, weight.shape[1], d_out)
+                return _confined_site(x, j, d, weight.shape[1], d_out, aligned)
             P = projections[spec.entry_key]
             if factored:
-                return _confined_site(x @ P.to(x.dtype).t(), j, d, subspace.ranks[spec.entry_key], d_out)
+                return _confined_site(x @ P.to(x.dtype).t(), j, d, subspace.ranks[spec.entry_key], d_out, aligned)
             g = self._basis_products(spec, P, col_start, n_groups * pdim, x)
             corr = torch.einsum("gcp,gpob->gcbo", d, g.reshape(n_groups, pdim, d_out, x.shape[0]))
             return None, out + corr.reshape(n_groups * n_cand, -1, d_out)

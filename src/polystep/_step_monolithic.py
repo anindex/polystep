@@ -325,11 +325,13 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     # parameter, so only that one is batched.
     _subspace_site = getattr(opt, "_site_vmap_evaluator", None) if opt._hybrid else None
     _bary_sd = None
+    _offset_ok = False
     if _fused_inputs is not None and (_subspace_delta is not None or _subspace_site is not None):
         _bary_coords = X.reshape(-1)[:_sub_dim]
         _half = [state.base_params[s.entry_key].dtype in (torch.float16, torch.bfloat16) for s in state.subspace.specs]
         if not any(_half):
             _bary_sd = state.subspace.apply_perturbation(state.hybrid_projections, state.base_params, _bary_coords)
+            _offset_ok = opt._hybrid and not _use_fused_inplace
         elif not (all(_half) and _subspace_delta is None and isinstance(_subspace_site, SiteInplaceEvaluator)):
             _bary_sd = state.subspace.reconstruct_batch(
                 state.hybrid_projections, state.base_params, _bary_coords.unsqueeze(0)
@@ -403,7 +405,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         chunk_mat = chunk = min(total_evals, max(1, (1 << 26) // (per_candidate + _act)))
         if _local:
             per_site = 2 * _act
-            if _site_vmap is not None or _subspace_site is not None:
+            if _subspace_site is not None or (
+                _site_vmap is not None and (_sparse_delta is None or device.type == "cpu")
+            ):
                 per_site += max(e.numel for e in opt.layout.entries)
             chunk = min(total_evals, max(1, (1 << 26) // max(1, per_site)))
 
@@ -422,7 +426,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         _sites = [(_sub_dim, None)]
     else:
         _sites = []
-    _site_bounds = site_bounds([s for s, _ in _sites], pdim, _group, total_evals)
     _site_chunks = None
     if _local and not opt.chunk_size and _sparse_delta is None and _subspace_delta is None:
         _site_chunks = site_chunks(opt, _fused_inputs, _sites, pdim, _group, total_evals)
@@ -461,13 +464,13 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         fused_inputs,
         fused_targets,
         out,
-        dense=False,
+        group=None,
         probes_src=None,
     ):
         """Evaluate an explicit list of (particle, vertex, probe) candidates.
 
-        ``dense`` marks the full list, whose particle-major grouping the delta
-        paths need; a screened subset has none.
+        ``group`` is the candidate count per particle of a particle-major list, the
+        grouping the delta paths need; None marks a list with none.
         """
         probe_src = X_probe if probes_src is None else probes_src
         n_cand = i_all.shape[0]
@@ -475,7 +478,10 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # copy); None means copy it all first.
         dirty_rows = None
         for chunk_start, chunk_end in chunk_spans(
-            n_cand, chunk, _site_bounds if dense else None, _site_chunks if dense else None
+            n_cand,
+            chunk if group in (None, _group) else max(group, chunk // _group * group),
+            site_bounds([s for s, _ in _sites], pdim, group, n_cand) if group else None,
+            _site_chunks if group == _group else None,
         ):
             chunk_size_actual = chunk_end - chunk_start
 
@@ -487,11 +493,11 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             # candidate config is built at all.
             _site = None
             if (_sparse_delta is not None or _site_vmap is not None) and fused_inputs is not None:
-                # Positions follow the particle, so gather once per group; a screened
-                # chunk has no grouping.
+                # Positions follow the particle, so gather once per group; an ungrouped
+                # chunk has none.
                 _offsets = i_idx * pdim
-                _cand = _group if dense else 1
-                _span = ((chunk_start // _group) * pdim, ((chunk_end - 1) // _group) * pdim + pdim) if dense else None
+                _cand = group or 1
+                _span = ((chunk_start // group) * pdim, ((chunk_end - 1) // group) * pdim + pdim) if group else None
                 _owner = _sparse_delta if _sparse_delta is not None else _site_vmap
                 _site = _owner.resolve_site(_offsets, pdim, _span)
                 if _site is None and _sparse_delta is not None and _site_vmap is not None:
@@ -508,13 +514,13 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 ).to(out.dtype)
                 continue
 
-            # Subspace delta: the dense list is particle-major, so the coordinate
+            # Subspace delta: a grouped list is particle-major, so the coordinate
             # span follows from arithmetic with no device read-back.
-            if _subspace_delta is not None and dense and fused_inputs is not None:
-                _g0, _g1 = chunk_start // _group, chunk_end // _group
+            if _subspace_delta is not None and group and fused_inputs is not None:
+                _g0, _g1 = chunk_start // group, chunk_end // group
                 _spec = _subspace_delta.resolve_site(state.subspace, _g0 * pdim, _g1 * pdim, _sub_dim)
                 if _spec is not None:
-                    _d = (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(_g1 - _g0, _group, pdim)
+                    _d = (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(_g1 - _g0, group, pdim)
                     out[chunk_start:chunk_end] = _subspace_delta.evaluate(
                         state.subspace,
                         state.hybrid_projections,
@@ -529,8 +535,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
 
             # Same locality in coordinate space: build only the one perturbed
             # parameter and share the rest.
-            if _subspace_site is not None and dense and fused_inputs is not None:
-                _g0, _g1 = chunk_start // _group, chunk_end // _group
+            if _subspace_site is not None and group and fused_inputs is not None:
+                _g0, _g1 = chunk_start // group, chunk_end // group
                 _spec = _subspace_site.resolve_spec(state.subspace, _g0 * pdim, _g1 * pdim, _sub_dim)
                 if _spec is not None:
                     out[chunk_start:chunk_end] = _subspace_site.evaluate_subspace(
@@ -540,21 +546,34 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                         _bary_sd,
                         _spec,
                         _g0 * pdim - _spec.flat_start,
-                        probe_src[i_idx, v_idx, k_idx].reshape(_g1 - _g0, _group, pdim),
+                        probe_src[i_idx, v_idx, k_idx].reshape(_g1 - _g0, group, pdim),
                         fused_inputs,
                         fused_targets,
                     ).to(out.dtype)
                     continue
 
-            if _bary_flat is not None and dense:
-                _g0, _g1 = chunk_start // _group, chunk_end // _group
+            if _offset_ok and chunk_size_actual == group:
+                chunk_losses = closure_fn(
+                    state.subspace.offset_batch(
+                        state.hybrid_projections,
+                        _bary_sd,
+                        (chunk_start // group) * pdim,
+                        probe_src[i_idx, v_idx, k_idx] - X[i_idx],
+                    )
+                )
+                check_losses(chunk_losses, chunk_size_actual)
+                out[chunk_start:chunk_end] = chunk_losses.to(out.dtype)
+                continue
+
+            if _bary_flat is not None and group:
+                _g0, _g1 = chunk_start // group, chunk_end // group
                 if _g1 * pdim <= _sub_dim:
                     chunk_losses = closure_fn(
                         state.subspace.reconstruct_offsets(
                             state.projection,
                             _bary_flat,
                             _g0 * pdim,
-                            (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(_g1 - _g0, _group, pdim),
+                            (probe_src[i_idx, v_idx, k_idx] - X[i_idx]).reshape(_g1 - _g0, group, pdim),
                             _bufs[7][: _g1 - _g0],
                         )
                     )
@@ -636,8 +655,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         return out
 
     if not _screen_ready:
-        _evaluate_candidates(_i_all, _v_all, _k_all, closure, _fused_inputs, _fused_targets, losses, dense=True)
+        _evaluate_candidates(_i_all, _v_all, _k_all, closure, _fused_inputs, _fused_targets, losses, group=_group)
     else:
+        _grouped_screen = _local and P * V * opt.layout.total_params >= (5e5 if device.type == "cpu" else 5e8)
         # Stage 1: rank every direction on the cheap fidelity, one probe scale.
         k_center = K_eff // 2
         _center = _k_all == k_center
@@ -650,6 +670,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             screen_inputs,
             screen_targets,
             X_probe.new_empty(P * V, dtype=_loss_dtype),
+            group=V if _grouped_screen else None,
         )
         screen_raw = screen_flat.reshape(P, V)
         screen_cost = sanitize_cost(screen_raw)
@@ -684,6 +705,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
             _fused_inputs,
             _fused_targets,
             X_probe.new_empty(sel_idx.numel(), dtype=_loss_dtype),
+            group=keep_v * K_eff if _grouped_screen else None,
         )
 
         # Offset the dropped entries by the per-particle difference on the kept ones,

@@ -220,9 +220,16 @@ optimizer.step(closure, screen_closure=screen)
 
 A registered evaluator screens on the same leading slice of its batch. Screening runs
 only when the screened share of the batch divided by `num_probe`, plus the share of
-vertices kept per particle, is below 1, where it costs less than the full sweep, and not
-with `use_quadratic_model`, `newton_refinement` or `trust_region`. With few vertices the
-kept share is coarse: at the default `particle_dim=2` the simplex has 3 vertices, so
+vertices kept per particle, is below 1, where it needs fewer forwards than the full
+sweep, and not with `use_quadratic_model`, `newton_refinement` or `trust_region`. It
+still runs two sweeps, so on small models and on launch-bound GPU steps it can take
+longer than one unscreened sweep. Screened candidates use the same delta and site paths
+as the full sweep once particles times vertices times model parameters reaches 5e5 on
+the CPU or 5e8 on CUDA. Below that, screened hybrid candidates build every weight, and a
+screened full-space chunk uses a site path only when it lies inside one parameter. The
+CPU threshold is the measured crossover. The CUDA one is set conservatively so that no
+measured model slows down, which forgoes wins on small MLPs. With few vertices the kept
+share is coarse: at the default `particle_dim=2` the simplex has 3 vertices, so
 `screen_keep_ratio=0.5` keeps 2 of them. The batch share rounds the same way: a
 registered batch of 2 samples screens on 1 of them even at `screen_fidelity=0.1`.
 

@@ -630,6 +630,59 @@ def test_site_vmap_screens_on_screen_slice():
     assert opt._last_screen_savings > 0
 
 
+@pytest.mark.parametrize(
+    "hybrid, drop, batch, chunk",
+    [
+        (False, (), 64, 240),
+        (True, (), 64, 240),
+        (True, ("_subspace_delta_evaluator",), 64, 240),
+        (True, ("_subspace_delta_evaluator",), 1500, None),
+    ],
+)
+def test_screened_candidates_skip_materialization(hybrid, drop, batch, chunk):
+    """Above the size gate both screen stages score on the delta and site paths, never the closure."""
+    from polystep.hybrid_subspace import HybridSubspace
+    from polystep.transform import ParamLayout
+
+    def run(off):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(32, 32), nn.ReLU(), nn.Linear(32, 4)).double()
+        x, y = torch.randn(batch, 32, dtype=torch.float64), torch.randint(0, 4, (batch,))
+        ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+        if hybrid:
+            sub = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4)
+            kwargs = dict(subspace=sub, subspace_particle_dim=4)
+        else:
+            kwargs = dict(particle_dim=4)
+        opt = PolyStepOptimizer(
+            model,
+            seed=0,
+            polytope_type="orthoplex",
+            multifidelity_screen=True,
+            screen_keep_ratio=0.75,
+            num_probe=3,
+            chunk_size=chunk,
+            **kwargs,
+        )
+        opt.register_evaluator(ev, x, y)
+        for name in off:
+            setattr(opt, name, None)
+        rows = [0]
+
+        def closure(bp, _x=x, _y=y):
+            rows[0] += next(iter(bp.values())).shape[0]
+            return ev.evaluate(bp, _x, _y)
+
+        opt.step(closure, screen_closure=opt.screen_closure_from(closure, x, y))
+        assert opt._last_screen_savings > 0
+        return rows[0], opt.state.X
+
+    rows, X = run(drop)
+    rows_mat, X_mat = run(("_sparse_delta_evaluator", "_site_vmap_evaluator", "_subspace_delta_evaluator"))
+    assert rows == 0 < rows_mat
+    torch.testing.assert_close(X, X_mat, rtol=0, atol=1e-12)
+
+
 def test_2d_cube_not_treated_as_orthoplex():
     """cube at pdim=2 also has 4 vertices, but its halves are not antipodal.
 
