@@ -8,28 +8,23 @@ import math
 
 import torch
 
+from .geometry import get_orthoplex_vertices
+
 
 def extract_fd_gradient(
     losses_3d: torch.Tensor,
     scales: torch.Tensor,
     probe_radius: float,
     pdim: int,
-    verts: torch.Tensor = None,
+    verts: torch.Tensor,
 ) -> torch.Tensor:
     """``g = (d / (V s r)) sum_v L_v v``, the rotated-frame least-squares gradient.
 
-    ``verts=None`` uses central differences on orthoplex pairs. These recover the
-    gradient of a quadratic up to rounding. Without antipodal pairs, a quadratic's
+    On orthoplex pairs this is the central difference, which recovers the gradient
+    of a quadratic up to rounding. Without antipodal pairs, a quadratic's
     third-moment contribution can bias the estimate by ``O(probe_radius)``.
     """
     V = losses_3d.shape[1]
-
-    if verts is None:
-        if V != 2 * pdim:
-            raise ValueError(f"FD gradient needs `verts`, or orthoplex losses (V == 2*pdim); got V={V}, pdim={pdim}")
-        # sum_v L_v v is L(+e_i) - L(-e_i) per coordinate, and d/V is 1/2.
-        denom = (2.0 * scales * probe_radius).clamp(min=1e-10)  # (K,)
-        return ((losses_3d[:, :pdim, :] - losses_3d[:, pdim:, :]) / denom).mean(dim=-1)
 
     # (P, V, K) against (V, pdim) -> (P, pdim, K)
     # The frame is centred mathematically, not bit-for-bit. Remove a common loss
@@ -68,7 +63,7 @@ def extract_fd_hessian_diag(
     Regresses on unit-radius scales; non-finite regressions return zero curvature.
     """
     if not losses_3d.shape[1] == 2 * pdim:
-        raise ValueError(f"FD Hessian needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}")
+        raise ValueError(f"FD Hessian needs antipodal [+e_i; -e_i] rows; got V={losses_3d.shape[1]}, pdim={pdim}")
     fwd = losses_3d[:, :pdim, :]  # (P, pdim, K)
     bwd = losses_3d[:, pdim:, :]  # (P, pdim, K)
 
@@ -97,7 +92,7 @@ def extract_fd_hessian_diag_centered(
 ) -> torch.Tensor:
     """Diagonal Hessian from one probe scale plus a shared centre evaluation."""
     if not losses_3d.shape[1] == 2 * pdim:
-        raise ValueError(f"FD Hessian needs orthoplex vertices (V == 2*pdim); got V={losses_3d.shape[1]}, pdim={pdim}")
+        raise ValueError(f"FD Hessian needs antipodal [+e_i; -e_i] rows; got V={losses_3d.shape[1]}, pdim={pdim}")
     fwd = losses_3d[:, :pdim, :]  # (P, pdim, K)
     bwd = losses_3d[:, pdim:, :]
 
@@ -162,7 +157,8 @@ def apply_newton_refinement(
     hessian_reg: float = 1e-4,
 ) -> torch.Tensor:
     """Blend the OT step with a Newton correction read off the probe evaluations."""
-    gradient = extract_fd_gradient(losses_3d, scales, probe_radius, pdim)
+    verts = get_orthoplex_vertices(pdim, device=losses_3d.device, dtype=losses_3d.dtype)
+    gradient = extract_fd_gradient(losses_3d, scales, probe_radius, pdim, verts)
     hessian_diag = extract_fd_hessian_diag(losses_3d, scales, probe_radius, pdim)
 
     delta_rot = compute_newton_step(

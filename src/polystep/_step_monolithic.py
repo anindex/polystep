@@ -255,7 +255,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 K_eff = 1
 
     if K_eff < K:
-        probes = probes[K // 2 : K // 2 + 1]  # center scale, shape (1,)
+        probes = probes.new_full((1,), 0.5)
 
     rot_mats = get_random_rotation_matrices(
         P,
@@ -862,7 +862,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # Stale otherwise: adaptive_num_probe can drop K_eff to 1 mid-run.
         opt._newton_direction = None
     if (opt.biased_rotation or opt.trust_region) and _quad_ready:
-        _fd_grad = extract_fd_gradient(opt._losses_3d, probes, probe_r, pdim, None if _antithetic else polytope_verts)
+        _fd_grad = extract_fd_gradient(opt._losses_3d, probes, probe_r, pdim, polytope_verts)
         if _center_loss is None:
             _fd_hess = extract_fd_hessian_diag(opt._losses_3d, probes, probe_r, pdim)  # (P, pdim)
         elif _antithetic:

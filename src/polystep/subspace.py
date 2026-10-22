@@ -68,6 +68,12 @@ class SvdRatioMixin:
         progress = min(1.0, step / max(1, total_steps or 1))
         return self.svd_ratio_init + progress * (self.svd_ratio_final - self.svd_ratio_init)
 
+    def check_svd_ratios(self) -> None:
+        """Require ``svd_ratio_init`` and ``svd_ratio_final`` in [0, 1]."""
+        for name in ("svd_ratio_init", "svd_ratio_final"):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {getattr(self, name)}.")
+
 
 @dataclass(frozen=True)
 class ProjectionSpec:

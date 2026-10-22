@@ -88,7 +88,7 @@ class KLSoftmaxSolver:
         alpha = self.alpha
 
         log_a = a.clamp(min=1e-30).log()
-        log_b = b.clamp(min=1e-30).log()
+        log_b = b.log()
 
         # Disable outer autocast; a BF16 downcast collapses the dual potentials.
         with torch.amp.autocast("cuda", enabled=False), torch.amp.autocast("cpu", enabled=False):
@@ -115,26 +115,27 @@ class KLSoftmaxSolver:
                 # Sync the convergence flag once per check_every to keep the dual updates GPU-resident.
                 check_every = self.check_every
                 threshold = float(self.threshold)
-                for it in range(self.max_iterations):
-                    # f-update: exact row-marginal enforcement.
-                    f_new = eps * (log_a - torch.logsumexp((g.unsqueeze(0) - C) / eps, dim=1))
-                    # g-update: α-fraction of full-Sinkhorn target.
-                    g_target = eps * (log_b - torch.logsumexp((f_new.unsqueeze(1) - C) / eps, dim=0))
-                    g_new = alpha * g_target
+                with torch.no_grad():
+                    for it in range(self.max_iterations):
+                        # f-update: exact row-marginal enforcement.
+                        f_new = eps * (log_a - torch.logsumexp((g.unsqueeze(0) - C) / eps, dim=1))
+                        # g-update: α-fraction of full-Sinkhorn target.
+                        g_target = eps * (log_b - torch.logsumexp((f_new.unsqueeze(1) - C) / eps, dim=0))
+                        g_new = alpha * g_target
 
-                    if (it + 1) % check_every == 0 or it == self.max_iterations - 1:
-                        # The g-update is damped by alpha, so divide its increment back out to keep the residual comparable at any lam.
-                        delta = torch.maximum(
-                            (f_new - f).abs().amax(),
-                            (g_new - g).abs().amax() / alpha,
-                        )
-                        # <= so threshold=0 means "converge on an exact fixed point", not "never converge".
-                        if delta.item() <= threshold:
-                            f, g = f_new, g_new
-                            converged = True
-                            n_iters = it + 1
-                            break
-                    f, g = f_new, g_new
+                        if (it + 1) % check_every == 0 or it == self.max_iterations - 1:
+                            # The g-update is damped by alpha, so divide its increment back out to keep the residual comparable at any lam.
+                            delta = torch.maximum(
+                                (f_new - f).abs().amax(),
+                                torch.where(b > 0, g_new - g, 0.0).abs().amax() / alpha,
+                            )
+                            # <= so threshold=0 means "converge on an exact fixed point", not "never converge".
+                            if delta.item() <= threshold:
+                                f, g = f_new, g_new
+                                converged = True
+                                n_iters = it + 1
+                                break
+                        f, g = f_new, g_new
 
             # Enforce rows directly: exp((f + g - C)/eps) loses their mass when
             # f and C nearly cancel. Shift before division, including at lam=0.

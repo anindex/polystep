@@ -74,6 +74,13 @@ class TestCosineEpsilon:
             v = ce.at(i)
             assert 0.01 - 1e-9 <= v <= 1.0 + 1e-9
 
+    def test_cosine_restart_period_grows_geometrically(self):
+        s = CosineEpsilon(init=1.0, target=0.01, total_steps=20, restart_mult=1.04)
+        assert s.at(40) == pytest.approx(0.0136, abs=1e-3)
+        assert s.at(41) == pytest.approx(1.0, abs=1e-3)
+        assert s.at(3000) > 0.02
+        assert CosineEpsilon(init=1.0, target=0.01, total_steps=1, restart_mult=3.0).at(1) == pytest.approx(1.0)
+
 
 class TestProgressiveEpsilon:
     def test_at_returns_init_value(self):
@@ -219,6 +226,20 @@ class TestProgressiveEpsilonDrivers:
             state = solver.step(state)
             seen.append(scheduler.at(None))
         assert len(set(seen)) > 1, f"epsilon pinned at {seen[0]}"
+
+    def test_progressive_epsilon_single_particle_raises(self):
+        import torch
+
+        from polystep.solver import PolyStep
+
+        solver = PolyStep(
+            objective_fn=lambda x: x.pow(2).sum(-1),
+            dim=3,
+            epsilon=ProgressiveEpsilon(init=1.0),
+            compile=False,
+        )
+        with pytest.raises(ValueError, match="ProgressiveEpsilon requires"):
+            solver.init_state(torch.ones(1, 3))
 
     def test_solvers_without_threshold_skip_feed(self):
         """A one-shot solve reports a ratio of 1.0, which would read as a slow Sinkhorn."""
@@ -372,3 +393,20 @@ def test_fixed_epsilon_does_not_decay():
     for i in range(100):
         eps = resolve_epsilon(optimizer.epsilon, i, "epsilon")
         assert eps == 1.0, f"Fixed epsilon changed at iteration {i}: {eps}"
+
+
+@pytest.mark.parametrize("role", ["epsilon", "ent_epsilon"])
+@pytest.mark.parametrize(
+    "schedule",
+    [LinearEpsilon(init=0.3, target=0.0, decay=0.1), CosineEpsilon(init=0.5, target=0.0, total_steps=4)],
+)
+def test_zero_target_schedule_rejected_at_init(schedule, role):
+    import torch.nn as nn
+
+    from polystep.optimizer import PolyStepOptimizer
+    from polystep.solver import PolyStep
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        PolyStepOptimizer(nn.Linear(3, 2), **{role: schedule})
+    with pytest.raises(ValueError, match="must be > 0"):
+        PolyStep(objective_fn=lambda x: (x**2).sum(-1), dim=4, **{role: schedule})

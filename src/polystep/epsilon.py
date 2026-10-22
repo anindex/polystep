@@ -14,6 +14,13 @@ def resolve_epsilon(value, iteration: int, name: str) -> Optional[float]:
     return validate_positive(value.at(iteration) if hasattr(value, "at") else value, name)
 
 
+def validate_epsilon(value, name: str) -> None:
+    """Raise ValueError when ``value`` or its Linear/Cosine schedule floor is not positive."""
+    floor = min(value.init, value.target) if isinstance(value, (LinearEpsilon, CosineEpsilon)) else value
+    if isinstance(floor, (int, float)) and floor <= 0:
+        raise ValueError(f"{name} must be > 0, got {floor}.")
+
+
 def resolve_radius(radius, iteration: int, epsilon: float) -> float:
     """The physical radius at ``iteration``: a scalar is ``radius * epsilon``, a schedule is its own value."""
     base = radius.at(iteration) if hasattr(radius, "at") else radius
@@ -148,17 +155,16 @@ class CosineEpsilon:
         )
 
         if self.restart_mult > 1.0:
-            # Walk to the current restart period; the bound stops a near-1.0 restart_mult looping forever.
-            period = T
-            t = iteration
-            max_restarts = 100
-            restarts = 0
-            while t >= period and period > 0 and restarts < max_restarts:
-                t -= period
-                period = int(period * self.restart_mult)
-                restarts += 1
-            T_local = max(period, 1)
-            t_local = t
+            m = self.restart_mult
+
+            def span(k: int) -> float:
+                return T * (m**k - 1) / (m - 1)
+
+            i = math.floor(math.log1p(iteration * (m - 1) / T) / math.log(m))
+            i -= span(i) > iteration
+            i += span(i + 1) <= iteration
+            T_local = T * m**i
+            t_local = iteration - span(i)
         else:
             T_local = T
             t_local = min(iteration, T)

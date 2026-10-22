@@ -31,9 +31,10 @@ def test_fd_gradient_and_hessian_recover_quadratic():
     probe_radius = 1.0
     losses_3d = _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P)
 
+    from polystep.geometry import get_orthoplex_vertices
     from polystep.quadratic_model import extract_fd_gradient, extract_fd_hessian_diag
 
-    grad = extract_fd_gradient(losses_3d, scales, probe_radius, pdim)
+    grad = extract_fd_gradient(losses_3d, scales, probe_radius, pdim, get_orthoplex_vertices(pdim))
     assert grad.shape == (P, pdim)
     torch.testing.assert_close(grad, true_grad, atol=1e-5, rtol=1e-5)
 
@@ -192,9 +193,10 @@ def test_fd_gradient_batch_particles():
     probe_radius = 0.5
     losses_3d = _make_quadratic_losses_3d(true_grad, true_hess, scales, probe_radius, pdim, P, c=5.0)
 
+    from polystep.geometry import get_orthoplex_vertices
     from polystep.quadratic_model import extract_fd_gradient, extract_fd_hessian_diag
 
-    grad = extract_fd_gradient(losses_3d, scales, probe_radius, pdim)
+    grad = extract_fd_gradient(losses_3d, scales, probe_radius, pdim, get_orthoplex_vertices(pdim))
     hess = extract_fd_hessian_diag(losses_3d, scales, probe_radius, pdim)
     torch.testing.assert_close(grad, true_grad, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(hess, true_hess, atol=1e-3, rtol=1e-3)
@@ -386,23 +388,25 @@ def test_newton_refinement_respects_max_step_norm():
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16])
-def test_orthoplex_path_is_exact_central_difference(dtype):
+def test_orthoplex_gradient_matches_central_difference(dtype):
     """sum_v v v^T = (V/d) I collapses the least-squares fit to (d/(V s r)) sum_v L_v v.
 
     On antipodal pairs that is the central difference with the 2d-2 zero terms dropped,
-    so every orthoplex result is unmoved bit for bit, at every shape and dtype.
+    up to the rounding of the shared centring and of the mean over probe scales.
     """
+    from polystep.geometry import get_orthoplex_vertices
     from polystep.quadratic_model import extract_fd_gradient
 
     gen = torch.Generator().manual_seed(0)
     for pdim in (2, 4, 8):
+        verts = get_orthoplex_vertices(pdim, dtype=dtype)
         for K in (1, 3, 6):
-            losses = torch.randn(4, 2 * pdim, K, generator=gen, dtype=torch.float64).to(dtype)
+            losses = (1.0 + 0.1 * torch.randn(4, 2 * pdim, K, generator=gen, dtype=torch.float64)).to(dtype)
             scales = torch.linspace(0, 1, K + 2, dtype=dtype)[1 : K + 1]
             for radius in (0.1, 0.4, 1.0):
                 denom = (2.0 * scales * radius).unsqueeze(0).unsqueeze(0).clamp(min=1e-10)
                 reference = ((losses[:, :pdim, :] - losses[:, pdim:, :]) / denom).mean(dim=-1)
-                assert torch.equal(extract_fd_gradient(losses, scales, radius, pdim), reference)
+                torch.testing.assert_close(extract_fd_gradient(losses, scales, radius, pdim, verts), reference)
 
 
 def test_simplex_recovers_gradient_and_curvature_trace():
@@ -432,15 +436,16 @@ def test_simplex_recovers_gradient_and_curvature_trace():
         assert curv.item() == pytest.approx(torch.trace(H).item() / d, rel=1e-9)
 
 
-def test_fd_gradient_requires_orthoplex_vertices():
-    """FD gradient slices [:pdim]/[pdim:], so a non-orthoplex vertex count
-    (V != 2*pdim) must fail loudly, not silently return wrong gradients."""
+def test_fd_gradient_without_verts_raises():
+    """A 2D cube has 2*pdim vertices too, but its halves are not antipodal."""
+    from polystep.geometry import get_cube_vertices
     from polystep.quadratic_model import extract_fd_gradient
 
-    losses = torch.randn(4, 5, 2)  # V=5, not 2*pdim
-    # Raises ValueError (not AssertionError) so the check survives `python -O`.
-    with pytest.raises(ValueError, match="orthoplex"):
-        extract_fd_gradient(losses, torch.ones(2), probe_radius=0.1, pdim=3)
+    v = get_cube_vertices(2).double()
+    s = torch.tensor([0.5, 1.0], dtype=torch.float64)
+    losses = (0.05 * s.view(1, -1, 1) * v.unsqueeze(1) @ torch.tensor([0.7, -1.3], dtype=torch.float64)).unsqueeze(0)
+    with pytest.raises(TypeError):
+        extract_fd_gradient(losses, s, 0.05, 2)
 
 
 def test_newton_step_survives_flat_coordinate():

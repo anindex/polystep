@@ -224,6 +224,30 @@ def test_convergence_measures_dual_step_not_magnitude():
     assert result.g.abs().max() > 0.1, "the duals must be off zero, or the test proves nothing"
 
 
+def test_kl_zero_column_gets_no_mass():
+    C = torch.tensor([[0.0, 1.0], [0.5, 0.2]], dtype=torch.float64)
+    a = torch.tensor([0.5, 0.5], dtype=torch.float64)
+    b = torch.tensor([0.0, 1.0], dtype=torch.float64)
+    result = KLSoftmaxSolver(epsilon=1.0, lam=0.01, threshold=1e-12).solve(C, a, b)
+    assert result.converged
+    assert result.matrix[:, 0].abs().max() == 0
+    torch.testing.assert_close(result.matrix.sum(dim=1), a)
+
+
+def test_kl_solve_skips_iteration_autograd_graph():
+    C = torch.rand(32, 5, dtype=torch.float64, requires_grad=True)
+    result = KLSoftmaxSolver(epsilon=0.05, lam=1.0, max_iterations=50, threshold=0.0).solve(C)
+    nodes, stack = set(), [result.matrix.grad_fn]
+    while stack:
+        node = stack.pop()
+        if node is None or node in nodes:
+            continue
+        nodes.add(node)
+        stack.extend(child for child, _ in node.next_functions)
+    assert result.matrix.requires_grad
+    assert len(nodes) < 40
+
+
 @pytest.mark.parametrize("check_every", [7, 13])
 def test_convergence_check_honors_check_every(check_every):
     C = torch.tensor([[0.0, 1.0, 2.0], [2.0, 0.0, 1.0], [1.0, 2.0, 0.0]])

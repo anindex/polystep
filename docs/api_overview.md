@@ -393,6 +393,7 @@ before loading a model into a new optimizer.
   `ent_epsilon`, `rank_schedule` without a `HybridSubspace`, `PowerDecay` with `gamma`
   outside `(0, 0.5]`, a negative `CosineEpsilon` decay, a blockwise closure that does
   not return one loss per candidate, and `resync_from_model()` on a moved model.
+  `PolyStep.init_state` raises `ValueError` for one particle with `ProgressiveEpsilon`.
 - New warnings cover two configurations: `AdaptiveSubspace` rotating every step
   with `amortize_steps > 1`, `biased_rotation` or `use_momentum`, because rotation
   clears their state; and `adaptive_num_probe=True` under orthoplex

@@ -30,7 +30,7 @@ from .cost_nn import (
     _reuse_prefixes,
 )
 from .costs import resolve_cost_scale
-from .epsilon import LinearEpsilon, ProgressiveEpsilon
+from .epsilon import LinearEpsilon, ProgressiveEpsilon, validate_epsilon
 from .geometry import POLYTOPE_MAP
 from .projection import SparseRandomProjection
 from .solvers import (
@@ -308,6 +308,8 @@ class PolyStepOptimizer(SerializationMixin):
             raise ValueError(
                 f"particle_dim must be >= 2, got {particle_dim}. The OT polytope requires at least 2 dimensions."
             )
+        if subspace is not None and subspace_particle_dim < 1:
+            raise ValueError(f"subspace_particle_dim must be >= 1, got {subspace_particle_dim}.")
         if particle_dim > 4 and polytope_type == "cube":
             warnings.warn(
                 f"particle_dim={particle_dim} with polytope_type='cube' produces "
@@ -401,8 +403,7 @@ class PolyStepOptimizer(SerializationMixin):
         # The fused softmax path divides by epsilon without the solvers' validation;
         # zero gives NaN, negative inverts the plan into ascent.
         for _name, _value in (("epsilon", epsilon), ("ent_epsilon", ent_epsilon)):
-            if isinstance(_value, (int, float)) and _value <= 0:
-                raise ValueError(f"{_name} must be > 0, got {_value}.")
+            validate_epsilon(_value, _name)
         # These run only in the monolithic step; default to None so the ignore warning
         # fires on an explicit True, not the default.
         _savings_default = not _full_blockwise
@@ -681,6 +682,14 @@ class PolyStepOptimizer(SerializationMixin):
         self._trainable_names = frozenset(n for n, p in model.named_parameters() if p.requires_grad)
 
         self._adaptive = isinstance(subspace, AdaptiveSubspace)
+        if self._adaptive and not subspace._entry_specs:
+            if subspace.full_dim != self.layout.total_params:
+                raise ValueError(
+                    f"AdaptiveSubspace full_dim={subspace.full_dim} does not match the model's "
+                    f"{self.layout.total_params} trainable parameters. Build it with "
+                    "AdaptiveSubspace.from_layout(layout, rank)."
+                )
+            subspace._entry_specs = tuple(AdaptiveSubspace._build_entry_specs(self.layout))
 
         self._hybrid = isinstance(subspace, HybridSubspace)
 

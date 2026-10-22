@@ -56,6 +56,7 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
                 "A reduced QR cannot return more orthonormal columns than rows, so the "
                 "projection would come back narrower than the coordinates allocated for it."
             )
+        self.check_svd_ratios()
         if self.compression_ratio == 0.0 and self.full_dim > 0:
             object.__setattr__(self, "compression_ratio", self.subspace_dim / self.full_dim)
 

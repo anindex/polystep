@@ -2,12 +2,14 @@
 SoftmaxSolver on every scale_cost mode.
 """
 
+import math
+
 import pytest
 import torch
 
 import torch.nn as nn
 
-from polystep import PolyStepOptimizer
+from polystep import AdaptiveSubspace, HybridSubspace, ParamLayout, PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
 from polystep._compiled import _fused_softmax_project
 from polystep.geometry import get_orthoplex_vertices, get_random_rotation_matrices
@@ -272,3 +274,28 @@ def test_invalid_temperature_rejected_before_fused_step(target, name, scheduled)
     with pytest.raises(ValueError, match=f"{name} must be > 0"):
         for _ in range(4):
             opt.step(lambda p: torch.full((next(iter(p.values())).shape[0],), 1.0))
+
+
+def test_subspace_particle_dim_zero_raises():
+    model = nn.Linear(4, 2)
+    sub = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+    with pytest.raises(ValueError, match="subspace_particle_dim"):
+        PolyStepOptimizer(model, subspace=sub, subspace_particle_dim=0, compile=False)
+
+
+def test_svd_ratio_above_one_raises():
+    with pytest.raises(ValueError, match="svd_ratio_final"):
+        AdaptiveSubspace(full_dim=10, subspace_dim=3, svd_ratio_final=2.0)
+
+
+def test_bare_adaptive_subspace_steps():
+    """Without from_layout the optimizer fills the entry specs, and a size mismatch raises."""
+    torch.manual_seed(0)
+    model = nn.Linear(4, 2)
+    with pytest.raises(ValueError, match="from_layout"):
+        PolyStepOptimizer(model, subspace=AdaptiveSubspace(full_dim=11, subspace_dim=4), compile=False)
+    sub = AdaptiveSubspace(full_dim=10, subspace_dim=4)
+    opt = PolyStepOptimizer(model, subspace=sub, subspace_particle_dim=2, compile=False)
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    inputs, targets = torch.randn(8, 4), torch.randn(8, 2)
+    assert math.isfinite(opt.step(lambda p: ev.evaluate(p, inputs, targets)))

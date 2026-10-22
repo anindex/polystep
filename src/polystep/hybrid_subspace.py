@@ -152,6 +152,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
                 "Non-zero values cause dual potential resets that degrade accuracy.",
                 stacklevel=2,
             )
+        self.check_svd_ratios()
         if self.compression_ratio == 0.0 and self._total_params > 0:
             object.__setattr__(self, "compression_ratio", self.subspace_dim / self._total_params)
 

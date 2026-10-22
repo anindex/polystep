@@ -9,7 +9,14 @@ import torch
 
 from ._compiled import CompiledFunctions
 from .costs import compute_cost_matrix, resolve_cost_scale
-from .epsilon import feed_solver_stats, resolve_epsilon, resolve_radius, LinearEpsilon, ProgressiveEpsilon
+from .epsilon import (
+    feed_solver_stats,
+    resolve_epsilon,
+    resolve_radius,
+    validate_epsilon,
+    LinearEpsilon,
+    ProgressiveEpsilon,
+)
 from .geometry import get_random_rotation_matrices, POLYTOPE_MAP
 from .solvers import SinkhornSolver, SoftmaxSolver
 from .solvers._shared import sanitize_cost, solver_health
@@ -93,6 +100,8 @@ class PolyStep:
             )
         if isinstance(self.epsilon, ProgressiveEpsilon) and self.ent_epsilon is not None:
             raise ValueError("ProgressiveEpsilon adapts the solve epsilon; it cannot be combined with ent_epsilon.")
+        validate_epsilon(self.epsilon, "epsilon")
+        validate_epsilon(self.ent_epsilon, "ent_epsilon")
         resolve_cost_scale(torch.ones((), dtype=torch.float64, device="cpu"), self.scale_cost)
 
         self.polytope_vertices = POLYTOPE_MAP[self.polytope_type](self.dim, radius=1.0)
@@ -124,6 +133,11 @@ class PolyStep:
             X_init = X_init.unsqueeze(0)
 
         num_points = X_init.shape[0]
+        if num_points == 1 and isinstance(self.epsilon, ProgressiveEpsilon):
+            raise ValueError(
+                "ProgressiveEpsilon requires Sinkhorn convergence feedback. "
+                "Use LinearEpsilon or CosineEpsilon with a single particle."
+            )
 
         # One particle forces a uniform plan, so the step ignores the cost and never
         # moves. Only warn here; ``_solver_for`` makes the substitution per step, so a

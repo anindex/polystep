@@ -1,6 +1,7 @@
 """Amortized steps: run the OT solve every N steps and move on the cached transport
 direction in between."""
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -301,6 +302,31 @@ def test_probe_count_drops_on_negative_descent():
 
     assert all(c < 0 for c in opt._ot_step_costs), "objective was meant to stay negative"
     assert opt._loss_decreasing_count >= 3, "descent on a negative objective never registered"
+
+
+@pytest.mark.parametrize("num_probe", [2, 3])
+def test_adaptive_probe_keeps_half_scale(num_probe):
+    torch.manual_seed(0)
+    opt = PolyStepOptimizer(
+        nn.Linear(4, 2),
+        compile=False,
+        num_probe=num_probe,
+        adaptive_num_probe=True,
+        adaptive_probe_warmup=0,
+        seed=0,
+    )
+    seen = []
+    inner = opt._compiled.compute_probe_points
+
+    def record(origin, directions, scales, radius):
+        seen.append(scales.tolist())
+        return inner(origin, directions, scales, radius)
+
+    opt._compiled.compute_probe_points = record
+    for _ in range(10):
+        opt.step(lambda b: sum(v.flatten(1).pow(2).sum(dim=1) for v in b.values()))
+
+    assert seen[-1] == [0.5]
 
 
 def test_amortized_step_reports_no_convergence():
