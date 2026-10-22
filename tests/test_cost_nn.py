@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 from torch.func import functional_call
+from torch.utils._pytree import register_pytree_node
 
 from polystep import HybridSubspace, PolyStepOptimizer, transform
 from polystep.transform import ParamLayout
@@ -194,6 +195,97 @@ def test_evaluator_unsupervised():
 
     assert losses.shape == (N,)
     assert losses.isfinite().all()
+
+
+class MaskedLinear(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(4, 3)
+
+    def forward(self, x, mask):
+        return self.lin(x) * mask
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("pack", [lambda x, m: (x, m), lambda x, m: {"x": x, "mask": m}], ids=["tuple", "dict"])
+def test_multi_input_matches_forward_loss(pack, dtype):
+    torch.manual_seed(0)
+    model = MaskedLinear()
+    x, mask, y = torch.randn(5, 4), (torch.rand(5, 3) > 0.5).float(), torch.randn(5, 3)
+    params = {k: v.detach()[None].expand(2, *v.shape) for k, v in model.named_parameters()}
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    losses = evaluator.evaluate(params, pack(x.to(dtype), mask), y)
+    assert not evaluator._vmap_failed
+    with torch.no_grad():
+        expected = nn.functional.mse_loss(model(x, mask), y)
+    torch.testing.assert_close(losses, expected.expand(2))
+
+
+def test_dict_inputs_cache_distinguishes_keys():
+    torch.manual_seed(0)
+    model = MaskedLinear()
+    x, mask, y = torch.randn(5, 4), (torch.rand(5, 3) > 0.5).float(), torch.randn(5, 3)
+    params = {k: v.detach().unsqueeze(0) for k, v in model.named_parameters()}
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    with torch.no_grad():
+        expected = nn.functional.mse_loss(model(x, mask), y)
+    for batch in ({"x": x, "mask": mask.double()}, {"x": x.double(), "mask": mask}, {"mask": mask, "x": x.double()}):
+        losses = evaluator.evaluate(params, batch, y)
+        torch.testing.assert_close(losses, expected.unsqueeze(0), check_dtype=False)
+
+
+class NestedMaskedLinear(MaskedLinear):
+    def forward(self, batch):
+        return super().forward(batch["x"], batch["mask"])
+
+
+def test_nested_inputs_cache_distinguishes_structure():
+    torch.manual_seed(0)
+    model = NestedMaskedLinear()
+    x, mask, y = torch.randn(5, 4), (torch.rand(5, 3) > 0.5).float(), torch.randn(5, 3)
+    params = {k: v.detach().unsqueeze(0) for k, v in model.named_parameters()}
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    with torch.no_grad():
+        expected = nn.functional.mse_loss(model({"x": x, "mask": mask}), y)
+    for batch in (
+        {"x": x, "mask": mask.double()},
+        {"mask": mask, "x": x.double()},
+        {"pad": x.double(), "x": x, "mask": mask.long()},
+        {"pad": x.long(), "x": x.double(), "mask": mask},
+    ):
+        losses = evaluator.evaluate(params, (batch,), y)
+        torch.testing.assert_close(losses, expected.unsqueeze(0), check_dtype=False)
+
+
+class AuxBox:
+    def __init__(self, aux):
+        self.aux = aux
+
+
+register_pytree_node(AuxBox, lambda b: ([b.aux], torch.arange(3)), lambda leaves, _: AuxBox(*leaves))
+
+
+class AddAux(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(4, 3)
+
+    def forward(self, x, box):
+        return self.lin(x) + box.aux
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_registered_pytree_inputs_skip_key_paths(dtype):
+    torch.manual_seed(0)
+    model = AddAux()
+    x, aux, y = torch.randn(5, 4), torch.randn(5, 3), torch.randn(5, 3)
+    params = {k: v.detach().unsqueeze(0) for k, v in model.named_parameters()}
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    with torch.no_grad():
+        expected = nn.functional.mse_loss(model(x, AuxBox(aux)), y)
+    for _ in range(2):
+        losses = evaluator.evaluate(params, (x.to(dtype), AuxBox(aux)), y)
+        torch.testing.assert_close(losses, expected.unsqueeze(0))
 
 
 def test_evaluator_different_params_different_losses():

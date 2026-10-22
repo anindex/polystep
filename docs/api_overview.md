@@ -60,10 +60,12 @@ train(model, loader, nn.CrossEntropyLoss(), optimizer, config)
 ```
 
 `restore_best` (on by default) restores the weights with the lowest tracked loss.
-After each step, `train()` scores the updated weights on that step's training batch.
-It uses the same input cast, autocast and loss reduction as the candidates.
+After each step, `train()` scores the updated weights on the first training batch, after `cost_batch_size` subsampling, so scores compare across steps.
+Callbacks receive the loss of the updated weights on that step's training batch.
+Both losses use the same input cast, autocast and loss reduction as the candidates.
 Checkpoint selection uses training loss, which can be optimistic on unseen data.
-Best-weight tracking and callbacks require an extra loss evaluation per step.
+`cost_batch_size` subsampling indexes only the input and target tensors whose leading dimension matches the first input's batch size, and passes scalars and other tensors through unchanged.
+Best-weight tracking and callbacks each require an extra loss evaluation per step.
 
 ## Subspaces
 
@@ -182,8 +184,8 @@ remaining bias comes from third-order terms, is `O(r^2)`, and is zero on a quadr
 Block models omit cross-block Hessian terms.
 
 `trust_region` compares consecutive incumbents and sums block predictions. Minibatch
-changes and momentum-only steps invalidate the deferred comparison; `train()` rejects
-this controller. Use a stationary objective with the manual step API, and pass
+changes and momentum-only steps invalidate the deferred comparison; `step_batch()` and
+`train()` reject this controller. Use a stationary objective with the manual step API, and pass
 `optimizer.step(closure, objective_token=token)` a new token whenever the batch or
 loss changes; a change drops the pending trust-region comparison, and `None` or a
 constant token means a stationary objective.

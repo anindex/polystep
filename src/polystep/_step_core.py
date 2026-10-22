@@ -7,6 +7,7 @@ import warnings
 import torch
 
 from ._compiled import normalize_rows
+from .cost_nn import _first_input_tensor
 from .dynamics import update_radius_multiplier, update_stagnation
 
 
@@ -56,10 +57,13 @@ def activation_elements(opt, inputs, key=None) -> int:
     """
     if inputs is None:
         return 0
+    inputs = _first_input_tensor(inputs)
     ratios = getattr(opt, "_act_ratios", None)
     if ratios is not None:
         return round(ratios.get(key, ratios[None]) * inputs.numel())
-    return inputs.shape[0] * max((e.shape[0] for e in opt.layout.entries if e.shape), default=0)
+    return (inputs.shape[0] if inputs.dim() else 1) * max(
+        (e.shape[0] for e in opt.layout.entries if e.shape), default=0
+    )
 
 
 def local_chunk(opt, act: int, per_site: int, cap: int, cpu: bool) -> int:
@@ -82,7 +86,7 @@ def site_chunks(opt, inputs, sites, pdim: int, group: int, cap: int, shrink: boo
     numel = max(e.numel for e in opt.layout.entries)
     sites = list(sites)
     stops = [start // pdim * group for start, _ in sites[1:]] + [cap]
-    cpu = shrink and inputs is not None and inputs.device.type == "cpu"
+    cpu = shrink and inputs is not None and _first_input_tensor(inputs).device.type == "cpu"
     chunks = {}
     for (start, key), stop in zip(sites, stops):
         first = -(-start // pdim) * group

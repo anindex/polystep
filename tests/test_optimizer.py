@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.func import functional_call
 
 from polystep.solver import PolyStep
-from polystep import CosineEpsilon, PolyStepOptimizer
+from polystep import CosineEpsilon, HybridSubspace, PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
 from polystep.transform import ParamLayout
 
@@ -625,6 +625,11 @@ def test_explicit_sinkhorn_with_one_particle_warns():
         PolyStepOptimizer(model, solver="sinkhorn", epsilon=0.1, max_iterations=20)
 
 
+def test_large_full_space_warns_candidate_count():
+    with pytest.warns(UserWarning, match="120,300 candidates"):
+        PolyStepOptimizer(nn.Linear(400, 100), num_probe=2)
+
+
 class TestNaNRevertRestoresState:
     """A NaN step must clear the derived state, not merely leave it finite.
 
@@ -855,3 +860,97 @@ def test_compiled_module_keeps_sparse_delta_path():
     assert opt._sparse_delta_evaluator is not None
     for a, b in zip(plain.parameters(), inner.parameters()):
         assert torch.equal(a, b)
+
+
+def test_step_without_reregistration_warns_once():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+    opt = PolyStepOptimizer(model, solver="softmax", seed=0)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    xa, ya = torch.randn(8, 4), torch.randint(0, 3, (8,))
+    xb, yb = torch.randn(8, 4), torch.randint(0, 3, (8,))
+    closure = opt.register_evaluator(ev, xa, ya)
+    bp = {k: v.detach().unsqueeze(0) for k, v in model.named_parameters()}
+    assert torch.equal(closure(bp), ev.evaluate(bp, xa, ya))
+    opt.step(closure)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        opt.step(closure)
+        assert not caught
+        opt.step(lambda p: ev.evaluate(p, xb, yb))
+        opt.step(lambda p: ev.evaluate(p, xb, yb))
+    assert sum("register_evaluator" in str(w.message) for w in caught) == 1
+    for opt_kw, ev_kw in (({}, {"use_inplace": True}), ({"candidate_autocast": torch.bfloat16}, {})):
+        alt_ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), **ev_kw)
+        alt_closure = PolyStepOptimizer(model, solver="softmax", seed=0, **opt_kw).register_evaluator(alt_ev, xa, ya)
+        assert torch.equal(alt_closure(bp), alt_ev.evaluate(bp, xa, ya))
+
+
+def test_reused_user_closure_warns_once():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(2, 2), nn.Tanh(), nn.Linear(2, 1))
+    opt = PolyStepOptimizer(model, solver="softmax", seed=0)
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    x, y = torch.ones(4, 2), torch.zeros(4, 1)
+
+    def closure(params):
+        return ev.evaluate(params, x, y)
+
+    opt.register_evaluator(ev, x, y)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            opt.step(closure)
+    assert sum("register_evaluator" in str(w.message) for w in caught) == 1
+
+
+@pytest.mark.parametrize("cost_bs", [None, 8, 16])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_step_batch_matches_manual_loop(hybrid, cost_bs):
+    torch.manual_seed(0)
+    models = [nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 3))]
+    models.append(copy.deepcopy(models[0]))
+    batches = [(torch.randn(16, 16), torch.randint(0, 3, (16,))) for _ in range(8)]
+    loss_fn = nn.CrossEntropyLoss()
+    manual, batched = (
+        PolyStepOptimizer(
+            m,
+            subspace=HybridSubspace.from_layout(ParamLayout.from_module(m), rank=4, max_subspace_dim=128)
+            if hybrid
+            else None,
+            seed=0,
+            cost_batch_size=cost_bs,
+            num_probe=2,
+            multifidelity_screen=True,
+        )
+        for m in models
+    )
+    ev = NNCostEvaluator(models[0], loss_fn)
+    for _ in range(2):
+        for x, y in batches:
+            batched.step_batch(x, y, loss_fn=loss_fn)
+            if cost_bs is not None and cost_bs < 16:
+                idx = torch.randperm(16, generator=manual._generator)[:cost_bs]
+                x, y = x[idx], y[idx]
+            closure = manual.register_evaluator(ev, x, y)
+            manual.step(closure, screen_closure=manual.screen_closure_from(closure, x, y))
+    for a, b in zip(*(m.parameters() for m in models)):
+        assert torch.equal(a, b)
+    x, y = batches[0]
+    cached = batched._step_batch_evaluator
+    batched.step_batch(x, y, loss_fn=loss_fn)
+    assert batched._step_batch_evaluator is cached
+    other = nn.CrossEntropyLoss(label_smoothing=0.1)
+    batched.step_batch(x, y, loss_fn=other)
+    assert batched._step_batch_evaluator.loss_fn is other
+    batched.resync_from_model()
+    assert batched._step_batch_evaluator is None
+
+
+def test_step_batch_rejects_trust_region():
+    model = nn.Linear(2, 1)
+    opt = PolyStepOptimizer(model, seed=0, trust_region=True, polytope_type="orthoplex")
+    before = [p.clone() for p in model.parameters()]
+    with pytest.raises(ValueError, match="trust_region is not supported by step_batch"):
+        opt.step_batch(torch.eye(2), torch.zeros(2, 1), loss_fn=nn.MSELoss())
+    assert all(torch.equal(a, b) for a, b in zip(before, model.parameters()))

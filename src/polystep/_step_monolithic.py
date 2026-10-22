@@ -358,6 +358,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     _screen_ready = (
         opt.multifidelity_screen
         and screen_closure is not None
+        and (_fused_inputs is None or isinstance(_fused_inputs, torch.Tensor))
         and not (opt.use_quadratic_model or opt._newton_refinement or opt.trust_region)
     )
     if _screen_ready:
@@ -370,7 +371,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         warnings.warn(
             "multifidelity_screen=True but the screen did not run, so no forward "
             "evaluations are saved this step. It needs a cheap screen_closure passed "
-            "to step() (api.train builds one), the screened batch share/num_probe plus the "
+            "to step() (api.train builds one), a single input tensor, the screened batch share/num_probe plus the "
             "share of vertices kept per particle < 1 (above that the screen costs more "
             "work than it saves), and none of use_quadratic_model / newton_refinement / "
             "trust_region enabled.",

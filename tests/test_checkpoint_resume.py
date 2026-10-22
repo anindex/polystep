@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from polystep import PolyStepOptimizer, ProgressiveEpsilon, TrainConfig, train
+from polystep import PolyStepOptimizer, ProgressiveEpsilon, TrainCallback, TrainConfig, train
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.optimizer import RankSchedule
 from polystep.transform import ParamLayout
@@ -328,6 +328,35 @@ class TestRestoreBest:
 
         assert results[True] <= results[False] + 1e-6
 
+    def test_restore_best_ignores_easy_minibatch(self):
+        gen = torch.Generator().manual_seed(0)
+        x_hard = torch.randn(16, 4, generator=gen)
+        y_hard = x_hard @ (3.0 * torch.randn(4, 2, generator=gen))
+        x_easy = 1e-3 * torch.randn(16, 4, generator=gen)
+        x, y = torch.cat([x_hard, x_easy]), torch.cat([y_hard, torch.zeros(16, 2)])
+        loader = DataLoader(TensorDataset(x, y), batch_size=16, shuffle=False)
+        losses = {}
+        for flag in (True, False):
+            torch.manual_seed(0)
+            model = nn.Linear(4, 2)
+            opt = PolyStepOptimizer(model, seed=0)
+            train(model, loader, nn.MSELoss(), opt, TrainConfig(epochs=20, restore_best=flag))
+            with torch.no_grad():
+                losses[flag] = nn.functional.mse_loss(model(x), y).item()
+        assert losses[True] <= 1.05 * losses[False]
+
+    def test_reference_respects_cost_batch_size(self):
+        class CappedBatch(nn.Linear):
+            def forward(self, x):
+                if x.shape[0] > 4:
+                    raise RuntimeError("forward batch exceeds 4")
+                return super().forward(x)
+
+        model = CappedBatch(2, 1)
+        opt = PolyStepOptimizer(model, solver="softmax", seed=0, cost_batch_size=4)
+        config = TrainConfig(epochs=2, callbacks=[TrainCallback()])
+        train(model, [(torch.ones(8, 2), torch.zeros(8, 1))], nn.MSELoss(), opt, config)
+
     def test_reverts_late_divergence(self):
         """A callback that blows the weights up on the last step must be undone."""
         loader = self._loaders()
@@ -342,8 +371,7 @@ class TestRestoreBest:
                 state["n"] += 1
                 if state["n"] == 4:
                     with torch.no_grad():
-                        for p in model.parameters():
-                            p.mul_(50.0)
+                        model[2].weight.mul_(50.0)
                 return False
 
             def on_epoch_end(self, metrics):
@@ -361,6 +389,41 @@ class TestRestoreBest:
         with torch.no_grad():
             final = nn.functional.mse_loss(model(inputs), targets).item()
         assert final < 100.0, f"late divergence was not reverted: {final}"
+        assert torch.equal(opt.state.X.reshape(-1), opt.layout.flatten(model).reshape(-1))
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_last_best_step_keeps_velocity(self, hybrid):
+        class Versioned(nn.Linear):
+            def get_extra_state(self):
+                return {"version": 1, "scale": torch.ones(2)}
+
+            def set_extra_state(self, state):
+                pass
+
+        loader = self._loaders(samples=64, in_dim=10, out_dim=2, batch_size=64)
+        torch.manual_seed(0)
+        model = nn.Sequential(Versioned(10, 16), nn.Tanh(), nn.Linear(16, 2))
+        subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4) if hybrid else None
+        opt = PolyStepOptimizer(model, subspace=subspace, epsilon=0.1, seed=0, use_momentum=True)
+        train(model, loader, nn.MSELoss(), opt, TrainConfig(epochs=3))
+        assert torch.any(opt.state.velocity != 0)
+
+    def test_dtype_cast_after_best_resyncs(self):
+        loader = self._loaders(samples=64, in_dim=10, out_dim=2, batch_size=64)
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(10, 16), nn.Tanh(), nn.Linear(16, 2))
+        opt = PolyStepOptimizer(model, epsilon=0.1, seed=0, use_momentum=True)
+
+        class Caster:
+            def on_step_end(self, metrics):
+                return False
+
+            def on_epoch_end(self, metrics):
+                if metrics["epoch"] == 2:
+                    model.double()
+
+        train(model, loader, nn.MSELoss(), opt, TrainConfig(epochs=3, callbacks=[Caster()]))
+        assert opt.state.X.dtype == torch.float64
 
 
 class TestAbsorbAlignedActive:

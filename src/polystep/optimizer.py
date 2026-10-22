@@ -11,6 +11,7 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_map
 
 from ._compiled import CompiledFunctions
 from ._step_core import invalidate_for_basis_change
@@ -25,6 +26,7 @@ from .cost_nn import (
     SiteVmapEvaluator,
     SparseDeltaEvaluator,
     SubspaceDeltaEvaluator,
+    _first_input_tensor,
     _reuse_prefixes,
 )
 from .costs import resolve_cost_scale
@@ -155,7 +157,7 @@ class PolyStepOptimizer(SerializationMixin):
         max_iterations: Maximum outer iterations.
         sinkhorn_max_iters: Maximum inner Sinkhorn iterations.
         chunk_size: Chunk size for cost-evaluation memory control.
-        cost_batch_size: Mini-batch size for cost evaluation, read by the training loop.
+        cost_batch_size: Mini-batch size for cost evaluation, read by step_batch() and train().
         compile: Compile hot-path tensor functions (default False).
         solver: OT solver. None auto-selects softmax for subspace modes, sinkhorn
             otherwise.
@@ -734,6 +736,17 @@ class PolyStepOptimizer(SerializationMixin):
         # Interior probe positions.
         self._probes = torch.linspace(0, 1, num_probe + 2)[1 : num_probe + 1]
 
+        _num_vertices = self._polytope_vertices.shape[0]
+        _candidates = X_init.shape[0] * _num_vertices * num_probe
+        if _candidates > 100_000:
+            warnings.warn(
+                f"Each step scores {_candidates:,} candidates ({X_init.shape[0]:,} particles x "
+                f"{_num_vertices} vertices x {num_probe} probes). For a neural network, pass "
+                "subspace=HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4, "
+                "max_subspace_dim=...) to bound it.",
+                stacklevel=2,
+            )
+
         # With one particle, balanced OT pins a uniform plan and the step freezes.
         _single_particle = X_init.shape[0] == 1 and not _full_blockwise
         if _single_particle and solver is None:
@@ -1092,7 +1105,7 @@ class PolyStepOptimizer(SerializationMixin):
         evaluator: "NNCostEvaluator",
         inputs: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> Callable:
         """Register an evaluator + data for fused in-place evaluation.
 
         Call before each ``step()`` with the current mini-batch. The evaluator's
@@ -1102,11 +1115,21 @@ class PolyStepOptimizer(SerializationMixin):
             evaluator: NNCostEvaluator instance.
             inputs: Current mini-batch inputs.
             targets: Current mini-batch targets (optional).
+
+        Returns:
+            Closure that scores this batch; pass it to ``step()``.
         """
         evaluator._refresh_recast_buffers()
         self._cost_evaluator = evaluator
         self._fused_inputs = inputs
         self._fused_targets = targets
+        self._registration_fresh = True
+
+        def closure(batched_params, _in=inputs, _tgt=targets):
+            return evaluator.evaluate(batched_params, _in, _tgt)
+
+        self._registration_closure = closure
+
         if self._candidate_autocast_dtype is not None:
             evaluator.autocast_dtype = self._candidate_autocast_dtype
         if self._compile_evaluator:
@@ -1125,7 +1148,7 @@ class PolyStepOptimizer(SerializationMixin):
             evaluator._inplace_forced,
             evaluator.autocast_dtype,
             half,
-            inputs.dim() == 2,
+            inputs.dim() == 2 if isinstance(inputs, torch.Tensor) else None,
         )
         rebuild = getattr(self, "_fastpath_key", None) != fastpath_key
         if rebuild:
@@ -1155,7 +1178,7 @@ class PolyStepOptimizer(SerializationMixin):
             self._sparse_delta_evaluator = None
             self._site_vmap_evaluator = None
             self._subspace_delta_evaluator = None
-            return
+            return closure
         # use_inplace=True asks for the real forward, so it outranks the fast paths.
         if evaluator._inplace_forced:
             # Warn once, not once per step.
@@ -1186,7 +1209,7 @@ class PolyStepOptimizer(SerializationMixin):
                     if self.subspace is None or self._hybrid
                     else None
                 )
-            return
+            return closure
         if rebuild:
             self._act_ratios = evaluator._activation_ratios(inputs)
         # FactoredSubspace can score through the low-rank identity, never building a
@@ -1219,11 +1242,13 @@ class PolyStepOptimizer(SerializationMixin):
         if half:
             self._factored_evaluator = None
             self._subspace_delta_evaluator = None
-        if inputs.dim() != 2:
+        tensor = isinstance(inputs, torch.Tensor)
+        if not tensor or inputs.dim() != 2:
             for attr in ("_factored_evaluator", "_sparse_delta_evaluator", "_subspace_delta_evaluator"):
                 ev = getattr(self, attr, None)
-                if ev is not None and not any(tag == "flatten" for _, tag, _ in ev._layer_keys):
+                if ev is not None and not (tensor and any(tag == "flatten" for _, tag, _ in ev._layer_keys)):
                     setattr(self, attr, None)
+        return closure
 
     def release_evaluator(self) -> None:
         """Drop the registered evaluator and its batch data."""
@@ -1237,9 +1262,13 @@ class PolyStepOptimizer(SerializationMixin):
         self._cost_evaluator = None
         self._fused_inputs = None
         self._fused_targets = None
+        self._registration_fresh = False
+        self._registration_closure = None
 
     def _screen_slice(self, inputs: torch.Tensor, targets=None):
         """Leading ``screen_fidelity`` rows of a batch and the batch share they realize."""
+        if not isinstance(inputs, torch.Tensor):
+            return inputs, targets, 1.0
         n = inputs.shape[0] if inputs.dim() else 1
         m = max(1, int(round(n * self.screen_fidelity)))
         if m >= n:
@@ -1301,6 +1330,20 @@ class PolyStepOptimizer(SerializationMixin):
                 "The set of requires_grad parameters changed after the optimizer was built, and "
                 "PolyStepOptimizer keeps the layout it was built with. Build a new optimizer on the model."
             )
+        if getattr(self, "_cost_evaluator", None) is not None:
+            if (
+                not self._registration_fresh
+                and closure is not self._registration_closure
+                and not getattr(self, "_warned_stale_registration", False)
+            ):
+                self._warned_stale_registration = True
+                warnings.warn(
+                    "register_evaluator was not called since the previous step, so the fast paths "
+                    "may score the batch registered earlier. Register each batch, or pass step() "
+                    "the closure register_evaluator returns.",
+                    stacklevel=3,
+                )
+            self._registration_fresh = False
         if objective_token != self._prev_objective_token:
             # A prediction on the previous minibatch cannot be scored against this one.
             self._prev_predicted_improvement = None
@@ -1328,6 +1371,36 @@ class PolyStepOptimizer(SerializationMixin):
 
         self._amortize_counter += 1
         return result
+
+    def step_batch(self, inputs, targets=None, *, loss_fn: Callable) -> float:
+        """Step on one batch through an evaluator cached per ``loss_fn`` object; returns the mean candidate loss."""
+        if self.trust_region:
+            raise ValueError(
+                "trust_region is not supported by step_batch() or train(): its ratio compares a "
+                "prediction against the loss on the next batch, which is a different objective. "
+                "Drop trust_region, or drive optimizer.step() on a fixed batch."
+            )
+        evaluator = getattr(self, "_step_batch_evaluator", None)
+        if evaluator is None or evaluator.loss_fn is not loss_fn:
+            evaluator = self._step_batch_evaluator = NNCostEvaluator(self.model, loss_fn)
+        first = _first_input_tensor(inputs)
+        cost_bs = self.cost_batch_size
+        if cost_bs is not None and first.dim() and cost_bs < first.shape[0]:
+            gen = self._generator
+            if gen is not None:
+                if gen.device == first.device:
+                    idx = torch.randperm(first.shape[0], device=first.device, generator=gen)[:cost_bs]
+                else:
+                    # randperm needs the generator and tensor on one device; sample on the generator's device to keep the seed, then move the index.
+                    idx = torch.randperm(first.shape[0], device=gen.device, generator=gen)[:cost_bs].to(first.device)
+            else:
+                idx = torch.randperm(first.shape[0], device=first.device)[:cost_bs]
+            inputs, targets = tree_map(
+                lambda t: t[idx] if isinstance(t, torch.Tensor) and t.shape[:1] == first.shape[:1] else t,
+                (inputs, targets),
+            )
+        closure = self.register_evaluator(evaluator, inputs, targets)
+        return self.step(closure, screen_closure=self.screen_closure_from(closure, inputs, targets))
 
     def _step_blockwise(self, closure: Callable) -> float:
         """Block-wise step: per-block OT solve."""
@@ -1472,6 +1545,7 @@ class PolyStepOptimizer(SerializationMixin):
         self._state.prev_loss = float("inf")
         self._loss_decreasing_count = 0
         self._ot_step_costs.clear()
+        self._step_batch_evaluator = None
 
     def _realign_subspace_to_model(self) -> None:
         """Cast per-layer projections to their parameters' dtypes, or a global projection and the coordinates to

@@ -20,8 +20,7 @@ inputs = torch.randn({batch}, {d_in})
 targets = torch.randint(0, 10, ({batch},))
 evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
 opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=1000, particle_dim={pdim})
-opt.register_evaluator(evaluator, inputs, targets)
-closure = lambda bp: evaluator.evaluate(bp, inputs, targets)
+closure = opt.register_evaluator(evaluator, inputs, targets)
 
 opt.step(closure)  # warm up lazily built buffers
 start = time.perf_counter()

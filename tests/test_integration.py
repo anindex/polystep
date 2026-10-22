@@ -173,8 +173,6 @@ class TestFeatureInteractions:
             sinkhorn_max_iters=100,
         )
 
-        # restore_best=False: the default True calls resync_from_model(), which
-        # clears the velocity on purpose.
         config = TrainConfig(epochs=1, restore_best=False)
         result = train(model, dl, nn.MSELoss(), opt, config)
         assert result is model

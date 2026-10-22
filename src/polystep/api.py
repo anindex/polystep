@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_flatten, tree_map
 from torch.utils.data import DataLoader
 
-from .cost_nn import NNCostEvaluator
 from .optimizer import PolyStepOptimizer
 
 
@@ -31,8 +32,9 @@ class TrainConfig:
     """Configuration for the ``train()`` function; optimizer params live on ``PolyStepOptimizer``.
 
     ``restore_best`` snapshots the weights at the lowest loss and restores them, since the last step of a noisy run
-    is not the best. The loss is in-sample: it scores each step's weights on the batch that step trained on, with the
-    candidates' input cast, autocast and loss reduction.
+    is not the best. The loss is in-sample: it scores each step's weights on the first training batch after
+    ``cost_batch_size`` subsampling, so scores compare across steps, with the candidates' input cast, autocast and loss
+    reduction. Callbacks still receive the loss on each step's own batch.
     """
 
     epochs: int = 10
@@ -44,6 +46,45 @@ class TrainConfig:
             raise ValueError(f"epochs must be > 0, got {self.epochs}")
         if self.callbacks is None:
             self.callbacks = []
+
+
+def _batch_inputs_targets(batch):
+    """Split a loader batch into model inputs and the target, or None for an unsupervised batch."""
+    if isinstance(batch, torch.Tensor):
+        return batch, None
+    if isinstance(batch, Mapping):
+        return {k: v for k, v in batch.items() if k != "labels"}, batch.get("labels")
+    if isinstance(batch, (tuple, list)) and batch:
+        if len(batch) == 1:
+            return batch[0], None
+        if len(batch) == 2:
+            return batch[0], batch[1]
+        return tuple(batch[:-1]), batch[-1]
+    raise TypeError(
+        "train() expects each batch to be a tensor, a tuple or list that ends with the target, "
+        f"or a dict whose 'labels' entry is the target; got {type(batch).__name__}."
+    )
+
+
+def _batch_loss(evaluator, inputs, targets, device) -> float:
+    """Loss of the live weights on one batch, with the candidates' input cast and autocast; buffers and RNG kept."""
+    with torch.inference_mode(), evaluator._probe_frame(device), evaluator._autocast(device):
+        x = evaluator.cast_inputs(inputs, evaluator._input_dtype(evaluator._param_dict_cache))
+        return evaluator._forward_loss(x, targets).item()
+
+
+def _same_state(saved, live) -> bool:
+    """Whether a snapshot entry matches the live one, nested tensors included."""
+    try:
+        (saved, saved_spec), (live, live_spec) = tree_flatten(saved), tree_flatten(live)
+        return saved_spec == live_spec and all(
+            a.dtype == b.dtype and torch.equal(a.cpu(), b.detach().cpu())
+            if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
+            else not isinstance(a, torch.Tensor) and not isinstance(b, torch.Tensor) and bool(a == b)
+            for a, b in zip(saved, live)
+        )
+    except Exception:
+        return False
 
 
 def train(
@@ -58,14 +99,13 @@ def train(
     if getattr(optimizer, "model", module) is not module:
         raise ValueError("train() got a different model than the optimizer was built on.")
     if getattr(optimizer, "trust_region", False):
-        # The optimizer clears the pending pair on every objective_token change, so the multiplier would sit at 1.0.
         raise ValueError(
             "trust_region is not supported by train(): its ratio compares a prediction "
             "against the loss on the next batch, which is a different objective. "
             "Drop trust_region, or drive optimizer.step() on a fixed batch."
         )
     was_training = module.training
-    evaluator = NNCostEvaluator(module, loss_fn)
+    module.eval()
     callbacks = list(config.callbacks)
     global_step = 0
     stop = False
@@ -78,6 +118,7 @@ def train(
     # Track the lowest-loss weights so a noisy run isn't left at a late step.
     best_loss = float("inf")
     best_state = None
+    reference = None
 
     try:
         for epoch in range(config.epochs):
@@ -85,52 +126,28 @@ def train(
             epoch_loss_count = 0
 
             for batch in dataloader:
-                inputs, targets = batch
-                inputs, targets = inputs.to(device), targets.to(device)
-
-                # Micro-batch: subsample for cost evaluation.
-                cost_bs = getattr(optimizer, "cost_batch_size", None)
-                if cost_bs is not None and cost_bs < inputs.shape[0]:
-                    gen = getattr(optimizer, "_generator", None)
-                    if gen is not None:
-                        if gen.device == inputs.device:
-                            idx = torch.randperm(inputs.shape[0], device=inputs.device, generator=gen)[:cost_bs]
-                        else:
-                            # randperm needs the generator and tensor on one device; sample on the generator's device to keep the seed, then move the index.
-                            idx = torch.randperm(inputs.shape[0], device=gen.device, generator=gen)[:cost_bs].to(
-                                inputs.device
-                            )
-                    else:
-                        idx = torch.randperm(inputs.shape[0], device=inputs.device)[:cost_bs]
-                    cost_inputs = inputs[idx]
-                    cost_targets = targets[idx]
-                else:
-                    cost_inputs = inputs
-                    cost_targets = targets
-
-                def closure(batched_params, _in=cost_inputs, _tgt=cost_targets):
-                    return evaluator.evaluate(batched_params, _in, _tgt)
-
-                # Registration enables the specialized candidate evaluators.
-                optimizer.register_evaluator(evaluator, cost_inputs, cost_targets)
-
-                optimizer.step(
-                    closure,
-                    screen_closure=optimizer.screen_closure_from(closure, cost_inputs, cost_targets),
-                    objective_token=global_step,
+                inputs, targets = tree_map(
+                    lambda t: t.to(device) if isinstance(t, torch.Tensor) else t, _batch_inputs_targets(batch)
                 )
+                optimizer.step_batch(inputs, targets, loss_fn=loss_fn)
 
                 state = optimizer.state
                 ot_cost = state.costs[-1] if state.costs else 0.0
 
                 # Score the updated weights; the probe cost describes the pre-step neighborhood.
-                if callbacks or config.restore_best:
-                    with torch.inference_mode(), evaluator._autocast(cost_inputs.device):
-                        x = evaluator.cast_inputs(cost_inputs, evaluator._input_dtype(evaluator._param_dict_cache))
-                        train_loss = evaluator._forward_loss(x, cost_targets).item()
+                evaluator = optimizer._step_batch_evaluator
+                if callbacks:
+                    train_loss = _batch_loss(evaluator, optimizer._fused_inputs, optimizer._fused_targets, device)
                 else:
                     # Nothing reads a per-step loss; skip the forward and its host sync.
                     train_loss = ot_cost
+                if config.restore_best:
+                    if reference is None:
+                        reference = tree_map(
+                            lambda t: t.clone() if isinstance(t, torch.Tensor) else t,
+                            (optimizer._fused_inputs, optimizer._fused_targets),
+                        )
+                    reference_loss = _batch_loss(evaluator, *reference, device)
 
                 if callbacks:
                     metrics = {
@@ -150,8 +167,8 @@ def train(
                 epoch_loss_count += 1
 
                 # Snapshot before callbacks run: they may write to the live model.
-                if config.restore_best and train_loss < best_loss:
-                    best_loss = train_loss
+                if config.restore_best and reference_loss < best_loss:
+                    best_loss = reference_loss
                     # Keep the snapshot on CPU.
                     best_state = {
                         k: v.detach().to("cpu", copy=True) if isinstance(v, torch.Tensor) else copy.deepcopy(v)
@@ -183,8 +200,10 @@ def train(
     finally:
         # Re-anchor so the next step starts from the restored weights.
         if config.restore_best and best_state is not None:
-            module.load_state_dict(best_state)
-            optimizer.resync_from_model()
+            live = module.state_dict()
+            if any(not _same_state(v, live[k]) for k, v in best_state.items()):
+                module.load_state_dict(best_state)
+                optimizer.resync_from_model()
         # An exception would otherwise leave the last batch alive on the optimizer.
         optimizer.release_evaluator()
         # NNCostEvaluator switched to eval so candidates score against frozen statistics.

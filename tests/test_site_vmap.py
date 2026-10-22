@@ -523,6 +523,23 @@ def test_injection_estimate_respects_chunk_size(chunk_size):
     assert bool(site._matched_injections) == (chunk_size is None)
 
 
+def test_tuple_inputs_keep_site_injection(monkeypatch):
+    from polystep import cost_nn
+
+    monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
+    torch.manual_seed(0)
+    model = SkipMLP().double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[0], torch.tensor([[0, 1], [2, 3]])
+    values = base_sd[entry.key].reshape(-1)[local_idx].unsqueeze(1) + torch.randn(2, 3, PDIM, dtype=torch.float64)
+    inputs, targets = _small_batch()
+    got = site.evaluate(base_sd, entry, local_idx, values, (inputs.double(),), targets)
+    assert site._matched_injections and not site._uninjectable_sites
+    torch.testing.assert_close(got, site.evaluate(base_sd, entry, local_idx, values, inputs.double(), targets))
+
+
 def test_scalar_input_site_gate_skips_crash():
     torch.manual_seed(0)
     model = nn.Embedding(4, 3)
@@ -1786,6 +1803,25 @@ def test_site_chunk_peak_within_budget(noise):
     opt.step(lambda p: ev.evaluate(p, x, y))
     assert set(peaks) == {"1.weight", "1.bias", "5.weight", "5.bias"}
     assert max(peaks.values()) <= 1.05 * 4 * (1 << 26)
+
+
+def test_cpu_stock_attention_skips_hint():
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*VmapSafeMultiHeadAttention")
+        NNCostEvaluator(nn.MultiheadAttention(8, 2, batch_first=True), nn.MSELoss(), use_inplace=False)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_stock_attention_warns_vmapsafe_layer(monkeypatch):
+    model = nn.MultiheadAttention(8, 2, batch_first=True).cuda()
+    monkeypatch.setattr(NNCostEvaluator, "_batched_footprint_exceeds_free_memory", staticmethod(lambda m: True))
+    for use_inplace in (False, None):
+        with pytest.warns(UserWarning, match="VmapSafeMultiHeadAttention"):
+            NNCostEvaluator(model, nn.MSELoss(), use_inplace=use_inplace)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*VmapSafeMultiHeadAttention")
+        NNCostEvaluator(model, nn.MSELoss(), use_inplace=True)
 
 
 class TinyAttention(nn.Module):

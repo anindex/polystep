@@ -52,7 +52,7 @@ Heavy-ball momentum can amplify the barycentric displacement.
   value. With FP16 or BF16 parameters, `FactoredSubspace` materializes
   every candidate and runs slower. See
   [precision](docs/performance.md#compilation-and-precision).
-- `train()` rejects `trust_region`. See
+- `step_batch()` and `train()` reject `trust_region`. See
   [radius control](docs/api_overview.md#quadratic-model-and-radius-control) for its
   manual-step use.
 - `trust_region` and `use_adaptive_radius` both scale the step. Choose one; the
@@ -88,6 +88,13 @@ masks accept `(query, key)`, `(batch * heads, query, key)`, and broadcastable 4D
 The wrapper also accepts `(batch, query, key)` masks.
 
 CPU vmap may emit a batching-fallback warning.
+
+Stock `nn.MultiheadAttention` and `nn.TransformerEncoderLayer` work, but vmap has no
+batching rule for their fused kernels, so it runs them once per candidate and PyTorch
+prints a performance-drop warning. On CUDA this makes a step several times slower, and
+the evaluator warns and points to `VmapSafeMultiHeadAttention`. On CPU stock
+`nn.MultiheadAttention` measured faster than `VmapSafeMultiHeadAttention`, so the
+evaluator stays silent there.
 
 Stock `nn.LSTM`, `nn.GRU` and `nn.RNN` have no vmap batching rule, so the evaluator
 scores them one candidate at a time in a sequential loop, with a warning. On a small

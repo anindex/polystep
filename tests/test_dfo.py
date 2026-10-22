@@ -491,11 +491,7 @@ def test_screen_keeps_top_k_vertices(monkeypatch):
         screen_fidelity=0.25,
         max_iterations=10,
     )
-    opt.register_evaluator(evaluator, inputs, targets)
-
-    def closure(batched_params, _in=inputs, _tgt=targets):
-        return evaluator.evaluate(batched_params, _in, _tgt)
-
+    closure = opt.register_evaluator(evaluator, inputs, targets)
     screen = opt.screen_closure_from(closure, inputs, targets)
     for _ in range(2):
         opt.step(closure, screen_closure=screen)

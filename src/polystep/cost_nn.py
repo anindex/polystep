@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch._C._functorch import is_batchedtensor, maybe_current_level
 from torch.func import functional_call, vmap
 from torch.overrides import TorchFunctionMode
-from torch.utils._pytree import tree_leaves, tree_map
+from torch.utils._pytree import tree_flatten, tree_leaves, tree_map
 
 from .projection import SparseRandomProjection
 from .solvers._shared import loss_buffer_dtype
@@ -301,8 +301,27 @@ def _candidate_loss(loss_fn, loss_kind, output, targets):
     return loss_fn(output, targets) if targets is not None else loss_fn(output)
 
 
-def cast_inputs_memo(holder, inputs: torch.Tensor, dtype: Optional[torch.dtype]) -> torch.Tensor:
+def _forward_args(inputs) -> tuple[tuple, dict]:
+    """Positional and keyword arguments for the model's forward: a dict, a tuple or list, or one tensor."""
+    if isinstance(inputs, dict):
+        return (), inputs
+    if isinstance(inputs, (tuple, list)):
+        return tuple(inputs), {}
+    return (inputs,), {}
+
+
+def _first_input_tensor(inputs) -> Optional[torch.Tensor]:
+    """First batched tensor among the leaves of ``inputs``, else the first tensor."""
+    if isinstance(inputs, torch.Tensor):
+        return inputs
+    tensors = [t for t in tree_leaves(inputs) if isinstance(t, torch.Tensor)]
+    return next((t for t in tensors if t.dim()), tensors[0] if tensors else None)
+
+
+def cast_inputs_memo(holder, inputs, dtype: Optional[torch.dtype]):
     """Cast float inputs to ``dtype``, memoized on ``holder`` so a chunk loop casts once."""
+    if not isinstance(inputs, torch.Tensor):
+        return tree_map(lambda t: t.to(dtype) if isinstance(t, torch.Tensor) and t.is_floating_point() else t, inputs)
     if dtype is None or not inputs.is_floating_point() or inputs.dtype == dtype:
         return inputs
     # Inference tensors have no version counter; their contents can change unseen.
@@ -400,6 +419,15 @@ class NNCostEvaluator:
             self._use_inplace = use_inplace
         else:
             self._use_inplace = self._batched_footprint_exceeds_free_memory(model)
+        if use_inplace is not True and any(
+            type(m) is nn.MultiheadAttention and m.out_proj.weight.is_cuda for m in model.modules()
+        ):
+            warnings.warn(
+                f"{type(model).__name__} uses nn.MultiheadAttention, whose fused kernel vmap runs once per "
+                f"candidate on CUDA. polystep.layers.VmapSafeMultiHeadAttention batches it; see "
+                f"LIMITATIONS.md#attention-and-recurrent-layers.",
+                stacklevel=2,
+            )
         # An explicit True also means "run the real forward": a forward that reads
         # state functional_call cannot substitute scores every candidate the same on
         # the stateless paths, and auto-detection only judges memory.
@@ -515,21 +543,33 @@ class NNCostEvaluator:
 
         try:
             # One autocast frame over every candidate-scoring path below.
-            with self._autocast(inputs.device):
+            with self._autocast(_first_input_tensor(inputs).device):
                 return self._dispatch(stacked_params, inputs, targets)
         finally:
             if was_training:
                 self.model.train()
 
-    def cast_inputs(self, inputs: torch.Tensor, dtype: Optional[torch.dtype]) -> torch.Tensor:
+    def cast_inputs(self, inputs, dtype: Optional[torch.dtype]):
         """Cast float inputs to ``dtype`` only when the forward rejects them, memoized across chunks."""
-        if dtype is None or not inputs.is_floating_point() or inputs.dtype == dtype:
+        if (
+            dtype is None
+            or isinstance(inputs, torch.Tensor)
+            and (not inputs.is_floating_point() or inputs.dtype == dtype)
+        ):
             return inputs
-        key = (inputs.dtype, self.autocast_dtype)
+        leaves, spec = tree_flatten(inputs)
+        floats = tuple(
+            (i, t.dtype) for i, t in enumerate(leaves) if isinstance(t, torch.Tensor) and t.is_floating_point()
+        )
+        if all(d == dtype for _, d in floats):
+            return inputs
+        key = (hash(spec), floats, self.autocast_dtype)
         if key not in self._uncast_ok:
-            with torch.inference_mode(), self._probe_frame(inputs.device), self._autocast(inputs.device):
+            device = _first_input_tensor(inputs).device
+            args, kwargs = _forward_args(inputs)
+            with torch.inference_mode(), self._probe_frame(device), self._autocast(device):
                 try:
-                    self.model(inputs)
+                    self.model(*args, **kwargs)
                     self._uncast_ok[key] = True
                 except Exception:
                     self._uncast_ok[key] = False
@@ -570,7 +610,7 @@ class NNCostEvaluator:
             restore()
 
     @torch.inference_mode()
-    def _activation_ratios(self, inputs: torch.Tensor) -> Optional[dict]:
+    def _activation_ratios(self, inputs) -> Optional[dict]:
         """Widest output per input element, keyed by parameter name.
 
         The ``None`` key holds the widest output of a module that owns parameters. A
@@ -601,25 +641,27 @@ class NNCostEvaluator:
                 owned.extend(sizes)
 
         inputs = self.cast_inputs(inputs, self._input_dtype(self._param_dict_cache))
+        first = _first_input_tensor(inputs)
+        args, kwargs = _forward_args(inputs)
         handles = [m.register_forward_hook(record) for m in hooked]
         handles += [m.register_forward_pre_hook(start) for m in owners]
-        devices = [inputs.device] if inputs.device.type == "cuda" else []
+        devices = [first.device] if first.device.type == "cuda" else []
 
         def rng_state():
             return [torch.get_rng_state(), *map(torch.cuda.get_rng_state, devices)]
 
         try:
-            with self._probe_frame(inputs.device):
+            with self._probe_frame(first.device):
                 before = rng_state()
                 with uses:
-                    self.model(inputs)
+                    self.model(*args, **kwargs)
                 drew = not all(map(torch.equal, before, rng_state()))
         except Exception:
             return None
         finally:
             for h in handles:
                 h.remove()
-        scale = max(1, inputs.numel())
+        scale = max(1, first.numel())
         ratios = {None: max(owned, default=0) / scale}
         if drew:
             return ratios
@@ -663,6 +705,7 @@ class NNCostEvaluator:
         if (
             self._batched_linear is not None
             and targets is not None
+            and isinstance(inputs, torch.Tensor)
             and (inputs.dim() == 2 or self._batched_linear.leading_flatten)
             and not self.per_sample
         ):
@@ -727,7 +770,7 @@ class NNCostEvaluator:
         def single_eval(params, shared, inputs, targets):
             # Buffers win on a key collision: frozen model state, not part of the solve.
             full_dict = {**shared, **params, **buffers}
-            output = functional_call(model, full_dict, (inputs,))
+            output = functional_call(model, full_dict, *_forward_args(inputs))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
         batched = vmap(
@@ -794,15 +837,15 @@ class NNCostEvaluator:
     def _evaluate_loop(self, stacked_params, inputs, targets):
         """Sequential fallback when vmap is incompatible."""
         if not stacked_params:
-            return torch.zeros(0, device=inputs.device)
+            return torch.zeros(0, device=_first_input_tensor(inputs).device)
         N = next(iter(stacked_params.values())).shape[0]
         if N == 0:
-            return torch.zeros(0, device=inputs.device)
+            return torch.zeros(0, device=_first_input_tensor(inputs).device)
         losses = []
         with self._restoring_buffers() as restore:
             for i in range(N):
                 full_dict = {**{k: v[i] for k, v in stacked_params.items()}, **self._buffers}
-                output = functional_call(self.model, full_dict, (inputs,))
+                output = functional_call(self.model, full_dict, *_forward_args(inputs))
                 loss = _candidate_loss(self.loss_fn, self._loss_kind, output, targets)
                 restore()
                 losses.append(_fold_candidate_loss(loss, self.per_sample))
@@ -810,7 +853,8 @@ class NNCostEvaluator:
 
     def _forward_loss(self, inputs, targets):
         """Forward + reduced scalar loss on the model's current params."""
-        loss = _candidate_loss(self.loss_fn, self._loss_kind, self.model(inputs), targets)
+        args, kwargs = _forward_args(inputs)
+        loss = _candidate_loss(self.loss_fn, self._loss_kind, self.model(*args, **kwargs), targets)
         if loss.dim() > 0:
             loss = loss.mean()
         return loss
@@ -869,9 +913,9 @@ class NNCostEvaluator:
     def _evaluate_inplace(self, stacked_params, inputs, targets):
         """Memory-minimal evaluation via in-place weight swapping (O(1 x activation))."""
         if not stacked_params:
-            return torch.zeros(0, device=inputs.device)
+            return torch.zeros(0, device=_first_input_tensor(inputs).device)
         N = next(iter(stacked_params.values())).shape[0]
-        device = inputs.device
+        device = _first_input_tensor(inputs).device
         losses = torch.empty(N, device=device, dtype=loss_buffer_dtype(next(iter(stacked_params.values())).dtype))
 
         param_dict = self._param_dict_cache
@@ -931,7 +975,7 @@ class NNCostEvaluator:
         peak memory is independent of N and no stacked parameter dict is allocated.
         """
         N = flat_subspace_batch.shape[0]
-        device = inputs.device
+        device = _first_input_tensor(inputs).device
 
         # Cast float inputs to the param dtype (integers untouched).
         inputs = self.cast_inputs(inputs, self._input_dtype(base_sd))
@@ -1802,10 +1846,11 @@ class SiteVmapEvaluator:
         groups, cand, pdim = values.shape
         n = groups * cand
         base = base_sd[entry.key]
+        first = _first_input_tensor(inputs)
         if (
             base.device.type == "cpu"
             and base.dim() > 1
-            and min(n, self._owner.chunk_size or n) * (inputs.shape[0] if inputs.dim() else 1) * base.numel()
+            and min(n, self._owner.chunk_size or n) * (first.shape[0] if first.dim() else 1) * base.numel()
             >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls + _INTERCEPT_SETUP_CALLS)
             and base.dtype not in (torch.float16, torch.bfloat16)
             and not self._owner._compile_vmap
@@ -1816,7 +1861,7 @@ class SiteVmapEvaluator:
             dv = values - base.reshape(-1)[rows].unsqueeze(1)
             dv = dv.masked_fill(local_idx.unsqueeze(1) >= entry.numel, 0)
             offsets = (rows.unsqueeze(1).expand(groups, cand, pdim).reshape(n, pdim), dv.reshape(n, pdim))
-            sig = (entry.key, inputs.shape, inputs.dtype)
+            sig = (entry.key, *((t.shape, t.dtype) for t in tree_leaves(inputs) if isinstance(t, torch.Tensor)))
             try:
                 if sig in self._matched_injections or self._injection_matches(
                     base_sd, entry, local_idx, values, offsets, inputs, targets
@@ -1860,12 +1905,14 @@ class SiteVmapEvaluator:
         def single_eval(site_param, shared, inputs, targets):
             if inject:
                 with _SiteDelta(base_sd[key], *site_param) as delta:
-                    output = functional_call(model, {**shared, **dict.fromkeys(names, base_sd[key])}, (inputs,))
+                    output = functional_call(
+                        model, {**shared, **dict.fromkeys(names, base_sd[key])}, *_forward_args(inputs)
+                    )
                 if not delta.added:
                     raise _SiteNotInjectable
                 self._forward_calls = delta.calls
             else:
-                output = functional_call(model, {**shared, **dict.fromkeys(names, site_param)}, (inputs,))
+                output = functional_call(model, {**shared, **dict.fromkeys(names, site_param)}, *_forward_args(inputs))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
         def score_alone(n):
@@ -1903,6 +1950,7 @@ class SiteVmapEvaluator:
                         warnings.warn(f"compile_vmap failed at site {key!r} ({e}); using eager vmap.", stacklevel=2)
                 if (
                     not inject
+                    and isinstance(inputs, torch.Tensor)
                     and site.is_cuda
                     and self._owner._compile_forward is not False
                     and not (self._owner._compile_vmap or self._owner._use_inplace)
@@ -2023,12 +2071,13 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
             torch._foreach_copy_([self._param(k) for k in keys], [sd[k] for k in keys])
             self._primed = sd
         inputs = owner.cast_inputs(inputs, owner._input_dtype(sd))
-        losses = torch.empty(n, device=inputs.device, dtype=loss_buffer_dtype(next(iter(sd.values())).dtype))
+        device = _first_input_tensor(inputs).device
+        losses = torch.empty(n, device=device, dtype=loss_buffer_dtype(next(iter(sd.values())).dtype))
         was_training = model.training
         if was_training:
             model.eval()
         try:
-            with owner._autocast(inputs.device):
+            with owner._autocast(device):
                 forward = owner._verified_forward_loss_fn(inputs, targets)
                 yield losses, lambda: forward(inputs, targets).detach()
         finally:

@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from polystep import (
     HybridSubspace,
+    NNCostEvaluator,
     ParamLayout,
     PolyStepOptimizer,
     train,
@@ -211,6 +212,73 @@ class TestTrain:
         assert optimizer._cost_evaluator is None
         assert optimizer._fused_inputs is None
         assert optimizer._fused_targets is None
+        assert optimizer._registration_closure is None
+
+    def test_dict_and_tuple_batches_train_alike(self):
+        class Masked(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(4, 3)
+
+            def forward(self, x, mask):
+                return self.lin(x) * mask
+
+        x, y = _batch(n=16)
+        mask = (torch.rand(16, 3, generator=torch.Generator().manual_seed(1)) > 0.3).float()
+        rows = [{"x": x[i], "mask": mask[i], "labels": y[i]} for i in range(16)]
+        weights = []
+        for dataset in (rows, TensorDataset(x, mask, y)):
+            torch.manual_seed(0)
+            model = Masked()
+            start = model.lin.weight.detach().clone()
+            opt = PolyStepOptimizer(model, seed=0, multifidelity_screen=True)
+            config = TrainConfig(epochs=1, restore_best=False)
+            train(model, DataLoader(dataset, batch_size=8), nn.CrossEntropyLoss(), opt, config)
+            weights.append(model.lin.weight.detach())
+        assert not torch.equal(weights[0], start)
+        assert torch.equal(*weights)
+
+    def test_cost_subsample_keeps_scalar_inputs(self):
+        class Scaled(nn.Linear):
+            def forward(self, x, scale):
+                return super().forward(x) * scale
+
+        x, y = _batch(n=8)
+        opt = PolyStepOptimizer(Scaled(4, 3), seed=0, cost_batch_size=4)
+        opt.step_batch((x, torch.tensor(2.0)), y, loss_fn=nn.CrossEntropyLoss())
+        sub_x, scale = opt._fused_inputs
+        assert sub_x.shape[0] == opt._fused_targets.shape[0] == 4
+        assert scale.dim() == 0 and scale.item() == 2.0
+
+    def test_cost_subsample_scalar_first_input(self):
+        class Scaled(nn.Linear):
+            def forward(self, scale, x):
+                return super().forward(x) * scale
+
+        class Weighted(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.ones(3))
+
+            def forward(self, scale):
+                return self.w * scale
+
+        class ScaledEmbedding(nn.Embedding):
+            def forward(self, scale, ids):
+                return super().forward(ids) * scale
+
+        x, y = _batch(n=8)
+        for autocast in (False, True):
+            opt = PolyStepOptimizer(Scaled(4, 3), seed=0, cost_batch_size=4, candidate_autocast=autocast)
+            opt.step_batch({"scale": torch.tensor(2.0), "x": x}, y, loss_fn=nn.CrossEntropyLoss())
+            assert opt._fused_inputs["x"].shape[0] == opt._fused_targets.shape[0] == 4
+            assert opt._fused_inputs["scale"].dim() == 0
+            opt = PolyStepOptimizer(Weighted(), seed=0, cost_batch_size=2, candidate_autocast=autocast)
+            loss = opt.step_batch({"scale": torch.tensor(2.0)}, torch.zeros(3), loss_fn=nn.MSELoss())
+            assert torch.isfinite(torch.tensor(loss)) and opt._fused_targets.shape == (3,)
+        opt = PolyStepOptimizer(ScaledEmbedding(10, 3), seed=0, cost_batch_size=4)
+        opt.step_batch({"scale": torch.tensor(2.0), "ids": torch.arange(8)}, torch.zeros(8, 3), loss_fn=nn.MSELoss())
+        assert opt._fused_inputs["ids"].shape[0] == 4
 
     def test_train_rejects_foreign_model(self):
         """Candidates would score one model while steps were written into the other."""
@@ -220,19 +288,27 @@ class TestTrain:
             train(b, loader, nn.CrossEntropyLoss(), PolyStepOptimizer(a, seed=0), TrainConfig(epochs=1))
 
     def test_train_rejects_trust_region(self):
-        """The changing objective_token would clear the pending pair before it was ever used."""
+        """Its ratio would compare a prediction against the loss on the next batch."""
         model = nn.Linear(4, 2)
         loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
         opt = PolyStepOptimizer(model, seed=0, trust_region=True, polytope_type="orthoplex")
-        with pytest.raises(ValueError, match="trust_region is not supported"):
+        opt.register_evaluator(NNCostEvaluator(model, nn.CrossEntropyLoss()), *_batch(c=2))
+        with pytest.raises(ValueError, match="trust_region is not supported by train"):
             train(model, loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=1))
+        assert opt._cost_evaluator is not None
 
     def test_train_restores_model_train_mode(self):
         """The evaluator switches to eval to freeze statistics; train() must switch back."""
-        model = nn.Linear(4, 2)
+        model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4), nn.Linear(4, 2))
         model.train()
         loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
-        train(model, loader, nn.CrossEntropyLoss(), PolyStepOptimizer(model, seed=0), TrainConfig(epochs=1))
+        opt = PolyStepOptimizer(model, seed=0)
+        loss_fn = nn.CrossEntropyLoss()
+        config = TrainConfig(epochs=1, restore_best=False, callbacks=[TrainCallback()])
+        train(model, loader, loss_fn, opt, config)
+        running_mean = model[1].running_mean.clone()
+        train(model, loader, loss_fn, opt, config)
+        assert torch.equal(model[1].running_mean, running_mean)
         assert model.training
 
     def test_train_compiled_module_matches_plain(self):
@@ -245,23 +321,70 @@ class TestTrain:
         for a, b in zip(plain.parameters(), inner.parameters()):
             assert torch.equal(a, b)
 
-    def test_train_restores_non_tensor_extra_state(self):
+    @pytest.mark.parametrize("written", [{"calibrated": False}, {"calibrated": True, "steps": 1}])
+    def test_train_restores_non_tensor_extra_state(self, written):
         class Calibrated(nn.Linear):
             def get_extra_state(self):
-                return {"calibrated": self.calibrated}
+                return dict(self.meta)
 
             def set_extra_state(self, state):
-                self.calibrated = state["calibrated"]
+                self.meta = dict(state)
 
         torch.manual_seed(0)
         model = nn.Sequential(Calibrated(5, 4), nn.Tanh(), nn.Linear(4, 2))
-        model[0].calibrated = True
+        model[0].meta = {"calibrated": True}
         layout = ParamLayout.from_module(model)
         opt = PolyStepOptimizer(model, subspace=HybridSubspace.from_layout(layout, rank=2), seed=0, max_iterations=2)
         loader = DataLoader(TensorDataset(*_batch(n=64, d=5, c=2)), batch_size=32)
-        train(model, loader, nn.CrossEntropyLoss(), opt, TrainConfig(epochs=1, restore_best=True))
+
+        class Recalibrate(TrainCallback):
+            def on_step_end(self, metrics):
+                model[0].meta = dict(written)
+                return True
+
+        config = TrainConfig(epochs=1, callbacks=[Recalibrate()], restore_best=True)
+        train(model, loader, nn.CrossEntropyLoss(), opt, config)
         assert layout.total_params == 34
-        assert model[0].calibrated is True
+        assert model[0].meta == {"calibrated": True}
+
+    def test_noop_callback_keeps_trajectory(self):
+        class Stateful(nn.Linear):
+            def __init__(self):
+                super().__init__(2, 1)
+                self.register_buffer("calls", torch.zeros(()))
+
+            def forward(self, x):
+                self.calls.add_(1)
+                return super().forward(x) + self.calls + 0.1 * torch.randn(())
+
+        costs = []
+        for config in (TrainConfig(epochs=1, restore_best=False), TrainConfig(epochs=1, callbacks=[TrainCallback()])):
+            torch.manual_seed(0)
+            model = Stateful()
+            opt = PolyStepOptimizer(model, solver="softmax", seed=0, compile_forward=False)
+            train(model, [(torch.ones(4, 2), torch.zeros(4, 1))] * 3, nn.MSELoss(), opt, config)
+            costs.append(opt.state.costs)
+        assert costs[0] == costs[1]
+
+    @pytest.mark.parametrize("restore_best", [False, True])
+    def test_callback_loss_tracks_current_batch(self, restore_best):
+        torch.manual_seed(0)
+        model = nn.Linear(2, 1)
+        opt = PolyStepOptimizer(model, solver="softmax", seed=0)
+        batches = [(torch.zeros(4, 2), torch.full((4, 1), v)) for v in (0.0, 10.0)]
+        pairs = []
+
+        class Rescore(TrainCallback):
+            def on_step_end(self, metrics):
+                x, y = batches[metrics["step"]]
+                with torch.inference_mode():
+                    pairs.append((metrics["loss"], nn.functional.mse_loss(model(x), y).item()))
+                return False
+
+        config = TrainConfig(epochs=1, restore_best=restore_best, callbacks=[Rescore()])
+        train(model, batches, nn.MSELoss(), opt, config)
+        assert len(pairs) == 2
+        assert all(loss == pytest.approx(expected) for loss, expected in pairs), pairs
 
 
 class TestLoggingCallback:
