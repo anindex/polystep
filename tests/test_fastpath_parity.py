@@ -217,7 +217,7 @@ def test_fast_paths_preserve_container_loss_behavior(behavior):
     "kind, attr",
     [("full", "_sparse_delta_evaluator"), ("hybrid", "_subspace_delta_evaluator"), ("factored", "_factored_evaluator")],
 )
-def test_3d_inputs_need_leading_flatten_for_delta(kind, attr, flatten):
+def test_3d_inputs_need_flatten_for_delta(kind, attr, flatten):
     from polystep.factored_subspace import FactoredSubspace
     from polystep.hybrid_subspace import HybridSubspace
 
@@ -244,7 +244,7 @@ def test_3d_inputs_need_leading_flatten_for_delta(kind, attr, flatten):
 
 
 @pytest.mark.parametrize("targets", [[0, -100], [-100, -100]])
-def test_fast_cross_entropy_matches_ignored_target_reduction(targets):
+def test_fast_cross_entropy_matches_ignored_targets(targets):
     model = nn.Sequential(nn.Linear(2, 2)).double()
     evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False)
     params = {k: v.detach().unsqueeze(0).expand(3, *v.shape) for k, v in model.named_parameters()}

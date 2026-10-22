@@ -89,7 +89,7 @@ def test_align_marginal_defaults_and_coerces():
     assert out.dtype == torch.float32
 
 
-def test_align_dual_coerces_dtype_warns_on_mismatch():
+def test_align_dual_coerces_dtype_warns_mismatch():
     f64 = torch.zeros(5, dtype=torch.float64)
     out = align_dual(f64, 5, torch.device("cpu"), torch.float32, "init_f")
     assert out is not None and out.dtype == torch.float32

@@ -11,7 +11,7 @@ evaluation when `biased_rotation` or `trust_region` uses it.
 ## Quick checklist
 
 - Pick the thread count with `python -m polystep.benchmarks.threads`.
-- Register the evaluator for each batch, or use `train()`.
+- Use `step_batch()` or `train()`, or register the evaluator for every batch.
 - Cap `max_subspace_dim`.
 - On a small CUDA model, try a `chunk_size` at or above the candidate count.
 - Time compilation separately from steady-state steps.
@@ -28,6 +28,7 @@ evaluation when `biased_rotation` or `trust_region` uses it.
 | Linear MLP, dense candidates | Batched matrix multiplication | Automatic |
 | Other models | vmap or sequential fallback | Automatic |
 | Models too large for batched weight copies | In-place parameter swaps | Automatic on CUDA when eight weight copies would take more than half the free memory; `NNCostEvaluator(..., use_inplace=True)` forces it |
+| Convolution nets on CPU with large activation maps | In-place parameter swaps | Opt-in with `NNCostEvaluator(model, loss_fn, use_inplace=True)`; time a few steps both ways |
 
 A Linear MLP is an `nn.Sequential`, or a module whose forward chains Linear layers,
 the common activations and `x.flatten(1)`, one call feeding the next. Activations count
@@ -100,6 +101,13 @@ site-local, delta and factored paths where they apply and swaps the remaining
 candidates in one at a time. It rewrites a single parameter in place only when the
 model ties weights.
 
+On the CPU, batching candidates multiplies every activation map by the chunk size, so
+a net that keeps full-resolution maps spends much of its step moving them through
+memory. On one thread, a two-block ResNet with 16 channels on 16x16 inputs stepped 1.4
+times faster with `use_inplace=True` at batch 32 and 128, while LeNet-5 took 7.6 times
+as long and a pooled three-convolution CIFAR net 1.6 times as long, and on CUDA the
+ResNet took 2.2 times as long in place.
+
 A forward that draws its own random numbers, such as injected noise, stays batched.
 vmap refuses the draw at first, so the evaluator retries once with
 `randomness="different"`. Each candidate then gets its own draw: identical
@@ -114,13 +122,14 @@ parameter stays site-local. Buffers the forward writes are restored after every
 batched call and after every looped candidate, so the retry, the probe, the loop and
 later calls all start from the same buffer values.
 
-Register the evaluator before each batch; `train()` does this automatically:
+`step_batch()` and `train()` register each batch for these paths:
 
 ```python
-evaluator = NNCostEvaluator(model, loss_fn)
-optimizer.register_evaluator(evaluator, inputs, targets)
-optimizer.step(lambda p: evaluator.evaluate(p, inputs, targets))
+optimizer.step_batch(inputs, targets, loss_fn=loss_fn)
 ```
+
+With an evaluator you built yourself, step with the closure its registration returns:
+`optimizer.step(optimizer.register_evaluator(evaluator, inputs, targets))`.
 
 The [API reference](api_overview.md#optimizer) covers the closure contract and what
 to call after replacing layers, parameters or buffers.
@@ -160,21 +169,22 @@ raised test accuracy from 51% to 73% at equal time. A rotation clears the
 extra full OT step: at `amortize_steps=5` the same run gained 12 points for 19% more
 time. Pass `rotation_interval=0` to keep `B` fixed.
 
-The delta path scores each parameter in its own pass and launches more kernels per
-chunk than the low-rank correction, which a GPU pays for while its chunks are too
-small to keep it busy. On CUDA it therefore runs only when one chunk of the default
-budget cannot hold every candidate and `chunk_size`, or the candidate count when it is
-unset, times a candidate's largest layer output reaches 2^24, about 16.8 million,
-elements. Other CUDA steps use the low-rank correction, which needs more peak memory
-per chunk. The threshold is where the delta path stops losing on shallow MLPs
-(784-128-10 at batch 512 on an RTX 5090). On that GPU the delta steps this rule picks
-at the default chunk size ran up to 5 times faster, though only a few percent faster
-close to the threshold, with 4 to 54 times less peak memory. A batch of one on a
-784-512-512-10 or 3072-1024-10 MLP stays below the threshold, and there the delta
-path ran up to 1.35 times slower. Below the threshold the low-rank correction ran up
-to 1.4 times faster on small or shallow MLPs, but wider, deeper and larger-batch ones
-favor the delta path from smaller chunks on, so with a `chunk_size` set they may step
-faster with a larger one.
+For `FactoredSubspace` the delta path scores each parameter in its own pass and
+launches more kernels per chunk than the low-rank correction, which a GPU pays for
+while its chunks are too small to keep it busy. On CUDA it therefore runs only when
+both hold: one chunk of the default budget cannot hold every candidate, and
+`chunk_size` (or the candidate count, when it is unset) times a candidate's largest
+layer output reaches 2^24, about 16.8 million, elements. Other factored CUDA steps use
+the low-rank correction, which needs more peak memory per chunk. `HybridSubspace` has
+no low-rank correction, so this rule does not apply to it. The threshold is where the
+delta path stops losing on shallow MLPs (784-128-10 at batch 512 on an RTX 5090). On
+that GPU the delta steps this rule picks at the default chunk size ran up to 5 times
+faster, though only a few percent faster close to the threshold, with 4 to 54 times
+less peak memory. A batch of one on a 784-512-512-10 or 3072-1024-10 MLP stays below
+the threshold, and there the delta path ran up to 1.35 times slower. Below the
+threshold the low-rank correction ran up to 1.4 times faster on small or shallow MLPs,
+but wider, deeper and larger-batch ones favor the delta path from smaller chunks on,
+so with a `chunk_size` set they may step faster with a larger one.
 
 `AdaptiveSubspace` still builds every candidate's full weights, since its single
 projection `P` spreads each coordinate over every parameter. On the CPU, with a dense
@@ -194,32 +204,33 @@ many thin batched products the offsets need.
 candidate's parameters and its largest layer output, which one forward measures when
 the evaluator is first registered and which then scales with the batch. Delta and
 site-local paths build no full candidate, so they are budgeted on activations and the
-perturbed parameter alone: 2^26 elements, counting two activations and the parameter. On
-the CPU, subspace site and subspace delta chunks drop to a 16 MiB budget once one
+perturbed parameter alone: 2^26 elements, counting two activations and the parameter.
+On the CPU, subspace site and subspace delta chunks drop to a 16 MiB budget once one
 activation of a chunk would pass 32 MiB, glibc's largest mmap threshold, above which
 each allocation maps fresh pages that fault in zeroed. Example 11's transformer keeps
 its chunks, whose activations stay under 32 MiB. Full-space delta and site chunks keep
 the element budget on every device. The delta estimate counts more than it allocates,
 and smaller chunks measured slower there. On the site path, smaller chunks can fall
-below the per-call size at which a convolution takes the output-delta injection. They
-also free only small mapped blocks, and glibc raises its mmap threshold to the largest
-block freed, so the fully connected sites after them fault on every chunk: a full-space
-LeNet-5 step took 17% to 49% longer at batch 32 and 128. On CUDA the full-space delta
-path counts activations only, since it never builds the parameter, so its chunks are
-larger and its peak memory
-higher: 397 MiB instead of 163 MiB for 784-256-256-10 at batch 256 on an RTX 5090. A
-candidate's loss can depend on the chunk shape, so on that model the larger chunks
-change a few losses in the last float32 bit. The CPU keeps the parameter in the budget,
-because smaller chunks run faster there. A site-local path batches only the layers from
-the perturbed one on, so each site is budgeted on the module outputs from its own layer
-on. A forward that draws random numbers is batched from the draw on, so its sites keep
-the whole-model budget, as does a parameter the forward reads before calling its layer.
-In example 10's LeNet-5 at batch 256 on CUDA, a chunk holds 27 candidates on the first
-convolution, whose output fills the budget, 72 on the second and up to 729 on the fully
-connected layers, so a step scores its 4,833 candidates in 36 forwards. On the CPU a
-chunk holds 9 candidates on both convolutions, 36 and 45 on the first two fully
-connected layers and up to 414 on the last, so a step takes 197 forwards. Reduce
-`chunk_size` after an out-of-memory error.
+below the per-call size the output-delta injection needs, which turned it off for a
+LeNet-5 convolution and for an LSTM's recurrent weight. They also free only small
+mapped blocks, and glibc raises its mmap threshold to the largest block freed, so the
+fully connected sites after them fault on every chunk: a full-space LeNet-5 step took
+17% to 49% longer at batch 32 and 128. On CUDA the full-space delta path counts
+activations only, since it never builds the parameter, so its chunks are larger and
+its peak memory higher: 397 MiB instead of 163 MiB for 784-256-256-10 at batch 256 on
+an RTX 5090. A candidate's loss can depend on the chunk shape, so on that model the
+larger chunks change a few losses in the last float32 bit. The CPU keeps the parameter
+in the budget, because there the larger chunks stepped at about half the speed. A
+site-local path batches only the layers from the perturbed one on, so each site is
+budgeted on the module outputs from its own layer on. A forward that draws random
+numbers is batched from the draw on, so its sites keep the whole-model budget, as does
+a parameter the forward reads before calling its layer. In example 10's LeNet-5 at
+batch 256 on CUDA, a chunk holds 27 candidates on the first convolution, whose output
+fills the budget, 72 on the second and up to 729 on the fully connected layers, so a
+step scores its 4,833 candidates in 36 forwards. On the CPU a chunk holds 9 candidates
+on both convolutions, 36 and 45 on the first two fully connected layers and up to 414
+on the last, so a step takes 197 forwards. Reduce `chunk_size` after an out-of-memory
+error.
 
 Steps that score on a delta or site-local path, or on CPU `AdaptiveSubspace` offsets,
 keep whole particles in each chunk, every vertex and probe of one particle, so
@@ -248,20 +259,21 @@ Profiler output confirms whether a compiled region actually ran. PyTorch's
 recompilation limit can cause later calls to run eagerly.
 
 On CUDA the site-local path replays its forward from CUDA graphs unless the evaluator
-or the optimizer gets `compile_forward=False`. Each parameter, chunk shape and batch shape runs eagerly
-once, is captured on its second call and replays after that, up to 64 graphs. This
-helps launch-bound models: example 11 steps about 1.15x to 1.35x faster, while LeNet-5 in
-example 10 is unchanged. The graphs share one memory pool sized to the largest chunk's
-activations and one copy of the weights and buffers. Each graph also holds its own copy
-of its candidate stack and batch, so memory grows with the number of graphs and can far
-exceed the weights. The graphs added 32 MiB allocated and 78 MiB reserved on example 11
-and about 120 MiB and 410 MiB on example 10. Widened to `d_model=256, d_ff=1024`,
-example 11 held 266 MiB of candidate stacks across 21 graphs for 3 MiB of weights. Capture
-freezes the Python-side state the forward reads, such as a Python counter, a flag or a
-reassigned tensor attribute. A forward that draws random numbers stays eager, and one
-that syncs with the host fails capture, warns once and keeps that parameter eager.
-`release_evaluator()` frees the graphs, so call it once after training rather than
-every epoch.
+or the optimizer gets `compile_forward=False`. Each parameter, chunk shape and batch
+shape runs eagerly once, is captured on its second call and replays after that, up to
+64 graphs. This helps launch-bound models: on an RTX 5090 example 11 steps about 1.7
+times faster, while LeNet-5 in example 10 is unchanged. The graphs share one memory
+pool sized to the largest chunk's activations and one copy of the weights and buffers.
+Each graph also holds its own copy of its candidate stack and batch, so memory grows
+with the number of graphs and can far exceed the weights. The graphs added 34 MiB
+allocated and 42 MiB reserved on example 11, and 280 MiB and 410 MiB on example 10,
+whose 12 graphs hold 240 MiB of candidate stacks. Widened to `d_model=256, d_ff=1024`,
+example 11 held 266 MiB of candidate stacks across 21 graphs for 3 MiB of weights.
+Capture freezes the Python-side state the forward reads, such as a Python counter, a
+flag or a reassigned tensor attribute. A forward that draws random numbers stays eager,
+and one that syncs with the host fails capture, warns once and keeps that parameter
+eager. `release_evaluator()` frees the graphs, so call it once after training rather
+than every epoch.
 
 CPU attention uses native scaled-dot-product attention. CUDA uses it too without a mask,
 or with `is_causal=True` and no padding mask, outside FP16; other CUDA attention uses
@@ -281,30 +293,41 @@ materialized candidate is built; factored candidates are materialized. The weigh
 swapped into the model under `use_inplace=True`, and the ones a step writes back
 when it ends, round the same way.
 
+The delta, site-local and vmap paths add each Linear's bias after the matmul, while
+the model's own Linear adds it inside the matmul and rounds once, so with FP16 or
+BF16 weights a Linear's output can differ from the forward's by about one ulp. That
+matters only for a hard threshold, such as a sign or a spike, whose pre-activation
+lies that close to its cut. `use_inplace=True` scores with the model's own forward,
+at 11 to 118 times the step time in our measurements, with no measurable change in
+training loss or accuracy on small sign, ReLU and spiking models.
+
 ## CPU measurements
 
-PyTorch 2.13 on one performance-core thread of an Intel Core Ultra 9 285K. Complete
+PyTorch 2.13 on one efficiency-core thread of an Intel Core Ultra 9 285K. Complete
 steps of a 32-w-w-4 MLP at batch 32 with `solver="softmax"`, `chunk_size=72` and a
-registered evaluator, the median over five seeds of the median of seven timed steps
-after one cold step and two warmup steps. The subspace row is a `HybridSubspace` at
-rank 4 capped at 1,024 coordinates:
+registered evaluator, the median over five seeds, each run twice, of the median of
+seven timed steps after one cold step and two warmup steps. The subspace row is a
+`HybridSubspace` at rank 4 capped at 1,024 coordinates:
 
 | Hidden width `w` | Search | Without prefix reuse | With reuse |
 |---|---|---:|---:|
-| 64 | Full space | 29.15 ms | 27.51 ms |
-| 256 | Full space | 411.24 ms | 339.87 ms |
-| 256 | 1,024 coordinates | 58.39 ms | 57.80 ms |
+| 64 | Full space | 34.50 ms | 31.69 ms |
+| 256 | Full space | 493.15 ms | 368.27 ms |
+| 256 | 1,024 coordinates | 57.14 ms | 56.36 ms |
 
-With the automatic chunk size, the full-space steps with reuse take about 39 ms at
-width 64 and 470 ms at width 256. The subspace row barely changes.
+With the automatic chunk size, the full-space steps with reuse take about 43 ms at
+width 64 and 550 ms at width 256, and the subspace step about 60 ms. On an RTX 5090
+the automatic chunk size brings the same three steps to 2.8 ms, 10.6 ms and 5.6 ms,
+while `chunk_size=72` leaves the full-space ones at 40 ms and 426 ms, one small forward
+per 72 candidates.
 
-Attention kernel medians, 16 candidates and batch 16:
+Attention kernel medians over three runs, 16 candidates and batch 16:
 
 | Sequence length | Explicit attention | Native CPU SDPA |
 |---|---:|---:|
-| 6 | 0.371 ms | 0.274 ms |
-| 64 | 6.921 ms | 1.841 ms |
-| 128 | 34.485 ms | 5.437 ms |
+| 6 | 0.440 ms | 0.396 ms |
+| 64 | 13.604 ms | 3.423 ms |
+| 128 | 54.022 ms | 11.216 ms |
 
 These kernel timings do not measure complete optimizer steps. GPU results depend on
 device, shapes, and backend selection.
@@ -312,10 +335,11 @@ device, shapes, and backend selection.
 ## CPU threads
 
 PyTorch starts one intra-op thread per core, and whether that helps depends on the
-step. On the machine above, the README quickstart step takes about 1.1 ms on one
-thread and about the same on 24, while the full-space 784-64-10 step that
-`python -m polystep.benchmarks.threads` times drops from 227 ms on one thread to
-77 ms on 16 and 79 ms on 24. A pool that covers every core also slows down when
+step. Other jobs held the performance cores of the machine above, so these runs used
+eight of its efficiency cores. There the README quickstart step takes about 1.6 ms on
+one thread and slightly longer on four or eight, while the full-space 784-64-10 step
+that `python -m polystep.benchmarks.threads` times drops from 104 ms on one thread to
+63 ms on four and 54 ms on eight. A pool that covers every core also slows down when
 other processes compete for the CPU, so the fast test suite and the examples default
 to one thread; [CONTRIBUTING](../CONTRIBUTING.md#tests) and the
 [examples](../examples/README.md) list the exceptions. The optimizer warns once when

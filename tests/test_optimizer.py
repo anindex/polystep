@@ -57,7 +57,7 @@ def optimizer(model):
 
 
 class TestClosureInterface:
-    def test_each_step_moves_model_records_one_cost(self, model, optimizer, closure):
+    def test_step_moves_model_records_cost(self, model, optimizer, closure):
         initial = {k: v.clone() for k, v in model.state_dict().items()}
         assert optimizer.state.iteration_count == 0
 
@@ -332,11 +332,12 @@ class TestDualMomentum:
                 f"beta=0 should match default: {cost_beta0} vs {cost_default}"
             )
 
-    def test_extrapolation_applied(self):
-        """After 2+ steps, state.prev_prev_f is not None (history is being tracked)."""
+    def test_dual_momentum_extrapolates_warm_start(self):
+        """The solver warm start is g + beta * (g - prev_prev_g)."""
         torch.manual_seed(42)
         model = _make_model()
         closure = _make_closure(model)
+        beta = 0.3
         opt = PolyStepOptimizer(
             model,
             max_iterations=50,
@@ -344,12 +345,23 @@ class TestDualMomentum:
             sinkhorn_max_iters=100,
             compile=False,
             seed=42,
-            dual_momentum_beta=0.3,
+            dual_momentum_beta=beta,
         )
-        opt.step(closure)
-        opt.step(closure)
-        assert opt.state.prev_prev_f is not None, "After 2 steps, prev_prev_f should be set"
-        assert opt.state.prev_prev_g is not None, "After 2 steps, prev_prev_g should be set"
+        seen = []
+        real_solve = opt.solver.solve
+
+        def spy(*args, **kwargs):
+            s = opt.state
+            if s.prev_prev_g is not None:
+                seen.append((kwargs["init_g"].clone(), s.g + beta * (s.g - s.prev_prev_g)))
+            return real_solve(*args, **kwargs)
+
+        opt.solver.solve = spy
+        for _ in range(4):
+            opt.step(closure)
+        assert len(seen) >= 2
+        for got, want in seen:
+            torch.testing.assert_close(got, want)
 
     def test_extrapolation_clamped(self):
         """The extrapolated warm start handed to the solver stays inside the clamp.
@@ -438,7 +450,7 @@ class TestProgressiveEpsilon:
         assert all(0 < e < 100 for e in eps_values)
 
 
-def test_both_entry_points_default_num_probe_one():
+def test_entry_points_default_num_probe_one():
     """K=1 is the reported and optimal setting; the two APIs must not disagree."""
 
     def objective(x):
@@ -464,7 +476,7 @@ class _SNNStub(nn.Module):
 
 
 @pytest.mark.parametrize("build, expect_warning", [(_SNNStub, True), (_make_model, False)])
-def test_cosine_step_radius_warns_only_for_snn(build, expect_warning):
+def test_cosine_step_radius_warns_snn_only(build, expect_warning):
     """A cosine step_radius schedule collapses hard-LIF SNN accuracy, so it warns only there."""
     cosine = CosineEpsilon(init=5.0, target=1.0, decay=0.01)
     with warnings.catch_warnings(record=True) as caught:
@@ -655,7 +667,7 @@ class TestNaNRevertRestoresState:
 
         return opt, closure
 
-    def test_poisoned_velocity_reverts_x_to_pre_step(self):
+    def test_poisoned_velocity_restores_pre_step_x(self):
         """Pre-step X is finite here, so the revert restores it rather than the origin."""
         opt, closure = self._build(use_momentum=True, momentum_init=0.9, momentum_final=0.9)
         opt.step(closure)

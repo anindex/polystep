@@ -52,7 +52,7 @@ def simple_closure(simple_model):
 
 
 class TestCombinedModeInitialization:
-    def test_row_segments_split_only_two_sided_solves(self, simple_model):
+    def test_row_segments_need_two_sided_solver(self, simple_model):
         """Sinkhorn splits the particles into 2 to 8 row segments; a one-sided solver
         keeps the monolithic step and says so."""
         subspace = AdaptiveSubspace.auto_from_params(simple_model, compression_target=0.5)

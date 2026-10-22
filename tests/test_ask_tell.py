@@ -111,7 +111,7 @@ def test_scale_cost_typo_raises_at_init():
         PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, scale_cost="maen")
 
 
-def test_scale_cost_beyond_float32_accepted_at_init():
+def test_huge_scale_cost_accepted_at_init():
     PolyStepES(dim=3, dtype=torch.float64, scale_cost=1e100)
     PolyStepOptimizer(torch.nn.Linear(3, 1).double(), scale_cost=1e100)
     PolyStep(objective_fn=lambda x: x.pow(2).sum(-1), dim=2, scale_cost=1e100)

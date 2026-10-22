@@ -291,7 +291,7 @@ def test_multifidelity_off_by_default():
     assert not opt.multifidelity_screen
 
 
-def test_simplex_screen_ranks_by_row_mean_deviation():
+def test_simplex_screen_ranks_by_mean_deviation():
     """sum_v v = 0, so a vertex at the row mean moves the barycentre by nothing.
 
     Deviation from the mean is what the antithetic contrast measures, written for a
@@ -716,7 +716,7 @@ def test_2d_cube_not_treated_as_orthoplex():
     torch.testing.assert_close(opt._prev_descent_direction[0], 2.0 * target[0], rtol=1e-4, atol=1e-4)
 
 
-def test_newton_refinement_warns_at_default_num_probe():
+def test_newton_refinement_warns_default_num_probe():
     """The finite-difference model needs two probe scales; num_probe defaults to 1."""
     with pytest.warns(UserWarning, match="newton_refinement needs num_probe"):
         PolyStepOptimizer(nn.Linear(8, 4), epsilon=0.1, max_iterations=5, newton_refinement=True)

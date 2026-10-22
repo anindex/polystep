@@ -37,6 +37,11 @@ one axis. Gradient-free baseline records from `run_elevation.py`, `run_moe.py`,
 `run_mnist.py` and `run_timeseries.py` store the axis as `hyperparameters.match_axis`;
 PolyStep, Adam, persistence, MAX-SAT and RL records carry none.
 
+The fair EGGROLL rows search the `A` coordinates of a `FactoredSubspace` whose `B` is
+drawn once, because the baselines never rotate their subspace. EGGROLL's rank-1 noise
+therefore stays in one r-dimensional row space per layer for the whole run. Published
+EGGROLL redraws both factors each generation.
+
 `--theory-mode` runs the unaccelerated reference configuration: jittered probe and
 step radii, independent rotations, flat epsilon, a decaying step radius, orthoplex
 probes, and no momentum, amortization or Anderson acceleration.

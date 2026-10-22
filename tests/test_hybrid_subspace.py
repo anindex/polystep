@@ -213,7 +213,7 @@ def test_rotate_random_produces_different_projections(hybrid_sub):
     assert any_different, "Rotated projections should differ from original"
 
 
-def test_rotate_all_step_zero_keeps_seeded_basis(hybrid_sub):
+def test_rotation_step_zero_keeps_seeded_basis(hybrid_sub):
     """Step 0 returns the seeded basis unchanged; rotating it would discard a draw
     nothing was evaluated against."""
     hybrid = HybridSubspace(
@@ -253,7 +253,7 @@ class TestHybridRotateDisplacement:
 
         assert any(not torch.allclose(projections[k], new_projections[k], atol=1e-3) for k in projections)
 
-    def test_wide_spec_rejected_by_both_projection_paths(self, hybrid_sub):
+    def test_both_projection_paths_reject_wide_spec(self, hybrid_sub):
         """num_coords > num_params must be rejected: QR would silently drop columns
         and a Gaussian would move at the wrong scale."""
         spec = ProjectionSpec(

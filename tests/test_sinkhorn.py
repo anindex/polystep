@@ -481,7 +481,7 @@ class TestFixedModeLogic:
             ({"adaptive_omega": True}, "adaptive_omega"),
         ],
     )
-    def test_anderson_not_silently_disabled_by_check_every(self, override, substring):
+    def test_anderson_survives_large_check_every(self, override, substring):
         """``check_every > max_iterations`` must leave the acceleration enabled.
 
         The eager path still runs it, so warning that it has no effect would be wrong.
@@ -555,7 +555,7 @@ class TestFixedModeLogic:
 
 
 @pytest.mark.parametrize("scale_cost", [None, "mean", "max_cost", 2.0])
-def test_sinkhorn_ent_reg_cost_in_caller_frame(scale_cost):
+def test_ent_reg_cost_in_caller_frame(scale_cost):
     C = torch.tensor([[0.0, 3.0, 1.0, 2.0], [2.0, 0.0, 4.0, 1.0], [1.0, 2.0, 0.0, 3.0]])
     solver = SinkhornSolver(epsilon=0.5, max_iterations=5000, threshold=1e-13)
     result = solver.solve(cost_matrix=C.clone(), scale_cost=scale_cost)

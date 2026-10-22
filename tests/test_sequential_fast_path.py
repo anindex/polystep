@@ -33,7 +33,7 @@ def _builds(model):
         ),
     ],
 )
-def test_shipped_mlps_take_fast_path_keep_keys(factory, expected_keys):
+def test_shipped_mlps_fast_path_keeps_keys(factory, expected_keys):
     """The Sequential conversion must not move state_dict keys, or checkpoints break."""
     model = factory()
     assert _builds(model), f"{type(model).__name__} does not take the batched path"
@@ -232,7 +232,7 @@ def test_module_extra_arg_keeps_vmap_path():
     assert plans == [["fc", "act"], None]
 
 
-def test_silent_on_unsupported_layer_or_extra_params():
+def test_unsupported_model_falls_back_silently():
     class HasConv(nn.Module):
         def __init__(self):
             super().__init__()
@@ -453,7 +453,7 @@ def _record_fc1_shapes(net):
     return shapes
 
 
-def test_spiking_net_loops_fc1_on_temporal_input():
+def test_snn_loops_fc1_on_temporal_input():
     """Temporal input keeps fc1 inside the timestep loop.
 
     Hoisting fc1 to one (T*B, F) GEMM changes BLAS blocking, and the LIF threshold
@@ -471,7 +471,7 @@ def test_spiking_net_loops_fc1_on_temporal_input():
     assert shapes == [(batch, features)] * steps
 
 
-def test_spiking_net_hoists_fc1_on_static_input():
+def test_snn_hoists_fc1_on_static_input():
     """Static input is constant in time, so fc1 runs once and broadcasts."""
     from polystep.benchmarks.utils import SpikingNet
 

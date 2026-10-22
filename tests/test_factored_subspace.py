@@ -112,7 +112,7 @@ def test_registered_step_matches_closure_step(polytope):
         (2048, 1, None, True),
     ],
 )
-def test_cuda_delta_path_only_for_large_chunks(width, batch, chunk_size, uses_delta):
+def test_cuda_delta_path_needs_large_chunks(width, batch, chunk_size, uses_delta):
     """The delta path launches more kernels per chunk, so on CUDA it waits until one
     default chunk cannot hold every candidate and each chunk carries enough activations."""
     torch.manual_seed(0)

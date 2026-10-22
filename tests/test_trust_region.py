@@ -63,7 +63,7 @@ def test_trust_region_activates_without_biased_rotation():
         assert 0.1 <= m <= 3.0
 
 
-def test_trust_region_one_probe_uses_shared_centre():
+def test_trust_region_one_probe_shares_centre():
     """One shared f(X) replaces the second probe scale the regression needs."""
     torch.manual_seed(0)
     model = _model()
@@ -85,7 +85,7 @@ def test_trust_region_one_probe_uses_shared_centre():
     assert opt._center_loss is not None and opt._center_loss.shape == (opt._state.X.shape[0],)
 
 
-def test_trust_region_runs_on_simplex_one_probe():
+def test_trust_region_runs_simplex_one_probe():
     """The gradient is a closed form on any centred tight frame, and the shared f(X)
     gives tr(H)/d, so d+1 vertices carry the model the orthoplex needed 2d for."""
     torch.manual_seed(0)

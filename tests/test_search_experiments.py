@@ -10,7 +10,7 @@ from experiments.runners.search_suite import ARMS, draw_directions, run_search
 from polystep.transform import ParamLayout
 
 
-def test_search_cli_budgets_rows_rejects_unknown_arm(tmp_path, monkeypatch):
+def test_search_cli_budgets_rejects_unknown_arm(tmp_path, monkeypatch):
     import json
     import sys
     from experiments.scripts.bench_polytope import main
@@ -63,7 +63,7 @@ def test_search_respects_budget_selects_on_validation(arm):
     assert all("test_loss" not in h for h in result["history"])
 
 
-def test_search_sub_step_budget_takes_no_step():
+def test_sub_step_budget_takes_no_step():
     short = run_search("mlp", "hybrid_newton", 0, budget=767, batch=8)
     assert short["steps"] == short["candidates"] == 0
     assert short["history"] == []

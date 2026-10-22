@@ -154,7 +154,8 @@ class PolyStepOptimizer(SerializationMixin):
         probe_radius: Probe radius, same two parameterizations as ``step_radius``. Probe
             ``k`` sits at ``k/(num_probe+1)`` of it, so the default single probe is at half.
         num_probe: Probe points per direction; 1 is optimal.
-        max_iterations: Maximum outer iterations.
+        max_iterations: Horizon in steps of the momentum warm-up and the subspace svd_ratio and
+            rotation ramps; past it they hold their final values. step() never stops on it.
         sinkhorn_max_iters: Maximum inner Sinkhorn iterations.
         chunk_size: Chunk size for cost-evaluation memory control.
         cost_batch_size: Mini-batch size for cost evaluation, read by step_batch() and train().
@@ -186,15 +187,15 @@ class PolyStepOptimizer(SerializationMixin):
         trust_region: Scale ``step_radius`` by predicted against actual improvement. Both
             must come from the same objective, so it engages only on a stationary one and
             at ``amortize_steps=1``. On a minibatch stream pass ``objective_token`` per
-            batch, or the ratio is measured across two different batches and the radius
-            collapses to ``radius_min``.
+            batch, or the ratio is measured across two different batches and the multiplier
+            falls to its fixed 0.1 floor.
         multifidelity_screen: Screen directions on a cheap fidelity first.
         screen_keep_ratio: Fraction of directions promoted to full fidelity.
         screen_fidelity: Fraction of the batch used for screening.
         radius_increase: Multiplicative factor for radius boost.
         radius_decrease: Multiplicative factor for radius decay.
-        radius_min: Minimum radius multiplier.
-        radius_max: Maximum radius multiplier.
+        radius_min: Floor of the stagnation radius multiplier.
+        radius_max: Cap of the stagnation radius multiplier.
         seed: Seed for reproducible random rotations.
         mixed_precision: Cast model, particles, and projections to BF16.
         candidate_autocast: Run the candidate forward in BF16 under autocast.

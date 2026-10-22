@@ -191,7 +191,7 @@ def test_fused_softmax_survives_large_negative_costs():
     assert transport[0, 0] > transport[0, 1]
 
 
-def test_fused_softmax_row_above_minimum_stays_finite():
+def test_fused_softmax_offset_row_stays_finite():
     C = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
     verts = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
     rot = torch.eye(2).expand(2, 2, 2).contiguous()

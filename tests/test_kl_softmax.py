@@ -96,6 +96,13 @@ def test_intermediate_lam_softens_column_constraint() -> None:
     )
 
 
+def test_constant_cost_columns_follow_b_power() -> None:
+    b = torch.tensor([0.6, 0.3, 0.1])
+    result = KLSoftmaxSolver(epsilon=0.1, lam=0.1).solve(torch.zeros(4, 3), b=b)
+    target = b.sqrt() / b.sqrt().sum()
+    torch.testing.assert_close(result.matrix.sum(0), target, atol=1e-6, rtol=0)
+
+
 def test_nan_safe_at_small_epsilon() -> None:
     """Tiny epsilon should not produce NaN/Inf via log-domain stability."""
     C, a, b = _make_problem()

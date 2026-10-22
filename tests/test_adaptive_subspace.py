@@ -579,9 +579,9 @@ def test_rotation_keeps_uncentered_displacement_direction():
         assert alignment > 0.9, f"rotation lost the dominant direction: {alignment:.3f}"
 
 
-@pytest.mark.parametrize("interval, expected_rotations", [(1, 4), (2, 2), (0, 0)])
-def test_rotation_interval_amortizes_basis_decomposition(interval, expected_rotations):
-    """Each rotation costs an absorb plus a QR/SVD, which dominate at large full_dim."""
+@pytest.mark.parametrize("interval, expected_steps", [(1, [1, 2, 3, 4]), (2, [2, 4]), (3, [3]), (0, [])])
+def test_rotation_fires_after_interval_multiples(interval, expected_steps):
+    """Rotation runs after steps k, 2k, ... and never before."""
     from torch.func import functional_call
 
     model = nn.Sequential(nn.Linear(16, 12), nn.ReLU(), nn.Linear(12, 4))
@@ -602,8 +602,8 @@ def test_rotation_interval_amortizes_basis_decomposition(interval, expected_rota
         )
         seen.append(opt.state.projection.clone())
 
-    changes = sum(not torch.equal(a, b) for a, b in zip(seen, seen[1:]))
-    assert changes == expected_rotations
+    changed = [k for k, (a, b) in enumerate(zip(seen, seen[1:]), 1) if not torch.equal(a, b)]
+    assert changed == expected_steps
 
 
 @pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored"])

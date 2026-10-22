@@ -181,7 +181,7 @@ def test_step_jitter_is_drawn_per_particle():
     assert len(set(scales.tolist())) > 1, scales
 
 
-def test_jitter_sampler_matches_lemma_4_3_law():
+def test_jitter_sampler_matches_lemma_4_3():
     """Mollifier tighter than uniform, tail empty at +-1, symmetric about zero."""
     n = 20_000
     smooth = _optimizer(probe_radius_jitter=0.9, probe_radius_jitter_dist="smooth", seed=3)

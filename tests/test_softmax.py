@@ -93,7 +93,7 @@ def test_softmax_warns_on_nonuniform_b():
     )
 
 
-def test_softmax_does_not_mutate_caller_cost_matrix():
+def test_softmax_keeps_caller_cost_intact():
     """solve() must not mutate the caller's cost matrix when scale_cost is set."""
     P, V = 4, 8
     torch.manual_seed(0)
@@ -106,7 +106,7 @@ def test_softmax_does_not_mutate_caller_cost_matrix():
     assert torch.equal(C, C_before), "solve() mutated the caller's cost matrix"
 
 
-def test_softmax_init_f_and_g_are_ignored():
+def test_softmax_ignores_warm_start_duals():
     """init_f / init_g are accepted for SolverProtocol parity but must not
     affect the output (softmax is closed-form, no warm start)."""
     torch.manual_seed(42)

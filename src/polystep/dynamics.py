@@ -12,7 +12,7 @@ def compute_momentum_coefficient(
     momentum_init: float = 0.5,
     momentum_final: float = 0.95,
 ) -> float:
-    """Linear warm-up from ``momentum_init`` to ``momentum_final`` over the run."""
+    """Linear warm-up from ``momentum_init`` to ``momentum_final`` over max_iterations steps, then held."""
     progress = min(1.0, iteration / max(1, max_iterations - 1))
     return momentum_init + progress * (momentum_final - momentum_init)
 

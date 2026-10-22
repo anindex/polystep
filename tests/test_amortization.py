@@ -1,11 +1,14 @@
 """Amortized steps: run the OT solve every N steps and move on the cached transport
 direction in between."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
 
 from polystep import AdaptiveSubspace, ParamLayout
+from polystep._step_core import update_amortized_direction
 from polystep.optimizer import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
 
@@ -76,6 +79,13 @@ def test_ema_transport_direction_stored():
     assert torch.isfinite(torch.tensor(cost2)), f"Cost is not finite: {cost2}"
     dir_after_2 = optimizer._transport_direction_ema
     assert not torch.equal(dir_after_1, dir_after_2)
+
+
+def test_amortize_ema_weights_previous_direction():
+    """amortize_ema weights the stored direction, so the newest one gets the rest."""
+    opt = SimpleNamespace(amortize_steps=2, amortize_ema=0.7, _transport_direction_ema=torch.tensor([1.0, 0.0]))
+    update_amortized_direction(opt, torch.tensor([0.0, 1.0]), nan_reverted=False)
+    torch.testing.assert_close(opt._transport_direction_ema, torch.tensor([0.7, 0.3]))
 
 
 def test_amortize_with_momentum_stays_finite():

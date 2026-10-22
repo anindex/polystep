@@ -29,7 +29,6 @@ from torch.utils.data import random_split
 
 from polystep import PolyStepOptimizer
 from polystep.benchmarks import MNISTNet
-from polystep.cost_nn import NNCostEvaluator
 from polystep.epsilon import CosineEpsilon
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
@@ -109,7 +108,6 @@ def main():
 
     # Select checkpoints on held-out training data; test once after selection.
     loss_fn = nn.CrossEntropyLoss()
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
     best_acc, best_state = -1.0, None
 
     print("training...")
@@ -119,13 +117,7 @@ def main():
         for start in range(0, len(train_x), batch_size):
             idx = order[start : start + batch_size]
             inputs, targets = train_x[idx], train_y[idx]
-
-            def closure(stacked_params, _in=inputs, _tgt=targets):
-                return evaluator.evaluate(stacked_params, _in, _tgt)
-
-            # Hand-rolled loops must register the evaluator; api.train() does it for you.
-            optimizer.register_evaluator(evaluator, inputs, targets)
-            optimizer.step(closure)
+            optimizer.step_batch(inputs, targets, loss_fn=loss_fn)
 
             with torch.no_grad():
                 epoch_loss += loss_fn(model(inputs), targets)

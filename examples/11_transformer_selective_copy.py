@@ -93,15 +93,13 @@ def build_optimizer(model: nn.Module, seed: int) -> PolyStepOptimizer:
     )
 
 
-def run_epoch(optimizer, evaluator, x, y, batch_size):
+def run_epoch(optimizer, loss_fn, x, y, batch_size):
     order = torch.randperm(x.shape[0])
     total, batches = 0.0, 0
     for start in range(0, x.shape[0], batch_size):
         idx = order[start : start + batch_size]
         xb, yb = x[idx], y[idx]
-        # Register so candidates are scored directly, not through the closure.
-        optimizer.register_evaluator(evaluator, xb, yb)
-        total += optimizer.step(lambda params, _x=xb, _y=yb: evaluator.evaluate(params, _x, _y))
+        total += optimizer.step_batch(xb, yb, loss_fn=loss_fn)
         batches += 1
     return total / max(batches, 1)
 
@@ -174,13 +172,13 @@ def main():
         f"SelectiveCopyTransformer: {sum(p.numel() for p in model.parameters())} parameters, "
         f"forward passes only. Chance is {100.0 / NUM_CLASSES:.1f}%.\n"
     )
-    evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
+    loss_fn = nn.CrossEntropyLoss()
     optimizer = build_optimizer(model, seed=args.seed)
 
     best, best_state = 0.0, None
     started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
-        loss = run_epoch(optimizer, evaluator, train_x, train_y, args.batch_size)
+        loss = run_epoch(optimizer, loss_fn, train_x, train_y, args.batch_size)
         val_acc = accuracy(model, val_x, val_y)
         if val_acc >= best:
             best, best_state = val_acc, {k: v.detach().clone() for k, v in model.state_dict().items()}

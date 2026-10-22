@@ -215,6 +215,16 @@ def test_blockwise_radius_follows_best_vertex_mean(monkeypatch):
     assert seen[0] < opt._state.costs[-1]
 
 
+def test_blockwise_cost_weights_blocks_by_size():
+    """``state.costs`` is the candidate-count-weighted mean over blocks."""
+    model = nn.Linear(4, 2)
+    w0 = model.weight.detach().clone()
+    opt = PolyStepOptimizer(model, block_strategy="per_layer", solver="softmax", seed=0)
+    opt.step(lambda p: torch.where((p["weight"] != w0).flatten(1).any(1), 1.0, 3.0))
+    assert [b.num_particles for b in opt._blocks] == [4, 1]
+    assert opt._state.costs[-1] == pytest.approx(1.4)
+
+
 class TestBlockwiseStepState:
     """Dual momentum, biased rotation and the amortized EMA must
     work in the blockwise step, not just monolithic."""

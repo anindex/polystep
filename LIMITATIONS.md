@@ -29,13 +29,16 @@ Heavy-ball momentum can amplify the barycentric displacement.
   The candidate tensors may be expanded views or share storage that the next chunk
   overwrites, so treat them as read-only and clone any you keep after the closure
   returns.
-- Manual loops must register the evaluator and current batch to enable fast paths.
-  The evaluator and closure must compute the same objective.
+- `step_batch()` and `train()` register each batch. A manual `step(closure)` loop must
+  register the evaluator and current batch to use the fast paths, and the two must
+  compute the same objective.
+- Multi-input batches use vmap and the site-local path; the batched-matmul, delta and
+  factored paths and multifidelity screening need one input tensor.
 - Tied weights must be the same Parameter object, and buffers may not share memory
   with trainable parameters. Register a clone or compute the tensor in forward instead.
-- `NNCostEvaluator` and `train()` score candidates in eval mode: dropout is off and
-  batch-norm running statistics never update. A custom closure that runs the model in
-  train mode compares candidates under different dropout masks.
+- `NNCostEvaluator`, `step_batch()` and `train()` score candidates in eval mode:
+  dropout is off and batch-norm running statistics never update. A custom closure that
+  runs the model in train mode compares candidates under different dropout masks.
 - The evaluator puts back any buffer the forward writes, such as a call counter, after
   each batched scoring call and after each candidate in the sequential loop. Chunks of
   `NNCostEvaluator(chunk_size=...)` run inside one vmap call and still see each other's
@@ -53,7 +56,11 @@ Heavy-ball momentum can amplify the barycentric displacement.
   or `torch.nn.functional` calls; a class-weighted cross-entropy does so only on the
   Linear MLP paths. Other losses may round nearby candidate scores to the same
   value. With FP16 or BF16 parameters, `FactoredSubspace` materializes
-  every candidate and runs slower. See
+  every candidate and runs slower. The delta, site-local and vmap paths add each
+  Linear's bias after the matmul, so with such weights a Linear's output can round
+  one ulp away from the model's own and flip a hard threshold, such as a sign or a
+  spike, on a pre-activation that close to its cut; `use_inplace=True` scores with
+  the model's forward. See
   [precision](docs/performance.md#compilation-and-precision).
 - `step_batch()` and `train()` reject `trust_region`. See
   [radius control](docs/api_overview.md#quadratic-model-and-radius-control) for its
@@ -102,8 +109,8 @@ evaluator stays silent there.
 Stock `nn.LSTM`, `nn.GRU` and `nn.RNN` have no vmap batching rule, so the evaluator
 scores them one candidate at a time in a sequential loop, with a warning. On a small
 CPU model, `NNCostEvaluator(..., use_inplace=True)` ran 1.1 to 1.3 times faster than
-the loop, and `VmapSafeLSTM` 3 to 5 times faster. `train()` builds its own evaluator,
-so it takes the loop for these layers.
+the loop, and `VmapSafeLSTM` 3 to 5 times faster. `step_batch()` and `train()` build
+their own evaluator, so they take the loop for these layers.
 
 [`VmapSafeLSTM`](src/polystep/layers/rnn.py) requires batch-first dense inputs. It does
 not support bidirectional recurrence, projection, or `PackedSequence`. Its explicit

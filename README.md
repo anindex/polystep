@@ -44,6 +44,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from polystep import HybridSubspace, ParamLayout, PolyStepOptimizer, TrainConfig, train
 
+torch.set_num_threads(1)
 model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 3))
 loader = DataLoader(
     TensorDataset(torch.randn(256, 16), torch.randint(0, 3, (256,))),
@@ -57,8 +58,23 @@ train(model, loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 ```
 
 Replace the generated data with your dataset. `max_subspace_dim=128` caps the search
-at 128 coordinates, so each step scores 144 candidates. In manual loops, call
-`register_evaluator()` before each batch; `train()` does this automatically. See
+at 128 coordinates, so each step scores 144 candidates. Biases and normalization
+weights always keep their full width, so on a larger model the cap has to exceed their
+total plus one coordinate per weight matrix; a smaller cap warns and reports the size
+it uses instead.
+
+To write the loop yourself, call `step_batch` once per batch. It scores the candidates
+on that batch through the same fast paths `train()` uses and moves the weights:
+
+```python
+loss_fn = nn.CrossEntropyLoss()
+for x, y in loader:
+    optimizer.step_batch(x, y, loss_fn=loss_fn)
+```
+
+`torch.set_num_threads(1)` keeps a model this small fast: a pool spanning every core
+can make each step about 100 times slower when other processes share the CPU. For
+larger models, `python -m polystep.benchmarks.threads` prints the fastest count. See
 [performance](https://github.com/anindex/polystep/blob/main/docs/performance.md)
 for candidate paths, thread counts, compilation, and memory settings.
 
@@ -70,8 +86,8 @@ from polystep import PolyStepES
 es = PolyStepES(dim=20, epsilon=0.1, step_radius=0.3)
 for _ in range(300):
     candidates = es.ask()
-    es.tell(candidates.square().sum(dim=1))
-print(es.best_fitness, es.best_solution)
+    es.tell((candidates - 1).square().sum(dim=1))
+print(es.best_fitness, (es.mean - 1).square().sum().item())
 ```
 
 ### Synthetic objectives
@@ -106,8 +122,8 @@ scored, even when candidates are batched:
 ```python
 from polystep.baselines import Objective, openai_es
 
-objective = Objective(lambda x: x.square().sum(1), dim=64, budget=10_000)
-result = openai_es(objective, sigma=0.05, lr=0.1, popsize=32)
+objective = Objective(lambda x: (x - 1).square().sum(1), dim=64, budget=10_000)
+result = openai_es(objective, sigma=0.05, popsize=32)
 ```
 
 The paper runners match search spaces, budgets and tuning as the

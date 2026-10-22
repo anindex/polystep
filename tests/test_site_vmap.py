@@ -1479,7 +1479,7 @@ def test_compiled_site_tracks_base_and_batch(monkeypatch):
     torch.compiler.reset()
 
 
-def test_mixed_dtype_site_skips_unrelated_scalar_cast():
+def test_mixed_dtype_site_skips_scalar_cast():
     class Mixed(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1627,6 +1627,8 @@ def test_site_chunk_capped_by_own_span():
     assert site_chunks(opt, x, sites, 1, 6, 600, shrink=True) == {0: 48, 48: 12}
     assert site_chunks(opt, x.to("meta"), sites, 1, 6, 600, shrink=True)[48] == 252
     assert site_chunks(opt, x, sites, 1, 6, 600)[48] == 252
+    assert site_chunks(opt, x, sites, 3, 6, 600) == {0: 12, 18: 252}
+    assert site_chunks(opt, None, sites, 1, 6, 600, shrink=True) == {0: 48, 48: 552}
 
 
 def test_cpu_site_chunk_keeps_injection():
@@ -1704,7 +1706,7 @@ def test_delta_paths_skip_site_chunks(monkeypatch, hybrid):
     assert plans and all(c is None for c in plans)
 
 
-def test_site_budget_unexecuted_module_uses_global_max():
+def test_site_budget_unexecuted_module_uses_global():
     from polystep._step_core import activation_elements
 
     class Functional(nn.Module):
@@ -1724,7 +1726,7 @@ def test_site_budget_unexecuted_module_uses_global_max():
     assert activation_elements(opt, x, "head.weight") == activation_elements(opt, x) == 4 * x.numel()
 
 
-def test_site_budget_weight_read_before_module_uses_global_max():
+def test_site_budget_reused_weight_uses_global():
     class Reuse(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1748,7 +1750,7 @@ class InputNoise(nn.Module):
         return x + 0.01 * torch.randn_like(x)
 
 
-def test_site_budget_random_forward_uses_global_max():
+def test_site_budget_random_forward_uses_global():
     model = nn.Sequential(InputNoise(), nn.Linear(4, 8), nn.Linear(8, 2))
     opt = PolyStepOptimizer(model, solver="softmax", compile=False, seed=0)
     x = torch.randn(8, 4)

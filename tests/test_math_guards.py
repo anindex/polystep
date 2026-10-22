@@ -23,7 +23,7 @@ def test_exp_plan_saturates_instead_of_overflowing():
     assert (P > 0).all()
 
 
-def test_exp_plan_exact_where_plain_exp_finite():
+def test_exp_plan_matches_finite_plain_exp():
     torch.manual_seed(0)
     f, g = torch.randn(4), torch.randn(5)
     C = torch.rand(4, 5)

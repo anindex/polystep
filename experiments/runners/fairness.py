@@ -139,6 +139,7 @@ def make_subspace(layout, *, rank: int, seed: int, method: str = "polystep", **k
     ``HybridSubspace`` coordinates carry no matrix structure, so EGGROLL there
     degenerates to dense Gaussian ES (see ``docs/reproducibility.md``).
     ``FactoredSubspace`` is that parameterization and takes the same ``rank``/``seed``.
+    Baselines never rotate it, so EGGROLL searches ``A`` against one ``B`` for the whole run.
     """
     cls = FactoredSubspace if method == "eggroll" else HybridSubspace
     return cls.from_layout(layout, rank=rank, seed=seed, **kwargs)

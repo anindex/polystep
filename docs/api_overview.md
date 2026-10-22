@@ -2,39 +2,115 @@
 
 ## Optimizer
 
-`PolyStepOptimizer` trains an `nn.Module` from candidate losses. The closure accepts
-a dictionary of batched parameters and returns one loss per candidate:
+`PolyStepOptimizer` trains an `nn.Module` from candidate losses. Pass the module
+itself; the optimizer reads its trainable parameters once, when it is built.
+`step_batch` scores the candidates on one batch and moves the weights:
 
 ```python
 import torch
 from torch import nn
-from polystep import NNCostEvaluator, PolyStepOptimizer
+from polystep import PolyStepOptimizer
 
+torch.set_num_threads(1)
 model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 3))
 loader = [(torch.randn(32, 16), torch.randint(0, 3, (32,))) for _ in range(8)]
 optimizer = PolyStepOptimizer(model, epsilon=0.1, step_radius=0.15)
-evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
+loss_fn = nn.CrossEntropyLoss()
 
 for x, y in loader:
-    optimizer.register_evaluator(evaluator, x, y)
-    optimizer.step(lambda p: evaluator.evaluate(p, x, y))
+    optimizer.step_batch(x, y, loss_fn=loss_fn)
 optimizer.release_evaluator()
 ```
 
-The evaluator and closure must compute the same objective, including regularization.
+`step_batch` builds an `NNCostEvaluator` for `loss_fn` the first time it sees that
+object and reuses it while you pass the same object, so create the loss once. To
+change a loss's settings, pass a new loss object. The builtin losses that
+[performance](performance.md#candidate-evaluation) lists let the batched-matmul and
+delta paths compute the loss in closed form; any other callable takes the site-local
+or vmap path. Each call scores every candidate on the batch, writes the new weights
+into the model and returns the mean candidate loss. With `cost_batch_size` set, it
+scores a random subset of that many rows. Pass `targets=None` for a loss that reads
+only the output. The batch stays registered until the next call, `release_evaluator()`
+or the end of `train()`, so call `release_evaluator()` once after a manual loop to free
+it.
+
 `NNCostEvaluator` puts the model in eval mode when it is constructed and scores every
 candidate in eval mode, so dropout stays off and batch-norm running statistics do not
 update.
 
-The optimizer, `NNCostEvaluator`, `ParamLayout` and `train()` unwrap a `torch.compile`
-module and work on the module inside it, so parameter names carry no `_orig_mod.` prefix.
-To compile candidate scoring, pass `compile_evaluator` or `compile_forward` instead.
+At the default settings, a full-space step scores about 1.5 candidates per trainable
+parameter, and the constructor warns when a step would score more than 100,000. Pass
+a [subspace](#subspaces) for larger models.
 
-After external parameter updates, call `optimizer.resync_from_model()`.
-After you replace layers, parameters, or buffers, call `evaluator.reset_vmap()`.
-Do the same after a dtype cast. Then register the evaluator again.
-For a layer swapped in under the same parameter names, also call `optimizer.resync_from_model()`.
-Otherwise, the next step overwrites it with the old weights plus the update.
+### Inputs
+
+`inputs` can be a tensor, a tuple or list of positional arguments, or a dict of
+keyword arguments for the model's forward. `(ids, mask)` calls `model(ids, mask)`, and
+`{"input_ids": ids, "attention_mask": mask}` calls
+`model(input_ids=ids, attention_mask=mask)`. To pass a dict or tuple as one positional
+argument, wrap it in a 1-tuple: `(batch,)`.
+
+```python
+class Masked(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(16, 3)
+
+    def forward(self, x, mask):
+        return self.linear(x) * mask
+
+masked = Masked()
+masked_optimizer = PolyStepOptimizer(masked)
+x, y = loader[0]
+mask = torch.ones(32, 3)
+masked_optimizer.step_batch((x, mask), y, loss_fn=loss_fn)
+masked_optimizer.step_batch({"x": x, "mask": mask}, y, loss_fn=loss_fn)
+```
+
+The step splits the candidates into chunks, never the batch. `cost_batch_size`
+subsampling indexes only the input and target tensors whose leading dimension matches
+the first batched input's, and passes scalars and other tensors through unchanged.
+Multi-input batches go through vmap and the site-local path. The batched-matmul, delta
+and factored paths need a single tensor and stand aside, and `multifidelity_screen`
+does not run.
+
+### Custom closures
+
+`step(closure)` calls `closure(batched_params)` with a dictionary of parameters that
+hold one candidate per row and expects one loss per candidate; `step_batch` builds
+this closure for you. To set evaluator options such as `chunk_size`, `use_inplace` or
+`compile_vmap`, build the evaluator yourself, register every batch and step with the
+closure `register_evaluator` returns:
+
+```python
+from polystep import NNCostEvaluator
+
+evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=True)
+for x, y in loader:
+    optimizer.step(optimizer.register_evaluator(evaluator, x, y))
+optimizer.release_evaluator()
+```
+
+Without a registration the delta, factored and site-local paths stay off, and every
+candidate goes through the closure. The registered loss and any other closure you pass
+must compute the same objective, regularization included. `step()` warns once when no
+`register_evaluator` call came since the previous step and the closure is not the one
+it returned. The manual step API is also the route to `trust_region`, through
+`objective_token`; see [radius control](#quadratic-model-and-radius-control).
+`step_batch` replaces any registration.
+
+### After changing the model
+
+After writing weights into the model yourself, or swapping in a layer under the same
+parameter names, call `optimizer.resync_from_model()`. Otherwise, the next step
+overwrites the change with the old weights plus the update. Resync also rebuilds the
+evaluator that `step_batch` caches.
+After you replace layers, parameters or buffers, or cast the model to another dtype,
+call `evaluator.reset_vmap()` on an evaluator you built yourself and register it
+again. The evaluator also resets itself when a cast changes its buffers' dtypes.
+Assigning `evaluator.loss_fn` rebuilds everything that depends on the loss. After
+changing a loss's settings in place, such as `label_smoothing`, call `reset_vmap()`;
+with `step_batch`, pass a new loss object instead.
 The optimizer keeps the set of `requires_grad` parameters it was built with, and `step()`
 raises `ValueError` if that set changes. To freeze, unfreeze, add or remove a parameter,
 set `requires_grad` first and then build a new optimizer.
@@ -45,9 +121,27 @@ Full space and an `AdaptiveSubspace` also move their coordinates to the new dtyp
 If the coordinates must use the new dtype, build a new optimizer.
 If the model moves to another device, build a new optimizer. Resync cannot change devices.
 
+The optimizer, `NNCostEvaluator`, `ParamLayout` and `train()` unwrap a `torch.compile`
+module and work on the module inside it, so parameter names carry no `_orig_mod.` prefix.
+To compile candidate scoring, pass `compile_evaluator` or `compile_forward` instead.
+
+### Coming from torch.optim
+
+- Pass the module, not `model.parameters()`; anything else raises `TypeError`.
+- There is no `zero_grad()` or `backward()`: a step scores candidates with forwards only.
+- `epsilon` acts as the learning rate, since it scales the scalar step and probe radii.
+  `LinearEpsilon` and `CosineEpsilon` replace an `lr_scheduler`, which does not accept
+  this optimizer.
+- There are no `param_groups`. Freeze parameters with `requires_grad_(False)` before
+  building the optimizer.
+- `max_iterations` only sets the length of the warm-up ramps; steps continue past it.
+- `step(closure)` passes batched parameters and expects one loss per candidate;
+  `step_batch` builds that closure for you.
+
 ## Training loop
 
-`train()` builds the closure and registers each batch automatically:
+`train()` puts the model in eval mode and calls `step_batch` for every batch the
+loader yields:
 
 ```python
 from polystep import train, TrainConfig, LoggingCallback, EarlyStoppingCallback
@@ -59,13 +153,21 @@ config = TrainConfig(
 train(model, loader, nn.CrossEntropyLoss(), optimizer, config)
 ```
 
+A tensor, or a one-element tuple, is the input alone. A longer tuple or list ends with
+the target and passes everything before it to the model as positional arguments, so
+`(x, y)` and `(ids, mask, y)` both work. A dict passes its entries to the model as
+keyword arguments, except `labels`, which becomes the target; a dict without `labels`
+trains unsupervised. Other batch types raise `TypeError`. When `train()` returns, the
+model is back in the mode it had before.
+
 `restore_best` (on by default) restores the weights with the lowest tracked loss.
 After each step, `train()` scores the updated weights on the first training batch, after `cost_batch_size` subsampling, so scores compare across steps.
 Callbacks receive the loss of the updated weights on that step's training batch.
 Both losses use the same input cast, autocast and loss reduction as the candidates.
 Checkpoint selection uses training loss, which can be optimistic on unseen data.
-`cost_batch_size` subsampling indexes only the input and target tensors whose leading dimension matches the first input's batch size, and passes scalars and other tensors through unchanged.
 Best-weight tracking and callbacks each require an extra loss evaluation per step.
+When the best weights are the last ones, `train()` leaves the optimizer state alone,
+so calling `train()` again continues the same run.
 
 ## Subspaces
 
@@ -135,6 +237,7 @@ optimizer = PolyStepOptimizer(
 | `subspace` | `None` | A constructed subspace instance |
 | `block_strategy` | `'monolithic'` | Also `'per_layer'` or `'grouped'`; with a subspace, only splits Sinkhorn/KL solves into row segments |
 | `chunk_size` | `None` | Automatic candidate chunk estimate |
+| `max_iterations` | `50` | Length of the momentum and svd_ratio warm-up ramps; steps continue past it |
 | `adaptive_num_probe` | `None`: on when `num_probe > 1`, except full-space `per_layer`/`grouped` and orthoplex `newton_refinement` | Drops the probe count to 1 while costs keep falling |
 
 A step scores one candidate per particle, vertex and probe. With `d` coordinates per
@@ -272,7 +375,7 @@ see [unsupported options](../LIMITATIONS.md#attention-and-recurrent-layers).
 ```python
 from polystep import PolyStepES, minimize
 
-objective = lambda x: x.square().sum(dim=1)
+objective = lambda x: (x - 1).square().sum(dim=1)
 es = PolyStepES(dim=20, epsilon=0.5, step_radius=0.5)
 for _ in range(200):
     es.tell(objective(es.ask()))

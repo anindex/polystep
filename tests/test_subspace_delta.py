@@ -171,7 +171,7 @@ def test_optimizer_step_matches_materializing_path(mixed, dtype, tol, path):
         ),
     ],
 )
-def test_subspace_delta_chunk_shrinks_only_on_cpu(device, monkeypatch):
+def test_subspace_delta_chunk_shrinks_cpu_only(device, monkeypatch):
     from polystep import PolyStepOptimizer
     from polystep._step_core import activation_elements
 

@@ -111,24 +111,43 @@ class TestStateDictRoundTrip:
                 {"hybrid": True, "block_strategy": "per_layer", "solver": "sinkhorn", "dual_momentum_beta": 0.5},
                 id="hybrid_row_segments",
             ),
+            pytest.param(
+                {
+                    "hybrid": True,
+                    "hybrid_kwargs": {
+                        "rank": 2,
+                        "absorb_mode": "periodic",
+                        "absorb_interval": 2,
+                        "absorb_aligned_active": True,
+                    },
+                },
+                id="hybrid_fused_basis_change",
+            ),
+            pytest.param(
+                {"block_strategy": "per_layer", "solver": "sinkhorn", "dual_momentum_beta": 0.5},
+                id="blockwise_dual_momentum",
+            ),
             pytest.param({"probe_radius_jitter": 0.2}, id="probe_jitter"),
             pytest.param({"adaptive": True}, id="adaptive_subspace"),
             pytest.param({"biased_rotation": True}, id="biased_rotation"),
             pytest.param({"amortize_steps": 4, "use_quadratic_model": True, "num_probe": 3}, id="amortize_quadratic"),
-            pytest.param({"adaptive_num_probe": True, "num_probe": 3}, id="adaptive_num_probe"),
+            pytest.param(
+                {"adaptive_num_probe": True, "num_probe": 3, "adaptive_probe_warmup": 0}, id="adaptive_num_probe"
+            ),
         ],
     )
     def test_stateful_features_resume_exactly(self, kwargs):
         """Features whose state lives outside SolverState still resume bit-exactly."""
         kwargs = dict(kwargs)
         hybrid = kwargs.pop("hybrid", False)
+        hybrid_kwargs = {"rank": 4, **kwargs.pop("hybrid_kwargs", {})}
         adaptive = kwargs.pop("adaptive", False)
 
         def build():
             model, closure = _model_and_closure(seed=2)
             subspace = None
             if hybrid:
-                subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4, seed=3)
+                subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), seed=3, **hybrid_kwargs)
             if adaptive:
                 from polystep.adaptive_subspace import AdaptiveSubspace
 
@@ -144,12 +163,12 @@ class TestStateDictRoundTrip:
             return model, closure, opt
 
         model_a, closure_a, opt_a = build()
-        for _ in range(6):
+        for _ in range(8):
             opt_a.step(closure_a)
         reference = [p.detach().clone() for p in model_a.parameters()]
 
         model_b, closure_b, opt_b = build()
-        for _ in range(3):
+        for _ in range(4):
             opt_b.step(closure_b)
         checkpoint = copy.deepcopy(opt_b.state_dict())
         weights = copy.deepcopy(model_b.state_dict())
@@ -157,11 +176,14 @@ class TestStateDictRoundTrip:
         model_c, closure_c, opt_c = build()
         model_c.load_state_dict(weights)
         opt_c.load_state_dict(checkpoint)
-        for _ in range(3):
+        if hybrid:
+            assert opt_c.subspace._fused_for(opt_c.state.hybrid_projections) is opt_c.subspace._fused_P
+        for _ in range(4):
             opt_c.step(closure_c)
 
         for expected, got in zip(reference, model_c.parameters()):
             assert torch.equal(expected, got), (expected - got).abs().max()
+        assert not kwargs.get("adaptive_num_probe") or opt_c._loss_decreasing_count >= 3
 
     def test_subspace_load_drops_block_state(self):
         """Subspace runs keep their duals in state.f and state.g, so per-block state from
