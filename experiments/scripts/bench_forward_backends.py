@@ -37,7 +37,7 @@ from polystep.cost_nn import (
     SubspaceDeltaEvaluator,
 )
 from polystep.factored_subspace import FactoredSubspace
-from polystep.geometry import apply_biased_rotation, get_random_rotation_matrices
+from polystep.geometry import apply_biased_rotation, get_random_rotation_matrices, get_simplex_vertices
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.projection.sparse import SparseRandomProjection
 from polystep.solver import PolyStep
@@ -537,13 +537,15 @@ def kernel_bench(args):
         for dim in (2, 8, 32):
             rot = get_random_rotation_matrices(512, dim, device=args.device, generator=gen)
             bias = torch.randn(512, dim, device=args.device, generator=gen)
-            out = apply_biased_rotation(rot, bias)
+            verts = get_simplex_vertices(dim, device=args.device)
+            out = apply_biased_rotation(rot, bias, verts)
+            reach = torch.einsum("pji,vi,pj->pv", out, verts, bias / bias.norm(dim=-1, keepdim=True))
             record(
-                lambda: apply_biased_rotation(rot, bias),
+                lambda: apply_biased_rotation(rot, bias, verts),
                 kernel="rotation",
                 particles=512,
                 dim=dim,
-                column_error=float((out[:, :, 0] - bias / bias.norm(dim=-1, keepdim=True)).abs().max()),
+                vertex_error=float((reach.amax(dim=1) - 1).abs().max()),
                 orthogonality_error=float((out.mT @ out - torch.eye(dim, device=args.device)).abs().max()),
                 det_error=float((torch.linalg.det(out) - 1).abs().max()),
             )

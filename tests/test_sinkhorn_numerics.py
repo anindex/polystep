@@ -180,14 +180,14 @@ def test_anderson_matches_plain_on_ill_conditioned():
     plain = SinkhornSolver(
         epsilon=eps,
         max_iterations=3000,
-        threshold=1e-4,
+        threshold=3.2e-3,
         anderson_depth=0,
         check_every=10,
     )
     accel = SinkhornSolver(
         epsilon=eps,
         max_iterations=3000,
-        threshold=1e-4,
+        threshold=3.2e-3,
         anderson_depth=5,
         check_every=10,
     )

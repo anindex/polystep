@@ -13,6 +13,7 @@ from ._shared import (
     align_dual,
     align_marginal,
     exp_plan,
+    precision_floor,
     prepare_cost,
     validate_positive,
     warn_tiny_temperature,
@@ -63,11 +64,14 @@ class SinkhornResult:
 
 @dataclass
 class SinkhornSolver:
-    """Log-domain Sinkhorn solver for entropic optimal transport."""
+    """Log-domain Sinkhorn solver for entropic optimal transport.
+
+    ``threshold`` bounds the relative marginal error, floored at what the dtype can resolve.
+    """
 
     epsilon: float = 0.1
     max_iterations: int = 2000
-    threshold: float = 1e-6
+    threshold: float = 3e-5
     check_every: int = 10
     compile: bool = False
     omega: float = 1.0
@@ -132,6 +136,8 @@ class SinkhornSolver:
 
         log_a = torch.log(torch.clamp(a, min=1e-30))
         log_b = torch.log(torch.clamp(b, min=1e-30))
+        inv_a = torch.where(a > 0, 1 / a, 0)
+        inv_b = torch.where(b > 0, 1 / b, 0)
 
         # align_dual returns None on a shape mismatch, so fall back to zeros.
         f = align_dual(init_f, n, device, dtype, "init_f")
@@ -300,15 +306,15 @@ class SinkhornSolver:
                     # Batch all scalars into one device->host transfer; always check the last iteration or ProgressiveEpsilon inflates epsilon.
                     if (i + 1) % self.check_every == 0 or i == self.max_iterations - 1:
                         log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
-                        err_a_t = torch.max(torch.abs(torch.exp(torch.logsumexp(log_P_row, dim=1)) - a))
+                        err_a_t = ((torch.exp(torch.logsumexp(log_P_row, dim=1)) - a).abs() * inv_a).amax()
                         if omega != 1.0 or self.anderson_depth > 0 or self.adaptive_omega:
-                            err_b_t = torch.max(torch.abs(torch.exp(torch.logsumexp(log_P_row, dim=0)) - b))
+                            err_b_t = ((torch.exp(torch.logsumexp(log_P_row, dim=0)) - b).abs() * inv_b).amax()
                         else:
                             err_b_t = err_a_t
 
                         # Batch all scalar measurements into one transfer; a dual's max is nonfinite exactly when the dual is.
-                        err_a, err_b, f_max, g_max = torch.stack(
-                            [err_a_t, err_b_t, f.abs().max(), g.abs().max()]
+                        err_a, err_b, f_max, g_max, c_max = torch.stack(
+                            [err_a_t, err_b_t, f.abs().max(), g.abs().max(), clamp_scale]
                         ).tolist()
                         if not (math.isfinite(f_max) and math.isfinite(g_max)):
                             f.zero_()
@@ -349,7 +355,7 @@ class SinkhornSolver:
                             prev_err = err
 
                         errors.append(err)
-                        if err < self.threshold:
+                        if err < max(self.threshold, precision_floor(dtype, eps, f_max + g_max + c_max)):
                             converged = True
                             break
 

@@ -11,6 +11,7 @@ import torch
 from ._shared import (
     align_dual,
     align_marginal,
+    precision_floor,
     prepare_cost,
     validate_positive,
     warn_tiny_temperature,
@@ -20,12 +21,15 @@ from .base import SolverResult
 
 @dataclass
 class KLSoftmaxSolver:
-    """KL-penalized one-sided entropic OT solver."""
+    """KL-penalized one-sided entropic OT solver.
+
+    ``threshold`` bounds the dual step over epsilon, a log marginal residual, floored at what the dtype can resolve.
+    """
 
     epsilon: float = 0.1
     lam: float = float("inf")
     max_iterations: int = 2000
-    threshold: float = 1e-6
+    threshold: float = 3e-5
     check_every: int = 10
 
     # KL(P^T 1 || b) from the last solve; None until the first solve.
@@ -116,6 +120,7 @@ class KLSoftmaxSolver:
                 check_every = self.check_every
                 threshold = float(self.threshold)
                 with torch.no_grad():
+                    c_max = C.abs().amax()
                     for it in range(self.max_iterations):
                         # f-update: exact row-marginal enforcement.
                         f_new = eps * (log_a - torch.logsumexp((g.unsqueeze(0) - C) / eps, dim=1))
@@ -129,8 +134,13 @@ class KLSoftmaxSolver:
                                 (f_new - f).abs().amax(),
                                 torch.where(b > 0, g_new - g, 0.0).abs().amax() / alpha,
                             )
+                            step, f_max, g_max, c = torch.stack(
+                                [delta / eps, f_new.abs().amax(), torch.where(b > 0, g_new, 0.0).abs().amax(), c_max]
+                            ).tolist()
                             # <= so threshold=0 means "converge on an exact fixed point", not "never converge".
-                            if delta.item() <= threshold:
+                            if step <= threshold or (
+                                threshold > 0 and step <= precision_floor(dtype, eps, f_max + g_max + c)
+                            ):
                                 f, g = f_new, g_new
                                 converged = True
                                 n_iters = it + 1

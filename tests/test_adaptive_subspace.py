@@ -453,7 +453,7 @@ def test_cuda_generator_draws_on_cuda():
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
 def test_nonfinite_history_redraws_random_basis(bad):
-    """The squared-norm check catches the bad entry."""
+    """The norm check catches the bad entry."""
     sub = AdaptiveSubspace(full_dim=50, subspace_dim=6, svd_ratio_init=0.5, svd_ratio_final=0.5)
     projection = sub.init_projection(generator=torch.Generator().manual_seed(0))
     history = torch.randn(3, 50, generator=torch.Generator().manual_seed(1))
@@ -462,6 +462,32 @@ def test_nonfinite_history_redraws_random_basis(bad):
     rotated = sub.rotate(projection, 5, 10, history, generator=torch.Generator().manual_seed(2), history_is_full=True)
     expected = sub._rotate_random(projection.device, projection.dtype, torch.Generator().manual_seed(2))
     assert torch.equal(rotated, expected)
+
+
+def test_rank_deficient_history_draws_random_columns():
+    """Null directions of the history are redrawn, not kept as near-axis columns."""
+    sub = AdaptiveSubspace(full_dim=200, subspace_dim=20, svd_ratio_init=0.5, svd_ratio_final=0.5)
+    history = torch.zeros(4, 200)
+    history[[0, 2]] = torch.randn(2, 200, generator=torch.Generator().manual_seed(0))
+    projection = sub.init_projection(generator=torch.Generator().manual_seed(1))
+
+    rotated = sub.rotate(projection, 1, 1, history, generator=torch.Generator().manual_seed(2), history_is_full=True)
+    torch.testing.assert_close(rotated.mT @ rotated, torch.eye(20), atol=1e-5, rtol=0)
+    assert rotated.abs().max() < 0.9
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_displacement_rotation_ten_million_rows_succeeds():
+    """A tall cuSOLVER SVD overflows its workspace query near 8M rows."""
+    sub = AdaptiveSubspace(full_dim=10_000_000, subspace_dim=2, svd_ratio_init=0.5, svd_ratio_final=0.5)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    projection = sub.init_projection(generator=gen, device="cuda")
+    history = torch.randn(2, sub.full_dim, device="cuda", generator=gen) * torch.tensor([[1.0], [0.1]], device="cuda")
+
+    rotated = sub.rotate(projection, 1, 10, history, generator=gen, history_is_full=True)
+    torch.testing.assert_close(rotated.mT @ rotated, torch.eye(2, device="cuda"), atol=1e-4, rtol=0)
+    assert (rotated[:, 0] @ history[0]).abs() / history[0].norm() > 0.999
 
 
 def test_rotation_keeps_uncentered_displacement_direction():
@@ -516,18 +542,57 @@ def test_rotation_interval_amortizes_basis_decomposition(interval, expected_rota
     assert changes == expected_rotations
 
 
+@pytest.mark.parametrize("kind", ["adaptive", "hybrid", "factored"])
 @pytest.mark.parametrize("option", [{"amortize_steps": 2}, {"biased_rotation": True}, {"use_momentum": True}])
-def test_per_step_rotation_warns_cleared_state(option):
+def test_per_step_rotation_warns_cleared_state(kind, option):
     """Basis changes clear velocity and cached directions."""
     import warnings
 
+    from polystep.factored_subspace import FactoredSubspace
+    from polystep.hybrid_subspace import HybridSubspace
+
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
+    layout = ParamLayout.from_module(model)
+    build = {
+        "adaptive": lambda k: AdaptiveSubspace.auto_from_params(model, rotation_interval=k),
+        "hybrid": lambda k: HybridSubspace.from_layout(layout, rank=2, rotation_interval=k),
+        "factored": lambda k: FactoredSubspace.from_layout(layout, rank=2, rotation_interval=k),
+    }[kind]
     with pytest.warns(UserWarning, match="changes its basis every step"):
-        PolyStepOptimizer(model, subspace=AdaptiveSubspace.auto_from_params(model), **option)
+        PolyStepOptimizer(model, subspace=build(1), **option)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        PolyStepOptimizer(model, subspace=AdaptiveSubspace.auto_from_params(model, rotation_interval=2), **option)
-    assert not [w for w in caught if "every step" in str(w.message)]
+        PolyStepOptimizer(model, **option)
+        for k in (0, 2):
+            PolyStepOptimizer(model, subspace=build(k), **option)
+    assert not [w for w in caught if "rotation_interval" in str(w.message)]
+
+
+@pytest.mark.parametrize(
+    "kind, kwargs",
+    [
+        ("adaptive", dict(rank=24, rotation_interval=2, absorb_mode="none")),
+        ("hybrid", dict(rank=2, rotation_interval=2, absorb_mode="none")),
+        ("adaptive", dict(rank=24, rotation_interval=0, absorb_mode="periodic", absorb_interval=2)),
+        ("hybrid", dict(rank=2, absorb_mode="periodic", absorb_interval=2)),
+    ],
+)
+def test_amortized_interval_still_fires(kind, kwargs):
+    """Coasting steps do not advance rotation or absorb intervals."""
+    from torch.func import functional_call, vmap
+
+    from polystep.hybrid_subspace import HybridSubspace
+
+    cls = AdaptiveSubspace if kind == "adaptive" else HybridSubspace
+    model = nn.Sequential(nn.Linear(6, 10), nn.Tanh(), nn.Linear(10, 1))
+    sub = cls.from_layout(ParamLayout.from_module(model), **kwargs)
+    opt = PolyStepOptimizer(model, subspace=sub, amortize_steps=2, seed=0, compile=False)
+    x = torch.randn(32, 6, generator=torch.Generator().manual_seed(1))
+    p0, h0 = opt.state.projection, opt.state.hybrid_projections
+    for _ in range(8):
+        opt.step(lambda bp: vmap(lambda p: functional_call(model, p, (x,)).pow(2).mean())(bp))
+    s = opt.state
+    assert s.absorb_count > 0 or s.projection is not p0 or s.hybrid_projections is not h0
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

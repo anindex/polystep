@@ -267,6 +267,17 @@ class TestStateDictRoundTrip:
         opt.load_state_dict(sd)
         assert opt._applied_rank == 7
 
+    def test_missing_ot_step_count_uses_iterations(self):
+        model, closure = _model_and_closure()
+        opt = PolyStepOptimizer(model, epsilon=0.1, max_iterations=10)
+        for _ in range(3):
+            opt.step(closure)
+        sd = opt.state_dict()
+        sd["solver_state"].pop("ot_step_count")
+        opt.state.ot_step_count = 0
+        opt.load_state_dict(sd)
+        assert opt.state.ot_step_count == 3
+
 
 class TestRestoreBest:
     """restore_best defaults to True, so it decides what train() hands back."""

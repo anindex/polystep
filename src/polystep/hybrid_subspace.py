@@ -12,7 +12,14 @@ import torch
 from .solvers._shared import decomposition_dtype, thin_qr
 
 from .projection.sparse import SparseRandomProjection
-from .subspace import ProjectedAbsorbMixin, ProjectionSpec, SvdRatioMixin, _stable_entry_seed, history_unusable
+from .subspace import (
+    ProjectedAbsorbMixin,
+    ProjectionSpec,
+    SvdRatioMixin,
+    _stable_entry_seed,
+    history_unusable,
+    top_directions,
+)
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -125,7 +132,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     specs: Tuple[ProjectionSpec, ...]
     subspace_dim: int
     compression_ratio: float
-    seed: int = 0
+    seed: Optional[int] = None
     rotation_mode: str = "displacement"
     rotation_interval: int = 0
     svd_ratio_init: float = 0.0
@@ -146,12 +153,6 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
     _entry_dtypes: Optional[Dict[str, torch.dtype]] = None
 
     def __post_init__(self) -> None:
-        if self.rotation_interval != 0:
-            warnings.warn(
-                "HybridSubspace works best with rotation_interval=0. "
-                "Non-zero values cause dual potential resets that degrade accuracy.",
-                stacklevel=2,
-            )
         self.check_svd_ratios()
         if self.compression_ratio == 0.0 and self._total_params > 0:
             object.__setattr__(self, "compression_ratio", self.subspace_dim / self._total_params)
@@ -163,7 +164,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         cls,
         layout: "ParamLayout",
         rank: int,
-        seed: int = 0,
+        seed: Optional[int] = None,
         max_subspace_dim: Optional[int] = None,
         **kwargs,
     ) -> "HybridSubspace":
@@ -193,7 +194,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         compression_ratio: int = 16,
         min_rank: int = 4,
         max_rank: int = 64,
-        seed: int = 0,
+        seed: Optional[int] = None,
         max_subspace_dim: Optional[int] = None,
         **kwargs,
     ) -> "HybridSubspace":
@@ -408,11 +409,8 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         svd_dtype = D_full.dtype
         D_full = D_full.to(decomposition_dtype(svd_dtype))
 
-        # The history is short, so the full SVD costs about the same as a randomized one.
-        U, S, Vh = torch.linalg.svd(D_full, full_matrices=False)
-        k_svd = min(k_svd, U.shape[1])
-        U_top = U[:, :k_svd]
-        k_random = spec.num_coords - k_svd
+        U_top = top_directions(D_full, k_svd)
+        k_random = spec.num_coords - U_top.shape[1]
         if U_top.dtype != svd_dtype:
             U_top = U_top.to(svd_dtype)
 

@@ -34,6 +34,7 @@ class SolverState:
     linear_convergence: List[bool] = field(default_factory=list)
     displacement_sqnorms: List[float] = field(default_factory=list)
     iteration_count: int = 0
+    ot_step_count: int = 0
     f: Optional[torch.Tensor] = None
     g: Optional[torch.Tensor] = None
     epsilon: Optional[float] = None

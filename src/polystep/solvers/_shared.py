@@ -93,6 +93,11 @@ def exp_plan(f: torch.Tensor, g: torch.Tensor, C: torch.Tensor, eps: float) -> t
     return torch.exp(log_P.clamp(max=math.log(torch.finfo(log_P.dtype).max) - 1.0))
 
 
+def precision_floor(dtype: torch.dtype, eps: float, magnitude: float) -> float:
+    """Smallest relative marginal error ``dtype`` resolves for duals and costs summing to ``magnitude``."""
+    return 2 * torch.finfo(dtype).eps * (magnitude / eps + 1)
+
+
 def recenter_cost(cost_matrix: torch.Tensor):
     """Subtract the per-matrix minimum so min(C)=0. The plan is shift-invariant, and this keeps the log-sum-exp in FP32 range."""
     if cost_matrix.numel() == 0:

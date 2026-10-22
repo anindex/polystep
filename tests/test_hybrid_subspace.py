@@ -192,7 +192,6 @@ def test_apply_perturbation_is_affine_and_local(model, hybrid_sub):
         assert moved == {spec.entry_key}, f"coordinate {spec.flat_start} also moved {moved - {spec.entry_key}}"
 
 
-@pytest.mark.filterwarnings("ignore:HybridSubspace works best:UserWarning")
 def test_rotate_random_produces_different_projections(hybrid_sub):
     hybrid = HybridSubspace(
         specs=hybrid_sub.specs,
@@ -214,7 +213,6 @@ def test_rotate_random_produces_different_projections(hybrid_sub):
     assert any_different, "Rotated projections should differ from original"
 
 
-@pytest.mark.filterwarnings("ignore:HybridSubspace works best:UserWarning")
 def test_rotate_all_step_zero_keeps_seeded_basis(hybrid_sub):
     """Step 0 returns the seeded basis unchanged; rotating it would discard a draw
     nothing was evaluated against."""
@@ -229,7 +227,6 @@ def test_rotate_all_step_zero_keeps_seeded_basis(hybrid_sub):
     assert hybrid.rotate_all(projections, step=0, total_steps=100) is projections
 
 
-@pytest.mark.filterwarnings("ignore:HybridSubspace works best:UserWarning")
 class TestHybridRotateDisplacement:
     def test_rotate_displacement_with_history(self, hybrid_sub):
         """Displacement rotation with non-zero history produces new projections."""
@@ -343,6 +340,22 @@ def test_optimizer_detects_hybrid_mode(model):
     assert optimizer._state.hybrid_projections is not None
     num_projected = sum(1 for s in hybrid.specs if s.is_projected)
     assert len(optimizer._state.hybrid_projections) == num_projected
+
+
+@pytest.mark.parametrize("cls_name", ["HybridSubspace", "FactoredSubspace"])
+def test_default_basis_follows_optimizer_seed(cls_name):
+    import polystep
+    from polystep import PolyStepOptimizer
+
+    bases = []
+    for seed in (0, 1):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(6, 8), nn.Tanh(), nn.Linear(8, 1))
+        subspace = getattr(polystep, cls_name).from_layout(ParamLayout.from_module(model), rank=2)
+        opt = PolyStepOptimizer(model, subspace=subspace, seed=seed, compile=False)
+        assert subspace.seed is None
+        bases.append(opt._state.hybrid_projections["0.weight"])
+    assert not torch.equal(*bases)
 
 
 class TestRankSchedule:
@@ -891,8 +904,7 @@ def test_sparse_threshold_measured_in_fp32_bytes():
 
     # Random rotation rebuilds every projection, so it has to make the same choice.
     for source, is_dense in ((dense, True), (sparse, False)):
-        with pytest.warns(UserWarning, match="rotation_interval=0"):
-            rotating = replace(source, rotation_mode="random", rotation_interval=1)
+        rotating = replace(source, rotation_mode="random", rotation_interval=1)
         projections = source.init_projections(torch.device("cpu"), torch.float32)
         rotated = rotating.rotate_all(projections, step=1, total_steps=10)
         assert isinstance(rotated[spec.entry_key], torch.Tensor) is is_dense

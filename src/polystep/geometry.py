@@ -145,17 +145,8 @@ def get_random_rotation_matrices(
     return Q.to(device=device, dtype=dtype)
 
 
-def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir: torch.Tensor) -> torch.Tensor:
-    """Point each frame's first axis along ``bias_dir`` with one Householder reflection.
-
-    A column sign fix keeps det +1, and the other axes stay Haar on the complement
-    of the bias. Rows with a zero or nonfinite ``bias_dir`` come back unchanged.
-    """
-    dim = rot_mats.shape[-1]
-    if dim == 1:
-        # SO(1) = {[[1]]}: a sign flip is a reflection, so bias is not representable.
-        return torch.ones_like(rot_mats)
-
+def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir: torch.Tensor, verts: torch.Tensor) -> torch.Tensor:
+    """Turn each frame so its unit vertex nearest ``bias_dir`` points along it; zero or nonfinite rows stay put."""
     out_dtype = rot_mats.dtype
     if out_dtype in (torch.bfloat16, torch.float16):
         rot_mats = rot_mats.float()
@@ -164,10 +155,14 @@ def apply_biased_rotation(rot_mats: torch.Tensor, bias_dir: torch.Tensor) -> tor
     norms = torch.linalg.vector_norm(bias_dir, dim=-1, keepdim=True)
     valid = torch.isfinite(norms) & (norms > 1e-8)
     b = torch.where(valid, bias_dir / norms.clamp(min=1e-10), torch.zeros_like(bias_dir))
-    r0 = rot_mats[:, :, 0]
-    s = torch.ones_like(norms).copysign((r0 * b).sum(dim=-1, keepdim=True))
-    w = r0 + s * b
-    scale = (2 / (w * w).sum(dim=-1, keepdim=True)).unsqueeze(-1)
-    out = rot_mats - scale * w.unsqueeze(-1) * (w.unsqueeze(1) @ rot_mats)
-    out = out * torch.cat([-s, torch.ones_like(r0[:, 2:]), s], dim=-1).unsqueeze(1)
+    verts = verts.to(rot_mats)
+    bR = (b.unsqueeze(-2) @ rot_mats).squeeze(-2)
+    v = verts[(bR @ verts.T).argmax(dim=-1)]
+    u = (rot_mats @ v.unsqueeze(-1)).squeeze(-1)
+    c = (u * b).sum(dim=-1, keepdim=True)
+    out = (
+        rot_mats
+        + (((1 + 2 * c) * b - u) / (1 + c)).unsqueeze(-1) * v.unsqueeze(-2)
+        - ((u + b) / (1 + c)).unsqueeze(-1) * bR.unsqueeze(-2)
+    )
     return torch.where(valid.unsqueeze(-1), out, rot_mats).to(out_dtype)

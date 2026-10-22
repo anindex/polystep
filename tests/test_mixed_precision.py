@@ -617,6 +617,7 @@ def test_synced_half_weights_match_scored(fused):
         model = nn.Sequential(nn.Linear(4, 3).bfloat16(), nn.Linear(3, 1))
     subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
     opt = PolyStepOptimizer(model, subspace=subspace, step_radius=3.0, seed=0)
+    subspace = opt.subspace
     assert (subspace._fused_P is not None) is fused
     opt.step(lambda p: sum(v.float().flatten(1).sin().sum(1) for v in p.values()))
 
@@ -676,6 +677,7 @@ def test_resync_after_cast_rebuilds_fused_projection(dtype):
     model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 16), nn.ReLU(), nn.Linear(16, 4))
     subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
     opt = PolyStepOptimizer(model, subspace=subspace, seed=0)
+    subspace = opt.subspace
     evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss())
     inputs, targets = torch.randn(16, 8), torch.randint(0, 4, (16,))
     for i in range(4):

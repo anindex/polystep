@@ -143,9 +143,21 @@ change the following results, so a rerun does not reproduce them:
 - The surviving `quadratic/trust_region`, `trust_x_quad/trust_quad_k3`,
   `quadratic/biased_rotation`, and `quadratic/newton` sweep arms change as well. The
   trust region applies its new radius on the step that measured the ratio instead of
-  one step later, `biased_rotation` turns each frame with a single Householder
-  reflection, and Newton refinement runs before momentum and keeps the Sinkhorn warm
-  start.
+  one step later, `biased_rotation` turns each frame so the vertex nearest the
+  previous descent direction points along it, and Newton refinement runs before
+  momentum and keeps the Sinkhorn warm start.
+- Sinkhorn stops when the relative marginal error falls below `threshold`, now 3e-5
+  by default and floored at the precision the dtype can reach. The old absolute 1e-6
+  test loosened in proportion to the particle count and could not pass in FP32 at a
+  sharp epsilon. Solves at a small epsilon, over few particles or over many particles
+  with uneven costs now stop at a different check, as do runs with over-relaxation,
+  adaptive omega, Anderson acceleration or `ProgressiveEpsilon`.
+- Every `HybridSubspace` and `FactoredSubspace` run draws new bases. Their layer
+  seeds now hash with CRC-32, because Adler-32 repeated bases across rotation steps
+  such as 120 and 201 and across layers such as `120.weight` and `201.weight`. A
+  subspace built without a `seed` also takes the optimizer's seed instead of 0. This
+  changes examples 05, 06, 10 and 11, the paper runners and the fairness EGGROLL and
+  Hybrid arms. `AdaptiveSubspace` and full-space runs are unchanged.
 
 Several other 1.0 changes move results in the last bit (see the
 [changelog](../CHANGELOG.md)), so the remaining rows need not match bit for bit

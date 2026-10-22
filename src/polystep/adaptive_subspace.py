@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from .projection import SparseRandomProjection
 from .solvers._shared import decomposition_dtype, thin_qr
-from .subspace import ProjectedAbsorbMixin, SvdRatioMixin, history_unusable
+from .subspace import ProjectedAbsorbMixin, SvdRatioMixin, history_unusable, top_directions
 from .transform import ParamLayout
 
 
@@ -176,11 +176,8 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         compute_dtype = decomposition_dtype(dtype)
         D_full = D_full.to(compute_dtype)
 
-        # The history is short, so the full SVD costs about the same.
-        U, S, Vh = torch.linalg.svd(D_full, full_matrices=False)
-        k_svd = min(k_svd, U.shape[1])
-        U_top = U[:, :k_svd]
-        k_random = self.subspace_dim - k_svd
+        U_top = top_directions(D_full, k_svd)
+        k_random = self.subspace_dim - U_top.shape[1]
 
         Z_random = _draw_basis_gaussian(self.full_dim, k_random, device, compute_dtype, generator)
         if U_top.device != Z_random.device:

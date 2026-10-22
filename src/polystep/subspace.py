@@ -15,7 +15,7 @@ def _stable_entry_seed(*parts: object) -> int:
     across processes (unlike Python's salted ``hash``).
     """
     key = "|".join(str(p) for p in parts).encode("utf-8")
-    return int(zlib.adler32(key)) & 0x7FFFFFFF
+    return zlib.crc32(key) & 0x7FFFFFFF
 
 
 def absorb_due(
@@ -37,8 +37,16 @@ def history_unusable(rotation_mode: str, history: Optional[torch.Tensor]) -> boo
     """Whether a rotation redraws at random: random mode, or a missing, empty, non-finite or near-zero history."""
     if rotation_mode == "random" or history is None or history.shape[0] == 0:
         return True
-    disp_norm_sq = torch.where(torch.isfinite(history).all(), (history * history).sum(), torch.nan).item()
-    return math.isnan(disp_norm_sq) or disp_norm_sq < 1e-20
+    disp_norm = torch.linalg.vector_norm(history).item()
+    return not math.isfinite(disp_norm) or disp_norm < 1e-10
+
+
+def top_directions(D: torch.Tensor, k: int) -> torch.Tensor:
+    """Unit-norm top-``k`` left singular directions of a tall ``D``, dropping numerically null ones."""
+    w, V = torch.linalg.eigh(D.mT @ D)
+    h = w.numel()
+    keep = min(k, int((w > w[-1:] * h * torch.finfo(D.dtype).eps).sum()))
+    return D @ (V[:, h - keep :].flip(1) * w[h - keep :].flip(0).rsqrt())
 
 
 class ProjectedAbsorbMixin:

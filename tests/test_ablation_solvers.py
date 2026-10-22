@@ -139,7 +139,12 @@ class TestSolverSelection:
 
 @pytest.mark.parametrize(
     "solver",
-    [MinCostGreedySolver(), TopKMeanSolver(k=2), SoftmaxSolver(epsilon=0.1), SinkhornSolver(epsilon=0.1)],
+    [
+        MinCostGreedySolver(),
+        TopKMeanSolver(k=2),
+        SoftmaxSolver(epsilon=0.1),
+        SinkhornSolver(epsilon=0.1, threshold=1e-6),
+    ],
     ids=["min_cost", "top_k", "softmax", "sinkhorn"],
 )
 def test_half_cost_gives_fp32_plan(solver):

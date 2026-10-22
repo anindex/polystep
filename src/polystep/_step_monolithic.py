@@ -153,7 +153,7 @@ def maintain_per_layer_subspace(opt, state, pre_step_sub_coords) -> None:
 
     should_absorb = hybrid_sub.should_absorb(
         state.stagnation_count,
-        state.iteration_count,
+        state.ot_step_count,
     )
     hist = state.displacement_history[: state.displacement_history_count]
     # absorb_aligned_active biases the basis toward productive directions via displacement-SVD.
@@ -170,7 +170,7 @@ def maintain_per_layer_subspace(opt, state, pre_step_sub_coords) -> None:
     else:
         new_projections = hybrid_sub.rotate_all(
             state.hybrid_projections,
-            step=state.iteration_count,
+            step=state.ot_step_count,
             total_steps=opt.max_iterations,
             displacement_history=hist,
         )
@@ -270,7 +270,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         and opt._prev_descent_direction is not None
         and opt._prev_descent_direction.shape == (P, pdim)
     ):
-        rot_mats = apply_biased_rotation(rot_mats, opt._prev_descent_direction)
+        rot_mats = apply_biased_rotation(rot_mats, opt._prev_descent_direction, polytope_verts)
 
     X_vertices, rotated = opt._compiled.rotate_and_translate(
         rot_mats,
@@ -1004,6 +1004,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     state.linear_convergence.append(_converged)
     state.displacement_sqnorms.append(_disp)
     state.iteration_count += 1
+    state.ot_step_count += 1
     opt._ot_step_costs.append(_cost_mean)
 
     # Save duals for warm-starting; reset if NaN reverted, and keep the old ones when
@@ -1031,7 +1032,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
 
         should_absorb = adaptive_sub.should_absorb(
             state.stagnation_count,
-            state.iteration_count,  # already incremented above
+            state.ot_step_count,
         )
 
         if should_absorb:
@@ -1059,7 +1060,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                     dtype=state.X.dtype,
                 )
             finish_absorb(opt, state)
-        elif _rotation_due(adaptive_sub, state.iteration_count):
+        elif _rotation_due(adaptive_sub, state.ot_step_count):
             # Re-anchor first: the point is base + P @ coords, so swapping P at non-zero
             # coords moves the weights unevaluated. The basis QR/SVD runs in fp32.
             state.base_params, _ = adaptive_sub.absorb(

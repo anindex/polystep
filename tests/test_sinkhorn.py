@@ -128,15 +128,28 @@ class TestSharedIteration:
     )
     def test_reported_error_matches_plan_marginals(self, kwargs):
         torch.manual_seed(0)
-        n, m = 12, 7
+        n, m = 5, 12
         C = torch.rand(n, m, dtype=torch.float64)
         solver = SinkhornSolver(epsilon=0.05, threshold=1e-12, **kwargs)
         result = solver.solve(C)
         P = result.matrix
-        row = (P.sum(dim=1) - 1.0 / n).abs().max()
-        col = (P.sum(dim=0) - 1.0 / m).abs().max()
+        row = (P.sum(dim=1) * n - 1.0).abs().max()
+        col = (P.sum(dim=0) * m - 1.0).abs().max()
         assert not result.converged
         assert abs(result.errors[-1] - max(row, col).item()) < 1e-12
+
+    def test_fp32_sinkhorn_converges_at_precision_floor(self):
+        cost = torch.rand(4, 3, generator=torch.Generator().manual_seed(0))
+        result = SinkhornSolver(epsilon=1e-3, threshold=1e-6).solve(cost, scale_cost="max_cost")
+        assert result.converged
+        assert result.n_iters < 2000
+
+    def test_sinkhorn_stop_rule_scale_free(self):
+        n = 50000
+        cost = torch.rand(n, 3, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
+        cost[:, 0] -= 0.5
+        result = SinkhornSolver(epsilon=0.05).solve(cost)
+        assert (result.matrix.sum(dim=1) * n - 1).abs().max() < 1e-4
 
     @pytest.mark.filterwarnings("ignore:SinkhornSolver epsilon.*very small:UserWarning")
     def test_nonfinite_duals_are_reset_while_checking(self):

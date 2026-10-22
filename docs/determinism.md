@@ -46,6 +46,11 @@ basis is drawn on the CPU but orthogonalized by a QR on the model's device, so i
 CUDA bases round differently. Sparse projections draw their rows and signs from their
 own seeded CPU generator and skip the QR, so every device gets the same projection.
 
+`HybridSubspace` and `FactoredSubspace` seed each layer's basis with a CRC-32 hash of
+the subspace seed, the parameter name and the step. A subspace built without a `seed`
+takes the optimizer's seed, so each seed in a sweep searches its own basis, and the
+optimizer keeps that seeded copy in `optimizer.subspace`.
+
 Under vmap, a stochastic forward draws separate random numbers for each candidate.
 Its random stream differs from a run that falls back to sequential evaluation; see
 [candidate evaluation](performance.md#candidate-evaluation).

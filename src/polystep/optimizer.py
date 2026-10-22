@@ -167,7 +167,7 @@ class PolyStepOptimizer(SerializationMixin):
         block_strategy: 'monolithic', 'per_layer', or 'grouped'. With a subspace, the
             last two only split Sinkhorn and KL solves into row segments.
         block_group_size: Consecutive entries per block group.
-        biased_rotation: Align the chart's first axis with the previous descent direction.
+        biased_rotation: Turn each chart so the vertex nearest the previous descent direction points along it.
         use_momentum: Accumulate a velocity (default False). Heavy-ball, so at steady
             state the move is ``velocity_lr/(1-beta)`` times the barycentric displacement,
             20x at the default ``momentum_final``. ``step_radius`` does not bound it.
@@ -530,6 +530,8 @@ class PolyStepOptimizer(SerializationMixin):
         self._last_screen_savings = 0.0
         #: Candidate evaluations charged by the step itself, so fast paths stay counted.
         self.candidate_evals = 0
+        if isinstance(subspace, (HybridSubspace, FactoredSubspace)) and subspace.seed is None and seed is not None:
+            subspace = replace(subspace, seed=seed)
         self.subspace = subspace
         self._subspace_particle_dim = subspace_particle_dim
         self._rank_schedule = rank_schedule
@@ -613,7 +615,8 @@ class PolyStepOptimizer(SerializationMixin):
                 f"use_adaptive_radius=False.",
                 stacklevel=2,
             )
-        if isinstance(subspace, AdaptiveSubspace) and 0 < subspace.rotation_interval <= 1:
+        _rotation = getattr(subspace, "rotation_interval", 0)
+        if 0 < _rotation <= 1:
             _cleared = [
                 name
                 for name, on in (
@@ -625,7 +628,7 @@ class PolyStepOptimizer(SerializationMixin):
             ]
             if _cleared:
                 warnings.warn(
-                    f"AdaptiveSubspace with rotation_interval={subspace.rotation_interval} changes its "
+                    f"{type(subspace).__name__} with rotation_interval={_rotation} changes its "
                     "basis every step, and each change clears the momentum velocity and the coasting "
                     f"and biased-rotation directions, so nothing from {', '.join(_cleared)} carries "
                     "over to the next step. Pass a larger rotation_interval to use them.",

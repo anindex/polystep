@@ -234,6 +234,30 @@ def test_kl_zero_column_gets_no_mass():
     torch.testing.assert_close(result.matrix.sum(dim=1), a)
 
 
+def test_kl_zero_column_matches_exact_reference():
+    C = torch.tensor([[0.0, 1.0, 0.3], [0.5, 0.2, 0.9]], dtype=torch.float64)
+    a = torch.tensor([0.5, 0.5], dtype=torch.float64)
+    b = torch.tensor([0.0, 0.5, 0.5], dtype=torch.float64)
+    result = KLSoftmaxSolver(epsilon=0.1, lam=1.0).solve(C, a, b)
+    reference = KLSoftmaxSolver(epsilon=0.1, lam=1.0, threshold=0.0).solve(C, a, b)
+    assert result.matrix[:, 0].abs().max() == 0
+    torch.testing.assert_close(result.matrix, reference.matrix, atol=1e-6, rtol=0)
+
+
+def test_kl_scaled_objective_matches_reference():
+    cost = torch.rand(5, 4, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
+    reference = KLSoftmaxSolver(epsilon=0.01, lam=1.0).solve(cost)
+    scaled = KLSoftmaxSolver(epsilon=1e-10, lam=1e-8).solve(cost * 1e-8)
+    assert scaled.n_iters == reference.n_iters
+    torch.testing.assert_close(scaled.matrix, reference.matrix, atol=1e-9, rtol=0)
+
+
+def test_fp32_kl_converges_at_precision_floor():
+    cost = torch.rand(128, 9, generator=torch.Generator().manual_seed(0))
+    result = KLSoftmaxSolver(epsilon=1e-3, lam=1.0).solve(cost)
+    assert result.converged
+
+
 def test_kl_solve_skips_iteration_autograd_graph():
     C = torch.rand(32, 5, dtype=torch.float64, requires_grad=True)
     result = KLSoftmaxSolver(epsilon=0.05, lam=1.0, max_iterations=50, threshold=0.0).solve(C)

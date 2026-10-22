@@ -16,7 +16,9 @@ factor. Rotation changes those directions. Retune radii when switching subspaces
 Momentum, the `amortize_steps` coasting direction, and the `biased_rotation`
 direction are cleared when the basis changes. `AdaptiveSubspace` rotates every step
 by default. These options need a longer rotation interval to take effect.
-The optimizer warns when you combine them with rotation on every step.
+The optimizer warns when you combine them with `rotation_interval=1` on any subspace.
+Under `amortize_steps`, `rotation_interval` and `absorb_interval` count OT steps
+and skip the coasting steps in between.
 Heavy-ball momentum can amplify the barycentric displacement.
 `step_radius` bounds the displacement before momentum.
 

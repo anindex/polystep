@@ -13,6 +13,7 @@ import torch.nn as nn
 from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.factored_subspace import FactoredSubspace
 from polystep.hybrid_subspace import HybridSubspace
+from polystep.subspace import _stable_entry_seed
 from polystep.transform import ParamLayout
 
 
@@ -92,3 +93,7 @@ def test_absorb_zeros_coords_folds_into_base(case):
     after = sub.apply_perturbation(proj, new_base, zeroed)
     for key, value in expected.items():
         torch.testing.assert_close(after[key], value, atol=1e-6, rtol=1e-6)
+
+
+def test_entry_seeds_distinct_across_steps():
+    assert len({_stable_entry_seed(0, "fc.weight", t) for t in range(5001)}) == 5001

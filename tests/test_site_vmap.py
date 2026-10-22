@@ -1099,6 +1099,7 @@ def test_half_inplace_step_builds_no_incumbent(monkeypatch, back):
     model = Model()
     subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
     opt = PolyStepOptimizer(model, seed=0, subspace=subspace)
+    subspace = opt.subspace
     evaluator = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=True)
     inputs, targets = _small_batch()
     with pytest.warns(UserWarning, match="use_inplace=True asks"):

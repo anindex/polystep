@@ -140,6 +140,9 @@ rank alone does not bound the total dimension. The cap shrinks every weight matr
 proportion, while biases and other 1D parameters keep their full width; a cap below
 that width warns and leaves each matrix one coordinate. Smaller subspaces reduce cost
 but restrict the search. Retune the radii when changing the representation.
+Random basis rotation (`rotation_mode="random"` with a positive `rotation_interval`)
+is optional for `HybridSubspace`: on MNIST MLPs it measured between no change and 4.8
+points more test accuracy, at up to 1.7x the step time.
 
 `FactoredSubspace` uses `dW = A @ B`, with fixed `B`, so sequential linear layers can
 compute `x @ W.T + (x @ B.T) @ A.T` without constructing candidate weights. A

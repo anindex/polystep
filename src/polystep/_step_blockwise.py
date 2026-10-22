@@ -78,7 +78,7 @@ def _prepare_probes(opt, block, block_X, verts, block_idx, probes, step_r, probe
         and descent_dirs[block_idx] is not None
         and descent_dirs[block_idx].shape == (P_block, block.particle_dim)
     ):
-        rot_mats = apply_biased_rotation(rot_mats, descent_dirs[block_idx])
+        rot_mats = apply_biased_rotation(rot_mats, descent_dirs[block_idx], verts)
 
     X_vertices, rotated = opt._compiled.rotate_and_translate(rot_mats, verts, block_X, step_r)
     X_probe = opt._compiled.compute_probe_points(block_X, rotated, probes, probe_r)

@@ -27,7 +27,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
     specs: Tuple[ProjectionSpec, ...]
     subspace_dim: int
     compression_ratio: float
-    seed: int = 0
+    seed: Optional[int] = None
     ranks: Dict[str, int] = field(default_factory=dict)
     rotation_interval: int = 0
     absorb_mode: str = "stagnation"
@@ -41,7 +41,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         cls,
         layout,
         rank: int = 8,
-        seed: int = 0,
+        seed: Optional[int] = None,
         **kwargs,
     ) -> "FactoredSubspace":
         """Build specs from a ParamLayout."""

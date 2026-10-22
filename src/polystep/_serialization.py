@@ -122,6 +122,8 @@ class SerializationMixin:
             if name == "subspace" or name not in valid:
                 continue
             setattr(self._state, name, _de(value))
+        if "ot_step_count" not in sd.get("solver_state", {}):
+            self._state.ot_step_count = self._state.iteration_count
 
         self._state._prev_prev_block_duals = _de(sd.get("prev_prev_block_duals"))
 
