@@ -134,9 +134,10 @@ def test_factored_evaluator_declines_unsupported_models():
     assert FactoredEvaluator.try_build(conv, nn.CrossEntropyLoss()) is None
 
 
-def test_rotation_defaults_off_and_is_deterministic():
+def test_rotation_redraws_on_interval_deterministically():
     _, subspace, projections, _ = _setup()
-    assert subspace.rotate_all(projections, step=5) is projections  # interval 0
+    assert subspace.rotate_all(projections, step=4) is projections
+    assert subspace.rotate_all(projections, step=5) is not projections
 
     torch.manual_seed(0)
     layout = ParamLayout.from_module(_mlp())
@@ -148,6 +149,22 @@ def test_rotation_defaults_off_and_is_deterministic():
     assert once is not proj
     for key in once:
         assert torch.equal(once[key], twice[key])  # same step -> same basis
+
+
+def test_factored_default_rotation_redraws_basis():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(6, 8), nn.Tanh(), nn.Linear(8, 1))
+    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+    inputs, targets = torch.randn(16, 6), torch.randn(16, 1)
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    opt = PolyStepOptimizer(model, subspace=subspace, seed=0)
+    closure = opt.register_evaluator(evaluator, inputs, targets)
+    opt.step(closure)
+    initial = opt.state.hybrid_projections["0.weight"].clone()
+    for _ in range(5):
+        opt.step(closure)
+
+    assert not torch.equal(initial, opt.state.hybrid_projections["0.weight"])
 
 
 def test_unsupported_model_warns_and_falls_back():

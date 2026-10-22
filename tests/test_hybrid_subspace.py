@@ -989,3 +989,24 @@ def test_offset_batch_matches_reconstruct_batch(layers, sparse):
         got = sub.offset_batch(proj, bary, lo, delta)
         for k in want:
             torch.testing.assert_close(got[k], want[k], rtol=0, atol=1e-12)
+
+
+def test_svd_ratio_tracks_training_step():
+    """Under amortize_steps both subspaces ramp the SVD ratio by training step."""
+    from polystep import AdaptiveSubspace, PolyStepOptimizer
+
+    steps = {}
+    for cls in (AdaptiveSubspace, HybridSubspace):
+        model = nn.Linear(8, 8)
+        sub = cls.from_layout(
+            ParamLayout.from_module(model), rank=3, rotation_interval=2, absorb_mode="none", svd_ratio_final=1.0
+        )
+        opt = PolyStepOptimizer(
+            model, subspace=sub, subspace_particle_dim=2, amortize_steps=4, max_iterations=8, seed=0, compile=False
+        )
+        seen = steps[cls] = []
+        ratio_at = opt.subspace.get_svd_ratio
+        opt.subspace.get_svd_ratio = lambda step, total: seen.append(step) or ratio_at(step, total)
+        for _ in range(8):
+            opt.step(lambda p: sum(v.flatten(1).square().sum(1) for v in p.values()))
+    assert steps[AdaptiveSubspace] == steps[HybridSubspace] == [5]

@@ -66,7 +66,7 @@ class SinkhornResult:
 class SinkhornSolver:
     """Log-domain Sinkhorn solver for entropic optimal transport.
 
-    ``threshold`` bounds the relative marginal error, floored at what the dtype can resolve.
+    ``threshold`` bounds the relative marginal error, floored at what the dtype can resolve once the error stops falling.
     """
 
     epsilon: float = 0.1
@@ -142,6 +142,7 @@ class SinkhornSolver:
         # align_dual returns None on a shape mismatch, so fall back to zeros.
         f = align_dual(init_f, n, device, dtype, "init_f")
         g = align_dual(init_g, m, device, dtype, "init_g")
+        warm = f is not None or g is not None
         if f is None:
             f = torch.zeros(n, device=device, dtype=dtype)
         if g is None:
@@ -217,6 +218,7 @@ class SinkhornSolver:
                 _divergence_patience = 3
                 # Latch the back-off so the adaptive estimator cannot re-raise omega in the same check.
                 _omega_capped = False
+                early = None
 
                 def dual_objective(fv, gv):
                     # True Sinkhorn Lyapunov; valid off the marginal constraint, unlike <f,a>+<g,b> alone.
@@ -300,11 +302,14 @@ class SinkhornSolver:
                             except RuntimeError:
                                 pass  # Fall back to the standard iterate on solver failure.
 
+                    check_due = (i + 1) % self.check_every == 0 or i == self.max_iterations - 1
+                    if warm and i == 1 and omega == 1.0 and not check_due:
+                        early = (f, g, torch.linalg.vector_norm(f - f_new, float("inf")))
                     f, g = f_new, g_new
                     n_iters = i + 1
 
                     # Batch all scalars into one device->host transfer; always check the last iteration or ProgressiveEpsilon inflates epsilon.
-                    if (i + 1) % self.check_every == 0 or i == self.max_iterations - 1:
+                    if check_due:
                         log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
                         err_a_t = ((torch.exp(torch.logsumexp(log_P_row, dim=1)) - a).abs() * inv_a).amax()
                         if omega != 1.0 or self.anderson_depth > 0 or self.adaptive_omega:
@@ -313,9 +318,20 @@ class SinkhornSolver:
                             err_b_t = err_a_t
 
                         # Batch all scalar measurements into one transfer; a dual's max is nonfinite exactly when the dual is.
-                        err_a, err_b, f_max, g_max, c_max = torch.stack(
-                            [err_a_t, err_b_t, f.abs().max(), g.abs().max(), clamp_scale]
+                        scalars = [err_a_t, err_b_t, f.abs().max(), g.abs().max(), clamp_scale]
+                        err_a, err_b, f_max, g_max, c_max, *early_norm = torch.stack(
+                            scalars if early is None else [*scalars, early[2]]
                         ).tolist()
+                    if early is not None and (
+                        check_due or (i == 1 and (not f.is_cuda or torch.cuda.current_stream(f.device).query()))
+                    ):
+                        step = (early_norm[0] if check_due else early[2].item()) / eps
+                        if step < math.log1p(self.threshold):
+                            f, g, n_iters, converged = early[0], early[1], 1, True
+                            errors.append(math.expm1(step))
+                            break
+                        early = None
+                    if check_due:
                         if not (math.isfinite(f_max) and math.isfinite(g_max)):
                             f.zero_()
                             g.zero_()
@@ -355,7 +371,10 @@ class SinkhornSolver:
                             prev_err = err
 
                         errors.append(err)
-                        if err < max(self.threshold, precision_floor(dtype, eps, f_max + g_max + c_max)):
+                        stalled = len(errors) > 1 and errors[-2] <= err
+                        if err < self.threshold or (
+                            stalled and err < precision_floor(dtype, eps, f_max + g_max, c_max)
+                        ):
                             converged = True
                             break
 

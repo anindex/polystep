@@ -144,7 +144,7 @@ Random basis rotation (`rotation_mode="random"` with a positive `rotation_interv
 is optional for `HybridSubspace`: on MNIST MLPs it measured between no change and 4.8
 points more test accuracy, at up to 1.7x the step time.
 
-`FactoredSubspace` uses `dW = A @ B`, with fixed `B`, so sequential linear layers can
+`FactoredSubspace` uses `dW = A @ B`, so sequential linear layers can
 compute `x @ W.T + (x @ B.T) @ A.T` without constructing candidate weights. A
 candidate changes a few consecutive coordinates of one `A`, so the subspace-delta
 path scores it from `x @ B.T` and moves only the output units those coordinates
@@ -152,7 +152,13 @@ belong to. Runs that span two parameters, screened candidates of small steps and
 incumbent use the full low-rank correction, which computes `x @ W.T` and `x @ B.T`
 for the first perturbed layer once per candidate sweep and reuses them across its
 chunks. Screening and incumbent scoring are separate sweeps. The search is limited to
-the input directions spanned by `B`; basis rotation changes that search space.
+the input directions spanned by the rows of `B`. A fixed `B` keeps the whole run in
+one row space, so `FactoredSubspace` redraws `B` every `rotation_interval` OT steps,
+5 by default. On a 784-64-10 MNIST MLP at rank 8 and 300 steps, rotating every 5 steps
+raised test accuracy from 51% to 73% at equal time. A rotation clears the
+`amortize_steps` coasting direction, so under amortization each rotation costs one
+extra full OT step: at `amortize_steps=5` the same run gained 12 points for 19% more
+time. Pass `rotation_interval=0` to keep `B` fixed.
 
 The delta path scores each parameter in its own pass and launches more kernels per
 chunk than the low-rank correction, which a GPU pays for while its chunks are too

@@ -1,6 +1,6 @@
 """Low-rank coordinates for matrix perturbations.
 
-``dW = A @ B`` with ``B`` fixed random orthonormal rows; see arXiv:2511.16652.
+``dW = A @ B`` with ``B`` random orthonormal rows, redrawn every ``rotation_interval`` OT steps; see arXiv:2511.16652.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
     compression_ratio: float
     seed: Optional[int] = None
     ranks: Dict[str, int] = field(default_factory=dict)
-    rotation_interval: int = 0
+    rotation_interval: int = 5
     absorb_mode: str = "stagnation"
     absorb_patience: int = 20
     absorb_interval: int = 0
@@ -89,7 +89,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         )
 
     def _make_b(self, spec: ProjectionSpec, device, dtype, step: int) -> torch.Tensor:
-        """Fixed ``(rank, d_in)`` factor with orthonormal rows, from a stable seed.
+        """``(rank, d_in)`` factor with orthonormal rows, seeded by entry and step.
 
         Drawn on CPU in fp32 so the seed is portable across devices.
         """
@@ -111,6 +111,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         step: int,
         total_steps: Optional[int] = None,
         displacement_history: Optional[torch.Tensor] = None,
+        svd_step: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Redraw every ``B`` on the rotation interval; returning the same object means nothing changed."""
         if self.rotation_interval <= 0 or step <= 0 or step % self.rotation_interval != 0:

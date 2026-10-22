@@ -8,8 +8,6 @@ import math
 
 import torch
 
-from .geometry import get_orthoplex_vertices
-
 
 def extract_fd_gradient(
     losses_3d: torch.Tensor,
@@ -33,6 +31,19 @@ def extract_fd_gradient(
     moment = torch.einsum("pvk,vd->pdk", centered, verts.to(dtype=losses_3d.dtype, device=losses_3d.device))
     denom = ((V / pdim) * scales * probe_radius).clamp(min=1e-10)  # (K,)
     return (moment / denom).mean(dim=-1)  # (P, pdim)
+
+
+def extract_fd_antipodal_gradient(
+    losses_3d: torch.Tensor,
+    scales: torch.Tensor,
+    probe_radius: float,
+    pdim: int,
+) -> torch.Tensor:
+    """Central differences on ``[+e_i; -e_i]`` rows, so a large shared loss cannot cancel a pair's difference."""
+    if not losses_3d.shape[1] == 2 * pdim:
+        raise ValueError(f"FD gradient needs antipodal [+e_i; -e_i] rows; got V={losses_3d.shape[1]}, pdim={pdim}")
+    denom = (2.0 * scales * probe_radius).clamp(min=1e-10)
+    return ((losses_3d[:, :pdim, :] - losses_3d[:, pdim:, :]) / denom).mean(dim=-1)
 
 
 def extract_iso_curvature(
@@ -157,8 +168,7 @@ def apply_newton_refinement(
     hessian_reg: float = 1e-4,
 ) -> torch.Tensor:
     """Blend the OT step with a Newton correction read off the probe evaluations."""
-    verts = get_orthoplex_vertices(pdim, device=losses_3d.device, dtype=losses_3d.dtype)
-    gradient = extract_fd_gradient(losses_3d, scales, probe_radius, pdim, verts)
+    gradient = extract_fd_antipodal_gradient(losses_3d, scales, probe_radius, pdim)
     hessian_diag = extract_fd_hessian_diag(losses_3d, scales, probe_radius, pdim)
 
     delta_rot = compute_newton_step(

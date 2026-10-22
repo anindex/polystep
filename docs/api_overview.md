@@ -80,7 +80,7 @@ optimizer = PolyStepOptimizer(model, subspace=subspace)
 | Class | Representation |
 |---|---|
 | `HybridSubspace` | Per-parameter projections with an optional total dimension cap |
-| `FactoredSubspace` | Matrix perturbations `dW = A @ B` with fixed `B` |
+| `FactoredSubspace` | Matrix perturbations `dW = A @ B`, with `B` redrawn every 5 OT steps by default |
 | `AdaptiveSubspace` | Global projection updated from displacement history |
 
 Factored evaluation avoids candidate weight construction for supported sequential

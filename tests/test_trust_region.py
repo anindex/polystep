@@ -108,6 +108,35 @@ def test_trust_region_runs_on_simplex_one_probe():
     assert all(0.1 <= m <= 3.0 for m in mults)
 
 
+@pytest.mark.parametrize(("polytope", "antipodal"), [("orthoplex", True), ("cube", False)])
+def test_step_gradient_antipodal_only_for_orthoplex(monkeypatch, polytope, antipodal):
+    """The cube at particle_dim=2 also has 2*pdim vertices, so routing must key on the polytope."""
+    import polystep._step_monolithic as step_module
+
+    calls = []
+    real = step_module.extract_fd_antipodal_gradient
+    monkeypatch.setattr(step_module, "extract_fd_antipodal_gradient", lambda *a: calls.append(1) or real(*a))
+    torch.manual_seed(0)
+    model = nn.Linear(2, 1)
+    evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
+    inputs, targets = torch.randn(8, 2), torch.randn(8, 1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt = PolyStepOptimizer(
+            model,
+            max_iterations=5,
+            epsilon=0.1,
+            num_probe=1,
+            polytope_type=polytope,
+            trust_region=True,
+            compile=False,
+            seed=0,
+            particle_dim=2,
+        )
+    opt.step(lambda params: evaluator.evaluate(params, inputs, targets))
+    assert bool(calls) == antipodal
+
+
 def test_amortized_trust_region_warns_inert():
     """Momentum steps drop the pending prediction, so the ratio test never runs."""
     torch.manual_seed(0)

@@ -409,6 +409,22 @@ def test_orthoplex_gradient_matches_central_difference(dtype):
                 torch.testing.assert_close(extract_fd_gradient(losses, scales, radius, pdim, verts), reference)
 
 
+@pytest.mark.parametrize(("dtype", "high"), [(torch.float32, 1e8), (torch.bfloat16, 1e3)])
+def test_orthoplex_gradient_survives_large_offset(dtype, high):
+    """Centring on a large first loss rounds the losses 1 and 2 to one value."""
+    from polystep.quadratic_model import apply_newton_refinement, extract_fd_antipodal_gradient
+
+    losses = torch.tensor([[[high], [1.0], [high], [2.0]]], dtype=dtype)
+    scales = torch.ones(1, dtype=dtype)
+    grad = extract_fd_antipodal_gradient(losses, scales, 1.0, 2)
+    assert grad.tolist() == [[0.0, -0.5]]
+
+    X = torch.zeros(1, 2, dtype=dtype)
+    eye = torch.eye(2, dtype=dtype).unsqueeze(0)
+    X_refined = apply_newton_refinement(X, losses, scales, 1.0, 2, eye, X, alpha=1.0, max_step_norm=1.0)
+    assert X_refined[0, 1] > 0
+
+
 def test_simplex_recovers_gradient_and_curvature_trace():
     """The simplex carries an O(r) third-moment bias the orthoplex cancels; the shared
     centre recovers tr(H)/d exactly at any radius."""

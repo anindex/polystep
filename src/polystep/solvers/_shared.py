@@ -58,6 +58,34 @@ def thin_qr(matrix: torch.Tensor):
         return torch.linalg.qr(matrix, mode="reduced")
 
 
+def orthonormal_columns(matrix: torch.Tensor) -> torch.Tensor:
+    """Q of the positive-diagonal QR: CholQR2 from 8 columns, 32x tallness and 2**18 entries at full FP32 unless ill-conditioned, else Householder."""
+    rows, cols = matrix.shape
+    try:
+        full_fp32 = torch.get_float32_matmul_precision() == "highest"
+    except RuntimeError:
+        full_fp32 = False
+    if cols >= 8 and rows >= 32 * cols and matrix.numel() >= 2**18 and full_fp32:
+        pin = single_thread_cpu(matrix.device) if matrix.numel() * cols < QR_PIN_MAX_WORK else contextlib.nullcontext()
+        device_type = matrix.device.type
+        no_autocast = (
+            torch.amp.autocast(device_type, enabled=False)
+            if torch.amp.is_autocast_available(device_type)
+            else contextlib.nullcontext()
+        )
+        with pin, no_autocast:
+            L, info = torch.linalg.cholesky_ex(matrix.mT @ matrix)
+            Q = matrix @ torch.linalg.inv_ex(L)[0].mT
+            gram = Q.mT @ Q
+            Q = Q @ torch.linalg.inv_ex(torch.linalg.cholesky_ex(gram)[0])[0].mT
+            gram_error = torch.linalg.matrix_norm(gram - torch.eye(cols, dtype=gram.dtype, device=gram.device))
+        if bool((info == 0) & (gram_error < 0.5)):
+            return Q
+    Q, R = thin_qr(matrix)
+    d = torch.sign(torch.diagonal(R))
+    return Q * torch.where(d == 0, 1.0, d)
+
+
 def loss_buffer_dtype(particle_dtype: torch.dtype) -> torch.dtype:
     """Accumulation dtype for probe losses: FP32 for half precision, keeps FP64."""
     return particle_dtype if particle_dtype == torch.float64 else torch.float32
@@ -93,9 +121,9 @@ def exp_plan(f: torch.Tensor, g: torch.Tensor, C: torch.Tensor, eps: float) -> t
     return torch.exp(log_P.clamp(max=math.log(torch.finfo(log_P.dtype).max) - 1.0))
 
 
-def precision_floor(dtype: torch.dtype, eps: float, magnitude: float) -> float:
-    """Smallest relative marginal error ``dtype`` resolves for duals and costs summing to ``magnitude``."""
-    return 2 * torch.finfo(dtype).eps * (magnitude / eps + 1)
+def precision_floor(dtype: torch.dtype, eps: float, dual_max: float, cost_max: float) -> float:
+    """Smallest relative marginal error ``dtype`` resolves on the costs that carry mass."""
+    return 2 * torch.finfo(dtype).eps * ((dual_max + min(dual_max, cost_max)) / eps + 1)
 
 
 def recenter_cost(cost_matrix: torch.Tensor):

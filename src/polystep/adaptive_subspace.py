@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from .projection import SparseRandomProjection
-from .solvers._shared import decomposition_dtype, thin_qr
+from .solvers._shared import decomposition_dtype, orthonormal_columns
 from .subspace import ProjectedAbsorbMixin, SvdRatioMixin, history_unusable, top_directions
 from .transform import ParamLayout
 
@@ -90,12 +90,7 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         target_device = torch.device(device)
         qr_device = target_device if target_device.type == "cuda" else torch.device("cpu")
         compute_dtype = decomposition_dtype(dtype)
-        Z = _draw_basis_gaussian(rows, cols, qr_device, compute_dtype, generator)
-        P, R = thin_qr(Z)
-        # Positive diagonal in R removes the QR sign ambiguity.
-        d = torch.sign(torch.diagonal(R))
-        d = torch.where(d == 0, 1.0, d)
-        P = P * d
+        P = orthonormal_columns(_draw_basis_gaussian(rows, cols, qr_device, compute_dtype, generator))
         if dtype != compute_dtype:
             P = P.to(dtype=dtype)
         if P.device != target_device:
@@ -183,11 +178,7 @@ class AdaptiveSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         if U_top.device != Z_random.device:
             U_top = U_top.to(device=Z_random.device)
 
-        combined = torch.cat([U_top, Z_random], dim=1)
-        P_new, R = thin_qr(combined)
-        d = torch.sign(torch.diagonal(R))
-        d = torch.where(d == 0, 1.0, d)
-        P_new = P_new * d
+        P_new = orthonormal_columns(torch.cat([U_top, Z_random], dim=1))
         if P_new.dtype != dtype:
             P_new = P_new.to(dtype)
 

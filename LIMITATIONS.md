@@ -10,8 +10,9 @@ directions; very small projection ratios can fail on large models.
 use sparse signed columns, which are not orthonormal. Claims requiring an orthogonal
 projection do not apply to those columns.
 
-`FactoredSubspace` restricts perturbations to the input directions in its fixed
-factor. Rotation changes those directions. Retune radii when switching subspaces.
+`FactoredSubspace` restricts each step to the input directions spanned by its factor
+`B`, which it redraws every 5 OT steps by default. With `rotation_interval=0` the whole
+run stays in one set of directions. Retune radii when switching subspaces.
 
 Momentum, the `amortize_steps` coasting direction, and the `biased_rotation`
 direction are cleared when the basis changes. `AdaptiveSubspace` rotates every step

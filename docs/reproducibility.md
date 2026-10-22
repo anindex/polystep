@@ -147,7 +147,8 @@ change the following results, so a rerun does not reproduce them:
   previous descent direction points along it, and Newton refinement runs before
   momentum and keeps the Sinkhorn warm start.
 - Sinkhorn stops when the relative marginal error falls below `threshold`, now 3e-5
-  by default and floored at the precision the dtype can reach. The old absolute 1e-6
+  by default. Once the error stops falling, the test is floored at the precision the
+  dtype can reach on the costs that carry mass. The old absolute 1e-6
   test loosened in proportion to the particle count and could not pass in FP32 at a
   sharp epsilon. Solves at a small epsilon, over few particles or over many particles
   with uneven costs now stop at a different check, as do runs with over-relaxation,

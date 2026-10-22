@@ -290,6 +290,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         step: int,
         total_steps: int,
         displacement_history: Optional[torch.Tensor] = None,
+        svd_step: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Rotate all layer projections on the shared schedule, by mode.
 
@@ -309,7 +310,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         if history_unusable(self.rotation_mode, displacement_history):
             return self._rotate_all_random(device, dtype, step)
         else:
-            svd_ratio = self.get_svd_ratio(step, total_steps)
+            svd_ratio = self.get_svd_ratio(step if svd_step is None else svd_step, total_steps)
             return self._rotate_all_displacement(
                 projections,
                 displacement_history,

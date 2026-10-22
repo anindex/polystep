@@ -79,6 +79,48 @@ def test_warmstart_shape_mismatch_warns_at_caller(solver_cls):
     assert {w.filename for w in caught if "shape mismatch" in str(w.message)} == {__file__}
 
 
+@pytest.mark.parametrize(
+    "device, busy",
+    [("cpu", False)]
+    + [
+        pytest.param(
+            "cuda",
+            busy,
+            marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")],
+        )
+        for busy in (False, True)
+    ],
+)
+def test_warm_sinkhorn_stops_after_one_iteration(device, busy, monkeypatch):
+    if busy:
+        monkeypatch.setattr(torch.cuda.Stream, "query", lambda self: False)
+    cost = torch.rand(64, 3, generator=torch.Generator().manual_seed(0)).to(device)
+    solver = SinkhornSolver(epsilon=0.1)
+    cold = solver.solve(cost, scale_cost=1.0)
+    warm = solver.solve(cost, init_f=cold.f, init_g=cold.g, scale_cost=1.0)
+    one = SinkhornSolver(epsilon=0.1, threshold=0, max_iterations=1).solve(
+        cost, init_f=cold.f, init_g=cold.g, scale_cost=1.0
+    )
+    missed = solver.solve(cost, init_f=cold.f, scale_cost=1.0)
+    flat = solver.solve(torch.zeros_like(cost), scale_cost=1.0)
+    for result in (cold, missed, flat):
+        assert len(result.errors) == result.n_iters // solver.check_every
+    assert warm.converged and warm.n_iters == 1
+    assert torch.equal(warm.f, one.f) and torch.equal(warm.g, one.g)
+    assert warm.errors[0] == pytest.approx((warm.matrix.sum(1) * 64 - 1).abs().max().item(), rel=0.2)
+    assert solver.solve(cost, init_g=cold.g, scale_cost=1.0).n_iters == 1
+    relaxed = SinkhornSolver(epsilon=0.1, omega=1.5)
+    assert relaxed.solve(cost, init_f=cold.f, init_g=cold.g, scale_cost=1.0).n_iters == 10
+
+
+@pytest.mark.filterwarnings("ignore:SinkhornSolver epsilon.*very small:UserWarning")
+def test_warm_check_tiny_epsilon_no_overflow():
+    cost = torch.rand(16, 3, generator=torch.Generator().manual_seed(9))
+    solver = SinkhornSolver(epsilon=1e-10, max_iterations=20)
+    cold = solver.solve(cost)
+    assert solver.solve(cost, init_f=cold.f, init_g=cold.g).n_iters == 20
+
+
 def test_zero_max_iterations_raises():
     """max_iterations=0 would return an infeasible plan, so it is rejected."""
     with pytest.raises(ValueError, match="max_iterations must be >= 1"):
@@ -141,8 +183,23 @@ class TestSharedIteration:
     def test_fp32_sinkhorn_converges_at_precision_floor(self):
         cost = torch.rand(4, 3, generator=torch.Generator().manual_seed(0))
         result = SinkhornSolver(epsilon=1e-3, threshold=1e-6).solve(cost, scale_cost="max_cost")
+        reference = SinkhornSolver(epsilon=1e-3, threshold=1e-12).solve(cost.double(), scale_cost="max_cost")
         assert result.converged
         assert result.n_iters < 2000
+        torch.testing.assert_close(result.matrix.double(), reference.matrix, atol=2.5e-5, rtol=0)
+
+    @pytest.mark.filterwarnings("ignore:SinkhornSolver epsilon.*very small:UserWarning")
+    def test_floor_ignores_inactive_edges(self):
+        cost = torch.tensor([[0.0, 0.0], [0.0, 1e5]])
+        result = SinkhornSolver(epsilon=0.1, max_iterations=200).solve(cost)
+        assert not result.converged
+        assert result.n_iters == 200
+        cost = torch.rand(4, 3, generator=torch.Generator().manual_seed(0))
+        cost[-1, -1] = 1e5
+        result = SinkhornSolver(epsilon=1e-3).solve(cost)
+        reference = SinkhornSolver(epsilon=1e-3, threshold=1e-12).solve(cost.double())
+        assert result.converged
+        torch.testing.assert_close(result.matrix.double(), reference.matrix, atol=2e-5, rtol=0)
 
     def test_sinkhorn_stop_rule_scale_free(self):
         n = 50000

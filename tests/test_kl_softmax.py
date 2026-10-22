@@ -252,10 +252,21 @@ def test_kl_scaled_objective_matches_reference():
     torch.testing.assert_close(scaled.matrix, reference.matrix, atol=1e-9, rtol=0)
 
 
-def test_fp32_kl_converges_at_precision_floor():
-    cost = torch.rand(128, 9, generator=torch.Generator().manual_seed(0))
-    result = KLSoftmaxSolver(epsilon=1e-3, lam=1.0).solve(cost)
+@pytest.mark.parametrize(
+    "shape,epsilon,lam,seed,atol", [((128, 9), 1e-3, 1.0, 0, 1e-5), ((256, 3), 3e-3, 0.1, 2, 1e-6)]
+)
+def test_fp32_kl_converges_at_precision_floor(shape, epsilon, lam, seed, atol):
+    cost = torch.rand(*shape, generator=torch.Generator().manual_seed(seed))
+    result = KLSoftmaxSolver(epsilon=epsilon, lam=lam).solve(cost)
+    reference = KLSoftmaxSolver(epsilon=epsilon, lam=lam, threshold=0.0).solve(cost.double())
     assert result.converged
+    torch.testing.assert_close(result.matrix.double(), reference.matrix, atol=atol, rtol=0)
+
+
+def test_kl_floor_ignores_inactive_edges():
+    cost = torch.tensor([[0.0, 0.0], [0.0, 1e5]])
+    result = KLSoftmaxSolver(epsilon=0.1, max_iterations=200).solve(cost)
+    assert not result.converged
 
 
 def test_kl_solve_skips_iteration_autograd_graph():

@@ -37,6 +37,7 @@ from .quadratic_model import (
     apply_newton_refinement,
     compute_newton_step,
     compute_predicted_improvement,
+    extract_fd_antipodal_gradient,
     extract_fd_gradient,
     extract_fd_hessian_diag,
     extract_fd_hessian_diag_centered,
@@ -173,6 +174,7 @@ def maintain_per_layer_subspace(opt, state, pre_step_sub_coords) -> None:
             step=state.ot_step_count,
             total_steps=opt.max_iterations,
             displacement_history=hist,
+            svd_step=state.iteration_count,
         )
     # Identity means nothing rotated, so the block_diag rebuild below can be skipped.
     rotated = new_projections is not state.hybrid_projections
@@ -862,7 +864,11 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         # Stale otherwise: adaptive_num_probe can drop K_eff to 1 mid-run.
         opt._newton_direction = None
     if (opt.biased_rotation or opt.trust_region) and _quad_ready:
-        _fd_grad = extract_fd_gradient(opt._losses_3d, probes, probe_r, pdim, polytope_verts)
+        _fd_grad = (
+            extract_fd_antipodal_gradient(opt._losses_3d, probes, probe_r, pdim)
+            if _antithetic
+            else extract_fd_gradient(opt._losses_3d, probes, probe_r, pdim, polytope_verts)
+        )
         if _center_loss is None:
             _fd_hess = extract_fd_hessian_diag(opt._losses_3d, probes, probe_r, pdim)  # (P, pdim)
         elif _antithetic:

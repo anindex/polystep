@@ -23,7 +23,7 @@ from .base import SolverResult
 class KLSoftmaxSolver:
     """KL-penalized one-sided entropic OT solver.
 
-    ``threshold`` bounds the dual step over epsilon, a log marginal residual, floored at what the dtype can resolve.
+    ``threshold`` bounds the dual step over epsilon, a log marginal residual, floored at what the dtype can resolve once the step stops falling.
     """
 
     epsilon: float = 0.1
@@ -119,6 +119,7 @@ class KLSoftmaxSolver:
                 # Sync the convergence flag once per check_every to keep the dual updates GPU-resident.
                 check_every = self.check_every
                 threshold = float(self.threshold)
+                prev_step = math.inf
                 with torch.no_grad():
                     c_max = C.abs().amax()
                     for it in range(self.max_iterations):
@@ -139,12 +140,13 @@ class KLSoftmaxSolver:
                             ).tolist()
                             # <= so threshold=0 means "converge on an exact fixed point", not "never converge".
                             if step <= threshold or (
-                                threshold > 0 and step <= precision_floor(dtype, eps, f_max + g_max + c)
+                                threshold > 0 and prev_step <= step <= precision_floor(dtype, eps, f_max + g_max, c)
                             ):
                                 f, g = f_new, g_new
                                 converged = True
                                 n_iters = it + 1
                                 break
+                            prev_step = step
                         f, g = f_new, g_new
 
             # Enforce rows directly: exp((f + g - C)/eps) loses their mass when

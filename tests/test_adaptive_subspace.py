@@ -9,6 +9,7 @@ import torch.nn as nn
 from polystep import PolyStepOptimizer
 from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.cost_nn import NNCostEvaluator
+from polystep.solvers._shared import orthonormal_columns, thin_qr
 from polystep.transform import ParamLayout
 
 
@@ -476,6 +477,48 @@ def test_rank_deficient_history_draws_random_columns():
     assert rotated.abs().max() < 0.9
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_orthonormal_columns_tall_matches_householder(dtype):
+    """CholQR2 on a tall basis of condition about 90 reproduces the positive-diagonal Householder Q."""
+    Z = torch.randn(4096, 64, generator=torch.Generator().manual_seed(0), dtype=dtype).cumsum(1)
+    Q, R = thin_qr(Z)
+    householder = Q * torch.sign(torch.diagonal(R))
+    P = orthonormal_columns(Z)
+    torch.testing.assert_close(P, householder, atol=1e-5, rtol=0)
+    assert not torch.equal(P, householder)
+    torch.testing.assert_close(P.mT @ P, torch.eye(64, dtype=dtype), atol=100 * torch.finfo(dtype).eps, rtol=0)
+
+
+def raise_mixed_api():
+    raise RuntimeError("mix of the legacy and new APIs")
+
+
+@pytest.mark.parametrize("precision_query", [raise_mixed_api, lambda: "high"])
+def test_orthonormal_columns_reduced_precision_uses_householder(monkeypatch, precision_query):
+    """TF32 matmuls, or a precision query that raises after mixed TF32 APIs, keep the tall basis on Householder."""
+    monkeypatch.setattr(torch, "get_float32_matmul_precision", precision_query)
+    Z = torch.randn(4096, 64, generator=torch.Generator().manual_seed(0)).cumsum(1)
+    Q, R = thin_qr(Z)
+    assert torch.equal(orthonormal_columns(Z), Q * torch.sign(torch.diagonal(R)))
+
+
+@pytest.mark.parametrize("shape", [(512, 512), (1386, 16), (2**18, 4)])
+def test_orthonormal_columns_excluded_shapes_use_householder(shape):
+    """Square bases can fail FP32 Cholesky; small or narrow tall ones run faster under Householder."""
+    Z = torch.randn(*shape, generator=torch.Generator().manual_seed(0))
+    Q, R = thin_qr(Z)
+    assert torch.equal(orthonormal_columns(Z), Q * torch.sign(torch.diagonal(R)))
+
+
+@pytest.mark.parametrize("gap", [0.0, 1e-4])
+def test_cholqr_ill_conditioned_falls_back(gap):
+    """A tall basis with a near-duplicate column fails CholQR2 and takes the Householder Q."""
+    Z = torch.randn(32768, 8, generator=torch.Generator().manual_seed(0))
+    Z[:, 1] = Z[:, 0] + gap * Z[:, 1]
+    Q, R = thin_qr(Z)
+    assert torch.equal(orthonormal_columns(Z), Q * torch.sign(torch.diagonal(R)))
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_displacement_rotation_ten_million_rows_succeeds():
@@ -488,6 +531,27 @@ def test_displacement_rotation_ten_million_rows_succeeds():
     rotated = sub.rotate(projection, 1, 10, history, generator=gen, history_is_full=True)
     torch.testing.assert_close(rotated.mT @ rotated, torch.eye(2, device="cuda"), atol=1e-4, rtol=0)
     assert (rotated[:, 0] @ history[0]).abs() / history[0].norm() > 0.999
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")],
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gram_rotation_under_autocast(device, dtype):
+    """Autocast must not hand ``eigh`` or Cholesky a half-precision Gram matrix."""
+    sub = AdaptiveSubspace(full_dim=2**17, subspace_dim=8, svd_ratio_init=1.0, svd_ratio_final=1.0)
+    history = torch.arange(1.0, 2**17 + 1.0, device=device).unsqueeze(0) * 300
+    with torch.autocast(device, dtype=dtype):
+        rotated = sub.rotate(torch.eye(2**17, 8, device=device), 1, 1, history, history_is_full=True)
+    assert rotated.dtype == torch.float32
+    torch.testing.assert_close(rotated[:, 0].abs(), history[0] / history[0].norm())
 
 
 def test_rotation_keeps_uncentered_displacement_direction():
