@@ -39,6 +39,7 @@ class SolverState:
     g: Optional[torch.Tensor] = None
     epsilon: Optional[float] = None
     base_params: Optional[dict] = None
+    absorb_residual: dict = field(default_factory=dict)
     subspace: Optional[object] = None
     block_duals: Optional[list] = None
     velocity: Optional[torch.Tensor] = None

@@ -466,6 +466,17 @@ def test_alias_cache_misses_changed_model():
         ParamLayout.from_module(model)
 
 
+def test_alias_cache_misses_changed_strides():
+    storage, model = torch.zeros(40), nn.Module()
+    model.w = nn.Parameter(storage.as_strided((4, 4), (8, 2), 0))
+    model.register_buffer("b", storage.as_strided((4, 4), (8, 2), 1))
+    ParamLayout.from_module(model)
+
+    model.b = storage.as_strided((4, 4), (9, 1), 1)
+    with pytest.raises(ValueError, match="'b' and trainable parameter 'w' share storage"):
+        ParamLayout.from_module(model)
+
+
 def test_numpy_wrapper_alias_raises():
     backing = np.arange(6, dtype=np.float32)
     model = nn.Module()

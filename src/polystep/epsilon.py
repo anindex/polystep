@@ -158,7 +158,7 @@ class CosineEpsilon:
             m = self.restart_mult
 
             def span(k: int) -> float:
-                return T * (m**k - 1) / (m - 1)
+                return round(T * (m**k - 1) / (m - 1), 6)
 
             i = math.floor(math.log1p(iteration * (m - 1) / T) / math.log(m))
             i -= span(i) > iteration

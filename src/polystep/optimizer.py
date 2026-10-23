@@ -1336,7 +1336,7 @@ class PolyStepOptimizer(SerializationMixin):
                 a stationary objective.
 
         Returns:
-            Mean raw model cost for this step.
+            Mean raw model cost for this step, or the last OT step's on a coasting ``amortize_steps`` call.
         """
         if frozenset(n for n, p in self.model.named_parameters() if p.requires_grad) != self._trainable_names:
             raise ValueError(
@@ -1386,7 +1386,7 @@ class PolyStepOptimizer(SerializationMixin):
         return result
 
     def step_batch(self, inputs, targets=None, *, loss_fn: Callable) -> float:
-        """Step on one batch through an evaluator cached per ``loss_fn`` object; returns the mean candidate loss."""
+        """Step on one batch through an evaluator cached per ``loss_fn`` object; returns the mean candidate loss, or the last OT step's on a coasting call."""
         if self.trust_region:
             raise ValueError(
                 "trust_region is not supported by step_batch() or train(): its ratio compares a "
@@ -1428,7 +1428,7 @@ class PolyStepOptimizer(SerializationMixin):
 
         old_subspace = self.subspace
         flat_sub = state.X.reshape(-1)[: old_subspace.subspace_dim]
-        new_base, _ = old_subspace.absorb(state.hybrid_projections, state.base_params, flat_sub)
+        new_base, _ = old_subspace.absorb(state.hybrid_projections, state.base_params, flat_sub, state.absorb_residual)
         state.base_params = new_base
 
         # Carry every non-structural config field across the rank change.
@@ -1522,6 +1522,7 @@ class PolyStepOptimizer(SerializationMixin):
                 k: v.detach().clone() for k, v in self.model.state_dict().items() if isinstance(v, torch.Tensor)
             }
             self._state.X = torch.zeros_like(self._state.X)
+            self._state.absorb_residual = {}
             self._realign_subspace_to_model()
         else:
             sd = self.model.state_dict()

@@ -11,7 +11,6 @@ import torch
 from ._shared import (
     align_dual,
     align_marginal,
-    precision_floor,
     prepare_cost,
     validate_positive,
     warn_tiny_temperature,
@@ -23,7 +22,7 @@ from .base import SolverResult
 class KLSoftmaxSolver:
     """KL-penalized one-sided entropic OT solver.
 
-    ``threshold`` bounds the dual step over epsilon, a log marginal residual, floored at what the dtype can resolve once the step stops falling.
+    ``threshold`` bounds the dual step over epsilon, a log marginal residual; a step stalled at the dtype's resolution ends the solve unconverged.
     """
 
     epsilon: float = 0.1
@@ -104,7 +103,8 @@ class KLSoftmaxSolver:
             if g is None:
                 g = torch.zeros(m, device=device, dtype=dtype)
             # Drop a non-finite warm start rather than propagate it into the LSE.
-            if not (torch.isfinite(f).all() & torch.isfinite(g).all()):
+            g = torch.where(b > 0, g, -math.inf)
+            if not (torch.isfinite(f).all() & (torch.isfinite(g) | (b == 0)).all()):
                 f = torch.zeros(n, device=device, dtype=dtype)
                 g = torch.zeros(m, device=device, dtype=dtype)
 
@@ -121,7 +121,6 @@ class KLSoftmaxSolver:
                 threshold = float(self.threshold)
                 prev_step = math.inf
                 with torch.no_grad():
-                    c_max = C.abs().amax()
                     for it in range(self.max_iterations):
                         # f-update: exact row-marginal enforcement.
                         f_new = eps * (log_a - torch.logsumexp((g.unsqueeze(0) - C) / eps, dim=1))
@@ -135,15 +134,16 @@ class KLSoftmaxSolver:
                                 (f_new - f).abs().amax(),
                                 torch.where(b > 0, g_new - g, 0.0).abs().amax() / alpha,
                             )
-                            step, f_max, g_max, c = torch.stack(
-                                [delta / eps, f_new.abs().amax(), torch.where(b > 0, g_new, 0.0).abs().amax(), c_max]
+                            step, f_max, g_max = torch.stack(
+                                [delta / eps, f_new.abs().amax(), torch.where(b > 0, g_new, 0.0).abs().amax()]
                             ).tolist()
                             # <= so threshold=0 means "converge on an exact fixed point", not "never converge".
                             if step <= threshold or (
-                                threshold > 0 and prev_step <= step <= precision_floor(dtype, eps, f_max + g_max, c)
+                                threshold > 0
+                                and prev_step <= step <= 2 * torch.finfo(dtype).eps * max(f_max, g_max) / eps
                             ):
                                 f, g = f_new, g_new
-                                converged = True
+                                converged = step <= threshold
                                 n_iters = it + 1
                                 break
                             prev_step = step

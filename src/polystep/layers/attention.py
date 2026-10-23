@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch._C._functorch import is_batchedtensor
 
 
 class VmapSafeMultiHeadAttention(nn.Module):
@@ -123,7 +124,11 @@ class VmapSafeMultiHeadAttention(nn.Module):
             Q.dtype != torch.float64 and autocast_on and torch.get_autocast_dtype(device_type) == torch.float16
         )
         fused = device_type == "cpu" or (
-            device_type == "cuda" and not half_scores and key_padding_mask is None and (attn_mask is None or is_causal)
+            device_type == "cuda"
+            and not any(map(is_batchedtensor, (Q, K, V)))
+            and not half_scores
+            and key_padding_mask is None
+            and (attn_mask is None or is_causal)
         )
         is_causal = fused and is_causal and key_padding_mask is None
         if is_causal:

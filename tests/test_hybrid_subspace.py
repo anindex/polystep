@@ -342,8 +342,9 @@ def test_optimizer_detects_hybrid_mode(model):
     assert len(optimizer._state.hybrid_projections) == num_projected
 
 
+@pytest.mark.parametrize("subspace_seed", [None, 7])
 @pytest.mark.parametrize("cls_name", ["HybridSubspace", "FactoredSubspace"])
-def test_default_basis_follows_optimizer_seed(cls_name):
+def test_optimizer_seed_fills_unset_subspace_seed(cls_name, subspace_seed):
     import polystep
     from polystep import PolyStepOptimizer
 
@@ -351,11 +352,12 @@ def test_default_basis_follows_optimizer_seed(cls_name):
     for seed in (0, 1):
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(6, 8), nn.Tanh(), nn.Linear(8, 1))
-        subspace = getattr(polystep, cls_name).from_layout(ParamLayout.from_module(model), rank=2)
+        subspace = getattr(polystep, cls_name).from_layout(ParamLayout.from_module(model), rank=2, seed=subspace_seed)
         opt = PolyStepOptimizer(model, subspace=subspace, seed=seed, compile=False)
-        assert subspace.seed is None
+        assert subspace.seed == subspace_seed
+        assert opt.subspace.seed == (seed if subspace_seed is None else subspace_seed)
         bases.append(opt._state.hybrid_projections["0.weight"])
-    assert not torch.equal(*bases)
+    assert torch.equal(*bases) == (subspace_seed is not None)
 
 
 class TestRankSchedule:
@@ -492,6 +494,16 @@ class TestRankTransition:
         for _ in range(3):
             opt.step(closure)
         assert ranks == [4], f"rebuilt inside a stage, got {ranks}"
+
+    def test_bf16_rank_transition_fills_absorb_residual(self):
+        """A bf16 rank change carries each entry's absorb rounding error."""
+        from polystep import PolyStepOptimizer
+
+        model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 5)).bfloat16()
+        subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
+        opt = PolyStepOptimizer(model, subspace=subspace, rank_schedule=RankSchedule(stages=[(0, 4)]), compile=False)
+
+        assert set(opt.state.absorb_residual) == set(model.state_dict())
 
     @pytest.mark.parametrize("kind", [None, "adaptive", "factored"])
     def test_rank_schedule_requires_hybrid_subspace(self, kind):

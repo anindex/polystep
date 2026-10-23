@@ -449,11 +449,22 @@ def test_vmap_sdpa_cuda_matches_explicit(monkeypatch, mask_kind):
         "padding": dict(key_padding_mask=padding),
     }[mask_kind]
     fused = torch.vmap(forward, in_dims=(0, None))(params, fused_kwargs)
-    assert bool(calls) == (mask_kind != "padding")
-    calls.clear()
+    assert not calls
     explicit = torch.vmap(forward, in_dims=(0, None))(params, dict(attn_mask=mask | padding[:, None, :]))
     assert not calls
     torch.testing.assert_close(fused, explicit, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("site", ["W_q", "W_k", "W_v"])
+def test_wide_vmap_attention_stays_batched(site):
+    attn = VmapSafeMultiHeadAttention(8, 2).cuda().eval()
+    x = torch.randn(64, 6, 8, device="cuda")
+    stacked = getattr(attn, site).weight.detach().expand(1024, -1, -1)
+    with torch.no_grad():
+        out = torch.vmap(lambda w: torch.func.functional_call(attn, {f"{site}.weight": w}, (x, x, x)))(stacked)
+        torch.testing.assert_close(out[-1], attn(x, x, x), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])

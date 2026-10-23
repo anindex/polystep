@@ -81,6 +81,10 @@ class TestCosineEpsilon:
         assert s.at(3000) > 0.02
         assert CosineEpsilon(init=1.0, target=0.01, total_steps=1, restart_mult=3.0).at(1) == pytest.approx(1.0)
 
+    def test_cosine_integer_span_restarts_on_time(self):
+        for T, m, it in [(100, 1.1, 331), (10, 1.2, 22), (50, 1.04, 102), (100_000, 1.01, 303_010)]:
+            assert CosineEpsilon(init=1.0, target=1e-3, total_steps=T, restart_mult=m).at(it) == pytest.approx(1.0)
+
 
 class TestProgressiveEpsilon:
     def test_at_returns_init_value(self):

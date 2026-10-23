@@ -306,6 +306,15 @@ def numpy_weight_product(h, w):
     return h @ w.t()
 
 
+@torch.jit.script
+def tail_weight_product(h, w):
+    return h @ torch.cat([torch.zeros_like(w[:3]), w[3:]]).t()
+
+
+def wide_batch_product(h, w):
+    return numpy_weight_product(h, w) if h.shape[0] > 7 else torch.zeros_like(h)
+
+
 class ClassScriptedNet(nn.Module):
     """Reads its Linear weight again inside a scripted function held as a class attribute."""
 
@@ -449,20 +458,140 @@ def test_script_module_model_skips_injection(monkeypatch, model_cls):
     torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
+class IdentityEqMeta(type):
+    def __eq__(cls, other):
+        return cls is other
+
+
+class IdentityEqLinear(nn.Linear, metaclass=IdentityEqMeta):
+    """Has an unhashable class, since its metaclass defines equality without a hash."""
+
+
+@pytest.mark.parametrize("model_fn, scripted", [(ScriptedLinearNet, True), (lambda: IdentityEqLinear(6, 3), False)])
+def test_site_construction_defers_script_scan(model_fn, scripted):
+    model = model_fn()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    assert "_has_script_module" not in vars(site)
+    assert site._has_script_module is scripted
+    assert vars(site)["_has_script_module"] is scripted
+
+
 @pytest.mark.filterwarnings("ignore:vmap failed:RuntimeWarning")
 @pytest.mark.parametrize(
     "model_fn, loss_fn",
     [
         (lambda: HiddenReadNet(scripted_weight_product), nn.CrossEntropyLoss()),
         (lambda: HiddenReadNet(numpy_weight_product), nn.CrossEntropyLoss()),
+        (lambda: HiddenReadNet(tail_weight_product), nn.CrossEntropyLoss()),
         (InfeasibleWeightNet, lambda out, y: out.mean()),
     ],
 )
-def test_hidden_weight_read_disables_injection(monkeypatch, model_fn, loss_fn):
+@pytest.mark.parametrize("dtype, atol", [(torch.float64, 1e-12), (torch.float32, 1e-5)])
+def test_hidden_weight_read_disables_injection(monkeypatch, model_fn, loss_fn, dtype, atol):
     torch.manual_seed(0)
-    got, want, site = _injected_and_materialized(monkeypatch, model_fn(), *_small_batch(), loss_fn=loss_fn)
-    torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+    got, want, site = _injected_and_materialized(monkeypatch, model_fn(), *_small_batch(), dtype=dtype, loss_fn=loss_fn)
+    torch.testing.assert_close(got, want, rtol=0, atol=atol)
     assert site._uninjectable_sites == {"fc.weight"}
+
+
+@pytest.mark.filterwarnings("ignore:vmap failed:RuntimeWarning")
+@pytest.mark.parametrize(
+    "read, calls",
+    [(scripted_weight_product, [(0.0, 7), (1.0, 7)]), (wide_batch_product, [(1.0, 7), (1.0, 9)])],
+)
+def test_later_call_hidden_read_declines_injection(monkeypatch, read, calls):
+    from polystep import cost_nn
+
+    monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
+    torch.manual_seed(0)
+    model = HiddenReadNet(read).double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[0], torch.tensor([[0, 1], [2, 3]])
+    flat = base_sd[entry.key].reshape(-1)
+    noise = torch.randn(2, 1, PDIM, dtype=torch.float64)
+    for scale, rows in calls:
+        values = flat[local_idx].unsqueeze(1).repeat(1, 3, 1)
+        values[:, 2:] += scale * noise
+        weights = flat.expand(2, 3, -1).clone().scatter_(2, local_idx.unsqueeze(1).expand(-1, 3, -1), values)
+        x, y = torch.randn(rows, 6, dtype=torch.float64), torch.randint(0, 3, (rows,))
+        got = site.evaluate(base_sd, entry, local_idx, values, x, y)
+        want = site._vmap_over_site(entry.key, base_sd, weights.view(6, *entry.shape), x, y)
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+    assert site._uninjectable_sites == {"fc.weight"}
+
+
+@pytest.mark.filterwarnings("ignore:vmap failed:RuntimeWarning")
+@pytest.mark.parametrize("unread_first", [False, True])
+def test_partial_move_hidden_read_declines_injection(monkeypatch, unread_first):
+    from polystep import cost_nn
+
+    monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
+    torch.manual_seed(0)
+    model = HiddenReadNet(tail_weight_product).double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[0], torch.tensor([[17, 18]])
+    flat = base_sd[entry.key].reshape(-1)
+    moves = torch.tensor([[[0.4, 0.0], [0.3, -0.5], [-0.2, 0.0]]], dtype=torch.float64)
+    x, y = _small_batch()
+    for move in [moves * torch.tensor([1.0, 0.0]), moves] if unread_first else [moves]:
+        values = flat[local_idx].unsqueeze(1) + move
+        weights = flat.expand(1, 3, -1).clone().scatter_(2, local_idx.unsqueeze(1).expand(-1, 3, -1), values)
+        got = site.evaluate(base_sd, entry, local_idx, values, x.double(), y)
+        want = site._vmap_over_site(entry.key, base_sd, weights.view(3, *entry.shape), x.double(), y)
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+    assert site._uninjectable_sites == {"fc.weight"}
+
+
+def test_barrier_loss_keeps_injection(monkeypatch):
+    from polystep import cost_nn
+
+    monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
+    torch.manual_seed(0)
+    model = SkipMLP().double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(
+        NNCostEvaluator(
+            model, lambda out, y: torch.where(out.abs().amax() > 10, torch.inf, nn.functional.cross_entropy(out, y))
+        ),
+        layout,
+    )
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[-1], torch.tensor([[0, 1]])
+    flat = base_sd[entry.key].reshape(-1)
+    x, y = _small_batch()
+    for scale in (100.0, 0.1):
+        values = flat[local_idx].unsqueeze(1) + scale * torch.tensor([[[0.0, 0.0], [1.0, -1.0]]], dtype=torch.float64)
+        weights = flat.expand(1, 2, -1).clone().scatter_(2, local_idx.unsqueeze(1).expand(-1, 2, -1), values)
+        got = site.evaluate(base_sd, entry, local_idx, values, x.double(), y)
+        want = site._vmap_over_site(entry.key, base_sd, weights.view(2, *entry.shape), x.double(), y)
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+        assert got[1].isinf() == (scale > 1)
+    assert site._matched_injections and not site._uninjectable_sites
+
+
+def test_noisy_forward_keeps_injection(monkeypatch):
+    from polystep import cost_nn
+
+    torch.manual_seed(0)
+    model = NoisyMLP().double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[0], torch.tensor([[0, 1]])
+    values = base_sd[entry.key].reshape(-1)[local_idx].unsqueeze(1) + torch.tensor([[[0.0], [0.5]]]).double()
+    inputs, targets = _small_batch()
+    scored = []
+    for macs in (cost_nn._MACS_PER_INTERCEPTED_CALL, 0):
+        monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", macs)
+        torch.manual_seed(1)
+        scored.append(site.evaluate(base_sd, entry, local_idx, values, inputs.double(), targets))
+    assert site._matched_injections and not site._uninjectable_sites
+    torch.testing.assert_close(scored[1], scored[0], rtol=0, atol=1e-12)
 
 
 def test_integer_loss_keeps_injection(monkeypatch):
@@ -503,7 +632,7 @@ def test_long_forward_stops_injecting_small_site():
     site._vmap_over_site = lambda key, sd, c, *a: injected.append(isinstance(c, tuple)) or materialize(key, sd, c, *a)
     for r in (rows // 2, rows, rows):
         site.evaluate(base_sd, entry, local_idx, values, torch.randn(r, 32), torch.randn(r, 16))
-    assert injected == [False, True, False, True, False]
+    assert injected == [False, True, False, False, False]
 
 
 @pytest.mark.parametrize("chunk_size", [None, 1])
@@ -1866,7 +1995,7 @@ class HostCopiedMLP(HostScaledMLP):
 def test_site_graph_matches_eager_losses():
     from polystep import HybridSubspace
 
-    x, y = torch.randn(32, 5, 4, device="cuda"), torch.randint(0, 3, (32,), device="cuda")
+    batches = [(torch.randn(32, 5, 4, device="cuda"), torch.randint(0, 3, (32,), device="cuda")) for _ in range(10)]
     runs = []
     for compile_forward in (False, None):
         torch.manual_seed(0)
@@ -1874,10 +2003,7 @@ def test_site_graph_matches_eager_losses():
         subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=2)
         opt = PolyStepOptimizer(model, seed=0, subspace=subspace)
         ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), compile_forward=compile_forward)
-        losses = []
-        for _ in range(10):
-            opt.register_evaluator(ev, x, y)
-            losses.append(opt.step(lambda p: ev.evaluate(p, x, y)))
+        losses = [opt.step(opt.register_evaluator(ev, x, y)) for x, y in batches]
         runs.append((losses, list(model.parameters()), opt._site_vmap_evaluator))
     (eager, eager_params, _), (graphed, graphed_params, site) = runs
     assert any(entry is not None for entry in site._graphs.values())
@@ -1927,4 +2053,32 @@ def test_tied_site_graph_matches_eager():
     for _ in range(3):
         got = graphed._vmap_over_site("out.bias", base_sd, candidates, x, y)
         assert torch.equal(got, eager._vmap_over_site("out.bias", base_sd, candidates, x, y))
+    graphed._vmap_over_site("out.bias", base_sd, candidates.flip(0), x, y)
+    assert torch.equal(got, eager._vmap_over_site("out.bias", base_sd, candidates, x, y))
     assert not graphed._graph_failed_sites and any(graphed._graphs.values())
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_site_graph_target_dtype_change_recaptures():
+    model = nn.Linear(2, 2, bias=False).cuda()
+    nn.init.zeros_(model.weight)
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    opt = PolyStepOptimizer(model, solver="softmax", seed=1)
+    x = torch.zeros(3, 2, device="cuda")
+    targets = (x.long(), x.long(), x + 0.5, x + 0.5)
+    assert [opt.step(opt.register_evaluator(ev, x, y)) for y in targets] == [0.0, 0.0, 0.25, 0.25]
+    assert sum(entry is not None for entry in opt._site_vmap_evaluator._graphs.values()) == 2
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_site_graph_tuple_targets_no_warning():
+    model = nn.Linear(2, 2, bias=False).cuda()
+    ev = NNCostEvaluator(model, lambda out, t: nn.functional.mse_loss(out, t[0]) + nn.functional.mse_loss(out, t[1]))
+    opt = PolyStepOptimizer(model, solver="softmax", seed=1)
+    x = torch.zeros(3, 2, device="cuda")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", "vmap failed")
+        for _ in range(3):
+            opt.step(opt.register_evaluator(ev, x, (x, x + 0.5)))

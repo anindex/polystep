@@ -66,7 +66,7 @@ class SinkhornResult:
 class SinkhornSolver:
     """Log-domain Sinkhorn solver for entropic optimal transport.
 
-    ``threshold`` bounds the relative marginal error, floored at what the dtype can resolve once the error stops falling.
+    ``converged`` means the relative marginal error fell below ``threshold``; an error stalled at the dtype's precision ends the solve unconverged.
     """
 
     epsilon: float = 0.1
@@ -136,8 +136,8 @@ class SinkhornSolver:
 
         log_a = torch.log(torch.clamp(a, min=1e-30))
         log_b = torch.log(torch.clamp(b, min=1e-30))
-        inv_a = torch.where(a > 0, 1 / a, 0)
-        inv_b = torch.where(b > 0, 1 / b, 0)
+        inv_a = torch.where(a > 1e-30, 1 / a, 0)
+        inv_b = torch.where(b > 1e-30, 1 / b, 0)
 
         # align_dual returns None on a shape mismatch, so fall back to zeros.
         f = align_dual(init_f, n, device, dtype, "init_f")
@@ -371,11 +371,9 @@ class SinkhornSolver:
                             prev_err = err
 
                         errors.append(err)
-                        stalled = len(errors) > 1 and errors[-2] <= err
-                        if err < self.threshold or (
-                            stalled and err < precision_floor(dtype, eps, f_max + g_max, c_max)
-                        ):
-                            converged = True
+                        stalled = len(errors) > 3 and min(errors[-3:]) >= min(errors[:-3])
+                        converged = err < self.threshold
+                        if converged or (stalled and err < precision_floor(dtype, eps, f_max + g_max, c_max)):
                             break
 
         return SinkhornResult(

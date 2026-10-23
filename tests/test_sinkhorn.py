@@ -113,6 +113,18 @@ def test_warm_sinkhorn_stops_after_one_iteration(device, busy, monkeypatch):
     assert relaxed.solve(cost, init_f=cold.f, init_g=cold.g, scale_cost=1.0).n_iters == 10
 
 
+def test_warm_early_stop_honors_threshold():
+    cost = torch.rand(64, 3, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    solver = SinkhornSolver(epsilon=0.1)
+    cold = solver.solve(cost, scale_cost=1.0)
+    shift = torch.tensor([1.0, -1.0, 0.5], dtype=torch.float64)
+    for scale, n_iters in ((3e-6, 1), (1e-5, 10)):
+        warm = solver.solve(cost, init_f=cold.f, init_g=cold.g + scale * shift, scale_cost=1.0)
+        plan = warm.matrix
+        err = torch.cat([(plan.sum(1) * 64 - 1).abs(), (plan.sum(0) * 3 - 1).abs()]).max()
+        assert warm.converged and warm.n_iters == n_iters and err <= solver.threshold
+
+
 @pytest.mark.filterwarnings("ignore:SinkhornSolver epsilon.*very small:UserWarning")
 def test_warm_check_tiny_epsilon_no_overflow():
     cost = torch.rand(16, 3, generator=torch.Generator().manual_seed(9))
@@ -180,11 +192,11 @@ class TestSharedIteration:
         assert not result.converged
         assert abs(result.errors[-1] - max(row, col).item()) < 1e-12
 
-    def test_fp32_sinkhorn_converges_at_precision_floor(self):
+    def test_fp32_sinkhorn_stall_stops_unconverged(self):
         cost = torch.rand(4, 3, generator=torch.Generator().manual_seed(0))
         result = SinkhornSolver(epsilon=1e-3, threshold=1e-6).solve(cost, scale_cost="max_cost")
         reference = SinkhornSolver(epsilon=1e-3, threshold=1e-12).solve(cost.double(), scale_cost="max_cost")
-        assert result.converged
+        assert not result.converged
         assert result.n_iters < 2000
         torch.testing.assert_close(result.matrix.double(), reference.matrix, atol=2.5e-5, rtol=0)
 
@@ -200,6 +212,25 @@ class TestSharedIteration:
         reference = SinkhornSolver(epsilon=1e-3, threshold=1e-12).solve(cost.double())
         assert result.converged
         torch.testing.assert_close(result.matrix.double(), reference.matrix, atol=2e-5, rtol=0)
+
+    @pytest.mark.filterwarnings("ignore:SinkhornSolver epsilon.*very small:UserWarning")
+    @pytest.mark.parametrize("epsilon, omega", [(0.01, 1.9), (1e-12, 1.0)])
+    def test_converged_plan_meets_marginals(self, epsilon, omega):
+        cost = torch.rand(256, 16, generator=torch.Generator().manual_seed(0))
+        result = SinkhornSolver(epsilon=epsilon, omega=omega, max_iterations=300).solve(cost)
+        plan = result.matrix.double()
+        error = max((plan.sum(dim=1) * 256 - 1).abs().max(), (plan.sum(dim=0) * 16 - 1).abs().max()).item()
+        assert not result.converged or error < 1e-3
+
+    @pytest.mark.parametrize("dtype, tiny", [(torch.float32, 1e-37), (torch.float32, 1e-40), (torch.float64, 1e-60)])
+    @pytest.mark.parametrize("omega", [1.0, 1.5])
+    def test_tiny_marginal_entry_converges(self, dtype, tiny, omega):
+        cost = torch.rand(4, 3, generator=torch.Generator().manual_seed(0), dtype=dtype)
+        a = torch.tensor([tiny, 1, 1, 1], dtype=dtype) / 3
+        b = torch.tensor([tiny, 1, 1], dtype=dtype) / 2
+        result = SinkhornSolver(epsilon=0.1, omega=omega).solve(cost, a=a, b=b)
+        assert result.converged and result.n_iters < 100
+        torch.testing.assert_close(result.matrix.sum(dim=0), b, atol=1e-4, rtol=0)
 
     def test_sinkhorn_stop_rule_scale_free(self):
         n = 50000
@@ -402,7 +433,7 @@ class TestAndersonAcceleration:
     def test_anderson_acceleration_reduces_iterations(self):
         """The update subtracts dX+dR; subtracting dX alone is worse than no acceleration."""
         torch.manual_seed(0)
-        cost = torch.rand(20, 30) * 5.0
+        cost = torch.rand(20, 30, dtype=torch.float64) * 5.0
         kwargs = dict(epsilon=0.05, max_iterations=400, threshold=1e-7, check_every=1)
         plain = SinkhornSolver(anderson_depth=0, **kwargs).solve(cost)
         accelerated = SinkhornSolver(anderson_depth=3, **kwargs).solve(cost)

@@ -261,6 +261,8 @@ def step_blockwise(opt, closure: Callable) -> float:
     site_vmap = getattr(opt, "_site_vmap_evaluator", None) if fused_inputs is not None else None
     site_owner = sparse_delta if sparse_delta is not None else site_vmap
     base_sd = opt.layout.unflatten(X) if site_owner is not None else None
+    if site_vmap is not None:
+        base_sd = site_vmap.aligned_base(base_sd)
     pdim_arange = torch.arange(opt._particle_dim, device=device)
 
     group = verts.shape[0] * probes.numel()

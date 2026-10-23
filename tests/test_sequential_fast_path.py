@@ -4,6 +4,7 @@ A custom forward takes the batched paths only when it traces to a plain chain;
 these tests pin that plan, the warning for forwards that do not, and the shipped models.
 """
 
+import random
 import warnings
 from collections import OrderedDict
 
@@ -207,6 +208,21 @@ def test_declined_trace_keeps_global_rng():
     torch.manual_seed(0)
     assert _plan_names(model) is None
     assert torch.equal(torch.rand(3), expected)
+
+
+@pytest.mark.parametrize("draw", [lambda: torch.rand(()).item(), random.random], ids=["torch", "python"])
+def test_traced_plan_random_branch_declined(draw):
+    model = _single_linear(lambda m, x: torch.relu(m.fc(x)) if draw() < 0.5 else torch.tanh(m.fc(x)))
+    state = random.getstate()
+    assert _plan_names(model) is None
+    assert random.getstate() == state
+
+
+def test_traced_plan_training_gated_kept():
+    model = _single_linear(
+        lambda m, x: torch.relu(m.fc(x)) if m.training and torch.rand(()) < 0.5 else torch.tanh(m.fc(x))
+    )
+    assert _plan_names(model.train()) == ["fc", "tanh"]
 
 
 def test_child_hook_keeps_vmap_path():

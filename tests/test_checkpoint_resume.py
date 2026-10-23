@@ -361,13 +361,22 @@ class TestRestoreBest:
 
         assert results[True] <= results[False] + 1e-6
 
-    def test_restore_best_ignores_easy_minibatch(self):
+    @pytest.mark.parametrize("reuse_buffer", [False, True])
+    def test_restore_best_ignores_easy_minibatch(self, reuse_buffer):
         gen = torch.Generator().manual_seed(0)
         x_hard = torch.randn(16, 4, generator=gen)
         y_hard = x_hard @ (3.0 * torch.randn(4, 2, generator=gen))
         x_easy = 1e-3 * torch.randn(16, 4, generator=gen)
         x, y = torch.cat([x_hard, x_easy]), torch.cat([y_hard, torch.zeros(16, 2)])
-        loader = DataLoader(TensorDataset(x, y), batch_size=16, shuffle=False)
+        batches = DataLoader(TensorDataset(x, y), batch_size=16, shuffle=False)
+        buf_x, buf_y = torch.empty(16, 4), torch.empty(16, 2)
+
+        class Reused:
+            def __iter__(self):
+                for bx, by in batches:
+                    yield buf_x.copy_(bx), buf_y.copy_(by)
+
+        loader = Reused() if reuse_buffer else batches
         losses = {}
         for flag in (True, False):
             torch.manual_seed(0)
@@ -530,6 +539,36 @@ def test_resume_across_rank_transition():
     actual = resumed.step(closure_for(resumed_model))
 
     assert actual == pytest.approx(expected, abs=1e-9)
+
+
+def test_site_injection_resume_matches_uninterrupted():
+    """A rebuilt site evaluator injects on the same chunks as the continuing one."""
+    gen = torch.Generator().manual_seed(5)
+    inputs, targets = torch.randn(18, 1, 8, 8, generator=gen), torch.randint(0, 3, (18,), generator=gen)
+    loss_fn = nn.CrossEntropyLoss()
+
+    def build():
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Conv2d(1, 4, 3), nn.BatchNorm2d(4), nn.ReLU(), nn.Flatten(), nn.Linear(144, 3))
+        return model, PolyStepOptimizer(model, seed=11)
+
+    model_a, opt_a = build()
+    for _ in range(4):
+        opt_a.step_batch(inputs, targets, loss_fn=loss_fn)
+
+    model_b, opt_b = build()
+    for _ in range(2):
+        opt_b.step_batch(inputs, targets, loss_fn=loss_fn)
+    checkpoint, weights = copy.deepcopy(opt_b.state_dict()), copy.deepcopy(model_b.state_dict())
+
+    model_c, opt_c = build()
+    model_c.load_state_dict(weights)
+    opt_c.load_state_dict(checkpoint)
+    for _ in range(2):
+        opt_c.step_batch(inputs, targets, loss_fn=loss_fn)
+
+    for expected, got in zip(model_a.parameters(), model_c.parameters()):
+        assert torch.equal(expected, got), (expected - got).abs().max()
 
 
 @pytest.mark.gpu

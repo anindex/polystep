@@ -151,11 +151,41 @@ def test_rotation_redraws_on_interval_deterministically():
         assert torch.equal(once[key], twice[key])  # same step -> same basis
 
 
-def test_factored_default_rotation_redraws_basis():
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_rotation_skips_host_sync():
+    _, subspace, _, _ = _setup()
+    projections = subspace.init_projections(torch.device("cuda"), torch.float32)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        rotated = subspace.rotate_all(projections, step=5)
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    expected = subspace.init_projections(torch.device("cpu"), torch.float32, step=5)
+    assert all(torch.equal(rotated[k].cpu(), expected[k]) for k in expected)
+
+
+def test_bf16_absorb_accumulates_subulp_delta():
+    layer = nn.Linear(8, 4)
+    nn.init.ones_(layer.weight)
+    subspace = FactoredSubspace.from_layout(ParamLayout.from_module(layer), rank=2, seed=0)
+    coords = torch.full((subspace.subspace_dim,), 1e-3)
+    exact = {k: v.clone() for k, v in layer.state_dict().items()}
+    half = {k: v.bfloat16() for k, v in exact.items()}
+    residual = {}
+    for step in range(20):
+        exact, _ = subspace.absorb(subspace.init_projections("cpu", torch.float32, step), exact, coords)
+        half, _ = subspace.absorb(subspace.init_projections("cpu", torch.bfloat16, step), half, coords, residual)
+
+    assert (half["weight"].float() - exact["weight"]).abs().max() <= 2**-8
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_factored_default_rotation_redraws_basis(dtype):
     torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(6, 8), nn.Tanh(), nn.Linear(8, 1))
+    model = nn.Sequential(nn.Linear(6, 8), nn.Tanh(), nn.Linear(8, 1)).to(dtype)
     subspace = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=2)
-    inputs, targets = torch.randn(16, 6), torch.randn(16, 1)
+    inputs, targets = torch.randn(16, 6, dtype=dtype), torch.randn(16, 1, dtype=dtype)
     evaluator = NNCostEvaluator(model, nn.MSELoss())
     opt = PolyStepOptimizer(model, subspace=subspace, seed=0)
     closure = opt.register_evaluator(evaluator, inputs, targets)
@@ -165,6 +195,9 @@ def test_factored_default_rotation_redraws_basis():
         opt.step(closure)
 
     assert not torch.equal(initial, opt.state.hybrid_projections["0.weight"])
+    assert bool(opt.state.absorb_residual) == (dtype == torch.bfloat16)
+    opt.resync_from_model()
+    assert opt.state.absorb_residual == {}
 
 
 def test_unsupported_model_warns_and_falls_back():

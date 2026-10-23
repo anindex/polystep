@@ -140,6 +140,7 @@ class _EpochLoss(TrainCallback):
 @pytest.mark.timeout(600)
 def test_mnist_accuracy(mnist_loaders):
     """Full-space training on 2000 downsampled samples clears 50%, well above 10% chance."""
+    torch.set_num_threads(1)
     torch.manual_seed(42)
     train_loader, test_loader = mnist_loaders(n_train=2000, n_test=1000, batch_size=32, downsample=4)
 

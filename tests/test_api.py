@@ -238,17 +238,19 @@ class TestTrain:
         assert not torch.equal(weights[0], start)
         assert torch.equal(*weights)
 
-    def test_cost_subsample_keeps_scalar_inputs(self):
+    def test_cost_subsample_keeps_side_inputs(self):
         class Scaled(nn.Linear):
-            def forward(self, x, scale):
-                return super().forward(x) * scale
+            def forward(self, x, scale, class_scale):
+                return super().forward(x) * scale * class_scale
 
         x, y = _batch(n=8)
+        class_scale = torch.tensor([1.0, 2.0, 3.0])
         opt = PolyStepOptimizer(Scaled(4, 3), seed=0, cost_batch_size=4)
-        opt.step_batch((x, torch.tensor(2.0)), y, loss_fn=nn.CrossEntropyLoss())
-        sub_x, scale = opt._fused_inputs
+        opt.step_batch((x, torch.tensor(2.0), class_scale), y, loss_fn=nn.CrossEntropyLoss())
+        sub_x, scale, kept = opt._fused_inputs
         assert sub_x.shape[0] == opt._fused_targets.shape[0] == 4
         assert scale.dim() == 0 and scale.item() == 2.0
+        assert torch.equal(kept, class_scale)
 
     def test_cost_subsample_scalar_first_input(self):
         class Scaled(nn.Linear):

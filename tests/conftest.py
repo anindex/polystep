@@ -51,9 +51,10 @@ def _cplus_include_path():
             os.environ["CPLUS_INCLUDE_PATH"] = previous
 
 
+_XDIST_WORKERS = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
 # The intra-op pool pays off at the slow tests' batch 512; capped at 16 to leave
 # cores free, floored at 2 so small CI runners keep more than one thread.
-_SLOW_TEST_THREADS = max(2, min(16, (os.cpu_count() or 1) - 8))
+_SLOW_TEST_THREADS = max(1, max(2, min(16, (os.cpu_count() or 1) - 8)) // _XDIST_WORKERS)
 _FAST_TEST_THREADS = int(os.environ.get("POLYSTEP_TEST_THREADS", "1"))
 
 

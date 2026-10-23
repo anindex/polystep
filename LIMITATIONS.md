@@ -18,6 +18,8 @@ Momentum, the `amortize_steps` coasting direction, and the `biased_rotation`
 direction are cleared when the basis changes. `AdaptiveSubspace` rotates every step
 by default. These options need a longer rotation interval to take effect.
 The optimizer warns when you combine them with `rotation_interval=1` on any subspace.
+`FactoredSubspace` clears them every 5 OT steps at its default without a warning;
+pass `rotation_interval=0` to keep them.
 Under `amortize_steps`, `rotation_interval` and `absorb_interval` count OT steps
 and skip the coasting steps in between.
 Heavy-ball momentum can amplify the barycentric displacement.
@@ -40,10 +42,14 @@ Heavy-ball momentum can amplify the barycentric displacement.
   dropout is off and batch-norm running statistics never update. A custom closure that
   runs the model in train mode compares candidates under different dropout masks.
 - The evaluator puts back any buffer the forward writes, such as a call counter, after
-  each batched scoring call and after each candidate in the sequential loop. Chunks of
-  `NNCostEvaluator(chunk_size=...)` run inside one vmap call and still see each other's
-  writes. `use_inplace=True` runs your real forward, so its writes persist. Update such
-  state in your own forward calls outside the closure.
+  each batched scoring call and after each candidate in the sequential and in-place
+  loops. Writes that leave the tensor version counter unchanged, such as
+  `F.batch_norm(training=True)` running statistics or writes through `.data`, are found
+  by comparing values after the evaluator's first forward and after the first candidate
+  of each sequential or in-place sweep. A batched call keeps such a write when no
+  earlier comparison saw it. Chunks of `NNCostEvaluator(chunk_size=...)` run inside one
+  vmap call and still see each other's writes. Update such state in your own forward
+  calls outside the closure.
 - Float inputs are cast to the dtype of the model's first floating weight only when
   the forward raises on them as given. The evaluator checks this with one extra
   forward per input dtype and puts back the buffers it changed. The delta and
@@ -57,10 +63,12 @@ Heavy-ball momentum can amplify the barycentric displacement.
   Linear MLP paths. Other losses may round nearby candidate scores to the same
   value. With FP16 or BF16 parameters, `FactoredSubspace` materializes
   every candidate and runs slower. The delta, site-local and vmap paths add each
-  Linear's bias after the matmul, so with such weights a Linear's output can round
-  one ulp away from the model's own and flip a hard threshold, such as a sign or a
-  spike, on a pre-activation that close to its cut; `use_inplace=True` scores with
-  the model's forward. See
+  Linear's bias after the matmul, so with such weights a Linear's output can differ
+  from the model's own by about one ulp of the matmul result or of the output,
+  whichever is larger. A hard threshold such as a sign or a spike flips on a
+  pre-activation that close to its cut, and when the bias cancels most of the matmul
+  result, a smooth rescaling in later layers can amplify the difference into a
+  different loss as well; `use_inplace=True` scores with the model's forward. See
   [precision](docs/performance.md#compilation-and-precision).
 - `step_batch()` and `train()` reject `trust_region`. See
   [radius control](docs/api_overview.md#quadratic-model-and-radius-control) for its
@@ -76,9 +84,7 @@ Heavy-ball momentum can amplify the barycentric displacement.
   forward neither draws random numbers nor reads the perturbed parameter before
   calling its layer. Attention scores and other temporary tensors inside a module's
   forward are not counted. Set `chunk_size` by hand if such a model runs out of memory.
-  CUDA attention without a mask, or with `is_causal=True` and no padding mask, usually
-  does not materialize the scores in FP32 or BF16. In FP32, PyTorch's fused kernel
-  needs a head size divisible by 4; other head sizes fall back to explicit scores.
+  Under vmap, CUDA attention materializes the scores of every candidate in the chunk.
   `PolyStepOptimizer(chunk_size=...)` caps the candidates scored per step chunk, and
   `NNCostEvaluator(chunk_size=...)` caps how many of them each vmap call batches.
 - On CUDA the site-local path replays CUDA graphs, which freeze Python-side state the

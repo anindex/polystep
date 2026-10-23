@@ -8,6 +8,11 @@ Larger subspace bases (adaptive, hybrid, factored) use the whole intra-op pool, 
 their results can change with the thread count. Random rotation QRs stay on one
 thread at any size.
 
+Tall `AdaptiveSubspace` bases, with at least 8 columns, 32 rows per column and 2**18
+entries, use Cholesky QR only when `torch.get_float32_matmul_precision()` is
+`"highest"` and Householder QR otherwise. The two round differently, so changing the
+matmul precision changes these bases on the CPU as well as on CUDA.
+
 `experiments/runners/common.py` sets:
 
 - `CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA initialization, unless already set.

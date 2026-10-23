@@ -251,6 +251,24 @@ def test_kl_zero_column_matches_exact_reference():
     torch.testing.assert_close(result.matrix, reference.matrix, atol=1e-6, rtol=0)
 
 
+@pytest.mark.parametrize("extrapolate", [False, True])
+def test_kl_zero_column_warm_start_reused(extrapolate):
+    gen = torch.Generator().manual_seed(0)
+    C = torch.rand(16, 12, generator=gen, dtype=torch.float64)
+    b = torch.rand(12, generator=gen, dtype=torch.float64)
+    b[[1, 4, 7, 10]] = 0
+    solver = KLSoftmaxSolver(epsilon=0.1, lam=1.0)
+    cold = solver.solve(C, b=b)
+    init_f, init_g = cold.f, cold.g
+    if extrapolate:
+        prev = KLSoftmaxSolver(epsilon=0.1, lam=1.0, max_iterations=30).solve(C, b=b)
+        init_f, init_g = 1.5 * cold.f - 0.5 * prev.f, 1.5 * cold.g - 0.5 * prev.g
+    warm = solver.solve(C, b=b, init_f=init_f, init_g=init_g)
+    assert warm.n_iters < cold.n_iters
+    assert warm.matrix[:, b == 0].abs().max() == 0
+    torch.testing.assert_close(warm.matrix, cold.matrix)
+
+
 def test_kl_scaled_objective_matches_reference():
     cost = torch.rand(5, 4, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
     reference = KLSoftmaxSolver(epsilon=0.01, lam=1.0).solve(cost)
@@ -262,12 +280,22 @@ def test_kl_scaled_objective_matches_reference():
 @pytest.mark.parametrize(
     "shape,epsilon,lam,seed,atol", [((128, 9), 1e-3, 1.0, 0, 1e-5), ((256, 3), 3e-3, 0.1, 2, 1e-6)]
 )
-def test_fp32_kl_converges_at_precision_floor(shape, epsilon, lam, seed, atol):
+def test_fp32_kl_stall_stops_unconverged(shape, epsilon, lam, seed, atol):
     cost = torch.rand(*shape, generator=torch.Generator().manual_seed(seed))
     result = KLSoftmaxSolver(epsilon=epsilon, lam=lam).solve(cost)
     reference = KLSoftmaxSolver(epsilon=epsilon, lam=lam, threshold=0.0).solve(cost.double())
-    assert result.converged
+    assert not result.converged and result.n_iters < 2000
     torch.testing.assert_close(result.matrix.double(), reference.matrix, atol=atol, rtol=0)
+
+
+def test_fp32_kl_slow_convergence_runs_on():
+    gen = torch.Generator().manual_seed(23)
+    cost = 30 * torch.rand(64, 4, generator=gen)
+    b = -torch.rand(4, generator=gen).log()
+    b = b / b.sum()
+    result = KLSoftmaxSolver(epsilon=0.1).solve(cost, b=b)
+    reference = KLSoftmaxSolver(epsilon=0.1, threshold=0.0, max_iterations=5000).solve(cost.double(), b=b.double())
+    torch.testing.assert_close(result.matrix.double(), reference.matrix, atol=1.4e-5, rtol=0)
 
 
 def test_kl_floor_ignores_inactive_edges():

@@ -185,6 +185,7 @@ def maintain_per_layer_subspace(opt, state, pre_step_sub_coords) -> None:
         state.hybrid_projections,
         state.base_params,
         state.X.reshape(-1)[: hybrid_sub.subspace_dim],
+        state.absorb_residual,
     )
     state.X = torch.zeros_like(state.X)
     if rotated:
@@ -315,6 +316,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     _pdim_arange = torch.arange(pdim, device=device)
     if _sparse_delta is not None or _site_vmap is not None:
         _base_sd = opt.layout.unflatten(X)
+        if _site_vmap is not None:
+            _base_sd = _site_vmap.aligned_base(_base_sd)
 
     _act = activation_elements(opt, _fused_inputs)
     _subspace_delta = getattr(opt, "_subspace_delta_evaluator", None) if opt._per_layer_projections else None
@@ -1047,6 +1050,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 proj_used,
                 state.base_params,
                 full_flat_sub,
+                state.absorb_residual,
             )
             state.base_params = new_base
             # Zero rather than re-project: after a random redraw the bases are largely
@@ -1073,6 +1077,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 proj_used,
                 state.base_params,
                 state.X.reshape(-1)[: adaptive_sub.subspace_dim],
+                state.absorb_residual,
             )
             state.X = torch.zeros_like(state.X)
 

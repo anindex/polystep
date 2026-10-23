@@ -99,7 +99,7 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         gen.manual_seed(_stable_entry_seed(self.seed, spec.entry_key, step))
         G = torch.randn(d_in, r, generator=gen, dtype=torch.float32, device="cpu")
         Q, _ = thin_qr(G)  # (d_in, r), orthonormal columns
-        return Q.t().contiguous().to(device=device, dtype=dtype)
+        return Q.t().contiguous().to(device=device, dtype=dtype, non_blocking=True)
 
     def init_projections(self, device, dtype, step: int = 0) -> Dict[str, torch.Tensor]:
         """Build the ``B`` factor for every projected entry."""

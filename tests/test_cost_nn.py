@@ -16,6 +16,7 @@ from polystep.transform import ParamLayout
 from polystep.cost_nn import (
     BatchedLinearEvaluator,
     NNCostEvaluator,
+    SiteVmapEvaluator,
     auto_detect_chunk_size,
     cast_inputs_memo,
 )
@@ -864,6 +865,116 @@ def test_candidate_sweep_leaves_buffers_unchanged(looped):
         assert model.calls.item() == 0
 
 
+@pytest.mark.parametrize("path", ["dense", "subspace", "site"])
+def test_inplace_sweep_restores_buffer_writes(path):
+    torch.manual_seed(0)
+    model = CountingLinear()
+    x, y = torch.randn(8, 4), torch.randn(8, 1)
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=True)
+    if path == "dense":
+        params = {k: v.detach() + 0.1 * torch.randn(4, *v.shape) for k, v in model.named_parameters()}
+        losses = ev.evaluate(params, x, y)
+        torch.testing.assert_close(losses, NNCostEvaluator(model, nn.MSELoss()).evaluate(params, x, y))
+    elif path == "subspace":
+        sub = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+        projections = sub.init_projections(torch.device("cpu"), torch.float32)
+        base = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        losses = ev.evaluate_subspace_inplace(sub, projections, base, torch.zeros(4, sub.subspace_dim), x, y)
+        assert torch.equal(losses, losses[:1].expand_as(losses))
+    else:
+        layout = ParamLayout.from_module(model, particle_dim=2)
+        site = SiteVmapEvaluator.try_build(ev, layout)
+        flat = layout.flatten(model).reshape(-1)
+        entry = site.resolve_site(torch.tensor([0]), 2, span=(0, 2))
+        losses = site.evaluate(
+            layout.unflatten(flat), entry, torch.arange(2).view(1, 2), flat[:2].repeat(1, 4, 1), x, y
+        )
+        assert torch.equal(losses, losses[:1].expand_as(losses))
+    assert model.calls.item() == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compiled_inplace_verify_restores_buffers():
+    torch.manual_seed(0)
+    model = CountingLinear().cuda()
+    x, y = torch.randn(8, 4, device="cuda"), torch.randn(8, 1, device="cuda")
+    params = {k: v.detach() + 0.1 * torch.randn(4, *v.shape, device="cuda") for k, v in model.named_parameters()}
+    expected = NNCostEvaluator(model, nn.MSELoss()).evaluate(params, x, y)
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=True)
+    torch.testing.assert_close(ev.evaluate(params, x, y), expected)
+    assert ev._compile_forward_verified
+    assert model.calls.item() == 0
+
+
+class LastStepRNN(nn.Module):
+    def __init__(self, cell):
+        super().__init__()
+        self.rnn = cell(4, 6, batch_first=True)
+        self.fc = nn.Linear(6, 3)
+
+    def forward(self, x):
+        return self.fc(self.rnn(x)[0][:, -1])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("path", ["dense", "site"])
+@pytest.mark.parametrize("cell", [nn.LSTM, nn.GRU])
+def test_rnn_inplace_after_rebind_matches_loop(cell, path):
+    torch.manual_seed(0)
+    model = LastStepRNN(cell).cuda()
+    x, y = torch.randn(8, 5, 4, device="cuda"), torch.randint(0, 3, (8,), device="cuda")
+    layout = ParamLayout.from_module(model, particle_dim=2)
+    flat = layout.flatten(model).reshape(-1)
+    noise = 0.05 * torch.randn(4, flat.numel(), device="cuda")
+    if path == "site":
+        noise[:, 2:] = 0
+    stacked = layout.batch_unflatten(flat + noise)
+    before = {k: v.detach().clone() for k, v in model.named_parameters()}
+    with pytest.warns(UserWarning, match="vmap failed"):
+        expected = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=False).evaluate(stacked, x, y)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=True, compile_forward=False)
+    if path == "dense":
+        losses = ev.evaluate(stacked, x, y)
+    else:
+        site = SiteVmapEvaluator.try_build(ev, layout)
+        entry = site.resolve_site(torch.tensor([0]), 2, span=(0, 2))
+        values = (flat[:2] + noise[:, :2]).unsqueeze(0)
+        losses = site.evaluate(layout.unflatten(flat), entry, torch.arange(2, device="cuda").view(1, 2), values, x, y)
+    torch.testing.assert_close(losses, expected)
+    for k, v in model.named_parameters():
+        assert torch.equal(v, before[k]), k
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("cell", [nn.LSTM, nn.GRU])
+@pytest.mark.parametrize("key", ["rnn.weight_ih_l0", "rnn.bias_ih_l0"])
+def test_rnn_subspace_after_rebind_matches_swap(cell, key):
+    torch.manual_seed(0)
+    model = LastStepRNN(cell).cuda()
+    x, y = torch.randn(8, 5, 4, device="cuda"), torch.randint(0, 3, (8,), device="cuda")
+    layout = ParamLayout.from_module(model, particle_dim=2)
+    sub = HybridSubspace.from_layout(layout, rank=3)
+    projections = sub.init_projections(torch.device("cuda"), torch.float32)
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss(), use_inplace=True, compile_forward=False)
+    site = SiteVmapEvaluator.try_build(ev, layout)
+    base = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    coords = 0.1 * torch.randn(sub.subspace_dim, device="cuda")
+    bary = sub.apply_perturbation(projections, base, coords)
+    spec = next(s for s in sub.specs if s.entry_key == key)
+    values = coords[spec.flat_start : spec.flat_start + 2] + 0.3 * torch.randn(1, 4, 2, device="cuda")
+    full = coords.repeat(4, 1)
+    full[:, spec.flat_start : spec.flat_start + 2] = values[0]
+    expected = ev.evaluate_subspace_inplace(sub, projections, base, full, x, y)
+    torch.func.functional_call(model, {k: v.detach().clone() for k, v in model.named_parameters()}, (x,))
+    losses = site.evaluate_subspace(projections, base, coords, bary, spec, 0, values, x, y)
+    torch.testing.assert_close(losses, expected)
+    for k, v in bary.items():
+        assert torch.equal(model.state_dict()[k], v), k
+
+
 def test_sequential_sweep_clones_buffers_once(monkeypatch):
     model = CountingLinear()
     x, y = torch.randn(8, 4), torch.randn(8, 1)
@@ -903,6 +1014,117 @@ def test_late_buffer_write_restored(looped):
     ev.evaluate(params, torch.ones(1, 1), torch.zeros(1, 1))
     assert ev.evaluate(params, torch.ones(2, 1), torch.zeros(2, 1)).tolist() == [4.0, 4.0, 4.0]
     assert model.counter.item() == 0
+
+
+def test_later_candidate_write_restored():
+    class WeightCounter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            self.register_buffer("counter", torch.zeros(()))
+
+        def forward(self, x):
+            if self.weight.item() > 1:
+                self.counter.add_(1)
+            return x * self.weight + self.counter
+
+    model = WeightCounter()
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    ev._vmap_failed = True
+    losses = ev.evaluate({"weight": torch.tensor([[1.0], [2.0], [1.0]])}, torch.ones(1, 1), torch.zeros(1, 1))
+    assert losses.tolist() == [1.0, 9.0, 1.0]
+    assert model.counter.item() == 0
+
+
+def test_vmap_fallback_restores_unversioned_write():
+    class ItemEma(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            self.register_buffer("ema", torch.zeros(()))
+
+        def forward(self, x):
+            self.ema.data.add_(self.weight.item())
+            return x * self.weight + self.ema
+
+    model = ItemEma()
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False)
+    with pytest.warns(UserWarning, match="vmap failed"):
+        losses = ev.evaluate({"weight": torch.ones(3, 1)}, torch.ones(1, 1), torch.zeros(1, 1))
+    assert losses.tolist() == [4.0, 4.0, 4.0]
+    assert model.ema.item() == 0
+
+
+@pytest.mark.parametrize("looped", [False, True])
+def test_registration_probe_keeps_running_stats(looped):
+    class RunningNorm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2))
+            self.register_buffer("mean", torch.zeros(2))
+            self.register_buffer("var", torch.ones(2))
+            self.register_buffer("seen", torch.zeros(0))
+
+        def forward(self, x):
+            torch.ops.aten.resize_(self.seen, [2])
+            return nn.functional.batch_norm(x, self.mean, self.var, weight=self.weight, training=True) + self.mean
+
+    model = RunningNorm()
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    ev._vmap_failed = looped
+    opt = PolyStepOptimizer(model, solver="softmax", seed=1)
+    x = torch.arange(16.0).reshape(8, 2)
+    closure = opt.register_evaluator(ev, x, torch.zeros_like(x))
+    assert model.mean.tolist() == [0.0, 0.0]
+    assert model.seen.shape == (0,)
+    losses = ev.evaluate({"weight": torch.ones(3, 2)}, x, torch.zeros_like(x))
+    assert losses.tolist() == [losses[0].item()] * 3
+    opt.step(closure)
+    assert model.mean.tolist() == [0.0, 0.0]
+    assert model.var.tolist() == [1.0, 1.0]
+    assert model.seen.shape == (0,)
+
+
+@pytest.mark.parametrize("looped", [False, True])
+@pytest.mark.parametrize("layout", [torch.sparse_coo, torch.sparse_csr])
+def test_sparse_buffer_model_steps(layout, looped):
+    class Graph(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(2, 2)
+            self.register_buffer("adj", (torch.eye(8) + torch.eye(8).roll(1, 1)).to_sparse(layout=layout))
+
+        def forward(self, x):
+            return torch.sparse.mm(self.adj, self.lin(x))
+
+    torch.manual_seed(0)
+    model = Graph()
+    dense = model.adj.to_dense()
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    ev._vmap_failed = looped
+    opt = PolyStepOptimizer(model, solver="softmax", seed=1)
+    opt.step(opt.register_evaluator(ev, torch.randn(8, 2), torch.randn(8, 2)))
+    assert torch.equal(model.adj.to_dense(), dense)
+
+
+@pytest.mark.parametrize("looped", [False, True])
+def test_nan_expanded_buffer_registers(looped):
+    class Padded(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(2, 2)
+            self.register_buffer("pad", torch.tensor(float("nan")).expand(4))
+
+        def forward(self, x):
+            return self.lin(x) + torch.nan_to_num(self.pad[:2])
+
+    torch.manual_seed(0)
+    model = Padded()
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    ev._vmap_failed = looped
+    opt = PolyStepOptimizer(model, solver="softmax", seed=1)
+    opt.step(opt.register_evaluator(ev, torch.randn(8, 2), torch.randn(8, 2)))
+    assert model.pad.isnan().all()
 
 
 @pytest.mark.parametrize("looped", [False, True])
@@ -1043,3 +1265,63 @@ def test_residual_straddler_keeps_dense_vmap():
 
     torch.testing.assert_close(ev.evaluate(params, x, y), torch.stack(expected))
     assert not ev._vmap_failed
+
+
+class MaskedAttention(nn.Module):
+    def __init__(self, lead, tail):
+        super().__init__()
+        self.lead, self.attn, self.tail = lead, nn.MultiheadAttention(8, 2, batch_first=True), tail
+
+    def forward(self, x, mask):
+        h = self.lead(x)
+        return self.tail(self.attn(h, h, h, key_padding_mask=mask, need_weights=False)[0]).mean((1, 2))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "lead, tail, misaligned",
+    [
+        (lambda: nn.Sequential(nn.PReLU(), nn.PReLU()), lambda: nn.Linear(8, 2), (True, False)),
+        (lambda: nn.Linear(8, 8, bias=False), lambda: nn.Sequential(nn.PReLU(), nn.PReLU()), (False, True)),
+    ],
+    ids=["start", "stride"],
+)
+def test_masked_attention_unaligned_views_match_slowpath(lead, tail, misaligned):
+    torch.manual_seed(0)
+    model = MaskedAttention(lead(), tail()).cuda()
+    x = torch.randn(6, 5, 8, device="cuda")
+    inputs, y = (x, x[..., 0] < -1), torch.zeros(6, device="cuda")
+    layout = ParamLayout.from_module(model)
+    offset = next(e.offset for e in layout.entries if e.key == "attn.in_proj_bias")
+    assert (offset % 4 != 0, layout.padded_size % 4 != 0) == misaligned
+    flat = layout.flatten(model).reshape(-1)
+    stacked = layout.batch_unflatten(torch.stack([flat, flat + 0.01, flat - 0.01]))
+    ev = NNCostEvaluator(model, nn.MSELoss())
+    fast = ev.evaluate(stacked, inputs, y)
+    ev._vmap_failed = True
+    torch.testing.assert_close(ev.evaluate(stacked, inputs, y), fast, rtol=1e-4, atol=1e-5)
+    torch.backends.mha.set_fastpath_enabled(False)
+    try:
+        slow = ev.evaluate(stacked, inputs, y)
+    finally:
+        torch.backends.mha.set_fastpath_enabled(True)
+    torch.testing.assert_close(fast, slow, rtol=1e-4, atol=1e-5)
+    cost = PolyStepOptimizer(model, seed=0).step_batch(inputs, y, loss_fn=nn.MSELoss())
+    assert torch.isfinite(torch.tensor(cost))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_attention_free_stacks_skip_alignment_copy(monkeypatch):
+    model = nn.Sequential(nn.PReLU(), nn.Linear(8, 3)).cuda()
+    layout = ParamLayout.from_module(model)
+    stacked = layout.batch_unflatten(layout.flatten(model).reshape(1, -1).repeat(3, 1))
+    ev, seen = NNCostEvaluator(model, nn.MSELoss(), use_inplace=False), {}
+    monkeypatch.setattr(ev, "_evaluate_vmap", lambda params, *_: seen.update(params) or torch.zeros(3))
+    ev.evaluate(stacked, torch.randn(4, 8, device="cuda"), torch.zeros(4, 3, device="cuda"))
+    assert stacked["1.weight"].data_ptr() % 16
+    assert all(seen[k] is v for k, v in stacked.items())
+    base = layout.unflatten(layout.flatten(model))
+    assert base["1.weight"].data_ptr() % 16
+    assert SiteVmapEvaluator.try_build(ev, layout).aligned_base(base) is base

@@ -10,6 +10,7 @@ from polystep import PolyStepOptimizer
 from polystep.adaptive_subspace import AdaptiveSubspace
 from polystep.cost_nn import NNCostEvaluator
 from polystep.solvers._shared import orthonormal_columns, thin_qr
+from polystep.subspace import top_directions
 from polystep.transform import ParamLayout
 
 
@@ -309,6 +310,21 @@ def test_absorb_keeps_progress_baseline(model, layout, kind):
         assert state.prev_loss < state.costs[-1]
 
 
+@pytest.mark.parametrize("schedule", [{}, {"absorb_mode": "periodic", "absorb_interval": 1}])
+def test_bf16_adaptive_fold_fills_absorb_residual(schedule):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(6, 8), nn.Tanh(), nn.Linear(8, 1)).bfloat16()
+    sub = AdaptiveSubspace.from_layout(ParamLayout.from_module(model), rank=4, **schedule)
+    opt = PolyStepOptimizer(model, subspace=sub, seed=0)
+    closure = opt.register_evaluator(
+        NNCostEvaluator(model, nn.MSELoss()), torch.randn(16, 6).bfloat16(), torch.randn(16, 1).bfloat16()
+    )
+    for _ in range(2):
+        opt.step(closure)
+
+    assert set(opt.state.absorb_residual) == set(model.state_dict())
+
+
 class TestFactoryMethods:
     @pytest.mark.parametrize(
         "full_dim, expected",
@@ -475,6 +491,35 @@ def test_rank_deficient_history_draws_random_columns():
     rotated = sub.rotate(projection, 1, 1, history, generator=torch.Generator().manual_seed(2), history_is_full=True)
     torch.testing.assert_close(rotated.mT @ rotated, torch.eye(20), atol=1e-5, rtol=0)
     assert rotated.abs().max() < 0.9
+
+
+def test_fp32_top_directions_match_fp64_span():
+    """FP32 keeps directions above its rounding level, within 0.06 degrees of the FP64 span."""
+    gen = torch.Generator().manual_seed(0)
+    U = torch.linalg.qr(torch.randn(20000, 5, generator=gen, dtype=torch.float64))[0]
+    V = torch.linalg.qr(torch.randn(5, 5, generator=gen, dtype=torch.float64))[0]
+    D = ((U * torch.tensor([1.0, 0.3, 0.1, 3e-4, 1e-7], dtype=torch.float64)) @ V.mT).float()
+
+    Q = top_directions(D, 5).double()
+    kept = torch.linalg.qr(Q)[0]
+    reference = torch.linalg.svd(D.double(), full_matrices=False)[0][:, :4]
+    assert kept.shape[1] == 4
+    assert (Q.mT @ Q - torch.eye(4, dtype=torch.float64)).abs().max() < 1e-3
+    assert (reference - kept @ (kept.mT @ reference)).norm(dim=0).max() < 1e-3
+
+
+def test_direction_only_in_last_chunk_kept():
+    """FP32 Gram sums every row chunk, so a direction in the last chunk survives."""
+    D = torch.zeros(1_000_000, 5)
+    D[[0, 1, 2, 3, 999_999], torch.arange(5)] = 1.0
+    assert top_directions(D, 5).shape[1] == 5
+
+
+def test_fp64_dependent_rows_keep_rank_columns():
+    """FP64 rounding noise from dependent history rows stays below the null threshold."""
+    b = torch.randn(3, 20000, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    D = torch.stack([b[0], b[1], b[2], b[0] + b[1], 0.3 * b[1] - 1.7 * b[2]]).mT
+    assert top_directions(D, 5).shape[1] == 3
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

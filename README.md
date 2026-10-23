@@ -142,7 +142,7 @@ OpenAI-ES scores 50 candidates at each of PolyStep's steps, while CMA-ES doubles
 population at each restart and takes fewer generations. The tables were recorded
 before 1.0; the
 [reproducibility guide](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md#changes-since-the-published-tables)
-lists the rows that 1.0 changes. The
+lists the rows that 1.0 and 1.1 change. The
 [experiment index](https://github.com/anindex/polystep/blob/main/experiments/EXPERIMENT_INDEX.md)
 has the full tables.
 

@@ -47,18 +47,31 @@ def top_directions(D: torch.Tensor, k: int) -> torch.Tensor:
     device_type = D.device.type
     autocast_available = torch.amp.is_autocast_available(device_type)
     with torch.amp.autocast(device_type, enabled=False) if autocast_available else contextlib.nullcontext():
-        w, V = torch.linalg.eigh(D.mT @ D)
-        h = w.numel()
-        keep = min(k, int((w > w[-1:] * h * torch.finfo(D.dtype).eps).sum()))
-        return D @ (V[:, h - keep :].flip(1) * w[h - keep :].flip(0).rsqrt())
+        h = D.shape[1]
+        rows = D.shape[0] if D.dtype == torch.float64 else (1 << 22) // h
+        chunks = map(torch.Tensor.double, D.split(max(1, rows)))
+        w, V = torch.linalg.eigh(sum(c.mT @ c for c in chunks))
+        tol = max(h * torch.finfo(w.dtype).eps, (h * torch.finfo(D.dtype).eps) ** 2)
+        keep = min(k, int((w > w[-1:] * tol).sum()))
+        return D @ (V[:, h - keep :].flip(1) * w[h - keep :].flip(0).rsqrt()).to(D.dtype)
 
 
 class ProjectedAbsorbMixin:
     """``absorb`` and ``should_absorb`` for subspaces whose ``apply_perturbation`` takes a projection."""
 
-    def absorb(self, projection, base_sd, flat_subspace):
-        """Fold the perturbation into the base weights, returning ``(new_base_sd, zeroed_subspace_vector)``."""
-        updated = self.apply_perturbation(projection, base_sd, flat_subspace)
+    def absorb(self, projection, base_sd, flat_subspace, residual=None):
+        """Fold the perturbation into the base weights, returning ``(new_base_sd, zeroed_subspace_vector)``.
+
+        ``residual`` carries each half-precision entry's rounding error into the next absorb.
+        """
+        half = {k for k, v in base_sd.items() if residual is not None and v.dtype in (torch.float16, torch.bfloat16)}
+        updated = self.apply_perturbation(
+            projection, {k: torch.zeros_like(v) if k in half else v for k, v in base_sd.items()}, flat_subspace
+        )
+        for k in half & updated.keys():
+            exact = base_sd[k].float() + updated[k].float() + residual.get(k, 0)
+            updated[k] = exact.to(base_sd[k].dtype)
+            residual[k] = (exact - updated[k].float()).to(updated[k].dtype)
         return {**base_sd, **updated}, torch.zeros_like(flat_subspace)
 
     def should_absorb(self, stagnation_count: int, iteration: int) -> bool:

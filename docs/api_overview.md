@@ -27,12 +27,13 @@ object and reuses it while you pass the same object, so create the loss once. To
 change a loss's settings, pass a new loss object. The builtin losses that
 [performance](performance.md#candidate-evaluation) lists let the batched-matmul and
 delta paths compute the loss in closed form; any other callable takes the site-local
-or vmap path. Each call scores every candidate on the batch, writes the new weights
-into the model and returns the mean candidate loss. With `cost_batch_size` set, it
-scores a random subset of that many rows. Pass `targets=None` for a loss that reads
-only the output. The batch stays registered until the next call, `release_evaluator()`
-or the end of `train()`, so call `release_evaluator()` once after a manual loop to free
-it.
+or vmap path. Each OT step scores every candidate on the batch, writes the new weights
+into the model and returns the mean candidate loss. Under `amortize_steps`, a coasting
+call in between moves the weights along the last direction without scoring anything
+and returns the last OT step's value. With `cost_batch_size` set, an OT step scores a
+random subset of that many rows. Pass `targets=None` for a loss that reads only the
+output. The batch stays registered until the next call, `release_evaluator()` or the
+end of `train()`, so call `release_evaluator()` once after a manual loop to free it.
 
 `NNCostEvaluator` puts the model in eval mode when it is constructed and scores every
 candidate in eval mode, so dropout stays off and batch-norm running statistics do not
@@ -430,6 +431,28 @@ the same objective and environment. Checkpoints can move between CPU and CUDA.
 When a seeded checkpoint crosses devices, loading keeps the new optimizer's
 generator and warns because the two generator types cannot share state.
 
+## Upgrading from 1.0
+
+Version 1.1 changes several defaults and adds new errors, so seeded runs can differ
+from 1.0. The [changelog](../CHANGELOG.md) lists every change, and
+[reproducibility](reproducibility.md#changes-since-the-published-tables) lists the
+affected results.
+
+- `SinkhornSolver` and `KLSoftmaxSolver` default `threshold` to 3e-5 instead of 1e-6,
+  and Sinkhorn compares it with the relative marginal error and `KLSoftmaxSolver`
+  with the dual step over epsilon, instead of absolute values.
+- `HybridSubspace` and `FactoredSubspace` hash layer seeds with CRC-32 instead of
+  Adler-32, and one built without a `seed` takes the optimizer's seed instead of 0,
+  so both draw new bases.
+- `FactoredSubspace` redraws its basis every 5 OT steps by default; set
+  `rotation_interval=0` for the 1.0 behavior.
+- `step()` raises `ValueError` when the set of `requires_grad` parameters changed
+  after construction; build a new optimizer instead.
+- A buffer or a separate Parameter that shares memory with a trainable parameter
+  raises `ValueError`. Tie weights by assigning the Parameter itself, or register a
+  clone.
+- `PolyStep.init_state` raises `ValueError` for one particle with `ProgressiveEpsilon`.
+
 ## Upgrading from 0.13
 
 Version 1.0 removes unused APIs and changes the checkpoint format. Update callers
@@ -496,7 +519,6 @@ before loading a model into a new optimizer.
   `ent_epsilon`, `rank_schedule` without a `HybridSubspace`, `PowerDecay` with `gamma`
   outside `(0, 0.5]`, a negative `CosineEpsilon` decay, a blockwise closure that does
   not return one loss per candidate, and `resync_from_model()` on a moved model.
-  `PolyStep.init_state` raises `ValueError` for one particle with `ProgressiveEpsilon`.
 - New warnings cover two configurations: `AdaptiveSubspace` rotating every step
   with `amortize_steps > 1`, `biased_rotation` or `use_momentum`, because rotation
   clears their state; and `adaptive_num_probe=True` under orthoplex

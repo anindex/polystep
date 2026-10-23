@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import random
 import warnings
 from bisect import bisect_right
 from contextlib import contextmanager
@@ -310,6 +311,17 @@ def _forward_args(inputs) -> tuple[tuple, dict]:
     return (inputs,), {}
 
 
+def _aligned_stack(v: torch.Tensor) -> torch.Tensor:
+    """Copy a CUDA stack whose start or row stride breaks the 16-byte alignment fused kernels assume."""
+    if (
+        v.is_cuda
+        and v.stride(0)
+        and (v.data_ptr() % 16 or not v.is_contiguous() and v.stride(0) * v.element_size() % 16)
+    ):
+        return v.clone(memory_format=torch.contiguous_format)
+    return v
+
+
 def _first_input_tensor(inputs) -> Optional[torch.Tensor]:
     """First batched tensor among the leaves of ``inputs``, else the first tensor."""
     if isinstance(inputs, torch.Tensor):
@@ -436,10 +448,12 @@ class NNCostEvaluator:
 
         # Frozen buffers shared across all particles.
         self._buffers = dict(model.named_buffers())
+        self._unversioned_writes = None
 
         # remove_duplicate=False so tied weights resolve under every module path: a
         # deduplicated dict would report their aliases as unknown parameters.
         self._param_dict_cache = dict(self.model.named_parameters(remove_duplicate=False))
+        self._align_stacks = any(isinstance(m, nn.MultiheadAttention) for m in self.model.modules())
         self._check_aliases()
 
     def _autocast(self, device: torch.device):
@@ -465,7 +479,9 @@ class NNCostEvaluator:
         self._compiled_fwd_loss = None
         self._compile_forward_verified = False
         self._buffers = dict(self.model.named_buffers())
+        self._unversioned_writes = None
         self._param_dict_cache = dict(self.model.named_parameters(remove_duplicate=False))
+        self._align_stacks = any(isinstance(m, nn.MultiheadAttention) for m in self.model.modules())
         self._check_aliases()
         self._inplace_backup = None
         self._subspace_backup = None
@@ -596,18 +612,51 @@ class NNCostEvaluator:
         state = [*self._buffers.values(), *extra]
         versions = [None if torch.is_inference(t) else t._version for t in state]
         copies = [t.clone() for t in state]
+        checked = False
+
+        def check_unversioned():
+            nonlocal checked
+            checked = True
+            groups = {}
+            for i, (t, c, v) in enumerate(zip(state, copies, versions)):
+                if (
+                    v is not None
+                    and t._version == v
+                    and t.layout == torch.strided
+                    and torch._debug_has_internal_overlap(t) != 1
+                ):
+                    groups.setdefault((t.dtype, t.device, t.shape == c.shape), []).append(i)
+            moved = set()
+            for (_, _, same_shape), group in groups.items():
+                if same_shape and torch.equal(
+                    torch.cat([state[i].reshape(-1) for i in group]), torch.cat([copies[i].reshape(-1) for i in group])
+                ):
+                    continue
+                moved |= {i for i in group if not torch.equal(state[i], copies[i])}
+            self._unversioned_writes = (self._unversioned_writes or set()) | moved
+
+        def put_back():
+            for i, (t, c, v) in enumerate(zip(state, copies, versions)):
+                if v is not None and t._version == v and i not in self._unversioned_writes:
+                    continue
+                overlaps = t.layout == torch.strided and torch._debug_has_internal_overlap(t) == 1
+                if (v is None or overlaps) and torch.equal(t, c):
+                    continue
+                if t.shape != c.shape:
+                    t.resize_(c.shape)
+                t.copy_(c)
 
         def restore():
-            for i, (t, v, c) in enumerate(zip(state, versions, copies)):
-                if not torch.equal(t, c) if v is None else t._version != v:
-                    t.copy_(c)
-                    if v is not None:
-                        versions[i] = t._version
+            if not checked:
+                check_unversioned()
+            put_back()
 
         try:
             yield restore
         finally:
-            restore()
+            if self._unversioned_writes is None:
+                check_unversioned()
+            put_back()
 
     @torch.inference_mode()
     def _activation_ratios(self, inputs) -> Optional[dict]:
@@ -646,16 +695,12 @@ class NNCostEvaluator:
         handles = [m.register_forward_hook(record) for m in hooked]
         handles += [m.register_forward_pre_hook(start) for m in owners]
         devices = [first.device] if first.device.type == "cuda" else []
-
-        def rng_state():
-            return [torch.get_rng_state(), *map(torch.cuda.get_rng_state, devices)]
-
         try:
             with self._probe_frame(first.device):
-                before = rng_state()
+                before = _rng_states(devices)
                 with uses:
                     self.model(*args, **kwargs)
-                drew = not all(map(torch.equal, before, rng_state()))
+                drew = not all(map(torch.equal, before, _rng_states(devices)))
         except Exception:
             return None
         finally:
@@ -722,6 +767,8 @@ class NNCostEvaluator:
                 ]
             )
 
+        if self._align_stacks:
+            stacked_params = {k: _aligned_stack(v) for k, v in stacked_params.items()}
         if self._vmap_failed:
             result = self._evaluate_loop(stacked_params, inputs, targets)
         else:
@@ -897,7 +944,8 @@ class NNCostEvaluator:
         if fwd_loss == self._forward_loss or self._compile_forward_verified:
             return fwd_loss
         try:
-            fwd_loss(inputs, targets)
+            with self._restoring_buffers():
+                fwd_loss(inputs, targets)
         except Exception as e:
             self._compile_forward_failed = True
             self._compiled_fwd_loss = None
@@ -945,18 +993,20 @@ class NNCostEvaluator:
         original_params = backup
 
         fwd_loss = self._verified_forward_loss_fn(inputs, targets)
-        # Resolve the destination views once so each swap is one fused foreach op.
         dst_keys = list(stacked_params)
-        dsts = [param_dict[k].data for k in dst_keys]
         try:
-            for i in range(N):
-                # One fused copy per candidate.
-                torch._foreach_copy_(dsts, [stacked_params[k][i] for k in dst_keys])
-                # Store the detached scalar before the next replay overwrites it.
-                losses[i] = fwd_loss(inputs, targets).detach()
+            with self._restoring_buffers() as restore:
+                for i in range(N):
+                    # One fused copy per candidate.
+                    torch._foreach_copy_(
+                        [param_dict[k].data for k in dst_keys], [stacked_params[k][i] for k in dst_keys]
+                    )
+                    # Store the detached scalar before the next replay overwrites it.
+                    losses[i] = fwd_loss(inputs, targets).detach()
+                    restore()
         finally:
             # Always restore, even on error.
-            torch._foreach_copy_(dsts, [original_params[k] for k in dst_keys])
+            torch._foreach_copy_([param_dict[k].data for k in dst_keys], [original_params[k] for k in dst_keys])
 
         return losses
 
@@ -1007,18 +1057,20 @@ class NNCostEvaluator:
         try:
             with self._autocast(device):
                 fwd_loss = self._verified_forward_loss_fn(inputs, targets)
-            for i in range(N):
-                # Reconstruct config i directly into the model params.
-                subspace.apply_perturbation_inplace(
-                    projections,
-                    self.model,
-                    base_sd,
-                    flat_subspace_batch[i],
-                    param_dict=param_dict,
-                )
-                # Under inference_mode from the caller; compiled when compile_forward.
-                with self._autocast(device):
-                    losses[i] = fwd_loss(inputs, targets).detach()
+            with self._restoring_buffers() as restore_buffers:
+                for i in range(N):
+                    # Reconstruct config i directly into the model params.
+                    subspace.apply_perturbation_inplace(
+                        projections,
+                        self.model,
+                        base_sd,
+                        flat_subspace_batch[i],
+                        param_dict=param_dict,
+                    )
+                    # Under inference_mode from the caller; compiled when compile_forward.
+                    with self._autocast(device):
+                        losses[i] = fwd_loss(inputs, targets).detach()
+                    restore_buffers()
         finally:
             if hasattr(subspace, "release_inplace"):
                 subspace.release_inplace()
@@ -1372,6 +1424,11 @@ _TRACED_LAYERS = {
 }
 
 
+def _rng_states(devices):
+    """CPU and per-device CUDA generator states."""
+    return [torch.get_rng_state(), *map(torch.cuda.get_rng_state, devices)]
+
+
 def _autocast_state():
     """Autocast ``(enabled, dtype)`` on CPU and CUDA."""
     return tuple((torch.is_autocast_enabled(d), torch.get_autocast_dtype(d)) for d in ("cpu", "cuda"))
@@ -1406,13 +1463,18 @@ def _traced_children(model: nn.Module):
         return None
     devices = list({p.device for p in model.parameters() if p.device.type == "cuda"})
     was_training = model.training
+    py_state = random.getstate()
     model.eval()
     try:
         with torch.random.fork_rng(devices=devices), torch.inference_mode():
+            before = _rng_states(devices)
             prev, *body, out = _PlanTracer().trace(model).nodes
+            if random.getstate() != py_state or not all(map(torch.equal, before, _rng_states(devices))):
+                return None
     except Exception:
         return None
     finally:
+        random.setstate(py_state)
         if was_training:
             model.train()
     if prev.op != "placeholder" or any(n.meta["autocast"] != prev.meta["autocast"] for n in body):
@@ -1687,12 +1749,7 @@ class SiteVmapEvaluator:
         self._compile_failed_sites = set()
         self._failed_sites = set()
         self._uninjectable_sites = set()
-        self._matched_injections = set()
-        self._has_script_module = any(
-            isinstance(v, (torch.jit.ScriptModule, torch.jit.ScriptFunction))
-            for m in model.modules()
-            for v in (m, *vars(m).values(), *(a for c in type(m).__mro__ for a in vars(c).values()))
-        )
+        self._matched_injections = {}
         self._forward_calls = 0
         self._graph_failed_sites = set()
         self._warned = False
@@ -1703,6 +1760,20 @@ class SiteVmapEvaluator:
         """Free the captured site graphs, their static tensors and their memory pool."""
         self._graphs = {}
         self._graph_pool = self._graph_shared = self._primed = None
+
+    @functools.cached_property
+    def _has_script_module(self) -> bool:
+        """Whether a module, its attributes or its classes' attributes hold TorchScript."""
+        modules = list(self.model.modules())
+        classes = {id(c): c for m in modules for c in type(m).__mro__}.values()
+        return any(
+            isinstance(v, (torch.jit.ScriptModule, torch.jit.ScriptFunction))
+            for v in itertools.chain(
+                modules,
+                (v for m in modules for v in vars(m).values()),
+                (a for c in classes for a in vars(c).values()),
+            )
+        )
 
     @classmethod
     def try_build(cls, evaluator: "NNCostEvaluator", layout) -> "SiteVmapEvaluator | None":
@@ -1728,6 +1799,13 @@ class SiteVmapEvaluator:
     def _retired(self) -> bool:
         """Whether a vmap failure has sent this path back to the dense one."""
         return self._owner._vmap_failed
+
+    def aligned_base(self, base_sd: dict) -> dict:
+        """``base_sd`` with CUDA entries off 16-byte alignment copied when the model has attention."""
+        if not self._owner._align_stacks:
+            return base_sd
+        copies = {id(v): v.clone() for v in base_sd.values() if v.is_cuda and v.data_ptr() % 16}
+        return {k: copies.get(id(v), v) for k, v in base_sd.items()}
 
     def resolve_site(self, offsets: torch.Tensor, pdim: int, span=None):
         """The one layout entry this chunk perturbs, or None to use the dense path."""
@@ -1816,16 +1894,13 @@ class SiteVmapEvaluator:
         idx = local_idx.clamp(max=entry.numel - 1)
         return idx, values.gather(2, (idx - local_idx[:, :1]).unsqueeze(1).expand_as(values))
 
-    def _injection_matches(self, base_sd, entry, local_idx, values, offsets, inputs, targets):
-        """Whether two candidates and the incumbent score alike injected and built, from one random state."""
-        k = min(2, values.shape[1])
-        rows, dv = offsets
-        idx, kept = self._clamp_padding(entry, local_idx[:1], values[:1, :k])
+    def _injection_matches(self, base_sd, entry, rows, dv, inputs, targets):
+        """Whether ``dv`` at ``rows`` scores alike injected and built; ``None`` when both are non-finite alike."""
         flat = base_sd[entry.key].reshape(1, -1)
-        weights = torch.cat([flat.expand(k, -1).clone().scatter_(1, idx.expand(k, -1), kept[0]), flat])
+        rows, dv = rows.reshape(1, -1), dv.reshape(1, -1)
         sites = (
-            (torch.cat([rows[:k], rows[:1]]), torch.cat([dv[:k], torch.zeros_like(dv[:1])])),
-            weights.view(k + 1, *entry.shape),
+            (rows.expand(2, -1), torch.cat([dv, torch.zeros_like(dv)])),
+            torch.cat([flat.scatter_add(1, rows, dv), flat]).view(2, *entry.shape),
         )
         losses = []
         for site in sites:
@@ -1834,10 +1909,13 @@ class SiteVmapEvaluator:
         injected, built = losses
         if not built.is_floating_point():
             return torch.equal(injected, built)
-        if not torch.stack(losses).isfinite().all():
+        finite = built.isfinite()
+        if not torch.equal(injected.isfinite(), finite):
             return False
+        if not finite.all():
+            return None
         eps = torch.finfo(built.dtype).eps
-        tol = torch.maximum(64 * eps * built.abs().clamp(min=1), 1e-2 * (built - built[k]).abs())
+        tol = torch.maximum(64 * eps * built.abs().clamp(min=1), 1e-2 * (built - built[-1]).abs())
         return bool(((injected - built).abs() <= tol).all())
 
     @torch.inference_mode()
@@ -1847,11 +1925,11 @@ class SiteVmapEvaluator:
         n = groups * cand
         base = base_sd[entry.key]
         first = _first_input_tensor(inputs)
+        work = min(n, self._owner.chunk_size or n) * (first.shape[0] if first.dim() else 1) * base.numel()
         if (
             base.device.type == "cpu"
             and base.dim() > 1
-            and min(n, self._owner.chunk_size or n) * (first.shape[0] if first.dim() else 1) * base.numel()
-            >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls + _INTERCEPT_SETUP_CALLS)
+            and work >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls + _INTERCEPT_SETUP_CALLS)
             and base.dtype not in (torch.float16, torch.bfloat16)
             and not self._owner._compile_vmap
             and not self._has_script_module
@@ -1862,15 +1940,23 @@ class SiteVmapEvaluator:
             dv = dv.masked_fill(local_idx.unsqueeze(1) >= entry.numel, 0)
             offsets = (rows.unsqueeze(1).expand(groups, cand, pdim).reshape(n, pdim), dv.reshape(n, pdim))
             sig = (entry.key, *((t.shape, t.dtype) for t in tree_leaves(inputs) if isinstance(t, torch.Tensor)))
+            tested = self._matched_injections.get(sig, base.new_zeros(entry.numel, dtype=torch.bool))
+            fresh = dv.ne(0) & ~tested[rows].unsqueeze(1)
+            probe = dv.gather(1, fresh.int().argmax(1, keepdim=True)).squeeze(1) * fresh.any(1)
+            pick = probe.ne(0).any(1)
             try:
-                if sig in self._matched_injections or self._injection_matches(
-                    base_sd, entry, local_idx, values, offsets, inputs, targets
-                ):
-                    self._matched_injections.add(sig)
-                    return self._vmap_over_site(entry.key, base_sd, offsets, inputs, targets)
+                matched = not pick.any() or self._injection_matches(
+                    base_sd, entry, rows[pick], probe[pick], inputs, targets
+                )
+                if matched:
+                    tested[rows[pick][probe[pick] != 0]] = True
+                    self._matched_injections[sig] = tested
+                    if work >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls + _INTERCEPT_SETUP_CALLS):
+                        return self._vmap_over_site(entry.key, base_sd, offsets, inputs, targets)
             except _SiteNotInjectable:
-                pass
-            self._uninjectable_sites.add(entry.key)
+                matched = False
+            if matched is False:
+                self._uninjectable_sites.add(entry.key)
         local_idx, values = self._clamp_padding(entry, local_idx, values)
 
         # Only this entry gets a candidate axis; every other parameter stays shared.
@@ -1951,6 +2037,7 @@ class SiteVmapEvaluator:
                 if (
                     not inject
                     and isinstance(inputs, torch.Tensor)
+                    and (targets is None or isinstance(targets, torch.Tensor))
                     and site.is_cuda
                     and self._owner._compile_forward is not False
                     and not (self._owner._compile_vmap or self._owner._use_inplace)
@@ -1988,7 +2075,8 @@ class SiteVmapEvaluator:
 
     def _replay_site(self, key, batched, base_sd, site, shared, inputs, targets):
         """Replay ``batched`` from a CUDA graph captured on a signature's second call, eager before that."""
-        sig = (key, site.shape, site.dtype, inputs.shape, inputs.dtype, None if targets is None else targets.shape)
+        live = (site, inputs, targets)
+        sig = (key, *((t.shape, t.dtype) for t in live if t is not None))
         if sig not in self._graphs:
             if len(self._graphs) < _MAX_SITE_GRAPHS:
                 self._graphs[sig] = None
@@ -2001,7 +2089,6 @@ class SiteVmapEvaluator:
         if self._primed is not base_sd:
             torch._foreach_copy_([self._graph_shared[k] for k in base_sd], list(base_sd.values()))
             self._primed = base_sd
-        live = (site, inputs, targets)
         if self._graphs[sig] is None:
             pool, stream = self._graph_pool
             graph = torch.cuda.CUDAGraph()
@@ -2077,9 +2164,15 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
         if was_training:
             model.eval()
         try:
-            with owner._autocast(device):
+            with owner._autocast(device), owner._restoring_buffers() as restore:
                 forward = owner._verified_forward_loss_fn(inputs, targets)
-                yield losses, lambda: forward(inputs, targets).detach()
+
+                def score():
+                    loss = forward(inputs, targets).detach()
+                    restore()
+                    return loss
+
+                yield losses, score
         finally:
             if was_training:
                 model.train()
@@ -2096,10 +2189,10 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
             for g, (idx, group) in enumerate(zip(local_idx, values)):
                 try:
                     for c, candidate in enumerate(group):
-                        flat.index_copy_(0, idx, candidate)
+                        self._param(entry.key).view(-1).index_copy_(0, idx, candidate)
                         losses[g * cand + c] = score()
                 finally:
-                    flat.index_copy_(0, idx, incumbent[g])
+                    self._param(entry.key).view(-1).index_copy_(0, idx, incumbent[g])
         return losses
 
     @torch.inference_mode()
@@ -2148,17 +2241,17 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
                     for g, group in enumerate(dcoords):
                         block = _column_run(P, col_start + g * pdim, pdim)
                         for c, delta in enumerate(group):
-                            torch.addmv(bary, block, delta, out=flat)
+                            torch.addmv(bary, block, delta, out=self._param(spec.entry_key).view(-1))
                             losses[g * n_cand + c] = score()
                 else:
                     incumbent = flat[rows]
                     for g, (idx, group) in enumerate(zip(rows, incumbent.unsqueeze(1) + src)):
                         for c, write in enumerate(group):
-                            flat.index_copy_(0, idx, write)
+                            self._param(spec.entry_key).view(-1).index_copy_(0, idx, write)
                             losses[g * n_cand + c] = score()
-                        flat.index_copy_(0, idx, incumbent[g])
+                        self._param(spec.entry_key).view(-1).index_copy_(0, idx, incumbent[g])
             finally:
-                flat.copy_(bary)
+                self._param(spec.entry_key).view(-1).copy_(bary)
         return losses
 
 

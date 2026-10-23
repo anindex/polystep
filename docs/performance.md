@@ -55,20 +55,28 @@ TorchScript or traced module or function, as a submodule or as an instance or cl
 attribute, keeps a full copy for every weight, since no call inside it can be
 intercepted. A read that escapes interception in some other way, such as a module-level
 scripted function, a scripted module kept in a list, a C++ extension or a read under
-`torch._C.DisableTorchFunction`, is caught by a parity check. The first time a weight
-would take this path for an input shape and dtype, two of its candidates and the
-incumbent are scored both with the added change and with built weights, from the same
-random state. The weight keeps the path only if every pair of losses agrees within 64
-machine epsilons times the larger of the loss and 1, or within 1% of how far the
-candidate moves the loss from the incumbent. Otherwise it gets a full copy for the rest
-of the run. A read whose effect on those first candidates stays below that tolerance
+`torch._C.DisableTorchFunction`, is caught by a parity check. Each weight coordinate is
+checked the first time a chunk on this path moves it for an input shape and dtype. Each
+such coordinate takes the move of the first candidate that moves it, and all these moves
+are applied together as one candidate. That candidate and the incumbent are scored both
+with the added change and with built weights, from the same random state. The weight
+keeps the path only if both pairs of losses agree within 64 machine epsilons times the
+larger of the loss and 1, or within 1% of how far the combined candidate moves the loss
+from the incumbent. Otherwise it gets a full copy for the rest of the run. A loss that
+is non-finite one way and finite the other also fails the check. When both ways give
+non-finite losses at the same places, the check is inconclusive: that chunk is scored
+with built weights and the next chunk checks the same coordinates again. A candidate
+that moves nothing adds nothing and needs no check. A read whose share of the
+loss change of that combined candidate stays below that tolerance
 goes unnoticed. The added change rounds differently from a built weight, so FP32 losses
 can differ in the last bits. Intercepting a call costs about 3 microseconds on one CPU
 thread, about what a batched matmul spends on 150,000 multiply-adds. The path therefore
 runs only when the candidates in one vmap chunk (all of them without a `chunk_size`)
 times batch size (1 for a scalar input) times weight elements reaches 150,000 for each
 torch call of the forward, plus 30 calls of setup. The call count comes from the last
-forward on this path and is zero before the first. On one CPU thread this made a step
+forward on this path. Before the first, the parity check counts the calls and the chunk
+is scored with built weights if that count rules the path out, so a run resumed from a
+checkpoint picks the same path as one that never stopped. On one CPU thread this made a step
 3.5 times faster for a residual 784-256-256-10 MLP at batch 64 and 3.7 times faster for
 a LeNet-5 at batch 32. CUDA keeps a full copy per candidate. There, intercepting each
 call of the forward costs a few microseconds that a launch-bound step pays in full: on
@@ -164,10 +172,13 @@ chunks. Screening and incumbent scoring are separate sweeps. The search is limit
 the input directions spanned by the rows of `B`. A fixed `B` keeps the whole run in
 one row space, so `FactoredSubspace` redraws `B` every `rotation_interval` OT steps,
 5 by default. On a 784-64-10 MNIST MLP at rank 8 and 300 steps, rotating every 5 steps
-raised test accuracy from 51% to 73% at equal time. A rotation clears the
-`amortize_steps` coasting direction, so under amortization each rotation costs one
-extra full OT step: at `amortize_steps=5` the same run gained 12 points for 19% more
-time. Pass `rotation_interval=0` to keep `B` fixed.
+raised test accuracy from 51% to 73% at equal time. A rotation clears momentum, the
+`amortize_steps` coasting direction and the `biased_rotation` direction, so at the
+default none of them lasts more than 5 OT steps. Under amortization each rotation
+costs one extra full OT step: at `amortize_steps=5` the same run gained 12 points for
+19% more time. `B` is drawn on the CPU so that a seed gives the same basis on every
+device; on CUDA the redraws added about 1.5% to the mean step time of the same MLP.
+Pass `rotation_interval=0` to keep `B` fixed.
 
 For `FactoredSubspace` the delta path scores each parameter in its own pass and
 launches more kernels per chunk than the low-rank correction, which a GPU pays for
@@ -275,9 +286,10 @@ and one that syncs with the host fails capture, warns once and keeps that parame
 eager. `release_evaluator()` frees the graphs, so call it once after training rather
 than every epoch.
 
-CPU attention uses native scaled-dot-product attention. CUDA uses it too without a mask,
-or with `is_causal=True` and no padding mask, outside FP16; other CUDA attention uses
-explicit matmuls.
+CPU attention uses native scaled-dot-product attention. Outside vmap, CUDA uses it too
+without a mask, or with `is_causal=True` and no padding mask, outside FP16. Other CUDA
+attention, including every candidate batch scored under vmap, uses explicit matmuls,
+because the fused CUDA kernel fails under vmap once candidates times batch reaches 65,536.
 BF16/FP16 solver costs accumulate in FP32. The builtin cross-entropy, MSE and L1
 losses, as modules or `torch.nn.functional` calls, also reduce half-precision candidate
 outputs in FP32, whether they come from an FP16/BF16 model or from
@@ -291,15 +303,21 @@ weights round away. Hybrid candidates go to the site-local path instead, which
 builds the changed weight and the shared ones from the base weights the way a
 materialized candidate is built; factored candidates are materialized. The weights
 swapped into the model under `use_inplace=True`, and the ones a step writes back
-when it ends, round the same way.
+when it ends, round the same way. When a subspace folds its coordinates into FP16 or
+BF16 base weights, at a basis rotation, an absorb or a rank change, it keeps each
+weight's rounding error in a buffer of the same size and adds it back at the next
+fold, so updates below the weight's precision accumulate instead of being dropped.
 
 The delta, site-local and vmap paths add each Linear's bias after the matmul, while
-the model's own Linear adds it inside the matmul and rounds once, so with FP16 or
-BF16 weights a Linear's output can differ from the forward's by about one ulp. That
-matters only for a hard threshold, such as a sign or a spike, whose pre-activation
-lies that close to its cut. `use_inplace=True` scores with the model's own forward,
-at 11 to 118 times the step time in our measurements, with no measurable change in
-training loss or accuracy on small sign, ReLU and spiking models.
+the model's own Linear adds it inside the matmul and rounds once, so with FP16 or BF16
+weights a Linear's output can differ from the forward's by about one ulp of the matmul
+result or of the output, whichever is larger. When the bias cancels most of that
+result, the difference is large next to the output, and later layers can amplify it. A
+hard threshold, such as a sign or a spike, flips when its pre-activation lies that
+close to its cut, and a smooth layer that scales up a cancelled output can change the
+loss as well. `use_inplace=True` scores with the model's own forward, at 11 to 118
+times the step time in our measurements, with no measurable change in training loss or
+accuracy on small sign, ReLU and spiking models.
 
 ## CPU measurements
 
