@@ -493,35 +493,28 @@ def test_rank_deficient_history_draws_random_columns():
     assert rotated.abs().max() < 0.9
 
 
-def test_fp32_top_directions_match_fp64_span():
-    """FP32 keeps directions above its rounding level, within 0.06 degrees of the FP64 span."""
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda", marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
+        ),
+    ],
+)
+def test_fp32_top_directions_match_fp64_span(monkeypatch, device):
+    """FP32, with TF32 matmuls on CUDA, keeps directions above its rounding level on the FP64 span."""
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
     gen = torch.Generator().manual_seed(0)
     U = torch.linalg.qr(torch.randn(20000, 5, generator=gen, dtype=torch.float64))[0]
     V = torch.linalg.qr(torch.randn(5, 5, generator=gen, dtype=torch.float64))[0]
-    D = ((U * torch.tensor([1.0, 0.3, 0.1, 3e-4, 1e-7], dtype=torch.float64)) @ V.mT).float()
+    D = ((U * torch.tensor([1.0, 0.3, 0.1, 3e-4, 1e-7], dtype=torch.float64)) @ V.mT).float().to(device)
 
     Q = top_directions(D, 5).double()
     kept = torch.linalg.qr(Q)[0]
     reference = torch.linalg.svd(D.double(), full_matrices=False)[0][:, :4]
     assert kept.shape[1] == 4
-    assert (Q.mT @ Q - torch.eye(4, dtype=torch.float64)).abs().max() < 1e-3
-    assert (reference - kept @ (kept.mT @ reference)).norm(dim=0).max() < 1e-3
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_gram_directions_survive_tf32(monkeypatch):
-    """TF32 matmuls leave the retained directions orthonormal and on the FP64 span."""
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
-    gen = torch.Generator().manual_seed(0)
-    U = torch.linalg.qr(torch.randn(20000, 5, generator=gen, dtype=torch.float64))[0]
-    V = torch.linalg.qr(torch.randn(5, 5, generator=gen, dtype=torch.float64))[0]
-    D = ((U * torch.tensor([1.0, 0.3, 0.1, 3e-4, 1e-7], dtype=torch.float64)) @ V.mT).float().cuda()
-
-    Q = top_directions(D, 5).double()
-    kept = torch.linalg.qr(Q)[0]
-    reference = torch.linalg.svd(D.double(), full_matrices=False)[0][:, :4]
-    assert (Q.mT @ Q - torch.eye(4, dtype=torch.float64, device="cuda")).abs().max() < 1e-3
+    assert (Q.mT @ Q - torch.eye(4, dtype=torch.float64, device=device)).abs().max() < 1e-3
     assert (reference - kept @ (kept.mT @ reference)).norm(dim=0).max() < 1e-3
 
 
@@ -564,19 +557,14 @@ def test_orthonormal_columns_reduced_precision_uses_householder(monkeypatch, pre
     assert torch.equal(orthonormal_columns(Z), Q * torch.sign(torch.diagonal(R)))
 
 
-@pytest.mark.parametrize("shape", [(512, 512), (1386, 16), (2**18, 4)])
-def test_orthonormal_columns_excluded_shapes_use_householder(shape):
-    """Square bases can fail FP32 Cholesky; small or narrow tall ones run faster under Householder."""
+@pytest.mark.parametrize(
+    "shape, gap", [((512, 512), None), ((1386, 16), None), ((2**18, 4), None), ((32768, 8), 0.0), ((32768, 8), 1e-4)]
+)
+def test_orthonormal_columns_excluded_inputs_use_householder(shape, gap):
+    """Square, small or narrow bases, and a near-duplicate column that fails CholQR2, keep the Householder Q."""
     Z = torch.randn(*shape, generator=torch.Generator().manual_seed(0))
-    Q, R = thin_qr(Z)
-    assert torch.equal(orthonormal_columns(Z), Q * torch.sign(torch.diagonal(R)))
-
-
-@pytest.mark.parametrize("gap", [0.0, 1e-4])
-def test_cholqr_ill_conditioned_falls_back(gap):
-    """A tall basis with a near-duplicate column fails CholQR2 and takes the Householder Q."""
-    Z = torch.randn(32768, 8, generator=torch.Generator().manual_seed(0))
-    Z[:, 1] = Z[:, 0] + gap * Z[:, 1]
+    if gap is not None:
+        Z[:, 1] = Z[:, 0] + gap * Z[:, 1]
     Q, R = thin_qr(Z)
     assert torch.equal(orthonormal_columns(Z), Q * torch.sign(torch.diagonal(R)))
 

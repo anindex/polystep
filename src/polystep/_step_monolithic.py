@@ -995,7 +995,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
 
     _nan_reverted = not _x_finite
     if _nan_reverted:
-        # Revert to pre-step X, resetting only its non-finite coordinates to the origin.
         state.X = X.nan_to_num(0.0, 0.0, 0.0)
         if opt.use_momentum and state.velocity is not None:
             state.velocity = torch.zeros_like(state.velocity)

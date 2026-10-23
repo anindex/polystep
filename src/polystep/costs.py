@@ -64,6 +64,11 @@ def resolve_cost_scale(
         raise ValueError(f"Unknown scale_cost: {scale_cost!r}. Expected 'mean', 'max_cost', or a float.")
 
 
+def validate_cost_scale(scale_cost) -> None:
+    """Raise ValueError unless ``scale_cost`` is None, 'mean', 'max_cost', or a finite positive number."""
+    resolve_cost_scale(torch.ones((), dtype=torch.float64, device="cpu"), scale_cost)
+
+
 def scale_cost_matrix(
     cost_matrix: torch.Tensor,
     scale_cost: Optional[Union[str, float]] = None,

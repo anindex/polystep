@@ -888,6 +888,8 @@ def test_step_without_reregistration_warns_once():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         opt.step(closure)
+        opt.register_evaluator(ev, xb, yb)
+        opt.step(lambda p: ev.evaluate(p, xb, yb))
         assert not caught
         opt.step(lambda p: ev.evaluate(p, xb, yb))
         opt.step(lambda p: ev.evaluate(p, xb, yb))

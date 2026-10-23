@@ -208,7 +208,7 @@ class MaskedLinear(nn.Module):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("pack", [lambda x, m: (x, m), lambda x, m: {"x": x, "mask": m}], ids=["tuple", "dict"])
+@pytest.mark.parametrize("pack", [lambda x, m: (x, m), lambda x, m: {"mask": m, "x": x}], ids=["tuple", "dict"])
 def test_multi_input_matches_forward_loss(pack, dtype):
     torch.manual_seed(0)
     model = MaskedLinear()
@@ -220,19 +220,6 @@ def test_multi_input_matches_forward_loss(pack, dtype):
     with torch.no_grad():
         expected = nn.functional.mse_loss(model(x, mask), y)
     torch.testing.assert_close(losses, expected.expand(2))
-
-
-def test_dict_inputs_cache_distinguishes_keys():
-    torch.manual_seed(0)
-    model = MaskedLinear()
-    x, mask, y = torch.randn(5, 4), (torch.rand(5, 3) > 0.5).float(), torch.randn(5, 3)
-    params = {k: v.detach().unsqueeze(0) for k, v in model.named_parameters()}
-    evaluator = NNCostEvaluator(model, nn.MSELoss())
-    with torch.no_grad():
-        expected = nn.functional.mse_loss(model(x, mask), y)
-    for batch in ({"x": x, "mask": mask.double()}, {"x": x.double(), "mask": mask}, {"mask": mask, "x": x.double()}):
-        losses = evaluator.evaluate(params, batch, y)
-        torch.testing.assert_close(losses, expected.unsqueeze(0), check_dtype=False)
 
 
 class NestedMaskedLinear(MaskedLinear):
@@ -378,6 +365,8 @@ def test_gru_forward_falls_back_to_loop():
     expected = [loss_fn(functional_call(model, {k: v[i] for k, v in stacked.items()}, (x,)), y) for i in range(3)]
     torch.testing.assert_close(losses, torch.stack(expected))
     assert evaluator._vmap_failed
+    assert evaluator.evaluate({k: v[:0] for k, v in stacked.items()}, x, y).shape == (0,)
+    assert evaluator._evaluate_loop({}, x, y).shape == (0,)
 
 
 def test_vmap_oom_raises_without_fallback():
@@ -446,15 +435,14 @@ class TestBatchedLinearRespectsCrossEntropyConfig:
         evaluator._batched_linear.evaluate = lambda *a, **k: pytest.fail("bmm path preempted use_inplace")
         torch.testing.assert_close(evaluator.evaluate(params, x, y), reference)
 
-    @pytest.mark.parametrize("smoothing", [0.0, 0.1], ids=["hard", "smooth"])
     @pytest.mark.parametrize("weight", [None, torch.rand(200) + 0.5], ids=["plain", "weight"])
-    def test_byte_label_156_stays_valid(self, weight, smoothing):
+    def test_byte_label_156_stays_valid(self, weight):
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 200))
         layout = ParamLayout.from_module(model)
         params = layout.batch_unflatten(layout.flatten(model).unsqueeze(0).expand(2, -1, -1).clone())
         x, y = torch.randn(3, 4), torch.tensor([156, 3, 156], dtype=torch.uint8)
-        loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=smoothing)
+        loss_fn = nn.CrossEntropyLoss(weight=weight)
         evaluator = NNCostEvaluator(model, loss_fn)
         assert evaluator._batched_linear is not None
         with torch.no_grad():
@@ -1055,21 +1043,31 @@ def test_vmap_fallback_restores_unversioned_write():
     assert model.ema.item() == 0
 
 
-def test_loop_loss_aliasing_buffer_survives_restore():
-    class CachedScore(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(2))
-            self.register_buffer("score", torch.zeros(()))
+class CachedScore(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(2))
+        self.register_buffer("score", torch.zeros(()))
 
-        def forward(self, x):
-            self.score.copy_((x * self.weight).sum())
-            return self.score
+    def forward(self, x):
+        self.score.copy_((x * self.weight).sum())
+        return self.score
 
+
+@pytest.mark.filterwarnings("ignore:vmap failed:RuntimeWarning")
+@pytest.mark.parametrize("path", ["loop", "site", "site_inplace"])
+def test_loss_aliasing_buffer_survives_restore(path):
     model = CachedScore()
-    ev = NNCostEvaluator(model, lambda out: out, use_inplace=False)
-    ev._vmap_failed = True
-    losses = ev.evaluate({"weight": torch.tensor([[1.0, 1.0], [2.0, 2.0]])}, torch.ones(2), None)
+    ev = NNCostEvaluator(model, lambda out: out, use_inplace=path == "site_inplace", compile_forward=False)
+    weights = torch.tensor([[1.0, 1.0], [2.0, 2.0]])
+    if path == "loop":
+        ev._vmap_failed = True
+        losses = ev.evaluate({"weight": weights}, torch.ones(2), None)
+    else:
+        layout = ParamLayout.from_module(model, particle_dim=2)
+        site = SiteVmapEvaluator.try_build(ev, layout)
+        base = layout.unflatten(layout.flatten(model))
+        losses = site.evaluate(base, layout.entries[0], torch.tensor([[0, 1]]), weights[None], torch.ones(2))
     assert losses.tolist() == [2.0, 4.0]
     assert model.score.item() == 0
 

@@ -9,7 +9,7 @@ from typing import Callable, Optional, Union
 import torch
 
 from ._compiled import _barycentric_projection
-from .costs import resolve_cost_scale
+from .costs import validate_cost_scale
 from .geometry import get_orthoplex_vertices, get_random_rotation_matrices
 from .solvers import SinkhornSolver, SoftmaxSolver
 from .solvers._shared import validate_positive
@@ -60,7 +60,7 @@ class PolyStepES:
         validate_positive(epsilon, "epsilon")
         if not (math.isfinite(step_radius) and step_radius >= 0):
             raise ValueError(f"step_radius must be finite and >= 0, got {step_radius}.")
-        resolve_cost_scale(torch.ones((), dtype=torch.float64, device="cpu"), scale_cost)
+        validate_cost_scale(scale_cost)
         self.dim = dim
         self.num_particles = num_particles
         self.epsilon = epsilon

@@ -119,8 +119,7 @@ def test_huge_scale_cost_accepted_at_init():
 
 def test_scale_cost_check_ignores_default_device(monkeypatch):
     devices = []
-    for module in ("ask_tell", "optimizer", "solver"):
-        monkeypatch.setattr(f"polystep.{module}.resolve_cost_scale", lambda cost, scale: devices.append(cost.device))
+    monkeypatch.setattr("polystep.costs.resolve_cost_scale", lambda cost, scale: devices.append(cost.device))
     model = torch.nn.Linear(3, 1)
     with torch.device("meta"):
         PolyStepES(dim=3, scale_cost=1e100)

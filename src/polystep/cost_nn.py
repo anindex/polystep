@@ -11,6 +11,7 @@ import functools
 import itertools
 import random
 import warnings
+import weakref
 from bisect import bisect_right
 from contextlib import contextmanager
 from typing import Callable, Optional, TYPE_CHECKING, Union
@@ -403,10 +404,10 @@ class NNCostEvaluator:
             raise ValueError("chunk_size must be None, 'auto', or a positive integer")
         model = getattr(model, "_orig_mod", model)
         self.model = model
-        self.loss_fn = loss_fn
+        self._loss_fn = loss_fn
         self.autocast_dtype = autocast_dtype
         # A reducing loss_fn returns (N,), the shape per_sample exists to avoid.
-        reduction = getattr(loss_fn, "reduction", "mean" if self._loss_kind else "none")
+        reduction = getattr(loss_fn, "reduction", "mean" if _builtin_loss_kind(loss_fn) else "none")
         if per_sample and reduction != "none":
             raise ValueError(
                 f"per_sample=True needs loss_fn.reduction='none', got "
@@ -415,29 +416,7 @@ class NNCostEvaluator:
             )
         self.per_sample = per_sample
         self._chunk_size_raw = chunk_size
-        self._chunk_size_cached = _UNSET  # lazily computed for "auto"
-        self._reset_count = 0
-        self._vmap_failed = False
-        self._share_failed = False
-        self._randomness = "error"
-        self._warned = False
         self._compile_vmap = compile_vmap
-        self._compiled_vmap_fn = None
-        self._compile_failed = False
-
-        # In-place forward+loss compile (CUDA graphs), resolved after auto-detection.
-        self._compiled_fwd_loss = None
-        self._compile_forward_failed = False
-        self._compile_forward_verified = False
-        # Restore buffers for the two in-place paths, allocated on first use.
-        self._inplace_backup = None
-        self._subspace_backup = None
-        self._cast_cache = None  # (inputs, dtype, converted) for the per-chunk cast
-        self._input_dtype_cache = _UNSET
-        self._uncast_ok = {}
-
-        # Eval mode: frozen BN stats, no dropout.
-        model.eval()
 
         # Pick in-place only when the batched footprint would not fit (not on a
         # parameter count); pass use_inplace=True/False to override.
@@ -459,16 +438,11 @@ class NNCostEvaluator:
         # the stateless paths, and auto-detection only judges memory.
         self._inplace_forced = use_inplace is True
         self._compile_forward = compile_forward
+        self._reset_count = 0
+        self.reset_vmap()
 
-        # Frozen buffers shared across all particles.
-        self._buffers = dict(model.named_buffers())
-        self._unversioned_writes = None
-
-        # remove_duplicate=False so tied weights resolve under every module path: a
-        # deduplicated dict would report their aliases as unknown parameters.
-        self._param_dict_cache = dict(self.model.named_parameters(remove_duplicate=False))
-        self._align_stacks = any(isinstance(m, nn.MultiheadAttention) for m in self.model.modules())
-        self._check_aliases()
+        # Eval mode: frozen BN stats, no dropout.
+        model.eval()
 
     def _autocast(self, device: torch.device):
         """Run the candidate forward in ``autocast_dtype``, or a no-op when unset."""
@@ -494,6 +468,8 @@ class NNCostEvaluator:
         self._compile_forward_verified = False
         self._buffers = dict(self.model.named_buffers())
         self._unversioned_writes = None
+        # remove_duplicate=False so tied weights resolve under every module path: a
+        # deduplicated dict would report their aliases as unknown parameters.
         self._param_dict_cache = dict(self.model.named_parameters(remove_duplicate=False))
         self._align_stacks = any(isinstance(m, nn.MultiheadAttention) for m in self.model.modules())
         self._check_aliases()
@@ -897,9 +873,7 @@ class NNCostEvaluator:
 
     def _evaluate_loop(self, stacked_params, inputs, targets):
         """Sequential fallback when vmap is incompatible."""
-        if not stacked_params:
-            return torch.zeros(0, device=_first_input_tensor(inputs).device)
-        N = next(iter(stacked_params.values())).shape[0]
+        N = next(iter(stacked_params.values())).shape[0] if stacked_params else 0
         if N == 0:
             return torch.zeros(0, device=_first_input_tensor(inputs).device)
         losses = []
@@ -1096,7 +1070,7 @@ class NNCostEvaluator:
         return losses
 
 
-_SEQ_EQUIVALENT_WARNED = set()
+_SEQ_EQUIVALENT_WARNED = weakref.WeakValueDictionary()
 
 
 def _warn_if_sequential_equivalent(model: nn.Module, supported: tuple) -> None:
@@ -1125,7 +1099,7 @@ def _warn_if_sequential_equivalent(model: nn.Module, supported: tuple) -> None:
     linear_numel = sum(p.numel() for _, m in flat if isinstance(m, nn.Linear) for p in m.parameters())
     if linear_numel != sum(p.numel() for p in model.parameters()):
         return
-    _SEQ_EQUIVALENT_WARNED.add(key)
+    _SEQ_EQUIVALENT_WARNED[key] = type(model)
     warnings.warn(
         f"{type(model).__name__} is built from Linear/activation layers only, but its forward "
         f"does not trace to a plain chain of them, so the batched and delta evaluators decline it "
@@ -1766,21 +1740,12 @@ class SiteVmapEvaluator:
     :class:`SparseDeltaEvaluator`.
     """
 
-    def __init__(
-        self,
-        model: nn.Module,
-        loss_fn: Callable,
-        layout,
-        buffers: dict,
-        per_sample: bool = False,
-        *,
-        owner: NNCostEvaluator,
-    ):
-        self.model = model
-        self.loss_fn = loss_fn
-        self.per_sample = per_sample
-        self._loss_kind = _builtin_loss_kind(loss_fn)
-        self._buffers = buffers
+    def __init__(self, owner: NNCostEvaluator, layout):
+        self.model = owner.model
+        self.loss_fn = owner.loss_fn
+        self.per_sample = owner.per_sample
+        self._loss_kind = owner._loss_kind
+        self._buffers = owner._buffers
         self._owner = owner
         self._entry_by_key = {e.key: e for e in layout.entries}
         self._names = {e.key: (e.key, *e.shared_with) for e in layout.entries}
@@ -1830,12 +1795,10 @@ class SiteVmapEvaluator:
         if evaluator._use_inplace and (evaluator._inplace_forced or layout.shared_groups):
             if evaluator.per_sample:
                 return None
-            return SiteInplaceEvaluator(evaluator.model, evaluator.loss_fn, layout, evaluator._buffers, owner=evaluator)
+            return SiteInplaceEvaluator(evaluator, layout)
         if evaluator._vmap_failed or evaluator._inplace_forced:
             return None
-        return cls(
-            evaluator.model, evaluator.loss_fn, layout, evaluator._buffers, evaluator.per_sample, owner=evaluator
-        )
+        return cls(evaluator, layout)
 
     def _retired(self) -> bool:
         """Whether a vmap failure has sent this path back to the dense one."""
@@ -1969,14 +1932,18 @@ class SiteVmapEvaluator:
         base = base_sd[entry.key]
         first = _first_input_tensor(inputs)
         work = min(n, self._owner.chunk_size or n) * (first.shape[0] if first.dim() else 1) * base.numel()
-        shapes = _input_signature(inputs)
-        if shapes is None or shapes not in self._forward_calls and len(self._forward_calls) >= _MAX_INPUT_SIGNATURES:
+        signature = _input_signature(inputs)
+        if (
+            signature is None
+            or signature not in self._forward_calls
+            and len(self._forward_calls) >= _MAX_INPUT_SIGNATURES
+        ):
             self._forward_calls.clear()
             self._matched_injections.clear()
         if (
             base.device.type == "cpu"
             and base.dim() > 1
-            and work >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls.get(shapes, 0) + _INTERCEPT_SETUP_CALLS)
+            and work >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls.get(signature, 0) + _INTERCEPT_SETUP_CALLS)
             and base.dtype not in (torch.float16, torch.bfloat16)
             and not self._owner._compile_vmap
             and not self._has_script_module
@@ -1986,12 +1953,12 @@ class SiteVmapEvaluator:
             dv = values - base.reshape(-1)[rows].unsqueeze(1)
             dv = dv.masked_fill(local_idx.unsqueeze(1) >= entry.numel, 0)
             offsets = (rows.unsqueeze(1).expand(groups, cand, pdim).reshape(n, pdim), dv.reshape(n, pdim))
-            sig = (entry.key, shapes)
+            sig = (entry.key, signature)
             tested = self._matched_injections.get(sig, base.new_zeros(entry.numel, dtype=torch.bool))
             fresh = dv.ne(0) & ~tested[rows].unsqueeze(1)
             probe = dv.gather(1, fresh.int().argmax(1, keepdim=True)).squeeze(1) * fresh.any(1)
             pick = probe.ne(0).any(1)
-            pick[0] |= shapes not in self._forward_calls
+            pick[0] |= signature not in self._forward_calls
             try:
                 matched = not pick.any() or self._injection_matches(
                     base_sd, entry, rows[pick], probe[pick], inputs, targets
@@ -2000,7 +1967,7 @@ class SiteVmapEvaluator:
                     tested[rows[pick][probe[pick] != 0]] = True
                     self._matched_injections[sig] = tested
                     if work >= _MACS_PER_INTERCEPTED_CALL * (
-                        self._forward_calls.get(shapes, 0) + _INTERCEPT_SETUP_CALLS
+                        self._forward_calls.get(signature, 0) + _INTERCEPT_SETUP_CALLS
                     ):
                         return self._vmap_over_site(entry.key, base_sd, offsets, inputs, targets)
             except _SiteNotInjectable:
@@ -2024,7 +1991,7 @@ class SiteVmapEvaluator:
         once per forward.
         """
         inject = isinstance(site, tuple)
-        shapes = _input_signature(inputs)
+        signature = _input_signature(inputs)
         names = self._names[key]
         shared = {k: v for k, v in base_sd.items() if k not in names}
         shared.update(self._buffers)
@@ -2047,7 +2014,7 @@ class SiteVmapEvaluator:
                     )
                 if not delta.added:
                     raise _SiteNotInjectable
-                self._forward_calls[shapes] = delta.calls
+                self._forward_calls[signature] = delta.calls
             else:
                 output = functional_call(model, {**shared, **dict.fromkeys(names, site_param)}, *_forward_args(inputs))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)

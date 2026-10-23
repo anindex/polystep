@@ -58,6 +58,13 @@ def thin_qr(matrix: torch.Tensor):
         return torch.linalg.qr(matrix, mode="reduced")
 
 
+def autocast_off(device_type: str):
+    """Autocast disabled on ``device_type``, or a no-op where it has none."""
+    if torch.amp.is_autocast_available(device_type):
+        return torch.amp.autocast(device_type, enabled=False)
+    return contextlib.nullcontext()
+
+
 def orthonormal_columns(matrix: torch.Tensor) -> torch.Tensor:
     """Q of the positive-diagonal QR: CholQR2 from 8 columns, 32x tallness and 2**18 entries at full FP32 unless ill-conditioned, else Householder."""
     rows, cols = matrix.shape
@@ -67,13 +74,7 @@ def orthonormal_columns(matrix: torch.Tensor) -> torch.Tensor:
         full_fp32 = False
     if cols >= 8 and rows >= 32 * cols and matrix.numel() >= 2**18 and full_fp32:
         pin = single_thread_cpu(matrix.device) if matrix.numel() * cols < QR_PIN_MAX_WORK else contextlib.nullcontext()
-        device_type = matrix.device.type
-        no_autocast = (
-            torch.amp.autocast(device_type, enabled=False)
-            if torch.amp.is_autocast_available(device_type)
-            else contextlib.nullcontext()
-        )
-        with pin, no_autocast:
+        with pin, autocast_off(matrix.device.type):
             L, info = torch.linalg.cholesky_ex(matrix.mT @ matrix)
             Q = matrix @ torch.linalg.inv_ex(L)[0].mT
             gram = Q.mT @ Q

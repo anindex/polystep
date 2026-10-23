@@ -247,22 +247,6 @@ def test_objective_token_change_drops_pending_pair(first, second, recorded):
     assert len(opt._state.trust_region_multipliers) == recorded
 
 
-def test_kl_marginal_violation_matches_generalized_kl():
-    """last_marginal_violation is reported to callers and has no other check."""
-    from polystep.solvers.kl_softmax import KLSoftmaxSolver
-
-    C = torch.rand(5, 7, generator=torch.Generator().manual_seed(0))
-    solver = KLSoftmaxSolver(epsilon=0.2, lam=1.0, max_iterations=400)
-    res = solver.solve(C)
-
-    q = res.matrix.sum(dim=0)
-    b = torch.full((7,), 1.0 / 7)
-    expected = (q * (q.log() - b.log()) - q + b).sum().item()
-    assert solver.last_marginal_violation == pytest.approx(expected, rel=1e-6)
-    # The mass terms are what keep it non-negative when sum(q) != sum(b).
-    assert solver.last_marginal_violation >= 0
-
-
 @pytest.mark.parametrize(
     "lam, epsilon, expected",
     [(0.0, 0.5, 0.0), (float("inf"), 0.5, 1.0), (1.0, 1.0, 0.5), (3.0, 1.0, 0.75)],

@@ -166,17 +166,6 @@ class ParamLayout:
         model = getattr(model, "_orig_mod", model)
         sd = {k: v for k, v in model.state_dict().items() if isinstance(v, torch.Tensor)}
 
-        if len(sd) == 0:
-            return cls(
-                entries=(),
-                total_params=0,
-                padded_size=0,
-                particle_dim=particle_dim,
-                dominant_dtype=torch.float32,
-                shared_groups=(),
-                _all_keys=(),
-            )
-
         canonical_entries: list[ParamEntry] = []
         shared_map: dict[str, list[str]] = {}  # canonical_key -> [alias keys]
         offset = 0

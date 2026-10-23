@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import contextlib
 import math
 import zlib
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
+
+from .solvers._shared import autocast_off
 
 
 def _stable_entry_seed(*parts: object) -> int:
@@ -44,9 +45,7 @@ def history_unusable(rotation_mode: str, history: Optional[torch.Tensor]) -> boo
 
 def top_directions(D: torch.Tensor, k: int) -> torch.Tensor:
     """Unit-norm top-``k`` left singular directions of a tall ``D``, dropping numerically null ones."""
-    device_type = D.device.type
-    autocast_available = torch.amp.is_autocast_available(device_type)
-    with torch.amp.autocast(device_type, enabled=False) if autocast_available else contextlib.nullcontext():
+    with autocast_off(D.device.type):
         h = D.shape[1]
         rows = D.shape[0] if D.dtype == torch.float64 else (1 << 22) // h
         chunks = D.split(max(1, rows))

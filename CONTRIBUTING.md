@@ -27,8 +27,9 @@ pytest tests/ -m ""
 ```
 
 The fast suite uses one CPU thread; `POLYSTEP_TEST_THREADS` overrides it. Slow tests
-use `ncpu - 8` threads, clamped to 2-16, and may download datasets. Keep downloads
-and training-quality checks in the slow suite; use synthetic inputs for unit tests.
+use `ncpu - 8` threads, clamped to 2-16 and split across xdist workers, and may
+download datasets. Keep downloads and training-quality checks in the slow suite; use
+synthetic inputs for unit tests.
 Tests importing `experiments/` must skip when that directory is absent, since it is
 excluded from distributions.
 

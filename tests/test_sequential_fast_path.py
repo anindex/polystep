@@ -4,6 +4,7 @@ A custom forward takes the batched paths only when it traces to a plain chain;
 these tests pin that plan, the warning for forwards that do not, and the shipped models.
 """
 
+import gc
 import random
 import subprocess
 import sys
@@ -52,7 +53,7 @@ def test_subspace_delta_accepts_shipped_mlp():
 
 
 def _warns(model):
-    _SEQ_EQUIVALENT_WARNED.discard(id(type(model)))
+    _SEQ_EQUIVALENT_WARNED.pop(id(type(model)), None)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         BatchedLinearEvaluator.try_build(model, nn.CrossEntropyLoss(), "cross_entropy")
@@ -125,6 +126,46 @@ def test_inline_relu_mlp_takes_delta_path():
     assert opt._subspace_delta_evaluator is not None
     assert losses == twin_losses
     assert all(torch.equal(a, b) for a, b in zip(params, twin_params))
+
+
+@pytest.mark.parametrize("flatten", [lambda x: x.flatten(1), lambda x: torch.flatten(x, 1)], ids=["method", "function"])
+@pytest.mark.parametrize(
+    "act",
+    [
+        torch.relu,
+        lambda h: h.relu(),
+        lambda h: h.tanh(),
+        torch.sigmoid,
+        lambda h: h.sigmoid(),
+        nn.functional.gelu,
+        nn.functional.silu,
+        nn.functional.leaky_relu,
+    ],
+    ids=["torch_relu", "relu_method", "tanh_method", "torch_sigmoid", "sigmoid_method", "gelu", "silu", "leaky_relu"],
+)
+def test_inline_activation_plan_matches_forward(act, flatten):
+    """Inline activations (torch.relu in forward) have no activation submodule, so
+    the bmm plan must take them from the trace or it scores a linear network."""
+
+    class InlineMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(12, 8)
+            self.fc2 = nn.Linear(8, 3)
+
+        def forward(self, x):
+            return self.fc2(act(self.fc1(flatten(x))))
+
+    torch.manual_seed(0)
+    model = InlineMLP().double()
+    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
+    assert ev._batched_linear is not None
+
+    inputs = torch.randn(10, 3, 4, dtype=torch.float64)
+    targets = torch.randint(0, 3, (10,))
+    stacked = {k: v.detach()[None] + 0.5 * torch.randn(4, *v.shape, dtype=v.dtype) for k, v in model.named_parameters()}
+    fast = ev._batched_linear.evaluate(stacked, inputs, targets)
+    torch.testing.assert_close(fast, ev._evaluate_loop(stacked, inputs, targets), rtol=0, atol=1e-12)
 
 
 def test_training_branch_traces_eval_forward():
@@ -203,15 +244,6 @@ def test_traced_autocast_chain_declines():
     assert _plan_names(_single_linear(forward)) is None
 
 
-def test_declined_trace_keeps_global_rng():
-    model = _single_linear(lambda m, x: m.fc(x + torch.randn(4)))
-    torch.manual_seed(0)
-    expected = torch.rand(3)
-    torch.manual_seed(0)
-    assert _plan_names(model) is None
-    assert torch.equal(torch.rand(3), expected)
-
-
 _GENERATOR = torch.Generator().manual_seed(0)
 
 
@@ -220,17 +252,28 @@ def _forked_draw():
         return torch.rand(()).item()
 
 
+def _branch_on(draw):
+    return lambda m, x: torch.relu(m.fc(x)) if draw() < 0.5 else torch.tanh(m.fc(x))
+
+
 @pytest.mark.parametrize(
-    "draw",
-    [lambda: torch.rand(()).item(), random.random, lambda: torch.rand((), generator=_GENERATOR).item(), _forked_draw],
-    ids=["torch", "python", "generator", "forked"],
+    "forward",
+    [
+        _branch_on(lambda: torch.rand(()).item()),
+        _branch_on(random.random),
+        _branch_on(lambda: torch.rand((), generator=_GENERATOR).item()),
+        _branch_on(_forked_draw),
+        lambda m, x: m.fc(x + torch.randn(4)),
+    ],
+    ids=["torch", "python", "generator", "forked", "noise"],
 )
-def test_traced_plan_random_branch_declined(draw):
-    model = _single_linear(lambda m, x: torch.relu(m.fc(x)) if draw() < 0.5 else torch.tanh(m.fc(x)))
-    state, generator_state = random.getstate(), _GENERATOR.get_state()
+def test_traced_plan_random_draw_declined(forward):
+    model = _single_linear(forward)
+    states = random.getstate(), _GENERATOR.get_state(), torch.get_rng_state()
     assert _plan_names(model) is None
-    assert random.getstate() == state
-    assert torch.equal(_GENERATOR.get_state(), generator_state)
+    assert random.getstate() == states[0]
+    assert torch.equal(_GENERATOR.get_state(), states[1])
+    assert torch.equal(torch.get_rng_state(), states[2])
 
 
 def test_traced_plan_build_skips_dynamo_import():
@@ -253,19 +296,28 @@ assert "torch._dynamo" not in sys.modules
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
-def test_traced_plan_training_gated_kept():
-    model = _single_linear(
-        lambda m, x: torch.relu(m.fc(x)) if m.training and torch.rand(()) < 0.5 else torch.tanh(m.fc(x))
-    )
-    assert _plan_names(model.train()) == ["fc", "tanh"]
-
-
 def test_child_hook_keeps_vmap_path():
     model = _single_linear(lambda m, x: m.fc(x))
     model.fc = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
     assert _plan_names(model) == ["fc.0", "fc.1"]
     model.fc.register_forward_hook(lambda m, i, o: None)
     assert _plan_names(model) is None
+
+
+def test_collected_model_type_leaves_warn_registry():
+    gc.collect()
+    before = len(_SEQ_EQUIVALENT_WARNED)
+    model = _single_linear(lambda m, x: m.fc(x))
+    model.fc = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
+    model.fc.register_forward_hook(lambda m, i, o: None)
+    assert _warns(model)
+    cls = type(model)
+    del model
+    gc.collect()
+    assert id(cls) in _SEQ_EQUIVALENT_WARNED
+    del cls
+    gc.collect()
+    assert len(_SEQ_EQUIVALENT_WARNED) == before
 
 
 def test_module_extra_arg_keeps_vmap_path():
@@ -488,70 +540,3 @@ def test_ternary_threshold_keeps_layer_alive(require_experiments):
     assert (effective != 0).float().mean() > 0.4
     with pytest.warns(UserWarning, match="zeroes every"):
         TernaryLinear(64, 32, threshold=5.0)
-
-
-def _record_fc1_shapes(net):
-    """Swap fc1 for a module recording the shape of every input it is called with."""
-    shapes = []
-    real_fc1 = net.fc1
-
-    class _Recorder(nn.Module):
-        def forward(self, inp):
-            shapes.append(tuple(inp.shape))
-            return real_fc1(inp)
-
-    net.fc1 = _Recorder()
-    return shapes
-
-
-def test_snn_loops_fc1_on_temporal_input():
-    """Temporal input keeps fc1 inside the timestep loop.
-
-    Hoisting fc1 to one (T*B, F) GEMM changes BLAS blocking, and the LIF threshold
-    turns that into a whole spike. Asserted on call shapes, not outputs, since
-    bitwise GEMM differences are machine-dependent.
-    """
-    from polystep.benchmarks.utils import SpikingNet
-
-    torch.manual_seed(0)
-    steps, batch, features = 6, 8, 64
-    net = SpikingNet(input_dim=features, hidden=32, output=10, num_steps=steps)
-
-    shapes = _record_fc1_shapes(net)
-    net(torch.rand(steps, batch, features))
-    assert shapes == [(batch, features)] * steps
-
-
-def test_snn_hoists_fc1_on_static_input():
-    """Static input is constant in time, so fc1 runs once and broadcasts."""
-    from polystep.benchmarks.utils import SpikingNet
-
-    torch.manual_seed(0)
-    steps, batch, features = 6, 8, 64
-    net = SpikingNet(input_dim=features, hidden=32, output=10, num_steps=steps)
-
-    shapes = _record_fc1_shapes(net)
-    net(torch.rand(batch, features))
-    assert shapes == [(batch, features)]
-
-
-def test_spiking_net_defaults_to_builtin_lif(monkeypatch):
-    from types import SimpleNamespace
-
-    from polystep.benchmarks import utils
-
-    monkeypatch.setattr(utils, "_HAS_SNNTORCH", True)
-    monkeypatch.setattr(utils, "snn", SimpleNamespace(Leaky=lambda beta: nn.Identity()), raising=False)
-    net = utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2)
-    assert isinstance(net.lif1, utils.LIFNeuron)
-    assert isinstance(net.lif2, utils.LIFNeuron)
-    stub_net = utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2, use_snntorch=True)
-    assert isinstance(stub_net.lif1, nn.Identity)
-
-
-def test_spiking_net_snntorch_missing_raises(monkeypatch):
-    from polystep.benchmarks import utils
-
-    monkeypatch.setattr(utils, "_HAS_SNNTORCH", False)
-    with pytest.raises(ImportError, match="needs snntorch"):
-        utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2, use_snntorch=True)

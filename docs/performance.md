@@ -38,52 +38,6 @@ site-local or vmap path. Tied weights, such as an output layer that reuses the
 embedding table, keep the site-local path too: a candidate for the tied weight reaches
 every module that reads it.
 
-In full space, on the site-local path on CPU, a candidate that moves an FP32 or FP64
-weight with two or more dimensions can skip its own copy of that weight. Each `F.linear`
-or ungrouped convolution that reads the weight with an input shared by all candidates
-adds the candidate's output change to the shared output. Any other read, including one
-whose input already depends on the candidate, as in the later steps of a recurrent loop,
-uses the candidate's weight, built once per forward, and so does every read after it. A
-forward that opens its own `torch.vmap` or other `torch.func` transform gets a full copy
-per candidate. So does a weight that `nn.MultiheadAttention` reads, or whose change
-reaches its input, as in `nn.TransformerEncoderLayer`: intercepting calls turns off
-PyTorch's fused attention, and `torch.vmap` runs the unfused CPU attention one candidate
-at a time. A weight that no such `F.linear` or convolution reads, such as an embedding
-table or a weight read through `.t()`, falls back to a full copy, and so does one whose
-`F.linear` or convolution runs under autocast in a lower precision. A model that holds a
-TorchScript or traced module or function, as a submodule or as an instance or class
-attribute, keeps a full copy for every weight, since no call inside it can be
-intercepted. A read that escapes interception in some other way, such as a module-level
-scripted function, a scripted module kept in a list, a C++ extension or a read under
-`torch._C.DisableTorchFunction`, is caught by a parity check. Each weight coordinate is
-checked the first time a chunk on this path moves it for an input shape and dtype. Each
-such coordinate takes the move of the first candidate that moves it, and all these moves
-are applied together as one candidate. That candidate and the incumbent are scored both
-with the added change and with built weights, from the same random state. The weight
-keeps the path only if both pairs of losses agree within 64 machine epsilons times the
-larger of the loss and 1, or within 1% of how far the combined candidate moves the loss
-from the incumbent. Otherwise it gets a full copy for the rest of the run. A loss that
-is non-finite one way and finite the other also fails the check. When both ways give
-non-finite losses at the same places, the check is inconclusive: that chunk is scored
-with built weights and the next chunk checks the same coordinates again. A candidate
-that moves nothing adds nothing and needs no check. A read whose share of the
-loss change of that combined candidate stays below that tolerance
-goes unnoticed. The added change rounds differently from a built weight, so FP32 losses
-can differ in the last bits. Intercepting a call costs about 3 microseconds on one CPU
-thread, about what a batched matmul spends on 150,000 multiply-adds. The path therefore
-runs only when the candidates in one vmap chunk (all of them without a `chunk_size`)
-times batch size (1 for a scalar input) times weight elements reaches 150,000 for each
-torch call of the forward, plus 30 calls of setup. The call count comes from the last
-forward on this path. Before the first, the parity check counts the calls and the chunk
-is scored with built weights if that count rules the path out, so a run resumed from a
-checkpoint picks the same path as one that never stopped. On one CPU thread this made a step
-3.5 times faster for a residual 784-256-256-10 MLP at batch 64 and 3.7 times faster for
-a LeNet-5 at batch 32. CUDA keeps a full copy per candidate. There, intercepting each
-call of the forward costs a few microseconds that a launch-bound step pays in full: on
-an RTX 5090 the residual MLP gained only 3%, while a LeNet-5 and a 20-step RNN with
-hidden size 64 took about 1.3 times as long per step. Biases, FP16/BF16 weights and
-`compile_vmap=True` keep a full copy too.
-
 The Linear MLP paths need a builtin loss: `nn.CrossEntropyLoss`, `nn.MSELoss` or
 `nn.L1Loss` with mean reduction, or `F.cross_entropy`, `F.mse_loss` or `F.l1_loss`.
 Cross-entropy may carry class weights, `ignore_index` and label smoothing. Any other
@@ -93,6 +47,76 @@ The delta and factored paths treat each sample as one feature vector, so they ne
 two-dimensional inputs or a leading `nn.Flatten` or `x.flatten(1)`. A Linear MLP
 applied per token to `(batch, tokens, features)` inputs takes the site-local path
 instead in full-space and hybrid runs; factored runs materialize its candidates.
+
+Delta paths reuse base activations within each candidate sweep. Reuse applies to
+supported builtin layers and ends before the next batch or fidelity level. Custom
+layers can declare the contracts in the [API reference](api_overview.md#custom-layers).
+
+Dense MLP evaluation also shares activations until the first changed layer when
+unchanged candidate parameters are expanded views. Shared weights use one linear
+operation across candidates. `chunk_size` bounds activation batches on this path.
+
+`step_batch()` and `train()` register each batch for these paths:
+
+```python
+optimizer.step_batch(inputs, targets, loss_fn=loss_fn)
+```
+
+With an evaluator you built yourself, step with the closure its registration returns:
+`optimizer.step(optimizer.register_evaluator(evaluator, inputs, targets))`.
+
+The [API reference](api_overview.md#optimizer) covers the closure contract and what
+to call after replacing layers, parameters or buffers.
+
+### Output-delta injection on CPU
+
+In full space on the CPU, the site-local path can skip a candidate's copy of an FP32 or
+FP64 weight with two or more dimensions. Each `F.linear` or ungrouped convolution that
+reads the weight with an input shared by all candidates adds the candidate's output
+change to the shared output instead. On one CPU thread this made a step 3.5 times
+faster for a residual 784-256-256-10 MLP at batch 64 and 3.7 times faster for a
+LeNet-5 at batch 32.
+
+A weight keeps a full copy per candidate when:
+
+- another kind of read uses it, or a read's input already depends on the candidate,
+  as in the later steps of a recurrent loop; that read and every read after it use
+  the candidate's weight, built once per forward;
+- the forward opens its own `torch.vmap` or other `torch.func` transform;
+- `nn.MultiheadAttention` reads it, or its change reaches that module's input, as in
+  `nn.TransformerEncoderLayer`, since interception turns off PyTorch's fused attention
+  and vmap then runs the CPU attention one candidate at a time;
+- no such `F.linear` or convolution reads it (an embedding table, a weight read
+  through `.t()`), or the read runs under autocast in a lower precision;
+- the model holds a TorchScript or traced module or function, as a submodule or as an
+  instance or class attribute;
+- it is a bias or an FP16/BF16 weight, or `compile_vmap=True`.
+
+A read that escapes interception another way, such as a module-level scripted
+function, a scripted module kept in a list, a C++ extension or a read under
+`torch._C.DisableTorchFunction`, is caught by a parity check. The first chunk that
+moves a coordinate, per input shape and dtype, combines the moves of all such
+coordinates into one candidate and scores it and the incumbent with the added change
+and with built weights, from the same random state. The weight keeps the path only if
+the losses agree within 64 machine epsilons times max(|loss|, 1), or within 1% of the
+combined candidate's loss change; otherwise it gets a full copy for the rest of the
+run. Finite against non-finite fails the check, and non-finite both ways scores that
+chunk with built weights and checks again. A read whose share of the loss change stays
+below the tolerance goes unnoticed, and FP32 losses can differ in the last bits.
+
+Intercepting a call costs about 3 microseconds on one CPU thread, about what a batched
+matmul spends on 150,000 multiply-adds. The path therefore runs only when the
+candidates in one vmap chunk (all of them without a `chunk_size`) times batch size (1
+for a scalar input) times weight elements reaches 150,000 per torch call of the
+forward, plus 30 calls of setup. The call count comes from the last forward on this
+path. Before the first, the parity check counts the calls and scores the chunk with
+built weights if that count rules the path out, so a run resumed from a checkpoint
+picks the same path as one that never stopped. CUDA keeps a full copy, since a
+launch-bound step pays the few microseconds of each intercepted call in full: on an
+RTX 5090 the residual MLP gained only 3%, while a LeNet-5 and a 20-step RNN with
+hidden size 64 took about 1.3 times as long per step.
+
+### In-place evaluation
 
 `NNCostEvaluator(model, loss_fn, use_inplace=True)` runs the model's own forward,
 one candidate at a time, and turns off the vmap, delta and factored paths. Each
@@ -116,6 +140,8 @@ times faster with `use_inplace=True` at batch 32 and 128, while LeNet-5 took 7.6
 as long and a pooled three-convolution CIFAR net 1.6 times as long, and on CUDA the
 ResNet took 2.2 times as long in place.
 
+### Random and untraceable forwards
+
 A forward that draws its own random numbers, such as injected noise, stays batched.
 vmap refuses the draw at first, so the evaluator retries once with
 `randomness="different"`. Each candidate then gets its own draw: identical
@@ -130,26 +156,6 @@ parameter stays site-local. Buffers the forward writes are restored after every
 batched call and after every looped candidate, so the retry, the probe, the loop and
 later calls all start from the same buffer values.
 
-`step_batch()` and `train()` register each batch for these paths:
-
-```python
-optimizer.step_batch(inputs, targets, loss_fn=loss_fn)
-```
-
-With an evaluator you built yourself, step with the closure its registration returns:
-`optimizer.step(optimizer.register_evaluator(evaluator, inputs, targets))`.
-
-The [API reference](api_overview.md#optimizer) covers the closure contract and what
-to call after replacing layers, parameters or buffers.
-
-Delta paths reuse base activations within each candidate sweep. Reuse applies to
-supported builtin layers and ends before the next batch or fidelity level.
-Custom layers can declare the contracts in the [API reference](api_overview.md#custom-layers).
-
-Dense MLP evaluation also shares activations until the first changed layer when
-unchanged candidate parameters are expanded views. Shared weights use one linear
-operation across candidates. `chunk_size` bounds activation batches on this path.
-
 ## Subspaces and memory
 
 Use `HybridSubspace.from_layout(..., max_subspace_dim=...)` to bound candidate count;
@@ -161,6 +167,8 @@ Random basis rotation (`rotation_mode="random"` with a positive `rotation_interv
 is optional for `HybridSubspace`: on MNIST MLPs it measured between no change and 4.8
 points more test accuracy, at up to 1.7x the step time.
 
+### FactoredSubspace
+
 `FactoredSubspace` uses `dW = A @ B`, so sequential linear layers can
 compute `x @ W.T + (x @ B.T) @ A.T` without constructing candidate weights. A
 candidate changes a few consecutive coordinates of one `A`, so the subspace-delta
@@ -168,34 +176,40 @@ path scores it from `x @ B.T` and moves only the output units those coordinates
 belong to. Runs that span two parameters, screened candidates of small steps and the
 incumbent use the full low-rank correction, which computes `x @ W.T` and `x @ B.T`
 for the first perturbed layer once per candidate sweep and reuses them across its
-chunks. Screening and incumbent scoring are separate sweeps. The search is limited to
-the input directions spanned by the rows of `B`. A fixed `B` keeps the whole run in
-one row space, so `FactoredSubspace` redraws `B` every `rotation_interval` OT steps,
-5 by default. On a 784-64-10 MNIST MLP at rank 8 and 300 steps, rotating every 5 steps
-raised test accuracy from 51% to 73% at equal time. A rotation clears momentum, the
-`amortize_steps` coasting direction and the `biased_rotation` direction, so at the
-default none of them lasts more than 5 OT steps. Under amortization each rotation
-costs one extra full OT step: at `amortize_steps=5` the same run gained 12 points for
-19% more time. `B` is drawn on the CPU so that a seed gives the same basis on every
-device; on CUDA the redraws added about 1.5% to the mean step time of the same MLP.
-Pass `rotation_interval=0` to keep `B` fixed.
+chunks. Screening and incumbent scoring are separate sweeps.
 
-For `FactoredSubspace` the delta path scores each parameter in its own pass and
-launches more kernels per chunk than the low-rank correction, which a GPU pays for
-while its chunks are too small to keep it busy. On CUDA it therefore runs only when
-both hold: one chunk of the default budget cannot hold every candidate, and
-`chunk_size` (or the candidate count, when it is unset) times a candidate's largest
-layer output reaches 2^24, about 16.8 million, elements. Other factored CUDA steps use
-the low-rank correction, which needs more peak memory per chunk. `HybridSubspace` has
-no low-rank correction, so this rule does not apply to it. The threshold is where the
-delta path stops losing on shallow MLPs (784-128-10 at batch 512 on an RTX 5090). On
-that GPU the delta steps this rule picks at the default chunk size ran up to 5 times
-faster, though only a few percent faster close to the threshold, with 4 to 54 times
-less peak memory. A batch of one on a 784-512-512-10 or 3072-1024-10 MLP stays below
-the threshold, and there the delta path ran up to 1.35 times slower. Below the
-threshold the low-rank correction ran up to 1.4 times faster on small or shallow MLPs,
-but wider, deeper and larger-batch ones favor the delta path from smaller chunks on,
-so with a `chunk_size` set they may step faster with a larger one.
+The search is limited to the input directions spanned by the rows of `B`. A fixed `B`
+keeps the whole run in one row space, so `FactoredSubspace` redraws `B` every
+`rotation_interval` OT steps, 5 by default. On a 784-64-10 MNIST MLP at rank 8 and 300
+steps, rotating every 5 steps raised test accuracy from 51% to 73% at equal time. A
+rotation clears momentum, the `amortize_steps` coasting direction and the
+`biased_rotation` direction, so at the default none of them lasts more than 5 OT
+steps. Under amortization each rotation costs one extra full OT step: at
+`amortize_steps=5` the same run gained 12 points for 19% more time. `B` is drawn on
+the CPU so that a seed gives the same basis on every device; on CUDA the redraws added
+about 1.5% to the mean step time of the same MLP. Pass `rotation_interval=0` to keep
+`B` fixed.
+
+The delta path scores each parameter in its own pass and launches more kernels per
+chunk than the low-rank correction, which a GPU pays for while its chunks are too
+small to keep it busy. On CUDA it therefore runs only when both hold: one chunk of the
+default budget cannot hold every candidate, and `chunk_size` (or the candidate count,
+when it is unset) times a candidate's largest layer output reaches 2^24, about 16.8
+million, elements. Other factored CUDA steps use the low-rank correction, which needs
+more peak memory per chunk. `HybridSubspace` has no low-rank correction, so this rule
+does not apply to it.
+
+The threshold is where the delta path stops losing on shallow MLPs (784-128-10 at
+batch 512 on an RTX 5090). On that GPU the delta steps this rule picks at the default
+chunk size ran up to 5 times faster, though only a few percent faster close to the
+threshold, with 4 to 54 times less peak memory. A batch of one on a 784-512-512-10 or
+3072-1024-10 MLP stays below the threshold, and there the delta path ran up to 1.35
+times slower. Below the threshold the low-rank correction ran up to 1.4 times faster
+on small or shallow MLPs, but wider, deeper and larger-batch ones favor the delta path
+from smaller chunks on, so with a `chunk_size` set they may step faster with a larger
+one.
+
+### AdaptiveSubspace
 
 `AdaptiveSubspace` still builds every candidate's full weights, since its single
 projection `P` spreads each coordinate over every parameter. On the CPU, with a dense
@@ -203,36 +217,44 @@ projection `P` spreads each coordinate over every parameter. On the CPU, with a 
 coordinates of the one particle the candidate moves, so each candidate reads
 `subspace_particle_dim` columns of `P` instead of all of them. The padded last
 particle, screened candidates and the incumbent use the full `base + P @ x`, as do
-sparse projections and FP16/BF16 runs. When `P` is dense FP32 or FP64 and the step
-has no screen, every chunk, the padded particle and the incumbent included, is written
-into one buffer that the optimizer keeps between steps, because a fresh allocation of
-that size costs the CPU a page fault per page, so a closure must
+sparse projections and FP16/BF16 runs.
+
+When `P` is dense FP32 or FP64 and the step has no screen, every chunk, the padded
+particle and the incumbent included, is written into one buffer that the optimizer
+keeps between steps, because a fresh allocation of that size costs the CPU a page
+fault per page, so a closure must
 [clone any candidate tensor it keeps](../LIMITATIONS.md#evaluation). CUDA keeps the
 full product for every candidate, since one dense GEMM measured faster there than the
 many thin batched products the offsets need.
+
+### Chunk sizes
 
 `chunk_size` limits candidates held at once. The automatic estimate counts the
 candidate's parameters and its largest layer output, which one forward measures when
 the evaluator is first registered and which then scales with the batch. Delta and
 site-local paths build no full candidate, so they are budgeted on activations and the
 perturbed parameter alone: 2^26 elements, counting two activations and the parameter.
-On the CPU, subspace site and subspace delta chunks drop to a 16 MiB budget once one
-activation of a chunk would pass 32 MiB, glibc's largest mmap threshold, above which
-each allocation maps fresh pages that fault in zeroed. Example 11's transformer keeps
-its chunks, whose activations stay under 32 MiB. Full-space delta and site chunks keep
-the element budget on every device. The delta estimate counts more than it allocates,
-and smaller chunks measured slower there. On the site path, smaller chunks can fall
-below the per-call size the output-delta injection needs, which turned it off for a
-LeNet-5 convolution and for an LSTM's recurrent weight. They also free only small
-mapped blocks, and glibc raises its mmap threshold to the largest block freed, so the
-fully connected sites after them fault on every chunk: a full-space LeNet-5 step took
-17% to 49% longer at batch 32 and 128. On CUDA the full-space delta path counts
-activations only, since it never builds the parameter, so its chunks are larger and
-its peak memory higher: 397 MiB instead of 163 MiB for 784-256-256-10 at batch 256 on
-an RTX 5090. A candidate's loss can depend on the chunk shape, so on that model the
-larger chunks change a few losses in the last float32 bit. The CPU keeps the parameter
-in the budget, because there the larger chunks stepped at about half the speed. A
-site-local path batches only the layers from the perturbed one on, so each site is
+
+On the CPU, subspace site-local and subspace-delta chunks drop to a 16 MiB budget once
+one activation of a chunk would pass 32 MiB, glibc's largest mmap threshold, above
+which each allocation maps fresh pages that fault in zeroed. Example 11's transformer
+keeps its chunks, whose activations stay under 32 MiB. Full-space delta and site-local
+chunks keep the element budget on every device. The delta estimate counts more than
+it allocates, and smaller chunks measured slower there. On the site-local path,
+smaller chunks can fall below the per-call size the output-delta injection needs,
+which turned it off for a LeNet-5 convolution and for an LSTM's recurrent weight. They
+also free only small mapped blocks, and glibc raises its mmap threshold to the largest
+block freed, so the fully connected sites after them fault on every chunk: a
+full-space LeNet-5 step took 17% to 49% longer at batch 32 and 128.
+
+On CUDA the full-space delta path counts activations only, since it never builds the
+parameter, so its chunks are larger and its peak memory higher: 397 MiB instead of
+163 MiB for 784-256-256-10 at batch 256 on an RTX 5090. A candidate's loss can depend
+on the chunk shape, so on that model the larger chunks change a few losses in the last
+float32 bit. The CPU keeps the parameter in the budget, because there the larger
+chunks stepped at about half the speed.
+
+A site-local path batches only the layers from the perturbed one on, so each site is
 budgeted on the module outputs from its own layer on. A forward that draws random
 numbers is batched from the draw on, so its sites keep the whole-model budget, as does
 a parameter the forward reads before calling its layer. In example 10's LeNet-5 at
@@ -249,17 +271,19 @@ keep whole particles in each chunk, every vertex and probe of one particle, so
 below one such group. A particle that straddles two parameters gets a chunk of its
 own. With `HybridSubspace`, FP32 or FP64 weights and no in-place evaluator, that chunk
 builds only the parameters the particle moves, as the incumbent plus the touched
-projection columns, and passes the rest as expanded views of the incumbent, so the vmap
-forward runs the layers ahead of the first moved parameter once. Otherwise the chunk
-falls back to materialization, in batches of at most `chunk_size`. So does the
+projection columns, and passes the rest as expanded views of the incumbent, so the
+vmap forward runs the layers ahead of the first moved parameter once. Otherwise the
+chunk falls back to materialization, in batches of at most `chunk_size`. So does the
 padded particle at the end of the CPU offsets, or of a per-layer or grouped block
 other than the last. On the delta and site-local paths the padded last particle stays
-with the particles before it, since its padding moves no parameter. Each chunk costs
-one forward, so a small CUDA model, whose forwards are bound by kernel launches, can
-step faster with a `chunk_size` at or above the candidate count than with the
-automatic one. Per-layer blocks reduce the size of each OT solve, but not the forward
-count. With a subspace, a block strategy only splits Sinkhorn and KL solves into at
-most eight row segments; candidates are scored exactly as in the monolithic step.
+with the particles before it, since its padding moves no parameter.
+
+Each chunk costs one forward, so a small CUDA model, whose forwards are bound by
+kernel launches, can step faster with a `chunk_size` at or above the candidate count
+than with the automatic one. Per-layer blocks reduce the size of each OT solve, but
+not the forward count. With a subspace, a block strategy only splits Sinkhorn and KL
+solves into at most eight row segments; candidates are scored exactly as in the
+monolithic step.
 
 ## Compilation and precision
 
@@ -289,13 +313,15 @@ than every epoch.
 CPU attention uses native scaled-dot-product attention. Outside vmap, CUDA uses it too
 without a mask, or with `is_causal=True` and no padding mask, outside FP16. Other CUDA
 attention, including every candidate batch scored under vmap, uses explicit matmuls,
-because the fused CUDA kernel fails under vmap once candidates times batch reaches 65,536.
-BF16/FP16 solver costs accumulate in FP32. The builtin cross-entropy, MSE and L1
-losses, as modules or `torch.nn.functional` calls, also reduce half-precision candidate
-outputs in FP32, whether they come from an FP16/BF16 model or from
+because the fused CUDA kernel fails under vmap once candidates times batch reaches
+65,536.
+
+FP16 and BF16 solver costs accumulate in FP32. The builtin cross-entropy, MSE and L1
+losses, as modules or `torch.nn.functional` calls, also reduce half-precision
+candidate outputs in FP32, whether they come from an FP16/BF16 model or from
 `candidate_autocast`. A cross-entropy with class weights does so only on the Linear
-MLP paths. Other losses keep their own dtype. Mixed-dtype models require
-per-entry subspaces; see [limitations](../LIMITATIONS.md).
+MLP paths. Other losses keep their own dtype. Mixed-dtype models require per-entry
+subspaces; see [limitations](../LIMITATIONS.md).
 
 With FP16 or BF16 parameters the subspace-delta and factored paths are off. They add
 each candidate's change after the matmul, so they would rank changes that the stored
@@ -315,9 +341,9 @@ result or of the output, whichever is larger. When the bias cancels most of that
 result, the difference is large next to the output, and later layers can amplify it. A
 hard threshold, such as a sign or a spike, flips when its pre-activation lies that
 close to its cut, and a smooth layer that scales up a cancelled output can change the
-loss as well. `use_inplace=True` scores with the model's own forward, at 11 to 118
-times the step time in our measurements, with no measurable change in training loss or
-accuracy on small sign, ReLU and spiking models.
+loss as well. `use_inplace=True` scores with the model's own forward. On small sign,
+ReLU and spiking models it took 11 to 118 times the step time and made no measurable
+difference to training loss or accuracy.
 
 ## CPU measurements
 

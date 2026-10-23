@@ -11,19 +11,18 @@ use sparse signed columns, which are not orthonormal. Claims requiring an orthog
 projection do not apply to those columns.
 
 `FactoredSubspace` restricts each step to the input directions spanned by its factor
-`B`, which it redraws every 5 OT steps by default. With `rotation_interval=0` the whole
+`B`. It redraws `B` every 5 OT steps by default; with `rotation_interval=0` the whole
 run stays in one set of directions. Retune radii when switching subspaces.
 
-Momentum, the `amortize_steps` coasting direction, and the `biased_rotation`
-direction are cleared when the basis changes. `AdaptiveSubspace` rotates every step
-by default. These options need a longer rotation interval to take effect.
-The optimizer warns when you combine them with `rotation_interval=1` on any subspace.
-`FactoredSubspace` clears them every 5 OT steps at its default without a warning;
-pass `rotation_interval=0` to keep them.
-Under `amortize_steps`, `rotation_interval` and `absorb_interval` count OT steps
-and skip the coasting steps in between.
-Heavy-ball momentum can amplify the barycentric displacement.
-`step_radius` bounds the displacement before momentum.
+A basis change clears momentum, the `amortize_steps` coasting direction and the
+`biased_rotation` direction, so these options need a rotation interval longer than one
+step. `AdaptiveSubspace` rotates every step by default, and the optimizer warns when
+any subspace combines these options with `rotation_interval=1`. `FactoredSubspace`
+clears them every 5 OT steps without a warning. Under `amortize_steps`,
+`rotation_interval` and `absorb_interval` count OT steps only.
+
+Heavy-ball momentum can amplify the barycentric displacement; `step_radius` bounds the
+displacement before momentum.
 
 ## Evaluation
 
@@ -58,24 +57,18 @@ Heavy-ball momentum can amplify the barycentric displacement.
   global-subspace coordinates use one dtype and reject mixed parameter dtypes.
 - `mixed_precision=True` uses BF16 geometry and forwards; solver costs use FP32.
   Models needing autocast internally must provide it. Half-precision candidate outputs
-  reduce in FP32 only under the builtin cross-entropy, MSE and L1 losses, as modules
-  or `torch.nn.functional` calls; a class-weighted cross-entropy does so only on the
-  Linear MLP paths. Other losses may round nearby candidate scores to the same
-  value. With FP16 or BF16 parameters, `FactoredSubspace` materializes
-  every candidate and runs slower. The delta, site-local and vmap paths add each
-  Linear's bias after the matmul, so with such weights a Linear's output can differ
-  from the model's own by about one ulp of the matmul result or of the output,
-  whichever is larger. A hard threshold such as a sign or a spike flips on a
-  pre-activation that close to its cut, and when the bias cancels most of the matmul
-  result, a smooth rescaling in later layers can amplify the difference into a
-  different loss as well; `use_inplace=True` scores with the model's forward. See
+  reduce in FP32 only under the builtin cross-entropy, MSE and L1 losses; other losses
+  may round nearby candidate scores to the same value. With FP16 or BF16 parameters,
+  `FactoredSubspace` materializes every candidate, and the fast paths can differ from
+  the model's own Linear output by about one ulp, enough to flip a hard threshold;
+  `use_inplace=True` scores with the model's forward. See
   [precision](docs/performance.md#compilation-and-precision).
 - `step_batch()` and `train()` reject `trust_region`. See
   [radius control](docs/api_overview.md#quadratic-model-and-radius-control) for its
   manual-step use.
 - `trust_region` and `use_adaptive_radius` both scale the step. Choose one; the
   optimizer warns when both are on.
-- Multi-fidelity screening imputes dropped costs using an additive offset. This can
+- Multifidelity screening imputes dropped costs using an additive offset. This can
   bias the full-fidelity cost estimate.
 - Full-space blockwise mode does not support every monolithic adaptation option;
   unsupported options warn at construction.
@@ -88,7 +81,8 @@ Heavy-ball momentum can amplify the barycentric displacement.
   `PolyStepOptimizer(chunk_size=...)` caps the candidates scored per step chunk, and
   `NNCostEvaluator(chunk_size=...)` caps how many of them each vmap call batches.
 - On CUDA the site-local path replays CUDA graphs, which freeze Python-side state the
-  forward reads, such as a Python counter or a flag. Pass `compile_forward=False` for such a forward.
+  forward reads, such as a Python counter or a flag. Pass `compile_forward=False` for
+  such a forward.
 - The library does not distribute optimizer state across multiple GPUs.
 
 ## Attention and recurrent layers

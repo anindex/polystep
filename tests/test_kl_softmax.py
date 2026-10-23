@@ -382,3 +382,17 @@ def test_negative_kl_penalty_rejected_at_solve():
     solver.lam = -0.05
     with pytest.raises(ValueError, match="lam must be >= 0"):
         solver.solve(torch.rand(3, 4))
+
+
+def test_kl_marginal_violation_matches_generalized_kl():
+    """last_marginal_violation is reported to callers and has no other check."""
+    C = torch.rand(5, 7, generator=torch.Generator().manual_seed(0))
+    solver = KLSoftmaxSolver(epsilon=0.2, lam=1.0, max_iterations=400)
+    res = solver.solve(C)
+
+    q = res.matrix.sum(dim=0)
+    b = torch.full((7,), 1.0 / 7)
+    expected = (q * (q.log() - b.log()) - q + b).sum().item()
+    assert solver.last_marginal_violation == pytest.approx(expected, rel=1e-6)
+    # The mass terms are what keep it non-negative when sum(q) != sum(b).
+    assert solver.last_marginal_violation >= 0

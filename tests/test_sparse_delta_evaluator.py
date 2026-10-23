@@ -217,7 +217,7 @@ def test_grouping_candidates_by_particle_changes_nothing():
     ids=["long", "long_ignore10", "uint8", "weight", "smoothing", "trailing_tanh"],
 )
 def test_class_major_ce_matches_reference_fp64(monkeypatch, tail, loss_fn, dtype, expected_calls):
-    """Class-major cross-entropy matches functional_call; unsupported configs keep the old path."""
+    """Class-major cross-entropy matches functional_call; unsupported configs take the per-candidate logits path."""
     calls = []
     monkeypatch.setattr(
         "polystep.cost_nn._class_major_cross_entropy", lambda *a: calls.append(1) or _class_major_cross_entropy(*a)

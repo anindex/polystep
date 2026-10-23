@@ -116,8 +116,9 @@ methods keep their throughput), or with `.../wallclock` under
 cell from the parent directory. `run_elevation.py`, `run_moe.py`, and
 `run_timeseries.py` read the variable; `run_maxsat.py` takes `--es-eval-budget`.
 
-See [determinism](determinism.md), [controlled experiments](../experiments/CONTROLLED_EXPERIMENTS.md),
-and [forward benchmarks](performance.md#benchmarks) for their specific checks.
+See [determinism](determinism.md),
+[controlled experiments](../experiments/CONTROLLED_EXPERIMENTS.md), and
+[forward benchmarks](performance.md#benchmarks) for their specific checks.
 
 ## Changes since the published tables
 
@@ -151,24 +152,16 @@ change the following results, so a rerun does not reproduce them:
   one step later, `biased_rotation` turns each frame with a single Householder
   reflection, and Newton refinement runs before momentum and keeps the Sinkhorn warm
   start.
-- In 1.1, `biased_rotation` turns each frame so the vertex nearest the previous
-  descent direction points along it, which changes the `quadratic/biased_rotation`
-  arm and the SNN/LIF and hard-MoE configurations again.
-- In 1.1, Sinkhorn converges when the relative marginal error falls below
-  `threshold`, 3e-5 by default. When the error stalls at the precision the dtype can
-  reach on the costs that carry mass, the solve ends early and reports
-  `converged=False`, so `ProgressiveEpsilon` raises epsilon after it. The old absolute
-  1e-6 test loosened in proportion to the particle count and could not pass in FP32 at a
-  sharp epsilon. Solves at a small epsilon, over few particles or over many particles
-  with uneven costs now stop at a different check, as do runs with over-relaxation,
-  adaptive omega, Anderson acceleration or `ProgressiveEpsilon`.
-- In 1.1, every `HybridSubspace` and `FactoredSubspace` run draws new bases. Their
-  layer seeds hash with CRC-32, because Adler-32 repeated bases across rotation steps
-  such as 120 and 201 and across layers such as `120.weight` and `201.weight`. A
-  subspace built without a `seed` also takes the optimizer's seed instead of 0. This
-  changes examples 05, 06, 10 and 11, the paper runners and the fairness EGGROLL and
-  Hybrid arms. `AdaptiveSubspace` and full-space runs are unchanged.
+- 1.1 changes three more inputs. `HybridSubspace` and `FactoredSubspace` draw new
+  seeded bases, which changes every paper runner that uses them and the fair EGGROLL
+  and Hybrid arms; `AdaptiveSubspace` and full-space runs keep their bases. Sinkhorn
+  stops on a relative marginal error with `threshold=3e-5`, which changes solves at a
+  small epsilon or over uneven costs and runs with over-relaxation, adaptive omega,
+  Anderson acceleration or `ProgressiveEpsilon`. `biased_rotation` points the vertex
+  nearest the previous descent direction along it, which changes the SNN/LIF and
+  hard-MoE configurations and the `quadratic/biased_rotation` arm again.
 
-Several other changes in 1.0 and 1.1 move results in the last bit (see the
-[changelog](../CHANGELOG.md)), so the remaining rows need not match bit for bit
-either.
+Other changes in 1.0 and 1.1 move results in the last bit (see the
+[changelog](../CHANGELOG.md) and the
+[upgrade guide](api_overview.md#upgrading-from-10)), so the remaining rows need not
+match bit for bit either.

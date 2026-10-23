@@ -1,4 +1,4 @@
-"""Convergence tests for PolyStep on synthetic objectives (Ackley, Rosenbrock, Rastrigin, Sphere)."""
+"""Synthetic-objective convergence (Ackley, Rosenbrock, Rastrigin, Sphere) and the polystep.benchmarks helpers."""
 
 import math
 
@@ -158,3 +158,70 @@ def test_evaluate_accuracy_raise_restores_train_mode():
     with pytest.raises(ValueError):
         evaluate_accuracy(model, [(torch.randn(8, 4),)])
     assert model.training
+
+
+def _record_fc1_shapes(net):
+    """Swap fc1 for a module recording the shape of every input it is called with."""
+    shapes = []
+    real_fc1 = net.fc1
+
+    class _Recorder(nn.Module):
+        def forward(self, inp):
+            shapes.append(tuple(inp.shape))
+            return real_fc1(inp)
+
+    net.fc1 = _Recorder()
+    return shapes
+
+
+def test_snn_loops_fc1_on_temporal_input():
+    """Temporal input keeps fc1 inside the timestep loop.
+
+    Hoisting fc1 to one (T*B, F) GEMM changes BLAS blocking, and the LIF threshold
+    turns that into a whole spike. Asserted on call shapes, not outputs, since
+    bitwise GEMM differences are machine-dependent.
+    """
+    from polystep.benchmarks.utils import SpikingNet
+
+    torch.manual_seed(0)
+    steps, batch, features = 6, 8, 64
+    net = SpikingNet(input_dim=features, hidden=32, output=10, num_steps=steps)
+
+    shapes = _record_fc1_shapes(net)
+    net(torch.rand(steps, batch, features))
+    assert shapes == [(batch, features)] * steps
+
+
+def test_snn_hoists_fc1_on_static_input():
+    """Static input is constant in time, so fc1 runs once and broadcasts."""
+    from polystep.benchmarks.utils import SpikingNet
+
+    torch.manual_seed(0)
+    steps, batch, features = 6, 8, 64
+    net = SpikingNet(input_dim=features, hidden=32, output=10, num_steps=steps)
+
+    shapes = _record_fc1_shapes(net)
+    net(torch.rand(batch, features))
+    assert shapes == [(batch, features)]
+
+
+def test_spiking_net_defaults_to_builtin_lif(monkeypatch):
+    from types import SimpleNamespace
+
+    from polystep.benchmarks import utils
+
+    monkeypatch.setattr(utils, "_HAS_SNNTORCH", True)
+    monkeypatch.setattr(utils, "snn", SimpleNamespace(Leaky=lambda beta: nn.Identity()), raising=False)
+    net = utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2)
+    assert isinstance(net.lif1, utils.LIFNeuron)
+    assert isinstance(net.lif2, utils.LIFNeuron)
+    stub_net = utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2, use_snntorch=True)
+    assert isinstance(stub_net.lif1, nn.Identity)
+
+
+def test_spiking_net_snntorch_missing_raises(monkeypatch):
+    from polystep.benchmarks import utils
+
+    monkeypatch.setattr(utils, "_HAS_SNNTORCH", False)
+    with pytest.raises(ImportError, match="needs snntorch"):
+        utils.SpikingNet(input_dim=4, hidden=3, output=2, num_steps=2, use_snntorch=True)

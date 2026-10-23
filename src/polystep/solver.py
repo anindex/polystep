@@ -8,7 +8,7 @@ from typing import Callable, List, Optional, Union
 import torch
 
 from ._compiled import CompiledFunctions
-from .costs import compute_cost_matrix, resolve_cost_scale
+from .costs import compute_cost_matrix, validate_cost_scale
 from .epsilon import (
     feed_solver_stats,
     resolve_epsilon,
@@ -104,7 +104,7 @@ class PolyStep:
             raise ValueError("ProgressiveEpsilon adapts the solve epsilon; it cannot be combined with ent_epsilon.")
         validate_epsilon(self.epsilon, "epsilon")
         validate_epsilon(self.ent_epsilon, "ent_epsilon")
-        resolve_cost_scale(torch.ones((), dtype=torch.float64, device="cpu"), self.scale_cost)
+        validate_cost_scale(self.scale_cost)
 
         self.polytope_vertices = POLYTOPE_MAP[self.polytope_type](self.dim, radius=1.0)
         self.probes = torch.linspace(0, 1, self.num_probe + 2)[1 : self.num_probe + 1]

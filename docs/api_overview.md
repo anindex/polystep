@@ -162,13 +162,14 @@ trains unsupervised. Other batch types raise `TypeError`. When `train()` returns
 model is back in the mode it had before.
 
 `restore_best` (on by default) restores the weights with the lowest tracked loss.
-After each step, `train()` scores the updated weights on the first training batch, after `cost_batch_size` subsampling, so scores compare across steps.
-Callbacks receive the loss of the updated weights on that step's training batch.
-Both losses use the same input cast, autocast and loss reduction as the candidates.
-Checkpoint selection uses training loss, which can be optimistic on unseen data.
-Best-weight tracking and callbacks each require an extra loss evaluation per step.
-When the best weights are the last ones, `train()` leaves the optimizer state alone,
-so calling `train()` again continues the same run.
+After each step, `train()` scores the updated weights on the first training batch,
+after `cost_batch_size` subsampling, so scores compare across steps. Callbacks receive
+the loss of the updated weights on that step's training batch. Both losses use the
+same input cast, autocast and loss reduction as the candidates. Checkpoint selection
+uses training loss, which can be optimistic on unseen data. Best-weight tracking and
+callbacks each require an extra loss evaluation per step. When the best weights are
+the last ones, `train()` leaves the optimizer state alone, so calling `train()` again
+continues the same run.
 
 ## Subspaces
 
@@ -289,10 +290,10 @@ Block models omit cross-block Hessian terms.
 
 `trust_region` compares consecutive incumbents and sums block predictions. Minibatch
 changes and momentum-only steps invalidate the deferred comparison; `step_batch()` and
-`train()` reject this controller. Use a stationary objective with the manual step API, and pass
-`optimizer.step(closure, objective_token=token)` a new token whenever the batch or
-loss changes; a change drops the pending trust-region comparison, and `None` or a
-constant token means a stationary objective.
+`train()` reject this controller. Use a stationary objective with the manual step API,
+and pass `optimizer.step(closure, objective_token=token)` a new token whenever the
+batch or loss changes; a change drops the pending trust-region comparison, and `None`
+or a constant token means a stationary objective.
 
 ## Evaluation controls
 
@@ -329,15 +330,16 @@ only when the screened share of the batch divided by `num_probe`, plus the share
 vertices kept per particle, is below 1, where it needs fewer forwards than the full
 sweep, and not with `use_quadratic_model`, `newton_refinement` or `trust_region`. It
 still runs two sweeps, so on small models and on launch-bound GPU steps it can take
-longer than one unscreened sweep. Screened candidates use the same delta and site paths
-as the full sweep once particles times vertices times model parameters reaches 5e5 on
-the CPU or 5e8 on CUDA. Below that, screened hybrid candidates build every weight, and a
-screened full-space chunk uses a site path only when it lies inside one parameter. The
-CPU threshold is the measured crossover. The CUDA one is set conservatively so that no
-measured model slows down, which forgoes wins on small MLPs. With few vertices the kept
-share is coarse: at the default `particle_dim=2` the simplex has 3 vertices, so
-`screen_keep_ratio=0.5` keeps 2 of them. The batch share rounds the same way: a
-registered batch of 2 samples screens on 1 of them even at `screen_fidelity=0.1`.
+longer than one unscreened sweep. Screened candidates use the same delta and site-local
+paths as the full sweep once particles times vertices times model parameters reaches
+5e5 on the CPU or 5e8 on CUDA. Below that, screened hybrid candidates build every
+weight, and a screened full-space chunk uses a site-local path only when it lies
+inside one parameter. The CPU threshold is the measured crossover. The CUDA one is
+set conservatively so that no measured model slows down, which forgoes wins on small
+MLPs. With few vertices the kept share is coarse: at the default `particle_dim=2` the
+simplex has 3 vertices, so `screen_keep_ratio=0.5` keeps 2 of them. The batch share
+rounds the same way: a registered batch of 2 samples screens on 1 of them even at
+`screen_fidelity=0.1`.
 
 ## Custom layers
 
@@ -433,25 +435,54 @@ generator and warns because the two generator types cannot share state.
 
 ## Upgrading from 1.0
 
-Version 1.1 changes several defaults and adds new errors, so seeded runs can differ
-from 1.0. The [changelog](../CHANGELOG.md) lists every change, and
-[reproducibility](reproducibility.md#changes-since-the-published-tables) lists the
-affected results.
+Version 1.1 adds errors and warnings and changes several defaults, so seeded runs can
+differ from 1.0.
+[Reproducibility](reproducibility.md#changes-since-the-published-tables) lists the
+published results that change.
 
-- `SinkhornSolver` and `KLSoftmaxSolver` default `threshold` to 3e-5 instead of 1e-6,
-  and Sinkhorn compares it with the relative marginal error and `KLSoftmaxSolver`
-  with the dual step over epsilon, instead of absolute values.
-- `HybridSubspace` and `FactoredSubspace` hash layer seeds with CRC-32 instead of
-  Adler-32, and one built without a `seed` takes the optimizer's seed instead of 0,
-  so both draw new bases.
-- `FactoredSubspace` redraws its basis every 5 OT steps by default; set
-  `rotation_interval=0` for the 1.0 behavior.
-- `step()` raises `ValueError` when the set of `requires_grad` parameters changed
-  after construction; build a new optimizer instead.
 - A buffer or a separate Parameter that shares memory with a trainable parameter
-  raises `ValueError`. Tie weights by assigning the Parameter itself, or register a
-  clone.
-- `PolyStep.init_state` raises `ValueError` for one particle with `ProgressiveEpsilon`.
+  raises `ValueError` when the optimizer, an evaluator or a layout is built. Tie
+  weights by assigning the Parameter itself, or register a clone of the buffer.
+- `step()` raises `ValueError` when the set of `requires_grad` parameters changed after
+  construction; build a new optimizer instead. Passing `model.parameters()` instead of
+  the module raises `TypeError`.
+- `FactoredSubspace` redraws `B` every 5 OT steps by default, which also clears
+  momentum and the coasting and `biased_rotation` directions. Set
+  `rotation_interval=0` for the 1.0 behavior.
+- `HybridSubspace` and `FactoredSubspace` hash layer seeds with CRC-32 instead of
+  Adler-32, and one built without a `seed` takes the optimizer's seed instead of 0, so
+  both draw new bases. The optimizer keeps that seeded copy in `optimizer.subspace`.
+- `SinkhornSolver` and `KLSoftmaxSolver` default `threshold` to 3e-5 instead of 1e-6.
+  Sinkhorn compares it with the relative marginal error `max|row/a - 1|`, the KL solver
+  with the dual step over epsilon. A solve whose error stalls at its dtype's precision
+  stops early and reports `converged=False`.
+- `train()` runs every batch through `step_batch` and accepts the batch formats listed
+  under [training loop](#training-loop). `restore_best` picks weights by their loss on
+  the first training batch.
+- The optimizer, `NNCostEvaluator`, `ParamLayout` and `train()` unwrap `torch.compile`
+  modules, so parameter names lose the `_orig_mod.` prefix. A 1.0 optimizer checkpoint
+  of a compiled hybrid or factored run no longer loads; rebuild the optimizer from the
+  saved model weights.
+- New errors: momentum outside [0, 1), invalid radius settings, an unknown or nonfinite
+  `scale_cost`, epsilon schedules with a non-positive target, SVD ratios outside
+  [0, 1], `subspace_particle_dim` below 1, and `PolyStep.init_state` with one particle
+  under `ProgressiveEpsilon`.
+- New warnings: `step()` warns once when it may score a stale registered batch, the
+  constructor warns when a full-space step would score more than 100,000 candidates,
+  and a CUDA model with stock `nn.MultiheadAttention` gets a hint to use
+  `VmapSafeMultiHeadAttention`. The every-step rotation warning covers every subspace,
+  and `HybridSubspace` no longer warns for a `rotation_interval` above 1.
+- `SpikingNet` uses the built-in LIF neuron by default; `use_snntorch=True` raises
+  `ImportError` without snntorch.
+- `SiteVmapEvaluator` and `SiteInplaceEvaluator` are built as
+  `SiteVmapEvaluator(owner, layout)` and read the model, loss, buffers and
+  `per_sample` from the `NNCostEvaluator` owner.
+- Seeded runs also change with `AdaptiveSubspace`, displacement rotation or
+  `biased_rotation`, under `amortize_steps` with periodic rotation or absorbs, with an
+  even `num_probe` under `adaptive_num_probe`, with screening, and with
+  `train(restore_best=True)` on loaders of more than one batch. Functional losses,
+  traced chains, site-local and tied-weight scoring, and half-precision attention,
+  losses and subspace folds move at rounding level.
 
 ## Upgrading from 0.13
 

@@ -129,46 +129,6 @@ def test_batched_linear_skips_nondefault_flatten():
     assert ev._batched_linear is None
 
 
-@pytest.mark.parametrize("flatten", [lambda x: x.flatten(1), lambda x: torch.flatten(x, 1)], ids=["method", "function"])
-@pytest.mark.parametrize(
-    "act",
-    [
-        torch.relu,
-        lambda h: h.relu(),
-        lambda h: h.tanh(),
-        torch.sigmoid,
-        lambda h: h.sigmoid(),
-        nn.functional.gelu,
-        nn.functional.silu,
-        nn.functional.leaky_relu,
-    ],
-    ids=["torch_relu", "relu_method", "tanh_method", "torch_sigmoid", "sigmoid_method", "gelu", "silu", "leaky_relu"],
-)
-def test_inline_activation_plan_matches_forward(act, flatten):
-    """Inline activations (torch.relu in forward) have no activation submodule, so
-    the bmm plan must take them from the trace or it scores a linear network."""
-
-    class InlineMLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc1 = nn.Linear(12, 8)
-            self.fc2 = nn.Linear(8, 3)
-
-        def forward(self, x):
-            return self.fc2(act(self.fc1(flatten(x))))
-
-    torch.manual_seed(0)
-    model = InlineMLP().double()
-    ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
-    assert ev._batched_linear is not None
-
-    inputs = torch.randn(10, 3, 4, dtype=torch.float64)
-    targets = torch.randint(0, 3, (10,))
-    stacked = {k: v.detach()[None] + 0.5 * torch.randn(4, *v.shape, dtype=v.dtype) for k, v in model.named_parameters()}
-    fast = ev._batched_linear.evaluate(stacked, inputs, targets)
-    torch.testing.assert_close(fast, ev._evaluate_loop(stacked, inputs, targets), rtol=0, atol=1e-12)
-
-
 def test_warmstart_dual_centering_keeps_marginals():
     """Gauge-preserving re-centering must not break marginal convergence under
     overrelaxation (omega != 1), where independent centering would perturb it."""

@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_leaves
 
-from polystep import PolyStepOptimizer
+from polystep import PolyStepOptimizer, cost_nn
 from polystep.cost_nn import NNCostEvaluator, SiteInplaceEvaluator, SiteVmapEvaluator, SparseDeltaEvaluator
 from polystep.layers import VmapSafeMultiHeadAttention
 from polystep.transform import ParamLayout
@@ -402,8 +402,6 @@ def _injected_and_materialized(
     monkeypatch, model, inputs, targets, dtype=torch.float64, injects=True, loss_fn=nn.CrossEntropyLoss()
 ):
     """Losses per candidate at every entry, scored as offsets and from built weights, and the evaluator."""
-    from polystep import cost_nn
-
     monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
     model, inputs = model.to(dtype), inputs.to(dtype)
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -442,6 +440,8 @@ def _injected_and_materialized(
         (ClampedWeightNet, _small_batch, {"fc.weight"}),
         (ItemScaledMLP, _small_batch, set()),
         (ResidualMLP, _small_batch, set()),
+        (TransposedReadNet, _small_batch, {"fc.weight"}),
+        (EncoderNet, _small_batch, {"inp.weight", "block.self_attn.in_proj_weight", "block.self_attn.out_proj.weight"}),
     ],
 )
 def test_site_injection_matches_materialized_linear(monkeypatch, model_cls, batch, uninjectable):
@@ -501,8 +501,6 @@ def test_hidden_weight_read_disables_injection(monkeypatch, model_fn, loss_fn, d
     [(scripted_weight_product, [(0.0, 7), (1.0, 7)]), (wide_batch_product, [(1.0, 7), (1.0, 9)])],
 )
 def test_later_call_hidden_read_declines_injection(monkeypatch, read, calls):
-    from polystep import cost_nn
-
     monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
     torch.manual_seed(0)
     model = HiddenReadNet(read).double()
@@ -524,8 +522,6 @@ def test_later_call_hidden_read_declines_injection(monkeypatch, read, calls):
 
 
 def test_forward_counts_cap_input_signatures(monkeypatch):
-    from polystep import cost_nn
-
     monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
     monkeypatch.setattr(cost_nn, "_MAX_INPUT_SIGNATURES", 2)
     torch.manual_seed(0)
@@ -544,8 +540,6 @@ def test_forward_counts_cap_input_signatures(monkeypatch):
 @pytest.mark.filterwarnings("ignore:vmap failed:RuntimeWarning")
 @pytest.mark.parametrize("unread_first", [False, True])
 def test_partial_move_hidden_read_declines_injection(monkeypatch, unread_first):
-    from polystep import cost_nn
-
     monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
     torch.manual_seed(0)
     model = HiddenReadNet(tail_weight_product).double()
@@ -566,8 +560,6 @@ def test_partial_move_hidden_read_declines_injection(monkeypatch, unread_first):
 
 
 def test_barrier_loss_keeps_injection(monkeypatch):
-    from polystep import cost_nn
-
     monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
     torch.manual_seed(0)
     model = SkipMLP().double()
@@ -593,8 +585,6 @@ def test_barrier_loss_keeps_injection(monkeypatch):
 
 
 def test_noisy_forward_keeps_injection(monkeypatch):
-    from polystep import cost_nn
-
     torch.manual_seed(0)
     model = NoisyMLP().double()
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -621,13 +611,6 @@ def test_integer_loss_keeps_injection(monkeypatch):
     assert site._uninjectable_sites == set()
 
 
-def test_nonlinear_weight_read_falls_back(monkeypatch):
-    torch.manual_seed(0)
-    got, want, site = _injected_and_materialized(monkeypatch, TransposedReadNet(), *_small_batch())
-    torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
-    assert site._uninjectable_sites == {"fc.weight"}
-
-
 def test_internal_autocast_site_skips_injection(monkeypatch):
     torch.manual_seed(0)
     got, want, site = _injected_and_materialized(monkeypatch, AutocastNet(), *_small_batch(), dtype=torch.float32)
@@ -636,8 +619,6 @@ def test_internal_autocast_site_skips_injection(monkeypatch):
 
 
 def test_long_forward_stops_injecting_small_site():
-    from polystep import cost_nn
-
     torch.manual_seed(0)
     model = SineTailNet()
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -655,8 +636,6 @@ def test_long_forward_stops_injecting_small_site():
 
 @pytest.mark.parametrize("chunk_size", [None, 1])
 def test_injection_estimate_respects_chunk_size(chunk_size):
-    from polystep import cost_nn
-
     torch.manual_seed(0)
     model = SkipMLP().double()
     layout = ParamLayout.from_module(model, particle_dim=PDIM)
@@ -671,8 +650,6 @@ def test_injection_estimate_respects_chunk_size(chunk_size):
 
 
 def test_tuple_inputs_keep_site_injection(monkeypatch):
-    from polystep import cost_nn
-
     monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
     torch.manual_seed(0)
     model = SkipMLP().double()
@@ -687,9 +664,7 @@ def test_tuple_inputs_keep_site_injection(monkeypatch):
     torch.testing.assert_close(got, site.evaluate(base_sd, entry, local_idx, values, inputs.double(), targets))
 
 
-def test_zero_offset_conv_chunk_scores_without_raising(monkeypatch):
-    from polystep import cost_nn
-
+def test_zero_offset_conv_chunk_scores_finite(monkeypatch):
     monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
     torch.manual_seed(0)
     model = ConvNet().double()
@@ -721,17 +696,6 @@ def test_scalar_input_site_gate_skips_crash():
     candidates = flat.expand(2, -1).clone()
     candidates[:, 3:5] = values
     torch.testing.assert_close(got, evaluator.evaluate(layout.batch_unflatten(candidates), inputs, targets))
-
-
-def test_sites_feeding_attention_skip_injection(monkeypatch):
-    torch.manual_seed(0)
-    got, want, site = _injected_and_materialized(monkeypatch, EncoderNet(), *_small_batch())
-    torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
-    assert site._uninjectable_sites == {
-        "inp.weight",
-        "block.self_attn.in_proj_weight",
-        "block.self_attn.out_proj.weight",
-    }
 
 
 def test_conv_step_skips_closure_keeps_losses():
@@ -767,8 +731,6 @@ def test_conv_step_skips_closure_keeps_losses():
 
 
 def test_site_vmap_honors_evaluator_chunk_size(monkeypatch):
-    from polystep import cost_nn
-
     chunks = []
     real_vmap = cost_nn.vmap
 
@@ -805,7 +767,7 @@ class TiedHead(nn.Module):
 @pytest.mark.parametrize("tie", ["attribute", "module"])
 def test_tied_site_vmap_matches_dense_costs(monkeypatch, tie, path):
     """Every alias of a tied site reads the candidate, with or without the alias keys in the base."""
-    from polystep import HybridSubspace, cost_nn
+    from polystep import HybridSubspace
 
     torch.manual_seed(0)
     gen = torch.Generator().manual_seed(1)
@@ -1168,35 +1130,6 @@ def test_inplace_site_keeps_float64_resolution():
     )
     assert losses.dtype == torch.float64
     assert len(torch.unique(losses)) == 3
-
-
-@pytest.mark.parametrize("use_inplace", [True, False])
-def test_site_loss_aliasing_buffer_survives_restore(use_inplace):
-    class CachedScore(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(2))
-            self.register_buffer("score", torch.zeros(()))
-
-        def forward(self, x):
-            self.score.copy_((x * self.weight).sum())
-            return self.score
-
-    model = CachedScore()
-    layout = ParamLayout.from_module(model, particle_dim=2)
-    evaluator = NNCostEvaluator(model, lambda out: out, use_inplace=use_inplace, compile_forward=False)
-    site = SiteVmapEvaluator.try_build(evaluator, layout)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        losses = site.evaluate(
-            layout.unflatten(layout.flatten(model)),
-            layout.entries[0],
-            torch.tensor([[0, 1]]),
-            torch.tensor([[[1.0, 1.0], [2.0, 2.0]]]),
-            torch.ones(2),
-        )
-    assert losses.tolist() == [2.0, 4.0]
-    assert model.score.item() == 0
 
 
 @pytest.mark.parametrize("projection", ["dense", "sparse", "unprojected"])

@@ -290,7 +290,7 @@ class TestTrain:
             train(b, loader, nn.CrossEntropyLoss(), PolyStepOptimizer(a, seed=0), TrainConfig(epochs=1))
 
     def test_train_rejects_trust_region(self):
-        """Its ratio would compare a prediction against the loss on the next batch."""
+        """train() rejects trust_region, whose ratio would compare a prediction with the next batch's loss."""
         model = nn.Linear(4, 2)
         loader = DataLoader(TensorDataset(*_batch(c=2)), batch_size=3)
         opt = PolyStepOptimizer(model, seed=0, trust_region=True, polytope_type="orthoplex")

@@ -29,7 +29,7 @@ from .cost_nn import (
     _first_input_tensor,
     _reuse_prefixes,
 )
-from .costs import resolve_cost_scale
+from .costs import validate_cost_scale
 from .epsilon import LinearEpsilon, ProgressiveEpsilon, validate_epsilon
 from .geometry import POLYTOPE_MAP
 from .projection import SparseRandomProjection
@@ -366,7 +366,7 @@ class PolyStepOptimizer(SerializationMixin):
         self._progressive_epsilon = epsilon if isinstance(epsilon, ProgressiveEpsilon) else None
         if self._progressive_epsilon is not None and ent_epsilon is not None:
             raise ValueError("ProgressiveEpsilon adapts the solve epsilon; it cannot be combined with ent_epsilon.")
-        resolve_cost_scale(torch.ones((), dtype=torch.float64, device="cpu"), scale_cost)
+        validate_cost_scale(scale_cost)
         self.scale_cost = scale_cost
         # A negative radius flips the finite-difference denominator, which the
         # clamp then turns positive and scales the gradient by 1e10. 0 is the
@@ -1147,7 +1147,6 @@ class PolyStepOptimizer(SerializationMixin):
             evaluator.autocast_dtype = self._candidate_autocast_dtype
         if self._compile_evaluator:
             evaluator._compile_vmap = True
-        # None leaves the evaluator's own setting; only an explicit True/False overrides it.
         if self._compile_forward is not None:
             evaluator._compile_forward = self._compile_forward
         half = any(p.dtype in (torch.float16, torch.bfloat16) for p in evaluator.model.parameters())
@@ -1400,14 +1399,8 @@ class PolyStepOptimizer(SerializationMixin):
         cost_bs = self.cost_batch_size
         if cost_bs is not None and first.dim() and cost_bs < first.shape[0]:
             gen = self._generator
-            if gen is not None:
-                if gen.device == first.device:
-                    idx = torch.randperm(first.shape[0], device=first.device, generator=gen)[:cost_bs]
-                else:
-                    # randperm needs the generator and tensor on one device; sample on the generator's device to keep the seed, then move the index.
-                    idx = torch.randperm(first.shape[0], device=gen.device, generator=gen)[:cost_bs].to(first.device)
-            else:
-                idx = torch.randperm(first.shape[0], device=first.device)[:cost_bs]
+            device = first.device if gen is None else gen.device
+            idx = torch.randperm(first.shape[0], device=device, generator=gen)[:cost_bs].to(first.device)
             inputs, targets = tree_map(
                 lambda t: t[idx] if isinstance(t, torch.Tensor) and t.shape[:1] == first.shape[:1] else t,
                 (inputs, targets),

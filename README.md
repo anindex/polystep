@@ -59,7 +59,7 @@ train(model, loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 
 Replace the generated data with your dataset. `max_subspace_dim=128` caps the search
 at 128 coordinates, so each step scores 144 candidates. Biases and normalization
-weights always keep their full width, so on a larger model the cap has to exceed their
+weights always keep their full width, so on a larger model the cap must reach their
 total plus one coordinate per weight matrix; a smaller cap warns and reports the size
 it uses instead.
 
@@ -132,17 +132,12 @@ The paper runners match search spaces, budgets and tuning as the
 ## Benchmarks
 
 Five-seed mean ± sample standard deviation, with configurations and checkpoints
-selected on validation data; the probSAT and RC2 columns are single runs. In the
-architecture tables, OpenAI-ES, CMA-ES and EGGROLL get PolyStep's candidate-evaluation
-budget, and SPSA, MeZO and random search get its step count. On argmax attention, hard
-MoE and ETTh1, the population methods instead get 32 evaluations per PolyStep step,
-spent at their own population size, and Adam trains for PolyStep's 30 epochs, except
-50 on ETTh1. On MAX-SAT, CMA-ES and OpenAI-ES get 50 evaluations per PolyStep step.
-OpenAI-ES scores 50 candidates at each of PolyStep's steps, while CMA-ES doubles its
-population at each restart and takes fewer generations. The tables were recorded
-before 1.0; the
+selected on validation data; the probSAT and RC2 columns are single runs. Each
+baseline gets a matched evaluation or step budget, as the
+[protocol](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md#protocol)
+describes. The tables were recorded before 1.0; the
 [reproducibility guide](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md#changes-since-the-published-tables)
-lists the rows that 1.0 and 1.1 change. The
+lists the rows that later releases change, and the
 [experiment index](https://github.com/anindex/polystep/blob/main/experiments/EXPERIMENT_INDEX.md)
 has the full tables.
 
@@ -186,6 +181,7 @@ for unsupported configurations and comparison limits.
 - [Performance](https://github.com/anindex/polystep/blob/main/docs/performance.md)
 - [Examples](https://github.com/anindex/polystep/blob/main/examples/README.md)
 - [Experiments](https://github.com/anindex/polystep/blob/main/experiments/README.md) and [reproduction](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md)
+- [Limitations](https://github.com/anindex/polystep/blob/main/LIMITATIONS.md)
 - [Determinism](https://github.com/anindex/polystep/blob/main/docs/determinism.md)
 - [Contributing](https://github.com/anindex/polystep/blob/main/CONTRIBUTING.md) and [changelog](https://github.com/anindex/polystep/blob/main/CHANGELOG.md)
 
