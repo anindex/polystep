@@ -77,7 +77,7 @@ def main():
     # Compress each weight matrix to a rank-8 search subspace.
     total_steps = args.epochs * steps_per_epoch
     layout = ParamLayout.from_module(model)
-    subspace = HybridSubspace.from_layout(layout, rank=8, rotation_interval=0, absorb_interval=0)
+    subspace = HybridSubspace.from_layout(layout, rank=8)
 
     # eps_target 0.5, not 0.1: a plan concentrated near argmax takes the full
     # step_radius, so a small target makes the effective step grow late and diverge.

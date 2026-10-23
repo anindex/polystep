@@ -9,7 +9,6 @@ Run: python examples/01_quickstart_2d.py
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 
 import torch
@@ -99,7 +98,7 @@ def main():
     ax_right.grid(True, alpha=0.3)
 
     out = Path(__file__).parent / "figures" / "quickstart_2d.png"
-    os.makedirs(out.parent, exist_ok=True)
+    out.parent.mkdir(exist_ok=True)
     fig.savefig(out, dpi=150)
     plt.close(fig)
 

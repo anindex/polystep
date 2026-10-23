@@ -11,8 +11,8 @@ Run: python examples/02_snn_starter.py
 
 from __future__ import annotations
 
-import importlib.util
 import argparse
+import importlib.util
 import time
 from pathlib import Path
 
@@ -22,10 +22,19 @@ import _env
 
 _env.setup()
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
-from _snn_demo import TinySNN, evaluate_accuracy, make_loaders
 from polystep import PolyStepOptimizer
-from polystep.cost_nn import NNCostEvaluator
+from polystep.benchmarks import SpikingNet, evaluate_accuracy
+
+
+def make_loader(num_samples: int, seed: int, shuffle: bool) -> DataLoader:
+    """Noisy copies of four class templates, each owning a block of four "on" features."""
+    rng = torch.Generator().manual_seed(seed)
+    templates = (torch.eye(4).repeat_interleave(4, dim=1) + 0.2 * torch.randn(4, 16, generator=rng)).clamp(0, 1)
+    labels = torch.randint(0, 4, (num_samples,), generator=rng)
+    data = (templates[labels] + 0.15 * torch.randn(num_samples, 16, generator=rng)).clamp(0, 1)
+    return DataLoader(TensorDataset(data, labels), batch_size=32, shuffle=shuffle)
 
 
 def main():
@@ -41,8 +50,8 @@ def main():
     print("Tiny SNN with hard-threshold LIF spikes (PolyStep training)")
     print("=" * 60)
 
-    train_loader, test_loader = make_loaders(seed=seed)
-    model = TinySNN().to(device)
+    train_loader, test_loader = make_loader(256, seed, shuffle=True), make_loader(64, seed + 1, shuffle=False)
+    model = SpikingNet(input_dim=16, hidden=24, output=4, num_steps=20).to(device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"  parameters: {num_params:,}")
     print(f"  train/test: {len(train_loader.dataset)}/{len(test_loader.dataset)} samples")
@@ -57,7 +66,6 @@ def main():
         solver="softmax",
     )
     loss_fn = nn.CrossEntropyLoss()
-    evaluator = NNCostEvaluator(model, loss_fn=loss_fn)
 
     init_acc = evaluate_accuracy(model, test_loader)
     print(f"  initial test accuracy: {100 * init_acc:.1f}%")
@@ -78,15 +86,7 @@ def main():
                 break
 
             inputs, targets = inputs.to(device), targets.to(device)
-
-            def closure(stacked_params, _in=inputs, _tgt=targets):
-                return evaluator.evaluate(stacked_params, _in, _tgt)
-
-            # Registering scores each parameter's candidates in its own forward: faster
-            # on CPU, slower on CUDA than one batched closure forward for this net.
-            if device.type == "cpu":
-                optimizer.register_evaluator(evaluator, inputs, targets)
-            optimizer.step(closure)
+            optimizer.step_batch(inputs, targets, loss_fn=loss_fn)
 
             with torch.no_grad():
                 logits = model(inputs)

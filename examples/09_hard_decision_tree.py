@@ -7,7 +7,7 @@ OpenAI-ES, and SPSA under a matched forward-pass budget, plus an Adam
 soft-tree baseline scored after hardening.
 
 Run:
-    MPLBACKEND=Agg python examples/09_hard_decision_tree.py
+    python examples/09_hard_decision_tree.py
 """
 
 from __future__ import annotations

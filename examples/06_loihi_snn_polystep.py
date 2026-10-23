@@ -9,6 +9,7 @@ on-chip path would.
 Run::
 
     python examples/06_loihi_snn_polystep.py
+    python examples/06_loihi_snn_polystep.py --device cpu --max-train 8000 --pretrain-epochs 1 --adapt-epochs 1
     python examples/06_loihi_snn_polystep.py --shift-sigma 0.0   # no shift
     python examples/06_loihi_snn_polystep.py --no-mixed-shift    # ablate safeguard
     python examples/06_loihi_snn_polystep.py --backend loihi2    # if lava installed
@@ -151,56 +152,18 @@ def freeze_to_writable_subset(model: MnistSpikingNet) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def make_pretrain_optimizer(model: nn.Module, *, seed: int) -> PolyStepOptimizer:
-    """Stage 1 optimizer (off-chip pretrain): the SNN settings of ``experiments/runners/run_elevation.py``.
-
-    The runner's ``biased_rotation`` and fixed chunk size are left out. Flat
-    epsilon / step_radius / probe_radius: ``CosineEpsilon`` scheduling on any of
-    them collapses SNN accuracy.
-    """
-    layout = ParamLayout.from_module(model)
-    subspace = HybridSubspace.from_layout(
-        layout,
-        rank=4,
-        rotation_mode="random",
-        rotation_interval=0,
-        absorb_mode="periodic",
-        absorb_interval=20,
-    )
-    return PolyStepOptimizer(
-        model,
-        seed=seed,
-        epsilon=0.5,
-        step_radius=2.0,
-        probe_radius=1.0,
-        num_probe=1,
-        subspace=subspace,
-        solver="softmax",
-    )
-
-
-def make_adapt_optimizer(
-    model: nn.Module,
-    *,
-    seed: int,
-    rank: int = 8,
-    num_probe: int = 2,
-    step_radius: float = 1.5,
-    probe_radius: float = 0.75,
+def make_optimizer(
+    model: nn.Module, *, seed: int, rank: int, num_probe: int, step_radius: float, probe_radius: float
 ) -> PolyStepOptimizer:
-    """Stage 2 optimizer (on-chip readout adaptation): small writable subset, low-rank, flat schedules.
+    """PolyStep with flat schedules on a ``HybridSubspace`` absorbed every 20 steps.
 
-    The writable subset is tiny (~1.3% of params), so a richer subspace
-    (``rank=8``) and an extra probe cost little and improve recovery.
+    Stage 1 uses the SNN settings of ``experiments/runners/run_elevation.py`` without
+    its ``biased_rotation``; ``CosineEpsilon`` scheduling of epsilon or either radius
+    collapses SNN accuracy. Stage 2's writable subset is tiny (~1.3% of params), so
+    ``rank=8`` and a second probe cost little.
     """
-    layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(
-        layout,
-        rank=rank,
-        rotation_mode="random",
-        rotation_interval=0,
-        absorb_mode="periodic",
-        absorb_interval=20,
+        ParamLayout.from_module(model), rank=rank, absorb_mode="periodic", absorb_interval=20
     )
     return PolyStepOptimizer(
         model,
@@ -210,7 +173,6 @@ def make_adapt_optimizer(
         probe_radius=probe_radius,
         num_probe=num_probe,
         subspace=subspace,
-        chunk_size=4096,
         solver="softmax",
     )
 
@@ -240,7 +202,6 @@ def train_loop(
     optimizer: PolyStepOptimizer,
     evaluator: CpuSimEvaluator,
     loader,
-    loss_fn: nn.Module,
     *,
     epochs: int,
     device: torch.device,
@@ -251,7 +212,7 @@ def train_loop(
     eval_shift_sigma: float = 0.0,
     patience: int = 2,
     noise_seed: int = 0,
-) -> tuple[float, dict]:
+) -> None:
     """Per-batch PolyStep updates with validation-based early stopping.
 
     ``mixed_shift=True`` concatenates each batch with a shifted copy of
@@ -312,7 +273,6 @@ def train_loop(
             print(f"  [{label}] early stop at epoch {epoch + 1} (patience {patience}); best={100 * best_acc:.1f}%")
             break
     model.load_state_dict(best_state)
-    return best_acc, best_state
 
 
 # Color palette: colorblind-safe (Wong 2011)
@@ -338,9 +298,6 @@ def _save_visualization(
 ) -> None:
     """Two-panel figure: clean vs. shifted inputs, plus per-phase accuracy bars with the recovery annotated."""
     try:
-        import matplotlib
-
-        matplotlib.use("Agg")
         import matplotlib.gridspec as gridspec
         import matplotlib.patches as mpatches
         import matplotlib.pyplot as plt
@@ -352,7 +309,7 @@ def _save_visualization(
         {
             "font.family": "DejaVu Sans",
             "font.size": 10,
-            "axes.titleweight": "semibold",
+            "axes.titleweight": "bold",
             "axes.labelcolor": "#222",
             "axes.edgecolor": "#888",
             "xtick.color": "#222",
@@ -428,7 +385,7 @@ def _save_visualization(
                     va="center",
                     labelpad=10,
                     fontsize=11,
-                    fontweight="semibold",
+                    fontweight="bold",
                     color=color,
                 )
 
@@ -515,7 +472,7 @@ def _save_visualization(
     ax_bar.text(
         (x_from + x_to) / 2,
         label_y,
-        f"+{recovery:.1f} pp shift-recovery",
+        f"{recovery:+.1f} pp shift-recovery",
         ha="center",
         va="bottom",
         fontsize=11.5,
@@ -589,11 +546,10 @@ def main():
     )
     parser.add_argument(
         "--mixed-shift",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Adapt on a half-clean/half-shifted batch (prevents catastrophic forgetting; default ON).",
+        help="Adapt on a half-clean/half-shifted batch (prevents catastrophic forgetting).",
     )
-    parser.add_argument("--no-mixed-shift", dest="mixed_shift", action="store_false")
     parser.add_argument("--adapt-rank", type=int, default=8)
     parser.add_argument("--adapt-num-probe", type=int, default=2)
     parser.add_argument(
@@ -605,7 +561,7 @@ def main():
         "Higher than typical SGD because zeroth-"
         "order validation curves are noisier per epoch.",
     )
-    parser.add_argument("--data-dir", type=str, default="data/mnist")
+    parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument(
         "--no-plot",
         action="store_true",
@@ -664,14 +620,13 @@ def main():
     print()
     print("Stage 1: off-chip PolyStep pretrain")
     print("-" * 70)
-    pre_opt = make_pretrain_optimizer(model, seed=args.seed)
+    pre_opt = make_optimizer(model, seed=args.seed, rank=4, num_probe=1, step_radius=2.0, probe_radius=1.0)
     pre_eval = CpuSimEvaluator(model, loss_fn=loss_fn)
     train_loop(
         model,
         pre_opt,
         pre_eval,
         train_loader,
-        loss_fn,
         epochs=args.pretrain_epochs,
         device=device,
         shift_sigma=0.0,
@@ -711,18 +666,19 @@ def main():
     else:
         adapt_eval = LoihiSpikeEvaluator(hdf5_path="snn_mnist.net", loss_fn=loss_fn)
 
-    ad_opt = make_adapt_optimizer(
+    ad_opt = make_optimizer(
         model,
         seed=args.seed,
         rank=args.adapt_rank,
         num_probe=args.adapt_num_probe,
+        step_radius=1.5,
+        probe_radius=0.75,
     )
     train_loop(
         model,
         ad_opt,
         adapt_eval,
         train_loader,
-        loss_fn,
         epochs=args.adapt_epochs,
         device=device,
         shift_sigma=args.shift_sigma,

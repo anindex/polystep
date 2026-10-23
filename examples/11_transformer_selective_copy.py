@@ -70,7 +70,7 @@ class SelectiveCopyTransformer(nn.Module):
         return self.head(tokens[:, 0])  # position 0 held the pointer
 
 
-def build_optimizer(model: nn.Module, seed: int) -> PolyStepOptimizer:
+def build_optimizer(model: nn.Module, seed: int, amortize_steps: int = 5) -> PolyStepOptimizer:
     """A per-layer subspace, so a coordinate run lands inside one parameter's block.
 
     That is what lets the step name a site in coordinate space; a single global
@@ -85,11 +85,8 @@ def build_optimizer(model: nn.Module, seed: int) -> PolyStepOptimizer:
         probe_radius=3.0,
         seed=seed,
         # A momentum step reuses the EMA transport direction and evaluates nothing,
-        # so only every fifth step pays for probes. It spends step budget rather than
-        # forward passes, so it needs a run with steps to spare; halving the batch
-        # doubles the steps per epoch to cover that.
-        amortize_steps=5,
-        amortize_ema=0.7,
+        # so only every fifth step pays for probes.
+        amortize_steps=amortize_steps,
     )
 
 
@@ -116,7 +113,7 @@ def compare_paths(x, y, device, batch_size, steps=6):
         torch.manual_seed(0)
         model = SelectiveCopyTransformer().to(device)
         evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
-        optimizer = build_optimizer(model, seed=3)
+        optimizer = build_optimizer(model, seed=3, amortize_steps=1)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         started = time.perf_counter()

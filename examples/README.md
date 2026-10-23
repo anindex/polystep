@@ -1,5 +1,9 @@
 # Examples
 
+Each script runs PolyStep on a small task and prints the result; 07, 08 and 09 also run
+baselines for comparison. Examples 01 to 04 and 06 to 09 save a figure to
+`examples/figures/`.
+
 ```bash
 pip install -e ".[examples]"
 python examples/01_quickstart_2d.py
@@ -19,24 +23,37 @@ python examples/01_quickstart_2d.py
 | [10_cnn_mnist.py](10_cnn_mnist.py) | Convolutional MNIST classifier |
 | [11_transformer_selective_copy.py](11_transformer_selective_copy.py) | Attention-based selective copying |
 
-Examples run on one CPU thread, except 07, which uses eight.
-To change the thread count, set `POLYSTEP_THREADS`.
-Examples 02, 04, 05, 06, 10, and 11 use CUDA when available. Example 05 uses BF16 on CUDA.
-Example 03 accepts `--device cuda`. To skip its GIF, use `--no-render`.
-For CPU runs of 02, 05, 06, 10, and 11, use `--device cpu`.
-For a smaller MAX-SAT task, use `--small`.
+## Devices and threads
 
-Examples 10 and 11 support `--compare` to check loss agreement and time registered
-evaluation against materialized candidates, including first-call setup. See
-[performance](../docs/performance.md) for subspace settings and the
-[API reference](../docs/api_overview.md#evaluation-controls) for amortization.
+Examples run on one CPU thread, except 07, which uses eight; set `POLYSTEP_THREADS` to
+change it. Examples 02, 04, 05, 06, 10 and 11 use CUDA when available, and 05 runs in
+BF16 there; pass `--device cpu` to run them on the CPU. Example 03 runs on the CPU,
+accepts `--device cuda`, and skips its GIF with `--no-render`. Example 04 accepts
+`--small` for a 2,000-variable task.
 
-Examples 05, 06, 10, and 11 select checkpoints on validation data and report
-test accuracy afterward. The Loihi example simulates the SNN in PyTorch on the
-selected device; its hardware evaluator is a deployment sketch.
+Example 10 trains in about 20 seconds on an RTX 5090. On one CPU thread its 40 default
+epochs take about an hour, so shorten a CPU run with `--epochs` and `--train-size`.
 
-Examples 07 and 08 report the mean over five seeds. Their OpenAI-ES baselines use
-the noise scale and learning rate that scored best on 20 seeds the examples do not
-report.
+## Data
+
+Examples 05, 06 and 10 download MNIST to `mnist` under the system temp directory,
+`/tmp/mnist` on Linux. Example 06 takes `--data-dir` to use another directory.
+
+## Comparing evaluation paths
+
+Examples 10 and 11 take `--compare`, which scores the same batches with fully built
+candidates and with the site-local evaluator, checks that the losses agree, and times
+both, first-call setup included. On the CPU, example 10's fully built candidates take
+about 15 GB of memory. See [performance](../docs/performance.md) for subspace settings
+and the [API reference](../docs/api_overview.md#evaluation-controls) for amortization.
+
+## Reported results
+
+Examples 05, 06, 10 and 11 select checkpoints on validation data and report test
+accuracy afterward. The Loihi example simulates the SNN in PyTorch on the selected
+device; its hardware evaluator is a deployment sketch.
+
+Examples 07 and 08 report the mean over five seeds. Their OpenAI-ES baselines use the
+noise scale and learning rate that scored best on 20 seeds the examples do not report.
 
 For published comparisons, see [experiments](../experiments/README.md).

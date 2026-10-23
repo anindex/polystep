@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import os
 import time
 from pathlib import Path
 
@@ -38,8 +37,8 @@ from polystep.benchmarks.rl.policies import DiscreteMLPPolicy
 from polystep.epsilon import CosineEpsilon
 
 
-def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
-    """Run the trained policy in Gymnasium and save a GIF.
+def visualize_policy(policy, horizon: int = 2000):
+    """Run the trained policy for one Gymnasium episode and save a GIF.
 
     Uses ``render_mode="rgb_array"``: the ``"human"`` mode needs a GLX
     context that fails on headless setups.
@@ -50,27 +49,23 @@ def visualize_policy(policy, num_episodes: int = 3, horizon: int = 500):
     # Override the 500-step truncation to show long-term stability.
     env = gym.make("CartPole-v1", render_mode="rgb_array", max_episode_steps=horizon)
     frames: list = []
-
-    for ep in range(num_episodes):
-        obs, _ = env.reset()
-        total_reward = 0.0
-        for _ in range(horizon):
-            frame = env.render()
-            frames.append(frame)
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=next(policy.parameters()).device).unsqueeze(0)
-            with torch.no_grad():
-                logits = policy(obs_t)
-                action = int(logits.argmax(dim=-1).item())
-            obs, reward, terminated, truncated, _ = env.step(action)
-            total_reward += reward
-            if terminated or truncated:
-                break
-        print(f"  episode {ep + 1}: return = {total_reward:.0f}")
+    obs, _ = env.reset()
+    total_reward = 0.0
+    for _ in range(horizon):
+        frames.append(env.render())
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=next(policy.parameters()).device).unsqueeze(0)
+        with torch.no_grad():
+            action = int(policy(obs_t).argmax(dim=-1).item())
+        obs, reward, terminated, truncated, _ = env.step(action)
+        total_reward += reward
+        if terminated or truncated:
+            break
+    print(f"  episode return = {total_reward:.0f}")
     env.close()
 
     # Save as GIF (sub-sampled to keep file size reasonable).
     out = Path(__file__).parent / "figures" / "rl_cartpole_policy.gif"
-    os.makedirs(out.parent, exist_ok=True)
+    out.parent.mkdir(exist_ok=True)
     step = max(1, len(frames) // 200)  # cap at ~200 frames
     imgs = [Image.fromarray(f) for f in frames[::step]]
     imgs[0].save(out, save_all=True, append_images=imgs[1:], duration=33, loop=0)
@@ -108,17 +103,12 @@ def main():
         device=device,
     )
 
-    epsilon_init, epsilon_target = 1.0, 0.3
     optimizer = PolyStepOptimizer(
         policy,
         solver="softmax",
         particle_dim=8,
         seed=seed,
-        epsilon=CosineEpsilon(
-            init=epsilon_init,
-            target=epsilon_target,
-            decay=(epsilon_init - epsilon_target) / target_steps,
-        ),
+        epsilon=CosineEpsilon(init=1.0, target=0.3, total_steps=target_steps),
         step_radius=0.1,
         probe_radius=1.6,
     )
@@ -129,13 +119,13 @@ def main():
         horizon=horizon,
         device=device,
     )
-    init_summary = evaluate_policy_module(
-        policy,
-        seed=seed + 10_000,
-        episodes=eval_episodes,
-        horizon=horizon,
-        device=device,
-    )
+
+    def evaluate():
+        return evaluate_policy_module(
+            policy, seed=seed + 10_000, episodes=eval_episodes, horizon=horizon, device=device
+        )
+
+    init_summary = evaluate()
     print(f"  random policy mean return:  {rand_summary['mean_return']:.1f}")
     print(f"  initial policy mean return: {init_summary['mean_return']:.1f}")
     print()
@@ -151,13 +141,7 @@ def main():
         optimizer.step(lambda params: evaluator.loss_for_stacked_params(params, seed=seed, step=step))
 
         if step % 4 == 0 or step == target_steps - 1:
-            summary = evaluate_policy_module(
-                policy,
-                seed=seed + 10_000,
-                episodes=eval_episodes,
-                horizon=horizon,
-                device=device,
-            )
+            summary = evaluate()
             return_log.append(summary["mean_return"])
             step_log.append(step)
             if step % 16 == 0 or step == target_steps - 1:
@@ -168,13 +152,7 @@ def main():
                 )
 
     elapsed = time.time() - start
-    final_summary = evaluate_policy_module(
-        policy,
-        seed=seed + 10_000,
-        episodes=eval_episodes,
-        horizon=horizon,
-        device=device,
-    )
+    final_summary = evaluate()
 
     print()
     print("=" * 60)
@@ -190,9 +168,6 @@ def main():
     if importlib.util.find_spec("matplotlib") is None:
         print("matplotlib not installed; skipping the figure (pip install matplotlib).")
     else:
-        import matplotlib
-
-        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(1, 1, figsize=(5.0, 2.8), constrained_layout=True)
@@ -212,7 +187,7 @@ def main():
         ax.legend(loc="lower right", fontsize=7)
 
         out = Path(__file__).parent / "figures" / "rl_cartpole.png"
-        os.makedirs(out.parent, exist_ok=True)
+        out.parent.mkdir(exist_ok=True)
         fig.savefig(out, dpi=150)
         plt.close(fig)
         print(f"saved figure: {out}")
@@ -225,7 +200,7 @@ def main():
     else:
         print()
         print("launching Gymnasium CartPole-v1 visualization...")
-        visualize_policy(policy, num_episodes=1, horizon=2000)
+        visualize_policy(policy)
 
 
 if __name__ == "__main__":

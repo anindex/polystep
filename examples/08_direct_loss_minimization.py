@@ -9,7 +9,7 @@ averaged over seeds. PolyStepES and OpenAI-ES share an evaluation budget;
 Adam+STE uses a separate 1,500-step gradient baseline.
 
 Run:
-    MPLBACKEND=Agg python examples/08_direct_loss_minimization.py
+    python examples/08_direct_loss_minimization.py
 """
 
 from __future__ import annotations

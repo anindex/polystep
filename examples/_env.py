@@ -8,11 +8,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def setup(default_threads: int = 1) -> None:
-    """Pin the CPU thread count and make a source checkout importable.
+    """Pin the CPU thread count, select a file-only plot backend, and make a source checkout importable.
 
     PolyStep's per-step ops are small, so torch's default ``nproc``-sized thread
     pool costs more than it returns. ``POLYSTEP_THREADS`` overrides.
     """
+    os.environ.setdefault("MPLBACKEND", "Agg")
     import torch
 
     torch.set_num_threads(int(os.environ.get("POLYSTEP_THREADS", 0)) or default_threads)

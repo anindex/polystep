@@ -65,7 +65,7 @@ class LeNet5(nn.Module):
         return self.out(torch.relu(self.f6(x)))
 
 
-def build_optimizer(model: nn.Module, total_steps: int, seed: int) -> PolyStepOptimizer:
+def build_optimizer(model: nn.Module, total_steps: int, seed: int, amortize_steps: int = 5) -> PolyStepOptimizer:
     """A per-layer subspace, flat epsilon and step radius, one annealed probe radius.
 
     Per-layer is required for the site argument: each layer owns a coordinate block,
@@ -74,21 +74,16 @@ def build_optimizer(model: nn.Module, total_steps: int, seed: int) -> PolyStepOp
     """
     # rank=4, not 8: halves the coordinates and the candidates per step; the conv
     # descent direction is low-rank, so the smaller perturbation carries less variance.
-    subspace = HybridSubspace.from_layout(
-        ParamLayout.from_module(model), rank=4, rotation_interval=0, absorb_interval=0
-    )
+    subspace = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=4)
     return PolyStepOptimizer(
         model,
         seed=seed,
         subspace=subspace,
-        solver="softmax",
-        num_probe=1,
         epsilon=10.0,
         step_radius=0.5,
         probe_radius=CosineEpsilon(init=10.0, target=2.0, total_steps=total_steps),
         # Four momentum steps between OT steps, so only every fifth pays for probes.
-        amortize_steps=5,
-        amortize_ema=0.7,
+        amortize_steps=amortize_steps,
     )
 
 
@@ -112,14 +107,14 @@ def accuracy(model, x, y, batch_size=512):
     return 100.0 * correct / x.shape[0]
 
 
-def compare_paths(x, y, device, batch_size, steps=4):
+def compare_paths(x, y, device, batch_size, steps=2):
     """Time and cross-check the two evaluation paths on the same batches."""
     results = {}
     for register in (False, True):
         torch.manual_seed(0)
         model = LeNet5().to(device)
         evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
-        optimizer = build_optimizer(model, total_steps=steps, seed=3)
+        optimizer = build_optimizer(model, total_steps=steps, seed=3, amortize_steps=1)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         started = time.perf_counter()
@@ -181,7 +176,7 @@ def main():
         f"  subspace dim {optimizer.subspace.subspace_dim}, {steps_per_epoch} steps per epoch\n"
     )
 
-    best, best_state = 0.0, None
+    best, best_state = -1.0, None
     started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
         loss = run_epoch(optimizer, loss_fn, train_x, train_y, args.batch_size)
@@ -195,8 +190,7 @@ def main():
         )
     optimizer.release_evaluator()
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    model.load_state_dict(best_state)
     print(f"\n  test accuracy: {accuracy(model, test_x, test_y):.2f}%  ({time.perf_counter() - started:.1f} s)")
 
 

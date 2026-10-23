@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import math
-import os
 import random
 import time
 from pathlib import Path
@@ -56,7 +55,6 @@ class MaxSATModel(nn.Module):
         self.assignments = nn.Parameter(torch.randn(num_vars) * 0.1)
 
 
-# Hyperparameter reference: sqrt-scaled from the 100K row of run_maxsat.py.
 REFERENCE_NUM_VARS = 100_000
 REFERENCE_STEP_RADIUS_INIT = 3000.0
 REFERENCE_STEP_RADIUS_TARGET = 600.0
@@ -101,16 +99,17 @@ def main():
     parser.add_argument(
         "--steps",
         type=int,
-        default=1500,
-        help="Number of PolyStep iterations; 1500 reaches about 98%% SAT.",
+        default=600,
+        help="Number of PolyStep iterations; 600 reaches about 98%% SAT.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if args.steps < 1:
         parser.error("--steps must be positive")
 
     num_vars = 2_000 if args.small else 10_000
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device
 
     torch.manual_seed(args.seed)
 
@@ -191,7 +190,7 @@ def main():
     ax.legend(loc="lower right", fontsize=7)
 
     out = Path(__file__).parent / "figures" / "maxsat_10k.png"
-    os.makedirs(out.parent, exist_ok=True)
+    out.parent.mkdir(exist_ok=True)
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"saved figure: {out}")

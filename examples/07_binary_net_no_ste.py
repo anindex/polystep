@@ -7,7 +7,7 @@ example skips gradients and minimizes 0-1 error directly, comparing PolyStepES
 against OpenAI-ES on a matched budget, averaged over seeds.
 
 Run:
-    MPLBACKEND=Agg python examples/07_binary_net_no_ste.py
+    python examples/07_binary_net_no_ste.py
 """
 
 from __future__ import annotations
