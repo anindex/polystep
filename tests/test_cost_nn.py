@@ -1055,6 +1055,51 @@ def test_vmap_fallback_restores_unversioned_write():
     assert model.ema.item() == 0
 
 
+def test_loop_loss_aliasing_buffer_survives_restore():
+    class CachedScore(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2))
+            self.register_buffer("score", torch.zeros(()))
+
+        def forward(self, x):
+            self.score.copy_((x * self.weight).sum())
+            return self.score
+
+    model = CachedScore()
+    ev = NNCostEvaluator(model, lambda out: out, use_inplace=False)
+    ev._vmap_failed = True
+    losses = ev.evaluate({"weight": torch.tensor([[1.0, 1.0], [2.0, 2.0]])}, torch.ones(2), None)
+    assert losses.tolist() == [2.0, 4.0]
+    assert model.score.item() == 0
+
+
+@pytest.mark.parametrize("chunk", [None, 2])
+def test_buffer_backed_loss_survives_restore(chunk):
+    class CachedScore(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2))
+            self.register_buffer("score", torch.zeros(()))
+
+        def forward(self, x):
+            self.score.copy_(x.sum())
+            return self.score
+
+    model = CachedScore()
+    ev = NNCostEvaluator(model, lambda out: out, use_inplace=False, compile_forward=False, chunk_size=chunk)
+    layout = ParamLayout.from_module(model, particle_dim=2)
+    site = SiteVmapEvaluator.try_build(ev, layout)
+    weights = torch.tensor([[1.0, 1.0], [2.0, 2.0]])
+    dense = ev.evaluate({"weight": weights}, torch.ones(2))
+    local = site.evaluate(
+        layout.unflatten(layout.flatten(model)), layout.entries[0], torch.tensor([[0, 1]]), weights[None], torch.ones(2)
+    )
+    assert dense.tolist() == local.tolist() == [2.0, 2.0]
+    assert not ev._vmap_failed
+    assert model.score.item() == 0
+
+
 @pytest.mark.parametrize("looped", [False, True])
 def test_registration_probe_keeps_running_stats(looped):
     class RunningNorm(nn.Module):
@@ -1064,6 +1109,7 @@ def test_registration_probe_keeps_running_stats(looped):
             self.register_buffer("mean", torch.zeros(2))
             self.register_buffer("var", torch.ones(2))
             self.register_buffer("seen", torch.zeros(0))
+            self.register_buffer("wide", self.mean.expand(3, 2))
 
         def forward(self, x):
             torch.ops.aten.resize_(self.seen, [2])
@@ -1287,11 +1333,12 @@ class MaskedAttention(nn.Module):
     ],
     ids=["start", "stride"],
 )
-def test_masked_attention_unaligned_views_match_slowpath(lead, tail, misaligned):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"])
+def test_masked_attention_unaligned_views_match_slowpath(lead, tail, misaligned, dtype):
     torch.manual_seed(0)
-    model = MaskedAttention(lead(), tail()).cuda()
-    x = torch.randn(6, 5, 8, device="cuda")
-    inputs, y = (x, x[..., 0] < -1), torch.zeros(6, device="cuda")
+    model = MaskedAttention(lead(), tail()).to("cuda", dtype)
+    x = torch.randn(6, 5, 8, device="cuda", dtype=dtype)
+    inputs, y = (x, x[..., 0] < -1), torch.zeros(6, device="cuda", dtype=dtype)
     layout = ParamLayout.from_module(model)
     offset = next(e.offset for e in layout.entries if e.key == "attn.in_proj_bias")
     assert (offset % 4 != 0, layout.padded_size % 4 != 0) == misaligned
@@ -1299,6 +1346,8 @@ def test_masked_attention_unaligned_views_match_slowpath(lead, tail, misaligned)
     stacked = layout.batch_unflatten(torch.stack([flat, flat + 0.01, flat - 0.01]))
     ev = NNCostEvaluator(model, nn.MSELoss())
     fast = ev.evaluate(stacked, inputs, y)
+    shared = layout.batch_unflatten(flat.expand(3, -1))
+    torch.testing.assert_close(ev.evaluate(shared, inputs, y), fast[:1].expand(3), rtol=1e-4, atol=1e-5)
     ev._vmap_failed = True
     torch.testing.assert_close(ev.evaluate(stacked, inputs, y), fast, rtol=1e-4, atol=1e-5)
     torch.backends.mha.set_fastpath_enabled(False)
@@ -1307,8 +1356,9 @@ def test_masked_attention_unaligned_views_match_slowpath(lead, tail, misaligned)
     finally:
         torch.backends.mha.set_fastpath_enabled(True)
     torch.testing.assert_close(fast, slow, rtol=1e-4, atol=1e-5)
-    cost = PolyStepOptimizer(model, seed=0).step_batch(inputs, y, loss_fn=nn.MSELoss())
-    assert torch.isfinite(torch.tensor(cost))
+    for strategy in ("monolithic", "per_layer"):
+        cost = PolyStepOptimizer(model, seed=0, block_strategy=strategy).step_batch(inputs, y, loss_fn=nn.MSELoss())
+        assert torch.isfinite(torch.tensor(cost))
 
 
 @pytest.mark.gpu

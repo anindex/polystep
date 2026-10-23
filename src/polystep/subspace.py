@@ -49,11 +49,12 @@ def top_directions(D: torch.Tensor, k: int) -> torch.Tensor:
     with torch.amp.autocast(device_type, enabled=False) if autocast_available else contextlib.nullcontext():
         h = D.shape[1]
         rows = D.shape[0] if D.dtype == torch.float64 else (1 << 22) // h
-        chunks = map(torch.Tensor.double, D.split(max(1, rows)))
-        w, V = torch.linalg.eigh(sum(c.mT @ c for c in chunks))
+        chunks = D.split(max(1, rows))
+        w, V = torch.linalg.eigh(sum(c.mT @ c for c in map(torch.Tensor.double, chunks)))
         tol = max(h * torch.finfo(w.dtype).eps, (h * torch.finfo(D.dtype).eps) ** 2)
         keep = min(k, int((w > w[-1:] * tol).sum()))
-        return D @ (V[:, h - keep :].flip(1) * w[h - keep :].flip(0).rsqrt()).to(D.dtype)
+        coef = V[:, h - keep :].flip(1) * w[h - keep :].flip(0).rsqrt()
+        return torch.cat([(c.double() @ coef).to(D.dtype) for c in chunks])
 
 
 class ProjectedAbsorbMixin:

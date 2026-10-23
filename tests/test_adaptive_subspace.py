@@ -508,6 +508,23 @@ def test_fp32_top_directions_match_fp64_span():
     assert (reference - kept @ (kept.mT @ reference)).norm(dim=0).max() < 1e-3
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gram_directions_survive_tf32(monkeypatch):
+    """TF32 matmuls leave the retained directions orthonormal and on the FP64 span."""
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    gen = torch.Generator().manual_seed(0)
+    U = torch.linalg.qr(torch.randn(20000, 5, generator=gen, dtype=torch.float64))[0]
+    V = torch.linalg.qr(torch.randn(5, 5, generator=gen, dtype=torch.float64))[0]
+    D = ((U * torch.tensor([1.0, 0.3, 0.1, 3e-4, 1e-7], dtype=torch.float64)) @ V.mT).float().cuda()
+
+    Q = top_directions(D, 5).double()
+    kept = torch.linalg.qr(Q)[0]
+    reference = torch.linalg.svd(D.double(), full_matrices=False)[0][:, :4]
+    assert (Q.mT @ Q - torch.eye(4, dtype=torch.float64, device="cuda")).abs().max() < 1e-3
+    assert (reference - kept @ (kept.mT @ reference)).norm(dim=0).max() < 1e-3
+
+
 def test_direction_only_in_last_chunk_kept():
     """FP32 Gram sums every row chunk, so a direction in the last chunk survives."""
     D = torch.zeros(1_000_000, 5)

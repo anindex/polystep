@@ -39,6 +39,8 @@ _INTERCEPT_SETUP_CALLS = 30
 
 _MAX_SITE_GRAPHS = 64
 
+_MAX_INPUT_SIGNATURES = 64
+
 
 def _is_vmap_error(e: BaseException, probe: Callable[[], object]) -> bool:
     """Whether an exception came from the vmap transform rather than the model.
@@ -242,6 +244,11 @@ def _fold_candidate_loss(loss, per_sample):
     return loss.flatten(1).mean(dim=1) if loss.dim() > 1 else loss
 
 
+def _materialize_expanded(losses):
+    """Copy ``losses`` when vmap expanded one unbatched value, which may be a restored buffer."""
+    return losses.clone() if losses.stride(0) == 0 else losses
+
+
 def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):
     """Reduce ``(N, B, ...)`` outputs to one loss per candidate."""
     if targets is None:
@@ -312,12 +319,11 @@ def _forward_args(inputs) -> tuple[tuple, dict]:
 
 
 def _aligned_stack(v: torch.Tensor) -> torch.Tensor:
-    """Copy a CUDA stack whose start or row stride breaks the 16-byte alignment fused kernels assume."""
-    if (
-        v.is_cuda
-        and v.stride(0)
-        and (v.data_ptr() % 16 or not v.is_contiguous() and v.stride(0) * v.element_size() % 16)
-    ):
+    """Copy a CUDA stack whose start or row stride breaks the alignment fused kernels assume."""
+    align = max(16, 4 * v.element_size())
+    if v.is_cuda and (v.data_ptr() % align or not v.is_contiguous() and v.stride(0) * v.element_size() % align):
+        if not v.stride(0):
+            return v[0].clone(memory_format=torch.contiguous_format).expand_as(v)
         return v.clone(memory_format=torch.contiguous_format)
     return v
 
@@ -328,6 +334,14 @@ def _first_input_tensor(inputs) -> Optional[torch.Tensor]:
         return inputs
     tensors = [t for t in tree_leaves(inputs) if isinstance(t, torch.Tensor)]
     return next((t for t in tensors if t.dim()), tensors[0] if tensors else None)
+
+
+def _input_signature(tree) -> Optional[tuple]:
+    """Structure, tensor shapes and dtypes, and plain leaf values of ``tree``; ``None`` for any other leaf."""
+    leaves, spec = tree_flatten(tree)
+    if not all(isinstance(t, (torch.Tensor, bool, int, float, str, type(None))) for t in leaves):
+        return None
+    return (spec, *((t.shape, t.dtype) if isinstance(t, torch.Tensor) else (type(t), t) for t in leaves))
 
 
 def cast_inputs_memo(holder, inputs, dtype: Optional[torch.dtype]):
@@ -774,7 +788,7 @@ class NNCostEvaluator:
         else:
             try:
                 with self._restoring_buffers():
-                    result = self._evaluate_vmap(stacked_params, inputs, targets)
+                    result = _materialize_expanded(self._evaluate_vmap(stacked_params, inputs, targets))
             except Exception as e:
                 if _batchable_draw(e, self._randomness):
                     self._randomness = "different"
@@ -894,8 +908,8 @@ class NNCostEvaluator:
                 full_dict = {**{k: v[i] for k, v in stacked_params.items()}, **self._buffers}
                 output = functional_call(self.model, full_dict, *_forward_args(inputs))
                 loss = _candidate_loss(self.loss_fn, self._loss_kind, output, targets)
+                losses.append(_fold_candidate_loss(loss, self.per_sample).clone())
                 restore()
-                losses.append(_fold_candidate_loss(loss, self.per_sample))
         return torch.stack(losses)
 
     def _forward_loss(self, inputs, targets):
@@ -1429,6 +1443,25 @@ def _rng_states(devices):
     return [torch.get_rng_state(), *map(torch.cuda.get_rng_state, devices)]
 
 
+class _GeneratorStates(TorchFunctionMode):
+    """Keeps each explicit generator's first state and notes any call that moves a default one."""
+
+    def __init__(self, devices):
+        super().__init__()
+        self.devices = devices
+        self.states = {}
+        self.drew = False
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        for g in tree_leaves((args, kwargs)):
+            if isinstance(g, torch.Generator):
+                self.states.setdefault(g, g.get_state())
+        before = _rng_states(self.devices)
+        out = func(*args, **(kwargs or {}))
+        self.drew = self.drew or not all(map(torch.equal, before, _rng_states(self.devices)))
+        return out
+
+
 def _autocast_state():
     """Autocast ``(enabled, dtype)`` on CPU and CUDA."""
     return tuple((torch.is_autocast_enabled(d), torch.get_autocast_dtype(d)) for d in ("cpu", "cuda"))
@@ -1464,17 +1497,25 @@ def _traced_children(model: nn.Module):
     devices = list({p.device for p in model.parameters() if p.device.type == "cuda"})
     was_training = model.training
     py_state = random.getstate()
+    generators = _GeneratorStates(devices)
     model.eval()
     try:
-        with torch.random.fork_rng(devices=devices), torch.inference_mode():
+        with torch.random.fork_rng(devices=devices), torch.inference_mode(), generators:
             before = _rng_states(devices)
             prev, *body, out = _PlanTracer().trace(model).nodes
-            if random.getstate() != py_state or not all(map(torch.equal, before, _rng_states(devices))):
+            if (
+                generators.states
+                or generators.drew
+                or random.getstate() != py_state
+                or not all(map(torch.equal, before, _rng_states(devices)))
+            ):
                 return None
     except Exception:
         return None
     finally:
         random.setstate(py_state)
+        for g, state in generators.states.items():
+            g.set_state(state)
         if was_training:
             model.train()
     if prev.op != "placeholder" or any(n.meta["autocast"] != prev.meta["autocast"] for n in body):
@@ -1750,7 +1791,7 @@ class SiteVmapEvaluator:
         self._failed_sites = set()
         self._uninjectable_sites = set()
         self._matched_injections = {}
-        self._forward_calls = 0
+        self._forward_calls = {}
         self._graph_failed_sites = set()
         self._warned = False
         self._randomness = "error"
@@ -1801,10 +1842,12 @@ class SiteVmapEvaluator:
         return self._owner._vmap_failed
 
     def aligned_base(self, base_sd: dict) -> dict:
-        """``base_sd`` with CUDA entries off 16-byte alignment copied when the model has attention."""
+        """``base_sd`` with CUDA entries off fused-kernel alignment copied when the model has attention."""
         if not self._owner._align_stacks:
             return base_sd
-        copies = {id(v): v.clone() for v in base_sd.values() if v.is_cuda and v.data_ptr() % 16}
+        copies = {
+            id(v): v.clone() for v in base_sd.values() if v.is_cuda and v.data_ptr() % max(16, 4 * v.element_size())
+        }
         return {k: copies.get(id(v), v) for k, v in base_sd.items()}
 
     def resolve_site(self, offsets: torch.Tensor, pdim: int, span=None):
@@ -1926,10 +1969,14 @@ class SiteVmapEvaluator:
         base = base_sd[entry.key]
         first = _first_input_tensor(inputs)
         work = min(n, self._owner.chunk_size or n) * (first.shape[0] if first.dim() else 1) * base.numel()
+        shapes = _input_signature(inputs)
+        if shapes is None or shapes not in self._forward_calls and len(self._forward_calls) >= _MAX_INPUT_SIGNATURES:
+            self._forward_calls.clear()
+            self._matched_injections.clear()
         if (
             base.device.type == "cpu"
             and base.dim() > 1
-            and work >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls + _INTERCEPT_SETUP_CALLS)
+            and work >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls.get(shapes, 0) + _INTERCEPT_SETUP_CALLS)
             and base.dtype not in (torch.float16, torch.bfloat16)
             and not self._owner._compile_vmap
             and not self._has_script_module
@@ -1939,11 +1986,12 @@ class SiteVmapEvaluator:
             dv = values - base.reshape(-1)[rows].unsqueeze(1)
             dv = dv.masked_fill(local_idx.unsqueeze(1) >= entry.numel, 0)
             offsets = (rows.unsqueeze(1).expand(groups, cand, pdim).reshape(n, pdim), dv.reshape(n, pdim))
-            sig = (entry.key, *((t.shape, t.dtype) for t in tree_leaves(inputs) if isinstance(t, torch.Tensor)))
+            sig = (entry.key, shapes)
             tested = self._matched_injections.get(sig, base.new_zeros(entry.numel, dtype=torch.bool))
             fresh = dv.ne(0) & ~tested[rows].unsqueeze(1)
             probe = dv.gather(1, fresh.int().argmax(1, keepdim=True)).squeeze(1) * fresh.any(1)
             pick = probe.ne(0).any(1)
+            pick[0] |= shapes not in self._forward_calls
             try:
                 matched = not pick.any() or self._injection_matches(
                     base_sd, entry, rows[pick], probe[pick], inputs, targets
@@ -1951,7 +1999,9 @@ class SiteVmapEvaluator:
                 if matched:
                     tested[rows[pick][probe[pick] != 0]] = True
                     self._matched_injections[sig] = tested
-                    if work >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls + _INTERCEPT_SETUP_CALLS):
+                    if work >= _MACS_PER_INTERCEPTED_CALL * (
+                        self._forward_calls.get(shapes, 0) + _INTERCEPT_SETUP_CALLS
+                    ):
                         return self._vmap_over_site(entry.key, base_sd, offsets, inputs, targets)
             except _SiteNotInjectable:
                 matched = False
@@ -1974,6 +2024,7 @@ class SiteVmapEvaluator:
         once per forward.
         """
         inject = isinstance(site, tuple)
+        shapes = _input_signature(inputs)
         names = self._names[key]
         shared = {k: v for k, v in base_sd.items() if k not in names}
         shared.update(self._buffers)
@@ -1996,7 +2047,7 @@ class SiteVmapEvaluator:
                     )
                 if not delta.added:
                     raise _SiteNotInjectable
-                self._forward_calls = delta.calls
+                self._forward_calls[shapes] = delta.calls
             else:
                 output = functional_call(model, {**shared, **dict.fromkeys(names, site_param)}, *_forward_args(inputs))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
@@ -2005,7 +2056,7 @@ class SiteVmapEvaluator:
             losses = []
             with self._owner._restoring_buffers() as restore:
                 for i in range(n):
-                    losses.append(single_eval(tree_map(lambda t: t[i], site), shared, inputs, targets))
+                    losses.append(single_eval(tree_map(lambda t: t[i], site), shared, inputs, targets).clone())
                     restore()
             return torch.stack(losses)
 
@@ -2025,7 +2076,7 @@ class SiteVmapEvaluator:
                             # Shared weights, buffers and data are explicit arguments: no
                             # batch or incumbent from the first call is baked into a graph.
                             self._compiled_sites[key] = torch.compile(batched, mode="default", fullgraph=False)
-                        return self._compiled_sites[key](site, shared, inputs, targets)
+                        return _materialize_expanded(self._compiled_sites[key](site, shared, inputs, targets))
                     except torch.cuda.OutOfMemoryError:
                         raise
                     except Exception as e:
@@ -2044,8 +2095,10 @@ class SiteVmapEvaluator:
                     and self._randomness == "error"
                     and key not in self._graph_failed_sites
                 ):
-                    return self._replay_site(key, batched, base_sd, site, shared, inputs, targets)
-                return batched(site, shared, inputs, targets)
+                    return _materialize_expanded(
+                        self._replay_site(key, batched, base_sd, site, shared, inputs, targets)
+                    )
+                return _materialize_expanded(batched(site, shared, inputs, targets))
         except _SiteNotInjectable:
             raise
         except Exception as e:
@@ -2167,10 +2220,9 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
             with owner._autocast(device), owner._restoring_buffers() as restore:
                 forward = owner._verified_forward_loss_fn(inputs, targets)
 
-                def score():
-                    loss = forward(inputs, targets).detach()
+                def score(i):
+                    losses[i] = forward(inputs, targets).detach()
                     restore()
-                    return loss
 
                 yield losses, score
         finally:
@@ -2190,7 +2242,7 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
                 try:
                     for c, candidate in enumerate(group):
                         self._param(entry.key).view(-1).index_copy_(0, idx, candidate)
-                        losses[g * cand + c] = score()
+                        score(g * cand + c)
                 finally:
                     self._param(entry.key).view(-1).index_copy_(0, idx, incumbent[g])
         return losses
@@ -2242,13 +2294,13 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
                         block = _column_run(P, col_start + g * pdim, pdim)
                         for c, delta in enumerate(group):
                             torch.addmv(bary, block, delta, out=self._param(spec.entry_key).view(-1))
-                            losses[g * n_cand + c] = score()
+                            score(g * n_cand + c)
                 else:
                     incumbent = flat[rows]
                     for g, (idx, group) in enumerate(zip(rows, incumbent.unsqueeze(1) + src)):
                         for c, write in enumerate(group):
                             self._param(spec.entry_key).view(-1).index_copy_(0, idx, write)
-                            losses[g * n_cand + c] = score()
+                            score(g * n_cand + c)
                         self._param(spec.entry_key).view(-1).index_copy_(0, idx, incumbent[g])
             finally:
                 self._param(spec.entry_key).view(-1).copy_(bary)

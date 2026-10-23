@@ -5,6 +5,8 @@ these tests pin that plan, the warning for forwards that do not, and the shipped
 """
 
 import random
+import subprocess
+import sys
 import warnings
 from collections import OrderedDict
 
@@ -210,12 +212,45 @@ def test_declined_trace_keeps_global_rng():
     assert torch.equal(torch.rand(3), expected)
 
 
-@pytest.mark.parametrize("draw", [lambda: torch.rand(()).item(), random.random], ids=["torch", "python"])
+_GENERATOR = torch.Generator().manual_seed(0)
+
+
+def _forked_draw():
+    with torch.random.fork_rng(devices=[]):
+        return torch.rand(()).item()
+
+
+@pytest.mark.parametrize(
+    "draw",
+    [lambda: torch.rand(()).item(), random.random, lambda: torch.rand((), generator=_GENERATOR).item(), _forked_draw],
+    ids=["torch", "python", "generator", "forked"],
+)
 def test_traced_plan_random_branch_declined(draw):
     model = _single_linear(lambda m, x: torch.relu(m.fc(x)) if draw() < 0.5 else torch.tanh(m.fc(x)))
-    state = random.getstate()
+    state, generator_state = random.getstate(), _GENERATOR.get_state()
     assert _plan_names(model) is None
     assert random.getstate() == state
+    assert torch.equal(_GENERATOR.get_state(), generator_state)
+
+
+def test_traced_plan_build_skips_dynamo_import():
+    code = """
+import sys
+import torch
+from polystep.cost_nn import BatchedLinearEvaluator
+
+class Net(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(4, 2)
+
+    def forward(self, x):
+        return torch.relu(self.fc(x))
+
+assert BatchedLinearEvaluator.try_build(Net(), torch.nn.CrossEntropyLoss()) is not None
+assert "torch._dynamo" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_traced_plan_training_gated_kept():

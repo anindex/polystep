@@ -1,6 +1,7 @@
 """Tests for optimizer checkpoint/resume and the restore_best training guard."""
 
 import copy
+from fractions import Fraction
 
 import pytest
 import torch
@@ -568,6 +569,55 @@ def test_site_injection_resume_matches_uninterrupted():
         opt_c.step_batch(inputs, targets, loss_fn=loss_fn)
 
     for expected, got in zip(model_a.parameters(), model_c.parameters()):
+        assert torch.equal(expected, got), (expected - got).abs().max()
+
+
+@pytest.mark.parametrize(
+    "side_inputs",
+    [
+        None,
+        ({"deep": True}, {"deep": False}),
+        ({"deep": Fraction(1)}, {"deep": Fraction(0)}),
+        ({"deep": True}, {"wide": True}),
+    ],
+)
+def test_resume_bit_exact_across_input_signatures(side_inputs):
+    """A forward whose call count depends on the batch shape or a side input keeps injection decisions per input."""
+
+    class Branch(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(32, 16)
+
+        def forward(self, x, deep=False, wide=False):
+            h = self.fc(x)
+            for _ in range(100 if deep or x.shape[0] > 40 else 0):
+                h = h.sin()
+            return h
+
+    def build():
+        torch.manual_seed(0)
+        model = Branch()
+        return model, PolyStepOptimizer(model, seed=11, solver="softmax", chunk_size=512, compile=False)
+
+    gen = torch.Generator().manual_seed(5)
+    if side_inputs:
+        x, y = torch.randn(32, 32, generator=gen), torch.randn(32, 16, generator=gen)
+        first, second = [({"x": x, **side}, y) for side in side_inputs]
+    else:
+        first, second = [(torch.randn(n, 32, generator=gen), torch.randn(n, 16, generator=gen)) for n in (64, 32)]
+    loss_fn = nn.MSELoss()
+    model_a, opt_a = build()
+    opt_a.step_batch(*first, loss_fn=loss_fn)
+    checkpoint, weights = copy.deepcopy(opt_a.state_dict()), copy.deepcopy(model_a.state_dict())
+
+    model_b, opt_b = build()
+    model_b.load_state_dict(weights)
+    opt_b.load_state_dict(checkpoint)
+    opt_a.step_batch(*second, loss_fn=loss_fn)
+    opt_b.step_batch(*second, loss_fn=loss_fn)
+
+    for expected, got in zip(model_a.parameters(), model_b.parameters()):
         assert torch.equal(expected, got), (expected - got).abs().max()
 
 

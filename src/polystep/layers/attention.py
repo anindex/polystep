@@ -123,6 +123,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
         half_scores = Q.dtype == torch.float16 or (
             Q.dtype != torch.float64 and autocast_on and torch.get_autocast_dtype(device_type) == torch.float16
         )
+        upcast_scores = Q.dtype in (torch.float16, torch.bfloat16) or (Q.dtype != torch.float64 and autocast_on)
         fused = device_type == "cpu" or (
             device_type == "cuda"
             and not any(map(is_batchedtensor, (Q, K, V)))
@@ -170,7 +171,7 @@ class VmapSafeMultiHeadAttention(nn.Module):
             )
         else:
             # Off CPU: explicit matmul and softmax, with fully masked rows given zero weight.
-            if half_scores:
+            if upcast_scores:
                 with torch.amp.autocast(device_type, enabled=False) if autocast_on else contextlib.nullcontext():
                     scores = torch.matmul(Q.float(), K.float().transpose(-2, -1))
             else:

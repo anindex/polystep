@@ -467,6 +467,24 @@ def test_wide_vmap_attention_stays_batched(site):
         torch.testing.assert_close(out[-1], attn(x, x, x), rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("autocast", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_half_vmap_attention_matches_eager(dtype, autocast):
+    x_dtype = torch.float32 if autocast else dtype
+    attn = VmapSafeMultiHeadAttention(4, 1).to(device="cuda", dtype=x_dtype).eval()
+    with torch.no_grad(), torch.autocast("cuda", dtype=dtype, enabled=autocast):
+        for p in attn.parameters():
+            p.copy_(torch.eye(4) if p.dim() == 2 else torch.zeros(4))
+        q = torch.tensor([[[1.0, 1.0, 0.0, 0.0]]], device="cuda", dtype=x_dtype)
+        k = torch.tensor([[[1024.0, 4.0, 0.0, 0.0], [1024.0, 0.0, 0.0, 0.0]]], device="cuda", dtype=x_dtype)
+        v = torch.eye(4, device="cuda", dtype=x_dtype)[None, :2]
+        params = {n: p.detach().expand(2, *p.shape) for n, p in attn.named_parameters()}
+        out = torch.vmap(lambda p: torch.func.functional_call(attn, p, (q, k, v)))(params)
+        torch.testing.assert_close(out[0], attn(q, k, v), check_dtype=False, rtol=1.6e-2, atol=1e-5)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_meta_attention_forward_keeps_shape(dtype):
     model = VmapSafeMultiHeadAttention(8, 2).to(device="meta", dtype=dtype)

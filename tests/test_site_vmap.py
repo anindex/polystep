@@ -523,6 +523,24 @@ def test_later_call_hidden_read_declines_injection(monkeypatch, read, calls):
     assert site._uninjectable_sites == {"fc.weight"}
 
 
+def test_forward_counts_cap_input_signatures(monkeypatch):
+    from polystep import cost_nn
+
+    monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
+    monkeypatch.setattr(cost_nn, "_MAX_INPUT_SIGNATURES", 2)
+    torch.manual_seed(0)
+    model = SkipMLP().double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[0], torch.tensor([[0, 1]])
+    values = base_sd[entry.key].reshape(-1)[local_idx].unsqueeze(1) + torch.randn(1, 3, PDIM, dtype=torch.float64)
+    for rows in (5, 6, 7):
+        x, y = torch.randn(rows, 6, dtype=torch.float64), torch.randint(0, 3, (rows,))
+        site.evaluate(base_sd, entry, local_idx, values, x, y)
+        assert 0 < len(site._forward_calls) <= 2
+
+
 @pytest.mark.filterwarnings("ignore:vmap failed:RuntimeWarning")
 @pytest.mark.parametrize("unread_first", [False, True])
 def test_partial_move_hidden_read_declines_injection(monkeypatch, unread_first):
@@ -667,6 +685,25 @@ def test_tuple_inputs_keep_site_injection(monkeypatch):
     got = site.evaluate(base_sd, entry, local_idx, values, (inputs.double(),), targets)
     assert site._matched_injections and not site._uninjectable_sites
     torch.testing.assert_close(got, site.evaluate(base_sd, entry, local_idx, values, inputs.double(), targets))
+
+
+def test_zero_offset_conv_chunk_scores_without_raising(monkeypatch):
+    from polystep import cost_nn
+
+    monkeypatch.setattr(cost_nn, "_MACS_PER_INTERCEPTED_CALL", 0)
+    torch.manual_seed(0)
+    model = ConvNet().double()
+    layout = ParamLayout.from_module(model, particle_dim=PDIM)
+    site = SiteVmapEvaluator.try_build(NNCostEvaluator(model, nn.CrossEntropyLoss()), layout)
+    base_sd = {k: v.detach() for k, v in model.state_dict().items()}
+    entry, local_idx = layout.entries[0], torch.tensor([[0, 1]])
+    values = base_sd[entry.key].reshape(-1)[local_idx].unsqueeze(1).expand(1, 3, PDIM).clone()
+    materialize, injected = site._vmap_over_site, []
+    site._vmap_over_site = lambda key, sd, c, *a: injected.append(isinstance(c, tuple)) or materialize(key, sd, c, *a)
+    inputs, targets = _batch()
+    got = site.evaluate(base_sd, entry, local_idx, values, inputs.double(), targets)
+    assert got.isfinite().all() and torch.equal(got, got[:1].expand_as(got))
+    assert injected == [True, False, True]
 
 
 def test_scalar_input_site_gate_skips_crash():
@@ -1131,6 +1168,35 @@ def test_inplace_site_keeps_float64_resolution():
     )
     assert losses.dtype == torch.float64
     assert len(torch.unique(losses)) == 3
+
+
+@pytest.mark.parametrize("use_inplace", [True, False])
+def test_site_loss_aliasing_buffer_survives_restore(use_inplace):
+    class CachedScore(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2))
+            self.register_buffer("score", torch.zeros(()))
+
+        def forward(self, x):
+            self.score.copy_((x * self.weight).sum())
+            return self.score
+
+    model = CachedScore()
+    layout = ParamLayout.from_module(model, particle_dim=2)
+    evaluator = NNCostEvaluator(model, lambda out: out, use_inplace=use_inplace, compile_forward=False)
+    site = SiteVmapEvaluator.try_build(evaluator, layout)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        losses = site.evaluate(
+            layout.unflatten(layout.flatten(model)),
+            layout.entries[0],
+            torch.tensor([[0, 1]]),
+            torch.tensor([[[1.0, 1.0], [2.0, 2.0]]]),
+            torch.ones(2),
+        )
+    assert losses.tolist() == [2.0, 4.0]
+    assert model.score.item() == 0
 
 
 @pytest.mark.parametrize("projection", ["dense", "sparse", "unprojected"])
