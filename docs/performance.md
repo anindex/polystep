@@ -1,12 +1,19 @@
 # Performance
 
-A step usually scores `P * V * K` candidates: particles, vertices, and probe radii.
+A step usually scores `P * V * K` candidates, where `P` is the particle count, `V`
+the vertices per particle and `K` the probe radii per vertex.
 Each particle holds `d` coordinates, `particle_dim` (default 2) in full space or
 `subspace_particle_dim` (default 8) with a subspace. The simplex has `d + 1`
 vertices, the orthoplex `2d`, and the cube `2^d`. The README quickstart searches 128
 coordinates, so at the default `num_probe=1` a step scores 16 particles times the 9
 simplex vertices, 144 candidates. The quadratic model adds one shared incumbent
 evaluation when `biased_rotation` or `trust_region` uses it.
+
+See [candidate evaluation](#candidate-evaluation) for how forwards are batched,
+[subspaces and memory](#subspaces-and-memory) for candidate counts and chunk sizes,
+and [compilation and precision](#compilation-and-precision) for backend tradeoffs.
+The [CPU measurements](#cpu-measurements) and [benchmark commands](#benchmarks)
+show how to measure a workload.
 
 ## Quick checklist
 
@@ -30,18 +37,23 @@ evaluation when `biased_rotation` or `trust_region` uses it.
 | Models too large for batched weight copies | In-place parameter swaps | Automatic on CUDA when eight weight copies would take more than half the free memory; `NNCostEvaluator(..., use_inplace=True)` forces it |
 | Convolution nets on CPU with large activation maps | In-place parameter swaps | Opt-in with `NNCostEvaluator(model, loss_fn, use_inplace=True)`; time a few steps both ways |
 
-A Linear MLP is an `nn.Sequential`, or a module whose forward chains Linear layers,
-the common activations and `x.flatten(1)`, one call feeding the next. Activations count
-as modules or as `torch.relu`, `F.gelu` and similar calls with default arguments. Hooks,
-buffers, residual connections and other operations keep a custom forward on the
-site-local or vmap path. Tied weights, such as an output layer that reuses the
-embedding table, keep the site-local path too: a candidate for the tied weight reaches
-every module that reads it.
+Here, a Linear MLP means an `nn.Sequential` or a custom forward that chains Linear
+layers, common activations and optional `x.flatten(1)` calls. Each call feeds the next.
+Activations may be modules or functions such as `torch.relu` and `F.gelu` with default
+arguments. Hooks, buffers, residual connections and other operations keep a custom
+forward on the site-local or vmap path. Tied weights, such as an output layer that
+reuses the embedding table, keep the site-local path too: a candidate for the tied
+weight reaches every module that reads it.
 
 The Linear MLP paths need a builtin loss: `nn.CrossEntropyLoss`, `nn.MSELoss` or
 `nn.L1Loss` with mean reduction, or `F.cross_entropy`, `F.mse_loss` or `F.l1_loss`.
 Cross-entropy may carry class weights, `ignore_index` and label smoothing. Any other
 loss, including a lambda that calls one of these, takes the site-local or vmap path.
+
+On CPU, vmap evaluates unweighted, unsmoothed mean cross-entropy on `(batch, classes)`
+logits with `log_softmax` and indexed reduction. Ignored targets keep PyTorch's mean
+semantics, including NaN when every target is ignored. Other shapes and loss settings
+use the original loss callable.
 
 The delta and factored paths treat each sample as one feature vector, so they need
 two-dimensional inputs or a leading `nn.Flatten` or `x.flatten(1)`. A Linear MLP
@@ -92,29 +104,32 @@ A weight keeps a full copy per candidate when:
   instance or class attribute;
 - it is a bias or an FP16/BF16 weight, or `compile_vmap=True`.
 
-A read that escapes interception another way, such as a module-level scripted
-function, a scripted module kept in a list, a C++ extension or a read under
-`torch._C.DisableTorchFunction`, is caught by a parity check. The first chunk that
-moves a coordinate, per input shape and dtype, combines the moves of all such
-coordinates into one candidate and scores it and the incumbent with the added change
-and with built weights, from the same random state. The weight keeps the path only if
-the losses agree within 64 machine epsilons times max(|loss|, 1), or within 1% of the
-combined candidate's loss change; otherwise it gets a full copy for the rest of the
-run. Finite against non-finite fails the check, and non-finite both ways scores that
-chunk with built weights and checks again. A read whose share of the loss change stays
-below the tolerance goes unnoticed, and FP32 losses can differ in the last bits.
+A parity check tests for reads that escape interception, such as a module-level
+scripted function, a scripted module kept in a list, a C++ extension or a read under
+`torch._C.DisableTorchFunction`. For each input shape and dtype, the first chunk to
+move a coordinate contributes that change to a combined candidate. The evaluator
+scores this candidate and the incumbent both ways: with injected output changes and
+with reconstructed weights, starting from the same random state.
 
-Intercepting a call costs about 3 microseconds on one CPU thread, about what a batched
-matmul spends on 150,000 multiply-adds. The path therefore runs only when the
-candidates in one vmap chunk (all of them without a `chunk_size`) times batch size (1
-for a scalar input) times weight elements reaches 150,000 per torch call of the
-forward, plus 30 calls of setup. The call count comes from the last forward on this
-path. Before the first, the parity check counts the calls and scores the chunk with
-built weights if that count rules the path out, so a run resumed from a checkpoint
-picks the same path as one that never stopped. CUDA keeps a full copy, since a
-launch-bound step pays the few microseconds of each intercepted call in full: on an
-RTX 5090 the residual MLP gained only 3%, while a LeNet-5 and a 20-step RNN with
-hidden size 64 took about 1.3 times as long per step.
+The weight keeps the injection path if losses agree within 64 machine epsilons times
+`max(abs(loss), 1)`, or within 1% of the combined candidate's loss change. A mismatch
+disables injection for that weight for the rest of the run. A finite loss on only one
+path counts as a mismatch. If both are nonfinite, the chunk uses reconstructed weights
+and the check is retried later. Differences below the tolerance can go undetected;
+FP32 losses can still differ in their last bits.
+
+Intercepting a call costs about 3 microseconds on one CPU thread, roughly the cost of
+150,000 multiply-adds in a batched matmul. Injection runs when
+`chunk_candidates * batch_size * weight_elements >= 150000 * (forward_calls + 30)`.
+Without `chunk_size`, the chunk includes all candidates; scalar inputs use batch size
+1. The extra 30 calls account for setup.
+
+The evaluator uses the call count from the previous forward on this path. On first
+use, the parity check measures it and selects reconstructed weights if injection
+would cost more. A resumed run therefore selects the same path as an uninterrupted
+one. CUDA always reconstructs the weights: on an RTX 5090, injection improved the
+residual MLP by only 3% and made LeNet-5 and a 20-step RNN with hidden size 64 take
+about 1.3 times as long per step.
 
 ### In-place evaluation
 
@@ -123,22 +138,25 @@ one candidate at a time, and turns off the vmap, delta and factored paths. Each
 sweep writes the incumbent into the model once; a full-space or `HybridSubspace`
 candidate that changes one parameter then rewrites only that parameter, and in full
 space only its own entries. Tied weights share storage, so they move together. The
-registered evaluator's loss scores these candidates. Candidates that span two
-parameters, FP16/BF16 hybrid weights and non-contiguous parameters swap in every
-weight instead, as do screened hybrid candidates of
-[small steps](api_overview.md#evaluation-controls), the hybrid incumbent and models
-with a `max_norm` embedding, whose forward rewrites the rows it looks up. When the
-evaluator picks the in-place path on its own to save memory, it still uses the
-site-local, delta and factored paths where they apply and swaps the remaining
-candidates in one at a time. It rewrites a single parameter in place only when the
-model ties weights.
+registered evaluator's loss scores these candidates.
+
+The evaluator swaps in every weight for candidates spanning two parameters,
+FP16/BF16 hybrid weights, non-contiguous parameters, the hybrid incumbent and screened
+hybrid candidates below the [fast-path threshold](api_overview.md#evaluation-controls).
+Models with a `max_norm` embedding also swap every weight, since their forward
+renormalizes the rows it reads.
+
+When the evaluator selects in-place evaluation automatically to save memory, it
+continues to use the site-local, delta and factored paths where supported. Remaining
+candidates are swapped in one at a time. In this automatic mode, the single-parameter
+rewrite applies only to tied-weight models.
 
 On the CPU, batching candidates multiplies every activation map by the chunk size, so
 a net that keeps full-resolution maps spends much of its step moving them through
 memory. On one thread, a two-block ResNet with 16 channels on 16x16 inputs stepped 1.4
-times faster with `use_inplace=True` at batch 32 and 128, while LeNet-5 took 7.6 times
-as long and a pooled three-convolution CIFAR net 1.6 times as long, and on CUDA the
-ResNet took 2.2 times as long in place.
+times faster with `use_inplace=True` at batch 32 and 128. The same option made LeNet-5
+take 7.6 times as long and a pooled three-convolution CIFAR net 1.6 times as long.
+On CUDA, the ResNet took 2.2 times as long in place.
 
 ### Random and untraceable forwards
 
@@ -146,15 +164,19 @@ A forward that draws its own random numbers, such as injected noise, stays batch
 vmap refuses the draw at first, so the evaluator retries once with
 `randomness="different"`. Each candidate then gets its own draw: identical
 candidates can score differently, and a seeded run's stream differs from scoring
-them one at a time. A forward vmap cannot trace, such as one that calls `.item()` on
-an activation or runs a stock `nn.GRU`, falls back to a sequential loop with a
-warning. When the error names no functorch cause, the evaluator first scores one
-candidate unbatched, so a forward that fails on its own raises its own error. On the
-site-local path the fallback is per parameter: a parameter whose site vmap refuses,
-such as a shortcut added in place with `+=`, moves to the dense path, and every other
-parameter stays site-local. Buffers the forward writes are restored after every
-batched call and after every looped candidate, so the retry, the probe, the loop and
-later calls all start from the same buffer values.
+them one at a time.
+
+A forward that vmap cannot batch, such as one that calls `.item()` on an activation
+or runs a stock `nn.GRU`, falls back to a sequential loop with a warning. If an error
+does not identify a functorch limitation, the evaluator tries one candidate unbatched.
+A failure there raises the model's own error. Site-local fallback applies per
+parameter: if vmap rejects one site, for example because of an in-place `+=`
+shortcut, that parameter moves to the dense path. Other parameters stay site-local.
+
+Buffers written by the forward are restored after each batched chunk and looped
+candidate. Embedding weights renormalized by `max_norm` are restored too, including
+frozen weights. See [evaluation limits](../LIMITATIONS.md#evaluation) for writes that
+bypass tensor version tracking.
 
 ## Subspaces and memory
 
@@ -191,13 +213,15 @@ about 1.5% to the mean step time of the same MLP. Pass `rotation_interval=0` to 
 `B` fixed.
 
 The delta path scores each parameter in its own pass and launches more kernels per
-chunk than the low-rank correction, which a GPU pays for while its chunks are too
-small to keep it busy. On CUDA it therefore runs only when both hold: one chunk of the
-default budget cannot hold every candidate, and `chunk_size` (or the candidate count,
-when it is unset) times a candidate's largest layer output reaches 2^24, about 16.8
-million, elements. Other factored CUDA steps use the low-rank correction, which needs
-more peak memory per chunk. `HybridSubspace` has no low-rank correction, so this rule
-does not apply to it.
+chunk than the low-rank correction. On CUDA, that overhead outweighs the savings for
+small chunks. The delta path runs only when both conditions hold:
+
+- The default chunk budget cannot hold every candidate.
+- `chunk_size` times a candidate's largest layer output reaches `2**24` elements
+  (about 16.8 million). If `chunk_size` is unset, use the candidate count.
+
+Other factored CUDA steps use the low-rank correction, which needs more peak memory
+per chunk. `HybridSubspace` has no low-rank correction, so this rule does not apply.
 
 The threshold is where the delta path stops losing on shallow MLPs (784-128-10 at
 batch 512 on an RTX 5090). On that GPU the delta steps this rule picks at the default
@@ -219,13 +243,12 @@ coordinates of the one particle the candidate moves, so each candidate reads
 particle, screened candidates and the incumbent use the full `base + P @ x`, as do
 sparse projections and FP16/BF16 runs.
 
-When `P` is dense FP32 or FP64 and the step has no screen, every chunk, the padded
-particle and the incumbent included, is written into one buffer that the optimizer
-keeps between steps, because a fresh allocation of that size costs the CPU a page
-fault per page, so a closure must
-[clone any candidate tensor it keeps](../LIMITATIONS.md#evaluation). CUDA keeps the
-full product for every candidate, since one dense GEMM measured faster there than the
-many thin batched products the offsets need.
+When `P` is dense FP32 or FP64 and screening is off, the optimizer reuses one buffer
+across chunks and steps, including the padded particle and incumbent. This avoids
+page faults from fresh allocations. A closure must
+[clone any candidate tensor it keeps](../LIMITATIONS.md#evaluation). CUDA computes the
+full product for every candidate: one dense matrix multiplication measured faster
+there than the many thin batched products needed for coordinate offsets.
 
 ### Chunk sizes
 
@@ -347,10 +370,11 @@ difference to training loss or accuracy.
 
 ## CPU measurements
 
-PyTorch 2.13 on one efficiency-core thread of an Intel Core Ultra 9 285K. Complete
-steps of a 32-w-w-4 MLP at batch 32 with `solver="softmax"`, `chunk_size=72` and a
-registered evaluator, the median over five seeds, each run twice, of the median of
-seven timed steps after one cold step and two warmup steps. The subspace row is a
+These measurements use PyTorch 2.13 and one efficiency-core thread of an Intel Core
+Ultra 9 285K. The workload is a complete step of a 32-w-w-4 MLP at batch 32, with
+`solver="softmax"`, `chunk_size=72` and a registered evaluator. Each of five seeds
+runs twice. Each run has one cold step, two warmup steps and seven timed steps; the
+table reports the median of the ten per-run medians. The subspace row uses a
 `HybridSubspace` at rank 4 capped at 1,024 coordinates:
 
 | Hidden width `w` | Search | Without prefix reuse | With reuse |
@@ -378,16 +402,17 @@ device, shapes, and backend selection.
 
 ## CPU threads
 
-PyTorch starts one intra-op thread per core, and whether that helps depends on the
-step. Other jobs held the performance cores of the machine above, so these runs used
-eight of its efficiency cores. There the README quickstart step takes about 1.6 ms on
-one thread and slightly longer on four or eight, while the full-space 784-64-10 step
-that `python -m polystep.benchmarks.threads` times drops from 104 ms on one thread to
-63 ms on four and 54 ms on eight. A pool that covers every core also slows down when
-other processes compete for the CPU, so the fast test suite and the examples default
-to one thread; [CONTRIBUTING](../CONTRIBUTING.md#tests) and the
-[examples](../examples/README.md) list the exceptions. The optimizer warns once when
-the pool covers every core or all but one.
+PyTorch's default intra-op thread pool can be too large for small steps, especially
+when other processes share the CPU. Measurements on eight efficiency cores of the
+machine above show the tradeoff: the README quickstart takes about 1.6 ms per step on
+one thread and slightly longer on four or eight. The full-space 784-64-10 workload in
+`python -m polystep.benchmarks.threads` drops from 104 ms on one thread to 63 ms on four
+and 54 ms on eight. Other jobs occupied the performance cores during these runs.
+
+The fast test suite and most examples default to one thread;
+[CONTRIBUTING](../CONTRIBUTING.md#tests) and the [examples](../examples/README.md) list
+the exceptions. The optimizer warns once when the pool covers every core or all but
+one.
 
 To choose a count, run `python -m polystep.benchmarks.threads`, which times that
 step at several thread counts in separate processes and prints the fastest, or time
@@ -411,3 +436,10 @@ Forward benchmarks check loss parity and report cold time, median, IQR, and exec
 operators. GPU peak allocation is measured; CPU allocation is left unreported. The
 [search benchmarks](../experiments/README.md#search-benchmarks) measure search
 quality rather than speed.
+
+For related approaches, [MeZO](https://arxiv.org/abs/2305.17333) uses in-place
+perturbations to keep memory near inference cost, while
+[EGGROLL](https://arxiv.org/abs/2511.16652) uses low-rank perturbations to make large
+candidate batches cheaper. These address different costs: fewer stored weights do
+not necessarily mean faster steps. Compare complete steps, peak memory and attained
+loss at matched evaluation and time budgets when choosing an evaluation path.

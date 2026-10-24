@@ -1132,6 +1132,8 @@ class PolyStepOptimizer(SerializationMixin):
         Returns:
             Closure that scores this batch; pass it to ``step()``.
         """
+        if evaluator.model is not self.model:
+            raise ValueError("register_evaluator() got a different model than the optimizer was built on.")
         evaluator._refresh_recast_buffers()
         self._cost_evaluator = evaluator
         self._fused_inputs = inputs

@@ -29,7 +29,7 @@ def extract_fd_gradient(
     # before taking moments or a large constant objective invents a gradient.
     centered = losses_3d - losses_3d[:, :1, :]
     moment = torch.einsum("pvk,vd->pdk", centered, verts.to(dtype=losses_3d.dtype, device=losses_3d.device))
-    denom = ((V / pdim) * scales * probe_radius).clamp(min=1e-10)  # (K,)
+    denom = ((V / pdim) * scales.to(losses_3d) * probe_radius).clamp(min=torch.finfo(losses_3d.dtype).tiny)
     return (moment / denom).mean(dim=-1)  # (P, pdim)
 
 
@@ -42,7 +42,7 @@ def extract_fd_antipodal_gradient(
     """Central differences on ``[+e_i; -e_i]`` rows, so a large shared loss cannot cancel a pair's difference."""
     if not losses_3d.shape[1] == 2 * pdim:
         raise ValueError(f"FD gradient needs antipodal [+e_i; -e_i] rows; got V={losses_3d.shape[1]}, pdim={pdim}")
-    denom = (2.0 * scales * probe_radius).clamp(min=1e-10)
+    denom = (2.0 * scales.to(losses_3d) * probe_radius).clamp(min=torch.finfo(losses_3d.dtype).tiny)
     return ((losses_3d[:, :pdim, :] - losses_3d[:, pdim:, :]) / denom).mean(dim=-1)
 
 
@@ -58,7 +58,7 @@ def extract_iso_curvature(
     The frame is Haar-random each step, so ``E[H_jj] = tr(H)/d`` for every ``j``.
     """
     mean_over_v = losses_3d.mean(dim=1)  # (P, K)
-    denom = (scales * probe_radius).pow(2).clamp(min=1e-30)  # (K,)
+    denom = (scales.to(losses_3d) * probe_radius).square().clamp(min=torch.finfo(losses_3d.dtype).tiny)
     curvature = (2.0 * (mean_over_v - center_loss.reshape(-1, 1)) / denom).mean(dim=-1, keepdim=True)  # (P, 1)
     return torch.where(torch.isfinite(curvature), curvature, torch.zeros_like(curvature))
 
@@ -81,16 +81,17 @@ def extract_fd_hessian_diag(
     # Symmetric sum: L(+s) + L(-s) = 2a + H*(s*r)^2.
     sym_sum = fwd + bwd  # (P, pdim, K)
 
-    s_sq = scales**2  # (K,), O(1) regardless of probe_radius
+    s_sq = scales.to(losses_3d).square()
 
     # Least-squares slope of sym_sum on s_sq, centered for stability.
     s_centered = s_sq - s_sq.mean()  # (K,)
     y_centered = sym_sum - sym_sum.mean(dim=-1, keepdim=True)  # (P, pdim, K)
 
     numerator = (s_centered.unsqueeze(0).unsqueeze(0) * y_centered).sum(dim=-1)  # (P, pdim)
-    denominator = (s_centered**2).sum().clamp(min=1e-10)
+    tiny = torch.finfo(losses_3d.dtype).tiny
+    denominator = (s_centered**2).sum().clamp(min=tiny)
     # Convert from s^2 units to (s*r)^2.
-    curvature = numerator / denominator / max(probe_radius**2, 1e-30)  # (P, pdim)
+    curvature = numerator / denominator / max(probe_radius**2, tiny)
     return torch.where(torch.isfinite(curvature), curvature, torch.zeros_like(curvature))
 
 
@@ -107,9 +108,10 @@ def extract_fd_hessian_diag_centered(
     fwd = losses_3d[:, :pdim, :]  # (P, pdim, K)
     bwd = losses_3d[:, pdim:, :]
 
-    second_diff = fwd + bwd - 2.0 * center_loss.reshape(-1, 1, 1)  # (P, pdim, K)
-    denom = (scales**2).reshape(1, 1, -1) * max(probe_radius**2, 1e-30)
-    curvature = (second_diff / denom.clamp(min=1e-30)).mean(dim=-1)  # (P, pdim)
+    center = center_loss.reshape(-1, 1, 1)
+    second_diff = (fwd - center) + (bwd - center)
+    denom = (scales.to(losses_3d) * probe_radius).square().reshape(1, 1, -1)
+    curvature = (second_diff / denom.clamp(min=torch.finfo(losses_3d.dtype).tiny)).mean(dim=-1)
     return torch.where(torch.isfinite(curvature), curvature, torch.zeros_like(curvature))
 
 

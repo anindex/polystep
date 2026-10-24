@@ -161,8 +161,12 @@ class KLSoftmaxSolver:
             cost = (C * P).sum() * cost_scale + cost_shift * a.sum()
 
             # Generalized KL includes -q+b because the marginals may have unequal mass.
-            col_marginal = P.sum(dim=0).clamp(min=1e-30)
-            b_safe = b.clamp(min=1e-30)
-            self._marginal_kl = (col_marginal * (col_marginal.log() - b_safe.log()) - col_marginal + b_safe).sum()
+            col_marginal = P.sum(dim=0)
+            self._marginal_kl = (
+                torch.special.xlogy(col_marginal, col_marginal)
+                - torch.special.xlogy(col_marginal, b)
+                - col_marginal
+                + b
+            ).sum()
 
         return SolverResult(matrix=P, f=f, g=g, converged=converged, n_iters=n_iters, _ent_reg=cost)

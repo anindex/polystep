@@ -116,7 +116,7 @@ def solve_seed(seed):
 
 def _mean_std(vals):
     t = torch.tensor(vals)
-    return t.mean().item(), t.std(unbiased=False).item()
+    return t.mean().item(), t.std().item()
 
 
 def main():

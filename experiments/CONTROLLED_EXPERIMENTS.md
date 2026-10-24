@@ -18,10 +18,11 @@ family; incomplete contrasts remain explicit in aggregation.
 
 ## Reproduction
 
-Install the experiment dependencies and download both MNIST partitions to
-`data/mnist`:
+From the repository root, install the experiment and test dependencies, then download
+both MNIST partitions to `data/mnist`:
 
 ```bash
+pip install -e ".[experiments,dev]"
 python -c "from torchvision.datasets import MNIST; [MNIST('data/mnist', train=t, download=True) for t in (True, False)]"
 PYTHONPATH=src:. python -m experiments.runners.run_controlled campaign --compiled --chunk 512 \
   --arms orthoplex_softmax_natural orthoplex_greedy_natural \
@@ -52,12 +53,13 @@ MeZO and Adam on the time axis only. Each of 27 configurations is tuned on three
 at two million evaluations or 12 minutes, and the selected one runs on ten final seeds
 at ten million evaluations or one hour.
 
-The diagnostics and the practical campaign both wait, without output, until all 23
-arms in `ARMS` (`run_controlled.py`) have a selected configuration and ten final
-seeds, so the first command below runs every arm, reusing records of the four above.
-The practical campaign also waits for the diagnostics to finish. It writes under
-`experiments/results/controlled/practical` and reruns `aggregate_practical` after each
-comparison. The DVS Gesture task reads frames that `controlled_data.py` builds from
+The diagnostics and practical campaign require CUDA. Both wait silently until all 23
+arms in `ARMS` (`run_controlled.py`) have a selected configuration and ten final seeds.
+The first command below completes those arms, reusing compatible records from the
+four-arm comparison above. The practical campaign also waits for the diagnostics to
+finish. It writes under `experiments/results/controlled/practical` and reruns
+`aggregate_practical` after each comparison. The DVS Gesture task reads frames that
+`controlled_data.py` builds from
 the original `DvsGesture.tar.gz` archive:
 
 ```bash

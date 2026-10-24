@@ -34,7 +34,7 @@ pip install "polystep[examples]"  # dependencies for the repository's examples
 
 Python 3.11+ and PyTorch 2.8+ are required. Choose a CUDA build compatible with your
 driver from the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
-For development, install `pip install -e ".[dev]"` from a checkout.
+For development, run `pip install -e ".[dev]"` from a checkout.
 
 ## Quickstart
 
@@ -59,9 +59,9 @@ train(model, loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 
 Replace the generated data with your dataset. `max_subspace_dim=128` caps the search
 at 128 coordinates, so each step scores 144 candidates. Biases and normalization
-weights always keep their full width, so on a larger model the cap must reach their
-total plus one coordinate per weight matrix; a smaller cap warns and reports the size
-it uses instead.
+weights keep their full width. On a larger model, the cap must cover those parameters
+plus at least one coordinate per weight matrix. If the cap is too small, PolyStep
+warns and reports the minimum dimension it can use.
 
 To write the loop yourself, call `step_batch` once per batch. It scores the candidates
 on that batch through the same fast paths `train()` uses and moves the weights:
@@ -70,11 +70,12 @@ on that batch through the same fast paths `train()` uses and moves the weights:
 loss_fn = nn.CrossEntropyLoss()
 for x, y in loader:
     optimizer.step_batch(x, y, loss_fn=loss_fn)
+optimizer.release_evaluator()
 ```
 
-`torch.set_num_threads(1)` keeps a model this small fast: a pool spanning every core
-can make each step about 100 times slower when other processes share the CPU. For
-larger models, `python -m polystep.benchmarks.threads` prints the fastest count. See
+`torch.set_num_threads(1)` avoids thread overhead for a model this small. Larger
+models may benefit from more threads; `python -m polystep.benchmarks.threads` compares
+several counts on an MLP workload. See
 [performance](https://github.com/anindex/polystep/blob/main/docs/performance.md)
 for candidate paths, thread counts, compilation, and memory settings.
 

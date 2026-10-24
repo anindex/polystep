@@ -8,7 +8,7 @@ Larger subspace bases (adaptive, hybrid, factored) use the whole intra-op pool, 
 their results can change with the thread count. Random rotation QRs stay on one
 thread at any size.
 
-Tall `AdaptiveSubspace` bases, with at least 8 columns, 32 rows per column and 2**18
+Tall `AdaptiveSubspace` bases, with at least 8 columns, 32 rows per column and `2**18`
 entries, use Cholesky QR only when `torch.get_float32_matmul_precision()` is
 `"highest"` and Householder QR otherwise. The two round differently, so changing the
 matmul precision changes these bases on the CPU as well as on CUDA.
@@ -31,9 +31,9 @@ as well as BF16. A `HybridSubspace` gives a layer sparse columns once its dense 
 would pass `sparse_threshold_bytes` (1 GB), which a 784x128 layer at rank 8 already
 does. With deterministic algorithms enabled, the projection runs as a sparse batched
 product with a fixed summation order, in FP32 for FP16 and BF16 parameters. It keeps a
-COO copy of the matrix for that, 24 bytes per stored entry, or 55 MB for a 100,352 x
-7,296 projection. On an RTX 5090 that product takes about 7 ms for 608 candidates,
-against 1.2 ms for the CSR product.
+COO copy of the matrix at 24 bytes per stored entry: about 55 MB for a projection
+with 100,352 rows and 7,296 columns. On an RTX 5090 that product takes about 7 ms for
+608 candidates, against 1.2 ms for the CSR product.
 
 ## Random streams
 

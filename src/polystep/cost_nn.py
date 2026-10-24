@@ -307,6 +307,21 @@ def _candidate_loss(loss_fn, loss_kind, output, targets):
         and output.dtype in (torch.float16, torch.bfloat16)
     ):
         output = output.float()
+    if (
+        loss_kind == "cross_entropy"
+        and output.device.type == "cpu"
+        and is_batchedtensor(output)
+        and output.dim() == 2
+        and targets is not None
+        and targets.dtype == torch.long
+        and targets.shape == output.shape[:1]
+        and getattr(loss_fn, "weight", None) is None
+        and getattr(loss_fn, "label_smoothing", 0.0) == 0
+        and getattr(loss_fn, "reduction", "mean") == "mean"
+    ):
+        valid = targets != getattr(loss_fn, "ignore_index", -100)
+        picked = output.log_softmax(1).gather(1, targets.masked_fill(~valid, 0).unsqueeze(1)).squeeze(1)
+        return -torch.where(valid, picked, 0).sum() / valid.sum()
     return loss_fn(output, targets) if targets is not None else loss_fn(output)
 
 
@@ -467,6 +482,7 @@ class NNCostEvaluator:
         self._compiled_fwd_loss = None
         self._compile_forward_verified = False
         self._buffers = dict(self.model.named_buffers())
+        self._mutable_weights = _max_norm_weights(self.model)
         self._unversioned_writes = None
         # remove_duplicate=False so tied weights resolve under every module path: a
         # deduplicated dict would report their aliases as unknown parameters.
@@ -588,7 +604,7 @@ class NNCostEvaluator:
         self.model.eval()
         try:
             with (
-                self._restoring_buffers(_max_norm_weights(self.model)),
+                self._restoring_buffers(),
                 torch.random.fork_rng(devices=[device] if device.type == "cuda" else []),
             ):
                 yield
@@ -597,9 +613,12 @@ class NNCostEvaluator:
                 self.model.train()
 
     @contextmanager
-    def _restoring_buffers(self, extra=()):
-        """Put back every buffer and ``extra`` tensor the frame writes, at exit and on each yielded restore."""
-        state = [*self._buffers.values(), *extra]
+    def _restoring_buffers(self):
+        """Restore buffers and forward-mutated weights at exit and on each yielded restore."""
+        state = [*self._buffers.values(), *self._mutable_weights]
+        if not state:
+            yield lambda: None
+            return
         versions = [None if torch.is_inference(t) else t._version for t in state]
         copies = [t.clone() for t in state]
         checked = False
@@ -799,7 +818,6 @@ class NNCostEvaluator:
         buffers = self._buffers
         loss_fn, loss_kind = self.loss_fn, self._loss_kind
         model = self.model
-        resolved_chunk = self.chunk_size
         per_sample = self.per_sample
 
         # inputs/targets are explicit args, so a cached graph does not bake in the
@@ -810,9 +828,7 @@ class NNCostEvaluator:
             output = functional_call(model, full_dict, *_forward_args(inputs))
             return _fold_candidate_loss(_candidate_loss(loss_fn, loss_kind, output, targets), per_sample)
 
-        batched = vmap(
-            single_eval, in_dims=(0, None, None, None), chunk_size=resolved_chunk, randomness=self._randomness
-        )
+        batched = self._batched_call(single_eval, self._randomness)
 
         # torch.compile on the vmapped forward for kernel fusion only; lazy on first call.
         if self._compile_vmap and not self._compile_failed:
@@ -853,6 +869,26 @@ class NNCostEvaluator:
         moving = {k: v for k, v in stacked_params.items() if self._share_failed or v.stride(0) != 0}
         moving = moving or dict(itertools.islice(stacked_params.items(), 1))
         return batched(moving, {k: v[0] for k, v in stacked_params.items() if k not in moving}, inputs, targets)
+
+    def _batched_call(self, fn, randomness):
+        """Batch candidates, restoring mutable model state between chunks."""
+        chunk = self.chunk_size
+        isolate = chunk is not None and (self._buffers or self._mutable_weights)
+        batched = vmap(fn, in_dims=(0, None, None, None), chunk_size=None if isolate else chunk, randomness=randomness)
+        if not isolate:
+            return batched
+
+        def chunked(params, *args):
+            n = tree_leaves(params)[0].shape[0]
+            with self._restoring_buffers() as restore:
+                losses = []
+                for start in range(0, n, chunk):
+                    part = tree_map(lambda t: t[start : start + chunk], params)
+                    losses.append(_materialize_expanded(batched(part, *args)))
+                    restore()
+            return torch.cat(losses)
+
+        return chunked
 
     @staticmethod
     def _batched_footprint_exceeds_free_memory(model: nn.Module) -> bool:
@@ -2031,12 +2067,7 @@ class SiteVmapEvaluator:
         # a conv model raises a dtype mismatch.
         try:
             with self._owner._restoring_buffers():
-                batched = vmap(
-                    single_eval,
-                    in_dims=(0, None, None, None),
-                    chunk_size=self._owner.chunk_size,
-                    randomness=self._randomness,
-                )
+                batched = self._owner._batched_call(single_eval, self._randomness)
                 if self._owner._compile_vmap and key not in self._compile_failed_sites:
                     try:
                         if key not in self._compiled_sites:

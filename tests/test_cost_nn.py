@@ -52,6 +52,20 @@ def test_compile_vmap_tracks_changing_batch():
     torch.testing.assert_close(lb, ref.evaluate(stacked, xb, tb), rtol=1e-4, atol=1e-4)
 
 
+def test_registration_rejects_another_model_without_replacing_current_batch():
+    model = nn.Linear(4, 2)
+    opt = PolyStepOptimizer(model, solver="softmax")
+    inputs, targets = torch.randn(3, 4), torch.randn(3, 2)
+    evaluator = NNCostEvaluator(model, nn.MSELoss())
+    closure = opt.register_evaluator(evaluator, inputs, targets)
+    other = NNCostEvaluator(nn.Linear(4, 2), nn.MSELoss())
+    with pytest.raises(ValueError, match="different model"):
+        opt.register_evaluator(other, inputs + 1, targets)
+    assert opt._cost_evaluator is evaluator
+    assert opt._registration_closure is closure
+    opt.step(closure)
+
+
 class SimpleMLP(nn.Module):
     def __init__(self, in_dim=10, hidden=5, out_dim=2):
         super().__init__()
@@ -1072,7 +1086,7 @@ def test_loss_aliasing_buffer_survives_restore(path):
     assert model.score.item() == 0
 
 
-@pytest.mark.parametrize("chunk", [None, 2])
+@pytest.mark.parametrize("chunk", [None, 1, 2])
 def test_buffer_backed_loss_survives_restore(chunk):
     class CachedScore(nn.Module):
         def __init__(self):
@@ -1081,21 +1095,64 @@ def test_buffer_backed_loss_survives_restore(chunk):
             self.register_buffer("score", torch.zeros(()))
 
         def forward(self, x):
-            self.score.copy_(x.sum())
+            self.score.add_(x.sum())
             return self.score
 
     model = CachedScore()
     ev = NNCostEvaluator(model, lambda out: out, use_inplace=False, compile_forward=False, chunk_size=chunk)
     layout = ParamLayout.from_module(model, particle_dim=2)
     site = SiteVmapEvaluator.try_build(ev, layout)
-    weights = torch.tensor([[1.0, 1.0], [2.0, 2.0]])
+    weights = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]])
     dense = ev.evaluate({"weight": weights}, torch.ones(2))
     local = site.evaluate(
         layout.unflatten(layout.flatten(model)), layout.entries[0], torch.tensor([[0, 1]]), weights[None], torch.ones(2)
     )
-    assert dense.tolist() == local.tolist() == [2.0, 2.0]
+    assert dense.tolist() == local.tolist() == [2.0] * 4
     assert not ev._vmap_failed
     assert model.score.item() == 0
+
+
+@pytest.mark.parametrize("path", ["vmap", "loop", "inplace", "hybrid"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_frozen_max_norm_embedding_is_restored(path, fails):
+    embedding = nn.Embedding(4, 2, max_norm=1.0)
+    embedding.weight.requires_grad_(False)
+    with torch.no_grad():
+        embedding.weight.fill_(3.0)
+    model = nn.Sequential(embedding, nn.Flatten(), nn.Linear(4, 2))
+    before = {k: p.detach().clone() for k, p in model.named_parameters()}
+    inputs = torch.tensor([[0, 1], [2, 3]])
+
+    def loss(out):
+        if fails:
+            raise ValueError("failed loss")
+        return out.square().mean()
+
+    ev = NNCostEvaluator(model, loss, use_inplace=path in ("inplace", "hybrid"), compile_forward=False)
+    ev._vmap_failed = path == "loop"
+    layout = ParamLayout.from_module(model)
+    if path == "hybrid":
+        sub = HybridSubspace.from_layout(layout, rank=1)
+        projections = sub.init_projections(torch.device("cpu"), torch.float32)
+        base = {k: v for k, v in before.items() if k != "0.weight"}
+
+        def evaluate():
+            return ev.evaluate_subspace_inplace(sub, projections, base, torch.zeros(2, sub.subspace_dim), inputs)
+    else:
+        params = {k: v.expand(2, *v.shape).clone() for k, v in before.items() if k != "0.weight"}
+
+        def evaluate():
+            return ev.evaluate(params, inputs)
+
+    if fails:
+        with pytest.raises(ValueError, match="failed loss"):
+            evaluate()
+    else:
+        with torch.inference_mode():
+            losses = evaluate()
+        torch.testing.assert_close(losses[0], losses[1])
+    for key, param in model.named_parameters():
+        torch.testing.assert_close(param, before[key], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("looped", [False, True])

@@ -5,6 +5,11 @@ configurations and checkpoints. Entries are five-seed means ± sample standard
 deviation, except the probSAT and RC2 columns, which are single runs; the
 [protocol](../docs/reproducibility.md#protocol) gives the budget each method gets.
 
+These tables were recorded before 1.0. Later changes to the optimizer and experiment
+runners affect the results; see
+[changes since the published tables](../docs/reproducibility.md#changes-since-the-published-tables)
+before comparing a new run with them.
+
 ## Results
 
 <!-- BENCH:START -->
@@ -45,7 +50,7 @@ and the SNN baseline's variance.
 
 ## Reproduction
 
-The [reproducibility guide](../docs/reproducibility.md) gives the commands that
-produce these results and regenerate these tables. See also the
+The [reproducibility guide](../docs/reproducibility.md) gives the current commands for
+running these comparisons and generating tables from their results. See also the
 [runner list](README.md#runners) and the
 [controlled hard-LIF comparison](CONTROLLED_EXPERIMENTS.md).

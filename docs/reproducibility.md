@@ -26,14 +26,21 @@ runner expects MNIST under `data/mnist`; see the
 
 Population methods (OpenAI-ES, CMA-ES, EGGROLL) get PolyStep's candidate-evaluation
 budget. SPSA, MeZO and random search, which score at most two candidates per step, get
-its step count. On argmax attention, hard MoE and ETTh1, the population methods instead
+its step count.
+
+On argmax attention, hard MoE and ETTh1, the population methods instead
 get 32 evaluations per PolyStep step, spent at their own population size, so their
 step counts differ from PolyStep's. Adam trains for PolyStep's 30 epochs there, except
-on ETTh1, where it trains for 50. On MAX-SAT, CMA-ES and OpenAI-ES get 50 evaluations
+on ETTh1, where it trains for 50.
+
+On MAX-SAT, CMA-ES and OpenAI-ES get 50 evaluations
 per PolyStep step. OpenAI-ES scores 50 candidates at each of PolyStep's steps; CMA-ES
 doubles its population at each restart, so it takes fewer generations. probSAT and RC2
-run once per instance size. Set `POLYSTEP_MATCH_AXIS=evals` or `wallclock` to force
-one axis. Gradient-free baseline records from `run_elevation.py`, `run_moe.py`,
+run once per instance size.
+
+For `run_elevation.py`, `run_moe.py` and `run_timeseries.py`, set
+`POLYSTEP_MATCH_AXIS=evals` or `wallclock` to override the default axis. Gradient-free
+baseline records from `run_elevation.py`, `run_moe.py`,
 `run_mnist.py` and `run_timeseries.py` store the axis as `hyperparameters.match_axis`;
 PolyStep, Adam, persistence, MAX-SAT and RL records carry none.
 
@@ -124,7 +131,8 @@ See [determinism](determinism.md),
 
 The tables in the README and the experiment index, and the RL and variant-sweep
 results, were recorded before 1.0. Fixes to the harness and the library since then
-change the following results, so a rerun does not reproduce them:
+affect the comparisons below. Current runs should not be expected to reproduce those
+historical numbers:
 
 - Random search scores the incumbent and the candidate on the same minibatch, two
   evaluations per step. The published column compared each candidate with the

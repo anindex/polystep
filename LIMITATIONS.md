@@ -31,24 +31,25 @@ displacement before momentum.
   overwrites, so treat them as read-only and clone any you keep after the closure
   returns.
 - `step_batch()` and `train()` register each batch. A manual `step(closure)` loop must
-  register the evaluator and current batch to use the fast paths, and the two must
-  compute the same objective.
+  register the evaluator and current batch to use the fast paths. The evaluator's
+  loss and the closure must compute the same objective.
 - Multi-input batches use vmap and the site-local path; the batched-matmul, delta and
   factored paths and multifidelity screening need one input tensor.
 - Tied weights must be the same Parameter object, and buffers may not share memory
   with trainable parameters. Register a clone or compute the tensor in forward instead.
 - `NNCostEvaluator`, `step_batch()` and `train()` score candidates in eval mode:
-  dropout is off and batch-norm running statistics never update. A custom closure that
-  runs the model in train mode compares candidates under different dropout masks.
-- The evaluator puts back any buffer the forward writes, such as a call counter, after
-  each batched scoring call and after each candidate in the sequential and in-place
-  loops. Writes that leave the tensor version counter unchanged, such as
+  standard dropout is off and batch-norm layers do not update their running statistics.
+  A custom closure that runs the model in train mode compares candidates under
+  different dropout masks.
+- The evaluator restores buffers written by the forward, such as a call counter,
+  after each batched chunk and each candidate in the sequential and in-place loops.
+  Embedding weights changed by `max_norm` are restored even when frozen. Update
+  persistent state outside the closure.
+- Writes that leave the tensor version counter unchanged, such as
   `F.batch_norm(training=True)` running statistics or writes through `.data`, are found
-  by comparing values after the evaluator's first forward and after the first candidate
-  of each sequential or in-place sweep. A batched call keeps such a write when no
-  earlier comparison saw it. Chunks of `NNCostEvaluator(chunk_size=...)` run inside one
-  vmap call and still see each other's writes. Update such state in your own forward
-  calls outside the closure.
+  by comparing values after the first forward and the first candidate of each
+  sequential, in-place or chunked vmap sweep. A write first triggered after those
+  checks can go undetected and persist into later evaluations.
 - Float inputs are cast to the dtype of the model's first floating weight only when
   the forward raises on them as given. The evaluator checks this with one extra
   forward per input dtype and puts back the buffers it changed. The delta and
@@ -60,8 +61,8 @@ displacement before momentum.
   reduce in FP32 only under the builtin cross-entropy, MSE and L1 losses; other losses
   may round nearby candidate scores to the same value. With FP16 or BF16 parameters,
   `FactoredSubspace` materializes every candidate, and the fast paths can differ from
-  the model's own Linear output by about one ulp, enough to flip a hard threshold;
-  `use_inplace=True` scores with the model's forward. See
+  the model's own Linear output by about one unit in the last place (ulp), enough to
+  flip a hard threshold. `use_inplace=True` scores with the model's forward. See
   [precision](docs/performance.md#compilation-and-precision).
 - `step_batch()` and `train()` reject `trust_region`. See
   [radius control](docs/api_overview.md#quadratic-model-and-radius-control) for its
@@ -124,7 +125,7 @@ Independent particle rotations mean Sinkhorn's shared column index does not iden
 a common direction across particles.
 
 Sinkhorn requires `omega` in `[0.5, 1.95]`. Anderson acceleration and adaptive omega
-are inactive in fixed-iteration mode (`threshold <= 0`). Both solver families promote
+are inactive in fixed-iteration mode (`threshold <= 0`). Sinkhorn and KLSoftmax promote
 FP16/BF16 costs to FP32. Cost differences and reductions must also fit the solver's
 dtype: finite FP32 inputs near its limits can still overflow when recentered or
 averaged. Rescale the objective before evaluation or return FP64 costs in that case.
@@ -136,6 +137,7 @@ finite magnitude plus one, clamped to the dtype limit. An infeasible candidate c
 therefore retain weight, depending on epsilon. With `scale_cost='mean'` or
 `'max_cost'`, the solvers compute the penalty after scaling. Otherwise, that weight
 also depends on the cost offset.
+
 Balanced Sinkhorn sends every column its prescribed mass, even when all of that
 column's candidates are infeasible. The monolithic step records a vertex's cost as
 the mean of its probes with each nonfinite probe already penalized, so with several

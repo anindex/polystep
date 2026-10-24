@@ -254,6 +254,25 @@ def test_fast_cross_entropy_matches_ignored_targets(targets):
     )
 
 
+@pytest.mark.parametrize("targets", [[0, 1], [0, -100], [-100, -100]])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+def test_cpu_vmap_cross_entropy_matches_native_loss(targets, dtype):
+    model = nn.Sequential(nn.Linear(4, 2, bias=False)).to(dtype)
+    loss_fn = nn.CrossEntropyLoss()
+    evaluator = NNCostEvaluator(model, loss_fn, use_inplace=False)
+    params = {k: v.to(dtype) for k, v in _stack(model, 3).items()}
+    inputs, targets = torch.randn(2, 4, dtype=dtype), torch.tensor(targets)
+
+    def reference(output, labels):
+        return loss_fn(output.float() if dtype == torch.bfloat16 else output, labels)
+
+    torch.testing.assert_close(
+        evaluator._evaluate_vmap(params, inputs, targets),
+        _reference_losses(model, params, inputs, targets, reference),
+        equal_nan=True,
+    )
+
+
 @pytest.mark.parametrize("subspace", [False, True])
 def test_delta_step_accepts_soft_cross_entropy(subspace):
     from polystep.hybrid_subspace import HybridSubspace

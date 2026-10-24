@@ -1,6 +1,6 @@
 # Contributing
 
-Install the development dependencies. Then run the CI checks:
+From the repository root, install the development dependencies and run the CI checks:
 
 ```bash
 pip install -e ".[dev]"
@@ -9,12 +9,10 @@ ruff format --check .
 pytest tests/ -q -n auto
 ```
 
-Work on a branch. Add a regression test when the change needs one.
-Open a pull request after the checks pass. Test observable behavior.
-Keep one small regression test per bug.
-Extend an existing case when it already covers the same path; avoid separate tests
-for trivial defaults, getters, or repeated shapes. Keep comments specific and public
-APIs typed.
+Work on a branch and open a pull request after the checks pass. A bug fix should have
+a small regression test of observable behavior. Extend an existing case when it
+already covers the same path; avoid separate tests for trivial defaults, getters, or
+repeated shapes. Keep comments specific and public APIs typed.
 
 ## Tests
 
@@ -30,6 +28,7 @@ The fast suite uses one CPU thread; `POLYSTEP_TEST_THREADS` overrides it. Slow t
 use `ncpu - 8` threads, clamped to 2-16 and split across xdist workers, and may
 download datasets. Keep downloads and training-quality checks in the slow suite; use
 synthetic inputs for unit tests.
+
 Tests importing `experiments/` must skip when that directory is absent, since it is
 excluded from distributions.
 

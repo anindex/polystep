@@ -1,5 +1,13 @@
 # API reference
 
+Start with the [optimizer](#optimizer) and [training loop](#training-loop), then choose
+a [subspace](#subspaces) and [configuration](#configuration). For custom models, see
+[evaluation controls](#evaluation-controls) and [custom layers](#custom-layers).
+[Ask/tell](#asktell), [checkpoints](#checkpoints) and the
+[upgrade notes](#upgrading-from-10) cover the other workflows.
+
+The Python snippets build on the imports, model and data in the first example.
+
 ## Optimizer
 
 `PolyStepOptimizer` trains an `nn.Module` from candidate losses. Pass the module
@@ -22,22 +30,29 @@ for x, y in loader:
 optimizer.release_evaluator()
 ```
 
-`step_batch` builds an `NNCostEvaluator` for `loss_fn` the first time it sees that
-object and reuses it while you pass the same object, so create the loss once. To
-change a loss's settings, pass a new loss object. The builtin losses that
-[performance](performance.md#candidate-evaluation) lists let the batched-matmul and
-delta paths compute the loss in closed form; any other callable takes the site-local
-or vmap path. Each OT step scores every candidate on the batch, writes the new weights
-into the model and returns the mean candidate loss. Under `amortize_steps`, a coasting
-call in between moves the weights along the last direction without scoring anything
-and returns the last OT step's value. With `cost_batch_size` set, an OT step scores a
-random subset of that many rows. Pass `targets=None` for a loss that reads only the
-output. The batch stays registered until the next call, `release_evaluator()` or the
-end of `train()`, so call `release_evaluator()` once after a manual loop to free it.
+`step_batch` creates an `NNCostEvaluator` for `loss_fn` and reuses it while you pass
+the same loss object. Create the loss once; pass a new object when its settings
+change. The [supported builtin losses](performance.md#candidate-evaluation) enable
+the batched-matmul and delta paths. Other callables use the site-local or vmap path.
+
+Each optimal-transport (OT) step scores the candidates, updates the model weights
+and returns the mean candidate loss. With `cost_batch_size` set, it uses a random
+subset of that many batch rows. Pass `targets=None` for a loss that reads only the
+output. Under `amortize_steps`, calls between OT steps move the weights along the
+last direction without scoring candidates and return the previous OT step's value.
+
+The batch stays registered until the next call, `release_evaluator()` or the end of
+`train()`. Call `release_evaluator()` once after a manual loop to free the batch and
+cached evaluation resources.
 
 `NNCostEvaluator` puts the model in eval mode when it is constructed and scores every
 candidate in eval mode, so dropout stays off and batch-norm running statistics do not
 update.
+
+Forward-written buffers and embedding weights renormalized by `max_norm` are restored
+after scoring, including between evaluator chunks and when evaluation raises.
+Frozen embedding weights are protected too. Writes through `.data` and other
+unversioned writes have [additional limits](../LIMITATIONS.md#evaluation).
 
 At the default settings, a full-space step scores about 1.5 candidates per trainable
 parameter, and the constructor warns when a step would score more than 100,000. Pass
@@ -66,14 +81,14 @@ x, y = loader[0]
 mask = torch.ones(32, 3)
 masked_optimizer.step_batch((x, mask), y, loss_fn=loss_fn)
 masked_optimizer.step_batch({"x": x, "mask": mask}, y, loss_fn=loss_fn)
+masked_optimizer.release_evaluator()
 ```
 
 The step splits the candidates into chunks, never the batch. `cost_batch_size`
 subsampling indexes only the input and target tensors whose leading dimension matches
 the first batched input's, and passes scalars and other tensors through unchanged.
-Multi-input batches go through vmap and the site-local path. The batched-matmul, delta
-and factored paths need a single tensor and stand aside, and `multifidelity_screen`
-does not run.
+Multi-input batches use vmap and the site-local path. The batched-matmul, delta and
+factored paths require a single input tensor, as does `multifidelity_screen`.
 
 ### Custom closures
 
@@ -94,11 +109,15 @@ optimizer.release_evaluator()
 
 Without a registration the delta, factored and site-local paths stay off, and every
 candidate goes through the closure. The registered loss and any other closure you pass
-must compute the same objective, regularization included. `step()` warns once when no
-`register_evaluator` call came since the previous step and the closure is not the one
-it returned. The manual step API is also the route to `trust_region`, through
-`objective_token`; see [radius control](#quadratic-model-and-radius-control).
+must compute the same objective, regularization included. `step()` warns once if you
+have not registered a batch since the previous step and pass a closure other than
+the one returned by `register_evaluator`. The manual step API also supports
+`trust_region`, through `objective_token`; see
+[radius control](#quadratic-model-and-radius-control).
 `step_batch` replaces any registration.
+
+The evaluator must wrap the same module as the optimizer. Registering a different
+model raises `ValueError` and leaves the previous registration intact.
 
 ### After changing the model
 
@@ -106,12 +125,14 @@ After writing weights into the model yourself, or swapping in a layer under the 
 parameter names, call `optimizer.resync_from_model()`. Otherwise, the next step
 overwrites the change with the old weights plus the update. Resync also rebuilds the
 evaluator that `step_batch` caches.
+
 After you replace layers, parameters or buffers, or cast the model to another dtype,
 call `evaluator.reset_vmap()` on an evaluator you built yourself and register it
 again. The evaluator also resets itself when a cast changes its buffers' dtypes.
 Assigning `evaluator.loss_fn` rebuilds everything that depends on the loss. After
 changing a loss's settings in place, such as `label_smoothing`, call `reset_vmap()`;
 with `step_batch`, pass a new loss object instead.
+
 The optimizer keeps the set of `requires_grad` parameters it was built with, and `step()`
 raises `ValueError` if that set changes. To freeze, unfreeze, add or remove a parameter,
 set `requires_grad` first and then build a new optimizer.
@@ -240,7 +261,11 @@ optimizer = PolyStepOptimizer(
 | `block_strategy` | `'monolithic'` | Also `'per_layer'` or `'grouped'`; with a subspace, only splits Sinkhorn/KL solves into row segments |
 | `chunk_size` | `None` | Automatic candidate chunk estimate |
 | `max_iterations` | `50` | Length of the momentum and svd_ratio warm-up ramps; steps continue past it |
-| `adaptive_num_probe` | `None`: on when `num_probe > 1`, except full-space `per_layer`/`grouped` and orthoplex `newton_refinement` | Drops the probe count to 1 while costs keep falling |
+| `adaptive_num_probe` | `None` (automatic) | Drops the probe count to 1 while costs keep falling |
+
+By default, `adaptive_num_probe` is enabled when `num_probe > 1`, except with
+full-space `per_layer`/`grouped` blocks or orthoplex `newton_refinement`. Set it
+explicitly to keep or disable this behavior.
 
 A step scores one candidate per particle, vertex and probe. With `d` coordinates per
 particle the simplex has `d + 1` vertices, the orthoplex `2d` and the cube `2^d`; see
@@ -265,7 +290,7 @@ marginals; softmax constrains only the source marginal.
 
 ## Quadratic model and radius control
 
-The quadratic model (`use_quadratic_model=True`) reads a centred unit-radius tight
+The quadratic model (`use_quadratic_model=True`) uses a centered unit-radius tight
 frame with `V` vertices `v` in dimension `d`. Probe `k` of `K` places the vertices at
 distance `s r` from the incumbent `X`, where `r` is the probe radius after epsilon
 scaling and `s = k / (K + 1)`. With `L_v` the loss at vertex `v` on that probe and
@@ -285,15 +310,19 @@ The curvature identity is exact for quadratic objectives. Simplex gradient fits 
 have an `O(r)` bias on anisotropic quadratics, which comes from the second-order term
 `(s r)^2 / 2 * v^T H v`. Centrally symmetric templates (orthoplex, cube) remove it:
 `v^T H v` is the same at `v` and `-v`, so its contributions cancel in pairs. Their
-remaining bias comes from third-order terms, is `O(r^2)`, and is zero on a quadratic.
+remaining gradient bias is `O(r^2)` for smooth objectives and zero on a quadratic.
 Block models omit cross-block Hessian terms.
 
+Denominators use the loss dtype's smallest normal value as a numerical floor.
+Small radii still need resolvable loss differences; a fit cannot recover information
+that the forward pass rounded away.
+
 `trust_region` compares consecutive incumbents and sums block predictions. Minibatch
-changes and momentum-only steps invalidate the deferred comparison; `step_batch()` and
-`train()` reject this controller. Use a stationary objective with the manual step API,
-and pass `optimizer.step(closure, objective_token=token)` a new token whenever the
-batch or loss changes; a change drops the pending trust-region comparison, and `None`
-or a constant token means a stationary objective.
+changes and momentum-only steps invalidate the deferred comparison, so `step_batch()`
+and `train()` reject this controller. Use the manual step API with a stationary
+objective. If the batch or loss changes, pass a new `objective_token` to
+`optimizer.step(closure, objective_token=token)` to discard the pending comparison.
+A constant token, including `None`, declares that the objective has not changed.
 
 ## Evaluation controls
 
@@ -305,10 +334,11 @@ or a constant token means a stationary objective.
 | `candidate_autocast` | `False` | Candidate forward precision; disables incompatible fast paths |
 
 `amortize_steps` skips evaluations between sampled updates. `multifidelity_screen`
-scores candidates on a smaller batch and re-scores on the full batch only the
-`round(V * screen_keep_ratio)` vertices it keeps per particle, at least the solver's
-`k` for `top_k_mean` and whole antithetic pairs on the orthoplex. Measure the quality
-of either at equal evaluation and time budgets.
+scores candidates on a smaller batch, then re-scores the retained vertices on the
+full batch. It keeps approximately `V * screen_keep_ratio` vertices per particle.
+`top_k_mean` keeps at least `min(k, V)`; softmax, Sinkhorn and KL screening keep whole
+antithetic pairs on the orthoplex. Compare either option at equal evaluation and time
+budgets.
 
 Screening needs a cheaper closure. `screen_closure_from` passes the first
 `screen_fidelity` fraction of the batch as extra arguments to the closure. Give those
@@ -325,21 +355,23 @@ screen = optimizer.screen_closure_from(closure, inputs, targets)
 optimizer.step(closure, screen_closure=screen)
 ```
 
-A registered evaluator screens on the same leading slice of its batch. Screening runs
-only when the screened share of the batch divided by `num_probe`, plus the share of
-vertices kept per particle, is below 1, where it needs fewer forwards than the full
-sweep, and not with `use_quadratic_model`, `newton_refinement` or `trust_region`. It
-still runs two sweeps, so on small models and on launch-bound GPU steps it can take
-longer than one unscreened sweep. Screened candidates use the same delta and site-local
-paths as the full sweep once particles times vertices times model parameters reaches
+A registered evaluator screens on the same leading slice of its batch. Screening is
+disabled with `use_quadratic_model`, `newton_refinement` or `trust_region`. Otherwise,
+it runs only when `screened_batch_fraction / effective_num_probe + kept_vertex_fraction < 1`,
+so the two sweeps need fewer sample forwards than a full sweep. Even then, two sweeps
+can take longer on small models or GPU steps dominated by kernel launches.
+
+Screened candidates use the same delta and site-local paths as the full sweep once
+particles times vertices times model parameters reaches
 5e5 on the CPU or 5e8 on CUDA. Below that, screened hybrid candidates build every
 weight, and a screened full-space chunk uses a site-local path only when it lies
 inside one parameter. The CPU threshold is the measured crossover. The CUDA one is
-set conservatively so that no measured model slows down, which forgoes wins on small
-MLPs. With few vertices the kept share is coarse: at the default `particle_dim=2` the
-simplex has 3 vertices, so `screen_keep_ratio=0.5` keeps 2 of them. The batch share
-rounds the same way: a registered batch of 2 samples screens on 1 of them even at
-`screen_fidelity=0.1`.
+set conservatively to avoid regressions on the measured models, at the cost of some
+speedups on small MLPs.
+
+Small batches and polytopes make the requested fractions coarse. At the default
+`particle_dim=2`, the simplex has 3 vertices, so `screen_keep_ratio=0.5` keeps 2.
+A registered batch of 2 samples screens on 1 even at `screen_fidelity=0.1`.
 
 ## Custom layers
 
@@ -426,8 +458,9 @@ optimizer.load_state_dict(checkpoint["optimizer"])
 
 Rebuild the optimizer with the original configuration before loading.
 `load_state_dict` reads only checkpoint format 6, written since 1.0, and raises
-`ValueError` on any other format. To continue a run saved by another release, build
-a fresh optimizer around the saved model weights.
+`ValueError` on any other format. For an older format, build a fresh optimizer around
+the saved model weights.
+
 The checkpoint also restores `candidate_evals`. Reproducible continuation requires
 the same objective and environment. Checkpoints can move between CPU and CUDA.
 When a seeded checkpoint crosses devices, loading keeps the new optimizer's
@@ -486,84 +519,14 @@ published results that change.
 
 ## Upgrading from 0.13
 
-Version 1.0 removes unused APIs and changes the checkpoint format. Update callers
-before loading a model into a new optimizer.
+Build a new optimizer from the saved model weights: checkpoint formats before 6 are
+unsupported. Pass the module to `PolyStepOptimizer`; use `step_batch` for supervised
+batches and `PolyStepES` for ask/tell objectives.
 
-- `CMAAdaptiveSubspace`, `compute_cma_hyperparameters`, `use_covariance_adaptation` and
-  the CMA fields of `SolverState` (`p_c`, `p_sigma`, `C_diag`, `generation`) are gone;
-  use `AdaptiveSubspace`. `TemperedSoftmaxSolver`, `solver='tempered_softmax'`
-  and `tempered_softmax_tau` are gone; use `solver='softmax'` with `ent_epsilon`.
-- `auto_epsilon` and `auto_epsilon_config` are gone; pass a `ProgressiveEpsilon` as
-  `epsilon`. To match the old schedule for a numeric `epsilon=e`, use
-  `ProgressiveEpsilon(init=e, target=max(0.01, 0.1 * e), max_epsilon=5 * e)`.
-  For a `LinearEpsilon`, reuse its `init` and `target` with `max_epsilon=5 * init`;
-  for other schedules, use `ProgressiveEpsilon()`. Pass `auto_epsilon_config` keys
-  as keyword arguments. An existing `ProgressiveEpsilon` works as before.
-- `PolyStep` no longer trains networks: `subspace`, `nn_evaluator`, `train_inputs`,
-  `train_targets` and `init_state(base_params=...)` are gone. Use `PolyStepOptimizer`.
-- `polystep` no longer exports low-level helpers; import them from `subspace`
-  (`ProjectionSpec`, which replaces `create_hybrid_blocks` and `LayerProjectionSpec`),
-  `_compiled` (`CompiledFunctions`, `try_compile`), `dynamics` (`apply_momentum`,
-  `compute_momentum_coefficient`, `update_radius_multiplier`, `update_stagnation`),
-  `blockwise` (`BlockConfig`, `create_per_layer_blocks`, `create_grouped_blocks`),
-  `cost_nn` (`auto_detect_chunk_size`), `transform` (`ParamEntry`, `create_generator`)
-  and `costs` (`compute_cost_matrix`, `scale_cost_matrix`).
-- `TrainConfig.batch_size` and `log_every` are gone; set them on the `DataLoader` and
-  `LoggingCallback`, which now prints `disp_sq` in scientific notation, not `disp`.
-- `SolverResult.cost` is gone; read `ent_reg_cost`, no longer a constructor argument.
-  `KLSoftmaxSolver.last_marginal_violation` is read-only. `SolverState` and
-  `CompiledFunctions.fused_softmax_project` drop the marginal `a`. The latter expects
-  the caller to recenter and scale costs; its `scale_cost_mean` argument is gone.
-  It returns `(X_new, W)` with rows of `W` summing to one; multiply by the marginal
-  to get the old transport plan.
-- Removed without replacement: `BenchmarkResult`, `data_dependent_init`, unused solver
-  `compile` fields, the block-splitting helpers in `polystep.blockwise`, and
-  `adaptive_probes` with its threshold. Candidates are scored on every OT step, and
-  `objective_token` only gates a pending trust-region check.
-- `get_simplex_vertices`, `get_orthoplex_vertices` and `get_cube_vertices` raise
-  `TypeError` on unknown keyword arguments. `CartPoleRolloutResult` is gone;
-  `CartPoleEvaluator.rollout_stacked_params` returns a `GymRolloutResult` with the same
-  fields. `NonDiffMLPPolicy.mode` is gone; read it from the policy's `NonDiffActivation`
-  layers. `SiteVmapEvaluator` takes a required keyword-only `owner`, and `PolyStep.step`
-  leaves `state.last_solve_eps` at `None`.
-- `experiments/baselines/openai_es.py` and `spsa.py` are gone; use `polystep.baselines`.
-  `evaluate_accuracy` moved from `experiments.runners.common` to
-  `polystep.benchmarks.utils` and reads the device from the model. With no replacement,
-  `common.py` drops `FunctionEvalCounter`, `get_loss_fn`, `load_flat_params`,
-  `set_flat_params` and the Tonic loaders; `nondiff_models.py` drops the soft MoE,
-  permutation and binary-convolution models, `cra_penalty`, `evaluate_sat_loss` and
-  `compute_expert_utilization`; `nondiff_data.py` drops `generate_sorting_data`; and
-  `sls_pysat.py`, `bench_ask_tell.py`, `run_maxsat_softmax_scaling.py`,
-  `bench_large_net_inplace.py` and `profile_controlled.py` are gone.
-- The elevation, MNIST, MoE, timeseries, MAX-SAT and RL runners write to
-  `experiments/results/revision` by default, not `results/softmax/main`
-  (`results/softmax/rl` for RL). Baseline runs given neither `--fair` nor `--budget`
-  record `match_axis` as `"unmatched"`. `run_gpt2_finetune.py` keeps only the
-  hard-quantized head experiment and drops `--steps`, `--subspace-dim`, `--head-only`
-  and `--measure-memory`. `bench_polytope.py` drops `--suite`, and the variant sweep
-  drops its `quadratic/multifidelity` arm. The `[experiments]` extra no longer installs
-  snntorch, and `[rl]` installs plain gymnasium without Box2D or swig.
-- Checkpoints use format 6 and restore `candidate_evals`. Older ones, including the
-  format 5 that 0.13 writes, raise `ValueError`; rebuild the optimizer from the model.
-- New errors: `TypeError` for a subspace that is not an `AdaptiveSubspace`,
-  `HybridSubspace` or `FactoredSubspace`; `ValueError` for `ProgressiveEpsilon` with
-  `ent_epsilon`, `rank_schedule` without a `HybridSubspace`, `PowerDecay` with `gamma`
-  outside `(0, 0.5]`, a negative `CosineEpsilon` decay, a blockwise closure that does
-  not return one loss per candidate, and `resync_from_model()` on a moved model.
-- New warnings cover two configurations: `AdaptiveSubspace` rotating every step
-  with `amortize_steps > 1`, `biased_rotation` or `use_momentum`, because rotation
-  clears their state; and `adaptive_num_probe=True` under orthoplex
-  `newton_refinement`. The thread-oversubscription warning suggests
-  `torch.set_num_threads(1)` or `python -m polystep.benchmarks.threads` instead of
-  `ncpu - 8` threads.
-- Call `resync_from_model()` after swapping a layer into the model, or steps restore the
-  old weights. A closure that keeps a candidate tensor must clone it, since CPU
-  `AdaptiveSubspace` steps now reuse one buffer, as full-space steps did.
-- With `use_inplace=True` and a registered evaluator, full-space candidates that change
-  one parameter are scored with the registered loss and batch, not the closure. Move
-  any term the closure adds, such as a penalty, into that loss.
-- Subspace `per_layer` and `grouped` runs with `num_probe > 1` now default
-  `adaptive_num_probe` to on; pass `False` to keep a fixed probe count.
+Use `AdaptiveSubspace` in place of the removed CMA subspace, `SoftmaxSolver` with
+`ent_epsilon` in place of tempered softmax, and `ProgressiveEpsilon` in place of
+`auto_epsilon`. The [1.0 release notes](../CHANGELOG.md#100---2026-10-13) record the
+other removals. Current signatures and defaults are documented above.
 
 Random streams and floating-point rounding can differ from earlier releases. Keep
 the version, configuration, device, and thread count fixed for repeatable runs; see

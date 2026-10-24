@@ -736,7 +736,12 @@ def test_site_vmap_honors_evaluator_chunk_size(monkeypatch):
 
     def spy(fn, *args, **kwargs):
         if "_vmap_over_site" in fn.__qualname__:
-            chunks.append(kwargs.get("chunk_size"))
+            original = fn
+
+            def fn(site, *rest):
+                chunks.append(torch._C._functorch.get_unwrapped(site).shape[0])
+                return original(site, *rest)
+
         return real_vmap(fn, *args, **kwargs)
 
     monkeypatch.setattr(cost_nn, "vmap", spy)
@@ -747,7 +752,7 @@ def test_site_vmap_honors_evaluator_chunk_size(monkeypatch):
     opt = PolyStepOptimizer(model, seed=0, particle_dim=PDIM)
     opt.register_evaluator(evaluator, inputs, targets)
     opt.step(lambda p: evaluator.evaluate(p, inputs, targets))
-    assert chunks and set(chunks) == {4}
+    assert chunks and max(chunks) == 4
 
 
 class TiedHead(nn.Module):

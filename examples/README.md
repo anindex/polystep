@@ -4,6 +4,9 @@ Each script runs PolyStep on a small task and prints the result; 07, 08 and 09 a
 baselines for comparison. Examples 01 to 04 and 06 to 09 save a figure to
 `examples/figures/`.
 
+Run these commands from a source checkout; the package's `examples` extra installs
+dependencies, while the scripts live in this repository:
+
 ```bash
 pip install -e ".[examples]"
 python examples/01_quickstart_2d.py
@@ -54,6 +57,11 @@ accuracy afterward. The Loihi example simulates the SNN in PyTorch on the select
 device; its hardware evaluator is a deployment sketch.
 
 Examples 07 and 08 report the mean over five seeds. Their OpenAI-ES baselines use the
-noise scale and learning rate that scored best on 20 seeds the examples do not report.
+noise scale and learning rate selected on 20 separate tuning seeds.
+
+Examples 07 to 09 measure the objective on the data used for optimization; those
+scores demonstrate fitting, not generalization. Their gradient baselines have a
+separate training-step budget. Example 08 reports sample standard deviations across
+its five seeds.
 
 For published comparisons, see [experiments](../experiments/README.md).

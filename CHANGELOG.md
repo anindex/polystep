@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Restore forward-written buffers between vmap chunks and protect frozen embedding
+  weights renormalized by `max_norm`, including when evaluation raises.
+- Reject an evaluator built for another model without replacing the registered batch.
+- Preserve finite-difference gradients and curvature at small physical probe radii.
+- Report infinite marginal KL when transport puts mass outside the target's support,
+  and retain tiny positive target masses in the diagnostic.
+- Reduce CPU vmap cross-entropy overhead for unweighted, unsmoothed classification.
+- Clarify example metrics and simulated Loihi adaptation, and report sample standard
+  deviation across seeds in the F1 example.
+
 ## 1.1.0 - 2026-10-24
 
 ### Upgrade notes
@@ -13,8 +25,9 @@
 - `FactoredSubspace` redraws `B` every 5 OT steps by default; set
   `rotation_interval=0` for the 1.0 behavior. `HybridSubspace` and `FactoredSubspace`
   draw new seeded bases.
-- `SinkhornSolver` and `KLSoftmaxSolver` stop on a relative error with
-  `threshold=3e-5` and report `converged=False` when the error stalls.
+- `SinkhornSolver` stops on relative marginal error; `KLSoftmaxSolver` uses the dual
+  step divided by epsilon. Both default to `threshold=3e-5` and report
+  `converged=False` when the error stalls above the threshold.
 - `train()` runs each batch through `step_batch`, and `restore_best` compares weights
   by their loss on the first training batch.
 - Parameter names of `torch.compile` modules lose the `_orig_mod.` prefix, so 1.0
@@ -38,9 +51,9 @@
 
 ### Fixes
 
-- Scoring restores every buffer the forward writes, so identical candidates get
-  identical costs. Models vmap cannot batch, such as stock `nn.LSTM`, fall back to
-  scoring one candidate at a time instead of raising.
+- Scoring restores buffers written by the forward, so their state does not carry
+  into later scoring calls. Models vmap cannot batch, such as stock `nn.LSTM`, fall
+  back to scoring one candidate at a time instead of raising.
 - Evaluators follow dtype casts and device moves, and inputs keep their dtype when
   the forward accepts it.
 - `AdaptiveSubspace` rotation no longer crashes on CUDA above about 8M parameters,
@@ -77,8 +90,8 @@ Measured against 1.0.0 on one CPU thread and a shared RTX 5090; see
 - Checkpoints use format 6. Rebuild the optimizer from saved model weights when
   upgrading from 0.13; older optimizer checkpoints cannot be loaded.
 - Some low-level exports and experiment helpers moved or were removed. The
-  [migration guide](docs/api_overview.md#upgrading-from-013) lists replacements and
-  changes to evaluation, configuration, and callbacks.
+  [migration guide](docs/api_overview.md#upgrading-from-013) covers the main API
+  replacements and checkpoint requirements.
 
 ### Fixes
 

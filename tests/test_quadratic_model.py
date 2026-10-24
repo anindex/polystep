@@ -43,6 +43,32 @@ def test_fd_gradient_and_hessian_recover_quadratic():
     torch.testing.assert_close(hess, true_hess, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("radius", [1e-12, 1e-20])
+def test_fd_fits_keep_small_physical_radii(radius):
+    from polystep.geometry import get_orthoplex_vertices
+    from polystep.quadratic_model import (
+        extract_fd_antipodal_gradient,
+        extract_fd_gradient,
+        extract_fd_hessian_diag,
+        extract_fd_hessian_diag_centered,
+        extract_iso_curvature,
+    )
+
+    vertices = get_orthoplex_vertices(2, dtype=torch.float64)
+    scales = torch.tensor([0.25, 0.75], dtype=torch.float64)
+    points = vertices[:, None, :] * scales[None, :, None] * radius
+    gradient = torch.tensor([[3.0, -2.0]], dtype=torch.float64)
+    linear = (points @ gradient[0]).unsqueeze(0)
+    torch.testing.assert_close(extract_fd_gradient(linear, scales, radius, 2, vertices), gradient)
+    torch.testing.assert_close(extract_fd_antipodal_gradient(linear, scales, radius, 2), gradient)
+    hessian = torch.tensor([[2.0, 4.0]], dtype=torch.float64)
+    quadratic = (0.5 * points.square() @ hessian[0]).unsqueeze(0)
+    center = torch.zeros(1, dtype=torch.float64)
+    torch.testing.assert_close(extract_fd_hessian_diag(quadratic, scales, radius, 2), hessian)
+    torch.testing.assert_close(extract_fd_hessian_diag_centered(quadratic, scales, radius, 2, center), hessian)
+    torch.testing.assert_close(extract_iso_curvature(quadratic, center, scales, radius), hessian.mean(1, keepdim=True))
+
+
 @pytest.mark.parametrize("probe_radius", [1.0, 1e-2, 2e-3, 1e-4])
 def test_fd_hessian_survives_small_probe_radius(probe_radius):
     """Curvature must not depend on the probe radius the loss was measured at.

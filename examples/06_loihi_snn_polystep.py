@@ -392,7 +392,7 @@ def _save_visualization(
     # Panel (b): grouped accuracy bars + recovery annotation
     ax_bar = fig.add_subplot(gs_outer[1])
     ax_bar.set_title(
-        "(b)  Accuracy recovery via on-chip PolyStep adaptation",
+        "(b)  Accuracy recovery via simulated readout adaptation",
         loc="left",
         fontsize=12,
         pad=14,
@@ -439,7 +439,7 @@ def _save_visualization(
 
     ax_bar.set_xticks(group_centers)
     ax_bar.set_xticklabels(
-        ["Stage 1\noff-chip pretrain", "Stage 2\non-chip adaptation"],
+        ["Stage 1\npretraining", "Stage 2\nsimulated adaptation"],
         fontsize=10,
     )
     ax_bar.tick_params(axis="x", length=0, pad=8)
@@ -484,7 +484,7 @@ def _save_visualization(
     legend_handles = [
         mpatches.Patch(color=_COLOR_CLEAN, label="Clean test"),
         mpatches.Patch(color=_COLOR_BASELINE, label=f"Shifted (σ={shift_sigma}), no adaptation"),
-        mpatches.Patch(color=_COLOR_RECOVERED, label=f"Shifted (σ={shift_sigma}), PolyStep on-chip adapt"),
+        mpatches.Patch(color=_COLOR_RECOVERED, label=f"Shifted (σ={shift_sigma}), simulated PolyStep adaptation"),
     ]
     ax_bar.legend(
         handles=legend_handles,
@@ -514,7 +514,7 @@ def _save_visualization(
     )
 
     fig.suptitle(
-        "PolyStep -> Loihi 2 (skeleton):  spiking MNIST + on-chip readout adaptation",
+        "PolyStep deployment simulation: spiking MNIST + readout adaptation",
         fontsize=13,
         fontweight="bold",
         y=0.965,
@@ -652,7 +652,7 @@ def main():
     pretrained_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
     print()
-    print(f"Stage 2: 'on-chip' readout + LIF Var adaptation (shift sigma={args.shift_sigma})")
+    print(f"Stage 2: simulated readout + LIF Var adaptation (shift sigma={args.shift_sigma})")
     print("-" * 70)
     n_writable = freeze_to_writable_subset(model)
     print(
@@ -718,7 +718,7 @@ def main():
         f"  best Stage 1 (off-chip pretrain):          clean {100 * pre_clean:5.1f}%   shifted {100 * pre_shift:5.1f}%"
     )
     print(
-        f"  best Stage 2 (PolyStep on-chip adapt):     "
+        f"  best Stage 2 (simulated PolyStep adapt):   "
         f"clean {100 * post_clean:5.1f}%   "
         f"shifted {100 * post_shift:5.1f}%"
     )

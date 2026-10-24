@@ -6,6 +6,7 @@ interpolation, NaN-safety at small epsilon, and monotone convergence.
 
 from __future__ import annotations
 
+import math
 
 import pytest
 import torch
@@ -101,6 +102,15 @@ def test_constant_cost_columns_follow_b_power() -> None:
     result = KLSoftmaxSolver(epsilon=0.1, lam=0.1).solve(torch.zeros(4, 3), b=b)
     target = b.sqrt() / b.sqrt().sum()
     torch.testing.assert_close(result.matrix.sum(0), target, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("mass", [0.0, 1e-100])
+def test_marginal_kl_respects_target_support(mass):
+    solver = KLSoftmaxSolver(lam=0.0)
+    target = torch.tensor([mass, 1.0], dtype=torch.float64)
+    solver.solve(torch.zeros(2, 2, dtype=torch.float64), b=target)
+    expected = math.inf if mass == 0 else -math.log(2) - 0.5 * math.log(mass) + mass
+    assert solver.last_marginal_violation == pytest.approx(expected)
 
 
 def test_nan_safe_at_small_epsilon() -> None:
