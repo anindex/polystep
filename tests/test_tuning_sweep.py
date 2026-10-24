@@ -38,7 +38,6 @@ def _tiny_head_splits(device="cpu", n=64):
 
 @pytest.fixture
 def headquant():
-    pytest.importorskip("transformers", reason="run_gpt2_finetune imports the GPT-2 stack")
     from experiments.runners import run_gpt2_finetune
 
     return run_gpt2_finetune

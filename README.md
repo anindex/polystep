@@ -21,9 +21,16 @@ backpropagation is usually faster.
 [Julia package](https://github.com/anindex/PolyStep.jl)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/method_diagram.png" width="840"
-       alt="PolyStep: search coordinates, polytope probes, cost evaluation, soft assignment, and a barycentric update.">
+  <a href="https://vietngth.github.io/polystep-visualization/">
+    <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/polystep_particles.gif" width="720"
+         alt="Four particles probe a two-basin objective and move toward its minima through weighted barycentric steps.">
+  </a>
 </p>
+
+Four particles exploring two minima. Animation by
+[Viet T. Nguyen](https://vietngth.github.io/); the
+[interactive version](https://vietngth.github.io/polystep-visualization/)
+walks through each step.
 
 ## Installation
 
@@ -113,6 +120,15 @@ Finite-radius probes can cross flat regions of discontinuous losses. Performance
 depends on the radius, representation, and evaluation budget. PolyStep's optional
 quadratic models and radius controllers are implementation heuristics; they do not
 inherit classical direct-search or trust-region guarantees.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/rl_cartpole_policy.gif" width="600"
+       alt="A CartPole policy trained with PolyStep moves the cart to keep the pole upright.">
+</p>
+
+A trained CartPole policy in action. The
+[CartPole example](https://github.com/anindex/polystep/blob/main/examples/03_rl_cartpole.py)
+optimizes a policy using rollout rewards and saves an animated rollout.
 
 ## Baselines
 

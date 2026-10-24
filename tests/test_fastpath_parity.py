@@ -323,21 +323,14 @@ def test_prefix_reuse_matches_uncached_frees_activations(subspace, block_strateg
     assert results[0][1] == results[1][1]
 
 
-@pytest.mark.parametrize("route", ["delta", "site", "inplace"])
 @pytest.mark.parametrize(
-    "kind",
+    "kind, route",
     [
-        "full",
-        "full_bias",
-        "per_layer",
-        "grouped",
-        "dense",
-        "sparse",
-        "unprojected",
-        "unprojected_bias",
-        "factored",
-        "bf16",
-    ],
+        (kind, route)
+        for kind in ("full", "full_bias", "per_layer", "grouped", "dense", "sparse", "unprojected", "unprojected_bias")
+        for route in ("delta", "site", "inplace")
+    ]
+    + [("factored", "delta"), ("bf16", "site")],
 )
 def test_padded_tail_scores_like_materialized_step(monkeypatch, kind, route):
     from polystep import _step_blockwise, _step_monolithic
@@ -345,8 +338,6 @@ def test_padded_tail_scores_like_materialized_step(monkeypatch, kind, route):
     from polystep.hybrid_subspace import HybridSubspace
     from polystep.solvers._shared import sanitize_cost
 
-    if (kind == "factored" and route != "delta") or (kind == "bf16" and route != "site"):
-        pytest.skip("no site path for this pair")
     dtype = torch.bfloat16 if kind == "bf16" else torch.float64
     out = 6 if kind.endswith("bias") else 5
 

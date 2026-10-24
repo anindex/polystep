@@ -165,7 +165,6 @@ def test_mnist_accuracy(mnist_loaders):
 
 @pytest.mark.slow
 @pytest.mark.timeout(600)
-@pytest.mark.flaky(reruns=2)
 @pytest.mark.parametrize("kind", ["adaptive", "hybrid"])
 def test_subspace_trains(mnist_loaders, kind):
     """One training run per subspace mode, checking everything that run can show.

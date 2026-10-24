@@ -11,6 +11,10 @@ concurrency:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -49,7 +53,7 @@ jobs:
         run: |
           uv build
           uvx twine check --strict dist/*
-          uv venv
+          uv venv --python 3.12
           for wheel in dist/*.whl; do
             uv pip install "${wheel}[dev]"
           done
@@ -59,13 +63,14 @@ jobs:
           mkdir "$RUNNER_TEMP/sdist"
           tar xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist" --strip-components=1
           cd "$RUNNER_TEMP/sdist"
-          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest -q -rs -n auto
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest -q -rs -n auto --maxprocesses=4
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # Only this job can mint the PyPI token; it runs no repository code.
   publish:

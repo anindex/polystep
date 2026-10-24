@@ -48,7 +48,6 @@ dev = [
     "setuptools>=77",  # PyTorch 2.8's compiler imports it at runtime
     "pytest>=8.0",
     "pytest-timeout>=2.2",
-    "pytest-rerunfailures>=14.0",
     "pytest-cov>=5.0",
     "pytest-xdist>=3.5",  # -n auto; the suite has no shared mutable state between tests
     "ruff==0.15.13",  # pinned to match CI so `ruff format` never disagrees local vs CI
@@ -97,7 +96,6 @@ testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "gpu: marks tests requiring CUDA GPU",
-    "flaky: retried by pytest-rerunfailures; registered so a missing plugin only skips the retry",
 ]
 # Matches the CI gate, so a local run selects the same tests as a PR. Opt back in
 # with `pytest -m gpu` or `pytest -m slow`, which override this.

@@ -86,8 +86,6 @@ def test_reduces_loss_and_respects_budget(name):
 @pytest.mark.parametrize("name", METHOD_NAMES)
 @pytest.mark.parametrize("budget", [3, 17, 33])
 def test_never_overspends_odd_budgets(name, budget):
-    if name == "cma_es" and budget < 16:
-        pytest.skip("pycma needs at least one full population")
     obj, result = run(name, budget=budget)
     assert obj.evals <= budget
     assert result.evals == obj.evals

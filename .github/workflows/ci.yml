@@ -16,6 +16,10 @@ concurrency:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
   UV_TORCH_BACKEND: cpu
 
@@ -57,13 +61,15 @@ jobs:
         run: |
           if [ "$PYTHON_VERSION" = "3.11" ]; then
             uv pip install --system -e ".[dev]" 'torch==2.8.*'
+          elif [ "$PYTHON_VERSION" = "3.13" ]; then
+            uv pip install --system -e ".[dev,experiments]"
           else
             uv pip install --system -e ".[dev]"
           fi
           if [ "$PYTHON_VERSION" = "3.12" ]; then
-            pytest -q -rs -n auto --cov=polystep --cov-report=term-missing
+            pytest -q -rs -n auto --maxprocesses=4 --cov=polystep --cov-report=term-missing
           else
-            pytest -q -rs -n auto
+            pytest -q -rs -n auto --maxprocesses=4
           fi
 
   slow:
@@ -114,4 +120,4 @@ jobs:
           mkdir "$RUNNER_TEMP/sdist"
           tar xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist" --strip-components=1
           cd "$RUNNER_TEMP/sdist"
-          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest -q -rs -n auto
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest -q -rs -n auto --maxprocesses=4

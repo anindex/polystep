@@ -71,16 +71,24 @@ class TestGenerateMaxsatInstance:
         assert len(result["cnf"].clauses) == 86
 
 
-@pytest.mark.slow
-class TestGenerateMultidomainData:
-    def test_combined_domains(self):
-        pytest.importorskip("torchvision", reason="torchvision not installed")
-        from experiments.runners.nondiff_data import generate_multidomain_data
+def test_combined_domains(monkeypatch, tmp_path):
+    torchvision = pytest.importorskip("torchvision")
+    import numpy as np
 
-        result = generate_multidomain_data(batch_size=32)
-        assert result["num_classes"] == 20
-        assert "test_loader" in result
-        images, labels = next(iter(result["train_loader"]))
-        assert images.shape == (32, 1, 28, 28)
-        assert labels.min() >= 0 and labels.max() <= 19
-        assert (labels < 10).any() and (labels >= 10).any()
+    from experiments.runners.nondiff_data import generate_multidomain_data
+
+    def digits(root, *, train, download, transform):
+        count = 10 if train else 4
+        image = transform(np.full((28, 28), 255, dtype=np.uint8))
+        return torch.utils.data.TensorDataset(image.expand(count, -1, -1, -1), torch.arange(count))
+
+    monkeypatch.setattr(torchvision.datasets, "MNIST", digits)
+    monkeypatch.setattr(torchvision.datasets, "FashionMNIST", digits)
+    result = generate_multidomain_data(data_dir=str(tmp_path), batch_size=32)
+    assert result["num_classes"] == 20
+    for split, count in (("train_loader", 10), ("test_loader", 4)):
+        images, labels = next(iter(result[split]))
+        assert images.shape == (2 * count, 1, 28, 28)
+        assert sorted(labels.tolist()) == [*range(count), *range(10, 10 + count)]
+        torch.testing.assert_close(images[labels < 10], torch.full_like(images[:count], (1 - 0.1307) / 0.3081))
+        torch.testing.assert_close(images[labels >= 10], torch.full_like(images[:count], (1 - 0.2860) / 0.3530))

@@ -6,7 +6,7 @@ From the repository root, install the development dependencies and run the CI ch
 pip install -e ".[dev]"
 ruff check .
 ruff format --check .
-pytest tests/ -q -n auto
+pytest tests/ -q -n auto --maxprocesses=4
 ```
 
 Work on a branch and open a pull request after the checks pass. A bug fix should have
@@ -24,18 +24,23 @@ pytest tests/ -m gpu
 pytest tests/ -m ""
 ```
 
-The fast suite uses one CPU thread; `POLYSTEP_TEST_THREADS` overrides it. Slow tests
-use `ncpu - 8` threads, clamped to 2-16 and split across xdist workers, and may
-download datasets. Keep downloads and training-quality checks in the slow suite; use
-synthetic inputs for unit tests.
+Capping parallel test workers at four limits startup and memory costs. The fast
+suite uses one CPU thread per worker; `POLYSTEP_TEST_THREADS` overrides it. Slow
+tests use `ncpu - 8` threads, clamped to 2-16 and split across xdist workers, and may
+download datasets. Keep downloads and training-quality checks in the slow suite;
+use synthetic inputs for unit tests.
 
 Tests importing `experiments/` must skip when that directory is absent, since it is
-excluded from distributions.
+excluded from distributions. Install `pip install -e ".[dev,experiments]"` to run
+tests that need optional experiment dependencies. Missing optional dependencies and
+unavailable hardware are valid reasons to skip a test; unsupported parameter pairs
+should not be collected. Tests run without automatic retries.
 
 Pushes and pull requests test Python 3.11 with PyTorch 2.8 and Python 3.14 with
-current PyTorch. Scheduled and manual runs add Python 3.12/3.13, coverage, real-data
-learning checks, and the shipped tests against the installed wheel. Every run
-builds both distributions and checks the wheel's imports and type marker.
+current PyTorch. Scheduled and manual runs add Python 3.12/3.13, coverage, optional
+experiment dependencies, real-data learning checks, and the shipped tests against
+the installed wheel. Every run builds both distributions and checks the wheel's
+imports and type marker.
 
 ## Releases
 

@@ -15,9 +15,8 @@ pytest.importorskip("experiments.runners")
 # --- Fairness tables: every method must actually be matched -------------------------
 
 
-@pytest.fixture
-def fairness_table():
-    """Run every gradient-free method on one tiny task through the real ``run_baseline`` path."""
+def test_fairness_table_matches_budgets_representation_and_trajectory():
+    """One run per method checks matched budgets, search spaces and validation-only trajectories."""
     pytest.importorskip("cma", reason="pycma drives the CMA-ES baseline")
     import torch.nn as nn
 
@@ -50,22 +49,11 @@ def fairness_table():
             probe_scale=0.5,
             log_points=8,
         )
-    return budget, rank, table
-
-
-def test_fairness_table_shares_one_eval_budget(fairness_table):
-    """Same budget for everyone, and nobody exceeds it."""
-    budget, _, table = fairness_table
     budgets = {m: r["hyperparameters"]["eval_budget"] for m, r in table.items()}
     assert set(budgets.values()) == {budget}, f"budgets differ across the table: {budgets}"
     for method, r in table.items():
         used = r["hyperparameters"]["evals_used"]
         assert used == r["metrics"]["function_evals"] <= budget, f"{method} used {used} of {budget}"
-
-
-def test_fairness_table_shares_one_representation(fairness_table):
-    """Same subspace class and rank, with EGGROLL's documented exception recorded."""
-    _, rank, table = fairness_table
     ranks = {m: r["hyperparameters"]["subspace_rank"] for m, r in table.items()}
     assert set(ranks.values()) == {rank}, f"ranks differ across the table: {ranks}"
 
@@ -75,11 +63,6 @@ def test_fairness_table_shares_one_representation(fairness_table):
     # allowed only because it is recorded in the JSON, which is what this asserts.
     assert classes.pop("eggroll") == "FactoredSubspace", classes
     assert set(classes.values()) == {"HybridSubspace"}, f"classes differ across the table: {classes}"
-
-
-def test_fairness_table_records_plottable_trajectory(fairness_table):
-    """Accuracy against CUMULATIVE candidate evaluations, the paper's figure."""
-    budget, _, table = fairness_table
     for method, r in table.items():
         traj = r["step_logs"]
         assert len(traj) >= 2, f"{method} recorded {len(traj)} trajectory points"
