@@ -64,8 +64,6 @@ class TestGroupedBlocks:
 
 
 class TestBlockLayoutConversion:
-    """Tests for layout_flat_to_block_flat and blocks_to_layout_flat."""
-
     @pytest.mark.parametrize(
         "make_blocks",
         [
@@ -254,7 +252,6 @@ class TestBlockwiseStepState:
         def closure(bp):
             return evaluator.evaluate(bp, inputs, targets)
 
-        # First step triggers a full OT.
         optimizer.step(closure)
         ema = optimizer._transport_direction_ema
         assert ema is not None, "the amortized momentum step has nothing to coast along"

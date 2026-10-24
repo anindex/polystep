@@ -209,8 +209,6 @@ def main() -> None:
     if out_prefix is None:
         return
 
-    # Write both the aggregate and the per-seed rows, so the paper's numbers have
-    # a regenerable artifact on disk behind them.
     summary_path = f"{out_prefix}_summary.csv"
     per_seed_path = f"{out_prefix}_per_seed.csv"
     os.makedirs(os.path.dirname(os.path.abspath(summary_path)) or ".", exist_ok=True)

@@ -1,11 +1,5 @@
 # API reference
 
-Start with the [optimizer](#optimizer) and [training loop](#training-loop), then choose
-a [subspace](#subspaces) and [configuration](#configuration). For custom models, see
-[evaluation controls](#evaluation-controls) and [custom layers](#custom-layers).
-[Ask/tell](#asktell), [checkpoints](#checkpoints) and the
-[upgrade notes](#upgrading-from-10) cover the other workflows.
-
 The Python snippets build on the imports, model and data in the first example.
 
 ## Optimizer
@@ -526,7 +520,7 @@ batches and `PolyStepES` for ask/tell objectives.
 Use `AdaptiveSubspace` in place of the removed CMA subspace, `SoftmaxSolver` with
 `ent_epsilon` in place of tempered softmax, and `ProgressiveEpsilon` in place of
 `auto_epsilon`. The [1.0 release notes](../CHANGELOG.md#100---2026-10-13) record the
-other removals. Current signatures and defaults are documented above.
+other removals.
 
 Random streams and floating-point rounding can differ from earlier releases. Keep
 the version, configuration, device, and thread count fixed for repeatable runs; see

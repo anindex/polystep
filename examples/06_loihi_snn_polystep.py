@@ -333,7 +333,6 @@ def _save_visualization(
         wspace=0.16,
     )
 
-    # Panel (a): clean vs. shifted MNIST inputs
     ax_left = fig.add_subplot(gs_outer[0])
     ax_left.axis("off")
     ax_left.set_title(
@@ -343,7 +342,6 @@ def _save_visualization(
         pad=14,
     )
 
-    # 2-row x n-col image grid (no extra label column).
     gs_imgs = gridspec.GridSpecFromSubplotSpec(
         2,
         n,
@@ -368,7 +366,6 @@ def _save_visualization(
             for spine in ax.spines.values():
                 spine.set_color(color if r == 1 else "#bbb")
                 spine.set_linewidth(1.8 if r == 1 else 0.6)
-            # Digit label only on top row (avoids clutter on shifted row)
             if r == 0:
                 ax.set_title(
                     f"\u2018{int(vis_y[c])}\u2019",
@@ -376,7 +373,6 @@ def _save_visualization(
                     color="#333",
                     pad=4,
                 )
-            # Row label as a horizontal ylabel on the leftmost image only
             if c == 0:
                 ax.set_ylabel(
                     label,
@@ -389,7 +385,6 @@ def _save_visualization(
                     color=color,
                 )
 
-    # Panel (b): grouped accuracy bars + recovery annotation
     ax_bar = fig.add_subplot(gs_outer[1])
     ax_bar.set_title(
         "(b)  Accuracy recovery via simulated readout adaptation",
@@ -398,14 +393,13 @@ def _save_visualization(
         pad=14,
     )
 
-    group_centers = [0.0, 1.4]  # Stage 1, Stage 2
+    group_centers = [0.0, 1.4]
     bar_offset = 0.32
     bar_width = 0.55
 
     clean_vals = [pre_clean * 100, post_clean * 100]
     shift_vals = [base_shift * 100, post_shift * 100]
 
-    # Clean bars (both stages, same blue)
     bars_clean = ax_bar.bar(
         [c - bar_offset for c in group_centers],
         clean_vals,
@@ -415,7 +409,6 @@ def _save_visualization(
         linewidth=1.0,
         label="Clean test set",
     )
-    # Shifted bars: orange for failed baseline, green for recovered
     shift_colors = [_COLOR_BASELINE, _COLOR_RECOVERED]
     bars_shift = ax_bar.bar(
         [c + bar_offset for c in group_centers],
@@ -449,7 +442,6 @@ def _save_visualization(
     ax_bar.grid(axis="y", linestyle=":", color="#ccc", alpha=0.7, zorder=0)
     ax_bar.set_axisbelow(True)
 
-    # Curved arrow between the two shifted bars, anchored above the value labels.
     recovery = (post_shift - base_shift) * 100
     x_from = group_centers[0] + bar_offset
     x_to = group_centers[1] + bar_offset
@@ -480,7 +472,6 @@ def _save_visualization(
         fontweight="bold",
     )
 
-    # Legend below the bar axis so it never overlaps the data.
     legend_handles = [
         mpatches.Patch(color=_COLOR_CLEAN, label="Clean test"),
         mpatches.Patch(color=_COLOR_BASELINE, label=f"Shifted (σ={shift_sigma}), no adaptation"),
@@ -498,7 +489,6 @@ def _save_visualization(
         columnspacing=1.6,
     )
 
-    # Footer note: writable-subset fraction
     pct_writable = 100 * n_writable / n_total
     fig.text(
         0.985,
@@ -637,8 +627,6 @@ def main():
         noise_seed=args.seed,
     )
     pre_clean = evaluate(model, test_loader, device)
-    # Best Stage 1 weights are loaded; measure their shifted accuracy
-    # (paired with the frozen-readout baseline below).
     pre_shift = evaluate(
         model,
         test_loader,
@@ -648,7 +636,6 @@ def main():
     )
     print(f"  -> best Stage 1 | clean: {100 * pre_clean:.1f}%  shifted: {100 * pre_shift:.1f}%")
 
-    # Snapshot the Stage 1 best for the frozen-readout baseline.
     pretrained_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
     print()
@@ -690,7 +677,6 @@ def main():
         noise_seed=args.seed,
     )
     post_shift = evaluate(model, test_loader, device, shift_sigma=args.shift_sigma, noise_seed=args.seed)
-    # Best Stage 2 weights are loaded; measure clean accuracy.
     post_clean = evaluate(
         model,
         test_loader,

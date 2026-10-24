@@ -1,9 +1,5 @@
 # Examples
 
-Each script runs PolyStep on a small task and prints the result; 07, 08 and 09 also run
-baselines for comparison. Examples 01 to 04 and 06 to 09 save a figure to
-`examples/figures/`.
-
 Run these commands from a source checkout; the package's `examples` extra installs
 dependencies, while the scripts live in this repository:
 
@@ -16,7 +12,7 @@ python examples/01_quickstart_2d.py
 |---|---|
 | [01_quickstart_2d.py](01_quickstart_2d.py) | Polytope search on a staircase objective |
 | [02_snn_starter.py](02_snn_starter.py) | Spiking network with hard LIF thresholds |
-| [03_rl_cartpole.py](03_rl_cartpole.py) | CartPole policy search |
+| [03_rl_cartpole.py](03_rl_cartpole.py) | CartPole policy search with hard left/right actions |
 | [04_maxsat_10k.py](04_maxsat_10k.py) | Random 3-SAT |
 | [05_mnist.py](05_mnist.py) | MNIST classifier |
 | [06_loihi_snn_polystep.py](06_loihi_snn_polystep.py) | SNN readout adaptation under input shift |

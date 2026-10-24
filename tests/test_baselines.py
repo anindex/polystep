@@ -62,9 +62,6 @@ def run(name: str, budget: int = BUDGET, **overrides) -> tuple[Objective, Result
     return obj, METHODS[name](obj, **kwargs)
 
 
-# Per-method behaviour
-
-
 @pytest.mark.parametrize("name", METHOD_NAMES)
 def test_reduces_loss_and_respects_budget(name):
     obj, result = run(name)
@@ -97,9 +94,6 @@ def test_deterministic_given_seed(name):
     _, b = run(name, seed=7)
     assert a.evals == b.evals
     assert a.best_loss == pytest.approx(b.best_loss)
-
-
-# The counter
 
 
 def test_objective_counts_candidates_not_calls():
@@ -200,9 +194,6 @@ def test_loss_dtypes_run_es_methods(name, shaping, dtype):
     assert torch.isfinite(result.x).all()
 
 
-# Subspace parity
-
-
 def build_subspace(max_subspace_dim=32):
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(8, 6), nn.Tanh(), nn.Linear(6, 2))
@@ -246,7 +237,6 @@ def test_subspace_run_keeps_counter_semantics(name):
         assert res.evals == obj.evals <= BUDGET
         assert res.best_x.numel() == obj.dim
         assert math.isfinite(res.best_loss)
-    # Identical budget accounting: the counter means the same thing on both sides.
     if name != "cma_es":
         assert r_plain.evals == r_proj.evals
         assert r_plain.iters == r_proj.iters
@@ -290,9 +280,6 @@ def test_x0_follows_objective_dtype_device(name, device):
         assert result.x.device.type == result.best_x.device.type == device
 
 
-# EGGROLL specifics
-
-
 def test_eggroll_lowrank_noise_full_rank_update():
     from polystep.baselines.methods import _lowrank_noise
 
@@ -317,9 +304,6 @@ def test_eggroll_handles_1d_entries():
     obj = Objective(quadratic(), dim=10, budget=64, shapes=[(2, 3), (4,)])
     result = METHODS["eggroll"](obj, sigma=0.1, lr=1.0, popsize=8)
     assert result.evals == 64
-
-
-# MeZO specifics
 
 
 def test_mezo_regenerates_same_perturbation():

@@ -125,7 +125,7 @@ def main():
         out = Path(__file__).parent / "figures" / "binary_net_no_ste.png"
         fig.savefig(out, dpi=110)
         print(f"  saved figure: {out}")
-    except Exception as e:  # plotting is optional / headless-safe
+    except Exception as e:
         print(f"  (skipped figure: {e})")
 
 

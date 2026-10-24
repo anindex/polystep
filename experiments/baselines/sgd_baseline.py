@@ -96,7 +96,6 @@ def train_sgd(
     model = model.to(device)
     loss_fn = loss_fn.to(device)
 
-    # Create optimizer
     if optimizer_name_lower == "adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     else:
@@ -119,7 +118,6 @@ def train_sgd(
 
     with track_gpu_memory() as mem:
         for epoch in range(1, epochs + 1):
-            # Training
             model.train()
             epoch_loss = 0.0
             epoch_batches = 0
@@ -147,7 +145,6 @@ def train_sgd(
             avg_loss = epoch_loss / max(epoch_batches, 1)
             train_acc = epoch_correct / max(epoch_total, 1)
 
-            # Evaluation
             selection_acc = evaluate_accuracy(model, selection_loader)
             elapsed = time.time() - start_time
 

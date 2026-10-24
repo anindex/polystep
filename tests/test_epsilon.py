@@ -159,14 +159,14 @@ class TestProgressiveEpsilon:
             slow_threshold=0.5,
             decrease_factor=0.8,
             increase_factor=1.5,
-            ema_alpha=0.7,  # heavy smoothing
+            ema_alpha=0.7,
         )
         values = [pe.at()]
         for i in range(10):
             if i % 2 == 0:
-                pe.update(n_iters=1, max_iterations=1000, converged=True)  # fast
+                pe.update(n_iters=1, max_iterations=1000, converged=True)
             else:
-                pe.update(n_iters=999, max_iterations=1000, converged=False)  # slow
+                pe.update(n_iters=999, max_iterations=1000, converged=False)
             values.append(pe.at())
 
         # EMA=0.7 caps each step at 30% of the raw change, so steps stay small.
@@ -378,7 +378,7 @@ class TestRadiusEpsilonSemantics:
         )
         state = solver.run(torch.zeros(4, 2))
         assert len(state.costs) == 3
-        assert all(c == c for c in state.costs)  # no NaN
+        assert all(c == c for c in state.costs)
 
 
 def test_fixed_epsilon_does_not_decay():

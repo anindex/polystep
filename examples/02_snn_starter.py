@@ -1,10 +1,10 @@
 """02 - SNN starter: train a tiny spiking network without gradients.
 
-A small spiking neural network with hard-threshold LIF spikes (zero gradient
-almost everywhere, so no backprop) trained via PolyStep. The radii sit above
+A small spiking neural network with hard-threshold LIF spikes trained via
+PolyStep, without surrogate gradients. The radii sit above
 the defaults because the LIF dynamics make the loss rugged on the scale of a
 few weight units, and momentum carries the step direction across minibatches.
-Saves a loss/accuracy figure to examples/figures/snn_starter.png.
+Saves a loss/accuracy figure and training animation to examples/figures/.
 
 Run: python examples/02_snn_starter.py
 """
@@ -93,13 +93,13 @@ def main():
                 step_loss = loss_fn(logits, targets).item()
                 step_acc = (logits.argmax(dim=-1) == targets).float().mean().item()
 
+            global_step += 1
             loss_log.append(step_loss)
             acc_log.append(step_acc)
             step_log.append(global_step)
 
-            if global_step % 10 == 0:
+            if global_step % 10 == 0 or global_step == 1:
                 print(f"  step {global_step:3d} | loss={step_loss:.3f} batch_acc={100 * step_acc:5.1f}%")
-            global_step += 1
 
     elapsed = time.time() - start
     final_acc = evaluate_accuracy(model, test_loader)
@@ -116,34 +116,46 @@ def main():
         return
 
     import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
 
     fig, (ax_loss, ax_acc) = plt.subplots(
-        1,
         2,
-        figsize=(7.0, 2.6),
+        1,
+        figsize=(6.0, 4.0),
+        sharex=True,
         constrained_layout=True,
     )
-    ax_loss.plot(step_log, loss_log, color="#0072B2", lw=1.4)
-    ax_loss.set_xlabel("PolyStep step")
+    fig.suptitle("Hard LIF spikes · no surrogate gradients", fontsize=12)
+    (loss_line,) = ax_loss.plot(step_log, loss_log, color="#0072B2", lw=1.6)
     ax_loss.set_ylabel("Cross-entropy loss")
-    ax_loss.set_title("Training loss", fontsize=9)
+    progress = ax_loss.set_title(f"Training batch · step {target_steps}/{target_steps}", fontsize=10)
     ax_loss.grid(True, alpha=0.3)
 
-    ax_acc.plot(step_log, [100 * a for a in acc_log], color="#0072B2", lw=1.4, label="train batch")
-    ax_acc.axhline(100 * init_acc, color="#999999", ls="--", lw=1.0, label=f"initial test {100 * init_acc:.1f}%")
-    ax_acc.axhline(100 * final_acc, color="#e84040", ls="--", lw=1.0, label=f"final test {100 * final_acc:.1f}%")
+    accuracy = [100 * a for a in acc_log]
+    (acc_line,) = ax_acc.plot(step_log, accuracy, color="#0072B2", lw=1.6, label="train batch")
+    ax_acc.axhline(25, color="#999999", ls="--", lw=1.0, label="chance (4 classes)")
     ax_acc.set_xlabel("PolyStep step")
     ax_acc.set_ylabel("Accuracy (%)")
-    ax_acc.set_title("Classification accuracy", fontsize=9)
-    ax_acc.set_ylim(0, 100)
+    ax_acc.set_xlim(0, target_steps)
+    ax_acc.set_ylim(0, 105)
     ax_acc.grid(True, alpha=0.3)
-    ax_acc.legend(loc="lower right", fontsize=7)
+    ax_acc.legend(loc="lower right", fontsize=8)
 
     out = Path(__file__).parent / "figures" / "snn_starter.png"
     out.parent.mkdir(exist_ok=True)
     fig.savefig(out, dpi=150)
-    plt.close(fig)
     print(f"saved figure: {out}")
+
+    def animate(count):
+        loss_line.set_data(step_log[:count], loss_log[:count])
+        acc_line.set_data(step_log[:count], accuracy[:count])
+        progress.set_text(f"Training batch · step {count}/{target_steps}")
+
+    animation = FuncAnimation(fig, animate, frames=[*range(1, target_steps + 1), *([target_steps] * 10)])
+    gif = out.with_suffix(".gif")
+    animation.save(gif, writer=PillowWriter(fps=10), dpi=100)
+    plt.close(fig)
+    print(f"saved animation: {gif}")
 
 
 if __name__ == "__main__":

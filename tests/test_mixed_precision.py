@@ -31,7 +31,6 @@ class TestMixedPrecisionProperties:
         model = nn.Linear(10, 5)
         opt = PolyStepOptimizer(model, compile=False, **kwargs)
         assert opt.mixed_precision is expected_mixed_precision
-        # On CPU, BF16 is always supported
         assert opt.model_dtype == expected_dtype
 
     @pytest.mark.parametrize(
@@ -324,10 +323,8 @@ def test_gpu_bf16_support():
     opt = PolyStepOptimizer(model, mixed_precision=True, compile=False)
 
     if cap[0] >= 7:
-        # Volta+ supports BF16
         assert opt.model_dtype == torch.bfloat16
     else:
-        # Pre-Volta falls back to FP32
         assert opt.model_dtype == torch.float32
 
 
@@ -408,7 +405,7 @@ def test_no_nans_in_normal_training():
 def test_barycentric_projection_keeps_vertex_dtype():
     """fp32 transport weights against bf16 vertices return finite bf16."""
     b, V, d = 3, 6, 3
-    transport = torch.rand(b, V)  # fp32
+    transport = torch.rand(b, V)
     X_vertices = torch.randn(b, V, d, dtype=torch.bfloat16)
     out = _barycentric_projection(transport, X_vertices)
     assert out.dtype == torch.bfloat16
@@ -419,7 +416,7 @@ def test_barycentric_projection_keeps_vertex_dtype():
 def test_fused_softmax_project_keeps_geometry_dtype():
     """fp32 cost against bf16 geometry returns finite bf16."""
     b, V, d = 3, 6, 3
-    C = torch.randn(b, V)  # fp32 cost
+    C = torch.randn(b, V)
     pv = torch.randn(V, d, dtype=torch.bfloat16)
     rot = torch.eye(d, dtype=torch.bfloat16).expand(b, d, d).contiguous()
     X = torch.randn(b, d, dtype=torch.bfloat16)
@@ -446,7 +443,7 @@ def test_barycentric_translation_invariant_unconverged_plan():
     origin = torch.randn(b, d)
     shift = torch.tensor([5.0, -2.0, 1.0])
     X_o = torch.randn(b, V, d) + origin.unsqueeze(1)
-    X_s = X_o + shift  # shift every vertex by the same constant
+    X_s = X_o + shift
     step_o = _barycentric_projection(plan, X_o)
     step_s = _barycentric_projection(plan, X_s)
     # Shifting all vertices by c must shift the barycenter by exactly c.
@@ -843,6 +840,5 @@ def test_blockwise_biased_rotation_runs_under_bfloat16():
     losses = [opt.step(closure) for _ in range(3)]
 
     assert all(math.isfinite(loss) for loss in losses)
-    # Reaching step 3 with finite particles is the contract, not just the absence of an exception.
     assert opt.state.iteration_count == 3
     assert torch.isfinite(opt.state.X).all()

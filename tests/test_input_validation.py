@@ -118,7 +118,7 @@ def test_batched_linear_honors_nondefault_activations():
     base = dict(model.named_parameters())
     stacked = {k: v.detach()[None].expand(N, *v.shape) + 0.05 * torch.randn(N, *v.shape) for k, v in base.items()}
     fast = ev._batched_linear.evaluate(stacked, inputs, targets)
-    ref = ev._evaluate_loop(stacked, inputs, targets)  # functional_call on real model
+    ref = ev._evaluate_loop(stacked, inputs, targets)
     assert torch.allclose(fast, ref, atol=1e-5)
 
 

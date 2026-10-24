@@ -45,9 +45,7 @@ def _make_obs_quantizer(low: np.ndarray, high: np.ndarray, bins: int):
         clipped = np.clip(obs.astype(np.float32), lo, hi)
         # Map into [0, bins-1] integer bins, then back to bin center in [lo, hi].
         u = (clipped - lo) / span  # in [0, 1]
-        # floor into [0, bins-1]
         idx = np.minimum(np.floor(u * bins).astype(np.int32), bins - 1)
-        # Bin center representative value.
         center = lo + (idx.astype(np.float32) + 0.5) * (span / bins)
         return center
 

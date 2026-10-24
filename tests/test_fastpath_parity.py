@@ -95,7 +95,7 @@ def test_loss_subclass_overriding_forward_refused():
 def test_soft_label_cross_entropy_stays_batched(monkeypatch):
     model = nn.Sequential(nn.Linear(4, 3))
     ev = NNCostEvaluator(model, nn.CrossEntropyLoss())
-    assert ev._batched_linear is not None  # the plan itself is eligible
+    assert ev._batched_linear is not None
     monkeypatch.setattr(ev, "_evaluate_vmap", lambda *a: pytest.fail("soft labels left the batched path"))
 
     inputs = torch.randn(6, 4)

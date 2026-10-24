@@ -15,9 +15,6 @@ def fairness():
     return fairness
 
 
-# --- 1. the test split is unreachable from a sweep --------------------------------
-
-
 def test_tripwire_raises_on_iterate_and_unpack(fairness):
     """A DataLoader is iterated; an ``(x, y)`` split is unpacked. Both hit ``__iter__``."""
     trap = fairness.TestSplitTripwire()
@@ -91,9 +88,6 @@ def test_tripwire_check_is_not_vacuous(headquant, tmp_path, fairness):
         )
 
 
-# --- 2. equal tuning budget -------------------------------------------------------
-
-
 def test_swept_methods_share_grid_size(fairness):
     """Equal tuning effort is the claim; equal grid size is what makes it checkable."""
     sizes = {m: len(g) for m, g in fairness.TUNING_GRID.items()}
@@ -107,9 +101,6 @@ def test_tuning_cost_matches_paper_quote(fairness):
     assert len({c["tuning_evals"] for c in costs}) == 1, costs
     one = costs[0]
     assert one["tuning_evals"] == one["configs"] * one["seeds_per_config"] * one["evals_per_config"]
-
-
-# --- 3. deterministic selection ---------------------------------------------------
 
 
 def test_selection_breaks_ties_by_grid_order(fairness):
@@ -155,9 +146,6 @@ def test_selection_roundtrips_through_disk(fairness, tmp_path):
     assert fairness.load_selection("elevation", "snn", "eggroll", str(tmp_path / "nope.json")) == (None, None)
 
 
-# --- how a grid point becomes hyperparameters -------------------------------------
-
-
 def test_radius_keys_multiply_shared_probe_scale(fairness):
     """PolyStep's radius is a norm, a baseline's sigma is per-coordinate; the grid is
     expressed in units of the shared scale so the two stay comparable."""
@@ -171,9 +159,6 @@ def test_polystep_multipliers_scale_schedule_ends(fairness):
     out = fairness.apply_polystep_multipliers(cfg, {"epsilon": 2.0, "step_radius": 0.5})
     assert out == {"epsilon_init": 10.0, "epsilon_target": 0.6, "step_radius": 4.0, "num_probe": 1}
     assert cfg["epsilon_init"] == 5.0, "apply_polystep_multipliers must not mutate its input"
-
-
-# --- the two recorded asymmetries -------------------------------------------------
 
 
 def test_eggroll_dimension_gap_recorded(fairness):

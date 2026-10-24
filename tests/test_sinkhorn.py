@@ -416,7 +416,6 @@ class TestAndersonAcceleration:
         )
         result = solver.solve(C)
 
-        # The hardened guard must prevent NaN/Inf in dual potentials
         assert torch.isfinite(result.f).all(), (
             f"noise={noise}: f has non-finite values: "
             f"NaN={torch.isnan(result.f).sum()}, Inf={torch.isinf(result.f).sum()}"
@@ -426,7 +425,6 @@ class TestAndersonAcceleration:
             f"NaN={torch.isnan(result.g).sum()}, Inf={torch.isinf(result.g).sum()}"
         )
 
-        # Transport plan must be finite (no NaN propagation)
         P = result.matrix
         assert torch.isfinite(P).all(), f"noise={noise}: Transport matrix contains NaN or Inf"
 
@@ -497,7 +495,6 @@ class TestFixedModeLogic:
         )
         result = solver.solve(C)
 
-        # Verify valid transport plan (eager path ran correctly)
         P = result.matrix
         a = torch.ones(n) / n
         assert torch.allclose(P.sum(dim=1), a, atol=1e-4), f"Row marginal error: {(P.sum(dim=1) - a).abs().max():.6f}"
@@ -523,7 +520,6 @@ class TestFixedModeLogic:
         n = 15
         C = torch.rand(n, n)
 
-        # This should NOT produce the fixed-mode warning for the acceleration
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             solver = SinkhornSolver(
@@ -540,7 +536,6 @@ class TestFixedModeLogic:
         assert len(disabled_warnings) == 0, (
             f"{substring} should NOT be disabled when threshold > 0, but got warning: {disabled_warnings[0].message}"
         )
-        # Result should be finite (acceleration ran in eager path)
         assert torch.isfinite(result.f).all(), "f contains NaN or Inf"
         assert torch.isfinite(result.g).all(), "g contains NaN or Inf"
 

@@ -74,7 +74,6 @@ def main():
     batch_size = 512
     steps_per_epoch = (len(train_x) + batch_size - 1) // batch_size
 
-    # Compress each weight matrix to a rank-8 search subspace.
     total_steps = args.epochs * steps_per_epoch
     layout = ParamLayout.from_module(model)
     subspace = HybridSubspace.from_layout(layout, rank=8)

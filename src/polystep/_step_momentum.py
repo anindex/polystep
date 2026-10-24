@@ -11,7 +11,6 @@ def step_momentum(opt) -> float:
     if opt._transport_direction_ema is None:
         return state.costs[-1] if state.costs else float("inf")
 
-    # Linear decay across the cheap steps.
     phase = (opt._amortize_counter % opt.amortize_steps) / opt.amortize_steps
     decay = 1.0 - phase
 
@@ -25,7 +24,6 @@ def step_momentum(opt) -> float:
 
     state.X = state.X + decay * direction
 
-    # NaN check: revert to pre-step state and reuse the previous cost.
     if not torch.isfinite(state.X).all():
         state.X = X_old
         opt._transport_direction_ema = None

@@ -540,7 +540,7 @@ def test_screen_places_kept_values_in_place():
     torch.manual_seed(0)
     screen_cost = torch.rand(P, V)
     keep_mask = torch.zeros(P, V, dtype=torch.bool)
-    keep_mask[:, :3] = True  # each particle keeps its first three vertices
+    keep_mask[:, :3] = True
 
     i_all = torch.arange(P * V * K) // (V * K)
     v_all = (torch.arange(P * V * K) % (V * K)) // K
@@ -550,7 +550,6 @@ def test_screen_places_kept_values_in_place():
     for mask_dropped in (False, True):
         out = _fill_screened_losses(screen_cost, kept, sel_idx, keep_mask, P, V, K, mask_dropped=mask_dropped)
         torch.testing.assert_close(out[sel_idx], kept)
-        # And nothing full-fidelity landed anywhere else.
         assert out.shape == (P * V * K,)
         dropped = torch.ones(P * V * K, dtype=torch.bool)
         dropped[sel_idx] = False

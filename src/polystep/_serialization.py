@@ -143,7 +143,6 @@ class SerializationMixin:
                     stacklevel=2,
                 )
 
-        # Restore the optimizer-owned control state.
         control = sd.get("control", {})
         for name in _CONTROL_STATE_KEYS:
             # `in`, not .get(): a missing key would write None over the live value.

@@ -57,7 +57,6 @@ class TestMemoryEfficiency:
     @pytest.mark.filterwarnings("ignore:SparseRandomProjection.*below the empirical floor:UserWarning")
     def test_large_scale_memory(self):
         """Memory stays bounded for large parameter counts."""
-        # Simulate 100M params with rank-256
         proj = SparseRandomProjection(full_dim=100_000_000, subspace_dim=256, seed=42)
 
         sparse_gb = proj.memory_bytes / 1e9
@@ -125,7 +124,7 @@ class TestJLTProperty:
             d_sub = torch.norm(x1 - x2).item()
             d_full = torch.norm(proj.project(x1) - proj.project(x2)).item()
 
-            if d_sub > 1e-6:  # Avoid division by zero
+            if d_sub > 1e-6:
                 ratios.append(d_full / d_sub)
 
         mean_ratio = sum(ratios) / len(ratios)

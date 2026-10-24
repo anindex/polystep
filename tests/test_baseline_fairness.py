@@ -12,9 +12,6 @@ import torch
 pytest.importorskip("experiments.runners")
 
 
-# --- Fairness tables: every method must actually be matched -------------------------
-
-
 def test_fairness_table_matches_budgets_representation_and_trajectory():
     """One run per method checks matched budgets, search spaces and validation-only trajectories."""
     pytest.importorskip("cma", reason="pycma drives the CMA-ES baseline")
@@ -72,7 +69,6 @@ def test_fairness_table_matches_budgets_representation_and_trajectory():
         assert all("val_accuracy" in p for p in traj)
         # Validation curve only: a per-point test score would leak test into the paper's figure.
         assert not any("test_accuracy" in p for p in traj), f"{method} logs test per point"
-        # Each point records whether validation scored the iterate or the best candidate.
         assert all(p.get("scored_at") in {"iterate", "best_x"} for p in traj)
 
 
@@ -101,9 +97,6 @@ def test_eval_budget_matches_polystep_spend():
     for _ in range(steps):
         opt.step(closure)
     assert polystep_eval_budget(opt, steps) == spent
-
-
-# --- Theory mode: the unaccelerated reference configuration ------------------------
 
 
 def test_theory_mode_selects_analysed_config():
@@ -242,7 +235,7 @@ def test_reseed_loaders_accepts_none_and_unshuffled():
     from experiments.runners.common import reseed_loaders
 
     plain = DataLoader(TensorDataset(torch.zeros(4, 1), torch.zeros(4)), batch_size=2)
-    reseed_loaders(7, None, plain)  # must not raise
+    reseed_loaders(7, None, plain)
 
 
 def test_eggroll_factors_over_factored_coordinates_only():

@@ -67,7 +67,6 @@ class TestGenerateMaxsatInstance:
 
         result = generate_maxsat_instance(num_vars=20, num_clauses=86, k=3)
         assert "cnf" in result
-        # CNF object should have clauses
         assert len(result["cnf"].clauses) == 86
 
 

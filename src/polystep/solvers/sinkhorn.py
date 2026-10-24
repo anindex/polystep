@@ -203,7 +203,6 @@ class SinkhornSolver:
                 else:
                     converged = True
             else:
-                # Convergence-checking path with overrelaxation.
                 if self.anderson_depth > 0:
                     aa_history_x = []  # list of (f, g) pairs
                     aa_history_r = []  # list of (r_f, r_g) residual pairs
@@ -229,7 +228,6 @@ class SinkhornSolver:
                 for i in range(self.max_iterations):
                     f_new, g_new = sinkhorn_iter(f, g, log_K, log_a, log_b, eps, omega)
 
-                    # Anderson acceleration
                     if self.anderson_depth > 0 and (i + 1) % self.check_every == 0:
                         r_f = f_new - f
                         r_g = g_new - g

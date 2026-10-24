@@ -1,18 +1,6 @@
 #!/usr/bin/env bash
-# Full run of the benchmark grid under the validation-selected protocol and matched budgets.
-#
-# Harness settings are measured, not guessed (docs/performance.md):
-#   POLYSTEP_THREADS=8   fastest on a 24-core host; the torch default of nproc
-#                        oversubscribes the pool against the main thread and
-#                        OpenMP spin-wait takes over.
-#   OMP_WAIT_POLICY      set to PASSIVE in common.py at import, before torch
-#                        initializes its pool.
-#   3 workers            the step is GPU-bound at low memory, so concurrency
-#                        buys throughput; 3 x 8 threads fill 24 cores.
-#
-# Every job runs --fair (same subspace, same candidate-evaluation budget, same
-# minibatch stream across gradient-free methods) and the default protocol
-# (val-selected checkpoint, test scored once).
+# Three workers at eight threads share a 24-core host; tune POLYSTEP_THREADS
+# for other hardware. PASSIVE prevents idle OpenMP threads from spinning.
 set -uo pipefail
 
 cd "$(dirname "$0")/../.." || exit 1
@@ -21,10 +9,7 @@ OUT=experiments/results/revision
 LOG=experiments/results/revision/logs
 mkdir -p "$OUT" "$LOG"
 
-# Every runner skips a cell whose result file already exists, so re-running
-# into a non-empty directory would silently measure only the missing cells and
-# the tables would mix old and new runs.  Refuse, and say exactly what to do
-# about it.
+# Refuse existing results to avoid mixing runs or overwriting completed cells.
 stale=$(find "$OUT" -maxdepth 2 -name '*.json' 2>/dev/null | wc -l)
 if [ "$stale" -gt 0 ] && [ "${ALLOW_STALE:-0}" != "1" ]; then
   echo "refusing to launch: $OUT already holds $stale result file(s)." >&2
@@ -37,8 +22,7 @@ fi
 
 export POLYSTEP_THREADS="${POLYSTEP_THREADS:-8}"
 export OMP_WAIT_POLICY=PASSIVE
-# Required, not cosmetic: without it a job log stays at 0 bytes for the life of the
-# run, so a hung job is indistinguishable from a slow one.
+# Flush progress to redirected logs while jobs are running.
 export PYTHONUNBUFFERED=1
 
 WORKERS=3
@@ -60,7 +44,6 @@ export PY LOG
 rm -f "$LOG/failed"
 
 JOBS=()
-# Non-differentiable showcases: the headline table.
 JOBS+=("nondiff_snn|experiments/runners/run_elevation.py --showcases snn --methods $GF adam --seeds $SEEDS --fair --force --results-dir $OUT")
 JOBS+=("mnist|experiments/runners/run_mnist.py --methods $GF adam --seeds $SEEDS --fair --force --results-dir $OUT")
 for sc in int8 argmax staircase; do
@@ -69,7 +52,6 @@ done
 JOBS+=("moe|experiments/runners/run_moe.py --seeds $SEEDS --fair --force --results-dir $OUT")
 JOBS+=("timeseries|experiments/runners/run_timeseries.py --seeds $SEEDS --fair --force --results-dir $OUT")
 JOBS+=("maxsat|experiments/runners/run_maxsat.py --force --results-dir $OUT")
-# RL: the 2 envs x 3 precisions grid at the standard seed set.
 for env in cartpole acrobot; do
   for prec in float32 int8 binary; do
     JOBS+=("rl_${env}_${prec}|experiments/runners/run_rl.py --env $env --nondiff-mode $prec --methods polystep es ppo dqn --seeds $SEEDS --results-dir $OUT")

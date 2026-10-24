@@ -25,7 +25,6 @@
 The download-free suite in `scripts/bench_polytope.py` covers MLPs, CNNs, attention,
 spiking, hard routing, and quantization. It compares existing optimizer options with
 global-subspace, rank-two, momentum-subspace, and same-batch acceptance experiments.
-All are opt-in.
 
 ```bash
 PYTHONPATH=src:. python experiments/scripts/bench_polytope.py --seeds 0 1 2 3 4 --budget 4096 --wall

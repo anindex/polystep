@@ -27,7 +27,6 @@ import sys
 import time
 import traceback
 
-# Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
@@ -71,14 +70,13 @@ BENCHMARK = "moe"
 BATCH_SIZE = 512
 EPOCHS = 30
 
-# HYBRID: flat eps + flat pr, but SCHEDULED sr only
 # eps <= 0.5 mandatory - eps scheduling causes MoE collapse (2.66% at eps=1.5)
 # sr scheduling (12->4) with rank=4 beats flat rank=8 while being 2x faster
 POLYSTEP_CONFIG = {
-    "epsilon": 0.5,  # FLAT - eps scheduling -> collapse
-    "step_radius_init": 12.0,  # sr scheduling: 12->4
+    "epsilon": 0.5,
+    "step_radius_init": 12.0,
     "step_radius_target": 4.0,
-    "probe_radius": 1.0,  # FLAT
+    "probe_radius": 1.0,
     "num_probe": 1,
     "rank": 4,
     "chunk_size": 1024,
@@ -206,8 +204,6 @@ def run_polystep(
                         {
                             "step": step_count,
                             "epoch": epoch + 1,
-                            # Cumulative candidate evaluations: the x-axis of the
-                            # accuracy-vs-evaluations figure, shared with the baselines.
                             "evals": fwd_pass_count,
                             "val_accuracy": evaluate_accuracy(model, selection_loader),
                             "loss": loss,
@@ -265,7 +261,6 @@ def run_polystep(
             "epochs": epochs,
             "batch_size": BATCH_SIZE,
             "solver": "softmax",
-            # The four keys that let a reader check the table was matched.
             **subspace_tag(subspace, cfg["rank"]),
             "eval_budget": eval_budget,
             "evals_used": fwd_pass_count,
@@ -343,8 +338,6 @@ def run_gradient_free(
     )
     selection_loader = val_loader if val_loader is not None else test_loader
 
-    # Read back what tune_gallery.py picked on validation, as run_elevation does.
-    # Without this the sweep's picks sit on disk and every baseline runs untuned.
     selected, provenance = load_selection("gallery", BENCHMARK, method)
     probe_scale = probe_scale_of(cfg, dim=subspace.subspace_dim if subspace else layout.total_params)
     hp = apply_point({}, selected["point"], probe_scale) if selected else None

@@ -1,84 +1,54 @@
 # Changelog
 
-## Unreleased
-
-- Restore forward-written buffers between vmap chunks and protect frozen embedding
-  weights renormalized by `max_norm`, including when evaluation raises.
-- Reject an evaluator built for another model without replacing the registered batch.
-- Preserve finite-difference gradients and curvature at small physical probe radii.
-- Report infinite marginal KL when transport puts mass outside the target's support,
-  and retain tiny positive target masses in the diagnostic.
-- Reduce CPU vmap cross-entropy overhead for unweighted, unsmoothed classification.
-- Clarify example metrics and simulated Loihi adaptation, and report sample standard
-  deviation across seeds in the F1 example.
-
 ## 1.1.0 - 2026-10-24
 
-### Upgrade notes
+### Features and performance
 
-- A buffer or a separate Parameter that shares memory with a trainable parameter now
-  raises `ValueError`. Tie weights by assigning the same Parameter, or register a
-  clone.
-- `step()` raises `ValueError` when the set of `requires_grad` parameters changes
-  after construction, and passing `model.parameters()` instead of the module raises
-  `TypeError`.
-- `FactoredSubspace` redraws `B` every 5 OT steps by default; set
-  `rotation_interval=0` for the 1.0 behavior. `HybridSubspace` and `FactoredSubspace`
-  draw new seeded bases.
-- `SinkhornSolver` stops on relative marginal error; `KLSoftmaxSolver` uses the dual
-  step divided by epsilon. Both default to `threshold=3e-5` and report
-  `converged=False` when the error stalls above the threshold.
-- `train()` runs each batch through `step_batch`, and `restore_best` compares weights
-  by their loss on the first training batch.
-- Parameter names of `torch.compile` modules lose the `_orig_mod.` prefix, so 1.0
-  optimizer checkpoints of compiled hybrid or factored runs no longer load.
-- Seeded runs differ from 1.0. The
-  [upgrade guide](docs/api_overview.md#upgrading-from-10) lists every change, new
-  warnings and validation included, and the
-  [reproducibility guide](docs/reproducibility.md#changes-since-the-published-tables)
-  lists the affected published results.
-
-### New
-
-- `PolyStepOptimizer.step_batch(inputs, targets, loss_fn=...)` runs one step on a
-  batch through the same fast paths as `train()`. Examples 02, 05, 10 and 11 use it.
-- `step_batch`, `train()` and `NNCostEvaluator` accept tuple and dict inputs for
-  multi-input models; `train()` reads the target from a dict's `labels` entry.
-- Functional and configured cross-entropy, MSE and L1 losses, and custom forwards
-  that trace to a chain of Linear layers, use the fast MLP paths.
-- `register_evaluator` returns a closure that scores the registered batch, and
-  `VmapSafeMultiHeadAttention` accepts `is_causal`.
+- Add `step_batch(inputs, targets, loss_fn=...)` for supervised training. It shares
+  the fast evaluation paths with `train()`; both accept tuple and dict inputs.
+  `register_evaluator` now returns a closure for the registered batch.
+- Add `is_causal` support to `VmapSafeMultiHeadAttention`.
+- Extend fast MLP evaluation to functional losses and traceable custom forwards.
+  Reuse unchanged forward work, reduce CPU cross-entropy overhead, and replay
+  site-local CUDA forwards with CUDA graphs.
+- Measured full-space MLP steps are 1.9–3.3x faster on one CPU thread and 2.6x on a
+  shared RTX 5090 than 1.0.0. Tiny tied-weight models can be slower on CUDA. See
+  [performance](docs/performance.md) for the evaluation paths and tradeoffs.
+- Refresh the examples and their metrics, clarify simulated Loihi adaptation, and
+  add SNN training and CartPole GIFs. The MAX-SAT example reaches about 98% SAT with
+  600 default steps instead of 1500.
 
 ### Fixes
 
-- Scoring restores buffers written by the forward, so their state does not carry
-  into later scoring calls. Models vmap cannot batch, such as stock `nn.LSTM`, fall
-  back to scoring one candidate at a time instead of raising.
-- Evaluators follow dtype casts and device moves, and inputs keep their dtype when
-  the forward accepts it.
-- `AdaptiveSubspace` rotation no longer crashes on CUDA above about 8M parameters,
-  and FP16 and BF16 absorbs carry their rounding error forward.
-- Smaller fixes cover `biased_rotation`, multifidelity screening, rotation schedules
-  under `amortize_steps`, `KLSoftmaxSolver` zero-support columns, `CosineEpsilon`
-  restarts, half-precision CUDA attention, and `PolyStepES` and baseline loss
-  precision.
+- Restore forward-written buffers between scoring calls and vmap chunks, including
+  on failure. Protect frozen embedding weights changed by `max_norm`, reject
+  evaluators for another model, and follow model dtype and device changes.
+- Preserve finite-difference gradients and curvature at small probe radii. Correct
+  KL zero-support handling and marginal diagnostics, including tiny target masses.
+- Fix CUDA rotation for large adaptive subspaces, carry FP16/BF16 absorb rounding
+  error forward, and correct biased rotation, screening, amortized schedules,
+  epsilon restarts, half-precision attention, and loss precision in ES and baselines.
+- Fall back to sequential scoring when vmap cannot batch a model, including stock
+  `nn.LSTM`.
 
-### Performance and examples
+### Upgrade notes
 
-Measured against 1.0.0 on one CPU thread and a shared RTX 5090; see
-[performance](docs/performance.md) for the scoring paths.
-
-- Full-space MLP steps run about 1.9x to 3.3x faster on CPU and 2.6x on CUDA. The
-  784-64-10 step at batch 64 that `python -m polystep.benchmarks.threads` times drops
-  from about 320 ms to 97 ms on one efficiency core. `per_layer`, `AdaptiveSubspace`
-  and `FactoredSubspace` steps run 2x to 4x faster on CPU.
-- On CPU, site-local scoring adds each candidate's output change instead of building
-  its weights; on CUDA it replays CUDA graphs. Example 05 trains about 2x faster on
-  CPU, and example 11 steps 2.2x faster on CUDA.
-- A tiny tied-weight `HybridSubspace` model now takes the site-local path and steps
-  about 2x slower on CUDA; larger tied models are faster.
-- Example 04 runs 600 steps by default instead of 1500. It still reaches about 98%
-  SAT, in about a third of the time, and takes a `--device` flag.
+- Pass the model to `PolyStepOptimizer`, not `model.parameters()`. Rebuild the
+  optimizer if its trainable parameter set changes. Separate parameters or buffers
+  that share trainable storage now raise `ValueError`; tie weights by assigning
+  the same Parameter, or register a clone.
+- `FactoredSubspace` redraws `B` every 5 OT steps by default; set
+  `rotation_interval=0` for the old behavior. Hybrid and factored seeded bases change.
+- `SinkhornSolver` and `KLSoftmaxSolver` default to `threshold=3e-5`, using relative
+  marginal error and the dual step divided by epsilon, respectively. Stalled solves
+  above the threshold report `converged=False`.
+- `train()` uses `step_batch`; `restore_best` compares weights on the first training
+  batch. Seeded results can differ from 1.0.
+- For compiled hybrid/factored runs, rebuild the optimizer from saved model weights:
+  checkpoint parameter names no longer contain the `_orig_mod.` prefix. The
+  [upgrade guide](docs/api_overview.md#upgrading-from-10) covers all compatibility
+  changes; [reproducibility](docs/reproducibility.md#changes-since-the-published-tables)
+  lists the affected published results.
 
 ## 1.0.0 - 2026-10-13
 

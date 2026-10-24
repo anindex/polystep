@@ -605,7 +605,6 @@ def test_delta_evaluator_declines_frozen_linear_param(frozen):
     optimizer.register_evaluator(evaluator, inputs, targets)
 
     assert optimizer._sparse_delta_evaluator is None
-    # The step must still run, through the materializing path.
     optimizer.step(lambda params: evaluator.evaluate(params, inputs, targets))
 
 

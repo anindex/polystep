@@ -11,9 +11,6 @@ from torch.utils.data import DataLoader, TensorDataset
 pytest.importorskip("experiments.runners")
 
 
-# --- (a) the val split reaches every method, not only polystep -------------
-
-
 def _tiny_loaders():
     """Four-sample MNIST-shaped train/test loaders."""
     x = torch.randn(4, 1, 28, 28)
@@ -41,9 +38,6 @@ def test_every_mnist_method_gets_val_split(monkeypatch, tmp_path):
     for method, kwargs in seen.items():
         assert kwargs.get("val_loader") is not None, f"{method} was dispatched without a validation split"
         assert kwargs.get("audit_no_leakage") is True, f"{method} was dispatched without the leakage guard"
-
-
-# --- (b) a leaked run cannot become a paper number -------------------------
 
 
 def _write_result(results_dir, leaked):

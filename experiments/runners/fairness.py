@@ -72,8 +72,6 @@ __all__ = [
     "write_selection",
 ]
 
-#: The gradient-free methods a fairness table compares. Adam is gradient-based and is
-#: not a peer; it is not in here.
 FAIR_METHODS = ("openai_es", "spsa", "mezo", "random_search", "eggroll", "cma_es")
 
 #: Population size every population method shares in fairness mode, so "one generation"
@@ -97,9 +95,6 @@ UNMATCHED_BUDGETS = {
     "mezo": 20_000,
     "random_search": 20_000,
 }
-
-
-# --- matched budget ---------------------------------------------------------------
 
 
 def evals_per_step(opt) -> int:
@@ -126,9 +121,6 @@ def polystep_eval_budget(opt, total_steps: int) -> int:
     a = max(1, int(getattr(opt, "amortize_steps", 1)))
     ot_steps = -(-int(total_steps) // a)  # ceil: counter % a == 0 is an OT step
     return evals_per_step(opt) * ot_steps
-
-
-# --- matched representation -------------------------------------------------------
 
 
 def make_subspace(layout, *, rank: int, seed: int, method: str = "polystep", **kwargs):
@@ -228,9 +220,6 @@ def subspace_tag(subspace, rank: Optional[int], *, shared_dim: Optional[int] = N
     return tag
 
 
-# --- matched hyperparameters ------------------------------------------------------
-
-
 def fair_hyperparams(method: str, *, probe_scale: float, seed: int, popsize: int = FAIR_POPSIZE) -> dict:
     """Default hyperparameters at a shared probe scale.
 
@@ -253,14 +242,11 @@ def fair_hyperparams(method: str, *, probe_scale: float, seed: int, popsize: int
     return {**hp, "seed": seed}
 
 
-#: Candidates a single generation of each method costs. The population methods draw
-#: ``popsize``; the rest are sequential by construction and draw two whatever the
-#: dimension. This is the number that makes a step budget and an evaluation budget
-#: different questions.
+#: Candidate evaluations per generation; population methods read popsize at runtime.
 EVALS_PER_GENERATION = {
-    "openai_es": None,  # popsize
-    "eggroll": None,  # popsize
-    "cma_es": None,  # popsize
+    "openai_es": None,
+    "eggroll": None,
+    "cma_es": None,
     "spsa": 2,  # f(x + c*delta), f(x - c*delta)
     "mezo": 2,  # the same two-point estimate
     "random_search": 2,
@@ -429,9 +415,7 @@ _EGGROLL_AXES = {"lr": (0.003, 0.03), "sigma": (0.25, 4.0), "popsize": (16, 64)}
 #: only mis-scaled.
 _RADIUS_MULT = (0.25, 1.0, 4.0)
 
-#: One grid per method, all the same size, so tuning cost is comparable across the
-#: table. Deliberately coarse: the point is a *recorded, equal* tuning budget, not a
-#: good one.
+#: Equal grid sizes keep tuning budgets comparable across methods.
 TUNING_GRID: Dict[str, List[dict]] = {
     "openai_es": [dict(lr=lr, sigma=s) for lr in (0.003, 0.01, 0.03) for s in _RADIUS_MULT],
     "spsa": [dict(a=a, c=c) for a in (0.03, 0.1, 0.3) for c in _RADIUS_MULT],
@@ -584,9 +568,6 @@ def apply_polystep_multipliers(cfg: dict, point: dict) -> dict:
     return out
 
 
-# --- validation-only sweeps -------------------------------------------------------
-
-
 class TestSplitTripwire:
     """Raise if a tuning run tries to read the test split."""
 
@@ -642,9 +623,7 @@ def write_selection(
                 "name": win["name"],
                 "configs_tried": len(group),
                 "distinct_val_scores": distinct,
-                # A sweep whose configs all score the same has not chosen anything: the
-                # tie-break returned the grid's first entry, which is the untuned prior.
-                # Say so here rather than let the paper quote it as a tuned config.
+                # All-tied sweeps return the first grid entry; record that no configuration won.
                 "informative": distinct > 1,
                 # Per pick, so each entry carries the sweep that produced it.
                 "provenance": dict(stamped),
@@ -724,8 +703,6 @@ def load_selection(experiment: str, showcase: str, method: str, path: str = DEFA
     # wrote last. A missing record is reported as missing.
     return entry, entry.get("provenance")
 
-
-# --- theory mode ------------------------------------------------------------------
 
 #: gamma in ``r_t = r_0 (t+1)^-(1/2+gamma)``.
 THEORY_GAMMA = 0.1
@@ -823,9 +800,6 @@ def apply_theory_mode(cfg: dict) -> dict:
     assert abs(resolve_radius(out["step_radius"], 0, eps) - r_s_phys) < 1e-9 * max(1.0, r_s_phys)
     assert abs(resolve_radius(out["probe_radius"], 0, eps) - r_p_phys) < 1e-9 * max(1.0, r_p_phys)
     return out
-
-
-# --- the runner -------------------------------------------------------------------
 
 
 def _load(model, stacked: Dict[str, torch.Tensor]) -> None:
@@ -1019,7 +993,6 @@ def run_baseline(
             while log_at and log_at[0] <= objective.evals:
                 log_at.pop(0)
             next_log[0] = log_at[0] if log_at else budget + 1
-            # Print as well as record, so a long population run shows progress.
             pct = 100.0 * objective.evals / max(budget, 1)
             head = f"      {pct:5.1f}%  evals={objective.evals:,}/{budget:,}"
             q = trajectory[-1].get(f"val_{quality_key}") if trajectory else None

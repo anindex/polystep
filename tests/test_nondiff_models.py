@@ -43,8 +43,8 @@ from experiments.runners.nondiff_models import (  # noqa: E402
 def test_spike_values_binary():
     """Spike output must be in {0.0, 1.0}."""
     lif = LIFNeuron(beta=0.95, threshold=1.0)
-    x = torch.randn(4, 32) * 2.0  # Large values to trigger spikes
-    mem = torch.randn(4, 32).abs() * 1.5  # Some above threshold
+    x = torch.randn(4, 32) * 2.0
+    mem = torch.randn(4, 32).abs() * 1.5
     spike, _ = lif(x, mem)
     unique_vals = spike.unique()
     for v in unique_vals:
@@ -59,7 +59,7 @@ def test_weights_are_int8_rounded():
         ql.bias.zero_()
     x = torch.tensor([[1.0, 1.0]])
     out = ql(x)
-    assert torch.allclose(out, torch.tensor([[-0.5]]), atol=1e-6)  # uses quantized weights
+    assert torch.allclose(out, torch.tensor([[-0.5]]), atol=1e-6)
     assert not torch.allclose(out, x @ ql.weight.t(), atol=1e-3)  # not the raw linear (-0.4)
 
 
@@ -146,7 +146,7 @@ def test_ste_passes_gradient_to_every_weight(build, input_shape):
 def test_output_values_quantized():
     """Output values must be in {0/5, 1/5, 2/5, 3/5, 4/5}."""
     sa = StaircaseActivation(levels=5)
-    x = torch.randn(100, 16)  # Enough samples for variety
+    x = torch.randn(100, 16)
     out = sa(x)
     valid_values = {0.0, 0.2, 0.4, 0.6, 0.8}
     unique_vals = out.unique()
@@ -178,15 +178,12 @@ class TestMaxSATModel:
 
 
 class TestVmapCompatibility:
-    """Test that all classification models work under torch.vmap + functional_call."""
-
     @staticmethod
     def _vmap_test(model, input_tensor, num_perturbations=2):
         """Helper: run vmap with `num_perturbations` parameter perturbations."""
         params = dict(model.named_parameters())
         buffers = dict(model.named_buffers())
 
-        # Create batched params: stack original params num_perturbations times with noise
         batched_params = {}
         for name, p in params.items():
             noise = torch.randn(num_perturbations, *p.shape) * 0.01

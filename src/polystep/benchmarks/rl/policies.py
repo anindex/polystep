@@ -58,7 +58,6 @@ class NonDiffActivation(nn.Module):
             return x
         if self.mode == "int8":
             return _quantize_int8_per_tensor(x)
-        # binary
         return torch.sign(x)
 
 

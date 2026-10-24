@@ -337,7 +337,6 @@ def cma_es(
     return _result("cma_es", obj, best, it, history)
 
 
-#: Name -> method, for runners that select a baseline by string.
 METHODS: Dict[str, Callable[..., Result]] = {
     "openai_es": openai_es,
     "spsa": spsa,

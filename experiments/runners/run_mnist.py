@@ -22,7 +22,6 @@ import os
 import sys
 import time
 
-# Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
@@ -66,7 +65,6 @@ BENCHMARK = "mnist"
 BATCH_SIZE = 512
 EPOCHS = 30
 
-# polystep hyperparameters (HybridSubspace + cosine schedules), no momentum.
 # No probe_radius_jitter here: setting it forces amortize_steps=1 (see
 # PolyStepOptimizer.__init__) and would change the tuned run;
 # --theory-mode runs the analysed configuration instead.
@@ -187,7 +185,6 @@ def run_polystep(
                         {
                             "step": step_count,
                             "epoch": epoch + 1,
-                            # Cumulative candidate evaluations, shared with the baselines.
                             "evals": fwd_pass_count,
                             "val_accuracy": evaluate_accuracy(model, selection_loader),
                             "loss": loss,
@@ -248,7 +245,6 @@ def run_polystep(
         hyperparameters={
             **cfg,
             "epochs": epochs,
-            # The four keys that let a reader check the table was matched.
             **subspace_tag(subspace, cfg["rank"]),
             "eval_budget": eval_budget,
             "evals_used": fwd_pass_count,
@@ -382,8 +378,6 @@ def run_adam(seed, device, train_loader, test_loader, results_dir, val_loader=No
     print(f"    Saved: {filepath}")
 
 
-# polystep and adam have their own loops; every gradient-free method goes through
-# the one shared runner.
 METHOD_RUNNERS = {"polystep": run_polystep, "adam": run_adam}
 ALL_METHODS = ("polystep", "adam", *FAIR_METHODS)
 

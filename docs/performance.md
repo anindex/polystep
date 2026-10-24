@@ -9,12 +9,6 @@ coordinates, so at the default `num_probe=1` a step scores 16 particles times th
 simplex vertices, 144 candidates. The quadratic model adds one shared incumbent
 evaluation when `biased_rotation` or `trust_region` uses it.
 
-See [candidate evaluation](#candidate-evaluation) for how forwards are batched,
-[subspaces and memory](#subspaces-and-memory) for candidate counts and chunk sizes,
-and [compilation and precision](#compilation-and-precision) for backend tradeoffs.
-The [CPU measurements](#cpu-measurements) and [benchmark commands](#benchmarks)
-show how to measure a workload.
-
 ## Quick checklist
 
 - Pick the thread count with `python -m polystep.benchmarks.threads`.

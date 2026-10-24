@@ -77,7 +77,7 @@ def auto_detect_chunk_size(
     try:
         param_device = next(model.parameters()).device
     except StopIteration:
-        return None  # No parameters
+        return None
 
     if param_device.type != "cuda":
         return None
@@ -941,7 +941,7 @@ class NNCostEvaluator:
             return self._forward_loss
         first = next(self.model.parameters(), None)
         if first is None or not first.is_cuda:
-            return self._forward_loss  # CUDA-graph capture needs CUDA
+            return self._forward_loss
         if self._compiled_fwd_loss is None:
             try:
                 self._compiled_fwd_loss = torch.compile(
@@ -1083,7 +1083,6 @@ class NNCostEvaluator:
                 fwd_loss = self._verified_forward_loss_fn(inputs, targets)
             with self._restoring_buffers() as restore_buffers:
                 for i in range(N):
-                    # Reconstruct config i directly into the model params.
                     subspace.apply_perturbation_inplace(
                         projections,
                         self.model,

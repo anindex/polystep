@@ -47,7 +47,7 @@ class _TiedHead(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(vocab, dim)
         self.lm_head = nn.Linear(dim, vocab, bias=False)
-        self.lm_head.weight = self.embedding.weight  # tie
+        self.lm_head.weight = self.embedding.weight
 
     def forward(self, ids):
         h = self.embedding(ids)
@@ -133,11 +133,9 @@ def test_tied_weights_deduplicated_with_info_log(caplog):
         "lm_head.weight should be aliased to embedding.weight, not a separate flat-param entry"
     )
 
-    # The canonical entry must record the alias.
     canonical = next(e for e in layout.entries if e.key == "embedding.weight")
     assert "lm_head.weight" in canonical.shared_with
 
-    # The dedup must be visible in the log at any level.
     all_msgs = [r.getMessage().lower() for r in caplog.records]
     assert any("tied" in m or "shared" in m or "alias" in m or "dedup" in m for m in all_msgs), (
         f"expected a log message mentioning the tied weight; got: {all_msgs}"
@@ -154,7 +152,6 @@ def test_bf16_tied_state_dict_roundtrip():
     flat1 = layout.flatten(model)
     sd1 = layout.unflatten(flat1)
 
-    # Reload into a fresh model with identical architecture.
     fresh = _TiedHead(vocab=8, dim=4).to(dtype=torch.bfloat16)
     # Drop strict=True since aliased keys may appear extra
     fresh.load_state_dict(sd1, strict=False)
@@ -217,11 +214,9 @@ def test_padded_roundtrip_preserves_state_dict():
     assert flat.numel() == 6
     sd = layout.unflatten(flat)
 
-    # Padding must not appear as a state_dict key.
     expected_keys = {"0.weight", "0.bias", "1.weight"}
     assert set(sd.keys()) == expected_keys, f"state_dict keys leaked padding: {set(sd.keys()) - expected_keys}"
 
-    # Values round-trip exactly.
     orig = model.state_dict()
     for k in expected_keys:
         assert torch.allclose(sd[k], orig[k]), f"value mismatch on {k}"

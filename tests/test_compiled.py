@@ -187,7 +187,6 @@ def test_fused_softmax_survives_large_negative_costs():
     X = torch.zeros(1, 1)
     X_new, transport = CompiledFunctions(compile=False).fused_softmax_project(cost, 1e-3, verts, rot, 0.1, X)
     assert torch.isfinite(X_new).all() and torch.isfinite(transport).all()
-    # The cheaper vertex still wins.
     assert transport[0, 0] > transport[0, 1]
 
 

@@ -25,8 +25,6 @@ def collect(results_dir, cutoff):
         if ts < cutoff:
             dropped += 1
             continue
-        # run_maxsat writes "cmaes" where every other runner writes "cma_es";
-        # normalized on read because 900+ existing result files use it.
         method = "cma_es" if r["method"] == "cmaes" else r["method"]
         runs[(r["benchmark"], method)].append(r)
     if dropped:

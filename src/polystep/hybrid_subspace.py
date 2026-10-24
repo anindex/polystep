@@ -157,8 +157,6 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         if self.compression_ratio == 0.0 and self._total_params > 0:
             object.__setattr__(self, "compression_ratio", self.subspace_dim / self._total_params)
 
-    # Factory methods
-
     @classmethod
     def from_layout(
         cls,
@@ -220,8 +218,6 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             **kwargs,
         )
 
-    # Projection management
-
     def init_projections(
         self,
         device: torch.device,
@@ -282,8 +278,6 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
 
         return P
 
-    # Rotation coordination
-
     def rotate_all(
         self,
         projections: Dict[str, torch.Tensor],
@@ -301,7 +295,7 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
             return projections
 
         # Sparse tensors lack .device/.dtype; take them from the first dense projection.
-        device, dtype = torch.device("cpu"), torch.float32  # safe defaults
+        device, dtype = torch.device("cpu"), torch.float32
         for p in projections.values():
             if isinstance(p, torch.Tensor):
                 device, dtype = p.device, p.dtype
@@ -435,8 +429,6 @@ class HybridSubspace(ProjectedAbsorbMixin, SvdRatioMixin):
         orig_dtype = combined.dtype
         Q, _ = thin_qr(combined.to(decomposition_dtype(orig_dtype)))
         return Q.to(orig_dtype) if Q.dtype != orig_dtype else Q
-
-    # Core reconstruction methods
 
     def apply_perturbation(
         self,

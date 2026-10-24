@@ -193,7 +193,6 @@ def main() -> int:
                             loss_batch=loss_batch,
                             budget=budget,
                             val_fn=lambda m: evaluate_accuracy(m, val_loader),
-                            # A tuning sweep that can reach test is a leak waiting to happen.
                             test_fn=lambda m: float("nan"),
                             mode="max",
                             seed=args.seed,

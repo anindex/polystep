@@ -163,7 +163,6 @@ def run_random_cartpole(
         normalized_score=_gym_normalized_score("cartpole", summary["mean_return"]),
         wall_time_seconds=time.time() - start,
         peak_gpu_memory_mb=0.0,
-        # One policy, evaluated over `eval_episodes` rollouts.
         function_evals=int(eval_episodes),
         total_steps=1,
         rl_env_steps=0,
@@ -196,7 +195,6 @@ def _run_cartpole_polystep_full(*, seed: int, device: str, results_dir: str, arg
     )
 
 
-# Per-env registry for generic Gymnasium envs.
 GYM_ENV_REGISTRY: dict[str, dict[str, Any]] = {
     "cartpole": {
         "env_id": "CartPole-v1",
@@ -423,7 +421,6 @@ def run_polystep_gym(
         step = optimizer.state.iteration_count if optimizer.state is not None else len(step_logs)
         return evaluator.loss_for_stacked_params(stacked_params, seed=seed, step=step)
 
-    # Step-0 anchor.
     init_summary = evaluator.summarize_stacked_params(
         stack_module_params(model, 1),
         seed=seed + 10_000,
@@ -572,7 +569,6 @@ def run_random_gym(
         normalized_score=_gym_normalized_score(env_short, summary["mean_return"]),
         wall_time_seconds=time.time() - start,
         peak_gpu_memory_mb=0.0,
-        # One policy, evaluated over `eval_episodes` rollouts.
         function_evals=int(eval_episodes),
         total_steps=1,
         rl_env_steps=0,
@@ -849,7 +845,6 @@ def run_es_gym(
         f"popsize={popsize} generations={generations}"
     )
 
-    # theta = current mean parameters as a list of named (name, shape).
     base_params: dict[str, torch.Tensor] = {n: p.detach().clone().to(device) for n, p in model.named_parameters()}
     rng = torch.Generator(device="cpu")
     rng.manual_seed(int(seed))
@@ -868,7 +863,6 @@ def run_es_gym(
             stacked[name] = theta.unsqueeze(0) + sigma * noise[name]
         return stacked
 
-    # Step-0 anchor.
     eval_stacked0 = {n: t.unsqueeze(0) for n, t in base_params.items()}
     init_summary = evaluator.summarize_stacked_params(
         eval_stacked0,
@@ -891,13 +885,11 @@ def run_es_gym(
     )
 
     for gen in range(1, generations + 1):
-        # Cosine-annealed sigma.
         import math as _math
 
         progress = (gen - 1) / max(1, generations - 1)
         sigma = sigma_target + 0.5 * (sigma_init - sigma_target) * (1 + _math.cos(_math.pi * progress))
 
-        # Antithetic noise: half random, half mirrored.
         noise: dict[str, torch.Tensor] = {}
         for name, theta in base_params.items():
             eps_half = torch.randn(
@@ -913,18 +905,14 @@ def run_es_gym(
         # Rank-centered weights (standardized -> sum to 0).
         centered = 2 * centered_rank(fitness)  # in [-1, 1]
 
-        # Update theta: theta <- theta + (lr / (popsize * sigma)) * sum_i (w_i * noise_i)
         scale = lr / (popsize * max(sigma, 1e-8))
         for name, theta in base_params.items():
-            # weighted sum across population: einsum 'p,p...->...'
             w = centered.to(theta.device, dtype=theta.dtype)
             update = torch.einsum("p,p...->...", w, noise[name])
             base_params[name] = theta + scale * update
 
-        # Periodic checkpoint eval at theta (mean params).
         if gen == 1 or gen == generations or gen % eval_interval == 0:
             with torch.no_grad():
-                # Build a 1-candidate stacked dict from the current theta.
                 eval_stacked = {n: t.unsqueeze(0) for n, t in base_params.items()}
             summary = evaluator.summarize_stacked_params(
                 eval_stacked,
@@ -954,7 +942,6 @@ def run_es_gym(
                 f"sigma={sigma:.3f} best={best_return:.1f} wall={time.time() - start:.0f}s"
             )
 
-    # Final multi-seed eval at the mean params.
     eval_stacked = {n: t.unsqueeze(0) for n, t in base_params.items()}
     final_summary = multi_seed_summary(
         evaluator,

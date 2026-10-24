@@ -20,17 +20,11 @@ backpropagation is usually faster.
 [API reference](https://github.com/anindex/polystep/blob/main/docs/api_overview.md) ·
 [Julia package](https://github.com/anindex/PolyStep.jl)
 
-<p align="center">
-  <a href="https://vietngth.github.io/polystep-visualization/">
-    <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/polystep_particles.gif" width="720"
-         alt="Four particles probe a two-basin objective and move toward its minima through weighted barycentric steps.">
-  </a>
-</p>
+| One particle | Four particles, two minima |
+|:---:|:---:|
+| [<img src="docs/figures/polystep_particle.gif" width="440" alt="One particle probes an objective and moves toward its minimum through weighted barycentric steps.">](https://vietngth.github.io/polystep-visualization/) | [<img src="docs/figures/polystep_particles.gif" width="440" alt="Four particles probe a two-basin objective and move toward its minima through weighted barycentric steps.">](https://vietngth.github.io/polystep-visualization/) |
 
-Four particles exploring two minima. Animation by
-[Viet T. Nguyen](https://vietngth.github.io/); the
-[interactive version](https://vietngth.github.io/polystep-visualization/)
-walks through each step.
+Animations from [Viet T. Nguyen's interactive visualization](https://vietngth.github.io/polystep-visualization/).
 
 ## Installation
 
@@ -64,14 +58,13 @@ optimizer = PolyStepOptimizer(model, subspace=subspace, solver="softmax")
 train(model, loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 ```
 
-Replace the generated data with your dataset. `max_subspace_dim=128` caps the search
-at 128 coordinates, so each step scores 144 candidates. Biases and normalization
-weights keep their full width. On a larger model, the cap must cover those parameters
-plus at least one coordinate per weight matrix. If the cap is too small, PolyStep
+`max_subspace_dim=128` caps the search at 128 coordinates, so each step scores
+144 candidates. Biases and normalization weights keep their full width. On a larger
+model, the cap must cover those parameters plus at least one coordinate per weight
+matrix. If the cap is too small, PolyStep
 warns and reports the minimum dimension it can use.
 
-To write the loop yourself, call `step_batch` once per batch. It scores the candidates
-on that batch through the same fast paths `train()` uses and moves the weights:
+`step_batch` uses the same candidate evaluation paths as `train()`:
 
 ```python
 loss_fn = nn.CrossEntropyLoss()
@@ -121,14 +114,16 @@ depends on the radius, representation, and evaluation budget. PolyStep's optiona
 quadratic models and radius controllers are implementation heuristics; they do not
 inherit classical direct-search or trust-region guarantees.
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/rl_cartpole_policy.gif" width="600"
-       alt="A CartPole policy trained with PolyStep moves the cart to keep the pole upright.">
-</p>
+| SNN training | CartPole policy |
+|:---:|:---:|
+| <img src="docs/figures/polystep_snn_progress.gif" width="440" alt="Training loss and batch accuracy over 60 PolyStep updates of a spiking network with hard LIF thresholds."> | <img src="docs/figures/rl_cartpole_policy.gif" width="440" alt="A trained CartPole policy uses hard left/right actions to keep the pole upright."> |
 
-A trained CartPole policy in action. The
-[CartPole example](https://github.com/anindex/polystep/blob/main/examples/03_rl_cartpole.py)
-optimizes a policy using rollout rewards and saves an animated rollout.
+The [SNN example](examples/02_snn_starter.py) trains a network with hard LIF spikes
+on four synthetic classes, without surrogate gradients.
+
+The [CartPole example](examples/03_rl_cartpole.py) uses real-valued weights and a
+hard left/right `argmax`. PolyStep optimizes episode return without gradients
+through the actions or simulator.
 
 ## Baselines
 

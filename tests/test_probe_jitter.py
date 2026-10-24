@@ -46,12 +46,10 @@ class TestProbeRadiusJitter:
         """With jitter=0, _apply_probe_radius_jitter returns the input unchanged
         and consumes NO random state from the optimizer's generator."""
         opt = _optimizer(particle_dim=2, probe_radius=2.0, seed=42)
-        # Snapshot the generator state BEFORE calling the helper.
         state_before = opt._generator.get_state().clone()
         result = opt._apply_probe_radius_jitter(2.0)
         state_after = opt._generator.get_state()
         assert result == 2.0
-        # No random call should have occurred.
         assert torch.equal(state_before, state_after)
 
     def test_jitter_perturbs_probe_radius(self):
@@ -61,8 +59,6 @@ class TestProbeRadiusJitter:
         eta_max = 0.05
         opt = _optimizer(particle_dim=2, probe_radius=2.0, probe_radius_jitter=eta_max, seed=42)
         base = 2.0
-        # Sample many jitter values and check (a) they are all in the interval,
-        # (b) the variance is non-zero (jitter is actually being applied).
         samples = [opt._apply_probe_radius_jitter(base) for _ in range(200)]
         lo = base * (1.0 - eta_max)
         hi = base * (1.0 + eta_max)
@@ -90,13 +86,10 @@ class TestProbeRadiusJitter:
         opt.step(closure)
         params_after = torch.cat([p.detach().flatten() for p in model.parameters()])
         assert opt._state.iteration_count == 1
-        # The step must have produced a finite, non-trivial update.
         assert torch.isfinite(params_after).all()
         assert not torch.equal(params_before, params_after)
 
 
-# --- Jitter is exclusive with the amortization heuristics -------------------------
-#
 # Jitter noise reads as particle movement to the amortization heuristic, so the
 # constructor turns it off instead of leaving each config to remember.
 
@@ -117,8 +110,6 @@ def test_no_jitter_leaves_amortization_alone():
     assert opt.amortize_steps == 3
 
 
-# --- Step-radius jitter: absolute continuity of the one-step law -------------------
-#
 # Without jitter the displacement has deterministic length, so the one-step law sits
 # on a Lebesgue-null sphere; Cor. 4.12 needs a volume there.
 
@@ -166,7 +157,6 @@ def test_step_jitter_spreads_displacement_length():
         return torch.tensor(out)
 
     jittered = norms(0.3)
-    # A degenerate sampler would return a constant; the jitter must actually vary.
     assert jittered.std().item() > 0.0
     assert (jittered > 0).all()
 

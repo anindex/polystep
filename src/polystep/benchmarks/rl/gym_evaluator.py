@@ -116,7 +116,6 @@ class GymVectorEvaluator(_StackedRolloutEvaluator):
         self.device = torch.device(device)
         # Real steps taken by loss_for_stacked_params rollouts, since episodes terminate early.
         self.env_steps = 0
-        # Probe env for spec metadata.
         probe = gym.make(self.env_id)
         self.obs_dim = int(np.prod(probe.observation_space.shape))
         if probe.action_space.__class__.__name__ != "Discrete":
@@ -154,7 +153,7 @@ class GymVectorEvaluator(_StackedRolloutEvaluator):
                 pass
         self._venvs.clear()
 
-    def __del__(self):  # best-effort cleanup
+    def __del__(self):
         try:
             self.close()
         except Exception:  # noqa: BLE001

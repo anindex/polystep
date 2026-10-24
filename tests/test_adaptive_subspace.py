@@ -204,7 +204,6 @@ class TestRotateDisplacement:
             P, step=50, total_steps=100, displacement_history=disp_history, generator=torch.Generator().manual_seed(99)
         )
 
-        # The new basis must have a column aligned with the dominant direction.
         dot_products = (P_new.T @ dominant_full).abs()
         max_dot = dot_products.max().item()
 
@@ -421,7 +420,6 @@ def test_displacement_mode_productivity():
             displacement = P @ best_coords
             x_base = x_base + displacement
 
-            # Track displacement for the next rotation.
             disp_history_list.append(best_coords.clone())
             if len(disp_history_list) > sub.displacement_history_size:
                 disp_history_list.pop(0)

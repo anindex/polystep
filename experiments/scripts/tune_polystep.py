@@ -38,12 +38,6 @@ from experiments.runners.fairness import (
 )
 
 
-# --- which module owns which showcase ---------------------------------------------
-#
-# Each adapter swaps its module's config, runs one PolyStep cell in tuning mode,
-# and puts the config back.
-
-
 def _elevation_adapter(showcase):
     from experiments.runners import run_elevation as R
 

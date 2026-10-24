@@ -35,14 +35,12 @@ Changelog = "https://github.com/anindex/polystep/blob/main/CHANGELOG.md"
 Issues = "https://github.com/anindex/polystep/issues"
 
 [project.optional-dependencies]
-# Lightweight: just enough for examples/ demos
 examples = [
     "numpy>=2.0",
     "matplotlib>=3.8",
     "Pillow>=10.0",
     "gymnasium[classic-control]>=0.29",
 ]
-# Core dev: lint + test the library itself (no experiment deps)
 dev = [
     "numpy>=2.0",  # the test suite loads MNIST through it
     "setuptools>=77",  # PyTorch 2.8's compiler imports it at runtime
@@ -52,7 +50,6 @@ dev = [
     "pytest-xdist>=3.5",  # -n auto; the suite has no shared mutable state between tests
     "ruff==0.15.13",  # pinned to match CI so `ruff format` never disagrees local vs CI
 ]
-# Full experiment reproduction (paper results, ablations, baselines)
 experiments = [
     "numpy>=2.0",  # polystep.benchmarks imports it; the optimizer itself does not
     "pandas>=2.0",
@@ -63,7 +60,6 @@ experiments = [
     "transformers>=4.40",  # GPT-2 tokenizer + pretrained weights, same runner
     "gymnasium>=0.29",
 ]
-# RL experiments (SB3 PPO/DQN baselines)
 rl = [
     "gymnasium>=0.29",
     "stable-baselines3>=2.3",

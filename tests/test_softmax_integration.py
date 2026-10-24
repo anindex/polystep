@@ -17,7 +17,6 @@ from polystep.solvers import SoftmaxSolver, SinkhornSolver
 
 
 def _make_model():
-    """Small MLP for fast testing."""
     torch.manual_seed(42)
     return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
 
@@ -27,7 +26,6 @@ def _flat_params(model):
 
 
 def _make_closure(model):
-    """Create a batched closure using NNCostEvaluator."""
     torch.manual_seed(42)
     evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
     inputs = torch.randn(16, 4)
@@ -55,8 +53,6 @@ def layout(model):
 
 
 class TestSolverSelection:
-    """Verify default solver auto-selection and explicit overrides."""
-
     def test_full_space_defaults_to_sinkhorn(self):
         model = _make_model()
         opt = PolyStepOptimizer(model)
@@ -69,8 +65,6 @@ class TestSolverSelection:
 
 
 class TestProgressiveEpsilonBlocking:
-    """Verify ProgressiveEpsilon is blocked with softmax solver."""
-
     def test_progressive_epsilon_with_softmax_raises(self, model):
         eps = ProgressiveEpsilon(init=0.1, target=0.01, max_epsilon=0.5)
         with pytest.raises(ValueError, match="ProgressiveEpsilon"):
@@ -90,8 +84,6 @@ class TestProgressiveEpsilonBlocking:
 
 
 class TestSoftmaxFunctionalStep:
-    """Verify softmax solver works through full optimizer step pipeline."""
-
     def test_softmax_step_leaves_duals_none(self, model, closure):
         opt = PolyStepOptimizer(model, solver="softmax", epsilon=0.5)
         opt.step(closure)
@@ -129,8 +121,6 @@ def test_amortize_steps_with_softmax(model, closure, feature_kwargs):
 
 
 class TestSubspaceModes:
-    """Verify softmax solver works with different subspace types."""
-
     def test_hybrid_subspace_step(self, model, layout):
         """HybridSubspace with softmax solver runs 2 steps without error."""
         sub = HybridSubspace.from_layout(layout, rank=4, rotation_interval=0)
@@ -154,7 +144,6 @@ def test_fixed_epsilon_with_softmax(model):
     closure = _make_closure(model)
     loss = opt.step(closure)
     assert math.isfinite(loss)
-    # Solver epsilon should be set from the optimizer
     assert opt.solver.epsilon == pytest.approx(0.5, abs=0.01)
 
 
@@ -172,8 +161,6 @@ def test_dual_momentum_with_softmax_keeps_stepping(model, closure):
 
 
 class TestFusedSoftmaxDispatch:
-    """Verify fused softmax fast path activation and correctness."""
-
     def test_fused_softmax_path_active_for_softmax(self, model, layout):
         """Fused path is active when solver='softmax' with subspace."""
         sub = HybridSubspace.from_layout(layout, rank=4)

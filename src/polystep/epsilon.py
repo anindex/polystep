@@ -85,7 +85,6 @@ class ProgressiveEpsilon:
     slow_threshold: float = 0.5
     ema_alpha: float = 0.7
 
-    # Internal state (not part of constructor signature for users).
     _current: float = field(init=False, repr=False)
     _smoothed: float = field(init=False, repr=False)
 

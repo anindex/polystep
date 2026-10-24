@@ -228,7 +228,6 @@ class PolyStepOptimizer(SerializationMixin):
         sinkhorn_max_iters: int = 2000,
         chunk_size: Optional[int] = None,
         cost_batch_size: Optional[int] = None,
-        # Alternate full OT steps with cheap momentum steps.
         amortize_steps: int = 1,
         amortize_ema: float = 0.7,
         compile: bool = False,
@@ -250,17 +249,13 @@ class PolyStepOptimizer(SerializationMixin):
         radius_decrease: float = 0.9,
         radius_min: float = 0.5,
         radius_max: float = 3.0,
-        # Extrapolate warm-start duals.
         dual_momentum_beta: float = 0.0,
         anderson_depth: int = 0,
         adaptive_omega: bool = False,
         biased_rotation: bool = False,
-        # Extract finite-difference gradient/Hessian from cost evaluations.
         use_quadratic_model: bool = False,
-        # Post-OT correction using the quadratic model.
         newton_refinement: bool = False,
         newton_refinement_alpha: float = 0.3,
-        # Adapt step_radius from predicted vs actual improvement.
         trust_region: bool = False,
         # Rank directions on a cheap fidelity, then pay full fidelity only for the survivors.
         multifidelity_screen: bool = False,
@@ -368,9 +363,6 @@ class PolyStepOptimizer(SerializationMixin):
             raise ValueError("ProgressiveEpsilon adapts the solve epsilon; it cannot be combined with ent_epsilon.")
         validate_cost_scale(scale_cost)
         self.scale_cost = scale_cost
-        # A negative radius flips the finite-difference denominator, which the
-        # clamp then turns positive and scales the gradient by 1e10. 0 is the
-        # no-movement control.
         if isinstance(step_radius, (int, float)) and step_radius < 0:
             raise ValueError(f"step_radius must be >= 0, got {step_radius}.")
         if isinstance(probe_radius, (int, float)) and probe_radius <= 0:
@@ -715,10 +707,8 @@ class PolyStepOptimizer(SerializationMixin):
             )
 
         if subspace is not None:
-            # Subspace coords reshaped to (num_particles, subspace_particle_dim).
             sub_dim = subspace.subspace_dim
             pdim = subspace_particle_dim
-            # Pad to a multiple of particle_dim.
             padded_sub = sub_dim + (-sub_dim % pdim)
             num_sub_particles = padded_sub // pdim
             # Start at base params, so coordinates are zero.
@@ -746,7 +736,6 @@ class PolyStepOptimizer(SerializationMixin):
             radius=1.0,
         )
 
-        # Interior probe positions.
         self._probes = torch.linspace(0, 1, num_probe + 2)[1 : num_probe + 1]
 
         _num_vertices = self._polytope_vertices.shape[0]
@@ -763,7 +752,6 @@ class PolyStepOptimizer(SerializationMixin):
         # With one particle, balanced OT pins a uniform plan and the step freezes.
         _single_particle = X_init.shape[0] == 1 and not _full_blockwise
         if _single_particle and solver is None:
-            # Never let the default produce a frozen optimizer.
             solver = "softmax"
             warnings.warn(
                 "num_particles=1: balanced Sinkhorn yields a uniform transport plan "
@@ -1195,7 +1183,6 @@ class PolyStepOptimizer(SerializationMixin):
             return closure
         # use_inplace=True asks for the real forward, so it outranks the fast paths.
         if evaluator._inplace_forced:
-            # Warn once, not once per step.
             if not getattr(self, "_warned_forced_inplace", False):
                 self._warned_forced_inplace = True
                 extra = (
@@ -1364,7 +1351,6 @@ class PolyStepOptimizer(SerializationMixin):
             self._prev_pre_step_loss = None
             self._prev_objective_token = objective_token
         self._last_screen_savings = 0.0
-        # Amortized OT: cheap momentum steps between full OT solves.
         if (
             self.amortize_steps > 1
             and self._amortize_counter % self.amortize_steps != 0
@@ -1512,7 +1498,6 @@ class PolyStepOptimizer(SerializationMixin):
             )
         _trainable_owners(self.model)
         if self.subspace is not None:
-            # Re-anchor the base and zero the coordinates.
             self._state.base_params = {
                 k: v.detach().clone() for k, v in self.model.state_dict().items() if isinstance(v, torch.Tensor)
             }
@@ -1593,7 +1578,6 @@ class PolyStepOptimizer(SerializationMixin):
         state = self._state
 
         if self.subspace is not None:
-            # Flatten X back to subspace coords, then rebuild params from base + perturb.
             X = state.X  # (num_sub_particles, particle_dim)
             flat_sub = X.reshape(-1)[: state.subspace.subspace_dim]
             proj = state.hybrid_projections if self._per_layer_projections else state.projection

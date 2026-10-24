@@ -18,7 +18,6 @@ import sys
 import time
 import urllib.request
 
-# Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import numpy as np
@@ -74,7 +73,6 @@ def load_etth1():
     """
     filepath = download_etth1()
 
-    # Parse CSV with stdlib csv module (no pandas dependency)
     ot_values = []
     with open(filepath, "r") as f:
         reader = csv.DictReader(f)
@@ -281,12 +279,11 @@ def regression_metrics(test: dict, val_mse: float, val_mae: float, **extra) -> d
 
 BENCHMARK = "timeseries"
 BATCH_SIZE = 64
-EPOCHS = 30  # polystep epochs
-ADAM_EPOCHS = 50  # Adam epochs (gradient-based ceiling)
+EPOCHS = 30
+ADAM_EPOCHS = 50
 SEQ_LEN = 96
 PRED_LEN = 96
 
-# polystep hyperparameters (HybridSubspace)
 POLYSTEP_CONFIG = {
     "rank": 8,
     "epsilon_init": 10.0,
@@ -306,7 +303,6 @@ POLYSTEP_CONFIG = {
     "momentum_final": 0.95,
 }
 
-# Adam hyperparameters
 ADAM_CONFIG = {
     "lr": 0.001,
     "epochs": ADAM_EPOCHS,
@@ -375,15 +371,12 @@ def run_polystep(
                 epoch_loss += loss
                 step_count += 1
 
-                # Per-20-step fine-grained tracking
                 if step_count % 20 == 0:
                     step_metrics = evaluate_regression(model, test_data, device=device)
                     step_logs.append(
                         {
                             "step": step_count,
                             "epoch": epoch + 1,
-                            # Cumulative candidate evaluations: the shared x-axis
-                            # of the quality-vs-evaluations figure.
                             "evals": fwd_pass_count,
                             "test_mse": step_metrics["mse"],
                             "test_mae": step_metrics["mae"],
@@ -392,7 +385,6 @@ def run_polystep(
                         }
                     )
 
-            # Score the selection split and snapshot if it improved.
             ev = selector()
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / len(train_loader)
@@ -429,7 +421,6 @@ def run_polystep(
         hyperparameters={
             **cfg,
             "epochs": epochs,
-            # Keys that let a reader check the table was matched.
             **subspace_tag(subspace, cfg["rank"]),
             "eval_budget": eval_budget,
             "evals_used": fwd_pass_count,
@@ -479,7 +470,6 @@ def run_adam(
                 epoch_loss += loss.item()
                 step_count += 1
 
-            # Score the selection split and snapshot if it improved.
             ev = selector()
             epoch_time = time.time() - epoch_start
             avg_loss = epoch_loss / len(train_loader)
@@ -658,8 +648,6 @@ def run_persistence(
     print(f"    Saved: {filepath}")
 
 
-# polystep, adam and persistence have their own loops; every gradient-free method
-# goes through the one shared runner.
 METHOD_RUNNERS = {"polystep": run_polystep, "adam": run_adam, "persistence": run_persistence}
 ALL_METHODS = ("polystep", "adam", "persistence", *FAIR_METHODS)
 

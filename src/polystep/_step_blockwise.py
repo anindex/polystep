@@ -58,7 +58,6 @@ def _resolve_geometry(opt, state, iteration):
     radius_mult = state.radius_multiplier if opt.use_adaptive_radius else 1.0
     step_r = opt._get_step_radius(iteration) * radius_epsilon_factor(opt.step_radius, current_eps) * radius_mult
     probe_r = opt._get_probe_radius(iteration) * radius_epsilon_factor(opt.probe_radius, current_eps) * radius_mult
-    # Probe-radius jitter; no-op when probe_radius_jitter == 0.
     probe_r = opt._apply_probe_radius_jitter(probe_r)
     ent_eps = resolve_epsilon(opt.ent_epsilon, iteration, "ent_epsilon")
     return current_eps, ent_eps if ent_eps is not None else current_eps, step_r, probe_r
@@ -129,7 +128,6 @@ def _solve_block(opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mat
 
     record_saturation(opt, state, ot_result.matrix, step_r)
 
-    # Per-particle step-radius jitter; no-op when step_radius_jitter == 0.
     X_new_block = opt._apply_particle_step_jitter(block_X, X_new_block)
 
     descent = (X_new_block - block_X).detach()

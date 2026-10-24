@@ -116,7 +116,6 @@ class FactoredSubspace(ProjectedAbsorbMixin):
         """Redraw every ``B`` on the rotation interval; returning the same object means nothing changed."""
         if self.rotation_interval <= 0 or step <= 0 or step % self.rotation_interval != 0:
             return projections
-        # Empty when nothing is projected.
         if not projections:
             return projections
         device = next(iter(projections.values())).device

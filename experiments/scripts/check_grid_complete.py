@@ -30,8 +30,6 @@ GALLERY = {
     "mnist": ALL_METHODS,
     "moe": tuple(m for m in ALL_METHODS if m != "adam"),
 }
-#: ``timeseries`` is outside the cross-product, so leaving it out means its six
-#: baselines are never checked.
 TIMESERIES_METHODS = ("polystep", "adam", "persistence") + GF
 PAIRS = [(b, m) for b, methods in GALLERY.items() for m in methods] + [("timeseries", m) for m in TIMESERIES_METHODS]
 

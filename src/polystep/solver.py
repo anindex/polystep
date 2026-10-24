@@ -46,21 +46,17 @@ class SolverState:
     stagnation_count: int = 0
     radius_multiplier: float = 1.0
     prev_loss: float = float("inf")
-    # Adaptive subspace state
     projection: Optional[torch.Tensor] = None
     displacement_history: Optional[torch.Tensor] = None
     displacement_history_full: Optional[torch.Tensor] = None
     displacement_history_idx: int = 0
     displacement_history_count: int = 0
     absorb_count: int = 0
-    # Dual potential momentum
     prev_prev_f: Optional[torch.Tensor] = None
     prev_prev_g: Optional[torch.Tensor] = None
     # Epsilon of the last solve; a >2x jump drops the dual-momentum history.
     last_solve_eps: Optional[float] = None
-    # Trust region diagnostics
     trust_region_multipliers: List[float] = field(default_factory=list)
-    # HybridSubspace state
     hybrid_projections: Optional[dict] = None
 
     def record_solver_health(self, ess=None, rho=None, evals=0) -> None:
@@ -258,7 +254,6 @@ class PolyStep:
             ]
         ).tolist()
 
-        # NaN-safe: revert if X_new has NaN.
         _nan_reverted = not finite
         if _nan_reverted:
             X_new = X.clone()
@@ -309,7 +304,6 @@ class PolyStep:
         for i in range(self.max_iterations):
             state = self.step(state, generator=generator)
 
-            # i is 0-based, so i + 1 steps have run.
             if i + 1 >= self.min_iterations:
                 if self._converged(state) or self._diverged(state):
                     break

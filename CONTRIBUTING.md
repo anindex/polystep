@@ -9,10 +9,10 @@ ruff format --check .
 pytest tests/ -q -n auto --maxprocesses=4
 ```
 
-Work on a branch and open a pull request after the checks pass. A bug fix should have
-a small regression test of observable behavior. Extend an existing case when it
-already covers the same path; avoid separate tests for trivial defaults, getters, or
-repeated shapes. Keep comments specific and public APIs typed.
+A bug fix should have a small regression test of observable behavior. Extend an
+existing case when it already covers the same path; avoid separate tests for trivial
+defaults, getters, or repeated shapes. Keep public APIs typed. Comments should
+explain constraints, numerical choices, or non-obvious behavior.
 
 ## Tests
 
@@ -49,20 +49,15 @@ Update `polystep.__version__`. Set the same version and the release date in
 `pyproject.toml` reads the package version automatically.
 If the project's maturity changes, update its `Development Status` classifier.
 
-Build the distributions. Then check their metadata:
-
 ```bash
 uv build
 uvx twine check --strict dist/*
 ```
 
-Run the full manual CI workflow on the release commit.
-This covers the Python matrix and repository-only experiment tests.
-After CI passes, publish a GitHub Release with the tag `vX.Y.Z`.
-This triggers the PyPI workflow. The workflow checks version consistency, lint, and
-package metadata. It tests the installed wheel before it publishes the package.
-Only the separate publish job has OIDC permission; it uses the `pypi` environment
-and PyPI Trusted Publishing.
+After the full manual CI workflow passes on the release commit, publish a GitHub
+Release tagged `vX.Y.Z`. The release workflow checks versions, lint, metadata, and
+the installed wheel before publishing. Only the publish job has OIDC permission;
+it uses the `pypi` environment and PyPI Trusted Publishing.
 
 ## Issues
 

@@ -17,12 +17,10 @@ from polystep.transform import ParamLayout
 
 
 def _make_model():
-    """Small MLP for fast testing."""
     return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
 
 
 def _make_closure(model):
-    """Create a batched closure using NNCostEvaluator."""
     evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
     inputs = torch.randn(16, 4)
     targets = torch.randn(16, 1)

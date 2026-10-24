@@ -24,8 +24,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-# Ensure the repo root is importable so `experiments.runners.common` resolves
-# when this file is run as a script.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
@@ -228,7 +226,7 @@ def _maxsat_env(budget, n_vars=200, ratio=4.2, seed0=0):
             return clause_sat.mean(dim=-1)
 
         def closure(batched_params):
-            assign = (batched_params["theta"] > 0).float()  # round() non-differentiability
+            assign = (batched_params["theta"] > 0).float()
             return 1.0 - _pct_sat(assign)  # fraction unsatisfied (minimized)
 
         def quality(m):
@@ -265,7 +263,7 @@ class TinySNN(nn.Module):
         for _ in range(self.num_steps):
             mem = mem + cur
             spk = (mem >= 1.0).float()  # hard LIF threshold, zero gradient a.e.
-            mem = mem - spk  # reset by subtraction
+            mem = mem - spk
             out = out + self.fc2(spk)
         return out
 
@@ -389,7 +387,6 @@ def screen_configs(env: Env):
         ),
     ]
 
-    # 6. Momentum family.
     cfgs += [
         Config("momentum", "use_momentum", s, kwargs={"use_momentum": True}),
         Config("momentum", "amortize", s, kwargs={"amortize_steps": 3}),
@@ -417,7 +414,6 @@ def screen_configs(env: Env):
         ),
     ]
 
-    # 9. Geometry.
     cfgs += [
         Config("geometry", "simplex", s, kwargs={"polytope_type": "simplex"}),
         Config("geometry", "num_probe_3", s, kwargs={"num_probe": 3}),
@@ -428,10 +424,8 @@ def screen_configs(env: Env):
 def interaction_configs(env: Env):
     s = env.default_solver
     cfgs = []
-    # solver x representation
     for solver in ["softmax", "sinkhorn"]:
         cfgs.append(Config("solver_x_repr", f"{solver}_hybrid", solver, subspace=_hybrid(8), needs_subspace=True))
-    # block x representation
     cfgs.append(
         Config(
             "block_x_repr",
@@ -442,7 +436,6 @@ def interaction_configs(env: Env):
             needs_subspace=True,
         )
     )
-    # trust_region x quadratic at K=3
     cfgs.append(
         Config(
             "trust_x_quad",
@@ -451,7 +444,6 @@ def interaction_configs(env: Env):
             kwargs={"num_probe": 3, "trust_region": True, "use_quadratic_model": True},
         )
     )
-    # adaptive_radius x schedule
     cfgs.append(
         Config("radius_x_sched", "adaptive_constant_eps", s, kwargs={"use_adaptive_radius": True, "epsilon": 0.3})
     )

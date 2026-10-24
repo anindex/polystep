@@ -291,7 +291,6 @@ def test_hardened_env_smoke(require_experiments):
     assert r == 0.0  # CartPole step reward is 1 < deadband 2 -> bucketed to 0
     env.close()
 
-    # End-to-end factory + Gym registration
     for s in ("cartpole_hard", "acrobot_hard"):
         e = make_hardened_env(s)
         obs, _ = e.reset(seed=0)

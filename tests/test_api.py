@@ -23,12 +23,10 @@ from polystep import (
 
 
 def _make_model():
-    """Small MLP for fast testing."""
     return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
 
 
 def _make_dataloader(num_samples=32, batch_size=16):
-    """Create a simple DataLoader with random data."""
     torch.manual_seed(42)
     X = torch.randn(num_samples, 4)
     y = torch.randn(num_samples, 1)
@@ -37,7 +35,6 @@ def _make_dataloader(num_samples=32, batch_size=16):
 
 
 def _make_optimizer(model):
-    """Create a PolyStepOptimizer with fast settings."""
     return PolyStepOptimizer(
         model,
         compile=False,
@@ -68,7 +65,7 @@ class TestTrain:
         """With epochs=2 and 2 batches/epoch, expect 4 on_step_end calls."""
         torch.manual_seed(42)
         model = _make_model()
-        dl = _make_dataloader(num_samples=32, batch_size=16)  # 2 batches
+        dl = _make_dataloader(num_samples=32, batch_size=16)
         opt = _make_optimizer(model)
 
         class StepCounter(TrainCallback):
@@ -120,7 +117,7 @@ class TestTrain:
         """Callback returning True after 2 calls stops training."""
         torch.manual_seed(42)
         model = _make_model()
-        dl = _make_dataloader(num_samples=32, batch_size=16)  # 2 batches
+        dl = _make_dataloader(num_samples=32, batch_size=16)
         opt = _make_optimizer(model)
 
         class EarlyStop(TrainCallback):
@@ -446,7 +443,6 @@ class TestEarlyStoppingCallback:
 
 class TestGetDiagnostics:
     def _run_optimizer(self, model, steps=3, use_momentum=False):
-        """Helper to create and run optimizer for a few steps."""
         dl = _make_dataloader()
         opt = PolyStepOptimizer(
             model,

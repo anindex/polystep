@@ -63,7 +63,6 @@ def visualize_policy(policy, horizon: int = 2000):
     print(f"  episode return = {total_reward:.0f}")
     env.close()
 
-    # Save as GIF (sub-sampled to keep file size reasonable).
     out = Path(__file__).parent / "figures" / "rl_cartpole_policy.gif"
     out.parent.mkdir(exist_ok=True)
     step = max(1, len(frames) // 200)  # cap at ~200 frames

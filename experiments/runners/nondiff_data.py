@@ -62,11 +62,9 @@ def generate_maxsat_instance(
     for _ in range(num_clauses):
         # Sample k distinct variables (1-indexed for PySAT convention)
         vars_chosen = rng.sample(range(1, num_vars + 1), k)
-        # Randomly negate each literal
         clause = [v if rng.random() < 0.5 else -v for v in vars_chosen]
         cnf.append(clause)
 
-    # Convert to tensors
     clause_vars_list = []
     clause_signs_list = []
     for clause in cnf.clauses:
@@ -126,8 +124,6 @@ def generate_multidomain_data(
             - 'num_classes': 20 (MNIST 0-9, Fashion-MNIST 10-19).
     """
 
-    # Load both datasets (returns DataLoaders; we need the underlying datasets)
-    # Use the underlying torchvision datasets directly for concatenation
     from torchvision import datasets, transforms
     import os
 
@@ -142,7 +138,6 @@ def generate_multidomain_data(
     mnist_train = datasets.MNIST(mnist_dir, train=True, download=True, transform=mnist_transform)
     mnist_test = datasets.MNIST(mnist_dir, train=False, download=True, transform=mnist_transform)
 
-    # Fashion-MNIST transform
     fmnist_dir = os.path.join(data_dir, "fashion_mnist")
     fmnist_transform = transforms.Compose(
         [
@@ -153,11 +148,9 @@ def generate_multidomain_data(
     fmnist_train = datasets.FashionMNIST(fmnist_dir, train=True, download=True, transform=fmnist_transform)
     fmnist_test = datasets.FashionMNIST(fmnist_dir, train=False, download=True, transform=fmnist_transform)
 
-    # Offset Fashion-MNIST labels by 10
     fmnist_train_offset = _LabelOffsetDataset(fmnist_train, offset=10)
     fmnist_test_offset = _LabelOffsetDataset(fmnist_test, offset=10)
 
-    # Combine datasets
     combined_train = ConcatDataset([mnist_train, fmnist_train_offset])
     combined_test = ConcatDataset([mnist_test, fmnist_test_offset])
 

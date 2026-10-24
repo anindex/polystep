@@ -87,7 +87,7 @@ class BinaryLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.polystep_weight_transform(self.weight).t() + self.bias  # NON-DIFFERENTIABLE
+        return x @ self.polystep_weight_transform(self.weight).t() + self.bias
 
 
 class TernaryLinear(nn.Module):
@@ -116,7 +116,7 @@ class TernaryLinear(nn.Module):
         return torch.sign(w) * (w.abs() >= self.threshold).to(w.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.polystep_weight_transform(self.weight).t() + self.bias  # NON-DIFFERENTIABLE
+        return x @ self.polystep_weight_transform(self.weight).t() + self.bias
 
 
 class STESign(torch.autograd.Function):
@@ -170,7 +170,7 @@ class BinaryLinearSTE(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_b = STESign.apply(self.weight)  # STE in backward pass
+        w_b = STESign.apply(self.weight)
         return x @ w_b.t() + self.bias
 
 
@@ -184,7 +184,7 @@ class TernaryLinearSTE(nn.Module):
         self.threshold = threshold
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_t = STETernary.apply(self.weight, self.threshold)  # STE in backward pass
+        w_t = STETernary.apply(self.weight, self.threshold)
         return x @ w_t.t() + self.bias
 
 
@@ -200,7 +200,6 @@ class DiscreteAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, dim)
         sim = x @ self.keys.t()  # (batch, num_slots)
-        # Hard routing via argmax, NON-DIFFERENTIABLE
         slot_idx = sim.argmax(dim=-1)  # (batch,)
         selected_keys = self.keys[slot_idx]  # (batch, dim)
         return self.values(x) * torch.sigmoid(selected_keys)
@@ -216,7 +215,7 @@ class StaircaseActivation(nn.Module):
         self.levels = levels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.floor(torch.sigmoid(x) * self.levels) / self.levels  # NON-DIFFERENTIABLE
+        return torch.floor(torch.sigmoid(x) * self.levels) / self.levels
 
 
 class HardMoELayer(nn.Module):
@@ -271,7 +270,7 @@ class SpikingMNISTNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[0]
-        x = x.reshape(batch, -1)  # Flatten to (batch, 784)
+        x = x.reshape(batch, -1)
 
         mem1 = torch.zeros(batch, 128, device=x.device, dtype=x.dtype)
         mem2 = torch.zeros(batch, 10, device=x.device, dtype=x.dtype)
@@ -296,7 +295,7 @@ class QuantizedMLP(nn.Sequential):
                     ("flatten", nn.Flatten()),
                     ("fc1", nn.Linear(input_dim, hidden)),
                     ("act1", nn.ReLU()),
-                    ("quant", QuantizedLinear(hidden, hidden)),  # NON-DIFFERENTIABLE
+                    ("quant", QuantizedLinear(hidden, hidden)),
                     ("relu", nn.ReLU()),
                     ("fc2", nn.Linear(hidden, output)),
                 ]
@@ -386,7 +385,7 @@ class DiscreteAttentionNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.reshape(x.shape[0], -1)
         x = torch.relu(self.fc1(x))
-        x = self.attn(x)  # NON-DIFFERENTIABLE argmax routing
+        x = self.attn(x)
         return self.fc2(x)
 
 
@@ -433,7 +432,7 @@ class HardMoENet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.reshape(x.shape[0], -1)
         x = self.relu(self.fc1(x))
-        x = self.moe(x)  # NON-DIFFERENTIABLE argmax gating
+        x = self.moe(x)
         return self.fc_out(x)
 
 
@@ -448,7 +447,7 @@ class SmoothLIFNeuron(nn.Module):
 
     def forward(self, x: torch.Tensor, mem: torch.Tensor):
         mem = self.beta * mem + x
-        spike = torch.sigmoid((mem - self.threshold) * self.temperature)  # DIFFERENTIABLE
+        spike = torch.sigmoid((mem - self.threshold) * self.temperature)
         mem = mem * (1.0 - spike)
         return spike, mem
 
@@ -489,7 +488,7 @@ class SmoothAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, dim)
         sim = x @ self.keys.t()  # (batch, num_slots)
-        weights = F.softmax(sim, dim=-1)  # DIFFERENTIABLE (no argmax)
+        weights = F.softmax(sim, dim=-1)
         selected = weights @ self.keys  # (batch, dim)
         return self.values(x) * torch.sigmoid(selected)
 
@@ -512,7 +511,7 @@ class SmoothDiscreteAttentionNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.reshape(x.shape[0], -1)
         x = torch.relu(self.fc1(x))
-        x = self.attn(x)  # DIFFERENTIABLE soft attention
+        x = self.attn(x)
         return self.fc2(x)
 
 

@@ -18,7 +18,6 @@ from polystep.transform import ParamLayout
 
 @pytest.fixture
 def simple_mlp():
-    """Small MLP for fast testing: Linear(4,8) -> ReLU -> Linear(8,2)."""
     torch.manual_seed(42)
     return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
 
@@ -188,7 +187,6 @@ def _make_small_model():
 
 
 def _make_integration_closure(model, input_dim=8, output_dim=4):
-    """Create a batched closure for integration testing."""
     evaluator = NNCostEvaluator(model, loss_fn=nn.MSELoss())
     inputs = torch.randn(16, input_dim)
     targets = torch.randn(16, output_dim)

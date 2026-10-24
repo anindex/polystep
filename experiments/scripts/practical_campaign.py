@@ -167,7 +167,6 @@ def result_path(task, axis, method, cfg, seed, stage):
 def campaign():
     manifest = [dict(task=t, axis=a, method=m, configs=list(points(t, m))) for t, a, m in groups()]
     atomic_json(OUT / "manifest.json", manifest)
-    # Wait for every controlled arm's selection and final seeds.
     while not arms_complete():
         time.sleep(30)
     while not (RESULTS / "diagnostics/complete.json").exists():

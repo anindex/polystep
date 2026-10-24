@@ -169,7 +169,6 @@ def train(
                 # Snapshot before callbacks run: they may write to the live model.
                 if config.restore_best and reference_loss < best_loss:
                     best_loss = reference_loss
-                    # Keep the snapshot on CPU.
                     best_state = {
                         k: v.detach().to("cpu", copy=True) if isinstance(v, torch.Tensor) else copy.deepcopy(v)
                         for k, v in module.state_dict().items()

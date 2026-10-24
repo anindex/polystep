@@ -22,7 +22,6 @@ _FAST_OPT_KWARGS = dict(
 
 @pytest.fixture
 def simple_model():
-    """Small MLP for basic tests."""
     return nn.Sequential(
         nn.Linear(16, 32),
         nn.ReLU(),
@@ -32,7 +31,6 @@ def simple_model():
 
 @pytest.fixture
 def simple_closure(simple_model):
-    """Create a closure for simple_model."""
     criterion = nn.CrossEntropyLoss()
     inputs = torch.randn(4, 16)
     targets = torch.randint(0, 10, (4,))
@@ -202,7 +200,6 @@ class TestSynchronizedAbsorb:
 
         P_before = optimizer._state.projection.clone()
 
-        # Run until absorb
         for _ in range(3):
             optimizer.step(simple_closure)
 
@@ -266,7 +263,6 @@ def test_combined_mode_runs_without_hang():
             losses.append(criterion(out, targets))
         return torch.stack(losses)
 
-    # Should complete without hanging - 2 steps
     for _ in range(2):
         cost = optimizer.step(closure)
         assert torch.isfinite(torch.tensor(cost)), "Cost should be finite"

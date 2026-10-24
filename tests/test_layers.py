@@ -281,7 +281,7 @@ class TestVmapSafeLSTM:
 
     def test_lstm_with_dropout(self):
         lstm = VmapSafeLSTM(input_size=32, hidden_size=64, num_layers=3, dropout=0.5)
-        lstm.train()  # Enable dropout
+        lstm.train()
         x = torch.randn(4, 10, 32)
         out1, _ = lstm(x)
         out2, _ = lstm(x)

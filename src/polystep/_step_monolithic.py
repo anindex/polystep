@@ -226,7 +226,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         step_r = _sr * _sr_eps * radius_mult
     probe_r = _pr * _pr_eps * radius_mult
 
-    # Probe-radius jitter; no-op at 0.
     probe_r = opt._apply_probe_radius_jitter(probe_r)
 
     if X.dim() == 1:
@@ -239,10 +238,10 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     if opt._probes.device != device or opt._probes.dtype != X.dtype:
         opt._probes = opt._probes.to(device=device, dtype=X.dtype)
     probes = opt._probes
-    V = polytope_verts.shape[0]  # num vertices
-    K = probes.shape[0]  # num probes
+    V = polytope_verts.shape[0]
+    K = probes.shape[0]
 
-    K_eff = K  # effective probe count for this step
+    K_eff = K
     if opt.adaptive_num_probe and iteration >= opt._adaptive_probe_warmup:
         # Drop K to 1 once the last 3 OT-step costs are strictly decreasing. Gate on
         # finiteness, not positivity: negative objectives descend just as much.
@@ -601,7 +600,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                     else:
                         batch_configs = _bufs[2]
                         if dirty_rows is None:
-                            batch_configs.copy_(X)  # copy_ broadcasts
+                            batch_configs.copy_(X)
                         else:
                             batch_configs[local_range, dirty_rows] = X[dirty_rows]
                     dirty_rows = i_idx
@@ -989,7 +988,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         _cost_mean = _progress = float("inf")
     _converged = ot_result.converged and not _fabricated
     feed_solver_stats(opt._progressive_epsilon, opt.solver, ot_result.n_iters, _converged)
-    # Candidate evaluations this step, net of screening.
     state.record_solver_health(_ess, _rho, _evals_this_step)
     update_stagnation_and_radius(opt, state, _progress)
 
@@ -1031,7 +1029,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         state.g = ot_result.g.detach() if ot_result.g is not None else None
     state.epsilon = current_eps
 
-    # Displacement tracking, absorb, and rotation.
     if opt._adaptive:
         adaptive_sub = opt.subspace
         proj_used = state.projection

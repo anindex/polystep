@@ -19,7 +19,6 @@ import sys
 import time
 import traceback
 
-# Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
@@ -146,7 +145,6 @@ POLYSTEP_CONFIGS = {
         "momentum_init": 0.3,
         "momentum_final": 0.5,
     },
-    # Argmax: same cosine strategy as INT8, but no momentum.
     "argmax": {
         "epsilon_init": 5.0,
         "epsilon_target": 0.3,
@@ -316,7 +314,6 @@ def run_polystep(
                         {
                             "step": step_count,
                             "epoch": epoch + 1,
-                            # Cumulative candidate evaluations, shared with the baselines.
                             "evals": fwd_pass_count,
                             "val_accuracy": evaluate_accuracy(model, selection_loader),
                             "loss": loss,
@@ -371,7 +368,6 @@ def run_polystep(
         hyperparameters={
             **polystep_cfg,
             "epochs": epochs,
-            # The four keys that let a reader check the table was matched.
             **subspace_tag(subspace, polystep_cfg["rank"]),
             "eval_budget": eval_budget,
             "evals_used": fwd_pass_count,
@@ -524,8 +520,6 @@ def run_gradient_free(
     print(f"    Saved: {filepath}")
 
 
-# polystep and adam have their own loops; every gradient-free method goes through
-# the one shared runner.
 METHOD_RUNNERS = {"polystep": run_polystep, "adam": run_adam}
 ALL_METHODS = ("polystep", "adam", *FAIR_METHODS)
 

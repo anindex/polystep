@@ -184,7 +184,7 @@ def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
     mapping = {}
 
     mapping["token_embedding.weight"] = hf_sd["wte.weight"]  # [50257, 768]
-    mapping["position_embedding.weight"] = hf_sd["wpe.weight"][: model.max_seq_len]  # truncate
+    mapping["position_embedding.weight"] = hf_sd["wpe.weight"][: model.max_seq_len]
 
     mapping["layer_norm.weight"] = hf_sd["ln_f.weight"]
     mapping["layer_norm.bias"] = hf_sd["ln_f.bias"]
@@ -227,7 +227,6 @@ def load_gpt2_weights(model: GPT2Small, hf_model_name: str = "gpt2") -> dict:
     assert set(missing) == {"classifier.weight", "classifier.bias"}, f"Unexpected missing keys: {missing}"
     assert len(unexpected) == 0, f"Unexpected keys: {unexpected}"
 
-    # Free HF model memory
     del hf, hf_sd
     gc.collect()
 
@@ -302,34 +301,11 @@ def get_sst2_gpt2_loaders(
     return train_loader, val_loader
 
 
-# ---------------------------------------------------------------------------
-# Hard-quantized head: the comparison the smooth head cannot make
-# ---------------------------------------------------------------------------
-#
-# An ordinary ``nn.Linear(768, 2)`` head trains under Adam, PolyStep, and any
-# zeroth-order method, which is exactly why that setup cannot separate them.
-# Quantize the head's weights with no straight-through estimator and the picture
-# splits:
-#
-#   * Adam gets an exactly-zero gradient (``round``/``sign`` have zero derivative)
-#     and never leaves its initialization.
-#   * MeZO and EGGROLL estimate a gradient by finite differences. A probe that
-#     does not push a weight across a bin boundary changes nothing, so the
-#     difference is exactly 0 and the estimated gradient is exactly 0. How often
-#     that happens depends on the grid: int8 at scale 0.01 is fine enough that
-#     most probes do cross, ``sign()`` is not. Both variants are run, and the
-#     runs record ``flat_generation_fraction`` so the claim is measured rather
-#     than asserted.
-#   * PolyStep never differentiates anything; the forward pass is a cost oracle.
-#
-# Features are extracted once from the frozen backbone and cached, so all of
-# this is minutes, not hours: the backbone is never re-run during training.
+# Frozen-backbone features are cached; only the head is optimized.
 
 HEADQUANT_BENCHMARK = "gpt2_headquant"
 HEADQUANT_SCALE = 0.01  # int8 grid step; the weight grid is 0.01 * {-128..127}
-#: Candidate evaluations, matched across the gradient-free methods. Evaluations are
-#: cheap here (a 768x2 matmul on cached features), so this is minutes per run and
-#: still buys PolyStep ~290 steps at ~1.1 evaluations per parameter per step.
+#: Candidate evaluations, matched across the gradient-free methods.
 HEADQUANT_BUDGET = 500_000
 HEADQUANT_BATCH = 64
 HEADQUANT_ADAM_EPOCHS = 30
@@ -337,20 +313,8 @@ HEADQUANT_ADAM_LR = 1e-3
 HEADQUANT_PROBE_EVERY = 5_000
 
 #: ``variant -> (head factory, backprop sees the weights, backprop sees the bias)``.
-#:
-#: The bias column is not decoration. ``QuantizedLinear`` quantizes its bias as well as
-#: its weight, so Adam's gradient on the int8 head is *exactly* zero and the row is a
-#: clean "backprop cannot move this at all". ``BinaryLinear`` does not: ``sign`` is
-#: declared for the weight only, so 2 of the head's 1,538 parameters stay
-#: differentiable and Adam reports ``final_grad_l1 = 1.0`` rather than 0.
-#:
-#: The bias is deliberately left alone rather than quantized. ``sign`` on a
-#: zero-initialized bias is pinned at ``sign(0) = 0`` and snaps to +-1 on the first
-#: movement -- a two-state bias that would be a different layer, in a class four other
-#: experiments share. Instead the asymmetry is labelled: the binary Adam row carries
-#: ``partially_differentiable_control: true`` and must be read as a partial control,
-#: not as the same "no gradient exists" claim the int8 row makes. The gradient-free
-#: methods are unaffected either way -- none of them differentiates anything.
+#: QuantizedLinear quantizes weights and biases, so autograd returns zero for both.
+#: BinaryLinear leaves two biases differentiable; its Adam result is a partial control.
 HEADQUANT_VARIANTS = {
     "int8": (lambda: QuantizedLinear(768, 2, scale=HEADQUANT_SCALE), False, False),
     "binary": (lambda: BinaryLinear(768, 2), False, True),
@@ -371,17 +335,8 @@ HEADQUANT_POLYSTEP_CONFIG = {
     "momentum_final": 0.9,
 }
 
-# MeZO and EGGROLL are run at more than one probe radius on purpose, because
-# picking one would decide the result. Both are finite-difference gradient
-# estimators, and their analysis is an eps -> 0 argument: at a hard quantizer
-# that limit is identically zero, because a small enough probe crosses no bin
-# boundary and ``L(x + eps z) - L(x - eps z)`` is exactly 0. Make eps large
-# enough to cross boundaries and they still move -- but then they are no longer
-# estimating a gradient, they are doing crude random search. Sweeping eps shows
-# both ends instead of asserting one, and ``flat_generation_fraction`` in each
-# result says which regime that run was in.
-#: 1e-5 is the eps -> 0 limit their analysis takes, 1e-3 is MeZO's own default,
-#: 0.02 is coarse enough to cross an int8 bin most of the time.
+# Quantization can make nearby probes tie. Sweep radii and record the fraction of
+# tied antithetic pairs as flat_generation_fraction.
 ZO_EPS = [1e-5, 1e-3, 0.02]
 HEADQUANT_MEZO = {"eps": 0.02, "lr": 1e-2}
 HEADQUANT_EGGROLL = {"sigma": 0.02, "lr": 1e-2, "rank": 1, "popsize": 32}
@@ -616,9 +571,6 @@ def run_headquant(
 
     with track_gpu_memory() as mem:
         if method == "adam":
-            # On a quantized head this is the point of the experiment, not a bug:
-            # round()/sign() have zero derivative, so the update is zero and the
-            # head stays at its initialization.
             opt = torch.optim.Adam(head.parameters(), lr=HEADQUANT_ADAM_LR)
             stream = _head_batches(splits["train"], HEADQUANT_BATCH, seed)
             steps_per_epoch = max(1, len(splits["train"][1]) // HEADQUANT_BATCH)
@@ -693,7 +645,7 @@ def run_headquant(
                     record(evals)
             extra = {**cfg, "gradient_based": False}
 
-        else:  # mezo / eggroll, over the flat 1538-dim parameter space
+        else:
             layout = ParamLayout.from_module(head)
             base = {e.key: p.detach().clone() for e, p in zip(layout.entries, head.parameters())}
             keys = list(base)
@@ -752,8 +704,6 @@ def run_headquant(
             if eps_str:
                 hyper["eps" if base_method == "mezo" else "sigma"] = float(eps_str)
             result = METHODS[base_method](obj, x0=torch.zeros(layout.total_params, device=device), seed=seed, **hyper)
-            # Final scoring mirrors the periodic probe: mean iterate and best
-            # candidate both validate, selection keeps the higher.
             final_it = getattr(obj, "iterate", None)
             if final_it is not None:
                 write(final_it)
@@ -794,10 +744,6 @@ def run_headquant(
             "variant": variant,
             "head": HEADQUANT_VARIANTS[variant][0]().__class__.__name__,
             "backprop_sees_the_weights": differentiable,
-            # BinaryLinear quantizes the weight but not the bias, so 2 of 1,538
-            # parameters stay live and Adam's gradient is nonzero here where int8's is
-            # exactly 0. Read that row as a partial control, not as "no gradient
-            # exists". See HEADQUANT_VARIANTS for why the bias is left alone.
             "backprop_sees_the_bias": bias_differentiable,
             "partially_differentiable_control": differentiable != bias_differentiable,
             "tuning": {
@@ -825,30 +771,10 @@ def run_headquant(
     return {"test_accuracy_at_selected": test_acc, "val_accuracy": best["val"], "wall_time": wall}
 
 
-#: Everything ``--tune`` sweeps here. Adam is gradient-based, so an evaluation budget
-#: does not apply to it and it is not swept; it keeps its published lr.
-#:
-#: Cheapest first. At the same evaluation budget MeZO costs ~1000x the wall-clock of
-#: the other two -- it scores 2 candidates per generation where EGGROLL scores 32 and
-#: PolyStep 2,307, and ``Objective.__call__`` pays two host syncs per generation
-#: regardless of population -- so it runs last and the selection file is rewritten
-#: after each method rather than only at the end.
+#: Adam keeps its fixed learning rate; only gradient-free methods are swept.
 HEADQUANT_TUNABLE = ["polystep", "eggroll", "mezo"]
-#: ``--tune`` budget as a fraction of ``--eval-budget``. PolyStep's cosine schedules are
-#: derived from the budget, so a reduced-budget trial is a scale model of the full run:
-#: same schedule shape, proportionally fewer steps.
-#:
-#: 5 and not more was measured, not guessed. PolyStep spends ~2,307 evaluations per step
-#: on the 1,538-parameter head, so the reduction factor *is* the step count, and on the
-#: int8 head its nine configurations produce this many distinct validation scores:
-#:
-#:     1/25 (20k evals,   8 steps)   1 of 9 -- every config ties at the majority class
-#:     1/10 (50k evals,  21 steps)   5 of 9
-#:     1/5  (100k evals, 43 steps)   6 of 9
-#:     1/1  (500k evals, 216 steps)  9 of 9
-#:
-#: Below 1/5 the sweep does not choose anything: the tie-break returns the grid's first
-#: entry, which is the untuned prior. 1/5 is the cheapest factor that still selects.
+#: Schedules keep their shape over fewer steps. At 1/5 budget, the int8 sweep had
+#: 43 PolyStep steps and six distinct scores across nine configs; at 1/25, all tied.
 HEADQUANT_TUNE_DIVISOR = 5
 
 
@@ -870,9 +796,6 @@ def _tune_head_quant(args, splits):
     print(f"  {n} configs per variant, {budget} evals each (1/{HEADQUANT_TUNE_DIVISOR} of the final budget)\n")
 
     trials, path = [], args.selection
-    # Method-outer, so the cheap methods finish first and the selection file is usable
-    # (and rewritten) after each one rather than only at the very end. MeZO is ~1000x
-    # the wall-clock of the other two at the same evaluation budget; see the report.
     for method in methods:
         if method not in HEADQUANT_TUNABLE:
             print(f"  skip {method} (gradient-based; not budget-matched, not swept)")
@@ -912,11 +835,7 @@ def _tune_head_quant(args, splits):
                     }
                 )
                 print(f"  {method:10s} {name:34s} val={out['val_accuracy'] * 100:.2f}%")
-                # Checkpoint every trial. MeZO's nine configurations cost hours where
-                # the other two cost minutes, so a file written only at the end is a
-                # file you cannot use until the slowest method finishes -- and lose
-                # entirely if the run is interrupted. ``trials_per_method`` in the
-                # provenance says how much of the sweep the file actually represents.
+                # Checkpoint each trial so an interrupted sweep retains completed results.
                 path = _write_headquant_selection(args, trials, budget, seed, methods, variants)
 
         print(f"  -> {method} done ({sum(t['method'] == method for t in trials)} trials)")
