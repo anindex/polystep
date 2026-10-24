@@ -1086,8 +1086,8 @@ def test_loss_aliasing_buffer_survives_restore(path):
     assert model.score.item() == 0
 
 
-@pytest.mark.parametrize("chunk", [None, 1, 2])
-def test_buffer_backed_loss_survives_restore(chunk):
+@pytest.mark.parametrize("candidates, chunk", [(4, None), (4, 1), (4, 2), (1, None)])
+def test_buffer_backed_loss_survives_restore(candidates, chunk):
     class CachedScore(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1102,12 +1102,12 @@ def test_buffer_backed_loss_survives_restore(chunk):
     ev = NNCostEvaluator(model, lambda out: out, use_inplace=False, compile_forward=False, chunk_size=chunk)
     layout = ParamLayout.from_module(model, particle_dim=2)
     site = SiteVmapEvaluator.try_build(ev, layout)
-    weights = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]])
+    weights = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]])[:candidates]
     dense = ev.evaluate({"weight": weights}, torch.ones(2))
     local = site.evaluate(
         layout.unflatten(layout.flatten(model)), layout.entries[0], torch.tensor([[0, 1]]), weights[None], torch.ones(2)
     )
-    assert dense.tolist() == local.tolist() == [2.0] * 4
+    assert dense.tolist() == local.tolist() == [2.0] * candidates
     assert not ev._vmap_failed
     assert model.score.item() == 0
 

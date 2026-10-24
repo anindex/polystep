@@ -246,8 +246,8 @@ def _fold_candidate_loss(loss, per_sample):
 
 
 def _materialize_expanded(losses):
-    """Copy ``losses`` when vmap expanded one unbatched value, which may be a restored buffer."""
-    return losses.clone() if losses.stride(0) == 0 else losses
+    """Copy unbatched vmap results before restoring buffers, including singleton batches."""
+    return losses.clone() if losses.shape[0] == 1 or losses.stride(0) == 0 else losses
 
 
 def _reduce_per_candidate(outputs, targets, loss_fn, loss_kind):

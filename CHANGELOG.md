@@ -20,9 +20,10 @@
 
 ### Fixes
 
-- Restore forward-written buffers between scoring calls and vmap chunks, including
-  on failure. Protect frozen embedding weights changed by `max_norm`, reject
-  evaluators for another model, and follow model dtype and device changes.
+- Restore forward-written buffers between scoring calls and vmap chunks, even on
+  failure, and preserve scores that share those buffers. Protect frozen embedding
+  weights changed by `max_norm`, reject evaluators for another model, and follow
+  model dtype and device changes.
 - Preserve finite-difference gradients and curvature at small probe radii. Correct
   KL zero-support handling and marginal diagnostics, including tiny target masses.
 - Fix CUDA rotation for large adaptive subspaces, carry FP16/BF16 absorb rounding

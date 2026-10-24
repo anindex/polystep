@@ -300,7 +300,7 @@ class TestOverrelaxation:
     def test_omega_overrelaxed(self, seed, n, cost_scale, omega):
         """omega in (1, 1.5] converges in fewer iterations than omega=1.0."""
         torch.manual_seed(seed)
-        C = torch.rand(n, n) * cost_scale  # Wider cost range makes standard Sinkhorn work harder
+        C = torch.rand(n, n, dtype=torch.float64) * cost_scale
 
         solver_standard = SinkhornSolver(
             epsilon=0.5,
