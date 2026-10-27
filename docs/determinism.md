@@ -1,7 +1,9 @@
 # Determinism
 
-Reproducibility requires the same configuration, device, software build, and CPU
-thread count. A seed alone does not guarantee identical results across systems.
+I record the package version, configuration, device, software build, and CPU thread
+count with each result. A seed alone does not guarantee identical results across
+systems or releases. Fused operations can round differently even when they implement
+the same formula; a changed sign or action can then alter the rest of a trajectory.
 
 CPU QR factorizations run on one thread when `rows * cols**2 < 1e8`.
 Larger subspace bases (adaptive, hybrid, factored) use the whole intra-op pool, so
@@ -24,11 +26,11 @@ Warnings remain possible when an operation has no deterministic implementation.
 Use `torch.use_deterministic_algorithms(True, warn_only=False)` to make these errors
 explicit when validating a workload.
 
-Sparse projections need deterministic algorithms to repeat on CUDA. Their CSR
-products and scatter-adds otherwise sum in whatever order the threads finish, so two
-hybrid or adaptive runs with a sparse projection can differ in the last bit, at FP32
-as well as BF16. A `HybridSubspace` gives a layer sparse columns once its dense basis
-would pass `sparse_threshold_bytes` (1 GB), which a 784x128 layer at rank 8 already
+Sparse projections need deterministic algorithms to repeat on CUDA. Otherwise,
+their CSR products and scatter-adds sum in the order the threads finish.
+Two hybrid or adaptive runs with a sparse projection can therefore differ in the
+last bit, at FP32 as well as BF16. A `HybridSubspace` gives a layer sparse columns
+once its dense basis would pass `sparse_threshold_bytes` (1 GB), which a 784x128 layer at rank 8 already
 does. With deterministic algorithms enabled, the projection runs as a sparse batched
 product with a fixed summation order, in FP32 for FP16 and BF16 parameters. It keeps a
 COO copy of the matrix at 24 bytes per stored entry: about 55 MB for a projection

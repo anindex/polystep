@@ -45,11 +45,12 @@ displacement before momentum.
   after each batched chunk and each candidate in the sequential and in-place loops.
   Embedding weights changed by `max_norm` are restored even when frozen. Update
   persistent state outside the closure.
-- Writes that leave the tensor version counter unchanged, such as
-  `F.batch_norm(training=True)` running statistics or writes through `.data`, are found
-  by comparing values after the first forward and the first candidate of each
-  sequential, in-place or chunked vmap sweep. A write first triggered after those
-  checks can go undetected and persist into later evaluations.
+- Some writes leave the tensor version counter unchanged. These include
+  `F.batch_norm(training=True)` running statistics and writes through `.data`.
+  The evaluator compares values after the first forward to detect these writes.
+  It repeats this check after the first candidate of each sequential, in-place or
+  chunked vmap sweep. A write first triggered after those checks can go undetected
+  and persist into later evaluations.
 - Float inputs are cast to the dtype of the model's first floating weight only when
   the forward raises on them as given. The evaluator checks this with one extra
   forward per input dtype and puts back the buffers it changed. The delta and
@@ -60,9 +61,9 @@ displacement before momentum.
   Models needing autocast internally must provide it. Half-precision candidate outputs
   reduce in FP32 only under the builtin cross-entropy, MSE and L1 losses; other losses
   may round nearby candidate scores to the same value. With FP16 or BF16 parameters,
-  `FactoredSubspace` materializes every candidate, and the fast paths can differ from
-  the model's own Linear output by about one unit in the last place (ulp), enough to
-  flip a hard threshold. `use_inplace=True` scores with the model's forward. See
+  `FactoredSubspace` materializes every candidate. Fast paths can differ from the
+  model's own Linear output by about one unit in the last place (ulp).
+  This can flip a hard threshold. `use_inplace=True` scores with the model's forward. See
   [precision](docs/performance.md#compilation-and-precision).
 - `step_batch()` and `train()` reject `trust_region`. See
   [radius control](docs/api_overview.md#quadratic-model-and-radius-control) for its
@@ -126,9 +127,16 @@ a common direction across particles.
 
 Sinkhorn requires `omega` in `[0.5, 1.95]`. Anderson acceleration and adaptive omega
 are inactive in fixed-iteration mode (`threshold <= 0`). Sinkhorn and KLSoftmax promote
-FP16/BF16 costs to FP32. Cost differences and reductions must also fit the solver's
-dtype: finite FP32 inputs near its limits can still overflow when recentered or
-averaged. Rescale the objective before evaluation or return FP64 costs in that case.
+FP16/BF16 costs to FP32. With `scale_cost='mean'` or `'max_cost'`, solvers rescale
+before subtracting the minimum, so extreme finite FP32 costs remain usable. Without
+these modes, cost differences must fit the solver's dtype. Rescale the objective
+before evaluation when the forward itself can overflow; solver scaling cannot
+recover a finite value from an infinite input.
+
+Balanced Sinkhorn needs equal positive total mass in both marginals. Zero entries
+carry exactly zero transport, and positive entries are logged without a mass floor.
+Masses and plan entries must still be representable in the solver's dtype. A result
+can underflow when individual entries are much smaller than their row sums.
 
 All nonfinite costs are invalid. `min_cost_greedy` and `top_k_mean` skip a vertex
 with any nonfinite probe, and the solve leaves a particle with no feasible vertex
@@ -140,9 +148,9 @@ also depends on the cost offset.
 
 Balanced Sinkhorn sends every column its prescribed mass, even when all of that
 column's candidates are infeasible. The monolithic step records a vertex's cost as
-the mean of its probes with each nonfinite probe already penalized, so with several
-probes a vertex with only some nonfinite probes can still set the best-vertex
-progress that drives the adaptive radius.
+the mean of its probes, after penalizing each nonfinite probe. With several probes,
+a partly infeasible vertex can still set the best-vertex progress that drives the
+adaptive radius.
 
 Quadratic fits are finite-radius models. Simplex gradients can be biased on
 anisotropic quadratics, and block models omit cross-block curvature. A fit does not
@@ -157,6 +165,11 @@ is an explicit opt-in for test-selected runs, which standard aggregation rejects
 The SNN surrogate-gradient baseline has substantial variation across seeds. MAX-SAT
 search heuristics use flip budgets, which are not equivalent to neural candidate
 budgets. Head-only GPT-2 experiments do not establish full-model fine-tuning results.
+
+Example 06 is a PyTorch SNN simulation. Its one-state neuron uses subtractive reset;
+it does not implement Loihi fixed-point arithmetic or the current and voltage states
+of [Lava LIF](https://lava-nc.org/lava/lava.proc.lif.html). No hardware latency, energy,
+or adaptation claim follows from its results.
 
 The [reproducibility guide](docs/reproducibility.md#protocol) gives the protocols, and the
 [experiment index](experiments/EXPERIMENT_INDEX.md) has the results.

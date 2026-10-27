@@ -90,7 +90,7 @@ class KLSoftmaxSolver:
         eps = float(self.epsilon)
         alpha = self.alpha
 
-        log_a = a.clamp(min=1e-30).log()
+        log_a = a.log()
         log_b = b.log()
 
         # Disable outer autocast; a BF16 downcast collapses the dual potentials.
@@ -104,7 +104,7 @@ class KLSoftmaxSolver:
                 g = torch.zeros(m, device=device, dtype=dtype)
             # Drop a non-finite warm start rather than propagate it into the LSE.
             g = torch.where(b > 0, g, -math.inf)
-            if not (torch.isfinite(f).all() & (torch.isfinite(g) | (b == 0)).all()):
+            if not ((torch.isfinite(f) | (a == 0)).all() & (torch.isfinite(g) | (b == 0)).all()):
                 f = torch.zeros(n, device=device, dtype=dtype)
                 g = torch.zeros(m, device=device, dtype=dtype)
 
@@ -131,11 +131,15 @@ class KLSoftmaxSolver:
                         if (it + 1) % check_every == 0 or it == self.max_iterations - 1:
                             # The g-update is damped by alpha, so divide its increment back out to keep the residual comparable at any lam.
                             delta = torch.maximum(
-                                (f_new - f).abs().amax(),
+                                torch.where(a > 0, f_new - f, 0.0).abs().amax(),
                                 torch.where(b > 0, g_new - g, 0.0).abs().amax() / alpha,
                             )
                             step, f_max, g_max = torch.stack(
-                                [delta / eps, f_new.abs().amax(), torch.where(b > 0, g_new, 0.0).abs().amax()]
+                                [
+                                    delta / eps,
+                                    torch.where(a > 0, f_new, 0.0).abs().amax(),
+                                    torch.where(b > 0, g_new, 0.0).abs().amax(),
+                                ]
                             ).tolist()
                             # <= so threshold=0 means "converge on an exact fixed point", not "never converge".
                             if step <= threshold or (

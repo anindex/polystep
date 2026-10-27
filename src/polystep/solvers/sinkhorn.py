@@ -58,7 +58,11 @@ class SinkhornResult:
         """Entropic dual objective, computed lazily and reported in the caller's frame."""
         log_P = (self.f.unsqueeze(1) + self.g.unsqueeze(0) - self._cost_matrix) / self._eps
         plan_mass = torch.exp(torch.logsumexp(log_P.reshape(-1), dim=0))
-        dual = (self.f * self._a).sum() + (self.g * self._b).sum() - self._eps * plan_mass
+        dual = (
+            torch.where(self._a > 0, self.f * self._a, 0).sum()
+            + torch.where(self._b > 0, self.g * self._b, 0).sum()
+            - self._eps * plan_mass
+        )
         return (dual * self._cost_scale + self._cost_shift * self._a.sum()).item()
 
 
@@ -121,7 +125,7 @@ class SinkhornSolver:
         n, m = cost_matrix.shape
         device, dtype = cost_matrix.device, cost_matrix.dtype
         b = align_marginal(b, m, device, dtype, "b")
-        if marginals_given and not torch.isclose(a.sum(), b.sum(), rtol=1e-3, atol=1e-6):
+        if marginals_given and not torch.isclose(a.sum(), b.sum(), rtol=1e-3, atol=0):
             warnings.warn(
                 f"Sinkhorn marginals have unequal total mass (a.sum()={a.sum().item():.6g}, "
                 f"b.sum()={b.sum().item():.6g}); balanced OT is infeasible, so 'converged' "
@@ -131,14 +135,6 @@ class SinkhornSolver:
 
         warn_tiny_temperature(self, float(self.epsilon), cost_matrix, "SinkhornSolver", "epsilon")
 
-        eps = self.epsilon
-        log_K = -cost_matrix / eps
-
-        log_a = torch.log(torch.clamp(a, min=1e-30))
-        log_b = torch.log(torch.clamp(b, min=1e-30))
-        inv_a = torch.where(a > 1e-30, 1 / a, 0)
-        inv_b = torch.where(b > 1e-30, 1 / b, 0)
-
         # align_dual returns None on a shape mismatch, so fall back to zeros.
         f = align_dual(init_f, n, device, dtype, "init_f")
         g = align_dual(init_g, m, device, dtype, "init_g")
@@ -147,6 +143,18 @@ class SinkhornSolver:
             f = torch.zeros(n, device=device, dtype=dtype)
         if g is None:
             g = torch.zeros(m, device=device, dtype=dtype)
+
+        full_problem = None
+        if marginals_given and ((a == 0).any() | (b == 0).any()):
+            full_problem = cost_matrix, a, b
+            rows, cols = a > 0, b > 0
+            cost_matrix = cost_matrix[rows][:, cols]
+            a, b, f, g = a[rows], b[cols], f[rows], g[cols]
+            n, m = cost_matrix.shape
+
+        eps = self.epsilon
+        log_K = -cost_matrix / eps
+        log_a, log_b = a.log(), b.log()
 
         # Dual potentials scale with the cost magnitude, not epsilon. Kept on-device to avoid a sync per solve.
         clamp_scale = cost_matrix.abs().max().clamp(min=1e-6)
@@ -309,9 +317,9 @@ class SinkhornSolver:
                     # Batch all scalars into one device->host transfer; always check the last iteration or ProgressiveEpsilon inflates epsilon.
                     if check_due:
                         log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
-                        err_a_t = ((torch.exp(torch.logsumexp(log_P_row, dim=1)) - a).abs() * inv_a).amax()
+                        err_a_t = (torch.logsumexp(log_P_row, dim=1) - log_a).expm1().abs().amax()
                         if omega != 1.0 or self.anderson_depth > 0 or self.adaptive_omega:
-                            err_b_t = ((torch.exp(torch.logsumexp(log_P_row, dim=0)) - b).abs() * inv_b).amax()
+                            err_b_t = (torch.logsumexp(log_P_row, dim=0) - log_b).expm1().abs().amax()
                         else:
                             err_b_t = err_a_t
 
@@ -373,6 +381,11 @@ class SinkhornSolver:
                         converged = err < self.threshold
                         if converged or (stalled and err < precision_floor(dtype, eps, f_max + g_max, c_max)):
                             break
+
+        if full_problem is not None:
+            cost_matrix, a, b = full_problem
+            f = a.new_full(a.shape, -math.inf).masked_scatter(rows, f)
+            g = b.new_full(b.shape, -math.inf).masked_scatter(cols, g)
 
         return SinkhornResult(
             f=f,

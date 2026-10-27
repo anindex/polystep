@@ -1,87 +1,57 @@
 # Changelog
 
+## 1.1.1 - 2026-10-27
+
+- Fix transport for tiny and zero masses, including warm starts, and prevent
+  overflow in FP32 cost scaling.
+- Make RL INT8 scoring consistent and compatible with vmap; speed up batched
+  policy evaluation.
+- Restrict example 06 to simulation and update the examples and guides.
+- Update CI actions, reduce scheduled runs, check release dates, and remove Dependabot.
+
 ## 1.1.0 - 2026-10-24
 
-### Features and performance
-
-- Add `step_batch(inputs, targets, loss_fn=...)` for supervised training. It shares
-  the fast evaluation paths with `train()`; both accept tuple and dict inputs.
-  `register_evaluator` now returns a closure for the registered batch.
+- Add `step_batch()` for supervised training, tuple and dict inputs, and a closure
+  returned by `register_evaluator`.
 - Add `is_causal` support to `VmapSafeMultiHeadAttention`.
-- Extend fast MLP evaluation to functional losses and traceable custom forwards.
-  Reuse unchanged forward work, reduce CPU cross-entropy overhead, and replay
-  site-local CUDA forwards with CUDA graphs.
-- Measured full-space MLP steps are 1.9–3.3x faster on one CPU thread and 2.6x on a
-  shared RTX 5090 than 1.0.0. Tiny tied-weight models can be slower on CUDA. See
-  [performance](docs/performance.md) for the evaluation paths and tradeoffs.
-- Refresh the examples and their metrics, clarify simulated Loihi adaptation, and
-  add SNN training and CartPole GIFs. The MAX-SAT example reaches about 98% SAT with
-  600 default steps instead of 1500.
-
-### Fixes
-
-- Restore forward-written buffers between scoring calls and vmap chunks, even on
-  failure, and preserve scores that share those buffers. Protect frozen embedding
-  weights changed by `max_norm`, reject evaluators for another model, and follow
-  model dtype and device changes.
-- Preserve finite-difference gradients and curvature at small probe radii. Correct
-  KL zero-support handling and marginal diagnostics, including tiny target masses.
-- Fix CUDA rotation for large adaptive subspaces, carry FP16/BF16 absorb rounding
-  error forward, and correct biased rotation, screening, amortized schedules,
-  epsilon restarts, half-precision attention, and loss precision in ES and baselines.
-- Fall back to sequential scoring when vmap cannot batch a model, including stock
-  `nn.LSTM`.
+- Speed up MLP evaluation and replay site-local CUDA forwards with CUDA graphs.
+  See [performance](docs/performance.md) for measurements and tradeoffs.
+- Restore forward-written buffers and frozen embedding weights, including on
+  failure; follow model dtype and device changes. Score sequentially when vmap
+  cannot batch a model, including stock `nn.LSTM`.
+- Fix small-radius gradients, KL support, marginal diagnostics, subspace rotation,
+  half-precision rounding, screening, and amortized schedules.
+- Update example settings and metrics; add SNN and CartPole animations.
 
 ### Upgrade notes
 
-- Pass the model to `PolyStepOptimizer`, not `model.parameters()`. Rebuild the
-  optimizer if its trainable parameter set changes. Separate parameters or buffers
-  that share trainable storage now raise `ValueError`; tie weights by assigning
-  the same Parameter, or register a clone.
+- Pass the model to `PolyStepOptimizer`. Rebuild it if the trainable parameter set
+  changes. Separate parameters or buffers that share trainable storage are rejected;
+  tie weights with the same Parameter, or register a clone.
 - `FactoredSubspace` redraws `B` every 5 OT steps by default; set
   `rotation_interval=0` for the old behavior. Hybrid and factored seeded bases change.
-- `SinkhornSolver` and `KLSoftmaxSolver` default to `threshold=3e-5`, using relative
-  marginal error and the dual step divided by epsilon, respectively. Stalled solves
-  above the threshold report `converged=False`.
-- `train()` uses `step_batch`; `restore_best` compares weights on the first training
-  batch. Seeded results can differ from 1.0.
-- For compiled hybrid/factored runs, rebuild the optimizer from saved model weights:
-  checkpoint parameter names no longer contain the `_orig_mod.` prefix. The
-  [upgrade guide](docs/api_overview.md#upgrading-from-10) covers all compatibility
-  changes; [reproducibility](docs/reproducibility.md#changes-since-the-published-tables)
-  lists the affected published results.
+- `SinkhornSolver` and `KLSoftmaxSolver` default to `threshold=3e-5`. Stalled solves
+  above the threshold report `converged=False`. `train(restore_best=True)` selects
+  weights on the first training batch.
+- Rebuild compiled hybrid/factored optimizers from saved model weights: checkpoint
+  names no longer contain `_orig_mod.`.
+
+The [upgrade guide](docs/api_overview.md#upgrading-from-10) lists all compatibility
+changes. Seeded results can differ; see
+[reproducibility](docs/reproducibility.md#changes-since-the-published-tables).
 
 ## 1.0.0 - 2026-10-13
-
-### Upgrade notes
 
 - Use `PolyStepOptimizer` for neural networks and `PolyStep` for standalone objectives.
 - Replace diagonal CMA with `AdaptiveSubspace`, tempered softmax with `SoftmaxSolver`,
   and `auto_epsilon` with `ProgressiveEpsilon`. Probe reuse has been removed.
-- Checkpoints use format 6. Rebuild the optimizer from saved model weights when
-  upgrading from 0.13; older optimizer checkpoints cannot be loaded.
-- Some low-level exports and experiment helpers moved or were removed. The
-  [migration guide](docs/api_overview.md#upgrading-from-013) covers the main API
-  replacements and checkpoint requirements.
-
-### Fixes
-
-- Preserve live model weights, buffers, momentum, and trust-region state across
-  evaluation, subspace updates, and checkpoint restoration.
-- Handle nonfinite costs, tiny transport rows, integer losses, and half-precision
-  reductions consistently. Sparse CUDA projections repeat in deterministic mode.
-- Accept device strings in rotation sampling and float32 masks in half-precision
-  CUDA attention.
-- Correct baseline budgets, tied ranks, rollout accounting, and download handling.
-
-### Performance and examples
-
-- Reuse unchanged forward work, update only affected weights, and size candidate
-  chunks from measured activations. Speed up blockwise, factored, and adaptive steps.
-- Reduce sparse projection storage and host synchronization; compile Sinkhorn loops.
-- Refresh all 11 examples, their evaluation paths, and their documented settings.
-  See [performance](docs/performance.md) for measurements and tradeoffs.
-- Consolidate redundant tests and keep release validation focused on the built wheel.
+- Move checkpoints to format 6. Older formats cannot be loaded; rebuild the optimizer
+  from saved model weights. Some low-level exports and experiment helpers moved or
+  were removed. See the [migration guide](docs/api_overview.md#upgrading-from-013).
+- Fix state restoration, nonfinite costs, tiny transport rows, half-precision
+  evaluation, deterministic sparse CUDA projections, and baseline accounting.
+- Reuse forward work, reduce projection memory and synchronization, and compile
+  Sinkhorn loops. Update all 11 examples and validate the built wheel.
 
 ## 0.13.0 - 2026-09-22
 

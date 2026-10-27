@@ -217,11 +217,16 @@ def recenter_and_scale(cost_matrix, raw, scale_cost):
     inflate the penalty.
     """
     finite = torch.isfinite(raw) if isinstance(scale_cost, str) else None
-    C, cost_shift = recenter_cost(cost_matrix)
+    prescale = (
+        (cost_matrix.abs().amax() / (torch.finfo(cost_matrix.dtype).max / 4)).clamp(min=1) if finite is not None else 1
+    )
+    C, cost_shift = recenter_cost(cost_matrix / prescale if finite is not None else cost_matrix)
     cost_scale = resolve_cost_scale(C, scale_cost, finite)
     C = C / cost_scale
     if finite is not None:
         C = torch.where(finite, C, C.where(finite, 0).amax() * 2 + 1)
+        cost_shift = cost_shift * prescale
+        cost_scale = cost_scale.double() * prescale
     return C, cost_shift, cost_scale
 
 

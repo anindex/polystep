@@ -1,6 +1,7 @@
 # API reference
 
-The Python snippets build on the imports, model and data in the first example.
+I start with `step_batch` for supervised training. The Python snippets below build
+on the imports, model and data in the first example.
 
 ## Optimizer
 
@@ -460,6 +461,17 @@ the same objective and environment. Checkpoints can move between CPU and CUDA.
 When a seeded checkpoint crosses devices, loading keeps the new optimizer's
 generator and warns because the two generator types cannot share state.
 
+## Upgrading from 1.1.0
+
+Version 1.1.1 keeps the public APIs, optimizer defaults and checkpoint format 6.
+Sinkhorn now preserves tiny positive marginals and exact zero support. Named cost
+scaling handles extreme finite FP32 inputs. These corrections can change results
+on those inputs. The RL evaluator shares the policy's INT8 quantization rule and
+uses a fused affine operation, so seeded RL trajectories can also change.
+
+Example 06 supports PyTorch simulation only. The filename and `--backend cpu_sim`
+remain valid; `--backend loihi2` exits with an error before loading data.
+
 ## Upgrading from 1.0
 
 Version 1.1 adds errors and warnings and changes several defaults, so seeded runs can
@@ -490,13 +502,13 @@ published results that change.
   modules, so parameter names lose the `_orig_mod.` prefix. A 1.0 optimizer checkpoint
   of a compiled hybrid or factored run no longer loads; rebuild the optimizer from the
   saved model weights.
-- New errors: momentum outside [0, 1), invalid radius settings, an unknown or nonfinite
-  `scale_cost`, epsilon schedules with a non-positive target, SVD ratios outside
-  [0, 1], `subspace_particle_dim` below 1, and `PolyStep.init_state` with one particle
-  under `ProgressiveEpsilon`.
-- New warnings: `step()` warns once when it may score a stale registered batch, the
-  constructor warns when a full-space step would score more than 100,000 candidates,
-  and a CUDA model with stock `nn.MultiheadAttention` gets a hint to use
+- New errors reject momentum outside [0, 1), invalid radius settings, and unknown or
+  nonfinite `scale_cost`. They also reject epsilon schedules with non-positive targets
+  or SVD ratios outside [0, 1]. `subspace_particle_dim` must be at least 1.
+  `PolyStep.init_state` rejects one particle under `ProgressiveEpsilon`.
+- New warnings: `step()` warns once when it may score a stale registered batch.
+  The constructor warns when a full-space step would score more than 100,000 candidates.
+  A CUDA model with stock `nn.MultiheadAttention` gets a hint to use
   `VmapSafeMultiHeadAttention`. The every-step rotation warning covers every subspace,
   and `HybridSubspace` no longer warns for a `rotation_interval` above 1.
 - `SpikingNet` uses the built-in LIF neuron by default; `use_snntorch=True` raises
@@ -505,9 +517,9 @@ published results that change.
   `SiteVmapEvaluator(owner, layout)` and read the model, loss, buffers and
   `per_sample` from the `NNCostEvaluator` owner.
 - Seeded runs also change with `AdaptiveSubspace`, displacement rotation or
-  `biased_rotation`, under `amortize_steps` with periodic rotation or absorbs, with an
-  even `num_probe` under `adaptive_num_probe`, with screening, and with
-  `train(restore_best=True)` on loaders of more than one batch. Functional losses,
+  `biased_rotation`. The changes also affect `amortize_steps` with periodic rotation
+  or absorbs, and `adaptive_num_probe` with an even `num_probe`. Other affected runs
+  use screening, or `train(restore_best=True)` on loaders of more than one batch. Functional losses,
   traced chains, site-local and tied-weight scoring, and half-precision attention,
   losses and subspace folds move at rounding level.
 

@@ -45,10 +45,10 @@ def resolve_cost_scale(
     if finite is not None and isinstance(scale_cost, str):
         cost_matrix = torch.where(finite, cost_matrix, 0)
     if scale_cost == "mean":
-        mean = cost_matrix.abs().mean()
+        mean = cost_matrix.abs().mean(dtype=torch.float64).to(cost_matrix.dtype)
         if finite is not None:
             count = finite.sum()
-            mean = torch.where(count == finite.numel(), mean, mean * finite.numel() / count.clamp(min=1))
+            mean = torch.where(count == finite.numel(), mean, mean * (finite.numel() / count.clamp(min=1)))
         return torch.clamp(mean, min=1e-10)
     elif scale_cost == "max_cost":
         return torch.clamp(cost_matrix.abs().max(), min=1e-10)

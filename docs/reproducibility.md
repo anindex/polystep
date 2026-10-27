@@ -10,7 +10,9 @@ pip install -e ".[experiments,rl]"
 `rl` adds stable-baselines3 for the PPO and DQN arms. `run_revision.sh` uses
 `.venv/bin/python`; set `PY` to use another interpreter.
 
-Record hardware, PyTorch version, seeds, and selected configurations with results.
+Record hardware, package and PyTorch versions, seeds, and selected configurations
+with each result.
+
 The MNIST, ETTh1 and SST-2 runners download their datasets. The controlled-study
 runner expects MNIST under `data/mnist`; see the
 [controlled hard-LIF comparison](../experiments/CONTROLLED_EXPERIMENTS.md).
@@ -139,8 +141,8 @@ historical numbers:
   incumbent's loss on an earlier batch.
 - The ES baselines average the ranks of tied returns and losses. The published RL and
   architecture runs ranked ties in sorting order.
-- The RL results predate three more runner fixes: `rl_env_steps` counts training
-  steps only, success on Acrobot means reaching the goal, and every CartPole arm
+- The RL results predate three more runner fixes. `rl_env_steps` counts training
+  steps only. Success on Acrobot means reaching the goal. Every CartPole arm
   except PPO and DQN runs on the analytic simulator.
 - Capped `HybridSubspace` runs used the old budget split, which kept full-width
   weight matrices out of `max_subspace_dim`. The RL configurations set a cap of 24,
@@ -157,9 +159,8 @@ historical numbers:
 - The surviving `quadratic/trust_region`, `trust_x_quad/trust_quad_k3`,
   `quadratic/biased_rotation`, and `quadratic/newton` sweep arms change as well. The
   trust region applies its new radius on the step that measured the ratio instead of
-  one step later, `biased_rotation` turns each frame with a single Householder
-  reflection, and Newton refinement runs before momentum and keeps the Sinkhorn warm
-  start.
+  one step later. `biased_rotation` turns each frame with a single Householder
+  reflection. Newton refinement runs before momentum and keeps the Sinkhorn warm start.
 - 1.1 changes three more inputs. `HybridSubspace` and `FactoredSubspace` draw new
   seeded bases, which changes every paper runner that uses them and the fair EGGROLL
   and Hybrid arms; `AdaptiveSubspace` and full-space runs keep their bases. Sinkhorn
@@ -168,6 +169,11 @@ historical numbers:
   Anderson acceleration or `ProgressiveEpsilon`. `biased_rotation` points the vertex
   nearest the previous descent direction along it, which changes the SNN/LIF and
   hard-MoE configurations and the `quadratic/biased_rotation` arm again.
+
+Version 1.1.1 corrects transport for tiny and zero marginals, protects named scaling
+from FP32 overflow, and makes stacked RL INT8 quantization match the policy. The RL
+affine operation is also fused. These changes can alter seeded results; the
+historical tables have not been rerun for this patch.
 
 Other changes in 1.0 and 1.1 move results in the last bit (see the
 [changelog](../CHANGELOG.md) and the

@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Optional
 import numpy as np
 import torch
 
-from .policies import count_stacked_candidates
+from .policies import _quantize_int8_per_tensor, count_stacked_candidates
 
 #: Envs whose episode ends when the goal is reached, so "success" is finishing
 #: *before* the horizon rather than surviving to it.
@@ -78,15 +78,12 @@ def _batched_mlp_logits(
     for j, idx in enumerate(linear_indices):
         w = stacked_params[f"net.{idx}.weight"]  # (N, out, in)
         b = stacked_params[f"net.{idx}.bias"]  # (N, out)
-        x = torch.bmm(x, w.transpose(1, 2)) + b.unsqueeze(1)
+        x = torch.baddbmm(b.unsqueeze(1), x, w.transpose(1, 2))
         if j < len(linear_indices) - 1:
             if activation == "tanh":
                 x = torch.tanh(x)
             elif activation == "int8":
-                # Per-candidate per-tensor quantization to mirror NonDiffActivation.
-                max_abs = x.detach().abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-8)
-                scale = max_abs / 127.0
-                x = torch.round(x / scale) * scale
+                x = _quantize_int8_per_tensor(x, dim=(1, 2))
             elif activation == "binary":
                 x = torch.sign(x)
             elif activation == "float32":

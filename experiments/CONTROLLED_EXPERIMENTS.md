@@ -13,8 +13,9 @@ validation data only.
 | Greedy | 75.887 ± 9.267% |
 
 All 40 final runs have finite results. Unadjusted paired sign-flip tests reject none
-of the three softmax comparisons at 5%. These are part of a prespecified 16-contrast
-family; incomplete contrasts remain explicit in aggregation.
+of the three softmax comparisons at 5%. This does not establish equivalence. These
+tests belong to a prespecified 16-contrast family; aggregation reports which
+contrasts are incomplete. The table has not been rerun for v1.1.1.
 
 ## Reproduction
 
@@ -47,11 +48,11 @@ protocol. Aggregators retain individual seed outcomes and do not fill missing ru
 ## Practical controls
 
 The practical controls compare PolyStep with OpenAI-ES, EGGROLL, SPSA, MeZO and random
-search at equal candidate evaluations and at equal time on the hard-LIF MNIST and DVS
-Gesture tasks, with full and subspace Adam added on the time axis. INT8 runs PolyStep,
-MeZO and Adam on the time axis only. Each of 27 configurations is tuned on three seeds
-at two million evaluations or 12 minutes, and the selected one runs on ten final seeds
-at ten million evaluations or one hour.
+search on hard-LIF MNIST and DVS Gesture. They use equal candidate evaluations and
+equal time as separate budgets. Full and subspace Adam join the time comparison.
+INT8 runs PolyStep, MeZO and Adam on the time axis only. Each of 27 configurations
+is tuned on three seeds at two million evaluations or 12 minutes. The selected one
+runs on ten final seeds at ten million evaluations or one hour.
 
 The diagnostics and practical campaign require CUDA. Both wait silently until all 23
 arms in `ARMS` (`run_controlled.py`) have a selected configuration and ten final seeds.

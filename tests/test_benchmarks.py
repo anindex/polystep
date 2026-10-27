@@ -1,6 +1,8 @@
 """Synthetic-objective convergence (Ackley, Rosenbrock, Rastrigin, Sphere) and the polystep.benchmarks helpers."""
 
 import math
+import importlib.util
+from pathlib import Path
 
 import pytest
 import torch
@@ -10,6 +12,41 @@ from polystep import LinearEpsilon
 from polystep.benchmarks.utils import evaluate_accuracy
 from polystep.solver import PolyStep
 from polystep.objectives import Ackley, Rosenbrock, Rastrigin, Sphere
+
+
+@pytest.fixture
+def adaptation_example(monkeypatch):
+    path = Path(__file__).resolve().parents[1] / "examples" / "06_loihi_snn_polystep.py"
+    if not path.is_file():
+        pytest.skip("examples are absent from distributions")
+    monkeypatch.syspath_prepend(str(path.parent))
+    spec = importlib.util.spec_from_file_location("snn_adaptation_example", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_adaptation_neuron_reset_and_threshold(adaptation_example):
+    lif = adaptation_example.LearnableLIF(beta=0.5, vth=1.0)
+    spike, mem = lif(torch.tensor([0.25, 1.5]), torch.tensor([0.5, 0.5]))
+    torch.testing.assert_close(spike, torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(mem, torch.tensor([0.5, 0.75]))
+    with torch.no_grad():
+        lif.vth.fill_(-1.0)
+    spike, mem = lif(torch.zeros(1), torch.zeros(1))
+    assert spike.item() == 0 and mem.item() == 0
+    spike, mem = lif(torch.ones(1), torch.zeros(1))
+    assert spike.item() == 1 and 0 <= mem.item() < 1
+    for kwargs in ({"vth": -1}, {"vth": math.nan}, {"beta": 1}, {"beta": math.nan}):
+        with pytest.raises(ValueError):
+            adaptation_example.LearnableLIF(**kwargs)
+
+
+def test_adaptation_rejects_hardware_before_training(adaptation_example, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["example", "--backend", "loihi2"])
+    with pytest.raises(SystemExit, match="2"):
+        adaptation_example.main()
+    assert "hardware backend is not implemented" in capsys.readouterr().err
 
 
 def _run_benchmark(

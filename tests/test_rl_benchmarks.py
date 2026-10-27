@@ -109,6 +109,70 @@ def test_cartpole_evaluator_activation_and_training_steps():
         )
 
 
+def test_cartpole_transitions_match_gymnasium():
+    gym = pytest.importorskip("gymnasium")
+    from polystep.benchmarks.rl.cartpole import cartpole_step, THETA_THRESHOLD, X_THRESHOLD
+
+    states = torch.randn(100, 4, dtype=torch.float64) * torch.tensor([2.0, 1.0, 0.2, 1.0])
+    states[:4] = torch.tensor(
+        [[X_THRESHOLD, 0, 0, 0], [-X_THRESHOLD, 0, 0, 0], [0, 0, THETA_THRESHOLD, 0], [0, 0, -THETA_THRESHOLD, 0]],
+        dtype=torch.float64,
+    )
+    actions = torch.randint(0, 2, (len(states),))
+    predicted, rewards, done = cartpole_step(states, actions)
+    env = gym.make("CartPole-v1").unwrapped
+    try:
+        for i, (state, action) in enumerate(zip(states, actions)):
+            env.reset(seed=0)
+            env.state = state.numpy().copy()
+            _, reward, terminated, _, _ = env.step(int(action))
+            torch.testing.assert_close(predicted[i], torch.from_numpy(env.state), atol=1e-14, rtol=1e-14)
+            assert reward == rewards[i] and terminated == done[i]
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("activation", ["tanh", "binary", "float32", "int8"])
+@pytest.mark.parametrize("scale", [0.0, 1e-8, 1.0])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda", marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
+        ),
+    ],
+)
+def test_stacked_policy_matches_individual_forwards(activation, scale, device):
+    from polystep.benchmarks.rl.gym_evaluator import _batched_mlp_logits
+    from polystep.benchmarks.rl.policies import DiscreteMLPPolicy, NonDiffMLPPolicy, stack_module_params
+
+    policy = DiscreteMLPPolicy(4, 16, 2) if activation == "tanh" else NonDiffMLPPolicy(4, 16, 2, mode=activation)
+    params = stack_module_params(policy.to(device), 5, noise_scale=0.1, seed=0)
+    params["net.0.weight"] *= scale
+    params["net.0.bias"] *= scale
+    params["net.2.bias"].zero_()
+    obs = torch.randn(5, 8, 4, device=device)
+    actual = _batched_mlp_logits(obs, params, activation)
+    expected = []
+    for i in range(5):
+        expected.append(torch.func.functional_call(policy, {k: v[i] for k, v in params.items()}, (obs[i],)))
+    torch.testing.assert_close(
+        actual, torch.stack(expected), rtol=1e-5, atol=1e-6 * (1 if activation == "binary" else scale)
+    )
+
+
+def test_int8_activation_preserves_nonfinite_candidates():
+    from polystep.benchmarks.rl.policies import NonDiffActivation, _quantize_int8_per_tensor
+
+    x = torch.tensor([[[1e-9, 1e-8]], [[0.0, 0.0]], [[float("inf"), 1.0]], [[float("nan"), 2.0]]])
+    expected = torch.stack([NonDiffActivation("int8")(candidate) for candidate in x])
+    actual = _quantize_int8_per_tensor(x, dim=(1, 2))
+    torch.testing.assert_close(actual, expected, equal_nan=True)
+    torch.testing.assert_close(actual[2:], x[2:], equal_nan=True)
+    torch.testing.assert_close(torch.vmap(NonDiffActivation("int8"))(x), expected, equal_nan=True)
+
+
 def test_es_cartpole_counts_training_steps(require_experiments, tmp_path):
     pytest.importorskip("gymnasium")
     import json

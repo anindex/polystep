@@ -5,8 +5,8 @@ configurations and checkpoints. Entries are five-seed means ± sample standard
 deviation, except the probSAT and RC2 columns, which are single runs; the
 [protocol](../docs/reproducibility.md#protocol) gives the budget each method gets.
 
-These tables were recorded before 1.0. Later changes to the optimizer and experiment
-runners affect the results; see
+These tables record runs made before 1.0. Later changes to the optimizer and
+experiment runners affect the results; see
 [changes since the published tables](../docs/reproducibility.md#changes-since-the-published-tables)
 before comparing a new run with them.
 

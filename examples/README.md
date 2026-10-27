@@ -1,7 +1,7 @@
 # Examples
 
-Run these commands from a source checkout; the package's `examples` extra installs
-dependencies, while the scripts live in this repository:
+Run these examples from a source checkout. The package's `examples` extra installs
+dependencies; the scripts live in this repository:
 
 ```bash
 pip install -e ".[examples]"
@@ -33,6 +33,16 @@ accepts `--device cuda`, and skips its GIF with `--no-render`. Example 04 accept
 Example 10 trains in about 20 seconds on an RTX 5090. On one CPU thread its 40 default
 epochs take about an hour, so shorten a CPU run with `--epochs` and `--train-size`.
 
+For a short CPU check, I use:
+
+```bash
+python examples/06_loihi_snn_polystep.py --device cpu --hidden 32 --num-steps 5 --max-train 1024 --max-test 256 --pretrain-epochs 1 --adapt-epochs 1
+python examples/10_cnn_mnist.py --device cpu --epochs 2 --train-size 1000 --test-size 256 --batch-size 32
+python examples/11_transformer_selective_copy.py --device cpu --epochs 5 --train-size 512 --test-size 256
+```
+
+These small budgets check execution; use the defaults to assess learning quality.
+
 ## Data
 
 Examples 05, 06 and 10 download MNIST to `mnist` under the system temp directory,
@@ -40,17 +50,20 @@ Examples 05, 06 and 10 download MNIST to `mnist` under the system temp directory
 
 ## Comparing evaluation paths
 
-Examples 10 and 11 take `--compare`, which scores the same batches with fully built
-candidates and with the site-local evaluator, checks that the losses agree, and times
-both, first-call setup included. On the CPU, example 10's fully built candidates take
-about 15 GB of memory. See [performance](../docs/performance.md) for subspace settings
+Examples 10 and 11 take `--compare` to score the same batches with fully built
+candidates and with the site-local evaluator. This checks that the losses agree and
+times both paths, including first-call setup. On the CPU, example 10's fully built
+candidates take about 15 GB of memory. See [performance](../docs/performance.md) for subspace settings
 and the [API reference](../docs/api_overview.md#evaluation-controls) for amortization.
 
 ## Reported results
 
 Examples 05, 06, 10 and 11 select checkpoints on validation data and report test
-accuracy afterward. The Loihi example simulates the SNN in PyTorch on the selected
-device; its hardware evaluator is a deployment sketch.
+accuracy afterward. Example 06 runs a PyTorch SNN simulation on the selected device.
+It adapts the readout and neuron parameters under Gaussian input noise. Its
+one-state neuron uses subtractive reset, so it does not reproduce
+[Lava LIF](https://lava-nc.org/lava/lava.proc.lif.html) or Loihi hardware.
+`--backend cpu_sim` remains accepted; `--backend loihi2` fails before loading data.
 
 Examples 07 and 08 report the mean over five seeds. Their OpenAI-ES baselines use the
 noise scale and learning rate selected on 20 separate tuning seeds.
@@ -61,3 +74,10 @@ separate training-step budget. Example 08 reports sample standard deviations acr
 its five seeds.
 
 For published comparisons, see [experiments](../experiments/README.md).
+
+I ran the default budgets on an RTX 5090 with v1.1.1, Python 3.14 and PyTorch 2.13.
+Test accuracy reached 94.4% in example 05, 94.35% in example 10, and 100% on example
+11's synthetic copy task. Example 06 recovered 13.3 percentage points on
+shifted test inputs, while clean accuracy fell from 73.2% to 72.0%. These are the
+scripts' default seeds, not multi-seed estimates. The CPU CartPole run reached its
+200-step evaluation limit on all 32 episodes.

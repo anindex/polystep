@@ -29,16 +29,14 @@ class DiscreteMLPPolicy(nn.Sequential):
         )
 
 
-def _quantize_int8_per_tensor(x: torch.Tensor) -> torch.Tensor:
+def _quantize_int8_per_tensor(x: torch.Tensor, dim: tuple[int, ...] | None = None) -> torch.Tensor:
     """Per-tensor symmetric INT8 quantize/dequantize (no STE)."""
 
     if x.numel() == 0:
         return x
-    max_abs = x.detach().abs().amax()
-    if not torch.isfinite(max_abs) or max_abs.item() == 0.0:
-        return x
+    max_abs = x.detach().abs().amax(dim=dim, keepdim=True)
     scale = (max_abs / 127.0).clamp(min=1e-8)
-    return torch.round(x / scale) * scale
+    return torch.where(torch.isfinite(max_abs), torch.round(x / scale) * scale, x)
 
 
 class NonDiffActivation(nn.Module):

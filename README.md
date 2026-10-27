@@ -11,9 +11,11 @@ Gradient-free neural network training via optimal transport.
 Accepted at [Transactions on Machine Learning Research (TMLR)](https://openreview.net/forum?id=8mlcqTTMuU).
 
 PolyStep evaluates finite-radius parameter perturbations and updates parameters
-through a weighted barycenter. It supports spiking networks, quantized layers, hard
+through a weighted barycenter. I use it for spiking networks, quantized layers, hard
 routing, and other models without useful gradients. For differentiable models,
 backpropagation is usually faster.
+
+Version 1.1.1. See the [changelog](CHANGELOG.md) for release changes.
 
 [Paper](https://arxiv.org/abs/2605.01928) ·
 [Interactive visualization](https://vietngth.github.io/polystep-visualization/) ·
