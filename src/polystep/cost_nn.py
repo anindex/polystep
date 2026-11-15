@@ -19,6 +19,7 @@ from typing import Callable, Optional, TYPE_CHECKING, Union
 import torch
 import torch.nn as nn
 from torch._C._functorch import is_batchedtensor, maybe_current_level
+from torch.nn.modules.module import _global_forward_hooks, _global_forward_pre_hooks
 from torch.func import functional_call, vmap
 from torch.overrides import TorchFunctionMode
 from torch.utils._pytree import tree_flatten, tree_leaves, tree_map
@@ -482,6 +483,12 @@ class NNCostEvaluator:
         self._compiled_fwd_loss = None
         self._compile_forward_verified = False
         self._buffers = dict(self.model.named_buffers())
+        self._buffer_slots = [
+            (module._buffers, name, buffer)
+            for module in self.model.modules()
+            for name, buffer in module._buffers.items()
+            if buffer is not None
+        ]
         self._mutable_weights = _max_norm_weights(self.model)
         self._unversioned_writes = None
         # remove_duplicate=False so tied weights resolve under every module path: a
@@ -645,6 +652,9 @@ class NNCostEvaluator:
             self._unversioned_writes = (self._unversioned_writes or set()) | moved
 
         def put_back():
+            for slots, name, buffer in self._buffer_slots:
+                if slots.get(name) is not buffer:
+                    slots[name] = buffer
             for i, (t, c, v) in enumerate(zip(state, copies, versions)):
                 if v is not None and t._version == v and i not in self._unversioned_writes:
                     continue
@@ -743,16 +753,19 @@ class NNCostEvaluator:
         first = next(iter(stacked_params.values()))
         return first.dtype if first.is_floating_point() else None
 
+    def _reject_per_sample_inplace(self) -> None:
+        if self.per_sample:
+            raise NotImplementedError(
+                "per_sample is not supported on the in-place path. Construct the "
+                "evaluator with use_inplace=False for diagnostic runs; the (N, B) "
+                "tensor defeats the point of the in-place path's O(1) memory anyway."
+            )
+
     def _dispatch(self, stacked_params, inputs, targets):
         """Pick the cheapest scoring path this model and call shape allow."""
         # In-place swap is O(1 x activation), checked before the bmm path's O(N) stack.
         if self._use_inplace:
-            if self.per_sample:
-                raise NotImplementedError(
-                    "per_sample is not supported on the in-place path. Construct the "
-                    "evaluator with use_inplace=False for diagnostic runs; the (N, B) "
-                    "tensor defeats the point of the in-place path's O(1) memory anyway."
-                )
+            self._reject_per_sample_inplace()
             return self._evaluate_inplace(stacked_params, inputs, targets)
 
         # Batched bmm for Linear-only models, supervised only.
@@ -1048,6 +1061,7 @@ class NNCostEvaluator:
         Reconstructs one configuration at a time with ``apply_perturbation_inplace``;
         peak memory is independent of N and no stacked parameter dict is allocated.
         """
+        self._reject_per_sample_inplace()
         N = flat_subspace_batch.shape[0]
         device = _first_input_tensor(inputs).device
 
@@ -1194,9 +1208,11 @@ def _base_prefix(evaluator, params, inputs, end):
             name, tag, module = evaluator._layer_keys[i]
             if tag == "linear":
                 # Match the delta paths' arithmetic (including its rounding order).
-                x = x @ params[f"{name}.weight"].t()
-                if f"{name}.bias" in params:
-                    x = x + params[f"{name}.bias"]
+                wq, bq = _weight_transforms(module)
+                weight, bias = params[f"{name}.weight"], params.get(f"{name}.bias")
+                x = x @ (weight if wq is None else wq(weight)).t()
+                if bias is not None:
+                    x = x + (bias if bq is None else bq(bias))
             elif tag not in ("flatten", "dropout"):
                 x = module(x)
             cache[i + 1] = x
@@ -1407,11 +1423,13 @@ def _linear_like(submod: nn.Module) -> bool:
 
 
 def _has_hooks(module: nn.Module) -> bool:
-    """Whether ``module`` carries a forward hook the hand-built matmuls never run."""
+    """Whether ``module`` carries a forward hook, its own or a global one, that the hand-built matmuls never run."""
     return bool(
         getattr(module, "_forward_hooks", None)
         or getattr(module, "_forward_pre_hooks", None)
         or getattr(module, "_forward_hooks_with_kwargs", None)
+        or _global_forward_hooks
+        or _global_forward_pre_hooks
     )
 
 
@@ -1777,11 +1795,8 @@ class SiteVmapEvaluator:
 
     def __init__(self, owner: NNCostEvaluator, layout):
         self.model = owner.model
-        self.loss_fn = owner.loss_fn
-        self.per_sample = owner.per_sample
-        self._loss_kind = owner._loss_kind
-        self._buffers = owner._buffers
         self._owner = owner
+        self._reset_seen = owner._reset_count
         self._entry_by_key = {e.key: e for e in layout.entries}
         self._names = {e.key: (e.key, *e.shared_with) for e in layout.entries}
         self._starts = [e.offset for e in layout.entries]
@@ -1796,6 +1811,11 @@ class SiteVmapEvaluator:
         self._warned = False
         self._randomness = "error"
         self._drop_graphs()
+
+    loss_fn = property(lambda self: self._owner.loss_fn)
+    per_sample = property(lambda self: self._owner.per_sample)
+    _loss_kind = property(lambda self: self._owner._loss_kind)
+    _buffers = property(lambda self: self._owner._buffers)
 
     def _drop_graphs(self) -> None:
         """Free the captured site graphs, their static tensors and their memory pool."""
@@ -1977,6 +1997,7 @@ class SiteVmapEvaluator:
             self._matched_injections.clear()
         if (
             base.device.type == "cpu"
+            and signature is not None
             and base.dim() > 1
             and work >= _MACS_PER_INTERCEPTED_CALL * (self._forward_calls.get(signature, 0) + _INTERCEPT_SETUP_CALLS)
             and base.dtype not in (torch.float16, torch.bfloat16)
@@ -2025,6 +2046,10 @@ class SiteVmapEvaluator:
         ``key``: after a Linear or convolution of a shared input, or into a weight built
         once per forward.
         """
+        if self._reset_seen != self._owner._reset_count:
+            self._reset_seen = self._owner._reset_count
+            self._compiled_sites.clear()
+            self._drop_graphs()
         inject = isinstance(site, tuple)
         signature = _input_signature(inputs)
         names = self._names[key]
@@ -2549,7 +2574,7 @@ class FactoredEvaluator:
         N = flat_subspace_batch.shape[0]
         specs = {s.entry_key: s for s in subspace.specs}
 
-        param_dtype = next(iter(base_sd.values())).dtype
+        param_dtype = base_sd[next(f"{name}.weight" for name, tag, _ in self._layer_keys if tag == "linear")].dtype
         inputs = cast_inputs_memo(self, inputs, param_dtype)
         x = inputs if inputs.dim() == 2 else inputs.reshape(inputs.shape[0], -1)
         # Shared across candidates until the first perturbed layer.

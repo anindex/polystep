@@ -1,6 +1,7 @@
 """Tests for NNCostEvaluator, ParamLayout.batch_unflatten(), chunked eval, and cost matrix."""
 
 import inspect
+import math
 import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1430,3 +1431,151 @@ def test_attention_free_stacks_skip_alignment_copy(monkeypatch):
     base = layout.unflatten(layout.flatten(model))
     assert base["1.weight"].data_ptr() % 16
     assert SiteVmapEvaluator.try_build(ev, layout).aligned_base(base) is base
+
+
+def test_rebound_buffer_restored_between_candidates():
+    """A forward that rebinds a buffer leaves the saved tensor untouched, so the binding itself is put back."""
+
+    class Rebind(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.ones(1))
+            self.register_buffer("calls", torch.zeros(()))
+
+        def forward(self, x):
+            self.calls = self.calls + 1
+            return x * self.w * self.calls
+
+    model = Rebind()
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=True, compile_forward=False)
+    losses = ev.evaluate({"w": torch.ones(3, 1)}, torch.ones(2, 1), torch.zeros(2, 1))
+
+    assert losses.tolist() == [1.0, 1.0, 1.0]
+    assert model.calls.item() == 0.0
+
+
+def test_global_forward_hook_declines_batched_plan():
+    """A hook registered for every module runs under functional_call, so the hand-built matmuls must step aside."""
+    model = nn.Sequential(nn.Linear(2, 1, bias=False))
+    model[0].weight.data.fill_(1)
+    x, y = torch.ones(2, 2), torch.zeros(2, 1)
+    handle = nn.modules.module.register_module_forward_hook(
+        lambda mod, args, out: out + 5 if isinstance(mod, nn.Linear) else None
+    )
+    try:
+        ev = NNCostEvaluator(model, nn.MSELoss())
+        stacked = {"0.weight": model[0].weight.detach()[None].clone()}
+        assert ev.evaluate(stacked, x, y).tolist() == ev._evaluate_loop(stacked, x, y).tolist() == [49.0]
+    finally:
+        handle.remove()
+
+
+def test_site_evaluator_reads_buffers_after_reset():
+    """``reset_vmap`` replaces the buffer dict; a site evaluator built earlier must follow it."""
+    from polystep.cost_nn import SiteVmapEvaluator
+
+    class Scaled(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(2, 1, bias=False)
+            self.register_buffer("scale", torch.tensor(1.0))
+
+        def forward(self, x):
+            return self.fc(x) * self.scale
+
+    model = Scaled()
+    model.fc.weight.data.fill_(1)
+    ev = NNCostEvaluator(model, nn.MSELoss(), compile_forward=False)
+    layout = ParamLayout.from_module(model)
+    site = SiteVmapEvaluator(ev, layout)
+    base = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    model.scale = torch.tensor(3.0)
+    ev.reset_vmap()
+    x, y = torch.ones(2, 2), torch.zeros(2, 1)
+    got = site.evaluate(base, layout.entries[0], torch.tensor([[0, 1]]), torch.ones(1, 1, 2), x, y)
+
+    assert got.tolist() == ev.evaluate({"fc.weight": torch.ones(1, 1, 2)}, x, y).tolist() == [36.0]
+
+
+def test_prefix_reuse_applies_weight_transform():
+    """The cached prefix and the delta walk must build a transformed layer the same way."""
+    from polystep.cost_nn import SparseDeltaEvaluator, _reuse_prefixes
+
+    model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.Linear(2, 1, bias=False))
+    model[0].weight.data.fill_(1)
+    model[1].weight.data.fill_(1)
+    model[0].polystep_weight_transform = lambda w: 2 * w
+    model[0].forward = lambda z: nn.functional.linear(z, model[0].polystep_weight_transform(model[0].weight))
+    layout = ParamLayout.from_module(model)
+    base = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    x, y = torch.ones(2, 2), torch.zeros(2, 1)
+    delta = SparseDeltaEvaluator.try_build(model, nn.MSELoss(), layout)
+    args = (base, "1.weight", torch.tensor([[0, 1]]), torch.tensor([[[2.0, 1.0]]]), x, y)
+    with _reuse_prefixes(delta):
+        cached = delta.evaluate(*args)
+    reference = nn.functional.mse_loss(
+        functional_call(model, {**base, "1.weight": torch.tensor([[2.0, 1.0]])}, (x,)), y
+    )
+
+    assert cached.tolist() == delta.evaluate(*args).tolist() == [reference.item()]
+
+
+def test_factored_step_ignores_integer_buffer():
+    """The input cast follows the first Linear weight, not whatever tensor the state dict lists first."""
+    from polystep.factored_subspace import FactoredSubspace
+
+    model = nn.Sequential(nn.Linear(2, 2))
+    model.register_buffer("counter", torch.tensor(0))
+    sub = FactoredSubspace.from_layout(ParamLayout.from_module(model), rank=1, seed=0)
+    opt = PolyStepOptimizer(model, subspace=sub, subspace_particle_dim=3, seed=0, solver="softmax")
+
+    assert math.isfinite(opt.step_batch(torch.ones(2, 2), torch.zeros(2, 2), loss_fn=nn.MSELoss()))
+
+
+def test_fused_inplace_rejects_per_sample():
+    """The fused path returns one loss per candidate, so it refuses a per-sample evaluator like the plain one."""
+    from polystep.hybrid_subspace import HybridSubspace
+
+    model = nn.Sequential(nn.Linear(2, 1))
+    sub = HybridSubspace.from_layout(ParamLayout.from_module(model), rank=1)
+    projections = sub.init_projections(torch.device("cpu"), torch.float32)
+    base = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    ev = NNCostEvaluator(model, nn.MSELoss(reduction="none"), per_sample=True, use_inplace=False)
+
+    with pytest.raises(NotImplementedError, match="per_sample"):
+        ev.evaluate_subspace_inplace(
+            sub, projections, base, torch.zeros(3, sub.subspace_dim), torch.ones(4, 2), torch.zeros(4, 1)
+        )
+
+
+def test_opaque_input_leaf_skips_injection_check():
+    """An input without a reusable signature cannot cache the injection check, so it never starts one."""
+    from polystep.cost_nn import SiteVmapEvaluator
+
+    class Count(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(512, 512)
+            self.calls = 0
+
+        def forward(self, x, tag=None):
+            self.calls += 1
+            return self.fc(x)
+
+    torch.manual_seed(0)
+    model = Count()
+    ev = NNCostEvaluator(model, nn.MSELoss(), compile_forward=False)
+    layout = ParamLayout.from_module(model)
+    base = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    entry = layout.entries[0]
+    x, y = torch.randn(16, 512), torch.randn(16, 512)
+    idx = torch.tensor([[0, 1]])
+    values = base[entry.key].flatten()[idx][:, None, :] + torch.randn(1, 8, 2) * 0.1
+    site = SiteVmapEvaluator(ev, layout)
+    counts = []
+    for _ in range(3):
+        model.calls = 0
+        site.evaluate(base, entry, idx, values, (x, object()), y)
+        counts.append(model.calls)
+
+    assert counts == [1, 1, 1]
