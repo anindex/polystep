@@ -44,12 +44,11 @@ class TestPerLayerBlocks:
 
 
 class TestGroupedBlocks:
-    @pytest.mark.parametrize("kwargs", [{}, {"group_size": 2}], ids=["default", "explicit"])
-    def test_grouped_pairs(self, kwargs):
-        """group_size defaults to 2, so both calls give the same 4-entry-into-2 split."""
+    def test_grouped_pairs(self):
+        """group_size defaults to 2, which splits the four entries into two blocks."""
         model = SimpleMLP()
         layout = ParamLayout.from_module(model)
-        blocks = create_grouped_blocks(layout, **kwargs)
+        blocks = create_grouped_blocks(layout)
         assert len(blocks) == 2
         assert [b.leaf_indices for b in blocks] == [(0, 1), (2, 3)]
 

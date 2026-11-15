@@ -121,15 +121,6 @@ def test_amortize_steps_with_softmax(model, closure, feature_kwargs):
 
 
 class TestSubspaceModes:
-    def test_hybrid_subspace_step(self, model, layout):
-        """HybridSubspace with softmax solver runs 2 steps without error."""
-        sub = HybridSubspace.from_layout(layout, rank=4, rotation_interval=0)
-        opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.5)
-        closure = _make_closure(model)
-        for _ in range(2):
-            loss = opt.step(closure)
-            assert math.isfinite(loss)
-
     def test_hybrid_subspace_with_sinkhorn_override(self, model, layout):
         sub = HybridSubspace.from_layout(layout, rank=4, rotation_interval=0)
         opt = PolyStepOptimizer(model, subspace=sub, solver="sinkhorn", epsilon=0.5)

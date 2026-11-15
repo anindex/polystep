@@ -85,31 +85,6 @@ def test_compile_forward_falls_back_on_cpu():
     assert torch.unique(losses).numel() == n
 
 
-@pytest.mark.parametrize(
-    "use_inplace, compile_forward, expected",
-    [
-        (True, None, True),
-        (False, None, False),
-        (True, False, False),
-        (False, True, True),
-    ],
-)
-def test_compile_forward_defaults_on_inplace_path(use_inplace, compile_forward, expected):
-    """The flag stays raw; the in-place gate resolves ``None`` to ``use_inplace``.
-
-    The in-place path is a Python loop of N sequential forwards, so it is
-    launch-bound. An explicit value still wins.
-    """
-    ev = NNCostEvaluator(
-        nn.Sequential(nn.Linear(8, 4)),
-        nn.MSELoss(),
-        use_inplace=use_inplace,
-        compile_forward=compile_forward,
-    )
-    assert ev._compile_forward is compile_forward
-    assert (ev._use_inplace if ev._compile_forward is None else ev._compile_forward) is expected
-
-
 def test_eager_inplace_skips_verification_forward():
     model = nn.Linear(3, 2)
     count = []

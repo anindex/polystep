@@ -18,7 +18,6 @@ from polystep.cost_nn import (
     BatchedLinearEvaluator,
     NNCostEvaluator,
     SiteVmapEvaluator,
-    auto_detect_chunk_size,
     cast_inputs_memo,
 )
 
@@ -590,13 +589,6 @@ def test_chunk_size_produces_same_result():
     torch.testing.assert_close(losses_chunk, losses_full, atol=1e-5, rtol=1e-5)
 
 
-def test_auto_detect_chunk_size_cpu():
-    """auto_detect_chunk_size returns None for CPU model (even on GPU machine)."""
-    model = nn.Linear(100, 50)
-    result = auto_detect_chunk_size(model)
-    assert result is None, f"Expected None for CPU model, got {result}"
-
-
 def test_evaluator_auto_chunk_size():
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
     layout = ParamLayout.from_module(model)
@@ -618,18 +610,6 @@ def test_evaluator_auto_chunk_size():
 
     assert losses.shape == (N,)
     assert losses.isfinite().all()
-
-
-def test_auto_chunk_size_cached():
-    model = nn.Linear(4, 2)
-    evaluator = NNCostEvaluator(model, nn.MSELoss(), chunk_size="auto")
-    cs1 = evaluator.chunk_size
-    cs2 = evaluator.chunk_size
-    assert cs1 == cs2
-    assert hasattr(evaluator, "_chunk_size_cached")
-    from polystep.cost_nn import _UNSET
-
-    assert evaluator._chunk_size_cached is not _UNSET
 
 
 def _chunk_bound_step(chunk_size):

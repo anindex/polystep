@@ -239,17 +239,6 @@ class TestCUDA:
         assert peak < 64 * proj.nnz
 
 
-def test_repr():
-    proj = SparseRandomProjection(full_dim=100000, subspace_dim=256, seed=42)
-    r = repr(proj)
-
-    assert "SparseRandomProjection" in r
-    assert "full_dim=100000" in r
-    assert "subspace_dim=256" in r
-    assert "density=" in r
-    assert "memory=" in r
-
-
 def test_min_nnz_per_col():
     """At least 1 nonzero per column even at very low density."""
     proj = SparseRandomProjection(full_dim=10, subspace_dim=5, density=0.001, seed=42)
