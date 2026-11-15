@@ -500,17 +500,22 @@ def test_rank_deficient_history_draws_random_columns():
         ),
     ],
 )
-def test_fp32_top_directions_match_fp64_span(monkeypatch, device):
+def test_fp32_top_directions_match_fp64_span(device):
     """FP32, with TF32 matmuls on CUDA, keeps directions above its rounding level on the FP64 span."""
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
-    gen = torch.Generator().manual_seed(0)
-    U = torch.linalg.qr(torch.randn(20000, 5, generator=gen, dtype=torch.float64))[0]
-    V = torch.linalg.qr(torch.randn(5, 5, generator=gen, dtype=torch.float64))[0]
-    D = ((U * torch.tensor([1.0, 0.3, 0.1, 3e-4, 1e-7], dtype=torch.float64)) @ V.mT).float().to(device)
+    matmul = torch.backends.cuda.matmul
+    prior = matmul.allow_tf32
+    matmul.allow_tf32 = True
+    try:
+        gen = torch.Generator().manual_seed(0)
+        U = torch.linalg.qr(torch.randn(20000, 5, generator=gen, dtype=torch.float64))[0]
+        V = torch.linalg.qr(torch.randn(5, 5, generator=gen, dtype=torch.float64))[0]
+        D = ((U * torch.tensor([1.0, 0.3, 0.1, 3e-4, 1e-7], dtype=torch.float64)) @ V.mT).float().to(device)
 
-    Q = top_directions(D, 5).double()
-    kept = torch.linalg.qr(Q)[0]
-    reference = torch.linalg.svd(D.double(), full_matrices=False)[0][:, :4]
+        Q = top_directions(D, 5).double()
+        kept = torch.linalg.qr(Q)[0]
+        reference = torch.linalg.svd(D.double(), full_matrices=False)[0][:, :4]
+    finally:
+        matmul.allow_tf32 = prior
     assert kept.shape[1] == 4
     assert (Q.mT @ Q - torch.eye(4, dtype=torch.float64, device=device)).abs().max() < 1e-3
     assert (reference - kept @ (kept.mT @ reference)).norm(dim=0).max() < 1e-3
