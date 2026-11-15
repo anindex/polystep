@@ -26,17 +26,17 @@ python examples/01_quickstart_2d.py
 
 ## Devices and threads
 
-Examples run on one CPU thread, except 07, which uses eight; set `POLYSTEP_THREADS` to
-change it. Examples 02, 04, 05, 06, 10, 11, 12 and 13 use CUDA when available, and 05 runs in
-BF16 there; pass `--device cpu` to run them on the CPU. Example 03 runs on the CPU,
-accepts `--device cuda`, and skips its GIF with `--no-render`. Example 04 accepts
-`--small` for a 2,000-variable task. Example 12 takes `--particles` to change the cloud
-size.
+Examples use one CPU thread, except 07, which uses eight. Set `POLYSTEP_THREADS` to
+change the count. Examples 02, 04, 05, 06, 10, 11, 12 and 13 use CUDA when available.
+Example 05 uses BF16 on CUDA. Pass `--device cpu` to run these examples on the CPU.
+Example 03 runs on the CPU by default. It accepts `--device cuda` and skips its GIF
+with `--no-render`. Example 04 accepts `--small` for a 2,000-variable task.
+Example 12 accepts `--particles` to change the particle count.
 
 Example 10 trains in about 20 seconds on an RTX 5090. On one CPU thread its 40 default
 epochs take about an hour, so shorten a CPU run with `--epochs` and `--train-size`.
 
-For a short CPU check, I use:
+For short CPU checks, run:
 
 ```bash
 python examples/06_loihi_snn_polystep.py --device cpu --hidden 32 --num-steps 5 --max-train 1024 --max-test 256 --pretrain-epochs 1 --adapt-epochs 1
@@ -44,7 +44,7 @@ python examples/10_cnn_mnist.py --device cpu --epochs 2 --train-size 1000 --test
 python examples/11_transformer_selective_copy.py --device cpu --epochs 5 --train-size 512 --test-size 256
 ```
 
-These small budgets check execution; use the defaults to assess learning quality.
+These small budgets check execution. Use the defaults to assess learning quality.
 
 ## Data
 
@@ -71,16 +71,17 @@ one-state neuron uses subtractive reset, so it does not reproduce
 Examples 07 and 08 report the mean over five seeds. Their OpenAI-ES baselines use the
 noise scale and learning rate selected on 20 separate tuning seeds.
 
-Examples 07 to 09 measure the objective on the data used for optimization; those
-scores demonstrate fitting, not generalization. Their gradient baselines have a
-separate training-step budget. Example 08 reports sample standard deviations across
+Examples 07 to 09 measure the objective on the data used for optimization. These
+scores measure training fit and do not estimate generalization. Their gradient
+baselines have a separate training-step budget. Example 08 reports sample standard deviations across
 its five seeds.
 
 For published comparisons, see [experiments](../experiments/README.md).
 
-I ran the default budgets on an RTX 5090 with v1.1.1, Python 3.14 and PyTorch 2.13.
-Test accuracy reached 94.4% in example 05, 94.35% in example 10, and 100% on example
-11's synthetic copy task. Example 06 recovered 13.3 percentage points on
-shifted test inputs, while clean accuracy fell from 73.2% to 72.0%. These are the
-scripts' default seeds, not multi-seed estimates. The CPU CartPole run reached its
-200-step evaluation limit on all 32 episodes.
+I ran the default budgets on an RTX 5090 with v1.2.0, Python 3.12 and PyTorch 2.15.
+Test accuracy reached 94.5% in example 05, 94.20% in example 10, 100% on example 11's
+synthetic copy task, and 98.03% for example 13's ReLU MLP. Example 06 recovered 15.9
+percentage points on shifted test inputs, while clean accuracy went from 81.5% to
+80.8%; its sparse projection does not repeat bit for bit on CUDA, so those digits vary
+between runs. These are the scripts' default seeds, not multi-seed estimates. The CPU
+CartPole run reached its 200-step evaluation limit on all 32 episodes.

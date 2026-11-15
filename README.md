@@ -10,12 +10,12 @@ Gradient-free neural network training via optimal transport.
 
 Accepted at [Transactions on Machine Learning Research (TMLR)](https://openreview.net/forum?id=8mlcqTTMuU).
 
-PolyStep evaluates finite-radius parameter perturbations and updates parameters
-through a weighted barycenter. I use it for spiking networks, quantized layers, hard
-routing, and other models without useful gradients. For differentiable models,
+PolyStep tests parameter changes within a finite radius. It then updates the parameters
+using a weighted average of these candidates, called a barycenter. I use it for spiking
+networks, quantized layers, hard routing, and other models without useful gradients. For differentiable models,
 backpropagation is usually faster.
 
-Version 1.1.1. See the [changelog](CHANGELOG.md) for release changes.
+Version 1.2.0. See the [changelog](https://github.com/anindex/polystep/blob/main/CHANGELOG.md) for release changes.
 
 [Paper](https://arxiv.org/abs/2605.01928) ·
 [Interactive visualization](https://vietngth.github.io/polystep-visualization/) ·
@@ -24,21 +24,22 @@ Version 1.1.1. See the [changelog](CHANGELOG.md) for release changes.
 
 | One particle | Four particles, two minima |
 |:---:|:---:|
-| [<img src="docs/figures/polystep_particle.gif" width="440" alt="One particle probes an objective and moves toward its minimum through weighted barycentric steps.">](https://vietngth.github.io/polystep-visualization/) | [<img src="docs/figures/polystep_particles.gif" width="440" alt="Four particles probe a two-basin objective and move toward its minima through weighted barycentric steps.">](https://vietngth.github.io/polystep-visualization/) |
+| [<img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/polystep_particle.gif" width="440" alt="One particle probes an objective and moves toward its minimum through weighted barycentric steps.">](https://vietngth.github.io/polystep-visualization/) | [<img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/polystep_particles.gif" width="440" alt="Four particles probe a two-basin objective and move toward its minima through weighted barycentric steps.">](https://vietngth.github.io/polystep-visualization/) |
 
 Animations from [Viet T. Nguyen's interactive visualization](https://vietngth.github.io/polystep-visualization/).
 
 | Ackley | Rastrigin | Rosenbrock |
 |:---:|:---:|:---:|
-| <img src="docs/figures/gallery_ackley.gif" width="290" alt="100,000 particles start uniform over the Ackley function and contract onto its central minima."> | <img src="docs/figures/gallery_rastrigin.gif" width="290" alt="100,000 particles start uniform over the Rastrigin function and settle on its grid of minima."> | <img src="docs/figures/gallery_rosenbrock.gif" width="290" alt="100,000 particles start uniform over the Rosenbrock function and collect along its curved valley."> |
+| <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/gallery_ackley.gif" width="290" alt="100,000 particles start uniform over the Ackley function and contract onto its central minima."> | <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/gallery_rastrigin.gif" width="290" alt="100,000 particles start uniform over the Rastrigin function and settle on its grid of minima."> | <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/gallery_rosenbrock.gif" width="290" alt="100,000 particles start uniform over the Rosenbrock function and collect along its curved valley."> |
 | **Levy** | **Himmelblau** | **Eggholder** |
-| <img src="docs/figures/gallery_levy.gif" width="290" alt="100,000 particles start uniform over the Levy function and collapse onto its single minimum."> | <img src="docs/figures/gallery_himmelblau.gif" width="290" alt="100,000 particles start uniform over the Himmelblau function and split among its four minima."> | <img src="docs/figures/gallery_eggholder.gif" width="290" alt="100,000 particles start uniform over the Eggholder function, gather along its ridges and settle in its many local minima."> |
+| <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/gallery_levy.gif" width="290" alt="100,000 particles start uniform over the Levy function and collapse onto its single minimum."> | <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/gallery_himmelblau.gif" width="290" alt="100,000 particles start uniform over the Himmelblau function and split among its four minima."> | <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/gallery_eggholder.gif" width="290" alt="100,000 particles start uniform over the Eggholder function, gather along its ridges and settle in its many local minima."> |
 
-Each panel moves 100,000 particles with the batch solver, from function values alone.
-The glow is the particle density, a ring marks each global minimum, and the curve below
-is the mean cost above the optimum. A step takes 40 to 70 ms on one CPU thread and 6 to
-11 ms on an RTX 5090, where 1,000,000 particles take 7 to 13 ms. [`examples/12_particle_gallery.py`](examples/12_particle_gallery.py)
-draws them and takes `--particles` and `--device`.
+Each panel moves 100,000 particles using function values alone. The glow shows particle
+density. Rings mark the global minima, and the curve below shows the mean cost above
+the optimum. A step takes 40 to 70 ms on one CPU thread and 6 to 11 ms on an RTX 5090.
+On that GPU, 1,000,000 particles take 7 to 13 ms per step.
+[`examples/12_particle_gallery.py`](https://github.com/anindex/polystep/blob/main/examples/12_particle_gallery.py) draws the animations.
+Use `--particles` to set the particle count and `--device` to select the device.
 
 ## Installation
 
@@ -75,8 +76,8 @@ train(model, loader, nn.CrossEntropyLoss(), optimizer, TrainConfig(epochs=5))
 `max_subspace_dim=128` caps the search at 128 coordinates, so each step scores
 144 candidates. Biases and normalization weights keep their full width. On a larger
 model, the cap must cover those parameters plus at least one coordinate per weight
-matrix. If the cap is too small, PolyStep
-warns and reports the minimum dimension it can use.
+matrix. If the cap is too small, PolyStep warns and reports the minimum dimension it
+can use.
 
 `step_batch` uses the same candidate evaluation paths as `train()`:
 
@@ -92,6 +93,32 @@ models may benefit from more threads; `python -m polystep.benchmarks.threads` co
 several counts on an MLP workload. See
 [performance](https://github.com/anindex/polystep/blob/main/docs/performance.md)
 for candidate paths, thread counts, compilation, and memory settings.
+
+### Forward-pass gradients
+
+`ProbeGradient` estimates gradients for supported `nn.Linear` and `nn.Conv2d` layers
+from forward passes. It writes them to `.grad`, so a standard optimizer can update
+the weights:
+
+```python
+from polystep import ProbeGradient
+
+estimator = ProbeGradient(model, probes=64, probe_radius=0.1)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+loss_fn = nn.CrossEntropyLoss(reduction="none")
+for inputs, targets in loader:
+    estimator(inputs, targets, loss_fn=loss_fn)
+    optimizer.step()
+```
+
+For linear layers, it probes each sample's outputs. For convolutions, it probes weight
+entries. With a fixed probe budget, the number of forward passes does not grow with
+layer width. A sufficiently large probe can cross a hard threshold, which lets it train
+sign and spiking networks. On MNIST with an RTX 5090,
+[example 13](https://github.com/anindex/polystep/blob/main/examples/13_probe_gradient.py) reaches 98.0% test accuracy with a
+ReLU MLP in 3 s, 96.8% with sign activations in 3 s, and 97.1% with hard-threshold
+spiking neurons in 8 s. The loss must return one value per sample. See the
+[API reference](https://github.com/anindex/polystep/blob/main/docs/api_overview.md#probegradient).
 
 ### Ask/tell
 
@@ -130,12 +157,12 @@ inherit classical direct-search or trust-region guarantees.
 
 | SNN training | CartPole policy |
 |:---:|:---:|
-| <img src="docs/figures/polystep_snn_progress.gif" width="440" alt="Training loss and batch accuracy over 60 PolyStep updates of a spiking network with hard LIF thresholds."> | <img src="docs/figures/rl_cartpole_policy.gif" width="440" alt="A trained CartPole policy uses hard left/right actions to keep the pole upright."> |
+| <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/polystep_snn_progress.gif" width="440" alt="Training loss and batch accuracy over 60 PolyStep updates of a spiking network with hard LIF thresholds."> | <img src="https://raw.githubusercontent.com/anindex/polystep/main/docs/figures/rl_cartpole_policy.gif" width="440" alt="A trained CartPole policy uses hard left/right actions to keep the pole upright."> |
 
-The [SNN example](examples/02_snn_starter.py) trains a network with hard LIF spikes
+The [SNN example](https://github.com/anindex/polystep/blob/main/examples/02_snn_starter.py) trains a network with hard LIF spikes
 on four synthetic classes, without surrogate gradients.
 
-The [CartPole example](examples/03_rl_cartpole.py) uses real-valued weights and a
+The [CartPole example](https://github.com/anindex/polystep/blob/main/examples/03_rl_cartpole.py) uses real-valued weights and a
 hard left/right `argmax`. PolyStep optimizes episode return without gradients
 through the actions or simulator.
 
@@ -157,9 +184,9 @@ The paper runners match search spaces, budgets and tuning as the
 
 ## Benchmarks
 
-Five-seed mean ± sample standard deviation, with configurations and checkpoints
-selected on validation data; the probSAT and RC2 columns are single runs. Each
-baseline gets a matched evaluation or step budget, as the
+Results are means ± sample standard deviations over five seeds. Configurations and
+checkpoints are selected on validation data. The probSAT and RC2 columns are single
+runs. Each baseline uses a matched evaluation or step budget, as the
 [protocol](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md#protocol)
 describes. The tables were recorded before 1.0; the
 [reproducibility guide](https://github.com/anindex/polystep/blob/main/docs/reproducibility.md#changes-since-the-published-tables)
@@ -168,6 +195,7 @@ lists the rows that later releases change, and the
 has the full tables.
 
 <!-- BENCH:START -->
+
 ### Non-differentiable tasks
 
 Test accuracy %. A dash means the method was not run on that task.

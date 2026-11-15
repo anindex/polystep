@@ -10,7 +10,7 @@ pytest tests/ -q -n auto --maxprocesses=4
 ```
 
 Include a small regression test with each bug fix. Extend an existing case when it
-already covers the same path; avoid separate tests for trivial defaults, getters, or
+already covers the same path. Avoid separate tests for trivial defaults, getters, or
 repeated shapes. Keep public APIs typed. Comments should explain constraints,
 numerical choices, or non-obvious behavior.
 
@@ -30,9 +30,9 @@ tests use `ncpu - 8` threads, clamped to 2-16 and split across xdist workers, an
 download datasets. Keep downloads and training-quality checks in the slow suite;
 use synthetic inputs for unit tests.
 
-Tests importing `experiments/` or `examples/` must skip when that directory is absent,
-since both are excluded from distributions. Install `pip install -e ".[dev,experiments]"` to run
-tests that need optional experiment dependencies. Missing optional dependencies and
+Tests importing `experiments/` or `examples/` must skip when that directory is absent.
+Neither directory is included in distributions. Run `pip install -e ".[dev,experiments]"`
+to install optional experiment dependencies. Missing optional dependencies and
 unavailable hardware are valid reasons to skip a test; unsupported parameter pairs
 should not be collected. Tests run without automatic retries.
 
@@ -58,9 +58,10 @@ uvx twine check --strict dist/*
 Check the pinned action versions before each release. Dependabot is disabled.
 
 Push the release commit and tag `vX.Y.Z`. Run the full manual CI workflow on that
-commit. After it passes, publish the GitHub Release with the changelog entry as its
-notes. The release workflow checks the version, date, lint, metadata, and installed
-wheel before publishing. Only the publish job can request an OIDC token. It uses
+commit. After it passes, publish the GitHub Release with short notes on the code changes.
+Keep documentation edits out of the changelog. The release workflow checks the version,
+date, lint, metadata, and installed wheel before publishing. Only the publish job can
+request an OIDC token. It uses
 the `pypi` environment and PyPI Trusted Publishing.
 
 ## Issues

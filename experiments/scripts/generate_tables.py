@@ -148,7 +148,7 @@ def write_markdown(path, runs, full):
     head, rest = text.split(README_START, 1)
     _, tail = rest.split(README_END, 1)
     with open(path, "w") as f:
-        f.write(head + README_START + "\n" + markdown_tables(runs, full) + "\n" + README_END + tail)
+        f.write(head + README_START + "\n\n" + markdown_tables(runs, full) + "\n" + README_END + tail)
     print(f"wrote the benchmark tables in {path}")
 
 

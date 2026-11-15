@@ -22,8 +22,9 @@
 
 ## Search benchmarks
 
-The download-free suite in `scripts/bench_polytope.py` covers MLPs, CNNs, attention,
-spiking, hard routing, and quantization. It compares existing optimizer options with
+The suite in `scripts/bench_polytope.py` uses synthetic data and needs no downloads.
+It covers MLPs, CNNs, attention, spiking, hard routing, and quantization.
+It compares existing optimizer options with
 global-subspace, rank-two, momentum-subspace, and same-batch acceptance experiments.
 
 ```bash
@@ -36,8 +37,8 @@ selects checkpoints; the test split is scored once afterward. Acceptance evaluat
 count toward the candidate budget, and validation overhead counts toward wall time.
 These small synthetic tasks do not establish performance on the paper workloads.
 
-The experimental directions draw on [EGGROLL](https://arxiv.org/abs/2511.16652) and
-[MpSub](https://arxiv.org/abs/2609.07666); they are adaptations, not reproductions.
+The experimental directions adapt ideas from [EGGROLL](https://arxiv.org/abs/2511.16652)
+and [MpSub](https://arxiv.org/abs/2609.07666). They do not reproduce either method.
 
 ## Layout
 
@@ -45,7 +46,7 @@ The experimental directions draw on [EGGROLL](https://arxiv.org/abs/2511.16652) 
   and the model and data definitions.
 - `baselines/`: the Adam/SGD reference loop.
 - `scripts/`: tuning (`tune_*.py`), the grid launcher `run_revision.sh` and its
-  `check_grid_complete.py` gate, aggregation (`aggregate_*.py`, `generate_tables.py`),
+  `check_grid_complete.py` completeness check, aggregation (`aggregate_*.py`, `generate_tables.py`),
   the practical and diagnostic campaigns, and the forward and search benchmarks
   (`bench_*.py`).
 - `results/`: untracked output files.

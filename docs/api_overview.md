@@ -1,7 +1,7 @@
 # API reference
 
-I start with `step_batch` for supervised training. The Python snippets below build
-on the imports, model and data in the first example.
+Use `step_batch` for supervised training. The Python snippets below reuse the imports,
+model and data from the first example unless they define their own.
 
 ## Optimizer
 
@@ -27,7 +27,7 @@ optimizer.release_evaluator()
 
 `step_batch` creates an `NNCostEvaluator` for `loss_fn` and reuses it while you pass
 the same loss object. Create the loss once; pass a new object when its settings
-change. The [supported builtin losses](performance.md#candidate-evaluation) enable
+change. The [supported built-in losses](performance.md#candidate-evaluation) enable
 the batched-matmul and delta paths. Other callables use the site-local or vmap path.
 
 Each optimal-transport (OT) step scores the candidates, updates the model weights
@@ -87,11 +87,10 @@ factored paths require a single input tensor, as does `multifidelity_screen`.
 
 ### Custom closures
 
-`step(closure)` calls `closure(batched_params)` with a dictionary of parameters that
-hold one candidate per row and expects one loss per candidate; `step_batch` builds
-this closure for you. To set evaluator options such as `chunk_size`, `use_inplace` or
-`compile_vmap`, build the evaluator yourself, register every batch and step with the
-closure `register_evaluator` returns:
+`step(closure)` calls `closure(batched_params)` with a parameter dictionary that holds
+one candidate per row. The closure must return one loss per candidate. `step_batch`
+builds this closure for you. To set `chunk_size`, `use_inplace` or `compile_vmap`, build
+the evaluator yourself. Register every batch, then pass the returned closure to `step`:
 
 ```python
 from polystep import NNCostEvaluator
@@ -170,7 +169,7 @@ config = TrainConfig(
 train(model, loader, nn.CrossEntropyLoss(), optimizer, config)
 ```
 
-A tensor, or a one-element tuple, is the input alone. A longer tuple or list ends with
+A tensor, or a one-element tuple or list, is the input alone. A longer tuple or list ends with
 the target and passes everything before it to the model as positional arguments, so
 `(x, y)` and `(ids, mask, y)` both work. A dict passes its entries to the model as
 keyword arguments, except `labels`, which becomes the target; a dict without `labels`
@@ -370,7 +369,7 @@ A registered batch of 2 samples screens on 1 even at `screen_fidelity=0.1`.
 
 ## Custom layers
 
-Batched paths accept supported builtin layers and explicit custom contracts:
+Batched paths accept supported built-in layers and explicit custom contracts:
 
 ```python
 class Staircase(nn.Module):
@@ -399,6 +398,82 @@ lstm = VmapSafeLSTM(input_size=128, hidden_size=256, num_layers=2)
 
 Use these when native layers lack vmap support. Both require batch-first inputs;
 see [unsupported options](../LIMITATIONS.md#attention-and-recurrent-layers).
+
+## ProbeGradient
+
+`ProbeGradient` estimates gradients from forward passes. Calling it on a batch writes
+`.grad` for the trainable weights and biases of supported `nn.Linear` and `nn.Conv2d`
+layers. It returns the mean loss. Use a `torch.optim` optimizer to update the weights
+and a standard scheduler to control its learning rate:
+
+```python
+from polystep import ProbeGradient
+
+estimator = ProbeGradient(model, probes=64, probe_radius=0.1, seed=0)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+loss_fn = nn.CrossEntropyLoss(reduction="none")
+for inputs, targets in loader:
+    loss = estimator(inputs, targets, loss_fn=loss_fn)
+    optimizer.step()
+```
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `probes` | `64` | Output units, or convolution weight entries, that each sample probes per layer |
+| `probe_radius` | `0.1` | Probe distance as a fraction of the layer's output RMS, or weight RMS for a convolution |
+| `seed` | `None` | Seed for the choice of probed units; unseeded, it is drawn from the global generator |
+| `max_probe_batch` | `32768` | Samples a probe forward aims to stay under; more probes run in chunks |
+
+For a layer `z = W x + b`, each sample moves `probes` of its own output units by
+`+radius` and `-radius`. The central difference of that sample's loss is the gradient
+with respect to those units, and its outer product with the layer input is the weight
+gradient. With `probes` at least the number of units the frame is complete and the
+result is the finite-radius gradient. At a small radius it approximates the backpropagated
+gradient; the tests check this to five digits on MLP, convolutional, sequence, residual,
+recurrent and tied-weight models. With fewer probes each sample draws its own units and
+the estimate is scaled by `units / probes`. That keeps it unbiased, and its per-sample
+variance grows as `(units - probes) / probes`.
+
+The estimator reduces forward work in three ways:
+
+- The probed layer's output is expanded to one copy per vertex inside the forward, so
+  the preceding layers run once.
+- The last layer is probed on the recorded outputs, so only the loss is evaluated again.
+- A convolution is probed through single weight entries per sample. Its weights are
+  shared over positions, so they are far fewer than its outputs.
+
+The first call checks the first two shortcuts for every layer, at the probe radius,
+against the model run on repeated inputs. A layer where they differ, such as one under
+a residual connection, a state tensor sized from the input or a reshape to the input's
+batch size, reruns the whole model on repeated inputs from then on. So does a layer
+whose expanded forward fails later, for example when the batch size changes.
+
+A linear layer called several times in one forward, such as in a recurrent cell,
+treats each call as additional output units. These calls may differ in shape.
+Each estimator call clears `.grad` on trainable linear and convolutional weights and
+biases before writing the estimates. Skipped layers and layers that the forward did
+not reach keep `.grad=None`. Parameters outside these layers retain their gradients.
+A layer with a frozen weight can still receive a gradient for its trainable bias.
+
+The estimate needs each sample's loss to depend on that sample alone. The first call
+tests this for every layer: it moves the outputs of a random half of the batch and
+warns if any other sample's loss changes, which happens when the forward or the loss
+mixes samples. The test runs once per layer and cannot see coupling confined to the
+samples it moved.
+
+Set `probe_radius` for the model. `0.1` suits smooth activations. A hard threshold needs
+a radius wide enough to cross it: example 13 uses `0.3` for sign units and `0.5` for
+spiking neurons. A layer whose outputs are all zero, such as a zero-initialized head,
+and a convolution whose weights are all zero are probed at `probe_radius` itself. Raise
+`probes` toward the layer width when the later layers are fast to evaluate. The example
+uses a complete frame of 128 for its MLPs and 64 sampled probes per layer for LeNet-5.
+
+Use `PolyStepOptimizer` when the loss does not decompose over samples, when the
+parameters are outside the supported layers, or when the objective is a black box. The
+estimator is node perturbation (Werfel, Xie and Seung, 2005) with antithetic
+axis-aligned probes at a finite radius, and per-sample weight perturbation for
+convolutions. See [measurements](performance.md#probegradient) and
+[limits](../LIMITATIONS.md#probegradient).
 
 ## Ask/tell
 
@@ -460,6 +535,21 @@ The checkpoint also restores `candidate_evals`. Reproducible continuation requir
 the same objective and environment. Checkpoints can move between CPU and CUDA.
 When a seeded checkpoint crosses devices, loading keeps the new optimizer's
 generator and warns because the two generator types cannot share state.
+
+## Upgrading from 1.1.1
+
+Version 1.2.0 adds `ProbeGradient` and keeps the public APIs, optimizer defaults and
+checkpoint format 6. Three behaviors change:
+
+- Sinkhorn builds its plan with the arithmetic of its convergence check, so a converged
+  flag holds for the plan it returns in FP32. Seeded Sinkhorn runs can differ in the
+  last digits. A warm start is bounded by the cost plus the epsilon-scaled log marginals
+  instead of the cost alone.
+- An unseeded `HybridSubspace` or `FactoredSubspace` under an unseeded optimizer takes
+  its seed from the global generator, where it used to draw the same basis on every
+  run. Checkpoints store that seed.
+- The trust region predicts with the measured curvature, and `update_trust_region` sums
+  a vector of predicted improvements instead of averaging it.
 
 ## Upgrading from 1.1.0
 

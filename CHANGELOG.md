@@ -1,13 +1,26 @@
 # Changelog
 
+## 1.2.0 - 2026-11-15
+
+- Add `ProbeGradient` for forward-pass gradient estimates in linear and convolutional
+  layers, with updates through `torch.optim`.
+- Fix Sinkhorn convergence reporting and warm starts, and trust-region predictions
+  from measured losses.
+- Fix subspace seeds, checkpoint continuation, FP64 bases, and dtype resynchronization.
+- Restore changed model buffers and respect forward hooks, weight transforms, and
+  evaluator resets. Enable single-tensor evaluation paths for one-element tuples.
+- Speed up sparse CPU projections, CUDA warm solves, and inference-buffer restoration.
+  Limit geometry compilation to CUDA.
+
+Seeded results can change. See [upgrade notes](docs/api_overview.md#upgrading-from-111).
+
 ## 1.1.1 - 2026-10-27
 
 - Fix transport for tiny and zero masses, including warm starts, and prevent
   overflow in FP32 cost scaling.
 - Make RL INT8 scoring consistent and compatible with vmap; speed up batched
   policy evaluation.
-- Restrict example 06 to simulation and update the examples and guides.
-- Update CI actions, reduce scheduled runs, check release dates, and remove Dependabot.
+- Restrict example 06 to simulation.
 
 ## 1.1.0 - 2026-10-24
 
@@ -21,7 +34,6 @@
   cannot batch a model, including stock `nn.LSTM`.
 - Fix small-radius gradients, KL support, marginal diagnostics, subspace rotation,
   half-precision rounding, screening, and amortized schedules.
-- Update example settings and metrics; add SNN and CartPole animations.
 
 ### Upgrade notes
 
@@ -51,7 +63,7 @@ changes. Seeded results can differ; see
 - Fix state restoration, nonfinite costs, tiny transport rows, half-precision
   evaluation, deterministic sparse CUDA projections, and baseline accounting.
 - Reuse forward work, reduce projection memory and synchronization, and compile
-  Sinkhorn loops. Update all 11 examples and validate the built wheel.
+  Sinkhorn loops.
 
 ## 0.13.0 - 2026-09-22
 
@@ -67,7 +79,7 @@ changes. Seeded results can differ; see
   to format 5.
 - Reuse MLP prefixes, use native CPU attention, and compile site-local evaluation.
 - Average tied baseline ranks; add controlled experiments and forward benchmarks.
-- Validate sparse dimensions and factored ranks; simplify documentation.
+- Validate sparse dimensions and factored ranks.
 
 ## 0.11.0 - 2026-08-14
 
@@ -134,12 +146,12 @@ changes. Seeded results can differ; see
 ## 0.3.0 - 2026-05-27
 
 - Reduce GPU synchronization in solvers and blockwise updates.
-- Fix CMA rotation forwarding and API examples.
+- Fix CMA rotation forwarding.
 
 ## 0.2.2 - 2026-05-21
 
 - Use unit-radius vertex generators with keyword-only `radius`.
-- Fix CMA transport weighting and stale API examples.
+- Fix CMA transport weighting.
 
 ## 0.2.1 - 2026-05-14
 

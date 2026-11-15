@@ -1,9 +1,9 @@
 # Experiment results
 
 Architecture results use seeds 42, 123, 456, 789, and 1337, with validation-selected
-configurations and checkpoints. Entries are five-seed means ± sample standard
-deviation, except the probSAT and RC2 columns, which are single runs; the
-[protocol](../docs/reproducibility.md#protocol) gives the budget each method gets.
+configurations and checkpoints. Entries are means ± sample standard deviations over
+five seeds. The probSAT and RC2 columns are single runs. The
+[protocol](../docs/reproducibility.md#protocol) gives each method's budget.
 
 These tables record runs made before 1.0. Later changes to the optimizer and
 experiment runners affect the results; see
@@ -13,6 +13,7 @@ before comparing a new run with them.
 ## Results
 
 <!-- BENCH:START -->
+
 ### Non-differentiable tasks
 
 Test accuracy %. A dash means the method was not run on that task.

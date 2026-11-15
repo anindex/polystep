@@ -7,7 +7,7 @@ build, and the experiment dependencies:
 pip install -e ".[experiments,rl]"
 ```
 
-`rl` adds stable-baselines3 for the PPO and DQN arms. `run_revision.sh` uses
+`rl` adds stable-baselines3 for the PPO and DQN baselines. `run_revision.sh` uses
 `.venv/bin/python`; set `PY` to use another interpreter.
 
 Record hardware, package and PyTorch versions, seeds, and selected configurations
@@ -30,10 +30,10 @@ Population methods (OpenAI-ES, CMA-ES, EGGROLL) get PolyStep's candidate-evaluat
 budget. SPSA, MeZO and random search, which score at most two candidates per step, get
 its step count.
 
-On argmax attention, hard MoE and ETTh1, the population methods instead
-get 32 evaluations per PolyStep step, spent at their own population size, so their
-step counts differ from PolyStep's. Adam trains for PolyStep's 30 epochs there, except
-on ETTh1, where it trains for 50.
+On argmax attention, hard MoE and ETTh1, population methods receive 32 evaluations
+per PolyStep step. They use their own population sizes, so their step counts differ
+from PolyStep's. Adam trains for 30 epochs, the same as PolyStep, except on ETTh1,
+where Adam trains for 50.
 
 On MAX-SAT, CMA-ES and OpenAI-ES get 50 evaluations
 per PolyStep step. OpenAI-ES scores 50 candidates at each of PolyStep's steps; CMA-ES
@@ -48,8 +48,8 @@ PolyStep, Adam, persistence, MAX-SAT and RL records carry none.
 
 The fair EGGROLL rows search the `A` coordinates of a `FactoredSubspace` whose `B` is
 drawn once, because the baselines never rotate their subspace. EGGROLL's rank-1 noise
-therefore stays in one r-dimensional row space per layer for the whole run. Published
-EGGROLL redraws both factors each generation.
+therefore stays in one r-dimensional row space per layer for the whole run, where r
+is the factor rank. Published EGGROLL redraws both factors each generation.
 
 `--theory-mode` runs the unaccelerated reference configuration: jittered probe and
 step radii, independent rotations, flat epsilon, a decaying step radius, orthoplex
@@ -131,10 +131,9 @@ See [determinism](determinism.md),
 
 ## Changes since the published tables
 
-The tables in the README and the experiment index, and the RL and variant-sweep
-results, were recorded before 1.0. Fixes to the harness and the library since then
-affect the comparisons below. Current runs should not be expected to reproduce those
-historical numbers:
+The README tables, experiment index, RL results, and variant-sweep results were
+recorded before 1.0. Later fixes to the experiment runners and library affect these
+comparisons. Current runs can differ from the historical results:
 
 - Random search scores the incumbent and the candidate on the same minibatch, two
   evaluations per step. The published column compared each candidate with the
@@ -156,6 +155,9 @@ historical numbers:
   well: it never ran the screen and repeated the baseline. The sweep's
   `block_x_repr`/`per_layer_hybrid` arm runs the Sinkhorn solver instead of softmax,
   so that row changes too.
+- Version 1.2.0 changes Sinkhorn plans in the last digits. Unseeded Hybrid and Factored
+  bases follow the global generator, and trust-region predictions use measured
+  curvature. These changes affect seeded runs of those configurations.
 - The surviving `quadratic/trust_region`, `trust_x_quad/trust_quad_k3`,
   `quadratic/biased_rotation`, and `quadratic/newton` sweep arms change as well. The
   trust region applies its new radius on the step that measured the ratio instead of

@@ -1,13 +1,14 @@
 # Performance
 
-A step usually scores `P * V * K` candidates, where `P` is the particle count, `V`
-the vertices per particle and `K` the probe radii per vertex.
-Each particle holds `d` coordinates, `particle_dim` (default 2) in full space or
-`subspace_particle_dim` (default 8) with a subspace. The simplex has `d + 1`
-vertices, the orthoplex `2d`, and the cube `2^d`. The README quickstart searches 128
-coordinates, so at the default `num_probe=1` a step scores 16 particles times the 9
-simplex vertices, 144 candidates. The quadratic model adds one shared incumbent
-evaluation when `biased_rotation` or `trust_region` uses it.
+A step usually scores `P * V * K` candidates. Here, `P` is the particle count,
+`V` is the number of vertices per particle, and `K` is the number of probe radii per
+vertex. Each particle holds `d` coordinates: `particle_dim` (default 2) in full space
+or `subspace_particle_dim` (default 8) with a subspace. The simplex has `d + 1`
+vertices, the orthoplex `2d`, and the cube `2^d`.
+
+The README quickstart searches 128 coordinates. With `num_probe=1`, each step scores
+16 particles times 9 simplex vertices, or 144 candidates. The quadratic model adds one
+shared incumbent evaluation when `biased_rotation` or `trust_region` uses it.
 
 ## Quick checklist
 
@@ -31,15 +32,16 @@ evaluation when `biased_rotation` or `trust_region` uses it.
 | Models too large for batched weight copies | In-place parameter swaps | Automatic on CUDA when eight weight copies would take more than half the free memory; `NNCostEvaluator(..., use_inplace=True)` forces it |
 | Convolution nets on CPU with large activation maps | In-place parameter swaps | Opt-in with `NNCostEvaluator(model, loss_fn, use_inplace=True)`; time a few steps both ways |
 
-Here, a Linear MLP means an `nn.Sequential` or a custom forward that chains Linear
-layers, common activations and optional `x.flatten(1)` calls. Each call feeds the next.
+Here, "Linear MLP" means a multilayer perceptron built from `nn.Linear` layers,
+common activations and optional `x.flatten(1)` calls. An `nn.Sequential` or a custom
+forward can define the chain. Each call feeds the next.
 Activations may be modules or functions such as `torch.relu` and `F.gelu` with default
 arguments. Hooks, buffers, residual connections and other operations keep a custom
 forward on the site-local or vmap path. Tied weights, such as an output layer that
 reuses the embedding table, keep the site-local path too: a candidate for the tied
 weight reaches every module that reads it.
 
-The Linear MLP paths need a builtin loss: `nn.CrossEntropyLoss`, `nn.MSELoss` or
+The Linear MLP paths need a built-in loss: `nn.CrossEntropyLoss`, `nn.MSELoss` or
 `nn.L1Loss` with mean reduction, or `F.cross_entropy`, `F.mse_loss` or `F.l1_loss`.
 Cross-entropy may carry class weights, `ignore_index` and label smoothing. Any other
 loss, including a lambda that calls one of these, takes the site-local or vmap path.
@@ -55,7 +57,7 @@ applied per token to `(batch, tokens, features)` inputs takes the site-local pat
 instead in full-space and hybrid runs; factored runs materialize its candidates.
 
 Delta paths reuse base activations within each candidate sweep. Reuse applies to
-supported builtin layers and ends before the next batch or fidelity level. Custom
+supported built-in layers and ends before the next batch or fidelity level. Custom
 layers can declare the contracts in the [API reference](api_overview.md#custom-layers).
 
 Dense MLP evaluation also shares activations until the first changed layer when
@@ -115,8 +117,8 @@ FP32 losses can still differ in their last bits.
 Intercepting a call costs about 3 microseconds on one CPU thread, roughly the cost of
 150,000 multiply-adds in a batched matmul. Injection runs when
 `chunk_candidates * batch_size * weight_elements >= 150000 * (forward_calls + 30)`.
-Without `chunk_size`, the chunk includes all candidates; scalar inputs use batch size
-1. The extra 30 calls account for setup.
+Without `chunk_size`, the chunk includes all candidates. Scalar inputs use a batch
+size of 1. The extra 30 calls account for setup.
 
 The evaluator uses the call count from the previous forward on this path. On first
 use, the parity check measures it and selects reconstructed weights if injection
@@ -182,6 +184,11 @@ but restrict the search. Retune the radii when changing the representation.
 Random basis rotation is optional for `HybridSubspace`. Set `rotation_mode="random"`
 with a positive `rotation_interval` to use it. On MNIST MLPs it measured between
 no change and 4.8 points more test accuracy, at up to 1.7x the step time.
+
+A layer above `sparse_threshold_bytes` gets sparse signed columns. On the CPU the
+subspace-delta path scores a chunk of them with one sparse matrix product. On a
+784-128-10 MLP at rank 8 and batch 512, whose first layer is sparse, this took a
+step from about 3.1 s to 1.1 s on one thread. CUDA keeps the gather and scatter.
 
 ### FactoredSubspace
 
@@ -290,7 +297,7 @@ A particle that straddles two parameters gets its own chunk. With `HybridSubspac
 FP32 or FP64 weights and no in-place evaluator, this chunk builds only the parameters
 the particle moves. It adds the touched projection columns to the incumbent and
 passes other parameters as expanded views. The vmap forward then runs the layers
-ahead of the first moved parameter once. Otherwise the
+before the first moved parameter once. Otherwise the
 chunk falls back to materialization, in batches of at most `chunk_size`. So does the
 padded particle at the end of the CPU offsets, or of a per-layer or grouped block
 other than the last. On the delta and site-local paths the padded last particle stays
@@ -308,11 +315,11 @@ monolithic step.
 The [API reference](api_overview.md#evaluation-controls) lists the compilation and
 autocast options. Measure compilation separately from steady-state execution. Each
 site compiles independently and falls back to eager execution on compilation failure.
-Profiler output confirms whether a compiled region actually ran. PyTorch's
+Profiler output confirms whether a compiled region ran. PyTorch's
 recompilation limit can cause later calls to run eagerly.
 
 On CUDA the site-local path replays its forward from CUDA graphs unless the evaluator
-or the optimizer gets `compile_forward=False`. Each parameter, chunk shape and batch
+or the optimizer receives `compile_forward=False`. Each parameter, chunk shape and batch
 shape runs eagerly once, is captured on its second call and replays after that, up to
 64 graphs. This helps launch-bound models: on an RTX 5090 example 11 steps about 1.7
 times faster, while LeNet-5 in example 10 is unchanged. The graphs share one memory
@@ -335,7 +342,7 @@ attention, including every candidate batch scored under vmap, uses explicit matm
 because the fused CUDA kernel fails under vmap once candidates times batch reaches
 65,536.
 
-FP16 and BF16 solver costs accumulate in FP32. The builtin cross-entropy, MSE and L1
+FP16 and BF16 solver costs accumulate in FP32. The built-in cross-entropy, MSE and L1
 losses, as modules or `torch.nn.functional` calls, also reduce half-precision
 candidate outputs in FP32, whether they come from an FP16/BF16 model or from
 `candidate_autocast`. A cross-entropy with class weights does so only on the Linear
@@ -398,28 +405,54 @@ device, shapes, and backend selection.
 
 ## INT8 policy evaluation
 
-Version 1.1.1 removes host scalar checks from the RL INT8 activation. This lets
-`NNCostEvaluator` batch these policies with vmap. Previously they fell back to one
-forward per candidate. For a 4-64-2 `NonDiffMLPPolicy`, 64 candidates, batch 32,
-cross-entropy and `compile_forward=False`, warm evaluation times were:
+The RL INT8 activation makes no host scalar checks, so `NNCostEvaluator` batches
+these policies with vmap. With such checks an evaluator falls back to one forward per
+candidate. For a 4-64-2 `NonDiffMLPPolicy`, 64 candidates, batch 32, cross-entropy and
+`compile_forward=False`, warm evaluation times were:
 
-| Device | 1.1.0 | 1.1.1 |
+| Device | One forward per candidate | vmap |
 |---|---:|---:|
 | CPU, one thread | 2.36 ms | 0.36 ms |
 | RTX 5090 | 148.87 ms | 0.35 ms |
 
 These are averages of two run medians under PyTorch 2.13, with run order reversed.
-The baseline is commit `353db52`, which reports version 1.1.0.
+The per-candidate column is commit `353db52`, the last one with the host checks.
 Each run used three warmup calls and at least two seconds of timing with
 `torch.utils.benchmark.Timer`. Seed 42 and perturbation seed 42 were fixed; candidate
 noise had standard deviation 0.1. Both paths matched individual policy forwards.
 
-The stacked rollout evaluator already batched its candidates. Its fused affine
-operation reduced a CPU tanh-policy rollout from 361 ms to 141 ms at hidden width
-128, 256 candidates, 16 rollouts each and horizon 200. Smaller tanh policies changed
-little. Matching the public INT8 policy's scale floor and nonfinite handling added
-about 7-17% to the smaller CPU INT8 rollouts tested. The vmap timing above does not
-predict the speed of every RL workload.
+The stacked rollout evaluator batches its candidates too. Its fused affine operation
+took a CPU tanh-policy rollout from 361 ms to 141 ms at hidden width 128, 256
+candidates, 16 rollouts each and horizon 200. Smaller tanh policies changed little.
+Matching the public INT8 policy's scale floor and nonfinite handling added about 7-17%
+to the smaller CPU INT8 rollouts tested. The vmap timing above does not predict the
+speed of every RL workload.
+
+## ProbeGradient
+
+`ProbeGradient` probes linear-layer outputs and convolutional weight entries. With a
+fixed probe budget, the number of forward passes does not grow with layer width.
+I measured [example 13](../examples/13_probe_gradient.py) on an RTX 5090
+that other jobs were using, with three seeds, full MNIST, and test accuracy at the
+validation-selected checkpoint:
+
+| Model | Probes | Radius | Test accuracy | Time |
+|---|---:|---:|---|---:|
+| ReLU MLP 784-128-10 | 128 | 0.1 | 98.03%, 98.03%, 97.97% | 3 s |
+| Sign MLP 784-128-10 | 128 | 0.3 | 96.79%, 96.77%, 96.90% | 3 s |
+| Spiking 784-128-10, 8 steps | 128 | 0.5 | 97.09%, 97.00%, 97.16% | 8 s |
+| LeNet-5 | 64 | 0.1 | 98.27%, 98.53%, 97.68% | 14 s |
+
+For comparison, the `HybridSubspace` examples reached 94.3% to 94.9% in 20 to 30 s
+(example 05, the same ReLU MLP) and 94.2% to 95.7% in 33 to 56 s (example 10, LeNet-5)
+on the same GPU in the same session. One step of the ReLU MLP took about 1.2 ms at batch
+512: a recorded forward, four probe forwards of the 128-unit layer's suffix, and a probe
+of the last layer on the recorded outputs.
+
+A complete frame costs little when the layers after the probed one are small, as in an
+MLP. With 16 probes in place of 128, the same MLP was still near 96% after 10 s of
+training. LeNet-5 spends its time in the first convolution, whose probes rerun the rest
+of the network.
 
 ## CPU threads
 
@@ -443,7 +476,7 @@ spinning; the experiment runners set it.
 
 ## Benchmarks
 
-I run one timing job at a time from the repository root:
+Run one timing job at a time from the repository root:
 
 ```bash
 PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --profile
@@ -453,8 +486,9 @@ PYTHONPATH=src:. python experiments/scripts/bench_forward_backends.py --compile 
 ```
 
 Use `--device cuda` for GPU measurements and `--output` to keep separate result files.
-Forward benchmarks check loss parity and report cold time, median, IQR, and executed
-operators. GPU peak allocation is measured; CPU allocation is left unreported. The
+Forward benchmarks check loss parity and report cold time, median, interquartile range
+(IQR), and executed operators. They measure GPU peak allocation but do not report CPU
+allocation. The
 [search benchmarks](../experiments/README.md#search-benchmarks) measure search
 quality rather than speed.
 

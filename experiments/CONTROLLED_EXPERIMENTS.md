@@ -1,9 +1,10 @@
 # Controlled hard-LIF comparison
 
-Four weighting rules share the same hard-LIF MNIST model, orthoplex probes, dense QR
-basis, and natural displacement update. Each rule uses 27 configurations, three
-tuning seeds, and ten final seeds. Configuration and checkpoint selection use
-validation data only.
+Four weighting rules use the same MNIST model with hard leaky integrate-and-fire
+(LIF) thresholds. They share orthoplex probes, a dense basis from QR factorization,
+and the natural displacement update. Each rule uses 27 configurations, three tuning
+seeds, and ten final seeds. Configuration and checkpoint selection use validation
+data only.
 
 | Rule | Test accuracy, mean ± sample SD |
 |---|---:|
@@ -12,10 +13,11 @@ validation data only.
 | Exponential rank | 78.415 ± 10.096% |
 | Greedy | 75.887 ± 9.267% |
 
-All 40 final runs have finite results. Unadjusted paired sign-flip tests reject none
-of the three softmax comparisons at 5%. This does not establish equivalence. These
-tests belong to a prespecified 16-contrast family; aggregation reports which
-contrasts are incomplete. The table has not been rerun for v1.1.1.
+All 40 final runs have finite results. Unadjusted paired sign-flip tests find no
+significant difference in the three softmax comparisons at the 5% level.
+This does not establish equivalence. These tests belong to a prespecified
+16-contrast family; aggregation reports which
+contrasts are incomplete. The table has not been rerun for v1.2.0.
 
 ## Reproduction
 
@@ -55,9 +57,9 @@ is tuned on three seeds at two million evaluations or 12 minutes. The selected o
 runs on ten final seeds at ten million evaluations or one hour.
 
 The diagnostics and practical campaign require CUDA. Both wait silently until all 23
-arms in `ARMS` (`run_controlled.py`) have a selected configuration and ten final seeds.
-The first command below completes those arms, reusing compatible records from the
-four-arm comparison above. The practical campaign also waits for the diagnostics to
+variants in `ARMS` (`run_controlled.py`) have a selected configuration and ten final seeds.
+The first command below completes those variants, reusing compatible records from the
+four-rule comparison above. The practical campaign also waits for the diagnostics to
 finish. It writes under `experiments/results/controlled/practical` and reruns
 `aggregate_practical` after each comparison. The DVS Gesture task reads frames that
 `controlled_data.py` builds from

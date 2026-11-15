@@ -1,9 +1,9 @@
 # Determinism
 
-I record the package version, configuration, device, software build, and CPU thread
+Record the package version, configuration, device, software build, and CPU thread
 count with each result. A seed alone does not guarantee identical results across
 systems or releases. Fused operations can round differently even when they implement
-the same formula; a changed sign or action can then alter the rest of a trajectory.
+the same formula. A changed sign or action can then alter the rest of a trajectory.
 
 CPU QR factorizations run on one thread when `rows * cols**2 < 1e8`.
 Larger subspace bases (adaptive, hybrid, factored) use the whole intra-op pool, so
@@ -30,9 +30,10 @@ Sparse projections need deterministic algorithms to repeat on CUDA. Otherwise,
 their CSR products and scatter-adds sum in the order the threads finish.
 Two hybrid or adaptive runs with a sparse projection can therefore differ in the
 last bit, at FP32 as well as BF16. A `HybridSubspace` gives a layer sparse columns
-once its dense basis would pass `sparse_threshold_bytes` (1 GB), which a 784x128 layer at rank 8 already
-does. With deterministic algorithms enabled, the projection runs as a sparse batched
-product with a fixed summation order, in FP32 for FP16 and BF16 parameters. It keeps a
+once its dense basis would exceed `sparse_threshold_bytes` (1 GB). A 784x128 layer at
+rank 8 already exceeds this threshold. With deterministic algorithms enabled, the
+projection runs as a sparse batched product with a fixed summation order, in FP32 for
+FP16 and BF16 parameters. It keeps a
 COO copy of the matrix at 24 bytes per stored entry: about 55 MB for a projection
 with 100,352 rows and 7,296 columns. On an RTX 5090 that product takes about 7 ms for
 608 candidates, against 1.2 ms for the CSR product.
@@ -44,7 +45,8 @@ reflections for larger batches. Both sample Haar rotations but consume different
 random streams. Changing the particle count or device can change the sequence.
 
 `PolyStepES` with a `seed` draws from its own generator. Without one it draws from
-PyTorch's global RNG, so `torch.manual_seed` before construction reproduces the run.
+PyTorch's global random number generator (RNG). Call `torch.manual_seed` before
+construction to reproduce the run in the same environment.
 
 Dense subspace bases depend on the device as well as the seed. A dense
 `AdaptiveSubspace` samples its bases on its generator's device, so a seeded CUDA run
@@ -56,7 +58,15 @@ own seeded CPU generator and skip the QR, so every device gets the same projecti
 `HybridSubspace` and `FactoredSubspace` seed each layer's basis with a CRC-32 hash of
 the subspace seed, the parameter name and the step. A subspace built without a `seed`
 takes the optimizer's seed, so each seed in a sweep searches its own basis, and the
-optimizer keeps that seeded copy in `optimizer.subspace`.
+optimizer keeps that seeded copy in `optimizer.subspace`. When the optimizer has no
+seed either, the subspace draws one from PyTorch's global RNG, so `torch.manual_seed`
+before construction reproduces the basis.
+
+`ProbeGradient` with a `seed` draws its probed units from its own generator on the
+model's device. Without one it takes a seed from the global RNG at construction. On
+CUDA its convolution estimate adds the per-sample slopes with a scatter-add, so two
+seeded runs of a convolutional model can differ in the last bit unless deterministic
+algorithms are enabled. Linear layers repeat either way.
 
 Under vmap, a stochastic forward draws separate random numbers for each candidate.
 Its random stream differs from a run that falls back to sequential evaluation; see
