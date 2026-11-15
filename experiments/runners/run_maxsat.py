@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 """Run the MAX-SAT benchmark: polystep vs CMA-ES, OpenAI-ES, RC2, SLS, probSAT.
 
-Random 3-SAT instances at scaling variable counts. All methods share the
-sigmoid+CRA relaxation; ES budgets are step-matched (polystep_steps * popsize).
-Results are saved as experiments/results/revision/maxsat_{method}_{seed}.json.
+Random 3-SAT instances at scaling variable counts, the same instance for every
+method. PolyStep and the evolution strategies optimize a sigmoid relaxation of the
+assignment, with ES budgets step-matched (polystep_steps * popsize); RC2, SLS and
+probSAT work on the clauses. Results are saved as
+experiments/results/revision/maxsat_{num_vars}v_{method}_{seed}.json.
 """
 
 from __future__ import annotations

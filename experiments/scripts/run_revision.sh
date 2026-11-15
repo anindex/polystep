@@ -15,8 +15,8 @@ if [ "$stale" -gt 0 ] && [ "${ALLOW_STALE:-0}" != "1" ]; then
   echo "refusing to launch: $OUT already holds $stale result file(s)." >&2
   echo "archive them first:" >&2
   echo "  mv $OUT $OUT.\$(date +%F-%H%M)" >&2
-  echo "(or set ALLOW_STALE=1 to run anyway; every job below passes --force, so" >&2
-  echo " existing cells will be overwritten rather than skipped)" >&2
+  echo "(or set ALLOW_STALE=1 to run anyway; every job below except the RL ones passes" >&2
+  echo " --force, so existing cells are overwritten and only RL skips the ones it finds)" >&2
   exit 1
 fi
 

@@ -84,12 +84,12 @@ def main():
         ),
     )
     if all(arm in summaries for arm in ARMS[:20]):
-        plot(records, summaries)
+        plot(records)
         endpoint_plot(summaries, contrasts)
     print(f"Completed variants: {len(summaries)}/{len(ARMS)}")
 
 
-def plot(records, summaries):
+def plot(records):
     import matplotlib
 
     matplotlib.use("Agg")

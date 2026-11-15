@@ -35,34 +35,12 @@ import torch.nn as nn
 from torch.utils.data import random_split
 
 from polystep import PolyStepOptimizer
-from polystep.cost_nn import NNCostEvaluator
 from polystep.epsilon import CosineEpsilon
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.transform import ParamLayout
 
-from _mnist_data import get_mnist_tensors
-
-
-class LeNet5(nn.Module):
-    """LeCun et al. 1998, with ReLU and max-pool. 61,706 parameters.
-
-    A plain ``nn.Module`` with its own ``forward``, handled by the site-aware path.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.c1 = nn.Conv2d(1, 6, 5, padding=2)  # 1 @ 28x28 -> 6 @ 28x28
-        self.c3 = nn.Conv2d(6, 16, 5)  # 6 @ 14x14 -> 16 @ 10x10
-        self.f5 = nn.Linear(16 * 5 * 5, 120)
-        self.f6 = nn.Linear(120, 84)
-        self.out = nn.Linear(84, 10)
-
-    def forward(self, x):
-        pool = nn.functional.max_pool2d
-        x = pool(torch.relu(self.c1(x)), 2)
-        x = pool(torch.relu(self.c3(x)), 2)
-        x = torch.relu(self.f5(x.flatten(1)))
-        return self.out(torch.relu(self.f6(x)))
+from _mnist_data import LeNet5, get_mnist_tensors
+from _site_paths import compare_paths, run_epoch
 
 
 def build_optimizer(model: nn.Module, total_steps: int, seed: int, amortize_steps: int = 5) -> PolyStepOptimizer:
@@ -87,17 +65,6 @@ def build_optimizer(model: nn.Module, total_steps: int, seed: int, amortize_step
     )
 
 
-def run_epoch(optimizer, loss_fn, x, y, batch_size):
-    order = torch.randperm(x.shape[0])
-    total, batches = 0.0, 0
-    for start in range(0, x.shape[0], batch_size):
-        idx = order[start : start + batch_size]
-        xb, yb = x[idx], y[idx]
-        total += optimizer.step_batch(xb, yb, loss_fn=loss_fn)
-        batches += 1
-    return total / max(batches, 1)
-
-
 @torch.no_grad()
 def accuracy(model, x, y, batch_size=512):
     correct = 0
@@ -105,37 +72,6 @@ def accuracy(model, x, y, batch_size=512):
         logits = model(x[start : start + batch_size])
         correct += (logits.argmax(-1) == y[start : start + batch_size]).sum().item()
     return 100.0 * correct / x.shape[0]
-
-
-def compare_paths(x, y, device, batch_size, steps=2):
-    """Time and cross-check the two evaluation paths on the same batches."""
-    results = {}
-    for register in (False, True):
-        torch.manual_seed(0)
-        model = LeNet5().to(device)
-        evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
-        optimizer = build_optimizer(model, total_steps=steps, seed=3, amortize_steps=1)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        started = time.perf_counter()
-        losses = []
-        for i in range(steps):
-            start = (i * batch_size) % len(x)
-            xb, yb = x[start : start + batch_size], y[start : start + batch_size]
-            if register:
-                optimizer.register_evaluator(evaluator, xb, yb)
-            losses.append(optimizer.step(lambda p, _x=xb, _y=yb: evaluator.evaluate(p, _x, _y)))
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        results["site" if register else "materializing"] = (losses, time.perf_counter() - started)
-
-    dense_losses, dense_time = results["materializing"]
-    site_losses, site_time = results["site"]
-    torch.testing.assert_close(torch.tensor(site_losses), torch.tensor(dense_losses), rtol=1e-4, atol=1e-5)
-    drift = max(abs(a - b) for a, b in zip(dense_losses, site_losses))
-    print(f"  materializing : {dense_time:6.2f} s for {steps} steps")
-    print(f"  site-aware    : {site_time:6.2f} s for {steps} steps   ({dense_time / site_time:.1f}x)")
-    print(f"  max loss difference between the two: {drift:.2e}")
 
 
 def main():
@@ -161,7 +97,15 @@ def main():
 
     if args.compare:
         print("\nSame batches, same seed, both paths:\n")
-        compare_paths(train_x, train_y, device, args.batch_size)
+        compare_paths(
+            LeNet5,
+            lambda model: build_optimizer(model, total_steps=2, seed=3, amortize_steps=1),
+            train_x,
+            train_y,
+            device,
+            args.batch_size,
+            steps=2,
+        )
         return
 
     train, val = random_split(range(len(train_x)), [0.9, 0.1], generator=torch.Generator().manual_seed(args.seed))

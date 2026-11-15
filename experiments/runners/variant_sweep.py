@@ -38,6 +38,7 @@ from polystep.hybrid_subspace import HybridSubspace
 from polystep.objectives.synthetic import Ackley, Rastrigin, Rosenbrock, Sphere
 from polystep.transform import ParamLayout
 
+from experiments.runners.common import SEEDS
 from experiments.runners.fairness import (
     TUNING_GRID,
     evals_per_step,
@@ -47,7 +48,6 @@ from experiments.runners.fairness import (
     tuning_cost,
 )
 
-SEEDS = [42, 123, 456, 789, 1337]
 DEFAULT_RESULTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "results",

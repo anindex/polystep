@@ -23,8 +23,7 @@ import _env
 _env.setup()
 
 from polystep import PolyStepES
-
-from _openai_es import OpenAIES, run
+from polystep.baselines import Objective, openai_es
 
 HIDDEN = 8
 GENERATIONS = 200
@@ -106,10 +105,18 @@ def solve_seed(seed):
     dim = param_dim()
     x0 = 0.5 * torch.randn(dim, generator=torch.Generator().manual_seed(seed + 100))
 
+    def fit(flat):
+        return f1_error(flat, X, y)
+
     ps = PolyStepES(dim, num_particles=1, epsilon=0.05, step_radius=1.5, x0=x0, seed=seed)
-    es = OpenAIES(dim, popsize=ps.popsize, x0=x0, sigma=0.25, lr=0.5, seed=seed)
-    ps_curve = run(ps, lambda f: f1_error(f, X, y), GENERATIONS)
-    es_curve = run(es, lambda f: f1_error(f, X, y), GENERATIONS)
+    ps_curve = []
+    for _ in range(GENERATIONS):
+        ps.tell(fit(ps.ask()))
+        ps_curve.append(100.0 * (1.0 - ps.best_fitness))
+    popsize = ps.popsize + ps.popsize % 2
+    budget = Objective(fit, dim=dim, budget=GENERATIONS * popsize)
+    es = openai_es(budget, x0, sigma=0.25, lr=0.5, popsize=popsize, shaping="zscore", seed=seed)
+    es_curve = [100.0 * (1.0 - loss) for _, loss in es.history]
     adam_f1 = adam_ste_f1(X, y, seed=seed)
     return ps_curve, es_curve, adam_f1, ps.popsize
 

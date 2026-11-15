@@ -80,11 +80,7 @@ class GPT2TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
         self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         seq_len = x.shape[1]
 
         causal_mask = torch.triu(
@@ -150,7 +146,7 @@ class GPT2Small(nn.Module):
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
 
         for layer in self.layers:
-            x = layer(x, attention_mask=attention_mask)
+            x = layer(x)
 
         x = self.layer_norm(x)
 

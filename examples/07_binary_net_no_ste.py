@@ -22,9 +22,8 @@ import _env
 _env.setup(default_threads=8)
 
 from polystep import PolyStepES
+from polystep.baselines import Objective, openai_es
 from polystep.epsilon import CosineEpsilon
-
-from _openai_es import OpenAIES, run
 
 HIDDEN = 32
 GENERATIONS = 200
@@ -84,8 +83,10 @@ def solve_task(X, y, seed):
         ps.step_radius = radius.at(t)
         ps.tell(fit(ps.ask()))
         ps_curve.append(100.0 * (1.0 - ps.best_fitness))
-    es = OpenAIES(D, popsize=ps.popsize, x0=x0, sigma=0.1, lr=0.03, seed=seed)
-    return ps_curve, run(es, fit, GENERATIONS), ps.popsize
+    popsize = ps.popsize + ps.popsize % 2
+    budget = Objective(fit, dim=D, budget=GENERATIONS * popsize)
+    es = openai_es(budget, x0, sigma=0.1, lr=0.03, popsize=popsize, shaping="zscore", seed=seed)
+    return ps_curve, [100.0 * (1.0 - loss) for _, loss in es.history], ps.popsize
 
 
 def main():

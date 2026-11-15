@@ -27,7 +27,7 @@ from torch.utils.data import random_split
 
 from polystep import ProbeGradient
 
-from _mnist_data import get_mnist_tensors
+from _mnist_data import LeNet5, get_mnist_tensors
 
 
 class Sign(nn.Module):
@@ -54,19 +54,6 @@ class Spiking(nn.Module):
         return out / self.steps
 
 
-class LeNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.c1, self.c3 = nn.Conv2d(1, 6, 5, padding=2), nn.Conv2d(6, 16, 5)
-        self.f5, self.f6, self.out = nn.Linear(400, 120), nn.Linear(120, 84), nn.Linear(84, 10)
-
-    def forward(self, x):
-        pool = nn.functional.max_pool2d
-        x = pool(torch.relu(self.c1(x)), 2)
-        x = pool(torch.relu(self.c3(x)), 2)
-        return self.out(torch.relu(self.f6(torch.relu(self.f5(x.flatten(1))))))
-
-
 MODELS = {
     "mlp": (
         lambda: nn.Sequential(nn.Flatten(), nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, 10)),
@@ -85,7 +72,7 @@ MODELS = {
         20,
     ),
     "spiking": (Spiking, 128, 0.5, 0.1, 512, 15),
-    "lenet": (LeNet, 64, 0.1, 0.05, 256, 4),
+    "lenet": (LeNet5, 64, 0.1, 0.05, 256, 4),
 }
 
 

@@ -1,7 +1,7 @@
 """11 - Transformer on selective copy: attention trained with forward passes only.
 
 Each sequence is six tokens; the first is a pointer ``p``, and the label is the
-token at position ``p``. The attention head learns to retrieve that token.
+token at position ``p``. The attention layer learns to retrieve that token.
 
 As in example 10, the site-aware path applies: a candidate perturbs one
 contiguous run of the flat parameter vector, so exactly one parameter tensor
@@ -32,10 +32,11 @@ _env.setup()
 import torch.nn as nn
 
 from polystep import PolyStepOptimizer
-from polystep.cost_nn import NNCostEvaluator
 from polystep.hybrid_subspace import HybridSubspace
 from polystep.layers import VmapSafeMultiHeadAttention
 from polystep.transform import ParamLayout
+
+from _site_paths import compare_paths, run_epoch
 
 SEQ_LEN = 6
 NUM_CLASSES = 8
@@ -52,11 +53,11 @@ def make_batch(n: int, seed: int):
 
 
 class SelectiveCopyTransformer(nn.Module):
-    """Embedding, one attention head, one feed-forward, read out at position 0."""
+    """Embedding, one attention layer with two heads, one feed-forward, read out at position 0."""
 
     def __init__(self, d_model: int = 16, n_heads: int = 2, d_ff: int = 32):
         super().__init__()
-        self.embed = nn.Embedding(NUM_CLASSES + SEQ_LEN, d_model)
+        self.embed = nn.Embedding(NUM_CLASSES, d_model)
         self.pos = nn.Parameter(torch.zeros(SEQ_LEN, d_model))
         self.attn = VmapSafeMultiHeadAttention(d_model, n_heads)
         self.ff1 = nn.Linear(d_model, d_ff)
@@ -90,51 +91,9 @@ def build_optimizer(model: nn.Module, seed: int, amortize_steps: int = 5) -> Pol
     )
 
 
-def run_epoch(optimizer, loss_fn, x, y, batch_size):
-    order = torch.randperm(x.shape[0])
-    total, batches = 0.0, 0
-    for start in range(0, x.shape[0], batch_size):
-        idx = order[start : start + batch_size]
-        xb, yb = x[idx], y[idx]
-        total += optimizer.step_batch(xb, yb, loss_fn=loss_fn)
-        batches += 1
-    return total / max(batches, 1)
-
-
 @torch.no_grad()
 def accuracy(model, x, y):
     return 100.0 * (model(x).argmax(-1) == y).float().mean().item()
-
-
-def compare_paths(x, y, device, batch_size, steps=6):
-    """Time and cross-check the two paths on the same batches."""
-    results = {}
-    for register in (False, True):
-        torch.manual_seed(0)
-        model = SelectiveCopyTransformer().to(device)
-        evaluator = NNCostEvaluator(model, loss_fn=nn.CrossEntropyLoss())
-        optimizer = build_optimizer(model, seed=3, amortize_steps=1)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        started = time.perf_counter()
-        losses = []
-        for i in range(steps):
-            start = (i * batch_size) % len(x)
-            xb, yb = x[start : start + batch_size], y[start : start + batch_size]
-            if register:
-                optimizer.register_evaluator(evaluator, xb, yb)
-            losses.append(optimizer.step(lambda p, _x=xb, _y=yb: evaluator.evaluate(p, _x, _y)))
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        results["site" if register else "materializing"] = (losses, time.perf_counter() - started)
-
-    dense_losses, dense_time = results["materializing"]
-    site_losses, site_time = results["site"]
-    torch.testing.assert_close(torch.tensor(site_losses), torch.tensor(dense_losses), rtol=1e-4, atol=1e-5)
-    drift = max(abs(a - b) for a, b in zip(dense_losses, site_losses))
-    print(f"  materializing : {dense_time:6.2f} s for {steps} steps")
-    print(f"  site-aware    : {site_time:6.2f} s for {steps} steps   ({dense_time / site_time:.1f}x)")
-    print(f"  max loss difference between the two: {drift:.2e}")
 
 
 def main():
@@ -161,7 +120,15 @@ def main():
 
     if args.compare:
         print("\nSame batches, same seed, both paths:\n")
-        compare_paths(train_x, train_y, device, args.batch_size)
+        compare_paths(
+            SelectiveCopyTransformer,
+            lambda model: build_optimizer(model, seed=3, amortize_steps=1),
+            train_x,
+            train_y,
+            device,
+            args.batch_size,
+            steps=6,
+        )
         return
 
     model = SelectiveCopyTransformer().to(device)

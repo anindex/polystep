@@ -21,8 +21,7 @@ import _env
 _env.setup()
 
 from polystep import PolyStepES
-
-from _openai_es import OpenAIES
+from polystep.baselines import Objective, openai_es, spsa
 
 DEPTH = 4  # complete binary tree: 15 internal nodes, 16 leaves
 TOTAL_EVALS = 40_000  # matched forward-pass budget for the gradient-free methods
@@ -80,43 +79,10 @@ def hard_error(flat, X, y, depth=DEPTH):
     return (pred.float() != y[None, :]).float().mean(dim=1)
 
 
-class SPSA:
-    """SPSA ask/tell (Spall, 1992): a two-point Rademacher gradient estimate with
-    decaying gain sequences a_k and c_k."""
-
-    def __init__(self, dim, x0, a=0.2, c=0.2, alpha=0.602, gamma=0.101, seed=0):
-        self.dim = dim
-        self.theta = x0.clone()
-        self.a, self.c, self.alpha, self.gamma = a, c, alpha, gamma
-        self.k = 0
-        self.generator = torch.Generator().manual_seed(seed)
-        self._delta = None
-        self._ck = None
-        self.best_fitness = float("inf")
-
-    def ask(self):
-        self._ck = self.c / (self.k + 1) ** self.gamma
-        self._delta = (torch.randint(0, 2, (self.dim,), generator=self.generator) * 2 - 1).float()
-        return torch.stack([self.theta + self._ck * self._delta, self.theta - self._ck * self._delta])
-
-    def tell(self, fitness):
-        self.best_fitness = min(self.best_fitness, fitness.min().item())
-        ak = self.a / (self.k + 1 + 10) ** self.alpha
-        ghat = (fitness[0] - fitness[1]) / (2.0 * self._ck * self._delta)
-        self.theta = self.theta - ak * ghat
-        self.k += 1
-
-
-def run_to_budget(opt, fit_fn, popsize, budget=TOTAL_EVALS):
-    """Run ask/tell until the forward-pass budget is spent; return (evals, best-acc)."""
-    evals, curve = [], []
-    used = 0
-    while used + popsize <= budget:
-        opt.tell(fit_fn(opt.ask()))
-        used += popsize
-        evals.append(used)
-        curve.append(100.0 * (1.0 - opt.best_fitness))
-    return evals, curve
+def curve(result):
+    """Forward evaluations and best accuracy so far of a baseline run, ending at its last evaluation."""
+    points = result.history + [(result.evals, result.best_loss)]
+    return [evals for evals, _ in points], [100.0 * (1.0 - loss) for _, loss in points]
 
 
 def adam_soft_tree(X, y, depth=DEPTH, steps=800, temp=0.2, seed=0):
@@ -156,21 +122,25 @@ def solve(X, y, seed=0):
     D = param_dim(X.shape[1])
     x0 = 0.3 * torch.randn(D, generator=torch.Generator().manual_seed(1))
     ps = PolyStepES(D, num_particles=1, epsilon=0.02, step_radius=1.5, x0=x0, seed=seed)
-    es = OpenAIES(D, popsize=ps.popsize, x0=x0, sigma=0.3, lr=0.15, seed=seed)
-    spsa = SPSA(D, x0=x0, seed=seed)
 
     def fit(flat):
         return hard_error(flat, X, y)
 
-    ps_evals, ps_curve = run_to_budget(ps, fit, ps.popsize)
-    es_evals, es_curve = run_to_budget(es, fit, es.popsize)
-    spsa_evals, spsa_curve = run_to_budget(spsa, fit, 2)
-    adam_hard = adam_soft_tree(X, y)
+    ps_evals, ps_curve = [], []
+    for used in range(ps.popsize, TOTAL_EVALS + 1, ps.popsize):
+        ps.tell(fit(ps.ask()))
+        ps_evals.append(used)
+        ps_curve.append(100.0 * (1.0 - ps.best_fitness))
+    popsize = ps.popsize + ps.popsize % 2
+    es = openai_es(
+        Objective(fit, dim=D, budget=TOTAL_EVALS), x0, sigma=0.3, lr=0.15, popsize=popsize, shaping="zscore", seed=seed
+    )
+    spsa_run = spsa(Objective(fit, dim=D, budget=TOTAL_EVALS), x0, a=0.2, c=0.2, A=10, seed=seed)
     return {
         "PolyStep": (ps_evals, ps_curve),
-        "OpenAI-ES": (es_evals, es_curve),
-        "SPSA": (spsa_evals, spsa_curve),
-        "Adam (soft, hardened)": adam_hard,
+        "OpenAI-ES": curve(es),
+        "SPSA": curve(spsa_run),
+        "Adam (soft, hardened)": adam_soft_tree(X, y),
     }
 
 

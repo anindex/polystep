@@ -195,7 +195,6 @@ class DiscreteAttention(nn.Module):
         super().__init__()
         self.keys = nn.Parameter(torch.randn(num_slots, dim) * 0.5)
         self.values = nn.Linear(dim, dim)
-        self.num_slots = num_slots
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, dim)
@@ -206,7 +205,7 @@ class DiscreteAttention(nn.Module):
 
 
 class StaircaseActivation(nn.Module):
-    """Piecewise-constant staircase: floor(sigmoid(x) * levels) / levels. Gradient zero everywhere."""
+    """Piecewise-constant staircase: floor(sigmoid(x) * levels) / levels. Gradient zero between steps, undefined at them."""
 
     polystep_elementwise = True  # coordinatewise, no state: the batched paths accept it
 
@@ -483,7 +482,6 @@ class SmoothAttention(nn.Module):
         super().__init__()
         self.keys = nn.Parameter(torch.randn(num_slots, dim) * 0.5)
         self.values = nn.Linear(dim, dim)
-        self.num_slots = num_slots
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, dim)
