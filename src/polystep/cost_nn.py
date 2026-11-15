@@ -659,7 +659,7 @@ class NNCostEvaluator:
                 if v is not None and t._version == v and i not in self._unversioned_writes:
                     continue
                 overlaps = t.layout == torch.strided and torch._debug_has_internal_overlap(t) == 1
-                if (v is None or overlaps) and torch.equal(t, c):
+                if overlaps and torch.equal(t, c):
                     continue
                 if t.shape != c.shape:
                     t.resize_(c.shape)
@@ -2470,6 +2470,15 @@ class SubspaceDeltaEvaluator:
             rows, vals = P.columns(cols, x.device, x.dtype)  # (real, nnz)
             out_idx = torch.div(rows, d_in, rounding_mode="floor")  # (real, nnz)
             in_idx = rows.remainder(d_in)
+            if x.device.type == "cpu":
+                stacked = out_idx + d_out * torch.arange(real, device=x.device).unsqueeze(1)
+                M = torch.sparse_coo_tensor(
+                    torch.stack([stacked.reshape(-1), in_idx.reshape(-1)]),
+                    vals.reshape(-1),
+                    (n_cols * d_out, d_in),
+                    check_invariants=False,
+                )
+                return torch.sparse.mm(M, x.t().contiguous()).view(n_cols, d_out, x.shape[0])
             contrib = x.index_select(1, in_idx.reshape(-1)).reshape(x.shape[0], real, -1)
             contrib = contrib.permute(1, 2, 0) * vals.unsqueeze(-1)  # (real, nnz, B)
             g = torch.zeros(n_cols, d_out, x.shape[0], device=x.device, dtype=x.dtype)

@@ -223,7 +223,6 @@ class SinkhornSolver:
                 _divergence_patience = 3
                 # Latch the back-off so the adaptive estimator cannot re-raise omega in the same check.
                 _omega_capped = False
-                early = None
 
                 def dual_objective(fv, gv):
                     # True Sinkhorn Lyapunov; valid off the marginal constraint, unlike <f,a>+<g,b> alone.
@@ -308,7 +307,11 @@ class SinkhornSolver:
 
                     check_due = (i + 1) % self.check_every == 0 or i == self.max_iterations - 1
                     if warm and i == 1 and omega == 1.0 and not check_due:
-                        early = (f, g, torch.linalg.vector_norm(f - f_new, float("inf")))
+                        step = torch.linalg.vector_norm(f - f_new, float("inf")).item() / eps
+                        if step < math.log1p(self.threshold):
+                            n_iters, converged = 1, True
+                            errors.append(math.expm1(step))
+                            break
                     f, g = f_new, g_new
                     n_iters = i + 1
 
@@ -319,20 +322,9 @@ class SinkhornSolver:
                         err_b_t = (torch.logsumexp(log_P, dim=0) - log_b).expm1().abs().amax()
 
                         # Batch all scalar measurements into one transfer; a dual's max is nonfinite exactly when the dual is.
-                        scalars = [err_a_t, err_b_t, f.abs().max(), g.abs().max(), cost_max]
-                        err_a, err_b, f_max, g_max, c_max, *early_norm = torch.stack(
-                            scalars if early is None else [*scalars, early[2]]
+                        err_a, err_b, f_max, g_max, c_max = torch.stack(
+                            [err_a_t, err_b_t, f.abs().max(), g.abs().max(), cost_max]
                         ).tolist()
-                    if early is not None and (
-                        check_due or (i == 1 and (not f.is_cuda or torch.cuda.current_stream(f.device).query()))
-                    ):
-                        step = (early_norm[0] if check_due else early[2].item()) / eps
-                        if step < math.log1p(self.threshold):
-                            f, g, n_iters, converged = early[0], early[1], 1, True
-                            errors.append(math.expm1(step))
-                            break
-                        early = None
-                    if check_due:
                         if not (math.isfinite(f_max) and math.isfinite(g_max)):
                             f.zero_()
                             g.zero_()
