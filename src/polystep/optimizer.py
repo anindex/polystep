@@ -635,6 +635,7 @@ class PolyStepOptimizer(SerializationMixin):
             model_device = next(model.parameters()).device
         except StopIteration:
             raise ValueError("Model has no trainable parameters. PolyStepOptimizer requires at least one parameter.")
+        compile = compile and model_device.type == "cuda"
 
         num_params = sum(p.numel() for p in model.parameters())
         self._actual_projection_type = _select_projection_type(

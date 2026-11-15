@@ -506,11 +506,6 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
                 _span = ((chunk_start // group) * pdim, ((chunk_end - 1) // group) * pdim + pdim) if group else None
                 _owner = _sparse_delta if _sparse_delta is not None else _site_vmap
                 _site = _owner.resolve_site(_offsets, pdim, _span)
-                if _site is None and _sparse_delta is not None and _site_vmap is not None:
-                    # Sparse-delta is confined to Linear layers; vmap shares the graph
-                    # ahead of any entry.
-                    _owner = _site_vmap
-                    _site = _site_vmap.resolve_site(_offsets, pdim, _span)
             if _site is not None:
                 _local_idx = _offsets[::_cand].unsqueeze(1) + _pdim_arange - _site.offset
                 _values = probe_src[i_idx, v_idx, k_idx].reshape(chunk_size_actual // _cand, _cand, pdim)

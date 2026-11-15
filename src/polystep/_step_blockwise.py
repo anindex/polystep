@@ -316,21 +316,16 @@ def step_blockwise(opt, closure: Callable) -> float:
                 g0, g1 = chunk_start // group, chunk_end // group
                 offsets = base + D * torch.arange(g0, g1, device=device)
                 span = (base + g0 * D, base + g1 * D)
-                owner = site_owner
-                site = owner.resolve_site(offsets, D, span)
-                if site is None and site_vmap is not None and owner is not site_vmap:
-                    # The sparse-delta correction is confined to Linear layers; vmap shares the graph ahead of any entry.
-                    owner = site_vmap
-                    site = owner.resolve_site(offsets, D, span)
+                site = site_owner.resolve_site(offsets, D, span)
                 if site is not None:
-                    losses[chunk_start:chunk_end] = owner.evaluate(
+                    losses[chunk_start:chunk_end] = site_owner.evaluate(
                         base_sd,
-                        site if owner is site_vmap else site.key,
+                        site if site_owner is site_vmap else site.key,
                         (offsets - site.offset).unsqueeze(1) + pdim_arange,
                         candidates[chunk_start:chunk_end].reshape(g1 - g0, group, D),
                         fused_inputs,
                         fused_targets,
-                        **({} if owner is site_vmap else {"base": base}),
+                        **({} if site_owner is site_vmap else {"base": base}),
                     ).to(losses.dtype)
                     continue
 

@@ -197,3 +197,16 @@ def test_fused_softmax_offset_row_stays_finite():
     X_new, transport = _fused_softmax_project(C, 1e-45, verts, rot, 0.1, torch.zeros(2, 2))
     assert torch.isfinite(transport).all()
     assert torch.isfinite(X_new).all()
+
+
+def test_cpu_model_compile_ignores_host_cuda(monkeypatch):
+    """``compile`` targets CUDA kernels, so a CPU model behaves the same on a host that has a GPU."""
+    from torch import nn
+
+    from polystep import PolyStepOptimizer
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    opt = PolyStepOptimizer(nn.Linear(2, 1), compile=True, solver="sinkhorn", seed=1)
+
+    assert opt._compiled.compile is False
+    assert opt.solver._compiled.compile is False

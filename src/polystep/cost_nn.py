@@ -1851,7 +1851,7 @@ class SiteVmapEvaluator:
             if evaluator.per_sample:
                 return None
             return SiteInplaceEvaluator(evaluator, layout)
-        if evaluator._vmap_failed or evaluator._inplace_forced:
+        if evaluator._vmap_failed:
             return None
         return cls(evaluator, layout)
 
