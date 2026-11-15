@@ -28,7 +28,7 @@ def test_exp_plan_matches_finite_plain_exp():
     f, g = torch.randn(4), torch.randn(5)
     C = torch.rand(4, 5)
     ref = torch.exp((f.unsqueeze(1) + g.unsqueeze(0) - C) / 0.1)
-    torch.testing.assert_close(exp_plan(f, g, C, 0.1), ref)
+    torch.testing.assert_close(exp_plan(f, g, C, 0.1), ref, rtol=1e-4, atol=0)
 
 
 def test_diverged_sinkhorn_duals_keep_plan_finite():

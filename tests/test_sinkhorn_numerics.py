@@ -370,3 +370,43 @@ def test_narrow_finite_spread_keeps_sinkhorn_marginals(mode, spread):
     assert result.converged
     torch.testing.assert_close(result.matrix.sum(dim=1), torch.full((3,), 1 / 3))
     torch.testing.assert_close(result.matrix.sum(dim=0), torch.full((2,), 0.5))
+
+
+@pytest.mark.parametrize("epsilon", [1e-3, 1e-2])
+def test_fp32_converged_flag_matches_plan(epsilon):
+    """The flag is measured on the returned plan, rows and columns, so it cannot pass on a rounding of another form."""
+    threshold = 3e-5
+    for seed in range(8):
+        torch.manual_seed(seed)
+        cost = torch.rand(7 + seed, 9 + 2 * seed)
+        result = SinkhornSolver(epsilon=epsilon, max_iterations=6000, threshold=threshold).solve(cost)
+        plan = result.matrix
+        error = max(
+            (plan.sum(1) * plan.shape[0] - 1).abs().max().item(), (plan.sum(0) * plan.shape[1] - 1).abs().max().item()
+        )
+        assert not result.converged or error < 1.05 * threshold
+
+
+def test_warm_start_kept_at_large_epsilon():
+    """Optimal duals carry ``eps * log`` marginal terms, so a cost-scaled clamp would discard a valid warm start."""
+    torch.manual_seed(3)
+    cost = torch.rand(8, 12, dtype=torch.float64) * 0.01
+    a = torch.arange(1.0, 9, dtype=torch.float64)
+    b = torch.arange(1.0, 13, dtype=torch.float64).square()
+    solver = SinkhornSolver(10.0, threshold=1e-10, check_every=10)
+    first = solver.solve(cost, a / a.sum(), b / b.sum())
+    again = solver.solve(cost, a / a.sum(), b / b.sum(), first.f, first.g)
+
+    assert first.f.abs().max() > 10 * cost.max()
+    assert again.converged and again.n_iters == 1
+
+
+def test_gauge_shifted_warm_start_converges_at_once():
+    """``(f + c, g - c)`` is the same plan, so it must warm-start as well as ``(f, g)``."""
+    torch.manual_seed(0)
+    cost = torch.rand(4, 4, dtype=torch.float64)
+    solver = SinkhornSolver(epsilon=0.1, threshold=1e-10, check_every=1, max_iterations=500)
+    exact = SinkhornSolver(epsilon=0.1, threshold=1e-12, check_every=1).solve(cost)
+    shifted = solver.solve(cost, init_f=exact.f + 15.0, init_g=exact.g - 15.0)
+
+    assert shifted.converged and shifted.n_iters <= 2

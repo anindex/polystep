@@ -118,7 +118,7 @@ def _solve_block(opt, state, block_idx, losses, P, V, K, block_X, verts, rot_mat
         ):
             ppf, ppg = state._prev_prev_block_duals[block_idx]
             if ppf is not None and ppg is not None:
-                # The solver bounds any warm start it is handed by 10 * max|C_scaled|.
+                # The solver resets a non-finite warm start, so no clamp is needed here.
                 init_f = init_f + opt._dual_momentum_beta * (init_f - ppf)
                 init_g = init_g + opt._dual_momentum_beta * (init_g - ppg)
 

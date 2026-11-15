@@ -156,16 +156,14 @@ class SinkhornSolver:
         log_K = -cost_matrix / eps
         log_a, log_b = a.log(), b.log()
 
-        # Dual potentials scale with the cost magnitude, not epsilon. Kept on-device to avoid a sync per solve.
-        clamp_scale = cost_matrix.abs().max().clamp(min=1e-6)
-        max_abs_dual = 10.0 * clamp_scale
-        # Reset a non-finite warm start to zero, else clamp to the cost-scaled bound. Kept device-side to avoid a host sync.
+        cost_max = cost_matrix.abs().max()
+        # Reset a non-finite warm start to zero. Kept device-side to avoid a host sync.
         finite = torch.isfinite(f).all() & torch.isfinite(g).all()
-        f = torch.where(finite, f.clamp(-max_abs_dual, max_abs_dual), torch.zeros_like(f))
-        g = torch.where(finite, g.clamp(-max_abs_dual, max_abs_dual), torch.zeros_like(g))
+        f = torch.where(finite, f, torch.zeros_like(f))
+        g = torch.where(finite, g, torch.zeros_like(g))
 
         # Gauge f -> f + c, g -> g - c leaves the plan unchanged; the half-difference
-        # balances magnitudes so the clamp holds. Subtracting each mean independently is
+        # balances the two magnitudes. Subtracting each mean independently is
         # NOT a gauge and perturbs the iterate under overrelaxation.
         c = 0.5 * (g.mean() - f.mean())
         f = f + c
@@ -316,15 +314,12 @@ class SinkhornSolver:
 
                     # Batch all scalars into one device->host transfer; always check the last iteration or ProgressiveEpsilon inflates epsilon.
                     if check_due:
-                        log_P_row = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
-                        err_a_t = (torch.logsumexp(log_P_row, dim=1) - log_a).expm1().abs().amax()
-                        if omega != 1.0 or self.anderson_depth > 0 or self.adaptive_omega:
-                            err_b_t = (torch.logsumexp(log_P_row, dim=0) - log_b).expm1().abs().amax()
-                        else:
-                            err_b_t = err_a_t
+                        log_P = f.unsqueeze(1) / eps + log_K + g.unsqueeze(0) / eps
+                        err_a_t = (torch.logsumexp(log_P, dim=1) - log_a).expm1().abs().amax()
+                        err_b_t = (torch.logsumexp(log_P, dim=0) - log_b).expm1().abs().amax()
 
                         # Batch all scalar measurements into one transfer; a dual's max is nonfinite exactly when the dual is.
-                        scalars = [err_a_t, err_b_t, f.abs().max(), g.abs().max(), clamp_scale]
+                        scalars = [err_a_t, err_b_t, f.abs().max(), g.abs().max(), cost_max]
                         err_a, err_b, f_max, g_max, c_max, *early_norm = torch.stack(
                             scalars if early is None else [*scalars, early[2]]
                         ).tolist()

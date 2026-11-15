@@ -114,10 +114,12 @@ def sanitize_cost(cost_matrix: torch.Tensor) -> torch.Tensor:
 def exp_plan(f: torch.Tensor, g: torch.Tensor, C: torch.Tensor, eps: float) -> torch.Tensor:
     """``P_ij = exp((f_i + g_j - C_ij) / eps)`` that cannot overflow to ``inf``.
 
-    Exact wherever the plain exp was finite. The clamp binds only after the duals
-    diverge, where inf/inf in the barycentric projection would give NaN parameters.
+    Each term is divided before the sum, as in Sinkhorn's convergence check, so the
+    plan carries exactly the marginal error that check measured and duals near the
+    dtype limit do not overflow. The clamp binds only after the duals diverge, where
+    inf/inf in the barycentric projection would give NaN parameters.
     """
-    log_P = (f.unsqueeze(1) + g.unsqueeze(0) - C) / eps
+    log_P = f.unsqueeze(1) / eps - C / eps + g.unsqueeze(0) / eps
     # -1 for headroom: exp(log(finfo.max)) rounds back up to inf.
     return torch.exp(log_P.clamp(max=math.log(torch.finfo(log_P.dtype).max) - 1.0))
 
