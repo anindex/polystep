@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: false
       - run: uvx ruff@0.15.13 check .
@@ -48,25 +48,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           prune-cache: true
           cache-dependency-glob: pyproject.toml
           cache-suffix: py${{ matrix.python-version }}
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
           python-version: ${{ matrix.python-version }}
+          activate-environment: true
       - name: Install and test
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
           if [ "$PYTHON_VERSION" = "3.11" ]; then
-            uv pip install --system -e ".[dev]" 'torch==2.8.*'
+            uv pip install -e ".[dev]" 'torch==2.8.*'
           elif [ "$PYTHON_VERSION" = "3.13" ]; then
-            uv pip install --system -e ".[dev,experiments]"
+            uv pip install -e ".[dev,experiments]"
           else
-            uv pip install --system -e ".[dev]"
+            uv pip install -e ".[dev]"
           fi
           if [ "$PYTHON_VERSION" = "3.12" ]; then
             pytest -q -rs -n auto --maxprocesses=4 --cov=polystep --cov-report=term-missing
@@ -82,17 +81,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           prune-cache: true
           cache-dependency-glob: pyproject.toml
           cache-suffix: slow
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
           python-version: '3.12'
+          activate-environment: true
       - run: |
-          uv pip install --system -e ".[dev]"
+          uv pip install -e ".[dev]"
           pytest -q -rs -m "slow and not gpu" --timeout=900
 
   build:
@@ -102,7 +100,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           prune-cache: true

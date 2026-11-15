@@ -26,12 +26,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
           python-version: '3.12'
+          activate-environment: true
       - name: Check release version and changelog
         run: |
           python - <<'PY'
@@ -48,6 +47,7 @@ jobs:
           assert os.environ['GITHUB_REF_NAME'] == f'v{version}', 'release tag must match the package version'
           assert citation_version == version, 'CITATION.cff version must match the package version'
           assert latest == f'## {version} - {release_date}', 'first changelog entry must match the release version and date'
+          assert f'Version {version}.' in Path('README.md').read_text(), 'README version must match the package version'
           date.fromisoformat(release_date)
           PY
       - name: Lint the release commit
@@ -58,7 +58,6 @@ jobs:
         run: |
           uv build
           uvx twine check --strict dist/*
-          uv venv --python 3.12
           for wheel in dist/*.whl; do
             uv pip install "${wheel}[dev]"
           done
