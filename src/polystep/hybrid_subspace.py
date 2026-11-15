@@ -59,8 +59,7 @@ def _layer_specs(layout: "ParamLayout", rank_of: Callable[[int, int], int]) -> "
             d_in = math.prod(shape[1:])
             effective_rank = min(rank_of(d_out, d_in), d_in, d_out)
             num_params = math.prod(shape)
-            # Capped at num_params: a wider matrix has no orthonormal basis and the
-            # fallback gain sqrt(num_params/num_coords) breaks the step radii.
+            # Capped at num_params: a wider matrix has no orthonormal basis.
             num_coords = min(d_out * effective_rank + effective_rank * d_in, num_params)
         else:
             # 1D params (bias, LayerNorm) are perturbed directly.

@@ -274,3 +274,11 @@ def test_vector_only_model_rotation_noop():
 def test_factored_subspace_rejects_nonpositive_rank():
     with pytest.raises(ValueError, match="rank"):
         FactoredSubspace.from_layout(ParamLayout.from_module(nn.Linear(3, 2)), rank=0)
+
+
+def test_fp64_factor_orthonormal_to_fp64():
+    """The factor is drawn in fp32 for a portable seed and must still be orthonormalized at fp64."""
+    layout = ParamLayout.from_module(nn.Linear(16, 12, bias=False).double())
+    B = FactoredSubspace.from_layout(layout, rank=2, seed=0).init_projections("cpu", torch.float64)["weight"]
+
+    assert (B @ B.T - torch.eye(2, dtype=torch.float64)).abs().max() < 1e-14

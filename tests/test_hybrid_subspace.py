@@ -336,7 +336,7 @@ def test_optimizer_detects_hybrid_mode(model):
     optimizer = PolyStepOptimizer(model, subspace=hybrid, epsilon=0.5)
 
     assert optimizer._hybrid is True
-    assert optimizer.subspace is hybrid
+    assert optimizer.subspace.specs is hybrid.specs
     assert optimizer._state.hybrid_projections is not None
     num_projected = sum(1 for s in hybrid.specs if s.is_projected)
     assert len(optimizer._state.hybrid_projections) == num_projected
@@ -1022,3 +1022,47 @@ def test_svd_ratio_tracks_training_step():
         for _ in range(8):
             opt.step(lambda p: sum(v.flatten(1).square().sum(1) for v in p.values()))
     assert steps[AdaptiveSubspace] == steps[HybridSubspace] == [5]
+
+
+@pytest.mark.parametrize("kind", ["hybrid", "factored"])
+def test_unseeded_optimizers_draw_different_bases(kind):
+    """With no seed anywhere the basis follows the global generator, like the rotations do."""
+    from polystep import PolyStepOptimizer
+    from polystep.factored_subspace import FactoredSubspace
+
+    def basis(global_seed):
+        torch.manual_seed(0)
+        model = nn.Linear(16, 12, bias=False)
+        make = HybridSubspace if kind == "hybrid" else FactoredSubspace
+        torch.manual_seed(global_seed)
+        opt = PolyStepOptimizer(model, subspace=make.from_layout(ParamLayout.from_module(model), rank=2))
+        return opt.state.hybrid_projections["weight"]
+
+    assert torch.equal(basis(1), basis(1))
+    assert not torch.equal(basis(1), basis(2))
+
+
+def test_absorb_and_rotation_seeds_never_coincide():
+    """Both redraws count OT steps, so an absorb and a later rotation cannot share a seed under amortization."""
+    from polystep import PolyStepOptimizer
+
+    torch.manual_seed(3)
+    model = nn.Linear(16, 12, bias=False).double()
+    sub = HybridSubspace.from_layout(
+        ParamLayout.from_module(model),
+        rank=1,
+        seed=7,
+        rotation_interval=5,
+        absorb_mode="periodic",
+        absorb_interval=3,
+        absorb_aligned_active=True,
+        svd_ratio_init=0.0,
+        svd_ratio_final=0.0,
+    )
+    opt = PolyStepOptimizer(model, subspace=sub, solver="softmax", compile=False, seed=2, amortize_steps=2)
+    seen = {}
+    for _ in range(7):
+        opt.step(lambda p: p["weight"].flatten(1).square().sum(1))
+        seen.setdefault(opt.state.ot_step_count, opt.state.hybrid_projections["weight"].clone())
+
+    assert not torch.equal(seen[3], seen[5])

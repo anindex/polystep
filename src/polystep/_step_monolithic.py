@@ -166,7 +166,7 @@ def maintain_per_layer_subspace(opt, state, pre_step_sub_coords) -> None:
             svd_ratio,
             state.X.device,
             state.X.dtype,
-            state.iteration_count,
+            state.ot_step_count,
         )
     else:
         new_projections = hybrid_sub.rotate_all(

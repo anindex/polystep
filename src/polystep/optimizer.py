@@ -523,8 +523,8 @@ class PolyStepOptimizer(SerializationMixin):
         self._last_screen_savings = 0.0
         #: Candidate evaluations charged by the step itself, so fast paths stay counted.
         self.candidate_evals = 0
-        if isinstance(subspace, (HybridSubspace, FactoredSubspace)) and subspace.seed is None and seed is not None:
-            subspace = replace(subspace, seed=seed)
+        if isinstance(subspace, (HybridSubspace, FactoredSubspace)) and subspace.seed is None:
+            subspace = replace(subspace, seed=int(torch.randint(2**31 - 1, ()).item()) if seed is None else seed)
         self.subspace = subspace
         self._subspace_particle_dim = subspace_particle_dim
         self._rank_schedule = rank_schedule

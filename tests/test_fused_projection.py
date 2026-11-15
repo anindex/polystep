@@ -172,6 +172,7 @@ def test_absorb_reuses_seeded_basis():
     opt = PolyStepOptimizer(model, subspace=sub, solver="softmax", epsilon=0.5, step_radius=0.3, probe_radius=1.0)
     first = opt._state.hybrid_projections
     calls = {"n": 0}
+    sub = opt.subspace
     original = sub.build_fused_projection
     sub.build_fused_projection = lambda projections: (calls.__setitem__("n", calls["n"] + 1), original(projections))[1]
 
@@ -188,7 +189,9 @@ def test_absorb_reuses_seeded_basis():
     assert calls["n"] == 0, f"absorb must not rebuild the fused matrix, got {calls['n']}"
     mutated = [k for k, v in snapshot.items() if not torch.equal(first[k], v)]
     assert not mutated, f"cached projections were written in place: {mutated}"
-    fresh = HybridSubspace.from_layout(layout, rank=4).init_projections(torch.device("cpu"), torch.float32)
+    fresh = HybridSubspace.from_layout(layout, rank=4, seed=sub.seed).init_projections(
+        torch.device("cpu"), torch.float32
+    )
     assert fresh.keys() == first.keys()
     assert all(torch.equal(first[k], v) for k, v in fresh.items()), "absorb must not redraw the basis"
 

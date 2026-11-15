@@ -11,7 +11,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .solvers._shared import thin_qr
+from .solvers._shared import decomposition_dtype, thin_qr
 from .subspace import ProjectedAbsorbMixin, ProjectionSpec, _stable_entry_seed
 
 from .hybrid_subspace import _require_positive_rank
@@ -91,14 +91,14 @@ class FactoredSubspace(ProjectedAbsorbMixin):
     def _make_b(self, spec: ProjectionSpec, device, dtype, step: int) -> torch.Tensor:
         """``(rank, d_in)`` factor with orthonormal rows, seeded by entry and step.
 
-        Drawn on CPU in fp32 so the seed is portable across devices.
+        Drawn on CPU in fp32 so the seed is portable across devices, then orthonormalized at the target precision.
         """
         r = self.ranks[spec.entry_key]
         d_in = spec.num_params // spec.original_shape[0]
         gen = torch.Generator(device="cpu")
         gen.manual_seed(_stable_entry_seed(self.seed, spec.entry_key, step))
         G = torch.randn(d_in, r, generator=gen, dtype=torch.float32, device="cpu")
-        Q, _ = thin_qr(G)  # (d_in, r), orthonormal columns
+        Q, _ = thin_qr(G.to(decomposition_dtype(dtype)))  # (d_in, r), orthonormal columns
         return Q.t().contiguous().to(device=device, dtype=dtype, non_blocking=True)
 
     def init_projections(self, device, dtype, step: int = 0) -> Dict[str, torch.Tensor]:
