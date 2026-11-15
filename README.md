@@ -28,6 +28,18 @@ Version 1.1.1. See the [changelog](CHANGELOG.md) for release changes.
 
 Animations from [Viet T. Nguyen's interactive visualization](https://vietngth.github.io/polystep-visualization/).
 
+| Ackley | Rastrigin | Rosenbrock |
+|:---:|:---:|:---:|
+| <img src="docs/figures/gallery_ackley.gif" width="290" alt="100,000 particles start uniform over the Ackley function and contract onto its central minima."> | <img src="docs/figures/gallery_rastrigin.gif" width="290" alt="100,000 particles start uniform over the Rastrigin function and settle on its grid of minima."> | <img src="docs/figures/gallery_rosenbrock.gif" width="290" alt="100,000 particles start uniform over the Rosenbrock function and collect along its curved valley."> |
+| **Levy** | **Himmelblau** | **Eggholder** |
+| <img src="docs/figures/gallery_levy.gif" width="290" alt="100,000 particles start uniform over the Levy function and collapse onto its single minimum."> | <img src="docs/figures/gallery_himmelblau.gif" width="290" alt="100,000 particles start uniform over the Himmelblau function and split among its four minima."> | <img src="docs/figures/gallery_eggholder.gif" width="290" alt="100,000 particles start uniform over the Eggholder function, gather along its ridges and settle in its many local minima."> |
+
+Each panel moves 100,000 particles with the batch solver, from function values alone.
+The glow is the particle density, a ring marks each global minimum, and the curve below
+is the mean cost above the optimum. A step takes 40 to 70 ms on one CPU thread and 6 to
+11 ms on an RTX 5090, where 1,000,000 particles take 7 to 13 ms. [`examples/12_particle_gallery.py`](examples/12_particle_gallery.py)
+draws them and takes `--particles` and `--device`.
+
 ## Installation
 
 ```bash

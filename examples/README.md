@@ -21,15 +21,17 @@ python examples/01_quickstart_2d.py
 | [09_hard_decision_tree.py](09_hard_decision_tree.py) | Decision tree with hard routing |
 | [10_cnn_mnist.py](10_cnn_mnist.py) | Convolutional MNIST classifier |
 | [11_transformer_selective_copy.py](11_transformer_selective_copy.py) | Attention-based selective copying |
+| [12_particle_gallery.py](12_particle_gallery.py) | 100,000 particles on six 2D test functions |
 | [13_probe_gradient.py](13_probe_gradient.py) | MNIST with `ProbeGradient` and `torch.optim.SGD`: ReLU, sign, spiking and LeNet-5 models |
 
 ## Devices and threads
 
 Examples run on one CPU thread, except 07, which uses eight; set `POLYSTEP_THREADS` to
-change it. Examples 02, 04, 05, 06, 10, 11 and 13 use CUDA when available, and 05 runs in
+change it. Examples 02, 04, 05, 06, 10, 11, 12 and 13 use CUDA when available, and 05 runs in
 BF16 there; pass `--device cpu` to run them on the CPU. Example 03 runs on the CPU,
 accepts `--device cuda`, and skips its GIF with `--no-render`. Example 04 accepts
-`--small` for a 2,000-variable task.
+`--small` for a 2,000-variable task. Example 12 takes `--particles` to change the cloud
+size.
 
 Example 10 trains in about 20 seconds on an RTX 5090. On one CPU thread its 40 default
 epochs take about an hour, so shorten a CPU run with `--epochs` and `--train-size`.
