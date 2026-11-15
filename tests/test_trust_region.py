@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from polystep import PolyStepOptimizer
 from polystep.cost_nn import NNCostEvaluator
+from polystep.quadratic_model import update_trust_region
 
 
 def _model():
@@ -346,3 +347,74 @@ def test_nn_trust_prediction_sums_parameter_blocks(num_probe):
     assert opt._prev_predicted_improvement.numel() == 1
     assert opt._prev_predicted_improvement.item() == pytest.approx(actual, abs=1e-10)
     assert opt.candidate_evals == 3 * 4 * num_probe + 1
+
+
+def _two_coordinate_optimizer():
+    model = nn.Linear(2, 1, bias=False).double()
+    model.weight.data.zero_()
+    return PolyStepOptimizer(
+        model,
+        particle_dim=2,
+        polytope_type="orthoplex",
+        epsilon=1.0,
+        probe_radius=2.0,
+        step_radius=1.0,
+        solver="softmax",
+        trust_region=True,
+        use_momentum=True,
+        momentum_init=0.5,
+        momentum_final=0.5,
+        compile=False,
+        seed=0,
+        max_iterations=10,
+    )
+
+
+def test_concave_step_prediction_uses_measured_curvature():
+    """A floored curvature predicts a rise on a concave quadratic and shrinks the radius after a real gain."""
+    opt = _two_coordinate_optimizer()
+    opt._state.velocity[0, 0] = 2.0
+
+    def closure(params):
+        return -params["weight"].flatten(1).square().sum(1)
+
+    opt.step(closure)
+    actual = -opt._state.X.square().sum().item()
+    assert opt._prev_predicted_improvement.item() == pytest.approx(actual)
+    opt.step(closure)
+    assert opt._trust_region_multiplier == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize("offset", [0.0, 100.0])
+def test_infeasible_probe_skips_quadratic_fit(offset):
+    """The penalty that stands in for an infinite loss is not a finite-difference observation."""
+    opt = _two_coordinate_optimizer()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt.step(lambda params: torch.where(params["weight"].flatten(1)[:, 0] > 0, torch.inf, offset))
+
+    assert opt._losses_3d is None
+    assert opt._prev_predicted_improvement is None
+
+
+def test_reverted_step_drops_pending_prediction():
+    """A move that was undone leaves nothing for the next step to compare against."""
+    opt = _two_coordinate_optimizer()
+    opt._state.velocity.fill_(float("inf"))
+
+    def closure(params):
+        return -params["weight"].flatten(1).square().sum(1)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        opt.step(closure)
+        assert opt._prev_predicted_improvement is None
+        opt.step(closure)
+    assert opt._trust_region_multiplier == 1.0
+
+
+def test_trust_region_sums_block_predictions():
+    """Rows are blocks of one objective, so a mean would overstate the ratio by the block count."""
+    predicted = torch.full((4,), -0.1)
+    assert update_trust_region(predicted, torch.tensor([-0.08]), 1.0) == pytest.approx(0.5)

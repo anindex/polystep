@@ -207,8 +207,8 @@ def update_trust_region(
     max_radius: float = 3.0,
 ) -> float:
     """Update the trust-region multiplier from predicted vs actual improvement (negative means improvement)."""
-    pred = predicted_improvement.mean().item()
-    actual = actual_improvement.mean().item()
+    pred = predicted_improvement.sum().item()
+    actual = actual_improvement.sum().item()
 
     if not (math.isfinite(pred) and math.isfinite(actual)):
         return max(current_radius * shrink_factor, min_radius)

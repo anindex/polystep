@@ -737,7 +737,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     opt._center_loss = None
     if opt.use_quadratic_model:
         # The step buffer is overwritten next time; the model owns a snapshot.
-        opt._losses_3d = safe.reshape(P, V, K_eff).detach()
+        opt._losses_3d = safe.reshape(P, V, K_eff).detach() if torch.isfinite(losses).all() else None
     if _center_wanted:
         # Every centre candidate equals X, so evaluate once, not once per block.
         _one = torch.zeros(1, dtype=torch.long, device=device)
@@ -889,7 +889,7 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     elif opt.biased_rotation:
         # OT descent direction when the quadratic model is unavailable, so warn rather
         # than let the caller assume the finite-difference path is running.
-        if not getattr(opt, "_biased_rotation_fallback_warned", False):
+        if not (opt.use_quadratic_model or getattr(opt, "_biased_rotation_fallback_warned", False)):
             opt._biased_rotation_fallback_warned = True
             warnings.warn(
                 "biased_rotation is aligning the chart to the OT barycenter's displacement, "
@@ -961,7 +961,9 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
     if opt.trust_region and _fd_grad is not None and _center_loss is not None:
         realized_rot = torch.einsum("bij,bj->bi", rot_mats.transpose(-1, -2), state.X - X)
         # Rows are disjoint parameter blocks of one objective, not independent losses.
-        opt._prev_predicted_improvement = compute_predicted_improvement(_fd_grad, _fd_hess, realized_rot).sum().detach()
+        opt._prev_predicted_improvement = (
+            compute_predicted_improvement(_fd_grad, _fd_hess, realized_rot, hessian_reg=float("-inf")).sum().detach()
+        )
         opt._prev_pre_step_loss = _center_value
 
     # One transfer for all of these, not a device sync each.
@@ -999,6 +1001,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         if opt.biased_rotation:
             opt._prev_descent_direction = None
         opt._newton_direction = None
+        opt._prev_predicted_improvement = None
+        opt._prev_pre_step_loss = None
         _disp = torch.mean(torch.sum((state.X - X) ** 2, dim=-1)).item()
 
     # From X_bary, not state.X: the coasting direction must not re-carry momentum/Newton.
