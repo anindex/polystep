@@ -214,13 +214,14 @@ class TestSharedIteration:
         torch.testing.assert_close(result.matrix.double(), reference.matrix, atol=2e-5, rtol=0)
 
     @pytest.mark.filterwarnings("ignore:SinkhornSolver epsilon.*very small:UserWarning")
-    @pytest.mark.parametrize("epsilon, omega", [(0.01, 1.9), (1e-12, 1.0)])
-    def test_converged_plan_meets_marginals(self, epsilon, omega):
+    @pytest.mark.parametrize("epsilon, omega, converges", [(0.05, 1.0, True), (0.01, 1.9, False), (1e-12, 1.0, False)])
+    def test_converged_plan_meets_marginals(self, epsilon, omega, converges):
         cost = torch.rand(256, 16, generator=torch.Generator().manual_seed(0))
         result = SinkhornSolver(epsilon=epsilon, omega=omega, max_iterations=300).solve(cost)
         plan = result.matrix.double()
         error = max((plan.sum(dim=1) * 256 - 1).abs().max(), (plan.sum(dim=0) * 16 - 1).abs().max()).item()
-        assert not result.converged or error < 1e-3
+        assert result.converged == converges
+        assert not converges or error < 1e-3
 
     @pytest.mark.parametrize("dtype, tiny", [(torch.float32, 1e-37), (torch.float32, 1e-40), (torch.float64, 1e-60)])
     @pytest.mark.parametrize("omega", [1.0, 1.5])

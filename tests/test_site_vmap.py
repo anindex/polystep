@@ -2057,7 +2057,8 @@ def test_tied_site_graph_matches_eager():
     for _ in range(3):
         got = graphed._vmap_over_site("out.bias", base_sd, candidates, x, y)
         assert torch.equal(got, eager._vmap_over_site("out.bias", base_sd, candidates, x, y))
-    graphed._vmap_over_site("out.bias", base_sd, candidates.flip(0), x, y)
+    flipped = graphed._vmap_over_site("out.bias", base_sd, candidates.flip(0), x, y)
+    assert torch.equal(flipped, eager._vmap_over_site("out.bias", base_sd, candidates.flip(0), x, y))
     assert torch.equal(got, eager._vmap_over_site("out.bias", base_sd, candidates, x, y))
     assert not graphed._graph_failed_sites and any(graphed._graphs.values())
 

@@ -124,7 +124,6 @@ class GymVectorEvaluator(_StackedRolloutEvaluator):
         spec_horizon = getattr(probe.spec, "max_episode_steps", None) or 500
         probe.close()
         self.horizon = int(horizon) if horizon is not None else int(spec_horizon)
-        self.action_type = "discrete"
         # Goal-reaching envs terminate early on success, so the "survived to horizon" default would invert them; default per env instead.
         if success_fn is None and _is_goal_reaching(self.env_id):
             horizon_ = float(self.horizon)

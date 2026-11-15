@@ -75,7 +75,6 @@ class CartPoleEvaluator(_StackedRolloutEvaluator):
     env_id = "CartPole-v1"
     obs_dim = OBS_DIM
     action_dim = ACTION_DIM
-    action_type = "discrete"
 
     def __init__(
         self,

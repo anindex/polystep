@@ -966,3 +966,42 @@ def test_step_batch_rejects_trust_region():
     with pytest.raises(ValueError, match="trust_region is not supported by step_batch"):
         opt.step_batch(torch.eye(2), torch.zeros(2, 1), loss_fn=nn.MSELoss())
     assert all(torch.equal(a, b) for a, b in zip(before, model.parameters()))
+
+
+def test_resync_casts_adaptive_displacement_history():
+    """A history left in the old dtype cannot meet the recast projection at the next rotation."""
+    from polystep import AdaptiveSubspace
+
+    model = nn.Sequential(nn.Linear(8, 8))
+    sub = AdaptiveSubspace.auto_from_params(
+        model,
+        compression_target=0.5,
+        min_rank=4,
+        rotation_interval=0,
+        rotation_mode="displacement",
+        svd_ratio_init=0.5,
+        svd_ratio_final=0.5,
+    )
+    opt = PolyStepOptimizer(model, subspace=sub, epsilon=0.5, seed=0)
+    model.double()
+    opt.resync_from_model()
+    opt.step(lambda params: torch.stack([v.pow(2).sum() for v in params["0.weight"]]))
+    history = opt.state.displacement_history[: opt.state.displacement_history_count]
+
+    assert history.dtype == torch.float64
+    sub.rotate(opt.state.projection, step=1, total_steps=10, displacement_history=history)
+
+
+def test_single_tensor_tuple_takes_tensor_paths():
+    """``(x,)`` calls the model exactly like ``x``, so it must reach the single-tensor fast paths too."""
+
+    def stepped(wrap):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 3))
+        opt = PolyStepOptimizer(model, solver="softmax", seed=0)
+        x, y = torch.randn(12, 8), torch.randint(0, 3, (12,))
+        loss = opt.step_batch((x,) if wrap else x, y, loss_fn=nn.CrossEntropyLoss())
+        return loss, opt._sparse_delta_evaluator is not None
+
+    assert stepped(True) == stepped(False)
+    assert stepped(True)[1]

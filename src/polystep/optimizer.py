@@ -1381,6 +1381,8 @@ class PolyStepOptimizer(SerializationMixin):
                 "prediction against the loss on the next batch, which is a different objective. "
                 "Drop trust_region, or drive optimizer.step() on a fixed batch."
             )
+        if isinstance(inputs, (tuple, list)) and len(inputs) == 1 and isinstance(inputs[0], torch.Tensor):
+            inputs = inputs[0]
         evaluator = getattr(self, "_step_batch_evaluator", None)
         if evaluator is None or evaluator.loss_fn is not loss_fn:
             evaluator = self._step_batch_evaluator = NNCostEvaluator(self.model, loss_fn)
@@ -1563,6 +1565,8 @@ class PolyStepOptimizer(SerializationMixin):
             state.velocity = state.velocity.to(dtype)
         if isinstance(state.projection, torch.Tensor):
             state.projection = state.projection.to(dtype)
+        if state.displacement_history is not None:
+            state.displacement_history = state.displacement_history.to(dtype)
 
     def _write_params(self, sd: dict) -> None:
         """Copy the parameter entries of ``sd`` into the live parameters, once per step.
