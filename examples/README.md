@@ -21,11 +21,12 @@ python examples/01_quickstart_2d.py
 | [09_hard_decision_tree.py](09_hard_decision_tree.py) | Decision tree with hard routing |
 | [10_cnn_mnist.py](10_cnn_mnist.py) | Convolutional MNIST classifier |
 | [11_transformer_selective_copy.py](11_transformer_selective_copy.py) | Attention-based selective copying |
+| [13_probe_gradient.py](13_probe_gradient.py) | MNIST with `ProbeGradient` and `torch.optim.SGD`: ReLU, sign, spiking and LeNet-5 models |
 
 ## Devices and threads
 
 Examples run on one CPU thread, except 07, which uses eight; set `POLYSTEP_THREADS` to
-change it. Examples 02, 04, 05, 06, 10 and 11 use CUDA when available, and 05 runs in
+change it. Examples 02, 04, 05, 06, 10, 11 and 13 use CUDA when available, and 05 runs in
 BF16 there; pass `--device cpu` to run them on the CPU. Example 03 runs on the CPU,
 accepts `--device cuda`, and skips its GIF with `--no-render`. Example 04 accepts
 `--small` for a 2,000-variable task.
@@ -45,7 +46,7 @@ These small budgets check execution; use the defaults to assess learning quality
 
 ## Data
 
-Examples 05, 06 and 10 download MNIST to `mnist` under the system temp directory,
+Examples 05, 06, 10 and 13 download MNIST to `mnist` under the system temp directory,
 `/tmp/mnist` on Linux. Example 06 takes `--data-dir` to use another directory.
 
 ## Comparing evaluation paths
@@ -58,7 +59,7 @@ and the [API reference](../docs/api_overview.md#evaluation-controls) for amortiz
 
 ## Reported results
 
-Examples 05, 06, 10 and 11 select checkpoints on validation data and report test
+Examples 05, 06, 10, 11 and 13 select checkpoints on validation data and report test
 accuracy afterward. Example 06 runs a PyTorch SNN simulation on the selected device.
 It adapts the readout and neuron parameters under Gaussian input noise. Its
 one-state neuron uses subtractive reset, so it does not reproduce

@@ -25,6 +25,7 @@ __all__ = [
     "PolyStepOptimizer",
     "RankSchedule",
     "PolyStepES",
+    "ProbeGradient",
     "minimize",
     "train",
     "TrainConfig",
@@ -72,6 +73,7 @@ from .cost_nn import NNCostEvaluator
 from .adaptive_subspace import AdaptiveSubspace
 
 from .optimizer import PolyStepOptimizer, RankSchedule
+from .probe_gradient import ProbeGradient
 from .ask_tell import PolyStepES, minimize
 
 from .api import (

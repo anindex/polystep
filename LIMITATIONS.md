@@ -87,6 +87,42 @@ displacement before momentum.
   such a forward.
 - The library does not distribute optimizer state across multiple GPUs.
 
+## ProbeGradient
+
+- The loss must return one value per sample. A loss that couples samples, such as a
+  batch-level F1 score or a contrastive loss, has no per-sample credit to assign; use
+  `PolyStepOptimizer` for those.
+- The forward must score each sample on its own as well. Batch statistics, as in a
+  `BatchNorm` without running statistics, make the estimate wrong. The first call
+  moves a random half of the batch at every layer and warns when another sample's loss
+  changes. It runs once per layer and misses coupling confined to the samples it
+  moved: with pairs of coupled samples it stayed silent in 30 of 100 runs at batch 4
+  and in none at batch 16.
+- The shortcuts that keep a call cheap are checked on the first call only, at one
+  probe. A forward whose structure changes afterwards is caught only if the shortcut
+  then fails outright.
+- Only `nn.Linear` and `nn.Conv2d` weights and biases get a gradient. Normalization
+  scales, embeddings, thresholds, parametrized weights and other parameters keep
+  `.grad` as it was. A layer that runs on a batch size other than the input's, a
+  grouped convolution, one with non-zero padding mode, or one called twice in a forward
+  is skipped with a warning.
+- The model is scored in eval mode, as in `NNCostEvaluator`. Buffers that the forward
+  writes are not restored between probe forwards.
+- The estimate is the gradient at a finite radius. A large radius smooths the loss; on
+  the sign network of example 13 a radius of 1.0 reached 89% where 0.3 reached 97%.
+- With fewer probes than units the estimate is noisy: the per-sample variance grows as
+  `(units - probes) / probes`. Convolutions with many weights are the weak point. In
+  LeNet-5 the second convolution's estimate had a cosine of about 0.2 with the true
+  gradient at 64 probes, and training still reached 97.7% to 98.5%.
+- A probe forward holds `2 * probes * batch` samples, split into chunks of about
+  `max_probe_batch`. A chunk always holds one vertex pair for the whole batch, so it
+  never drops below `2 * batch`. The cap counts samples and not bytes; lower it for
+  long sequences. A forward that cannot share its prefix reruns the whole model on
+  that batch.
+- The estimator works per layer on recorded activations, so a model that never calls
+  its layers through `nn.Module.__call__`, for example one using `torch.func` on raw
+  weights, exposes nothing to probe.
+
 ## Attention and recurrent layers
 
 [`VmapSafeMultiHeadAttention`](src/polystep/layers/attention.py) requires batch-first
