@@ -1,6 +1,7 @@
 """Checkpoint format for :class:`~polystep.optimizer.PolyStepOptimizer`."""
 
 import warnings
+from dataclasses import replace
 
 import torch
 
@@ -65,6 +66,7 @@ class SerializationMixin:
             solver_state[name] = _ser(getattr(self._state, name))
 
         sd = {"format": _STATE_DICT_FORMAT, "solver_state": solver_state}
+        sd["subspace_seed"] = getattr(self.subspace, "seed", None)
 
         # Attached by the blockwise step, not a dataclass field, so the loop above can't see it.
         sd["prev_prev_block_duals"] = _ser(getattr(self._state, "_prev_prev_block_duals", None))
@@ -95,6 +97,9 @@ class SerializationMixin:
         device = self._state.X.device
         valid = set(type(self._state).__dataclass_fields__)
 
+        seed = sd.get("subspace_seed")
+        if seed is not None and getattr(self.subspace, "seed", None) != seed:
+            self.subspace = self._state.subspace = replace(self.subspace, seed=seed)
         # Rebuild the subspace to the checkpoint's rank before any tensors land.
         saved_rank = sd.get("control", {}).get("_applied_rank")
         if saved_rank is not None and saved_rank != self._applied_rank and self.subspace is not None:

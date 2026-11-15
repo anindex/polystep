@@ -410,3 +410,17 @@ def test_gauge_shifted_warm_start_converges_at_once():
     shifted = solver.solve(cost, init_f=exact.f + 15.0, init_g=exact.g - 15.0)
 
     assert shifted.converged and shifted.n_iters <= 2
+
+
+@pytest.mark.parametrize("anderson_depth", [0, 2])
+def test_huge_warm_start_cannot_certify_convergence(anderson_depth):
+    """Duals too large to resolve an update stop changing, which must not read as a converged plan."""
+    cost = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+    warm = torch.full((2,), 1e10)
+    result = SinkhornSolver(epsilon=0.1, max_iterations=100, anderson_depth=anderson_depth).solve(
+        cost, init_f=warm, init_g=warm
+    )
+    plan = result.matrix.double()
+    error = max((plan.sum(1) * 2 - 1).abs().max().item(), (plan.sum(0) * 2 - 1).abs().max().item())
+
+    assert result.converged and error < 3e-5

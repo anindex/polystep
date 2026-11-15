@@ -643,3 +643,39 @@ def test_seeded_checkpoint_moves_between_device_types(src, dst):
     with pytest.warns(UserWarning, match="another device type"):
         resumed.load_state_dict(checkpoint)
     assert torch.isfinite(torch.as_tensor(resumed.step(closure)))
+
+
+@pytest.mark.parametrize("kind", ["hybrid", "factored"])
+def test_unseeded_basis_seed_survives_resume(kind):
+    """The seed an unseeded subspace draws is run state: a resumed run must redraw the same bases."""
+    from polystep.factored_subspace import FactoredSubspace
+    from polystep.hybrid_subspace import HybridSubspace
+
+    def make(model):
+        subspace = HybridSubspace if kind == "hybrid" else FactoredSubspace
+        sub = subspace.from_layout(ParamLayout.from_module(model), rank=2, rotation_interval=2)
+        return PolyStepOptimizer(model, subspace=sub, solver="softmax", compile=False)
+
+    def loss(params):
+        return params["weight"].flatten(1).square().sum(1)
+
+    torch.manual_seed(8)
+    model = nn.Linear(8, 6, bias=False).double()
+    original = make(model)
+    original.step(loss)
+    checkpoint = original.state_dict()
+    rng = torch.get_rng_state()
+    resumed_model = copy.deepcopy(model)
+    resumed = make(resumed_model)
+    resumed.load_state_dict(checkpoint)
+
+    for _ in range(2):
+        torch.set_rng_state(rng)
+        original.step(loss)
+        after = torch.get_rng_state()
+        torch.set_rng_state(rng)
+        resumed.step(loss)
+        rng = after
+
+    assert resumed.subspace.seed == original.subspace.seed
+    torch.testing.assert_close(resumed_model.weight, model.weight, rtol=0, atol=0)

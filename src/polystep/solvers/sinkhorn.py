@@ -156,18 +156,20 @@ class SinkhornSolver:
         log_K = -cost_matrix / eps
         log_a, log_b = a.log(), b.log()
 
+        # Dual potentials scale with the cost and the epsilon-scaled log marginals. Kept on-device to avoid a sync per solve.
         cost_max = cost_matrix.abs().max()
+        max_abs_dual = 10.0 * (cost_max + eps * (log_a.abs().max() + log_b.abs().max())).clamp(min=1e-6)
         # Reset a non-finite warm start to zero. Kept device-side to avoid a host sync.
         finite = torch.isfinite(f).all() & torch.isfinite(g).all()
         f = torch.where(finite, f, torch.zeros_like(f))
         g = torch.where(finite, g, torch.zeros_like(g))
 
         # Gauge f -> f + c, g -> g - c leaves the plan unchanged; the half-difference
-        # balances the two magnitudes. Subtracting each mean independently is
+        # balances magnitudes so the clamp holds. Subtracting each mean independently is
         # NOT a gauge and perturbs the iterate under overrelaxation.
         c = 0.5 * (g.mean() - f.mean())
-        f = f + c
-        g = g - c
+        f = (f + c).clamp(-max_abs_dual, max_abs_dual)
+        g = (g - c).clamp(-max_abs_dual, max_abs_dual)
 
         fixed_mode = self.threshold <= 0
 

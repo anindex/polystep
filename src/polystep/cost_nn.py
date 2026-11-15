@@ -484,10 +484,7 @@ class NNCostEvaluator:
         self._compile_forward_verified = False
         self._buffers = dict(self.model.named_buffers())
         self._buffer_slots = [
-            (module._buffers, name, buffer)
-            for module in self.model.modules()
-            for name, buffer in module._buffers.items()
-            if buffer is not None
+            (module, dict(module._buffers), set(module._non_persistent_buffers_set)) for module in self.model.modules()
         ]
         self._mutable_weights = _max_norm_weights(self.model)
         self._unversioned_writes = None
@@ -527,6 +524,7 @@ class NNCostEvaluator:
     @loss_fn.setter
     def loss_fn(self, fn: Callable) -> None:
         self._loss_fn = fn
+        self._reset_count += 1
         self._loss_kind = _builtin_loss_kind(fn)
         self._batched_linear = (
             BatchedLinearEvaluator.try_build(self.model, fn, self._loss_kind) if _batched_loss_kind(fn) else None
@@ -621,10 +619,22 @@ class NNCostEvaluator:
 
     @contextmanager
     def _restoring_buffers(self):
-        """Restore buffers and forward-mutated weights at exit and on each yielded restore."""
+        """Restore buffers, their registration and forward-mutated weights at exit and on each yielded restore."""
+
+        def rebind():
+            for module, buffers, non_persistent in self._buffer_slots:
+                live = module._buffers
+                if len(live) != len(buffers) or any(live.get(name) is not buffer for name, buffer in buffers.items()):
+                    live.clear()
+                    live.update(buffers)
+                    module._non_persistent_buffers_set = set(non_persistent)
+
         state = [*self._buffers.values(), *self._mutable_weights]
         if not state:
-            yield lambda: None
+            try:
+                yield rebind
+            finally:
+                rebind()
             return
         versions = [None if torch.is_inference(t) else t._version for t in state]
         copies = [t.clone() for t in state]
@@ -652,9 +662,7 @@ class NNCostEvaluator:
             self._unversioned_writes = (self._unversioned_writes or set()) | moved
 
         def put_back():
-            for slots, name, buffer in self._buffer_slots:
-                if slots.get(name) is not buffer:
-                    slots[name] = buffer
+            rebind()
             for i, (t, c, v) in enumerate(zip(state, copies, versions)):
                 if v is not None and t._version == v and i not in self._unversioned_writes:
                     continue
@@ -1817,6 +1825,13 @@ class SiteVmapEvaluator:
     _loss_kind = property(lambda self: self._owner._loss_kind)
     _buffers = property(lambda self: self._owner._buffers)
 
+    def _follow_owner_reset(self) -> None:
+        """Drop what was captured from the owner before its last ``reset_vmap`` or loss change."""
+        if self._reset_seen != self._owner._reset_count:
+            self._reset_seen = self._owner._reset_count
+            self._compiled_sites.clear()
+            self._drop_graphs()
+
     def _drop_graphs(self) -> None:
         """Free the captured site graphs, their static tensors and their memory pool."""
         self._graphs = {}
@@ -2046,10 +2061,7 @@ class SiteVmapEvaluator:
         ``key``: after a Linear or convolution of a shared input, or into a weight built
         once per forward.
         """
-        if self._reset_seen != self._owner._reset_count:
-            self._reset_seen = self._owner._reset_count
-            self._compiled_sites.clear()
-            self._drop_graphs()
+        self._follow_owner_reset()
         inject = isinstance(site, tuple)
         signature = _input_signature(inputs)
         names = self._names[key]
@@ -2228,6 +2240,7 @@ class SiteInplaceEvaluator(SiteVmapEvaluator):
     def _frame(self, sd, inputs, targets, n):
         """``(losses, score)`` for ``n`` candidates on the model primed with ``sd``, in eval mode."""
         owner, model = self._owner, self.model
+        self._follow_owner_reset()
         if self._primed is not sd:
             keys = [k for k in sd if k in self._entry_by_key]
             torch._foreach_copy_([self._param(k) for k in keys], [sd[k] for k in keys])

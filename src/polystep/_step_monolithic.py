@@ -800,8 +800,8 @@ def step_monolithic(opt, closure: Callable, screen_closure: Callable | None = No
         beta = opt._dual_momentum_beta
         init_f_for_solve = state.f + beta * (state.f - state.prev_prev_f)
         init_g_for_solve = state.g + beta * (state.g - state.prev_prev_g)
-        # No clamp: Sinkhorn converges from any finite warm start, and a bound would
-        # truncate valid extrapolations.
+        # No clamp: SinkhornSolver bounds any warm start it is handed, and an
+        # epsilon-scaled bound here would truncate valid extrapolations.
 
     opt.solver.epsilon = ot_epsilon
     if opt._use_fused_softmax:

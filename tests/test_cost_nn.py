@@ -1579,3 +1579,77 @@ def test_opaque_input_leaf_skips_injection_check():
         counts.append(model.calls)
 
     assert counts == [1, 1, 1]
+
+
+@pytest.mark.parametrize("mode", ["none", "add", "delete"])
+def test_buffer_registration_restored_between_candidates(mode):
+    """A forward that registers, fills or deletes a buffer leaves the module as it found it."""
+
+    class Lazy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.ones(1))
+            if mode == "none":
+                self.register_buffer("calls", None)
+            elif mode == "delete":
+                self.register_buffer("calls", torch.zeros(()), persistent=False)
+
+        def forward(self, x):
+            if mode == "delete":
+                value = self.calls + 1
+                del self.calls
+            else:
+                if getattr(self, "calls", None) is None:
+                    self.register_buffer("calls", x.new_zeros(()))
+                self.calls = self.calls + 1
+                value = self.calls
+            return x * self.w * value
+
+    model = Lazy()
+    keys, buffers = list(model.state_dict()), dict(model._buffers)
+    ev = NNCostEvaluator(model, nn.MSELoss(), use_inplace=True, compile_forward=False)
+    losses = ev.evaluate({"w": torch.ones(3, 1)}, torch.ones(2, 1), torch.zeros(2, 1))
+
+    assert losses.tolist() == [1.0, 1.0, 1.0]
+    assert list(model.state_dict()) == keys
+    assert model._buffers.keys() == buffers.keys() and all(model._buffers[k] is v for k, v in buffers.items())
+
+
+def test_inplace_site_follows_owner_reset():
+    """A replaced parameter must reach the model again after ``reset_vmap``, even for an unchanged base dict."""
+    from polystep.cost_nn import SiteVmapEvaluator
+
+    model = nn.Sequential(nn.Linear(2, 1))
+    model[0].weight.data.fill_(1)
+    model[0].bias.data.fill_(1)
+    owner = NNCostEvaluator(model, nn.MSELoss(), use_inplace=True, compile_forward=False)
+    layout = ParamLayout.from_module(model)
+    site = SiteVmapEvaluator.try_build(owner, layout)
+    base = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    args = (base, layout.entries[0], torch.tensor([[0, 1]]), torch.ones(1, 2, 2), torch.ones(2, 2), torch.zeros(2, 1))
+    first = site.evaluate(*args).tolist()
+    model[0].bias = nn.Parameter(torch.full((1,), 5.0))
+    owner.reset_vmap()
+
+    assert site.evaluate(*args).tolist() == first == [9.0, 9.0]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_site_graph_dropped_on_loss_change():
+    """A captured CUDA graph holds the loss it was built with, so assigning a new loss must drop it."""
+    from polystep.cost_nn import SiteVmapEvaluator
+
+    model = nn.Sequential(nn.Linear(2, 1, bias=False)).cuda()
+    model[0].weight.data.fill_(1)
+    owner = NNCostEvaluator(model, nn.MSELoss())
+    layout = ParamLayout.from_module(model)
+    site = SiteVmapEvaluator(owner, layout)
+    base = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    x, y = torch.ones(2, 2, device="cuda"), torch.zeros(2, 1, device="cuda")
+    args = (base, layout.entries[0], torch.tensor([[0, 1]], device="cuda"), torch.ones(1, 2, 2, device="cuda"), x, y)
+    for _ in range(3):
+        assert site.evaluate(*args).tolist() == [4.0, 4.0]
+    owner.loss_fn = nn.L1Loss()
+
+    assert site.evaluate(*args).tolist() == [2.0, 2.0]
